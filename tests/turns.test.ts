@@ -45,7 +45,7 @@ test("Turn helpers build prompt text with history and attachments", () => {
     prompt,
     /Earlier Telegram messages arrived after an aborted turn/,
   );
-  assert.match(prompt, /1\. older message/);
+  assert.match(prompt, /1\. \[AAAK\] msg=older message/);
   assert.match(prompt, /Current Telegram message:\ncurrent message/);
   assert.match(prompt, /\[attachments\] \/tmp\n- \/demo.png/);
 });

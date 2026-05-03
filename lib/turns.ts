@@ -32,6 +32,46 @@ export interface TelegramTurnMessage {
 
 export type DownloadedTelegramTurnFile = DownloadedTelegramMessageFile;
 
+/**
+ * Compress history text to AAAK format for compact multi-message context.
+ * Extracts text content, counts attachments/outputs, truncates to ~40 chars.
+ * Format: [AAAK] msg=...|files=N|outputs=N
+ */
+export function compressTelegramHistoryToAAAK(
+  historyText: string,
+  maxMsgLen = 40,
+): string {
+  if (!historyText) return historyText;
+
+  let text = historyText;
+  let filesCount = 0;
+  let outputsCount = 0;
+
+  // Extract [attachments] count
+  const attachMatch = text.match(/\n\n\[attachments\].*$/s);
+  if (attachMatch) {
+    filesCount = (attachMatch[0].match(/\n-/g) || []).length;
+    text = text.slice(0, attachMatch.index);
+  }
+
+  // Extract [outputs] count
+  const outMatch = text.match(/\n\n\[outputs\].*$/s);
+  if (outMatch) {
+    outputsCount = (outMatch[0].match(/\n-/g) || []).length;
+    text = text.slice(0, outMatch.index);
+  }
+
+  // Truncate message text
+  const truncated =
+    text.length > maxMsgLen ? text.slice(0, maxMsgLen).trimEnd() + "…" : text;
+  if (!truncated) return "(empty)";
+
+  let result = `[AAAK] msg=${truncated}`;
+  if (filesCount > 0) result += `|files=${filesCount}`;
+  if (outputsCount > 0) result += `|outputs=${outputsCount}`;
+  return result;
+}
+
 export function truncateTelegramQueueSummary(
   text: string,
   maxWords = 5,
@@ -107,7 +147,7 @@ export function buildTelegramTurnPrompt(options: {
     prompt +=
       "\n\nEarlier Telegram messages arrived after an aborted turn. Treat them as prior user messages, in order:";
     for (const [index, turn] of (options.historyTurns ?? []).entries()) {
-      prompt += `\n\n${index + 1}. ${turn.historyText}`;
+      prompt += `\n\n${index + 1}. ${compressTelegramHistoryToAAAK(turn.historyText)}`;
     }
     prompt += "\n\nCurrent Telegram message:";
   }
