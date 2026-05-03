@@ -563,7 +563,7 @@ export function buildStatusHtml(
       lines.push(
         buildStatusRow(
           "\u26A0\uFE0F Cost",
-          `$${stats.totalCost.toFixed(3)} \u226B $${threshold.toFixed(3)}. /restart or /compact`,
+          `$${stats.totalCost.toFixed(3)} \u226B $${threshold.toFixed(3)}. /compact to reset`,
         ),
       );
     }
