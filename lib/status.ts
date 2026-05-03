@@ -546,6 +546,28 @@ export function buildStatusHtml(
     lines.push(buildStatusRow("Cost", costSummary));
   }
   lines.push(buildStatusRow("Context", buildContextSummary(ctx, activeModel)));
+  // Show active model
+  if (activeModel) {
+    const modelId =
+      (activeModel as Record<string, unknown>)["id"] ??
+      (activeModel as Record<string, unknown>)["modelId"];
+    if (modelId) {
+      lines.push(buildStatusRow("Model", String(modelId)));
+    }
+  }
+  // Cost threshold warning (env PI_COST_THRESHOLD, e.g. "0.10")
+  const thresholdStr = process.env["PI_COST_THRESHOLD"];
+  if (thresholdStr && stats.totalCost > 0) {
+    const threshold = parseFloat(thresholdStr);
+    if (!isNaN(threshold) && threshold > 0 && stats.totalCost > threshold) {
+      lines.push(
+        buildStatusRow(
+          "\u26A0\uFE0F Cost",
+          `$${stats.totalCost.toFixed(3)} \u226B $${threshold.toFixed(3)}. /restart or /compact`,
+        ),
+      );
+    }
+  }
   if (lines.length === 0) {
     lines.push(buildStatusRow("Status", "No usage data yet."));
   }
