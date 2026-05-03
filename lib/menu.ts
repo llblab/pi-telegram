@@ -499,7 +499,7 @@ export interface BuildTelegramModelMenuStateParams<
 
 export type TelegramMenuCallbackAction =
   | { kind: "ignore" }
-  | { kind: "status"; action: "model" | "thinking" }
+  | { kind: "status"; action: "model" | "thinking" | "restart" }
   | { kind: "thinking:set"; level: string }
   | {
       kind: "model";
@@ -669,6 +669,9 @@ export function parseTelegramMenuCallbackAction(
   if (data === "status:model") return { kind: "status", action: "model" };
   if (data === "status:thinking") {
     return { kind: "status", action: "thinking" };
+  }
+  if (data === "status:restart") {
+    return { kind: "status", action: "restart" };
   }
   if (data?.startsWith("thinking:set:")) {
     return {
@@ -1117,6 +1120,13 @@ export async function handleTelegramStatusMenuCallbackAction(
     await deps.answerCallbackQuery(callbackQueryId);
     return true;
   }
+  if (action.kind === "status" && action.action === "restart") {
+    await deps.answerCallbackQuery(
+      callbackQueryId,
+      "Restarting Telegram bridge...",
+    );
+    return true;
+  }
   if (!(action.kind === "status" && action.action === "thinking")) {
     return false;
   }
@@ -1261,6 +1271,15 @@ export function buildStatusReplyMarkup(
       {
         text: formatStatusButtonLabel("Thinking", currentThinkingLevel),
         callback_data: "status:thinking",
+      },
+    ]);
+  }
+  // Restart button (hidden upstream, enable via PI_ENABLE_RESTART env)
+  if (process.env["PI_ENABLE_RESTART"]) {
+    rows.push([
+      {
+        text: "🔄 Restart",
+        callback_data: "status:restart",
       },
     ]);
   }
