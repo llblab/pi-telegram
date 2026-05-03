@@ -27,12 +27,21 @@ export interface TelegramVoice {
   mime_type?: string;
 }
 
+export interface TelegramReplyToMessage {
+  message_id?: number;
+  text?: string;
+  caption?: string;
+  from?: { first_name?: string; is_bot?: boolean };
+}
+
 export interface TelegramSticker {
   file_id: string;
 }
 
+
 export interface TelegramMediaMessage {
   message_id: number;
+  reply_to_message?: TelegramReplyToMessage;
   text?: string;
   caption?: string;
   media_group_id?: string;
@@ -164,7 +173,14 @@ function isImageMimeType(mimeType: string | undefined): boolean {
 export function extractTelegramMessageText(
   message: TelegramMediaMessage,
 ): string {
-  return (message.text || message.caption || "").trim();
+  let text = (message.text || message.caption || "").trim();
+  if (message.reply_to_message) {
+    const quoted = (message.reply_to_message.text || message.reply_to_message.caption || "").trim();
+    if (quoted) {
+      text = text ? `[reply] "${quoted}"\n\n${text}` : `[reply] "${quoted}"`;
+    }
+  }
+  return text;
 }
 
 export function extractTelegramMessagesText(
