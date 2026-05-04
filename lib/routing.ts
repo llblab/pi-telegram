@@ -10,6 +10,7 @@ import type { TelegramAttachmentHandlerRuntime } from "./attachment-handlers.ts"
 import * as Media from "./media.ts";
 import * as Menu from "./menu.ts";
 import * as Model from "./model.ts";
+import type { PiExtensionApiRuntimePorts } from "./pi.ts";
 import * as Queue from "./queue.ts";
 import type { TelegramBridgeRuntime } from "./runtime.ts";
 import * as Turns from "./turns.ts";
@@ -69,6 +70,7 @@ export interface TelegramInboundRouteRuntimeDeps<
   getThinkingLevel: () => Model.ThinkingLevel;
   setThinkingLevel: (level: Model.ThinkingLevel) => void;
   setModel: (model: TModel) => Promise<boolean>;
+  sendUserMessage?: PiExtensionApiRuntimePorts["sendUserMessage"];
   isIdle: (ctx: TContext) => boolean;
   hasPendingMessages: (ctx: TContext) => boolean;
   compact: (
@@ -80,6 +82,26 @@ export interface TelegramInboundRouteRuntimeDeps<
     error: unknown,
     details?: Record<string, unknown>,
   ) => void;
+}
+
+/**
+ * Prefixes of callback_data values handled by pi-telegram's built-in
+ * model/thinking/status menus. Anything else falls through to the
+ * button-action store, and finally (if still unmatched) is forwarded
+ * to the agent via sendUserMessage so other extensions can react to
+ * inline-button presses they registered themselves.
+ */
+const TELEGRAM_MENU_CALLBACK_PREFIXES = [
+  "model:",
+  "thinking:",
+  "status:",
+] as const;
+
+function isTelegramMenuCallbackData(data: string | undefined): boolean {
+  if (!data) return false;
+  return TELEGRAM_MENU_CALLBACK_PREFIXES.some((prefix) =>
+    data.startsWith(prefix),
+  );
 }
 
 export function createTelegramInboundRouteRuntime<
@@ -158,6 +180,23 @@ export function createTelegramInboundRouteRuntime<
         },
       );
       if (handled) return;
+    }
+    // Forward unknown (non-menu, non-button-store) callback queries to other
+    // extensions via sendUserMessage. Lets extensions register their own
+    // inline buttons with arbitrary callback_data and react to user clicks.
+    const data = query.data;
+    if (
+      deps.sendUserMessage &&
+      typeof data === "string" &&
+      data.length > 0 &&
+      !isTelegramMenuCallbackData(data)
+    ) {
+      deps.sendUserMessage(`[callback] ${data}`);
+      const callbackQueryId = query.id;
+      if (typeof callbackQueryId === "string") {
+        await deps.answerCallbackQuery(callbackQueryId);
+      }
+      return;
     }
     await menuCallbackHandler(query, ctx);
   };
