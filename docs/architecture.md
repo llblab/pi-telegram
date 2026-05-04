@@ -112,7 +112,7 @@ Dispatch is gated by:
 - `ctx.isIdle()` being true
 - `ctx.hasPendingMessages()` being false
 
-This prevents queue races around rapid follow-ups, `/compact`, and mixed local plus Telegram activity. Telegram `/status` and `/model` execute immediately; the dispatch controller still serializes any deferred control items so a queued control action must settle before the next queued action can dispatch.
+This prevents queue races around rapid follow-ups, `/compact`, and mixed local plus Telegram activity. Post-agent-end dispatch retries are scheduled through a session-bound deferred dispatcher that activates on session start, cancels timers on session shutdown, and skips callbacks from older generations before they touch `ExtensionContext`. Telegram `/status` and `/model` execute immediately; the dispatch controller still serializes any deferred control items so a queued control action must settle before the next queued action can dispatch.
 
 ### Abort Behavior
 

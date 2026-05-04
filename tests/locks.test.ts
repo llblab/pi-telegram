@@ -226,18 +226,12 @@ test("Locked polling runtime suspends session replacement without releasing owne
   }
 });
 
-test("Locked polling runtime tolerates stale contexts after session replacement", async () => {
+test("Locked polling runtime stops after ownership loss without live context", async () => {
   const temp = createTempLockPath();
   try {
     const events: string[] = [];
     const runtimeEvents: { category: string; phase: unknown; message: string }[] = [];
-    let stale = false;
-    const ctx = {
-      get cwd() {
-        if (stale) throw new Error("stale ctx");
-        return "/repo";
-      },
-    };
+    const ctx = { cwd: "/repo" };
     const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
     const runtime = createTelegramLockedPollingRuntime({
       lock,
@@ -250,7 +244,6 @@ test("Locked polling runtime tolerates stale contexts after session replacement"
         events.push("stop");
       },
       updateStatus: () => {
-        if (stale) throw new Error("stale ctx");
         events.push("status");
       },
       recordRuntimeEvent: (category, error, details) => {
@@ -262,13 +255,10 @@ test("Locked polling runtime tolerates stale contexts after session replacement"
       },
     });
     assert.equal((await runtime.start(ctx)).ok, true);
-    stale = true;
     writeFileSync(temp.path, JSON.stringify({}));
     await waitForCondition(() => events.includes("stop"));
     assert.deepEqual(events, ["start", "status", "stop"]);
-    assert.deepEqual(runtimeEvents, [
-      { category: "lock", phase: "ownership-loss-status", message: "stale ctx" },
-    ]);
+    assert.deepEqual(runtimeEvents, []);
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }

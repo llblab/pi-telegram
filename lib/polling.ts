@@ -97,7 +97,7 @@ export interface TelegramPollingRuntimeDeps<TContext> {
   setPollingController: (controller: AbortController | undefined) => void;
   stopTypingLoop: () => unknown;
   runPollLoop: (ctx: TContext, signal: AbortSignal) => Promise<void>;
-  updateStatus: (ctx: TContext) => void;
+  updateStatus: (ctx: TContext, message?: string) => void;
   createAbortController?: () => AbortController;
 }
 

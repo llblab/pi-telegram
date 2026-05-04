@@ -46,10 +46,16 @@ export default function (pi: Pi.ExtensionAPI) {
   const runtimeEvents = Status.createTelegramRuntimeEventRecorder({
     getBotToken: configStore.getBotToken,
   });
-  const mediaGroupRuntime =
-    Media.createTelegramMediaGroupController<Api.TelegramMessage>();
+  const mediaGroupRuntime = Media.createTelegramMediaGroupController<
+    Api.TelegramMessage,
+    Pi.ExtensionContext
+  >();
   const telegramQueueStore =
     Queue.createTelegramQueueStore<Pi.ExtensionContext>();
+  const deferredQueueDispatchRuntime =
+    Queue.createTelegramDeferredQueueDispatchRuntime<Pi.ExtensionContext>({
+      recordRuntimeEvent: runtimeEvents.record,
+    });
   const pollingControllerState = Polling.createTelegramPollingControllerState();
   const { getStatusLines, updateStatus } =
     Status.createTelegramBridgeStatusRuntime<
@@ -88,12 +94,14 @@ export default function (pi: Pi.ExtensionAPI) {
       updateStatus,
     });
   const attachmentHandlerRuntime =
-    AttachmentHandlers.createTelegramAttachmentHandlerRuntime<Pi.ExtensionContext>({
-      getHandlers: configStore.getAttachmentHandlers,
-      execCommand: CommandTemplates.execCommandTemplate,
-      getCwd: Pi.getExtensionContextCwd,
-      recordRuntimeEvent: runtimeEvents.record,
-    });
+    AttachmentHandlers.createTelegramAttachmentHandlerRuntime<Pi.ExtensionContext>(
+      {
+        getHandlers: configStore.getAttachmentHandlers,
+        execCommand: CommandTemplates.execCommandTemplate,
+        getCwd: Pi.getExtensionContextCwd,
+        recordRuntimeEvent: runtimeEvents.record,
+      },
+    );
 
   // --- Telegram API ---
 
@@ -149,6 +157,7 @@ export default function (pi: Pi.ExtensionAPI) {
       hasDispatchPending: bridgeRuntime.lifecycle.hasDispatchPending,
       isIdle: Pi.isExtensionContextIdle,
       hasPendingMessages: Pi.hasExtensionContextPendingMessages,
+      hasDispatchContext: deferredQueueDispatchRuntime.isBound,
       updateStatus,
       sendTextReply,
       recordRuntimeEvent: runtimeEvents.record,
@@ -274,8 +283,10 @@ export default function (pi: Pi.ExtensionAPI) {
       setPendingModelSwitch: pendingModelSwitchStore.set,
       syncCounters: bridgeRuntime.queue.syncCounters,
       syncFlags: bridgeRuntime.lifecycle.syncFlags,
+      bindDeferredDispatchContext: deferredQueueDispatchRuntime.bind,
       prepareTempDir,
       updateStatus,
+      unbindDeferredDispatchContext: deferredQueueDispatchRuntime.unbind,
       clearPendingMediaGroups: mediaGroupRuntime.clear,
       clearModelMenuState: modelMenuRuntime.clear,
       getActiveTurnChatId: activeTurnRuntime.getChatId,
@@ -352,6 +363,8 @@ export default function (pi: Pi.ExtensionAPI) {
         clearDispatchPending: bridgeRuntime.lifecycle.clearDispatchPending,
       }),
       dispatchNextQueuedTelegramTurn,
+      requestDeferredDispatchNextQueuedTelegramTurn:
+        deferredQueueDispatchRuntime.request,
       clearPreview: previewRuntime.clear,
       setPreviewPendingText: previewRuntime.setPendingText,
       finalizeMarkdownPreview: previewRuntime.finalizeMarkdown,
@@ -362,16 +375,16 @@ export default function (pi: Pi.ExtensionAPI) {
         sendTextReply,
         recordRuntimeEvent: runtimeEvents.record,
       }),
-      planOutboundReply: OutboundHandlers.createTelegramOutboundReplyPlanner(
-        buttonActionStore,
-      ),
-      sendOutboundReplyArtifacts: OutboundHandlers.createTelegramOutboundReplyArtifactSender({
-        execCommand: CommandTemplates.execCommandTemplate,
-        sendMultipart: callMultipart,
-        sendTextReply,
-        getHandlers: configStore.getOutboundHandlers,
-        recordRuntimeEvent: runtimeEvents.record,
-      }),
+      planOutboundReply:
+        OutboundHandlers.createTelegramOutboundReplyPlanner(buttonActionStore),
+      sendOutboundReplyArtifacts:
+        OutboundHandlers.createTelegramOutboundReplyArtifactSender({
+          execCommand: CommandTemplates.execCommandTemplate,
+          sendMultipart: callMultipart,
+          sendTextReply,
+          getHandlers: configStore.getOutboundHandlers,
+          recordRuntimeEvent: runtimeEvents.record,
+        }),
       getActiveToolExecutions: bridgeRuntime.lifecycle.getActiveToolExecutions,
       setActiveToolExecutions: bridgeRuntime.lifecycle.setActiveToolExecutions,
       triggerPendingModelSwitchAbort: modelSwitchController.triggerPendingAbort,

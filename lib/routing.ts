@@ -41,7 +41,7 @@ export interface TelegramInboundRouteRuntimeDeps<
   >;
   bridgeRuntime: TelegramBridgeRuntime;
   activeTurnRuntime: Queue.TelegramActiveTurnStore;
-  mediaGroupRuntime: Media.TelegramMediaGroupController<TMessage>;
+  mediaGroupRuntime: Media.TelegramMediaGroupController<TMessage, TContext>;
   telegramQueueStore: Queue.TelegramQueueStateStore<TContext>;
   queueMutationRuntime: Queue.TelegramQueueMutationController<TContext>;
   modelMenuRuntime: Menu.TelegramModelMenuRuntime<TModel>;

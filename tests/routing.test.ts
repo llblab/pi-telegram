@@ -106,7 +106,8 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
     },
     bridgeRuntime,
     activeTurnRuntime,
-    mediaGroupRuntime: Media.createTelegramMediaGroupController<TestMessage>(),
+    mediaGroupRuntime:
+      Media.createTelegramMediaGroupController<TestMessage, TestContext>(),
     telegramQueueStore,
     queueMutationRuntime,
     modelMenuRuntime: Menu.createTelegramModelMenuRuntime<TestModel>(),

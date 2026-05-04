@@ -59,7 +59,8 @@
 - Dispatch must still respect active turns, pending prompt dispatch, unsettled control-item execution, compaction, and pi pending-message state
 - Telegram `/stop` is a queue-reset command: clear pending model-switch state, all queued Telegram items, and aborted-turn history preservation before aborting the active run so the next Telegram message starts from a clean queue.
 - Telegram `reply_to_message` context is prompt-only: preserve raw new-message text/caption for slash-command parsing, then inject quoted text/caption as `[reply]` context only while building or editing queued prompt turns.
-- Long-lived timers, pollers, and ownership watchers must not depend on live pi context objects after session replacement. Snapshot primitive identity such as `cwd` when installing a watcher, stop local timers during session shutdown, and catch stale-context status updates during async cleanup.
+- Long-lived timers, pollers, and ownership watchers must not depend on live pi context objects after session replacement. Snapshot primitive identity such as `cwd` when installing a watcher, stop local timers during session shutdown, and prefer lifecycle-bound context ports over stale-context catch wrappers.
+- Deferred queue dispatch must be session-bound: bind on `session_start`, unbind/cancel on `session_shutdown`, and resolve the current bound context only when the deferred callback fires.
 - Prompt items should remain in the queue until `agent_start` consumes the dispatched turn; removing them earlier breaks active-turn binding, preview delivery, and end-of-turn follow-up behavior
 - In-flight `/model` switching is supported only for Telegram-owned active turns and is implemented as set-model plus synthetic continuation turn plus abort
 - If a tool call is active during in-flight `/model` switching, the abort is delayed until that tool finishes instead of interrupting the tool mid-flight

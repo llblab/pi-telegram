@@ -524,7 +524,7 @@ test("Typing loop starter binds default chat and reports failures", async () => 
   });
   startFailingTypingLoop({ id: "ctx" }, 8);
   await flushMicrotasks();
-  assert.deepEqual(failingStatusErrors, ["typing failed: boom"]);
+  assert.deepEqual(failingStatusErrors, []);
   assert.deepEqual(runtimeEvents, ["typing:boom:8"]);
   assert.equal(runtime.typing.stop(), true);
 });

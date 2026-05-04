@@ -353,7 +353,6 @@ export function createTelegramTypingLoopStarter<TContext>(
           deps.recordRuntimeEvent?.("typing", error, {
             chatId: targetChatId,
           });
-          deps.updateStatus(ctx, `typing failed: ${message}`);
         }
       },
     });

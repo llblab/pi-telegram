@@ -25,6 +25,7 @@ import {
   createTelegramAgentStartHook,
   createTelegramControlItemBuilder,
   createTelegramControlQueueController,
+  createTelegramDeferredQueueDispatchRuntime,
   createTelegramDispatchReadinessChecker,
   createTelegramPromptEnqueueController,
   createTelegramQueueDispatchController,
@@ -935,6 +936,9 @@ test("Agent end hook binds assistant extraction and runtime ports", async () => 
     dispatchNextQueuedTelegramTurn: (ctx) => {
       events.push(`dispatch:${ctx.id}`);
     },
+    requestDeferredDispatchNextQueuedTelegramTurn: (dispatch) => {
+      setTimeout(() => dispatch({ id: "ctx" }), 0);
+    },
     clearPreview: async (chatId) => {
       events.push(`clear:${chatId}`);
     },
@@ -1186,6 +1190,9 @@ test("Agent lifecycle hooks bind start, end, and tool lifecycle ports", async ()
     },
     dispatchNextQueuedTelegramTurn: (ctx) => {
       events.push(`dispatch:${ctx}`);
+    },
+    requestDeferredDispatchNextQueuedTelegramTurn: (dispatch) => {
+      setTimeout(() => dispatch("ctx"), 0);
     },
     clearPreview: async () => {
       events.push("preview:clear");
@@ -1554,6 +1561,9 @@ test("Session state applier syncs start and shutdown state through live stores",
 test("Session runtime helper runs shutdown side effects in order", async () => {
   const events: string[] = [];
   await shutdownTelegramSessionRuntime<string>({
+    unbindDeferredDispatchContext: () => {
+      events.push("unbind");
+    },
     applyState: (state) => {
       events.push(`state:${state.queuedTelegramItems.length}`);
     },
@@ -1578,6 +1588,7 @@ test("Session runtime helper runs shutdown side effects in order", async () => {
     },
   });
   assert.deepEqual(events, [
+    "unbind",
     "state:0",
     "media",
     "menus",
@@ -1788,6 +1799,65 @@ test("Control runtime reports failures before settling", async () => {
     "Telegram control action failed: boom",
     "settled",
   ]);
+});
+
+test("Deferred queue dispatch uses only the bound session context", () => {
+  const events: string[] = [];
+  const callbacks: Array<() => void> = [];
+  const clearedTimers: number[] = [];
+  const runtime = createTelegramDeferredQueueDispatchRuntime<{ id: string }>({
+    setTimer: (callback) => {
+      callbacks.push(callback);
+      return callbacks.length as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimer: (timer) => {
+      clearedTimers.push(timer as unknown as number);
+    },
+  });
+  runtime.request((ctx) => {
+    events.push(`dispatch:${ctx.id}`);
+  });
+  assert.equal(callbacks.length, 0);
+  runtime.bind({ id: "old" });
+  runtime.request((ctx) => {
+    events.push(`dispatch:${ctx.id}`);
+  });
+  runtime.unbind();
+  callbacks[0]?.();
+  runtime.bind({ id: "new" });
+  runtime.request((ctx) => {
+    events.push(`dispatch:${ctx.id}`);
+  });
+  callbacks[1]?.();
+  assert.deepEqual(clearedTimers, [1]);
+  assert.deepEqual(events, ["dispatch:new"]);
+});
+
+test("Dispatch controller skips inactive stale contexts before readiness checks", () => {
+  const events: string[] = [];
+  const controller = createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => {
+      events.push("unexpected:items");
+      return [];
+    },
+    setQueuedItems: () => {
+      events.push("unexpected:set");
+    },
+    canDispatch: () => {
+      events.push("unexpected:can-dispatch");
+      return true;
+    },
+    hasDispatchContext: () => false,
+    updateStatus: () => {
+      events.push("unexpected:status");
+    },
+    sendTextReply: async () => undefined,
+    onPromptDispatchStart: () => {},
+    sendUserMessage: () => {},
+    onPromptDispatchFailure: () => {},
+  });
+  controller.dispatchNext("stale");
+  assert.deepEqual(events, []);
 });
 
 test("Dispatch runtime idles on none and executes control items directly", () => {
@@ -2125,12 +2195,16 @@ test("Session runtime helper runs start side effects in order", async () => {
   const events: string[] = [];
   const currentModel = createQueueTestModel();
   await startTelegramSessionRuntime({
+    ctx: "ctx",
     currentModel,
     loadConfig: async () => {
       events.push("load");
     },
     applyState: (state) => {
       events.push(`state:${state.currentTelegramModel?.id}`);
+    },
+    bindDeferredDispatchContext: (ctx) => {
+      events.push(`bind:${ctx}`);
     },
     prepareTempDir: async () => {
       events.push("temp");
@@ -2139,7 +2213,7 @@ test("Session runtime helper runs start side effects in order", async () => {
       events.push("status");
     },
   });
-  assert.deepEqual(events, ["load", "state:gpt-5", "temp", "status"]);
+  assert.deepEqual(events, ["load", "state:gpt-5", "temp", "bind:ctx", "status"]);
 });
 
 test("Session runtime helper clears shutdown state", () => {
@@ -2181,11 +2255,17 @@ test("Session lifecycle runtime binds state applier into lifecycle hooks", async
     syncFlags: () => {
       events.push("flags");
     },
+    bindDeferredDispatchContext: (ctx) => {
+      events.push(`bind:${ctx}`);
+    },
     prepareTempDir: async () => {
       events.push("temp");
     },
     updateStatus: (ctx) => {
       events.push(`status:${ctx}`);
+    },
+    unbindDeferredDispatchContext: () => {
+      events.push("unbind");
     },
     clearPendingMediaGroups: () => {
       events.push("media:clear");
@@ -2216,7 +2296,9 @@ test("Session lifecycle runtime binds state applier into lifecycle hooks", async
     "counters",
     "flags",
     "temp",
+    "bind:ctx",
     "status:ctx",
+    "unbind",
     "queued:0",
     "counters",
     "flags",
@@ -2244,6 +2326,9 @@ test("Session lifecycle hooks bind start and shutdown runtime ports", async () =
     applySessionStartState: (state) => {
       events.push(`start:${state.currentTelegramModel?.id}`);
     },
+    bindDeferredDispatchContext: (ctx) => {
+      events.push(`bind:${ctx.model?.id ?? "none"}`);
+    },
     prepareTempDir: async () => {
       events.push("temp");
     },
@@ -2252,6 +2337,9 @@ test("Session lifecycle hooks bind start and shutdown runtime ports", async () =
     },
     applySessionShutdownState: (state) => {
       events.push(`shutdown:${state.queuedTelegramItems.length}`);
+    },
+    unbindDeferredDispatchContext: () => {
+      events.push("unbind");
     },
     clearPendingMediaGroups: () => {
       events.push("media");
@@ -2279,7 +2367,9 @@ test("Session lifecycle hooks bind start and shutdown runtime ports", async () =
     "load",
     "start:gpt-5",
     "temp",
+    "bind:gpt-5",
     "status:gpt-5",
+    "unbind",
     "shutdown:0",
     "media",
     "menu",

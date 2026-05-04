@@ -246,13 +246,6 @@ export function createTelegramLockedPollingRuntime<
     clearInterval(ownershipInterval);
     ownershipInterval = undefined;
   };
-  const updateStatusSafely = (ctx: TContext, phase: string) => {
-    try {
-      deps.updateStatus(ctx);
-    } catch (error) {
-      deps.recordRuntimeEvent?.("lock", error, { phase });
-    }
-  };
   const suspendPolling = async () => {
     stopOwnershipWatcher();
     if (ownershipStop) {
@@ -261,7 +254,7 @@ export function createTelegramLockedPollingRuntime<
     }
     await deps.stopPolling();
   };
-  const stopAfterOwnershipLoss = (ctx: TContext) => {
+  const stopAfterOwnershipLoss = () => {
     if (ownershipStop) return;
     stopOwnershipWatcher();
     ownershipStop = deps
@@ -271,7 +264,6 @@ export function createTelegramLockedPollingRuntime<
       )
       .finally(() => {
         ownershipStop = undefined;
-        updateStatusSafely(ctx, "ownership-loss-status");
       });
   };
   const startOwnershipWatcher = (ctx: TContext) => {
@@ -279,7 +271,7 @@ export function createTelegramLockedPollingRuntime<
     stopOwnershipWatcher();
     ownershipInterval = setInterval(() => {
       if (deps.lock.owns(owner)) return;
-      stopAfterOwnershipLoss(ctx);
+      stopAfterOwnershipLoss();
     }, ownershipCheckMs);
     ownershipInterval.unref?.();
   };

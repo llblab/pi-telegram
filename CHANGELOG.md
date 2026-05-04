@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.2: Reload-Stale Queue Dispatch Hotfix
+
+- `[Queue Dispatch]` Deferred post-agent-end queue dispatch is now session-bound and canceled on session shutdown. Impact: `/reload` and session replacement can no longer leave old queue timers calling stale `ExtensionContext` methods such as `ctx.isIdle()`.
+- `[Typing Safety]` Typing-loop transport failures now go only to runtime diagnostics instead of updating status through an interval-captured context. Impact: typing errors remain visible in diagnostics without retaining live `ExtensionContext` in timer error paths.
+- `[Lock Watcher Safety]` Ownership-loss watchers now retain only the snapshotted lock identity and stop polling without a captured live context. Impact: singleton takeover cleanup no longer needs stale-prone status refreshes from watcher callbacks.
+- `[Media Group Safety]` Media-group debounce timers now flush through controller state instead of closure-capturing the inbound context. Impact: album coalescing keeps the same behavior while reducing stale-context retention in timer callbacks.
+
 ## 0.6.1: Outbound Action & Command Timeout Hardening
 
 - `[Command Template Runtime]` Timed-out command templates now escalate from `SIGTERM` to `SIGKILL` when the child process does not exit. Impact: attachment and outbound-handler pipelines no longer hang forever on commands that ignore graceful termination.

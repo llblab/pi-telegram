@@ -59,17 +59,20 @@ export interface TelegramMediaGroupMessage {
   media_group_id?: string;
 }
 
-export interface TelegramMediaGroupState<TMessage> {
+export interface TelegramMediaGroupState<TMessage, TContext = unknown> {
   messages: TMessage[];
+  context?: TContext;
   flushTimer?: ReturnType<typeof setTimeout>;
 }
 
 export interface TelegramMediaGroupController<
   TMessage extends TelegramMediaGroupMessage,
+  TContext = unknown,
 > {
   queueMessage: (options: {
     message: TMessage;
-    dispatchMessages: (messages: TMessage[]) => void;
+    context?: TContext;
+    dispatchMessages: (messages: TMessage[], ctx?: TContext) => void;
   }) => boolean;
   removeMessages: (messageIds: number[]) => number;
   clear: () => void;
@@ -79,7 +82,7 @@ export interface TelegramMediaGroupDispatchRuntimeDeps<
   TMessage extends TelegramMediaGroupMessage,
   TContext,
 > {
-  mediaGroups: TelegramMediaGroupController<TMessage>;
+  mediaGroups: TelegramMediaGroupController<TMessage, TContext>;
   dispatchMessages: (messages: TMessage[], ctx: TContext) => Promise<void>;
 }
 
@@ -249,7 +252,7 @@ export function getTelegramMediaGroupKey(
 export function removePendingTelegramMediaGroupMessages<
   TMessage extends TelegramMediaGroupMessage,
 >(
-  groups: Map<string, TelegramMediaGroupState<TMessage>>,
+  groups: Map<string, TelegramMediaGroupState<TMessage, unknown>>,
   messageIds: number[],
   clearTimer: (timer: ReturnType<typeof setTimeout>) => void,
 ): number {
@@ -273,24 +276,27 @@ export function removePendingTelegramMediaGroupMessages<
 
 export function queueTelegramMediaGroupMessage<
   TMessage extends TelegramMediaGroupMessage,
+  TContext = unknown,
 >(options: {
   message: TMessage;
-  groups: Map<string, TelegramMediaGroupState<TMessage>>;
+  context?: TContext;
+  groups: Map<string, TelegramMediaGroupState<TMessage, TContext>>;
   debounceMs: number;
   setTimer: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
-  dispatchMessages: (messages: TMessage[]) => void;
+  dispatchMessages: (messages: TMessage[], ctx?: TContext) => void;
 }): boolean {
   const key = getTelegramMediaGroupKey(options.message);
   if (!key) return false;
   const existing = options.groups.get(key) ?? { messages: [] };
   existing.messages.push(options.message);
+  existing.context = options.context;
   if (existing.flushTimer) options.clearTimer(existing.flushTimer);
   existing.flushTimer = options.setTimer(() => {
     const state = options.groups.get(key);
     options.groups.delete(key);
     if (!state) return;
-    options.dispatchMessages(state.messages);
+    options.dispatchMessages(state.messages, state.context);
   }, options.debounceMs);
   options.groups.set(key, existing);
   return true;
@@ -298,10 +304,11 @@ export function queueTelegramMediaGroupMessage<
 
 export function createTelegramMediaGroupController<
   TMessage extends TelegramMediaGroupMessage,
+  TContext = unknown,
 >(
   options: TelegramMediaGroupControllerOptions = {},
-): TelegramMediaGroupController<TMessage> {
-  const groups = new Map<string, TelegramMediaGroupState<TMessage>>();
+): TelegramMediaGroupController<TMessage, TContext> {
+  const groups = new Map<string, TelegramMediaGroupState<TMessage, TContext>>();
   const debounceMs = options.debounceMs ?? TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS;
   const setTimer =
     options.setTimer ??
@@ -309,9 +316,10 @@ export function createTelegramMediaGroupController<
       setTimeout(callback, ms));
   const clearTimer = options.clearTimer ?? clearTimeout;
   return {
-    queueMessage: ({ message, dispatchMessages }) =>
+    queueMessage: ({ message, context, dispatchMessages }) =>
       queueTelegramMediaGroupMessage({
         message,
+        context,
         groups,
         debounceMs,
         setTimer,
@@ -339,8 +347,11 @@ export function createTelegramMediaGroupDispatchRuntime<
     handleMessage: async (message, ctx) => {
       const queuedMediaGroup = deps.mediaGroups.queueMessage({
         message,
-        dispatchMessages: (messages) => {
-          void deps.dispatchMessages(messages, ctx);
+        context: ctx,
+        dispatchMessages: (messages, queuedCtx) => {
+          if (queuedCtx !== undefined) {
+            void deps.dispatchMessages(messages, queuedCtx);
+          }
         },
       });
       if (queuedMediaGroup) return;

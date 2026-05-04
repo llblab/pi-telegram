@@ -274,11 +274,14 @@ test("Media group controller owns timers, removal, and cleanup", () => {
 test("Media group dispatch runtime handles immediate and grouped messages", async () => {
   const callbacks: Array<() => void> = [];
   const dispatched: Array<{ ids: number[]; ctx: string }> = [];
-  const controller = createTelegramMediaGroupController<{
-    message_id: number;
-    chat: { id: number };
-    media_group_id?: string;
-  }>({
+  const controller = createTelegramMediaGroupController<
+    {
+      message_id: number;
+      chat: { id: number };
+      media_group_id?: string;
+    },
+    string
+  >({
     setTimer: (callback) => {
       callbacks.push(callback);
       return createTestTimer(callbacks.length);
