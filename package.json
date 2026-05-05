@@ -50,7 +50,7 @@
     "@sinclair/typebox": "*"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "typescript": "latest"
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3"
   }
 }
