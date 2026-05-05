@@ -64,6 +64,18 @@ test("Status bar text renders bridge connection and queue states", () => {
       pollingActive: true,
       paired: true,
       compactionInProgress: false,
+      processing: true,
+      processingStatus: "active",
+      queuedStatus: "",
+    }),
+    "<accent>telegram</accent> <warning>active</warning>",
+  );
+  assert.equal(
+    buildTelegramStatusBarText(theme, {
+      hasBotToken: true,
+      pollingActive: true,
+      paired: true,
+      compactionInProgress: false,
       processing: false,
       queuedStatus: "",
       error: "typing failed",
@@ -277,14 +289,14 @@ test("Status HTML builder binds active model lookup", () => {
   const buildStatusHtml = createTelegramStatusHtmlBuilder({
     getActiveModel: () => model,
   });
-  assert.match(
-    buildStatusHtml({
-      sessionManager: { getEntries: () => [] },
-      getContextUsage: () => ({ percent: 0, contextWindow: undefined }),
-      modelRegistry: { isUsingOAuth: () => false },
-    }),
-    /Context.*0\.0%\/1\.0k/s,
-  );
+  const html = buildStatusHtml({
+    sessionManager: { getEntries: () => [] },
+    getContextUsage: () => ({ percent: 0, contextWindow: undefined }),
+    isIdle: () => true,
+    modelRegistry: { isUsingOAuth: () => false },
+  });
+  assert.match(html, /Status.*idle/s);
+  assert.match(html, /Context.*0\.0%\/1\.0k/s);
 });
 
 test("Runtime event lines render the recent-event ring newest first", () => {

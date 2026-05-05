@@ -1,5 +1,6 @@
 /**
  * pi SDK adapter boundary
+ * Zones: pi agent sdk boundary, shared adapters
  * Owns direct pi SDK imports and exposes narrow bridge-facing helpers/types for the extension composition layer
  */
 
@@ -12,6 +13,7 @@ import {
   type ExtensionContext,
   type SessionShutdownEvent,
   type SessionStartEvent,
+  type SlashCommandInfo,
   SettingsManager,
 } from "@mariozechner/pi-coding-agent";
 
@@ -24,6 +26,7 @@ export type {
   ExtensionContext,
   SessionShutdownEvent,
   SessionStartEvent,
+  SlashCommandInfo,
 };
 
 export interface PiSettingsManager {
@@ -31,9 +34,12 @@ export interface PiSettingsManager {
   getEnabledModels: () => string[] | undefined;
 }
 
+export type PiSlashCommandInfo = SlashCommandInfo;
+
 export interface PiExtensionApiRuntimePorts {
   sendUserMessage: ExtensionAPI["sendUserMessage"];
   exec: ExtensionAPI["exec"];
+  getCommands: ExtensionAPI["getCommands"];
   getThinkingLevel: ExtensionAPI["getThinkingLevel"];
   setThinkingLevel: ExtensionAPI["setThinkingLevel"];
   setModel: ExtensionAPI["setModel"];
@@ -44,6 +50,7 @@ export function createExtensionApiRuntimePorts(
     ExtensionAPI,
     | "sendUserMessage"
     | "exec"
+    | "getCommands"
     | "getThinkingLevel"
     | "setThinkingLevel"
     | "setModel"
@@ -52,6 +59,7 @@ export function createExtensionApiRuntimePorts(
   return {
     sendUserMessage: (content) => api.sendUserMessage(content),
     exec: (command, args, options) => api.exec(command, args, options),
+    getCommands: () => api.getCommands(),
     getThinkingLevel: () => api.getThinkingLevel(),
     setThinkingLevel: (level) => api.setThinkingLevel(level),
     setModel: (model) => api.setModel(model),

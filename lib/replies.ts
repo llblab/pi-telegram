@@ -1,5 +1,6 @@
 /**
  * Telegram reply delivery helpers
+ * Zones: telegram outbound, rendering transport
  * Owns rendered-message delivery, reply transport wiring, and plain or markdown final replies
  */
 
@@ -10,10 +11,48 @@ import {
   type TelegramRenderMode,
 } from "./rendering.ts";
 
+// --- Reply Dedup ---
+
+/** Non-persistent reply deduplication for a single agent turn.
+ *  First reply to a prompt gets `reply_parameters.reply_to_message_id`;
+ *  subsequent replies in the same turn skip it to avoid stacking
+ *  duplicate reply headers in the chat viewport. */
+export interface ReplyDedupRuntime {
+  /** Returns true if this is the first reply for the given prompt
+   *  message id in the current turn. Side-effect: marks it replied. */
+  shouldReply(promptMessageId: number): boolean;
+  /** Reset the tracker when a new prompt enters the queue. */
+  reset(): void;
+}
+
+export function createReplyDedupRuntime(): ReplyDedupRuntime {
+  const replied = new Map<number, boolean>();
+  return {
+    shouldReply(promptMessageId: number): boolean {
+      if (replied.has(promptMessageId)) return false;
+      replied.set(promptMessageId, true);
+      return true;
+    },
+    reset(): void {
+      replied.clear();
+    },
+  };
+}
+
+// --- Transport-level dedup ---
+
+let lastRepliedToMessageId: number | undefined;
+
+export function resetTransportReplyDedup(): void {
+  lastRepliedToMessageId = undefined;
+}
+
 export function buildTelegramReplyParameters(
   messageId: number | undefined,
 ): TelegramReplyParameters | undefined {
   if (messageId === undefined) return undefined;
+  if (messageId === lastRepliedToMessageId) return undefined;
+  lastRepliedToMessageId = messageId;
   return { message_id: messageId, allow_sending_without_reply: true };
 }
 
@@ -219,13 +258,13 @@ export interface TelegramRenderedMessageRuntimeDeps<TReplyMarkup> {
 export interface TelegramRenderedMessageRuntime<TReplyMarkup> {
   sendTextReply: (
     chatId: number,
-    replyToMessageId: number,
+    replyToMessageId: number | undefined,
     text: string,
     options?: { parseMode?: "HTML" },
   ) => Promise<number | undefined>;
   sendMarkdownReply: (
     chatId: number,
-    replyToMessageId: number,
+    replyToMessageId: number | undefined,
     markdown: string,
     options?: { replyMarkup?: unknown },
   ) => Promise<number | undefined>;
@@ -330,5 +369,50 @@ export function createTelegramRenderedMessageRuntime<TReplyMarkup>(
         { replyMarkup },
       );
     },
+  };
+}
+
+// --- Dedup-wrapped Reply Wrappers ---
+
+/** Wrap a sendTextReply with reply dedup so only the first message
+ *  in a turn carries `reply_to_message_id`. */
+export function dedupSendTextReply(
+  dedup: ReplyDedupRuntime,
+  inner: (
+    chatId: number,
+    replyToMessageId: number | undefined,
+    text: string,
+    options?: { parseMode?: "HTML" },
+  ) => Promise<number | undefined>,
+): (
+  chatId: number,
+  replyToMessageId: number,
+  text: string,
+  options?: { parseMode?: "HTML" },
+) => Promise<number | undefined> {
+  return async (chatId, replyToMessageId, text, options) => {
+    const effectiveReplyTo = dedup.shouldReply(replyToMessageId) ? replyToMessageId : undefined;
+    return inner(chatId, effectiveReplyTo, text, options);
+  };
+}
+
+/** Wrap a sendMarkdownReply with reply dedup. */
+export function dedupSendMarkdownReply<TReplyMarkup = unknown>(
+  dedup: ReplyDedupRuntime,
+  inner: (
+    chatId: number,
+    replyToMessageId: number | undefined,
+    markdown: string,
+    options?: { replyMarkup?: TReplyMarkup },
+  ) => Promise<number | undefined>,
+): (
+  chatId: number,
+  replyToMessageId: number,
+  markdown: string,
+  options?: { replyMarkup?: TReplyMarkup },
+) => Promise<number | undefined> {
+  return async (chatId, replyToMessageId, markdown, options) => {
+    const effectiveReplyTo = dedup.shouldReply(replyToMessageId) ? replyToMessageId : undefined;
+    return inner(chatId, effectiveReplyTo, markdown, options);
   };
 }

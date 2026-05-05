@@ -1,5 +1,6 @@
 /**
  * Telegram inbound attachment handler pipeline
+ * Zones: telegram inbound, command templates, prompt preparation
  * Owns MIME/type matching, command-template execution, fallback handling, and prompt injection before prompt enqueueing
  */
 
@@ -299,6 +300,7 @@ async function executeTelegramAttachmentHandlerInvocation(
   const result = await deps.execCommand(invocation.command, invocation.args, {
     cwd,
     timeout,
+    ...(typeof handler === "object" && handler.retry !== undefined ? { retry: handler.retry } : {}),
     ...(stdin !== undefined ? { stdin } : {}),
   });
   if (result.code !== 0)
@@ -342,15 +344,20 @@ async function executeTelegramAttachmentHandler(
   const startedAt = Date.now();
   let output = "";
   for (const [index, step] of steps.entries()) {
-    output = await executeTelegramAttachmentHandlerInvocation(
-      step,
-      file,
-      cwd,
-      deps,
-      false,
-      getTelegramAttachmentCompositionStepTimeout(handler, step, startedAt),
-      index === 0 ? undefined : output,
-    );
+    try {
+      output = await executeTelegramAttachmentHandlerInvocation(
+        step,
+        file,
+        cwd,
+        deps,
+        false,
+        getTelegramAttachmentCompositionStepTimeout(handler, step, startedAt),
+        index === 0 ? undefined : output,
+      );
+    } catch (error) {
+      if (typeof step === "object" && step.critical) throw error;
+      output = "";
+    }
   }
   return output.trim();
 }

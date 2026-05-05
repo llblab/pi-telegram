@@ -1,5 +1,6 @@
 /**
  * Telegram turn-building helpers
+ * Zones: telegram inbound, pi agent prompt content, queue
  * Owns prompt-turn summary and content construction so queued Telegram turns are assembled consistently
  */
 

@@ -538,7 +538,7 @@ test("Queued status formatting marks priority prompts in the pi status bar", () 
       priorityPrompt,
       defaultPrompt,
     ]),
-    " +3: [⚡ status, ⬆ prompt, default]",
+    " +3: [⚡ status, ⚡ prompt, default]",
   );
 });
 

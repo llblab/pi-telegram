@@ -1,5 +1,6 @@
 /**
  * Telegram prompt injection helpers
+ * Zones: pi agent prompts, telegram guidance
  * Owns Telegram-specific system prompt suffixes injected into pi agent turns
  */
 

@@ -1,5 +1,6 @@
 /**
  * Telegram bridge runtime-state helpers
+ * Zones: pi agent runtime state, telegram session, shared coordination
  * Owns small session-local runtime primitives that are shared by orchestration but are not specific to queueing, rendering, polling, or Telegram transport
  */
 
@@ -350,6 +351,7 @@ export function createTelegramTypingLoopStarter<TContext>(
         } catch (error) {
           const message =
             error instanceof Error ? error.message : String(error);
+          deps.updateStatus(ctx, message);
           deps.recordRuntimeEvent?.("typing", error, {
             chatId: targetChatId,
           });

@@ -1,6 +1,7 @@
 /**
- * Telegram queue and queue-runtime domain helpers
- * Owns queue items, queue mutations, dispatch and lifecycle planning, session resets, and queue-adjacent runtime helpers
+ * Telegram queue core contracts and pure planning helpers
+ * Zones: telegram queue, pi agent lifecycle, scheduling
+ * Owns queue item contracts, lane admission, pure queue mutations, and dispatch planning
  */
 
 // --- Queue Items ---
@@ -178,6 +179,14 @@ export function createTelegramQueueStore<TContext = unknown>(
   };
 }
 
+export function createTelegramQueueItemCountGetter<TContext = unknown>(
+  store: Pick<TelegramQueueStore<TContext>, "getQueuedItems">,
+): () => number {
+  return function getTelegramQueueItemCount() {
+    return store.getQueuedItems().length;
+  };
+}
+
 export function createTelegramActiveTurnStore<
   TTurn extends PendingTelegramTurn = PendingTelegramTurn,
 >(): TelegramActiveTurnStore<TTurn> {
@@ -344,7 +353,7 @@ function formatTelegramQueueItemStatusSummary<TContext = unknown>(
   item: TelegramQueueItem<TContext>,
 ): string {
   if (item.queueLane === "priority") {
-    return `⬆ ${item.statusSummary}`;
+    return `⚡ ${item.statusSummary}`;
   }
   return item.statusSummary;
 }
@@ -665,18 +674,32 @@ export type TelegramAgentLifecycleHooksRuntimeDeps<
   TTurn extends PendingTelegramTurn,
   TContext,
   TMessage,
+  TReplyMarkup = unknown,
 > = TelegramAgentStartHookRuntimeDeps<TTurn, TContext> &
-  TelegramAgentEndHookRuntimeDeps<TTurn, TContext, TMessage> &
+  TelegramAgentEndHookRuntimeDeps<TTurn, TContext, TMessage, TReplyMarkup> &
   TelegramToolExecutionHookRuntimeDeps<TContext>;
 
 export function createTelegramAgentLifecycleHooks<
   TTurn extends PendingTelegramTurn,
   TContext,
   TMessage,
->(deps: TelegramAgentLifecycleHooksRuntimeDeps<TTurn, TContext, TMessage>) {
+  TReplyMarkup = unknown,
+>(
+  deps: TelegramAgentLifecycleHooksRuntimeDeps<
+    TTurn,
+    TContext,
+    TMessage,
+    TReplyMarkup
+  >,
+) {
   return {
     onAgentStart: createTelegramAgentStartHook<TTurn, TContext>(deps),
-    onAgentEnd: createTelegramAgentEndHook<TTurn, TContext, TMessage>(deps),
+    onAgentEnd: createTelegramAgentEndHook<
+      TTurn,
+      TContext,
+      TMessage,
+      TReplyMarkup
+    >(deps),
     ...createTelegramToolExecutionHooks<TContext>(deps),
   };
 }
@@ -737,6 +760,7 @@ export interface TelegramAgentEndOutboundReplyPlan<TReplyMarkup = unknown> {
 
 export interface TelegramAgentEndRuntimeDeps<
   TTurn extends PendingTelegramTurn,
+  TReplyMarkup = unknown,
 > {
   turn: TTurn | undefined;
   assistant: TelegramAgentEndAssistantResult;
@@ -750,13 +774,13 @@ export interface TelegramAgentEndRuntimeDeps<
     chatId: number,
     markdown: string,
     replyToMessageId: number,
-    options?: { replyMarkup?: unknown },
+    options?: { replyMarkup?: TReplyMarkup },
   ) => Promise<boolean>;
   sendMarkdownReply: (
     chatId: number,
     replyToMessageId: number,
     markdown: string,
-    options?: { replyMarkup?: unknown },
+    options?: { replyMarkup?: TReplyMarkup },
   ) => Promise<unknown>;
   sendTextReply: (
     chatId: number,
@@ -764,7 +788,9 @@ export interface TelegramAgentEndRuntimeDeps<
     text: string,
   ) => Promise<unknown>;
   sendQueuedAttachments: (turn: TTurn) => Promise<void>;
-  planOutboundReply?: (markdown: string) => TelegramAgentEndOutboundReplyPlan;
+  planOutboundReply?: (
+    markdown: string,
+  ) => TelegramAgentEndOutboundReplyPlan<TReplyMarkup>;
   sendOutboundReplyArtifacts?: (
     turn: TTurn,
     plan: TelegramAgentEndOutboundReplyPlan,
@@ -776,6 +802,7 @@ export interface TelegramAgentEndHookRuntimeDeps<
   TTurn extends PendingTelegramTurn,
   TContext,
   TMessage,
+  TReplyMarkup = unknown,
 > {
   getActiveTurn: () => TTurn | undefined;
   extractAssistant: (
@@ -790,11 +817,11 @@ export interface TelegramAgentEndHookRuntimeDeps<
   ) => void;
   clearPreview: (chatId: number) => Promise<void>;
   setPreviewPendingText: (text: string) => void;
-  finalizeMarkdownPreview: TelegramAgentEndRuntimeDeps<TTurn>["finalizeMarkdownPreview"];
-  sendMarkdownReply: TelegramAgentEndRuntimeDeps<TTurn>["sendMarkdownReply"];
+  finalizeMarkdownPreview: TelegramAgentEndRuntimeDeps<TTurn, TReplyMarkup>["finalizeMarkdownPreview"];
+  sendMarkdownReply: TelegramAgentEndRuntimeDeps<TTurn, TReplyMarkup>["sendMarkdownReply"];
   sendTextReply: TelegramAgentEndRuntimeDeps<TTurn>["sendTextReply"];
   sendQueuedAttachments: (turn: TTurn) => Promise<void>;
-  planOutboundReply?: TelegramAgentEndRuntimeDeps<TTurn>["planOutboundReply"];
+  planOutboundReply?: TelegramAgentEndRuntimeDeps<TTurn, TReplyMarkup>["planOutboundReply"];
   sendOutboundReplyArtifacts?: TelegramAgentEndRuntimeDeps<TTurn>["sendOutboundReplyArtifacts"];
 }
 
@@ -872,7 +899,15 @@ export function createTelegramAgentEndHook<
   TTurn extends PendingTelegramTurn,
   TContext,
   TMessage,
->(deps: TelegramAgentEndHookRuntimeDeps<TTurn, TContext, TMessage>) {
+  TReplyMarkup = unknown,
+>(
+  deps: TelegramAgentEndHookRuntimeDeps<
+    TTurn,
+    TContext,
+    TMessage,
+    TReplyMarkup
+  >,
+) {
   return async function onAgentEnd(
     event: TelegramAgentEndHookEvent<TMessage>,
     ctx: TContext,
@@ -903,7 +938,8 @@ export function createTelegramAgentEndHook<
 
 export async function handleTelegramAgentEndRuntime<
   TTurn extends PendingTelegramTurn,
->(deps: TelegramAgentEndRuntimeDeps<TTurn>): Promise<void> {
+  TReplyMarkup = unknown,
+>(deps: TelegramAgentEndRuntimeDeps<TTurn, TReplyMarkup>): Promise<void> {
   const { turn, assistant } = deps;
   const rawFinalText = assistant.text;
   const outboundReply = rawFinalText
@@ -934,7 +970,7 @@ export async function handleTelegramAgentEndRuntime<
       turn.chatId,
       turn.replyToMessageId,
       assistant.errorMessage ||
-        "Telegram bridge: pi failed while processing the request.",
+        "Telegram bridge: π failed while processing the request.",
     );
     if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
     return;

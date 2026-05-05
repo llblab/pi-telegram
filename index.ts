@@ -1,5 +1,6 @@
 /**
  * Telegram bridge extension entrypoint and orchestration layer
+ * Zones: telegram, pi agent, orchestration
  * Keeps the runtime wiring in one place while delegating reusable domain logic to /lib modules
  */
 
@@ -9,14 +10,17 @@ import * as Attachments from "./lib/attachments.ts";
 import * as Commands from "./lib/commands.ts";
 import * as CommandTemplates from "./lib/command-templates.ts";
 import * as Config from "./lib/config.ts";
+import * as Keyboard from "./lib/keyboard.ts";
 import * as Lifecycle from "./lib/lifecycle.ts";
 import * as Locks from "./lib/locks.ts";
 import * as Media from "./lib/media.ts";
 import * as Menu from "./lib/menu.ts";
+import * as MenuQueue from "./lib/menu-queue.ts";
 import * as Model from "./lib/model.ts";
 import * as Pi from "./lib/pi.ts";
 import * as Polling from "./lib/polling.ts";
 import * as Preview from "./lib/preview.ts";
+import * as PromptTemplates from "./lib/prompt-templates.ts";
 import * as Prompts from "./lib/prompts.ts";
 import * as Queue from "./lib/queue.ts";
 import * as Replies from "./lib/replies.ts";
@@ -33,8 +37,13 @@ type RuntimeTelegramQueueItem = Queue.TelegramQueueItem<Pi.ExtensionContext>;
 
 export default function (pi: Pi.ExtensionAPI) {
   const piRuntime = Pi.createExtensionApiRuntimePorts(pi);
-  const { getThinkingLevel, sendUserMessage, setModel, setThinkingLevel } =
-    piRuntime;
+  const {
+    getCommands,
+    getThinkingLevel,
+    sendUserMessage,
+    setModel,
+    setThinkingLevel,
+  } = piRuntime;
   const bridgeRuntime = Runtime.createTelegramBridgeRuntime();
   const { abort, lifecycle, queue, setup, typing } = bridgeRuntime;
   const configStore = Config.createTelegramConfigStore();
@@ -150,7 +159,7 @@ export default function (pi: Pi.ExtensionAPI) {
     editInteractiveMessage,
     sendInteractiveMessage,
   } =
-    Replies.createTelegramRenderedMessageDeliveryRuntime<Menu.TelegramReplyMarkup>(
+    Replies.createTelegramRenderedMessageDeliveryRuntime<Keyboard.TelegramInlineKeyboardMarkup>(
       {
         sendMessage,
         editMessage: editTelegramMessageText,
@@ -171,7 +180,10 @@ export default function (pi: Pi.ExtensionAPI) {
       ...promptDispatchRuntime,
       sendUserMessage,
     }).dispatchNext;
-  const previewRuntime = Preview.createTelegramAssistantPreviewRuntime({
+  const previewRuntime = Preview.createTelegramAssistantPreviewRuntime<
+    unknown,
+    Keyboard.TelegramInlineKeyboardMarkup
+  >({
     getActiveTurn: activeTurnRuntime.get,
     isAssistantMessage: Replies.isAssistantAgentMessage,
     getMessageText: Replies.getAgentMessageText,
@@ -201,6 +213,14 @@ export default function (pi: Pi.ExtensionAPI) {
       appendQueuedItem: queueMutationRuntime.append,
       updateStatus,
     });
+  const getQueueItemCount = Queue.createTelegramQueueItemCountGetter(
+    telegramQueueStore,
+  );
+  const getPromptTemplateCommands =
+    PromptTemplates.createTelegramPromptTemplateCommandGetter({
+      getCommands,
+      reservedCommandNames: Commands.TELEGRAM_RESERVED_COMMAND_NAMES,
+    });
   const menuActions = Menu.createTelegramMenuActionRuntimeWithStateBuilder<
     ActivePiModel,
     Pi.ExtensionContext
@@ -209,8 +229,12 @@ export default function (pi: Pi.ExtensionAPI) {
     createSettingsManager: Pi.createSettingsManager,
     getActiveModel: currentModelRuntime.get,
     getThinkingLevel,
-    buildStatusHtml: Status.createTelegramStatusHtmlBuilder({
-      getActiveModel: currentModelRuntime.get,
+    getQueueItemCount,
+    buildStatusHtml: Commands.createTelegramAppMenuHtmlBuilder({
+      buildStatusHtml: Status.createTelegramStatusHtmlBuilder({
+        getActiveModel: currentModelRuntime.get,
+      }),
+      getPromptTemplateCommands,
     }),
     storeModelMenuState: modelMenuRuntime.storeState,
     isIdle,
@@ -218,6 +242,26 @@ export default function (pi: Pi.ExtensionAPI) {
     sendTextReply,
     editInteractiveMessage,
     sendInteractiveMessage,
+  });
+
+  // --- Queue Menu ---
+
+  const getQueueMenuState = Menu.createTelegramModelMenuStateBuilder({
+    runtime: modelMenuRuntime,
+    createSettingsManager: Pi.createSettingsManager,
+    getActiveModel: currentModelRuntime.get,
+  });
+  const queueMenuRuntime = MenuQueue.createTelegramQueueMenuRuntime({
+    telegramQueueStore,
+    queueMutationRuntime,
+    sendInteractiveMessage,
+    editInteractiveMessage,
+    answerCallbackQuery,
+    getModelMenuState: getQueueMenuState,
+    getStoredModelMenuState: modelMenuRuntime.getState,
+    storeModelMenuState: modelMenuRuntime.storeState,
+    updateStatusMessage: menuActions.updateStatusMessage,
+    updateStatus,
   });
 
   // --- Polling ---
@@ -239,6 +283,8 @@ export default function (pi: Pi.ExtensionAPI) {
     currentModelRuntime,
     modelSwitchController,
     menuActions,
+    openQueueMenu: queueMenuRuntime.openQueueMenu,
+    queueMenuCallbackHandler: queueMenuRuntime.handleCallbackQuery,
     buttonActionStore,
     attachmentHandlerRuntime,
     updateStatus,
@@ -246,6 +292,7 @@ export default function (pi: Pi.ExtensionAPI) {
     answerCallbackQuery,
     sendTextReply,
     setMyCommands,
+    getCommands,
     downloadFile: downloadTelegramBridgeFile,
     getThinkingLevel,
     setThinkingLevel,
@@ -363,7 +410,8 @@ export default function (pi: Pi.ExtensionAPI) {
   const agentLifecycleHooks = Queue.createTelegramAgentLifecycleHooks<
     Queue.PendingTelegramTurn,
     Pi.ExtensionContext,
-    unknown
+    unknown,
+    Keyboard.TelegramInlineKeyboardMarkup
   >({
     setAbortHandler: Runtime.createTelegramContextAbortHandlerSetter(abort),
     getQueuedItems: telegramQueueStore.getQueuedItems,
@@ -396,9 +444,13 @@ export default function (pi: Pi.ExtensionAPI) {
     setActiveToolExecutions: lifecycle.setActiveToolExecutions,
     triggerPendingModelSwitchAbort: modelSwitchController.triggerPendingAbort,
   });
+  // Wire transport-level reply dedup reset via lifecycle
+  Lifecycle.setResetTransportReplyDedup(Replies.resetTransportReplyDedup);
+  const agentStartWithDedupReset = Lifecycle.createAgentStartDedupHook(agentLifecycleHooks.onAgentStart);
   Lifecycle.registerTelegramLifecycleHooks(pi, {
     ...sessionLifecycleRuntime,
     ...agentLifecycleHooks,
+    onAgentStart: agentStartWithDedupReset,
     onBeforeAgentStart: Prompts.createTelegramBeforeAgentStartHook(),
     onModelSelect: currentModelRuntime.onModelSelect,
     onMessageStart: previewRuntime.onMessageStart,

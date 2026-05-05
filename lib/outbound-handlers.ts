@@ -1,5 +1,6 @@
 /**
  * Telegram outbound handler helpers
+ * Zones: telegram outbound, assistant markup, command templates, callback routing
  * Owns assistant-authored outbound markup extraction, configured artifact generation, callback actions, and Telegram outbound delivery
  */
 
@@ -8,6 +9,7 @@ import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
+import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
 import type { PendingTelegramTurn } from "./queue.ts";
 import { buildTelegramMultipartReplyParameters } from "./replies.ts";
 import { truncateTelegramQueueSummary } from "./turns.ts";
@@ -52,6 +54,7 @@ export interface TelegramVoiceExecOptions {
   timeout?: number;
   signal?: AbortSignal;
   stdin?: string;
+  retry?: number;
 }
 
 export interface TelegramVoiceExecResult {
@@ -473,6 +476,7 @@ async function runVoiceReplyCommand(
     {
       cwd: options.cwd,
       timeout: options.timeout,
+      ...(typeof config === "object" && config.retry !== undefined ? { retry: config.retry } : {}),
       ...(options.stdin !== undefined ? { stdin: options.stdin } : {}),
     },
   );
@@ -597,22 +601,27 @@ async function generateTelegramVoiceReplyFileWithHandler(
     const startedAt = Date.now();
     let stdout = "";
     for (const [index, step] of steps.entries()) {
-      const result = await runVoiceReplyCommand(
-        `Outbound voice template step ${index + 1}`,
-        step,
-        values,
-        {
-          cwd: options.cwd,
-          timeout: getVoiceReplyCompositionStepTimeout(
-            options.timeout,
-            step,
-            startedAt,
-          ),
-          execCommand: options.execCommand,
-          ...(index === 0 ? {} : { stdin: stdout }),
-        },
-      );
-      stdout = result.stdout;
+      try {
+        const result = await runVoiceReplyCommand(
+          `Outbound voice template step ${index + 1}`,
+          step,
+          values,
+          {
+            cwd: options.cwd,
+            timeout: getVoiceReplyCompositionStepTimeout(
+              options.timeout,
+              step,
+              startedAt,
+            ),
+            execCommand: options.execCommand,
+            ...(index === 0 ? {} : { stdin: stdout }),
+          },
+        );
+        stdout = result.stdout;
+      } catch (error) {
+        if (typeof step === "object" && step.critical) throw error;
+        stdout = "";
+      }
     }
     return getVoiceReplyOutputPath(options.handler, values, stdout);
   }
@@ -722,9 +731,7 @@ export interface TelegramOutboundButtonStoredAction extends TelegramOutboundButt
   createdAt: number;
 }
 
-export interface TelegramOutboundButtonMarkup {
-  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
-}
+export type TelegramOutboundButtonMarkup = TelegramInlineKeyboardMarkup;
 
 export interface TelegramButtonReplyPlan {
   markdown: string;

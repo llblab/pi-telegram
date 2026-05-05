@@ -6,6 +6,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { resetTransportReplyDedup } from "../lib/replies.ts";
+
+test.beforeEach(() => resetTransportReplyDedup());
+
 import {
   createTelegramButtonActionStore,
   createTelegramButtonPromptTurn,
@@ -844,4 +848,101 @@ test("Voice reply sender uploads generated ogg via sendVoice", async () => {
       fileName: "voice.ogg",
     },
   ]);
+});
+
+// --- Critical-step composition tests ---
+
+test("Voice reply composition: non-critical failure continues to next step", async () => {
+  const calls: string[] = [];
+  const path = await generateTelegramVoiceReplyFile("hello", {
+    handler: {
+      type: "voice",
+      template: [
+        "preprocess {text}",
+        "synthesize {text}",
+      ],
+    },
+    execCommand: async (command) => {
+      calls.push(command);
+      if (command === "preprocess")
+        return { stdout: "", stderr: "skip", code: 1, killed: false };
+      return { stdout: "/tmp/out.ogg\n", stderr: "", code: 0, killed: false };
+    },
+  });
+  assert.equal(path, "/tmp/out.ogg");
+  assert.deepEqual(calls, ["preprocess", "synthesize"]);
+});
+
+test("Voice reply composition: critical failure aborts composition", async () => {
+  const calls: string[] = [];
+  let caught: Error | undefined;
+  try {
+    await generateTelegramVoiceReplyFile("hello", {
+      handler: {
+        type: "voice",
+        template: [
+          { template: "preprocess {text}", critical: true },
+          "synthesize {text}",
+          "finalize {text}",
+        ],
+      },
+      execCommand: async (command) => {
+        calls.push(command);
+        if (command === "preprocess")
+          return { stdout: "", stderr: "fatal", code: 1, killed: false };
+        return { stdout: "/tmp/ok.ogg\n", stderr: "", code: 0, killed: false };
+      },
+    });
+  } catch (e) {
+    caught = e as Error;
+  }
+  assert.ok(caught);
+  assert.ok(caught.message.includes("code 1"));
+  assert.deepEqual(calls, ["preprocess"]);
+});
+
+// --- Combined profile: CI-like pipeline (composition + retry + critical) ---
+
+test("Voice reply composition: full CI-like pipeline with retry and critical", async () => {
+  let testCalls = 0;
+  const execOnce = async () => {
+    testCalls++;
+    return { stdout: "", stderr: "flake", code: 1, killed: false };
+  };
+  let caught: Error | undefined;
+  try {
+    await generateTelegramVoiceReplyFile("ship", {
+      handler: {
+        type: "voice",
+        template: [
+          { template: "build", critical: true },
+          "lint",
+          { template: "test --suite {text}", critical: true, retry: 2 },
+          { template: "deploy", critical: true },
+        ],
+      },
+      execCommand: async (command, _args, options) => {
+        if (command === "build")
+          return { stdout: "built\n", stderr: "", code: 0, killed: false };
+        if (command === "lint")
+          return { stdout: "", stderr: "warnings", code: 1, killed: false };
+        if (command === "test") {
+          const max = options?.retry ?? 1;
+          for (let i = 0; i < max; i++) {
+            const result = await execOnce();
+            if (result.code === 0) return result;
+          }
+          return { stdout: "", stderr: "all retries exhausted", code: 1, killed: false };
+        }
+        return { stdout: "/tmp/shipped.ogg\n", stderr: "", code: 0, killed: false };
+      },
+    });
+  } catch (e) {
+    caught = e as Error;
+  }
+  // build (critical, succeeds) → lint (non-critical, fails, continues) →
+  // test (critical, retry=2, both fail → abort) → deploy unreached
+  assert.ok(caught);
+  assert.ok(caught.message.includes("Outbound voice template step"));
+  assert.equal(testCalls, 2);
 });

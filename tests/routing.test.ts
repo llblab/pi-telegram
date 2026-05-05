@@ -91,6 +91,9 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
     openModelMenu: async () => {
       events.push("model-menu");
     },
+    openThinkingMenu: async () => {
+      events.push("thinking-menu");
+    },
   };
   const routeRuntime = Routing.createTelegramInboundRouteRuntime<
     TestUpdate,
@@ -114,6 +117,8 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
     currentModelRuntime,
     modelSwitchController,
     menuActions,
+    openQueueMenu: async () => undefined,
+    queueMenuCallbackHandler: async () => false,
     attachmentHandlerRuntime: {
       process: async (files, rawText) => ({
         rawText,
@@ -127,6 +132,7 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
     answerCallbackQuery: async () => undefined,
     sendTextReply: async () => undefined,
     setMyCommands: async () => undefined,
+    getCommands: () => [],
     downloadFile: async (_fileId, fileName) => `/tmp/${fileName}`,
     getThinkingLevel: () => "high",
     setThinkingLevel: () => undefined,
@@ -154,4 +160,23 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
     "[telegram] hello from telegram",
   );
   assert.deepEqual(events, ["status", "dispatch"]);
+  await routeRuntime.handleUpdate(
+    {
+      message: {
+        message_id: 12,
+        chat: { id: 100, type: "private" },
+        from: { id: 7, is_bot: false },
+        text: "/continue",
+      },
+    },
+    { cwd: "/repo" },
+  );
+  const [continueTurn] = telegramQueueStore.getQueuedItems();
+  assert.equal(continueTurn?.kind, "prompt");
+  assert.equal(continueTurn?.queueLane, "priority");
+  assert.equal(continueTurn?.statusSummary, "continue");
+  assert.equal(
+    continueTurn?.content[0]?.type === "text" ? continueTurn.content[0].text : "",
+    "[telegram] continue",
+  );
 });

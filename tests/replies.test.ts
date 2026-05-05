@@ -6,18 +6,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+// Transport-level dedup is module-global; reset between tests.
+test.beforeEach(() => {
+  resetTransportReplyDedup();
+});
+
 import {
   buildTelegramReplyTransport,
+  createReplyDedupRuntime,
   createTelegramRenderedMessageDeliveryRuntime,
   createTelegramRenderedMessageRuntime,
+  dedupSendTextReply,
   editTelegramRenderedMessage,
   extractLatestAssistantMessageText,
   getAgentMessageText,
   isAssistantAgentMessage,
+  resetTransportReplyDedup,
   sendTelegramMarkdownReply,
   sendTelegramPlainReply,
   sendTelegramRenderedChunks,
 } from "../lib/replies.ts";
+import { createDedupAgentStartHook } from "../lib/lifecycle.ts";
 
 test("Reply helpers extract assistant message text and metadata", () => {
   const messages = [
@@ -259,4 +268,45 @@ test("Reply runtime falls back to plain delivery when markdown rendering yields 
   });
   assert.equal(messageId, 9);
   assert.deepEqual(calls, ["plain"]);
+});
+
+test("Reply dedup tracks first reply per prompt message id and resets", () => {
+  const dedup = createReplyDedupRuntime();
+  assert.equal(dedup.shouldReply(42), true);
+  assert.equal(dedup.shouldReply(42), false);
+  assert.equal(dedup.shouldReply(99), true);
+  dedup.reset();
+  assert.equal(dedup.shouldReply(42), true);
+});
+
+test("Dedup wrapper suppresses reply_to_message_id after the first message in a turn", async () => {
+  const dedup = createReplyDedupRuntime();
+  const passedReplyIds: Array<number | undefined> = [];
+  const inner = async (
+    _chatId: number,
+    replyToMessageId: number | undefined,
+  ) => {
+    passedReplyIds.push(replyToMessageId);
+    return 1;
+  };
+  const wrapped = dedupSendTextReply(dedup, inner);
+  await wrapped(7, 42, "first");
+  await wrapped(7, 42, "second");
+  await wrapped(7, 99, "other");
+  assert.deepEqual(passedReplyIds, [42, undefined, 99]);
+});
+
+test("Dedup reset fires on agent_start through lifecycle hook", async () => {
+  const dedup = createReplyDedupRuntime();
+  dedup.shouldReply(42); // marks replied
+  let agentStartCalled = false;
+  const hook = createDedupAgentStartHook(dedup, async () => {
+    agentStartCalled = true;
+  });
+  await hook(
+    {} as Parameters<typeof hook>[0],
+    {} as Parameters<typeof hook>[1],
+  );
+  assert.equal(agentStartCalled, true);
+  assert.equal(dedup.shouldReply(42), true, "reset clears previous reply state");
 });

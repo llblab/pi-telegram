@@ -2,18 +2,18 @@
 
 ## Overview
 
-`pi-telegram` is a session-local pi extension that binds one Telegram DM to one running pi session. The bridge owns four main responsibilities:
+`pi-telegram` is a session-local π extension that binds one Telegram DM to one running π session. The bridge owns four main responsibilities:
 
 - Poll Telegram updates and enforce single-user pairing
-- Translate Telegram messages and media into pi inputs
-- Stream and deliver pi responses back to Telegram
-- Manage Telegram-specific controls such as queue reactions, `/status`, `/model`, `/compact`, and `/stop`
+- Translate Telegram messages and media into π inputs
+- Stream and deliver π responses back to Telegram
+- Manage Telegram-specific controls such as queue reactions, π prompt-template commands, `/start` application menu sections, `/compact`, `/next`, `/abort`, and `/stop`
 
 ## Runtime Structure
 
 `index.ts` remains the extension entrypoint and composition root. Reusable runtime logic is split into flat domain files under `/lib` rather than into a deep local module tree.
 
-Architecture shorthand: this repository uses a `Flat Domain DAG`: cohesive bridge domains live as flat `/lib/*.ts` modules, local imports must form a directed acyclic graph, shared buckets are avoided, and `index.ts` wires live pi/Telegram ports plus session state.
+Architecture shorthand: this repository uses a `Flat Domain DAG`: cohesive bridge domains live as flat `/lib/*.ts` modules, local imports must form a directed acyclic graph, shared buckets are avoided, and `index.ts` wires live π/Telegram ports plus session state. Source-module opening comments include `Zones:` tags such as `telegram`, `pi agent`, `tui`, or `shared utils` so cross-cutting responsibility areas stay visible without folder nesting.
 
 Domain grouping rule: prefer cohesive domain files over atomizing every helper into its own file. A `shared` domain is allowed only for types or constants that genuinely span multiple bridge domains.
 
@@ -25,7 +25,7 @@ Current runtime areas use these ownership boundaries:
 
 | Domain                                    | Owns                                                                                                                                                              |
 | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `index.ts`                                | Single composition root for live pi/Telegram ports, session state, API-bound transport adapters, and status updates                                               |
+| `index.ts`                                | Single composition root for live π/Telegram ports, session state, API-bound transport adapters, and status updates                                                |
 | `api`                                     | Bot API transport shapes/helpers, retries, file download, temp-dir lifecycle, inbound limits, chat actions, lazy bot-token clients, runtime error recording       |
 | `config` / `setup`                        | Persisted bot/session pairing state, authorization, first-user pairing, token prompting, env fallback, validation, config persistence                             |
 | `locks` / `polling`                       | Singleton `locks.json` ownership, takeover/restart semantics, long-poll controller state, update offset persistence, poll-loop runtime wiring                     |
@@ -33,17 +33,19 @@ Current runtime areas use these ownership boundaries:
 | `media` / `turns` / `attachment-handlers` | Text/media extraction, media-group debounce, inbound downloads, turn building/editing, image reads, attachment-handler matching/execution/fallback output         |
 | `queue`                                   | Queue item contracts, lane admission/order, stores, mutations, dispatch readiness/runtime, prompt/control enqueueing, session and agent/tool lifecycle sequencing |
 | `runtime`                                 | Session-local coordination primitives: counters, lifecycle flags, setup guard, abort handler, typing-loop timers, prompt-dispatch flags, agent-end reset binding  |
-| `model` / `menu` / `commands`             | Model identity/thinking levels, scoped model resolution, in-flight switching, inline status/model/thinking UI, slash commands, bot command registration           |
+| `model` / `menu-model` / `menu-thinking` / `menu-status` / `menu` / `menu-queue` / `commands` | Model identity/thinking levels, scoped model resolution, in-flight switching, model-menu UI, thinking-menu UI, status-menu UI, inline application callback composition, queue-menu UI, slash commands, bot command registration |
+| `keyboard`                                | Shared Telegram inline-keyboard reply-markup structure; feature domains own callback semantics and button construction                                           |
 | `preview` / `replies` / `rendering`       | Preview lifecycle/transports, final reply delivery and reply parameters, Telegram HTML Markdown rendering, chunking, stable-preview snapshots                     |
 | `outbound-handlers`                       | Assistant-authored outbound comments, generated reply artifacts, inline-keyboard callbacks, and post-`agent_end` outbound action delivery                         |
 | `attachments`                             | `telegram_attach` registration, outbound attachment queueing, stat/limit checks, photo/document delivery classification                                           |
-| `status`                                  | Status-bar/status-message rendering, queue-lane status views, redacted runtime event ring, grouped pi diagnostics                                                 |
-| `lifecycle` / `prompts` / `pi`            | pi hook registration, Telegram-specific before-agent prompt injection, centralized direct pi SDK imports and context adapters                                     |
+| `status`                                  | Status-bar/status-message rendering, queue-lane status views, redacted runtime event ring, grouped π diagnostics                                                  |
+| `lifecycle` / `prompts` / `prompt-templates` / `pi` | π hook registration, Telegram-specific before-agent prompt injection, π prompt-template discovery/expansion, centralized direct pi SDK imports and context adapters |
 | `command-templates`                       | Portable shell-free command-template standard helpers, composition expansion, placeholder substitution, and executable resolution                                 |
 
 Boundary invariants:
 
 - Constants and state types live with their owning domains; do not reintroduce shared buckets such as `lib/constants.ts` or `lib/types.ts`
+- Shared Telegram inline-keyboard structure belongs to `keyboard`; application-control labels, callback data, and callback behavior stay in `menu`/`menu-model`/`menu-thinking`/`menu-status`/`menu-queue`; core queue mechanics stay in `queue`
 - Domain helpers use narrow structural projections when that avoids importing concrete wire DTOs or broader runtime objects unnecessarily
 - Preview appearance stays in `rendering`; preview transport/lifecycle stays in `preview`
 - Direct `node:*` file-operation imports stay in owning domains, not in `index.ts`
@@ -59,11 +61,11 @@ Boundary invariants:
 2. Otherwise use the first configured environment variable from the supported Telegram token list
 3. Fall back to the example placeholder when no real value exists
 
-Because `ctx.ui.input()` only exposes placeholder text, the bridge uses `ctx.ui.editor()` whenever a real default value must appear already filled in. The persisted `telegram.json` config is written with private `0600` permissions because it contains the bot token.
+Because `ctx.ui.input()` only exposes placeholder text, the bridge uses `ctx.ui.editor()` whenever a real default value must appear already filled in. The persisted `telegram.json` config is written through a private temp file plus atomic rename, then left with `0600` permissions because it contains the bot token.
 
 ## Runtime Ownership
 
-Telegram bot configuration stays in `~/.pi/agent/telegram.json`; singleton runtime ownership lives separately in `~/.pi/agent/locks.json` under `@llblab/pi-telegram`. `/telegram-connect` acquires or moves that lock before polling starts, and `/telegram-disconnect` stops polling and releases it. Session start may read the existing lock and resume polling when the lock already points at the current `pid`/`cwd`; after a full pi process restart, it may also replace a stale lock from the same `cwd` and resume polling automatically. Session start does not create new ownership from an inactive lock, a live external lock, or a stale lock from another directory. Session replacement suspends polling and ownership watchers without releasing the lock, allowing the next session-start hook in the same `pid`/`cwd` to resume from the existing explicit ownership. When a live external owner exists, `/telegram-connect` asks whether to move singleton ownership to the current pi instance. Active owners poll the lock while running through a snapshotted ownership context, so long-lived timers do not touch stale pi contexts after `/new`; they stop local polling when `locks.json` no longer points at their own `pid`/`cwd`, without deleting the new owner lock. Deleting `locks.json` resets runtime ownership without deleting Telegram configuration.
+Telegram bot configuration stays in `~/.pi/agent/telegram.json`; singleton runtime ownership lives separately in `~/.pi/agent/locks.json` under `@llblab/pi-telegram`. `/telegram-connect` acquires or moves that lock before polling starts, and `/telegram-disconnect` stops polling and releases it. Session start may read the existing lock and resume polling when the lock already points at the current `pid`/`cwd`; after a full π process restart, it may also replace a stale lock from the same `cwd` and resume polling automatically. Session start does not create new ownership from an inactive lock, a live external lock, or a stale lock from another directory. Session replacement suspends polling and ownership watchers without releasing the lock, allowing the next session-start hook in the same `pid`/`cwd` to resume from the existing explicit ownership. When a live external owner exists, `/telegram-connect` asks whether to move singleton ownership to the current π instance. Active owners poll the lock while running through a snapshotted ownership context, so long-lived timers do not touch stale π contexts after `/new`; they stop local polling when `locks.json` no longer points at their own `pid`/`cwd`, without deleting the new owner lock. Deleting `locks.json` resets runtime ownership without deleting Telegram configuration.
 
 ## Message And Queue Flow
 
@@ -80,11 +82,11 @@ Telegram bot configuration stays in `~/.pi/agent/telegram.json`; singleton runti
 9. Local attachments stay visible under `[attachments] <directory>` with relative file entries, and handler stdout is appended under `[outputs]` before the agent sees the turn; failed handlers omit output while keeping the attachment entry
 10. A `PendingTelegramTurn` is created and queued locally
 11. Telegram `edited_message` updates are routed separately and update a matching queued turn when the original message has not been dispatched yet
-12. The queue dispatcher sends the turn into pi only when dispatch is safe
+12. The queue dispatcher sends the turn into π only when dispatch is safe
 
 ### Queue Safety Model
 
-The bridge keeps its own Telegram queue and does not rely only on pi's internal pending-message state.
+The bridge keeps its own Telegram queue and does not rely only on π's internal pending-message state.
 
 Queued items now use two explicit dimensions:
 
@@ -95,24 +97,27 @@ Admission contract:
 
 | Admission             | Examples                                                     | Queue shape                                                          | Dispatch rank |
 | --------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------- | ------------- |
-| Immediate execution   | `/compact`, `/stop`, `/help`, `/start`                       | Does not enter the Telegram queue; `/stop` also clears queued items  | N/A           |
+| Immediate execution   | `/compact`, `/queue`, `/stop`, `/help`, `/start` | Does not enter the Telegram queue; `/help` opens the same menu as `/start`; `/stop` also clears queued items | N/A           |
+| Queued prompt command | `/continue`, `/template_name args` | `/continue` enqueues a Telegram-owned `continue` prompt; prompt-template commands expand the matching π template before entering the normal prompt queue | priority for `/continue`, otherwise default |
 | Control queue         | Model-switch continuation turns and future deferred controls | `queueLane: control`; accepts control items and continuation prompts | 0             |
-| Priority prompt queue | A waiting prompt promoted by `👍`                            | `kind: prompt`, `queueLane: priority`                                | 1             |
+| Priority prompt queue | A waiting prompt promoted by `👍`, `⚡️`, `❤️`, or `🕊`      | `kind: prompt`, `queueLane: priority`                                | 1             |
 | Default prompt queue  | Normal Telegram text/media turns                             | `kind: prompt`, `queueLane: default`                                 | 2             |
 
-The command action itself carries its execution mode, and the queue domain exposes lane contracts for admission mode, dispatch rank, and allowed item kinds. Queue append and planning paths validate lane admission so a malformed control/default or other invalid lane pairing fails predictably instead of silently changing priority. This lets synthetic control actions and Telegram prompts share one stable ordering model while still rendering distinctly in status output. In the pi status bar, busy labels distinguish `active`, `dispatching`, `queued`, `tool running`, `model`, and `compacting`; priority prompts are marked with `⬆` while control items keep markers such as `⚡`.
+The command action itself carries its execution mode, and the queue domain exposes lane contracts for admission mode, dispatch rank, and allowed item kinds. Queue append and planning paths validate lane admission so a malformed control/default or other invalid lane pairing fails predictably instead of silently changing priority. This lets synthetic control actions and Telegram prompts share one stable ordering model while still rendering distinctly in status output. In the π status bar, busy labels distinguish `active`, `dispatching`, `queued`, `tool running`, `model`, and `compacting`; priority prompts and priority control items are marked with `⚡`.
 
 A dispatched prompt remains in the queue until `agent_start` consumes it. That keeps the active Telegram turn bound correctly for previews, attachments, abort handling, and final reply delivery.
 
 Dispatch is gated by:
 
 - No active Telegram turn
-- No pending Telegram dispatch already sent to pi
+- No pending Telegram dispatch already sent to π
 - No compaction in progress
 - `ctx.isIdle()` being true
 - `ctx.hasPendingMessages()` being false
 
-This prevents queue races around rapid follow-ups, `/compact`, and mixed local plus Telegram activity. Post-agent-end dispatch retries are scheduled through a session-bound deferred dispatcher that activates on session start, cancels timers on session shutdown, and skips callbacks from older generations before they touch `ExtensionContext`. Telegram `/status` and `/model` execute immediately; the dispatch controller still serializes any deferred control items so a queued control action must settle before the next queued action can dispatch.
+This prevents queue races around rapid follow-ups, `/compact`, and mixed local plus Telegram activity. Post-agent-end dispatch retries are scheduled through a session-bound deferred dispatcher that activates on session start, cancels timers on session shutdown, and skips callbacks from older generations before they touch `ExtensionContext`. Telegram `/start` and hidden compatibility shortcuts `/status`, `/model`, `/thinking`, and `/queue` execute immediately; the dispatch controller still serializes any deferred control items so a queued control action must settle before the next queued action can dispatch.
+
+`/start` opens the main application menu: visible command help, compact command-only prompt-template rows when π exposes Telegram-compatible prompt-template names, status rows (`Status`, `Usage`, `Cost`, `Context`), and top-level buttons for model, thinking, and queue sections. The Queue button includes the current queued-item count. Hidden compatibility shortcuts `/help`, `/status`, `/model`, `/thinking`, and `/queue` jump directly to their corresponding menu screens. Command emoji come from the `commands` domain map so visible command descriptions and matching menu buttons share one fixed adornment source. Prompt-template commands use a fixed `🧩` marker, map π template names to Telegram-safe aliases such as `fix-tests` → `/fix_tests`, are registered in the Telegram bot command menu when the mapped command does not conflict with built-in bridge commands or hidden shortcuts, and expand before queueing because `ExtensionAPI.sendUserMessage()` intentionally bypasses π prompt-template expansion for extension-originated messages. Every submenu starts with a top Back row so navigation stays anchored near the original user message above the inline keyboard; model-menu scope and pagination controls sit directly under that top row before model choices, and tapping the pagination indicator opens a compact page picker headed by `<b>Choose a page:</b>`. `menu-model` owns model-menu state, scoped model pages, model callback planning, page-picker rendering, and model-menu rendering while `model` owns core model identity/switching semantics. `menu-thinking` owns thinking-menu text, reply markup, callback handling, and message rendering. `menu-status` owns status-menu payloads, status callback handling, and status-message rendering. `menu-queue` owns queue-menu UI only: queue items are rendered under a compact `<b>Queue:</b>` heading, top-to-bottom in dispatch order, numbered, and marked with `⚡` for priority prompts or `📎` for prompts with attachments. An empty queue renders bold message text plus the top Main menu button, not a disabled empty-state button. Selecting an item opens a submenu that displays the full queued prompt text with Back, priority toggle, and Cancel. If a callback targets an item that has already left the queue, the menu refreshes the list instead of applying a stale mutation.
 
 ### Abort Behavior
 
@@ -155,7 +160,7 @@ Telegram prompt responses use explicit delivery context to attach outbound text,
 
 Outbound files are sent only after the active Telegram turn completes, must be staged through the `telegram_attach` tool, are staged atomically per tool call, are checked against a default 50 MiB limit configurable through `PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES` or `TELEGRAM_MAX_ATTACHMENT_SIZE_BYTES`, and use file-backed multipart blobs so large sends do not require preloading whole files into memory.
 
-Assistant-authored outbound actions use final-message markup instead of agent tool calls. Preview updates strip closed top-level HTML comments and currently open/partial top-level comment starts before rendering, so users do not see transient metadata even when streaming flushes happen after only `<`, `<!`, or `<!--`. On `agent_end`, the bridge removes top-level comments from the Markdown text reply, but treats column-zero top-level `<!-- telegram_voice ... -->` and `<!-- telegram_button ... -->` blocks specially before delivery; comments inside fenced code, quotes, lists, or indented examples stay literal, including fenced blocks with Markdown-valid indented closing fences. Voice maps to the first matching `outboundHandlers[]` entry with `type: "voice"`, synthesizes body text, `text="..."`, or colon shorthand through command-template execution, and uploads the generated OGG/Opus file via Telegram `sendVoice`; when no outbound voice handler is configured, it silently skips voice delivery. The `template: [...]` form can express TTS plus MP3-to-OGG conversion using configured templates and bridge-provided `{text}`, `{mp3}`, and `{ogg}` placeholders. Top-level `args` and `defaults` apply to all composed steps unless a step defines private values, top-level `timeout` wraps the whole sequence, and each step receives the previous step's stdout on stdin by default, without hard-coded filesystem defaults. Button blocks are built in: each `telegram_button` block becomes one inline-keyboard button on the final text, and callback clicks enqueue the configured prompt text as a normal Telegram prompt turn; the `telegram_button: Label` shorthand uses the same text for label and prompt, `prompt="..."` supports explicit one-line prompts, and body-form buttons use the body as the prompt. This keeps technical Markdown, code, tables, formulas, and numbered lists in the text channel when appropriate while allowing TTS-friendly voice messages and tappable continuations without invoking `telegram_attach` or extra transport tools.
+Assistant-authored outbound actions use final-message markup instead of agent tool calls. Preview updates strip closed top-level HTML comments and currently open/partial top-level comment starts before rendering, so users do not see transient metadata even when streaming flushes happen after only `<`, `<!`, or `<!--`. On `agent_end`, the bridge removes top-level comments from the Markdown text reply, but treats column-zero top-level `<!-- telegram_voice ... -->` and `<!-- telegram_button ... -->` blocks specially before delivery; comments inside fenced code, quotes, lists, or indented examples stay literal, including fenced blocks with Markdown-valid indented closing fences. Voice maps to the first matching `outboundHandlers[]` entry with `type: "voice"`, synthesizes body text, `text="..."`, or colon shorthand through command-template execution, and uploads the generated OGG/Opus file via Telegram `sendVoice`; when no outbound voice handler is configured, it silently skips voice delivery. The `template: [...]` form can express TTS plus MP3-to-OGG conversion using configured templates and bridge-provided `{text}`, `{mp3}`, and `{ogg}` placeholders. Top-level `args` and `defaults` apply to all composed steps unless a step defines private values, the default command timeout applies automatically, and each step receives the previous step's stdout on stdin by default, without hard-coded filesystem defaults. Button blocks are built in: each `telegram_button` block becomes one inline-keyboard button on the final text, and callback clicks enqueue the configured prompt text as a normal Telegram prompt turn; the `telegram_button: Label` shorthand uses the same text for label and prompt, `prompt="..."` supports explicit one-line prompts, and body-form buttons use the body as the prompt. This keeps technical Markdown, code, tables, formulas, and numbered lists in the text channel when appropriate while allowing TTS-friendly voice messages and tappable continuations without invoking `telegram_attach` or extra transport tools.
 
 ## Interactive Controls
 
@@ -163,17 +168,21 @@ The bridge exposes Telegram-side session controls in addition to regular chat fo
 
 Current operator controls include:
 
-- `/status` for model, usage, cost, and context visibility, executed immediately from Telegram even while generation is active
-- Inline status buttons for model and thinking adjustments, applying idle selections immediately while still respecting busy-run restart rules; model-menu inputs are cached briefly and stored inline-menu states are pruned by TTL/LRU so old keyboards expire predictably
-- `/model` for interactive model selection, executed immediately from Telegram and supporting in-flight restart of the active Telegram-owned run on a newly selected model
-- `/compact` for Telegram-triggered pi session compaction when the bridge is idle
+- `/start` for the main application menu: command help, prompt-template commands, model, usage, cost, context visibility, and inline controls, executed immediately from Telegram even while generation is active
+- Inline application-menu buttons for model, thinking, and queue controls, applying idle selections immediately while still respecting busy-run restart rules; model-menu inputs are cached briefly and stored inline-menu states are pruned by TTL/LRU so old keyboards expire predictably
+- Hidden `/model` and `/thinking` shortcuts for opening the model and thinking sections directly while keeping settings out of the visible bot command menu
+- `/compact` for Telegram-triggered π session compaction when the bridge is idle
+- `/queue` for opening the queue section of the inline application menu; the same section is reachable from the status/main menu and supports top-anchored Back navigation, priority toggling, and cancellation
+- `/next` for dispatching the next queued turn, aborting the active run first when π is busy
+- `/continue` for enqueueing a Telegram-owned `continue` prompt, without aborting the current turn or forcing the next queued item
+- `/abort` for aborting the active Telegram-owned run while preserving queued items for manual continuation
 - `/stop` for aborting the active Telegram-owned run and clearing waiting Telegram queue items
-- `/telegram-status` for pi-side diagnostics as grouped line-by-line sections separated by blank lines: connection, polling, execution, queue, and the recent redacted runtime/API event ring. These sections include polling state, last update id, active turn source ids, pending dispatch, compaction state, active tool count, pending model-switch state, total queue depth, and queue-lane counts. The event ring records transport/API, polling/update, prompt-dispatch, control-action, typing, compaction, setup, session-lifecycle, and attachment queue/delivery failures; benign unchanged edit responses and unsupported empty draft-clear attempts are filtered out so expected preview transport noise does not obscure real failures
-- Queue reactions using `👍` and `👎` apply to waiting text, voice, file, image, and media-group turns by matching the turn's source Telegram message ids; `👎` acts as the canonical queue-removal path because ordinary Telegram DM message deletions are not exposed through the Bot API polling path this bridge uses
+- `/telegram-status` for π-side diagnostics as grouped line-by-line sections separated by blank lines: connection, polling, execution, queue, and the recent redacted runtime/API event ring. These sections include polling state, last update id, active turn source ids, pending dispatch, compaction state, active tool count, pending model-switch state, total queue depth, and queue-lane counts. The event ring records transport/API, polling/update, prompt-dispatch, control-action, typing, compaction, setup, session-lifecycle, and attachment queue/delivery failures; benign unchanged edit responses and unsupported empty draft-clear attempts are filtered out so expected preview transport noise does not obscure real failures
+- Queue reactions apply to waiting text, voice, file, image, and media-group turns by matching the turn's source Telegram message ids: `👍`, `⚡️`, `❤️`, and `🕊` promote waiting prompts, while `👎`, `👻`, `💔`, and `💩` remove waiting turns because ordinary Telegram DM message deletions are not exposed through the Bot API polling path this bridge uses
 
 ## In-Flight Model Switching
 
-When `/model` is used during an active Telegram-owned run, the bridge can emulate the interactive pi workflow of stopping, switching model, and continuing.
+When `/model` is used during an active Telegram-owned run, the bridge can emulate the interactive π workflow of stopping, switching model, and continuing.
 
 The current implementation does this by:
 
@@ -182,7 +191,7 @@ The current implementation does this by:
 3. Aborting the active Telegram turn immediately, or delaying the abort until the current tool finishes when a tool call is in flight
 4. Dispatching the continuation turn after the abort completes
 
-This behavior is intentionally limited to runs currently owned by the Telegram bridge. If pi is busy with non-Telegram work, the bridge still refuses the switch instead of hijacking unrelated session activity.
+This behavior is intentionally limited to runs currently owned by the Telegram bridge. If π is busy with non-Telegram work, the bridge still refuses the switch instead of hijacking unrelated session activity.
 
 ## Related
 

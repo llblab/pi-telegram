@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -44,6 +44,10 @@ test("Telegram config helpers persist and reload config", async () => {
   const raw = await readFile(configPath, "utf8");
   assert.match(raw, /demo_bot/);
   assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+  assert.deepEqual(
+    (await readdir(agentDir)).filter((entry) => entry.includes(".tmp-")),
+    [],
+  );
 });
 
 test("Telegram config store owns load, mutation, and persistence", async () => {

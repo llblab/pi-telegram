@@ -1,5 +1,6 @@
 /**
  * Telegram model control domain helpers
+ * Zones: pi agent model control, telegram controls, queue continuation
  * Owns model identity, thinking levels, scoped resolution, current-model state, and in-flight model switching
  */
 

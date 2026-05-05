@@ -1,5 +1,6 @@
 /**
  * Telegram singleton lock helpers
+ * Zones: shared singleton, filesystem, telegram runtime ownership
  * Owns shared locks.json access and Telegram bridge ownership semantics
  */
 
@@ -285,7 +286,7 @@ export function createTelegramLockedPollingRuntime<
           ok: false,
           canTakeover: true,
           owner: formatLock(acquired.lock),
-          message: `Telegram bridge is active in another pi instance (${formatLock(acquired.lock)}).`,
+          message: `Telegram bridge is active in another π instance (${formatLock(acquired.lock)}).`,
         };
       }
       await deps.startPolling(ctx);
@@ -298,7 +299,7 @@ export function createTelegramLockedPollingRuntime<
       await suspendPolling();
       const state = deps.lock.release();
       if (state.kind === "active-elsewhere") {
-        return `Telegram bridge is active in another pi instance (${formatLock(state.lock)}).`;
+        return `Telegram bridge is active in another π instance (${formatLock(state.lock)}).`;
       }
       if (state.kind === "stale")
         return `Removed stale Telegram bridge lock (${formatLock(state.lock)}).`;

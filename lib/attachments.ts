@@ -1,5 +1,6 @@
 /**
  * Telegram attachment domain helpers
+ * Zones: telegram outbound, pi agent tool, filesystem
  * Owns telegram_attach registration, attachment queueing, and attachment delivery so Telegram file output stays in one domain module
  */
 

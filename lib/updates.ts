@@ -1,5 +1,6 @@
 /**
  * Telegram updates domain helpers
+ * Zones: telegram inbound, authorization, routing plans
  * Owns update extraction, authorization, classification, execution planning, and runtime execution for Telegram updates
  */
 
@@ -25,6 +26,9 @@ export type TelegramReactionType =
   | TelegramReactionTypeEmoji
   | TelegramReactionTypeNonEmoji;
 
+export const TELEGRAM_PRIORITY_REACTION_EMOJIS = ["👍", "⚡", "❤", "🕊"] as const;
+export const TELEGRAM_REMOVAL_REACTION_EMOJIS = ["👎", "👻", "💔", "💩"] as const;
+
 export interface TelegramUpdateDeletion {
   deleted_business_messages?: { message_ids?: unknown };
 }
@@ -48,6 +52,21 @@ export function collectTelegramReactionEmojis(
       )
       .map((reaction) => normalizeTelegramReactionEmoji(reaction.emoji)),
   );
+}
+
+function hasAnyTelegramReactionEmoji(
+  emojis: Set<string>,
+  candidates: readonly string[],
+): boolean {
+  return candidates.some((emoji) => emojis.has(emoji));
+}
+
+function hasAddedTelegramReactionEmoji(
+  oldEmojis: Set<string>,
+  newEmojis: Set<string>,
+  candidates: readonly string[],
+): boolean {
+  return candidates.some((emoji) => !oldEmojis.has(emoji) && newEmojis.has(emoji));
 }
 
 export function extractDeletedTelegramMessageIds(
@@ -579,8 +598,13 @@ export async function handleAuthorizedTelegramReactionUpdate<TContext>(
   }
   const oldEmojis = collectTelegramReactionEmojis(reactionUpdate.old_reaction);
   const newEmojis = collectTelegramReactionEmojis(reactionUpdate.new_reaction);
-  const dislikeAdded = !oldEmojis.has("👎") && newEmojis.has("👎");
-  if (dislikeAdded) {
+  if (
+    hasAddedTelegramReactionEmoji(
+      oldEmojis,
+      newEmojis,
+      TELEGRAM_REMOVAL_REACTION_EMOJIS,
+    )
+  ) {
     deps.removePendingMediaGroupMessages([reactionUpdate.message_id]);
     deps.removeQueuedTelegramTurnsByMessageIds(
       [reactionUpdate.message_id],
@@ -588,15 +612,21 @@ export async function handleAuthorizedTelegramReactionUpdate<TContext>(
     );
     return;
   }
-  const likeRemoved = oldEmojis.has("👍") && !newEmojis.has("👍");
-  if (likeRemoved) {
+  const hadPriorityReaction = hasAnyTelegramReactionEmoji(
+    oldEmojis,
+    TELEGRAM_PRIORITY_REACTION_EMOJIS,
+  );
+  const hasPriorityReaction = hasAnyTelegramReactionEmoji(
+    newEmojis,
+    TELEGRAM_PRIORITY_REACTION_EMOJIS,
+  );
+  if (hadPriorityReaction && !hasPriorityReaction) {
     deps.clearQueuedTelegramTurnPriorityByMessageId(
       reactionUpdate.message_id,
       deps.ctx,
     );
   }
-  const likeAdded = !oldEmojis.has("👍") && newEmojis.has("👍");
-  if (!likeAdded) return;
+  if (!hasAddedTelegramReactionEmoji(oldEmojis, newEmojis, TELEGRAM_PRIORITY_REACTION_EMOJIS)) return;
   deps.prioritizeQueuedTelegramTurnByMessageId(
     reactionUpdate.message_id,
     deps.ctx,

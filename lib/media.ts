@@ -1,5 +1,6 @@
 /**
  * Telegram media and text extraction helpers
+ * Zones: telegram inbound, media groups, filesystem paths
  * Normalizes inbound Telegram messages into reusable file, text, id, history, and media-group metadata
  */
 

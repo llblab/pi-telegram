@@ -1,10 +1,11 @@
 /**
  * Telegram bridge config and pairing helpers
+ * Zones: telegram config, pairing, filesystem
  * Owns persisted bot/session pairing state, local config storage, authorization policy, and first-user pairing side effects
  */
 
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -76,10 +77,13 @@ export async function writeTelegramConfig(
   config: TelegramConfig,
 ): Promise<void> {
   await mkdir(agentDir, { recursive: true });
-  await writeFile(configPath, JSON.stringify(config, null, "\t") + "\n", {
+  const tempConfigPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
+  await writeFile(tempConfigPath, JSON.stringify(config, null, "\t") + "\n", {
     encoding: "utf8",
     mode: 0o600,
   });
+  await chmod(tempConfigPath, 0o600);
+  await rename(tempConfigPath, configPath);
   await chmod(configPath, 0o600);
 }
 

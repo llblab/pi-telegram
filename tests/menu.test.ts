@@ -10,11 +10,13 @@ import {
   applyTelegramModelPageSelection,
   applyTelegramModelScopeSelection,
   buildModelMenuReplyMarkup,
+  buildModelPageMenuReplyMarkup,
   buildStatusReplyMarkup,
   buildTelegramModelCallbackPlan,
   buildTelegramModelMenuRenderPayload,
   buildTelegramModelMenuState,
   buildTelegramModelMenuStateRuntime,
+  buildTelegramModelPageMenuRenderPayload,
   buildTelegramStatusMenuRenderPayload,
   buildTelegramThinkingMenuRenderPayload,
   buildThinkingMenuReplyMarkup,
@@ -37,6 +39,7 @@ import {
   handleTelegramStatusMenuCallbackAction,
   handleTelegramThinkingMenuCallbackAction,
   MODEL_MENU_TITLE,
+  MODEL_PAGE_MENU_TITLE,
   openTelegramModelMenu,
   openTelegramStatusMenu,
   parseTelegramMenuCallbackAction,
@@ -50,7 +53,9 @@ import {
   updateTelegramStatusMessage,
   updateTelegramThinkingMenuMessage,
 } from "../lib/menu.ts";
+import { createTelegramQueueMenuRuntime } from "../lib/menu-queue.ts";
 import type { MenuModel } from "../lib/model.ts";
+import type { TelegramQueueItem } from "../lib/queue.ts";
 
 function createMenuState<TModel extends MenuModel = MenuModel>(
   messageId: number,
@@ -73,7 +78,9 @@ function createMenuModel(
   id: string,
   reasoning?: boolean,
 ): MenuModel {
-  return reasoning === undefined ? { provider, id } : { provider, id, reasoning };
+  return reasoning === undefined
+    ? { provider, id }
+    : { provider, id, reasoning };
 }
 
 test("Menu helpers store, refresh, prune, and bound model menu state", () => {
@@ -273,6 +280,7 @@ test("Menu runtime builds menu state from settings and model-registry ports", as
 
 test("Menu helpers expose UI constants", () => {
   assert.equal(MODEL_MENU_TITLE, "<b>Choose a model:</b>");
+  assert.equal(MODEL_PAGE_MENU_TITLE, "<b>Choose a page:</b>");
   assert.equal(TELEGRAM_MODEL_PAGE_SIZE, 6);
 });
 
@@ -301,6 +309,11 @@ test("Menu helpers build model menu state and parse callback actions", () => {
     kind: "model",
     action: "pick",
     value: "2",
+  });
+  assert.deepEqual(parseTelegramMenuCallbackAction("model:pages"), {
+    kind: "model",
+    action: "pages",
+    value: undefined,
   });
   assert.deepEqual(parseTelegramMenuCallbackAction("unknown"), {
     kind: "ignore",
@@ -345,11 +358,44 @@ test("Menu helpers derive normalized menu pages without mutating state", () => {
   assert.deepEqual(menuPage.items, [{ model: modelB }]);
   assert.equal(state.page, 99);
   const markup = buildModelMenuReplyMarkup(state, modelA, 1);
+  assert.equal(markup.inline_keyboard[0]?.[0]?.text, "⬆️ Main menu");
+  assert.equal(markup.inline_keyboard[0]?.[0]?.callback_data, "menu:back");
   assert.equal(markup.inline_keyboard[1]?.[1]?.text, "2/2");
+  assert.equal(markup.inline_keyboard[1]?.[1]?.callback_data, "model:pages");
   assert.equal(state.page, 99);
 });
 
-test("Menu helpers build model callback plans for paging, selection, and restart modes", () => {
+test("Menu helpers build model page selector markup and payloads", () => {
+  const models = Array.from({ length: 31 }, (_unused, index) =>
+    createMenuModel("test", `model-${index + 1}`),
+  );
+  const state = createMenuState<MenuModel>(2, {
+    page: 1,
+    scope: "all",
+    allModels: models.map((model) => ({ model })),
+    mode: "model-pages",
+  });
+  const markup = buildModelPageMenuReplyMarkup(state, TELEGRAM_MODEL_PAGE_SIZE);
+  const payload = buildTelegramModelPageMenuRenderPayload(state);
+  assert.equal(markup.inline_keyboard[0]?.[0]?.text, "⬆️ Back");
+  assert.equal(
+    markup.inline_keyboard[0]?.[0]?.callback_data,
+    "model:pages:back",
+  );
+  assert.deepEqual(
+    markup.inline_keyboard[1]?.map((button) => button.text),
+    ["1", "2", "3", "4"],
+  );
+  assert.deepEqual(
+    markup.inline_keyboard[2]?.map((button) => button.text),
+    ["5", "6"],
+  );
+  assert.equal(payload.nextMode, "model-pages");
+  assert.equal(payload.text, "<b>Choose a page:</b>");
+  assert.equal(payload.mode, "html");
+});
+
+test("Menu helpers build model callback plans for paging, page menu, selection, and restart modes", () => {
   const modelA = createMenuModel("openai", "gpt-5", true);
   const modelB = createMenuModel("anthropic", "claude-3", false);
   const state = createMenuState<MenuModel>(2, {
@@ -357,6 +403,32 @@ test("Menu helpers build model callback plans for paging, selection, and restart
     scopedModels: [{ model: modelA, thinkingLevel: "high" }],
     allModels: [{ model: modelA }, { model: modelB }],
   });
+  assert.deepEqual(
+    buildTelegramModelCallbackPlan({
+      data: "model:pages",
+      state,
+      activeModel: modelA,
+      currentThinkingLevel: "medium",
+      isIdle: true,
+      canRestartBusyRun: false,
+      hasActiveToolExecutions: false,
+    }),
+    { kind: "update-menu" },
+  );
+  assert.equal(state.mode, "model-pages");
+  assert.deepEqual(
+    buildTelegramModelCallbackPlan({
+      data: "model:pages:back",
+      state,
+      activeModel: modelA,
+      currentThinkingLevel: "medium",
+      isIdle: true,
+      canRestartBusyRun: false,
+      hasActiveToolExecutions: false,
+    }),
+    { kind: "update-menu" },
+  );
+  assert.equal(state.mode, "model");
   assert.deepEqual(
     buildTelegramModelCallbackPlan({
       data: "model:page:1",
@@ -414,7 +486,7 @@ test("Menu helpers build model callback plans for paging, selection, and restart
       canRestartBusyRun: false,
       hasActiveToolExecutions: false,
     }),
-    { kind: "answer", text: "Pi is busy. Send /stop first." },
+    { kind: "answer", text: "π is busy. Send /abort, /next, or /stop." },
   );
 });
 
@@ -515,7 +587,12 @@ test("Menu helpers report model-menu busy and no-model paths", async () => {
     sendModelMenu: async () => 1,
     storeModelMenuState: () => {},
   });
-  assert.deepEqual(events, ["status", "store-status", "no-models", "busy-model"]);
+  assert.deepEqual(events, [
+    "status",
+    "store-status",
+    "no-models",
+    "busy-model",
+  ]);
 });
 
 test("Menu helpers route callback entry states before action handlers", async () => {
@@ -1121,9 +1198,18 @@ test("Menu helpers build pure render payloads before transport", () => {
   assert.equal(modelPayload.nextMode, "model");
   assert.equal(modelPayload.text, "<b>Choose a model:</b>");
   assert.equal(modelPayload.mode, "html");
+  const pageState = createMenuState(3, {
+    scope: "all",
+    allModels: [{ model: modelA }],
+    mode: "model-pages",
+  });
+  const pagePayload = buildTelegramModelMenuRenderPayload(pageState, modelA);
+  assert.equal(pagePayload.nextMode, "model-pages");
+  assert.equal(pagePayload.text, "<b>Choose a page:</b>");
+  assert.equal(pagePayload.mode, "html");
   assert.equal(thinkingPayload.nextMode, "thinking");
-  assert.match(thinkingPayload.text, /^Choose a thinking level/);
-  assert.equal(thinkingPayload.mode, "plain");
+  assert.equal(thinkingPayload.text, "<b>Choose a thinking level:</b>");
+  assert.equal(thinkingPayload.mode, "html");
   assert.equal(statusPayload.nextMode, "status");
   assert.equal(statusPayload.text, "<b>Status</b>");
   assert.equal(statusPayload.mode, "html");
@@ -1165,7 +1251,7 @@ test("Menu action runtime opens and updates interactive menu messages", async ()
   await runtime.sendStatusMessage(1, 2, "ctx");
   await runtime.openModelMenu(1, 2, "ctx");
   assert.equal(events[0], "edit:1:2:html:<b>Choose a model:</b>");
-  assert.match(events[1] ?? "", /^edit:1:2:plain:Choose a thinking level/);
+  assert.equal(events[1], "edit:1:2:html:<b>Choose a thinking level:</b>");
   assert.equal(events[2], "edit:1:2:html:<b>Status ctx</b>");
   assert.equal(events[3], "send:1:html:<b>Status ctx</b>");
   assert.equal(events[4], "store:99");
@@ -1281,10 +1367,100 @@ test("Menu helpers update and send interactive menu messages", async () => {
   assert.equal(sentStatusId, 99);
   assert.equal(sentModelId, 99);
   assert.equal(events[0], "edit:1:2:html:<b>Choose a model:</b>");
-  assert.match(events[1] ?? "", /^edit:1:2:plain:Choose a thinking level/);
+  assert.equal(events[1], "edit:1:2:html:<b>Choose a thinking level:</b>");
   assert.equal(events[2], "edit:1:2:html:<b>Status</b>");
   assert.equal(events[3], "send:1:html:<b>Status</b>");
   assert.equal(events[4], "send:1:html:<b>Choose a model:</b>");
+});
+
+test("Queue menu keeps main-menu navigation on top", async () => {
+  const state = createMenuState(2);
+  const queuedItems: TelegramQueueItem<string>[] = [
+    {
+      kind: "prompt",
+      chatId: 1,
+      replyToMessageId: 10,
+      queueOrder: 1,
+      queueLane: "default",
+      laneOrder: 1,
+      statusSummary: "queued <prompt>",
+      sourceMessageIds: [10],
+      queuedAttachments: [],
+      content: [{ type: "text", text: "[telegram] queued <prompt>\n\nfull body" }],
+      historyText: "",
+    },
+  ];
+  const texts: string[] = [];
+  const modes: string[] = [];
+  const markups: Array<{
+    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  }> = [];
+  const runtime = createTelegramQueueMenuRuntime<string>({
+    telegramQueueStore: {
+      getQueuedItems: () => queuedItems,
+      setQueuedItems: () => {},
+      hasQueuedItems: () => queuedItems.length > 0,
+    },
+    queueMutationRuntime: {
+      append: () => {},
+      reorder: () => {},
+      clear: () => 0,
+      removeByMessageIds: () => 0,
+      clearPriorityByMessageId: () => false,
+      prioritizeByMessageId: () => false,
+    },
+    sendInteractiveMessage: async (_chatId, text, mode, replyMarkup) => {
+      texts.push(text);
+      modes.push(mode);
+      markups.push(replyMarkup);
+      return 99;
+    },
+    editInteractiveMessage: async (
+      _chatId,
+      _messageId,
+      text,
+      mode,
+      replyMarkup,
+    ) => {
+      texts.push(text);
+      modes.push(mode);
+      markups.push(replyMarkup);
+    },
+    answerCallbackQuery: async () => {},
+    getModelMenuState: async () => state,
+    getStoredModelMenuState: () => state,
+    storeModelMenuState: () => {},
+    updateStatusMessage: async () => {},
+    updateStatus: () => {},
+  });
+  await runtime.openQueueMenu(1, 2, "ctx");
+  await runtime.handleCallbackQuery(
+    {
+      id: "callback",
+      data: "status:queue",
+      message: { chat: { id: 1 }, message_id: 2 },
+    },
+    "ctx",
+  );
+  await runtime.handleCallbackQuery(
+    {
+      id: "callback",
+      data: "queue:pick:1:10",
+      message: { chat: { id: 1 }, message_id: 2 },
+    },
+    "ctx",
+  );
+  queuedItems.length = 0;
+  await runtime.openQueueMenu(1, 2, "ctx");
+  assert.equal(markups[0]?.inline_keyboard[0]?.[0]?.callback_data, "menu:back");
+  assert.equal(markups[1]?.inline_keyboard[0]?.[0]?.callback_data, "menu:back");
+  assert.deepEqual(markups[3]?.inline_keyboard, [
+    [{ text: "⬆️ Main menu", callback_data: "menu:back" }],
+  ]);
+  assert.equal(texts[0], "<b>Queue:</b>");
+  assert.equal(texts[2], "[telegram] queued &lt;prompt&gt;\n\nfull body");
+  assert.equal(texts[3], "<b>Queue is empty.</b>");
+  assert.deepEqual(modes, ["html", "html", "html", "html"]);
 });
 
 test("Menu helpers build model, thinking, and status UI payloads", () => {
@@ -1300,19 +1476,50 @@ test("Menu helpers build model, thinking, and status UI payloads", () => {
     /^✅ /,
   );
   const modelMarkup = buildModelMenuReplyMarkup(state, modelA, 6);
+  assert.equal(modelMarkup.inline_keyboard[0]?.[0]?.callback_data, "menu:back");
   assert.equal(
-    modelMarkup.inline_keyboard[0]?.[0]?.callback_data,
+    modelMarkup.inline_keyboard[1]?.[0]?.callback_data,
+    "model:scope:scoped",
+  );
+  assert.equal(
+    modelMarkup.inline_keyboard[1]?.[1]?.callback_data,
+    "model:scope:all",
+  );
+  assert.equal(
+    modelMarkup.inline_keyboard[2]?.[0]?.callback_data,
+    "model:pages",
+  );
+  assert.equal(
+    modelMarkup.inline_keyboard[3]?.[0]?.callback_data,
     "model:pick:0",
   );
-  const thinkingText = buildThinkingMenuText(modelA, "medium");
-  assert.match(thinkingText, /Model: openai\/gpt-5/);
+  const thinkingText = buildThinkingMenuText();
+  assert.equal(thinkingText, "<b>Choose a thinking level:</b>");
   const thinkingMarkup = buildThinkingMenuReplyMarkup("medium");
+  assert.equal(thinkingMarkup.inline_keyboard[0]?.[0]?.text, "⬆️ Main menu");
+  assert.equal(
+    thinkingMarkup.inline_keyboard[0]?.[0]?.callback_data,
+    "menu:back",
+  );
   assert.equal(
     thinkingMarkup.inline_keyboard.some((row) => row[0]?.text === "✅ medium"),
     true,
   );
-  const statusMarkup = buildStatusReplyMarkup(modelA, "medium");
-  assert.equal(statusMarkup.inline_keyboard.length, 2);
+  const statusMarkup = buildStatusReplyMarkup(modelA, "medium", 3);
+  assert.equal(statusMarkup.inline_keyboard.length, 3);
+  assert.equal(
+    statusMarkup.inline_keyboard[0]?.[0]?.text.startsWith("🤖 Model"),
+    true,
+  );
+  assert.equal(
+    statusMarkup.inline_keyboard[1]?.[0]?.text.startsWith("🧠 Thinking"),
+    true,
+  );
+  assert.equal(statusMarkup.inline_keyboard.at(-1)?.[0]?.text, "🔢 Queue: 3");
+  assert.equal(
+    statusMarkup.inline_keyboard.at(-1)?.[0]?.callback_data,
+    "status:queue",
+  );
   const noReasoningMarkup = buildStatusReplyMarkup(modelB, "medium");
-  assert.equal(noReasoningMarkup.inline_keyboard.length, 1);
+  assert.equal(noReasoningMarkup.inline_keyboard.length, 2);
 });

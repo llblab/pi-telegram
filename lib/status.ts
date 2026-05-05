@@ -1,5 +1,6 @@
 /**
  * Telegram status rendering helpers
+ * Zones: telegram ui, pi agent diagnostics, tui
  * Builds usage, cost, and context summaries for the interactive Telegram status view
  */
 
@@ -41,6 +42,8 @@ export interface TelegramStatusActiveModel {
 export interface TelegramStatusContext {
   sessionManager: { getEntries(): TelegramStatusSessionEntry[] };
   getContextUsage(): TelegramContextUsage | undefined;
+  isIdle?: () => boolean;
+  hasPendingMessages?: () => boolean;
   modelRegistry: {
     isUsingOAuth(model: TelegramStatusActiveModel): boolean;
   };
@@ -406,12 +409,14 @@ export function buildTelegramStatusBarText(
     return `${label} ${theme.fg("muted", "disconnected")}`;
   if (!state.paired)
     return `${label} ${theme.fg("warning", "awaiting pairing")}`;
-  const queued = theme.fg("muted", state.queuedStatus);
+  const queued = state.queuedStatus ? theme.fg("muted", state.queuedStatus) : "";
   if (state.compactionInProgress) {
     return `${label} ${theme.fg("accent", "compacting")}${queued}`;
   }
   if (state.processing) {
-    return `${label} ${theme.fg("accent", state.processingStatus ?? "processing")}${queued}`;
+    const processingStatus = state.processingStatus ?? "processing";
+    const processingToken = processingStatus === "active" ? "warning" : "accent";
+    return `${label} ${theme.fg(processingToken, processingStatus)}${queued}`;
   }
   return `${label} ${theme.fg("success", "connected")}`;
 }
@@ -528,6 +533,13 @@ function buildContextSummary(
   return `${percent}/${formatTokens(contextWindow)}`;
 }
 
+function buildStatusSummary(ctx: TelegramStatusContext): string {
+  if (ctx.hasPendingMessages?.()) return "pending";
+  if (ctx.isIdle?.() === false) return "active";
+  if (ctx.isIdle?.() === true) return "idle";
+  return "unknown";
+}
+
 export function buildStatusHtml(
   ctx: TelegramStatusContext,
   activeModel: TelegramStatusActiveModel | undefined,
@@ -536,7 +548,7 @@ export function buildStatusHtml(
   const usesSubscription = activeModel
     ? ctx.modelRegistry.isUsingOAuth(activeModel)
     : false;
-  const lines: string[] = [];
+  const lines: string[] = [buildStatusRow("Status", buildStatusSummary(ctx))];
   const usageSummary = buildUsageSummary(stats);
   const costSummary = buildCostSummary(stats, usesSubscription);
   if (usageSummary) {
@@ -546,8 +558,5 @@ export function buildStatusHtml(
     lines.push(buildStatusRow("Cost", costSummary));
   }
   lines.push(buildStatusRow("Context", buildContextSummary(ctx, activeModel)));
-  if (lines.length === 0) {
-    lines.push(buildStatusRow("Status", "No usage data yet."));
-  }
   return lines.join("\n");
 }

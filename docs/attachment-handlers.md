@@ -1,6 +1,6 @@
 # Attachment Handlers
 
-`pi-telegram` can run ordered inbound attachment handlers after downloading files and before the Telegram turn enters the pi queue.
+`pi-telegram` can run ordered inbound attachment handlers after downloading files and before the Telegram turn enters the π queue.
 
 This document is the local adaptation of the portable [Command Template Standard](./command-templates.md).
 
@@ -13,19 +13,17 @@ This document is the local adaptation of the portable [Command Template Standard
   "attachmentHandlers": [
     {
       "type": "voice",
-      "template": "/path/to/stt1 --file {file} --lang {lang=ru}",
-      "timeout": 30000
+      "template": "/path/to/stt1 --file {file} --lang {lang=ru}"
     },
     {
       "mime": "audio/*",
-      "template": "/path/to/stt2 --file {file} --lang {lang=ru}",
-      "timeout": 30000
+      "template": "/path/to/stt2 --file {file} --lang {lang=ru}"
     }
   ]
 }
 ```
 
-Handlers match by `type`, `mime`, or `match`. Wildcards such as `audio/*` are accepted. Each matching handler must provide `template`; a string is one command, and an array is ordered composition. Top-level `args` and `defaults` apply to composed steps unless a step defines private values; top-level `timeout` wraps the whole sequence instead of being inherited by leaves. Legacy configs may still use `pipe` as a local alias.
+Handlers match by `type`, `mime`, or `match`. Wildcards such as `audio/*` are accepted. Each matching handler must provide `template`; a string is one command, and an array is ordered composition. Top-level `args` and `defaults` apply to composed steps unless a step defines private values. The command-template default timeout applies automatically. Legacy configs may still use `pipe` as a local alias.
 
 ## Template Placeholders
 

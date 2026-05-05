@@ -1,5 +1,9 @@
 # Extension Locks Standard
 
+**Meta-contract:** transportable (bit-for-bit identical across projects), high-density (zero fluff), constant (evolve by crystallizing, not speculating), optimal minimum (add only when it hurts).
+
+---
+
 `locks.json` is a shared registry for singleton pi extensions.
 
 Path:

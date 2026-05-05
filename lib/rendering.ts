@@ -1,5 +1,6 @@
 /**
  * Telegram preview and markdown rendering helpers
+ * Zones: telegram rendering, shared text utils
  * Converts assistant output into Telegram-safe plain text and HTML chunks with chunk-boundary handling
  */
 

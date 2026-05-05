@@ -1,5 +1,6 @@
 /**
  * Telegram API transport helpers
+ * Zones: telegram transport, filesystem, runtime diagnostics
  * Wraps bot API calls, file downloads, runtime transport binding, and Telegram temp-file cleanup
  */
 

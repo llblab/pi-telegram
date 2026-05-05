@@ -1,5 +1,6 @@
 /**
  * Telegram polling domain helpers
+ * Zones: telegram transport, polling runtime
  * Owns polling request builders, stop conditions, and the long-poll loop runtime for Telegram updates
  */
 

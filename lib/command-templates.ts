@@ -1,5 +1,6 @@
 /**
  * Command-template standard helpers
+ * Zones: shared utils, local process execution, automation standard
  * Owns shell-free command-template splitting, placeholder defaults, composition expansion, executable path expansion, and direct execution
  */
 
@@ -7,12 +8,16 @@ import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 
+export const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+
 export interface CommandTemplateObjectConfig {
   template?: CommandTemplateValue;
   args?: string[];
   defaults?: Record<string, unknown>;
   timeout?: number;
   output?: string;
+  retry?: number;
+  critical?: boolean;
 }
 
 export type CommandTemplateValue = string | CommandTemplateConfig[];
@@ -34,6 +39,7 @@ export interface CommandTemplateExecOptions {
   signal?: AbortSignal;
   stdin?: string;
   killGrace?: number;
+  retry?: number;
 }
 
 export interface CommandTemplateExecResult {
@@ -100,7 +106,13 @@ export function expandCommandTemplateConfigs(
   }
   if (typeof normalizedConfig.template !== "string") return [];
   return [
-    { ...normalizedConfig, ...context, template: normalizedConfig.template },
+    {
+      ...normalizedConfig,
+      ...context,
+      template: normalizedConfig.template,
+      retry: normalizedConfig.retry,
+      critical: normalizedConfig.critical,
+    },
   ];
 }
 
@@ -192,7 +204,22 @@ export function substituteCommandTemplateToken(
   );
 }
 
-export function execCommandTemplate(
+export async function execCommandTemplate(
+  command: string,
+  args: string[],
+  options: CommandTemplateExecOptions = {},
+): Promise<CommandTemplateExecResult> {
+  const maxAttempts = options.retry ?? 1;
+  let lastResult: CommandTemplateExecResult = { stdout: "", stderr: "", code: 1, killed: false };
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = await execCommandTemplateOnce(command, args, options);
+    if (result.code === 0) return result;
+    lastResult = result;
+  }
+  return lastResult;
+}
+
+function execCommandTemplateOnce(
   command: string,
   args: string[],
   options: CommandTemplateExecOptions = {},
@@ -231,8 +258,10 @@ export function execCommandTemplate(
       else
         options.signal.addEventListener("abort", killProcess, { once: true });
     }
-    if (options.timeout && options.timeout > 0)
+    if (options.timeout !== undefined && options.timeout > 0)
       timeoutId = setTimeout(killProcess, options.timeout);
+    else if (options.timeout === undefined)
+      timeoutId = setTimeout(killProcess, DEFAULT_COMMAND_TIMEOUT_MS);
     proc.stdout?.on("data", (data) => {
       stdout += data.toString();
     });

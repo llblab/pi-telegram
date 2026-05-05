@@ -15,7 +15,7 @@ type RuntimeTestHandler = (context: TestContext) => void | Promise<void>;
 type RuntimeTelegramExtension = typeof import("../index.ts")["default"];
 
 function test(name: string, fn: RuntimeTestHandler): void {
-  void testRoot(name, { concurrency: false }, fn);
+  void testRoot(name, { concurrency: false, timeout: 5000 }, fn);
 }
 
 let runtimeTelegramExtension: RuntimeTelegramExtension | undefined;
@@ -39,12 +39,6 @@ async function getRuntimeTelegramExtension(): Promise<RuntimeTelegramExtension> 
 async function flushMicrotasks(iterations = 10): Promise<void> {
   for (let i = 0; i < iterations; i++) {
     await Promise.resolve();
-  }
-}
-
-async function flushEventLoop(iterations = 5): Promise<void> {
-  for (let i = 0; i < iterations; i++) {
-    await new Promise((resolve) => setImmediate(resolve));
   }
 }
 
@@ -218,6 +212,7 @@ type RuntimePiHarnessOptions = {
   getThinkingLevel?: () => string;
   setModel?: (model: { provider: string; id: string }) => Promise<boolean>;
   setThinkingLevel?: (level: string) => void;
+  getCommands?: () => unknown[];
 };
 
 function createRuntimePiHarness(options: RuntimePiHarnessOptions = {}) {
@@ -232,6 +227,7 @@ function createRuntimePiHarness(options: RuntimePiHarnessOptions = {}) {
     },
     registerTool: () => {},
     sendUserMessage: options.sendUserMessage ?? (() => {}),
+    getCommands: options.getCommands ?? (() => []),
     getThinkingLevel: options.getThinkingLevel ?? (() => "medium"),
     ...(options.setModel ? { setModel: options.setModel } : {}),
     ...(options.setThinkingLevel
@@ -524,7 +520,7 @@ test("Typing loop starter binds default chat and reports failures", async () => 
   });
   startFailingTypingLoop({ id: "ctx" }, 8);
   await flushMicrotasks();
-  assert.deepEqual(failingStatusErrors, []);
+  assert.deepEqual(failingStatusErrors, ["boom"]);
   assert.deepEqual(runtimeEvents, ["typing:boom:8"]);
   assert.equal(runtime.typing.stop(), true);
 });
@@ -840,6 +836,7 @@ test("Extension runtime handles immediate status before queued prompt after agen
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const runtimeEvents: string[] = [];
   let firstDispatchResolved = false;
+  let shutdownCtx: unknown;
   const secondUpdates = createRuntimeDeferredResponse();
   const thirdUpdates = createRuntimeDeferredResponse();
   const { handlers, commands, pi } = createRuntimePiHarness({
@@ -852,9 +849,7 @@ test("Extension runtime handles immediate status before queued prompt after agen
   const restoreFetch = setRuntimeTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
-    if (method === "deleteWebhook") {
-      return createRuntimeTelegramApiResponse(true);
-    }
+    if (method === "deleteWebhook") return createRuntimeTelegramApiResponse(true);
     if (method === "getUpdates") {
       getUpdatesCalls += 1;
       if (getUpdatesCalls === 1) {
@@ -879,9 +874,7 @@ test("Extension runtime handles immediate status before queued prompt after agen
       runtimeEvents.push(`send:${String(body?.text ?? "")}`);
       return createRuntimeTelegramApiResponse({ message_id: 100 + runtimeEvents.length });
     }
-    if (method === "sendChatAction") {
-      return createRuntimeTelegramApiResponse(true);
-    }
+    if (method === "sendChatAction") return createRuntimeTelegramApiResponse(true);
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
   try {
@@ -907,6 +900,7 @@ test("Extension runtime handles immediate status before queued prompt after agen
       ...baseCtx,
       isIdle: () => false,
     };
+    shutdownCtx = idleCtx;
     await handlers.get("session_start")?.({}, idleCtx);
     await commands.get("telegram-connect")?.handler("", idleCtx);
     await waitForCondition(() => firstDispatchResolved);
@@ -950,13 +944,13 @@ test("Extension runtime handles immediate status before queued prompt after agen
     );
     await waitForCondition(() => runtimeEvents.length >= 3);
     assert.equal(runtimeEvents[0], "dispatch:[telegram] first request");
-    assert.match(runtimeEvents[1] ?? "", /^send:<b>Context:<\/b>/);
+    assert.match(runtimeEvents[1] ?? "", /^send:<b>π Telegram bridge<\/b>/);
     assert.equal(
       runtimeEvents[2],
       "dispatch:[telegram] follow up after status",
     );
-    await handlers.get("session_shutdown")?.({}, idleCtx);
   } finally {
+    if (shutdownCtx) await handlers.get("session_shutdown")?.({}, shutdownCtx);
     restoreFetch();
     await telegramConfig.restore();
   }
@@ -1419,6 +1413,7 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
   const modelB = createRuntimeModel("anthropic", "claude-b", true);
   const setModels: Array<string> = [];
   const thinkingLevels: Array<string> = [];
+  let shutdownCtx: unknown;
   const secondUpdates = createRuntimeDeferredResponse();
   const { handlers, commands, pi } = createRuntimePiHarness({
     getThinkingLevel: () => thinkingLevels.at(-1) ?? "medium",
@@ -1436,9 +1431,7 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
   const restoreFetch = setRuntimeTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
-    if (method === "deleteWebhook") {
-      return createRuntimeTelegramApiResponse(true);
-    }
+    if (method === "deleteWebhook") return createRuntimeTelegramApiResponse(true);
     if (method === "getUpdates") {
       getUpdatesCalls += 1;
       if (getUpdatesCalls === 1) {
@@ -1470,9 +1463,7 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
       callbackAnswers.push(String(body?.text ?? ""));
       return createRuntimeTelegramApiResponse(true);
     }
-    if (method === "sendChatAction") {
-      return createRuntimeTelegramApiResponse(true);
-    }
+    if (method === "sendChatAction") return createRuntimeTelegramApiResponse(true);
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
   try {
@@ -1490,6 +1481,7 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
         statusEvents.push(text);
       },
     });
+    shutdownCtx = ctx;
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
     await waitForCondition(() =>
@@ -1517,11 +1509,11 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
     assert.equal(callbackAnswers.includes("Switched to claude-b"), true);
     assert.equal(statusEvents.length > statusCountBeforePick, true);
     assert.equal(
-      runtimeEvents.some((event) => event.startsWith("edit:<b>Context:")),
+      runtimeEvents.some((event) => event.startsWith("edit:<b>π Telegram bridge</b>")),
       true,
     );
-    await handlers.get("session_shutdown")?.({}, ctx);
   } finally {
+    if (shutdownCtx) await handlers.get("session_shutdown")?.({}, shutdownCtx);
     process.argv = previousArgv;
     restoreFetch();
     await telegramConfig.restore();

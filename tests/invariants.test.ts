@@ -155,6 +155,15 @@ test("Project TypeScript files start with responsibility headers", () => {
   assert.deepEqual(filesWithoutHeaders, []);
 });
 
+test("Project source module headers include Domain DAG zone tags", () => {
+  const sourceFilesWithoutZoneTags = getProjectSourceFiles().filter((file) => {
+    const source = readFileSync(join(PROJECT_ROOT, file), "utf8");
+    const header = source.match(/^\/\*\*[\s\S]*?\*\//)?.[0] ?? "";
+    return !/^ \* Zones: .+/m.test(header);
+  });
+  assert.deepEqual(sourceFilesWithoutZoneTags, []);
+});
+
 test("Project source avoids empty interface-extension shells", () => {
   const emptyInterfacePattern =
     /export\s+interface\s+\w+(?:<[^>{}]+>)?\s+extends[^{]+\{\s*\}/g;

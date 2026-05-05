@@ -2,7 +2,7 @@
 
 `pi-telegram` maps hidden assistant-authored HTML comments to Telegram-native outbound actions.
 
-This is intentionally prompt-driven: the agent writes normal Markdown plus small hidden top-level blocks, and the bridge performs the transport work after `agent_end`. `telegram_voice` and `telegram_button` are not pi tools. Outbound behavior is an emergent result of the assistant prompt, configured command-template handlers, generated artifacts, and reply delivery. That avoids extra agent-side tool calls, avoids fragile parameter plumbing inside the conversation, and minimizes latency because text, voice, and buttons are planned in one standard assistant reply.
+This is intentionally prompt-driven: the agent writes normal Markdown plus small hidden top-level blocks, and the bridge performs the transport work after `agent_end`. `telegram_voice` and `telegram_button` are not π tools. Outbound behavior is an emergent result of the assistant prompt, configured command-template handlers, generated artifacts, and reply delivery. That avoids extra agent-side tool calls, avoids fragile parameter plumbing inside the conversation, and minimizes latency because text, voice, and buttons are planned in one standard assistant reply.
 
 This document is the local outbound adaptation of the portable [Command Template Standard](./command-templates.md).
 
@@ -15,7 +15,7 @@ An outbound handler is selected by `type`. Assistant markup maps to handler type
 | `telegram_voice`  | `voice`      | Generate OGG/Opus and call `sendVoice`             |
 | `telegram_button` | Built-in     | Attach an inline keyboard button to the final text |
 
-Configured command-template handlers provide `template`. A string is one command; an array is ordered composition. Top-level `args`, `defaults`, and `timeout` apply to all composed steps unless a step defines private values. `output` selects the primary artifact path when the handler produces a file instead of stdout text. Legacy configs may still use `pipe`, but `template: [...]` is the preferred standard shape.
+Configured command-template handlers provide `template`. A string is one command; an array is ordered composition. Top-level `args` and `defaults` apply to all composed steps unless a step defines private values. The command-template default timeout applies automatically. `output` selects the primary artifact path when the handler produces a file instead of stdout text. Legacy configs may still use `pipe`, but `template: [...]` is the preferred standard shape.
 
 ## Voice Handler Config
 
@@ -30,8 +30,7 @@ Configured command-template handlers provide `template`. A string is one command
         "/path/to/tts --text {text} --lang {lang=ru} --rate {rate=+30%} --write-media {mp3}",
         "ffmpeg -y -i {mp3} -c:a libopus -b:a 32k -ar 16000 -ac 1 -vbr on {ogg}"
       ],
-      "output": "ogg",
-      "timeout": 120000
+      "output": "ogg"
     }
   ]
 }
@@ -77,9 +76,11 @@ For composed handlers, `output` selects the primary artifact after the compositi
 
 For one-step `template` handlers, stdout remains the default result channel: the command should print the generated OGG/Opus path.
 
+**Critical steps:** voice synthesis is a multi-step pipeline (TTS → ffmpeg → OGG). The ffmpeg conversion step is inherently critical — if it fails, the voice output is invalid. Mark it as `"critical": true` when a composed handler must abort after conversion failure instead of continuing to later non-critical steps. Keep the fallback chain (Mistral TTS → Groq TTS) as the safety net for persistent outages. See [Command Template Standard](./command-templates.md) for semantics.
+
 ## Buttons Markup
 
-Assistant replies can include independent button blocks. The prompt is sent back to pi when the user taps the button; use the colon shorthand when the prompt should equal the label, `prompt="..."` for one-line prompts, or the body form for multiline prompts:
+Assistant replies can include independent button blocks. The prompt is sent back to π when the user taps the button; use the colon shorthand when the prompt should equal the label, `prompt="..."` for one-line prompts, or the body form for multiline prompts:
 
 ```md
 I can continue.

@@ -1,6 +1,14 @@
 # Command Template Standard
 
-Command templates are the portable integration format for deterministic local automation. Extensions may choose their own config files, selectors, placeholder sources, and examples, but should preserve this core contract.
+Command templates are the portable integration format for deterministic local automation.
+
+**Meta-contract:** transportable (bit-for-bit identical across projects), high-density (zero fluff), constant (evolve by crystallizing, not speculating), optimal minimum (add only when it hurts).
+
+**Scope:** portable command execution format — shell-free exec, composition/pipes, default timeout, critical-step branching, output artifact selection, handler-level fallback. Single JSON standard; no platform lock-in.
+
+---
+
+Extensions may choose their own config files, selectors, placeholder sources, and examples, but should preserve this core contract.
 
 ## Shape
 
@@ -22,13 +30,14 @@ There is no portable `command` field. The command is derived from `template`: af
 
 Common object fields:
 
-| Field      | Meaning                                                                                                               |
-| ---------- | --------------------------------------------------------------------------------------------------------------------- |
-| `template` | Required command string or ordered composition array                                                                  |
-| `args`     | Optional placeholder-name declarations only; never stores defaults                                                    |
-| `defaults` | Placeholder default values by name                                                                                    |
-| `timeout`  | Optional execution timeout in milliseconds                                                                            |
-| `output`   | Optional result selector; default is `"stdout"`, artifact-producing handlers may name a runtime value such as `"ogg"` |
+| Field      | Meaning                                                                                    |
+| ---------- | ------------------------------------------------------------------------------------------ |
+| `template` | Required command string or ordered composition array                                       |
+| `args`     | Optional placeholder-name declarations only; never stores defaults                         |
+| `defaults` | Placeholder default values by name                                                         |
+| `timeout`  | Optional execution timeout override in milliseconds; default `30000` (30s)                 |
+| `output`   | Optional result selector; default `"stdout"`, or a "runtime value", e.g. `"ogg"`           |
+| `critical` | Optional boolean; default `false`. When `true`, failure aborts the entire root composition |
 
 Storage paths, labels, selectors, descriptions, and registry-specific metadata belong to each extension's local schema.
 
@@ -113,7 +122,7 @@ Composition rules:
 - Treat the whole composition as one handler for selector matching and fallback
 - Top-level `args` and `defaults` apply to every leaf unless the leaf defines private values
 - Leaf `args` replace inherited `args`; leaf `defaults` merge over inherited defaults; `timeout` and `output` are not inherited into leaves
-- Top-level `timeout` wraps the whole sequence; leaf `timeout` applies only to that leaf within the remaining total budget
+- Default `30000` (30s) timeout applies automatically; configure `timeout` only for exceptional long-running commands
 - Each leaf receives the previous leaf's stdout on stdin by default, while the final leaf stdout remains the default composition result
 - Each leaf still applies its own inline defaults
 
@@ -135,6 +144,41 @@ Composition rules:
 `output` selects the primary result channel. Omitted `output` means `"stdout"`, and explicitly writing `"output": "stdout"` is valid standard syntax. Artifact-producing handlers may instead name a runtime value or placeholder path, e.g. `"ogg"` or `"{ogg}"`.
 
 Legacy local schemas may accept `pipe` as an alias, but the portable standard is `template: [...]`.
+
+## Fail-Open Default Policy
+
+By default, composition continues on failure: the failed step is logged and the next step executes. This is analogous to `make -k` — the user sees all failures at once and decides what to fix.
+
+## Critical Steps
+
+Set `critical: true` on any leaf to abort the entire root composition on failure. One `critical` leaf can halt the whole pipeline.
+
+```json
+{
+  "template": [
+    { "template": "cargo build" },
+    { "template": "cargo fmt --check" },
+    { "template": "cargo test", "critical": true }
+  ]
+}
+```
+
+`build` / `fmt` failures are logged, execution continues. `test` failure aborts the root composition immediately.
+
+A `critical` leaf in a nested composition still aborts the outermost root `template: [...]`. There is no per-branch scoping in the current standard.
+
+## Progressive Disclosure
+
+The standard uses a single `template` field that grows with the user's needs:
+
+```text
+string           → leaf command
+string[]         → sequential composition
+{ template }     → leaf with defaults
+{ template, critical, output } → full leaf
+```
+
+Start with a string. Add composition when needed. Add critical when safety matters. Same contract, growing capability, no dead weight.
 
 ## Tool Boundary
 

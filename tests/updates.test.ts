@@ -16,6 +16,8 @@ import {
   executeTelegramUpdate,
   executeTelegramUpdatePlan,
   extractDeletedTelegramMessageIds,
+  TELEGRAM_PRIORITY_REACTION_EMOJIS,
+  TELEGRAM_REMOVAL_REACTION_EMOJIS,
   getAuthorizedTelegramCallbackQuery,
   handleAuthorizedTelegramReactionUpdate,
   getAuthorizedTelegramEditedMessage,
@@ -33,6 +35,18 @@ test("Update helpers normalize emoji reactions and collect emoji-only entries", 
     { type: "custom_emoji" },
   ]);
   assert.deepEqual([...emojis], ["👍", "👎"]);
+  assert.deepEqual([...TELEGRAM_PRIORITY_REACTION_EMOJIS], [
+    "👍",
+    "⚡",
+    "❤",
+    "🕊",
+  ]);
+  assert.deepEqual([...TELEGRAM_REMOVAL_REACTION_EMOJIS], [
+    "👎",
+    "👻",
+    "💔",
+    "💩",
+  ]);
 });
 
 test("Update helpers extract deleted business-message ids only from Bot API shapes", () => {
@@ -402,10 +416,60 @@ test("Update runtime handles authorized reaction priority and removal effects", 
   await handleAuthorizedTelegramReactionUpdate(
     {
       chat: { type: "private" },
-      user: { id: 8, is_bot: false },
+      user: { id: 7, is_bot: false },
       message_id: 13,
       old_reaction: [],
-      new_reaction: [{ type: "emoji", emoji: "👍" }],
+      new_reaction: [{ type: "emoji", emoji: "⚡" }],
+    },
+    deps,
+  );
+  await handleAuthorizedTelegramReactionUpdate(
+    {
+      chat: { type: "private" },
+      user: { id: 7, is_bot: false },
+      message_id: 14,
+      old_reaction: [],
+      new_reaction: [{ type: "emoji", emoji: "❤️" }],
+    },
+    deps,
+  );
+  await handleAuthorizedTelegramReactionUpdate(
+    {
+      chat: { type: "private" },
+      user: { id: 7, is_bot: false },
+      message_id: 15,
+      old_reaction: [],
+      new_reaction: [{ type: "emoji", emoji: "🕊️" }],
+    },
+    deps,
+  );
+  await handleAuthorizedTelegramReactionUpdate(
+    {
+      chat: { type: "private" },
+      user: { id: 7, is_bot: false },
+      message_id: 16,
+      old_reaction: [],
+      new_reaction: [{ type: "emoji", emoji: "👻" }],
+    },
+    deps,
+  );
+  await handleAuthorizedTelegramReactionUpdate(
+    {
+      chat: { type: "private" },
+      user: { id: 7, is_bot: false },
+      message_id: 17,
+      old_reaction: [],
+      new_reaction: [{ type: "emoji", emoji: "💔" }],
+    },
+    deps,
+  );
+  await handleAuthorizedTelegramReactionUpdate(
+    {
+      chat: { type: "private" },
+      user: { id: 7, is_bot: false },
+      message_id: 18,
+      old_reaction: [],
+      new_reaction: [{ type: "emoji", emoji: "💩" }],
     },
     deps,
   );
@@ -414,6 +478,15 @@ test("Update runtime handles authorized reaction priority and removal effects", 
     "clear:11",
     "media:12",
     "remove:12",
+    "prioritize:13",
+    "prioritize:14",
+    "prioritize:15",
+    "media:16",
+    "remove:16",
+    "media:17",
+    "remove:17",
+    "media:18",
+    "remove:18",
   ]);
 });
 

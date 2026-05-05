@@ -1,5 +1,6 @@
 /**
  * Telegram lifecycle hook registration helpers
+ * Zones: pi agent lifecycle, telegram session
  * Owns binding prepared Telegram lifecycle runtimes to pi extension lifecycle events
  */
 
@@ -12,6 +13,21 @@ import type {
   SessionShutdownEvent,
   SessionStartEvent,
 } from "./pi.ts";
+
+let resetTransportReplyDedupFn: (() => void) | undefined;
+
+export function setResetTransportReplyDedup(fn: () => void): void {
+  resetTransportReplyDedupFn = fn;
+}
+
+export function createAgentStartDedupHook(
+  inner: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>,
+): (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void> {
+  return async function onAgentStartDedup(event, ctx) {
+    if (resetTransportReplyDedupFn) resetTransportReplyDedupFn();
+    return inner(event, ctx);
+  };
+}
 
 export interface TelegramBeforeAgentStartResult {
   systemPrompt?: string;
@@ -74,6 +90,16 @@ export interface TelegramSessionLifecycleHooks {
     event: SessionShutdownEvent,
     ctx: ExtensionContext,
   ) => Promise<void>;
+}
+
+export function createDedupAgentStartHook(
+  dedup: { reset(): void },
+  inner: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>,
+): (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void> {
+  return async (event, ctx) => {
+    dedup.reset();
+    await inner(event, ctx);
+  };
 }
 
 export interface TelegramExtraLifecycleHooks {

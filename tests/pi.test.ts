@@ -42,6 +42,10 @@ test("Pi API runtime ports bind methods without losing receiver context", async 
       this.events.push(`exec:${command}:${args.join(",")}`);
       return { stdout: "ok", stderr: "", code: 0, killed: false };
     },
+    getCommands() {
+      this.events.push("commands");
+      return [];
+    },
     getThinkingLevel() {
       this.events.push("get-thinking");
       return "high";
@@ -62,12 +66,14 @@ test("Pi API runtime ports bind methods without losing receiver context", async 
     code: 0,
     killed: false,
   });
+  assert.deepEqual(runtime.getCommands(), []);
   assert.equal(runtime.getThinkingLevel(), "high");
   runtime.setThinkingLevel("low");
   assert.equal(await runtime.setModel(createHarnessModel("gpt-5")), true);
   assert.deepEqual(api.events, [
     "send:hello",
     "exec:cmd:arg",
+    "commands",
     "get-thinking",
     "thinking:low",
     "model:gpt-5",

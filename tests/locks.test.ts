@@ -130,7 +130,7 @@ test("Locked polling runtime can force takeover of live external owners", async 
       ok: false,
       canTakeover: true,
       owner: "pid 99, cwd /old",
-      message: "Telegram bridge is active in another pi instance (pid 99, cwd /old).",
+      message: "Telegram bridge is active in another π instance (pid 99, cwd /old)."
     });
     const moved = await runtime.start({ cwd: "/new" }, { force: true });
     assert.deepEqual(moved, { ok: true, message: "Telegram bridge connected." });
