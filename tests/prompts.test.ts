@@ -1,7 +1,7 @@
 /**
  * Tests for Telegram prompt injection helpers
- * Covers system prompt suffix construction, translation injection,
- * debug logging, and log prune mechanism
+ * Covers system prompt suffix construction, Google Translate bypass integration,
+ * language detection, debug logging, and log prune mechanism
  */
 
 import assert from "node:assert/strict";
@@ -17,6 +17,7 @@ import test from "node:test";
 import {
   buildTelegramBridgeSystemPrompt,
   createTelegramBeforeAgentStartHook,
+  createTelegramAfterAgentEndHook,
   logTelegramBridgePrompt,
   MAX_LOG_ENTRIES,
   pruneTelegramBridgeLogs,
@@ -39,7 +40,7 @@ const LOG_FILE = join(homedir(), ".pi", "agent", "logs", "telegram-bridge.log");
 // Existing regression tests (must still pass)
 // ---------------------------------------------------------------------------
 
-test("Prompt helpers append Telegram-aware system prompt suffixes", () => {
+test("buildTelegramBridgeSystemPrompt appends suffix and Telegram marker", () => {
   assert.deepEqual(
     buildTelegramBridgeSystemPrompt({
       prompt: " [telegram] hello",
@@ -63,87 +64,115 @@ test("Prompt helpers append Telegram-aware system prompt suffixes", () => {
   );
 });
 
-test("Prompt helpers build before-agent-start hooks", () => {
+// ---------------------------------------------------------------------------
+// Hook behavior: sync path (English/ASCII)
+// ---------------------------------------------------------------------------
+
+test("createTelegramBeforeAgentStartHook sync path for English Telegram messages", async () => {
   const hook = createTelegramBeforeAgentStartHook({
     telegramPrefix: "[telegram]",
-    systemPromptSuffix: "\nbridge active",
+    systemPromptSuffix: "\nbase suffix",
   });
-  assert.deepEqual(
-    hook(createBeforeAgentStartEvent(" [telegram] hello", "base")),
-    {
-      systemPrompt:
-        "base\nbridge active\n- The current user message came from Telegram.",
-    },
+  const result = await hook(
+    createBeforeAgentStartEvent(" [telegram] Hello world", "base"),
   );
-  const defaultSystemPrompt = createTelegramBeforeAgentStartHook()(
-    createBeforeAgentStartEvent(" [telegram] hello", "base"),
-  ).systemPrompt;
-  assert.match(
-    defaultSystemPrompt,
-    /The current user message came from Telegram/,
+  assert.ok(
+    result.systemPrompt.includes("base suffix"),
+    "Should include base suffix",
   );
-  assert.match(defaultSystemPrompt, /prefer narrow table columns/);
-  assert.match(defaultSystemPrompt, /telegram_attach/);
+  assert.ok(
+    result.systemPrompt.includes("The current user message came from Telegram"),
+    "Should include Telegram marker",
+  );
+  assert.ok(
+    !result.systemPrompt.includes("Language Detection"),
+    "Should NOT include language detection for English",
+  );
+});
+
+test("createTelegramBeforeAgentStartHook sync path for non-Telegram messages", () => {
+  const hook = createTelegramBeforeAgentStartHook({
+    telegramPrefix: "[telegram]",
+    systemPromptSuffix: "\nbase suffix",
+  });
+  const result = hook(
+    createBeforeAgentStartEvent("local command", "base"),
+  );
+  assert.equal(result.systemPrompt, "base\nbase suffix");
+  assert.ok(
+    !result.systemPrompt.includes("The current user message came from Telegram"),
+    "Should NOT include Telegram marker for local messages",
+  );
 });
 
 // ---------------------------------------------------------------------------
-// Translation prompt injection tests
+// Hook behavior: async path (non-English)
 // ---------------------------------------------------------------------------
 
-test("SYSTEM_PROMPT_SUFFIX contains TRANSLATION instructions", () => {
-  const hook = createTelegramBeforeAgentStartHook();
-  const vnResult = hook(
-    createBeforeAgentStartEvent(" [telegram] Xin chào", "base"),
+test("createTelegramBeforeAgentStartHook async path for non-English Telegram messages", async () => {
+  const hook = createTelegramBeforeAgentStartHook({
+    telegramPrefix: "[telegram]",
+  });
+  const result = await hook(
+    createBeforeAgentStartEvent(" [telegram] Xin chào bạn", "base"),
   );
-  assert.match(
-    vnResult.systemPrompt,
-    /TRANSLATION/i,
-    "Should contain TRANSLATION heading",
+  assert.ok(
+    result.systemPrompt.includes("Language Detection"),
+    "Should include language detection section",
   );
-  assert.match(
-    vnResult.systemPrompt,
-    /Vietnamese|Vietnamese or Chinese/i,
-    "Should mention Vietnamese as a target language",
+  assert.ok(
+    result.systemPrompt.includes("Vietnamese"),
+    "Should detect Vietnamese",
   );
-  assert.match(
-    vnResult.systemPrompt,
-    /translate.*back|dịch ngược/i,
-    "Should mention translating back to original language",
+  assert.ok(
+    result.systemPrompt.includes("English Translation"),
+    "Should include English translation",
+  );
+  assert.ok(
+    result.systemPrompt.includes("Respond in Vietnamese"),
+    "Should instruct LLM to respond in Vietnamese",
+  );
+  assert.ok(
+    result.systemPrompt.includes("The current user message came from Telegram"),
+    "Should include Telegram marker",
   );
 });
 
-test("Telegram messages get TRANSLATION suffix", () => {
-  const result = buildTelegramBridgeSystemPrompt({
-    prompt: " [telegram] Xin chào bạn",
-    systemPrompt: "base",
+test("createTelegramBeforeAgentStartHook handles Arabic messages correctly", async () => {
+  const hook = createTelegramBeforeAgentStartHook({
     telegramPrefix: "[telegram]",
-    systemPromptSuffix: "\n**TRANSLATION**: test instruction",
   });
-  assert.ok(
-    result.systemPrompt.includes("TRANSLATION"),
-    "Translation instructions should be in the suffix for Telegram messages",
+  const result = await hook(
+    createBeforeAgentStartEvent(" [telegram] \u0645\u0631\u062d\u0628\u0627", "base"),
   );
   assert.ok(
-    result.systemPrompt.includes(
-      "The current user message came from Telegram",
-    ),
-    "Telegram context line should be appended",
+    result.systemPrompt.includes("Language Detection"),
+    "Should include language detection section",
+  );
+  assert.ok(
+    result.systemPrompt.includes("Arabic") || result.systemPrompt.includes("ar"),
+    "Should detect Arabic",
+  );
+  assert.ok(
+    result.systemPrompt.includes("Respond in Arabic"),
+    "Should instruct LLM to respond in Arabic",
   );
 });
 
-test("Non-Telegram prompts do NOT get Telegram suffix line", () => {
-  const result = buildTelegramBridgeSystemPrompt({
-    prompt: "local command",
-    systemPrompt: "base",
-    telegramPrefix: "[telegram]",
-    systemPromptSuffix: "\n**TRANSLATION**: test instruction",
-  });
-  assert.ok(
-    !result.systemPrompt.includes(
-      "The current user message came from Telegram",
-    ),
-    "Telegram context line should NOT be appended for local prompts",
-  );
+// ---------------------------------------------------------------------------
+// afterAgentEnd hook
+// ---------------------------------------------------------------------------
+
+test("createTelegramAfterAgentEndHook returns response unchanged for English", async () => {
+  const hook = createTelegramAfterAgentEndHook();
+  const result = await hook("Hello there", "en");
+  assert.equal(result, "Hello there");
+});
+
+test("createTelegramAfterAgentEndHook returns response unchanged for auto", async () => {
+  const hook = createTelegramAfterAgentEndHook();
+  const result = await hook("Hello there", "auto");
+  assert.equal(result, "Hello there");
 });
 
 // ---------------------------------------------------------------------------
@@ -173,7 +202,6 @@ test("logTelegramBridgePrompt writes JSON entries to log file", () => {
 });
 
 test("pruneTelegramBridgeLogs keeps at most MAX_LOG_ENTRIES entries", () => {
-  // Append more than MAX_LOG_ENTRIES lines
   const overflow = MAX_LOG_ENTRIES + 50;
   for (let i = 0; i < overflow; i++) {
     appendFileSync(
@@ -186,23 +214,19 @@ test("pruneTelegramBridgeLogs keeps at most MAX_LOG_ENTRIES entries", () => {
       "utf-8",
     );
   }
-  // Count before pruning
   const beforeContent = readFileSync(LOG_FILE, "utf-8");
   const beforeLines = beforeContent.trim().split("\n").filter(Boolean);
   assert.ok(
     beforeLines.length > MAX_LOG_ENTRIES,
     `Should have >${MAX_LOG_ENTRIES} lines before prune`,
   );
-  // Prune
   pruneTelegramBridgeLogs();
-  // Count after pruning
   const afterContent = readFileSync(LOG_FILE, "utf-8");
   const afterLines = afterContent.trim().split("\n").filter(Boolean);
   assert.ok(
     afterLines.length <= MAX_LOG_ENTRIES,
     `After pruning, should have <=${MAX_LOG_ENTRIES} lines, got ${afterLines.length}`,
   );
-  // Verify latest entries are preserved
   const lastParsed = JSON.parse(afterLines[afterLines.length - 1]);
   assert.match(
     lastParsed.prompt,
@@ -212,29 +236,6 @@ test("pruneTelegramBridgeLogs keeps at most MAX_LOG_ENTRIES entries", () => {
 });
 
 test("pruneTelegramBridgeLogs handles missing log file gracefully", () => {
-  // Should not throw when LOG_FILE doesn't exist
   pruneTelegramBridgeLogs();
   assert.ok(true, "Should not throw when log file is missing");
-});
-
-// ---------------------------------------------------------------------------
-// Hook integration test
-// ---------------------------------------------------------------------------
-
-test("createTelegramBeforeAgentStartHook produces suffix with translation instructions", () => {
-  const hook = createTelegramBeforeAgentStartHook();
-  const result = hook(
-    createBeforeAgentStartEvent(" [telegram] Xin chào bạn", "base"),
-  ).systemPrompt;
-  assert.match(
-    result,
-    /TRANSLATION/i,
-    "Should include translation instructions",
-  );
-  assert.match(
-    result,
-    /The current user message came from Telegram/,
-    "Should include Telegram marker",
-  );
-  assert.match(result, /telegram_attach/, "Should include telegram_attach guidance");
 });
