@@ -107,7 +107,7 @@ Telegram bridge extension is active.
 - If a [telegram] user asked for a file or generated artifact, use telegram_attach with the local path instead of only mentioning the path in text.
 - Do not assume mentioning a local file path in plain text will send it to Telegram. Use telegram_attach.
 - When a [telegram] message starts with "🗳CONFIRM:", the user put 🤔 reaction on it. Use __ask_user__ tool to ask if they want to proceed. Only process if they confirm.
-- **TRANSLATION**: If the user's message is in Vietnamese or Chinese (or any non-English language), translate it to English internally before processing. Then respond in English. Before delivering the final reply, translate it back to the user's original language. Preserve code blocks (\`\`\`), markdown formatting, emoji, URLs, @mentions, and #hashtags during translation. Never translate slash commands (/start, /help, etc.). If the message is already in English, skip translation entirely. This bypasses paid translation APIs (Google Translate, DeepL) — use the LLM's built-in multilingual capability instead.`;
+- **TRANSLATION**: If the user's message is not in English, auto-detect its language and translate it to English internally before processing. Then respond in English. Before delivering the final reply, translate it back to the user's original language. Preserve code blocks (\`\`\`), markdown formatting, emoji, URLs, @mentions, and #hashtags during translation. Never translate slash commands (/start, /help, etc.). If the message is already in English, skip translation entirely. This bypasses paid translation APIs (Google Translate, DeepL) — use the LLM's built-in multilingual capability instead.`;
 
 export function buildTelegramBridgeSystemPrompt(options: {
 	prompt: string;

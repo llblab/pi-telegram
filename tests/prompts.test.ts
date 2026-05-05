@@ -102,8 +102,8 @@ test("SYSTEM_PROMPT_SUFFIX contains TRANSLATION instructions", () => {
   );
   assert.match(
     vnResult.systemPrompt,
-    /Vietnamese|Vietnamese or Chinese/i,
-    "Should mention Vietnamese as a target language",
+    /auto-detect|not in English/i,
+    "Should mention auto-detection for any language",
   );
   assert.match(
     vnResult.systemPrompt,
