@@ -109,7 +109,7 @@ export async function handleTelegramThinkingMenuCallbackAction(
 }
 
 export function buildThinkingMenuText(): string {
-  return "<b>Choose a thinking level:</b>";
+  return "<b>🧠 Choose a thinking level:</b>";
 }
 
 export function buildThinkingMenuReplyMarkup(

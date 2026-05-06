@@ -236,7 +236,7 @@ export interface TelegramModelMenuRuntime<
 
 export const TELEGRAM_MODEL_PAGE_SIZE = 6;
 const TELEGRAM_MODEL_PAGE_PICKER_ROW_SIZE = 4;
-export const MODEL_MENU_TITLE = "<b>Choose a model:</b>";
+export const MODEL_MENU_TITLE = "<b>🤖 Choose a model:</b>";
 export const MODEL_PAGE_MENU_TITLE = "<b>Choose a page:</b>";
 
 function truncateTelegramButtonLabel(label: string, maxLength = 56): string {

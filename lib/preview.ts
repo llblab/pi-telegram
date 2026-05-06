@@ -89,6 +89,7 @@ export interface TelegramPreviewRuntimeDeps<
     chunks: TelegramRenderedChunk[],
     options?: { replyMarkup?: TReplyMarkup },
   ) => Promise<number | undefined>;
+  canSend?: () => boolean;
 }
 
 export interface TelegramPreviewActiveTurn {
@@ -182,6 +183,7 @@ export interface TelegramPreviewControllerDeps<
     chunks: TelegramRenderedChunk[],
     options?: { replyMarkup?: TReplyMarkup },
   ) => Promise<number | undefined>;
+  canSend?: () => boolean;
   throttleMs?: number;
   maxDraftId?: number;
   setTimer?: (
@@ -418,6 +420,7 @@ export function createTelegramPreviewController<
         options,
       ),
     editRenderedMessage: deps.editRenderedMessage,
+    canSend: deps.canSend,
   });
   return {
     getState: () => state,
@@ -574,6 +577,10 @@ async function performTelegramPreviewFlush<
   state: TelegramPreviewRuntimeState,
   deps: TelegramPreviewRuntimeDeps<TReplyMarkup>,
 ): Promise<void> {
+  if (deps.canSend && !deps.canSend()) {
+    await clearTelegramPreview(chatId, deps);
+    return;
+  }
   const snapshot = buildTelegramPreviewSnapshot({
     state,
     maxMessageLength: deps.maxMessageLength,
@@ -658,6 +665,10 @@ export async function finalizeTelegramPreview<
 ): Promise<boolean> {
   const state = deps.getState();
   if (!state) return false;
+  if (deps.canSend && !deps.canSend()) {
+    await clearTelegramPreview(chatId, deps);
+    return false;
+  }
   await flushTelegramPreview(chatId, deps);
   const finalText = buildTelegramPreviewFinalText(state);
   if (!finalText) {
@@ -683,6 +694,10 @@ export async function finalizeTelegramMarkdownPreview<
 ): Promise<boolean> {
   const state = deps.getState();
   if (!state) return false;
+  if (deps.canSend && !deps.canSend()) {
+    await clearTelegramPreview(chatId, deps);
+    return false;
+  }
   await flushTelegramPreview(chatId, deps);
   const chunks = deps.renderTelegramMessage(markdown, { mode: "markdown" });
   if (chunks.length === 0) {

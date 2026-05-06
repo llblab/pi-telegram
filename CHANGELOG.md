@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.2: Lock-Safe Delivery
+
+- `[Lock Safety]` Active Telegram turns now re-check singleton ownership before preview flushes and final agent-end delivery. Impact: an old π instance stays silent after another instance takes the Telegram bridge lock, even if the old instance finishes a long-running prompt later.
+- `[Inbound Handlers]` The first step of an inbound composition now receives the full configured handler timeout before elapsed-time accounting starts on later steps. Impact: composition timeout behavior is deterministic and avoids one-millisecond test/runtime drift at pipeline start.
+- `[Menu UI]` Model and Thinking submenu headers now include their matching command icons (`🤖` and `🧠`). Impact: submenu headings match the Queue menu's icon-led style.
+- `[Package]` Bumped package metadata to `0.8.2` and kept the lockfile in sync.
+
 ## 0.8.1: Outbound Voice Translation Hotfix
 
 - `[Outbound Voice]` Composed voice handlers now pass the original `telegram_voice` text to the first pipeline step through stdin, then continue piping each step's stdout into the next step. Impact: translate-from-stdin voice pipelines can translate hidden voice text before TTS instead of failing with an empty first-step input.

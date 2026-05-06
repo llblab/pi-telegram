@@ -812,6 +812,51 @@ test("Agent end runtime resets state, finalizes replies, sends attachments, and 
   ]);
 });
 
+test("Agent end runtime stays silent when Telegram lock moved away", async () => {
+  const events: string[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    queuedAttachments: [{ path: "/tmp/demo.txt", fileName: "demo.txt" }],
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "final" },
+    preserveQueuedTurnsAsHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    isCurrentOwner: () => false,
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("unexpected:dispatch");
+    },
+    clearPreview: async (chatId) => {
+      events.push(`clear:${chatId}`);
+    },
+    setPreviewPendingText: () => {
+      events.push("unexpected:preview");
+    },
+    finalizeMarkdownPreview: async () => {
+      events.push("unexpected:finalize");
+      return true;
+    },
+    sendMarkdownReply: async () => {
+      events.push("unexpected:markdown");
+    },
+    sendTextReply: async () => {
+      events.push("unexpected:text");
+    },
+    sendQueuedAttachments: async () => {
+      events.push("unexpected:attachments");
+    },
+    sendOutboundReplyArtifacts: async () => {
+      events.push("unexpected:voice");
+    },
+  });
+  assert.deepEqual(events, ["reset", "status", "clear:1"]);
+});
+
 test("Agent end runtime passes assistant button markup to final text delivery", async () => {
   const events: unknown[] = [];
   const replyMarkup = {

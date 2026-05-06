@@ -61,6 +61,11 @@ export interface TelegramLockRuntime<TContext extends TelegramLockContext> {
   owns: (ctx?: TelegramLockContext) => boolean;
 }
 
+export interface TelegramLockOwnershipGuard<TContext extends TelegramLockContext> {
+  ownsCurrentProcess: () => boolean;
+  ownsContext: (ctx: TContext) => boolean;
+}
+
 export interface TelegramLockRuntimeOptions {
   key?: string;
   locksPath?: string;
@@ -231,6 +236,17 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
     getStatusLabel: () =>
       formatLockState(getLockState(readLock(), pid, isAlive)),
     owns: (ctx) => ownsLockContext(readLock(), pid, ctx),
+  };
+}
+
+export function createTelegramLockOwnershipGuard<
+  TContext extends TelegramLockContext,
+>(
+  lock: TelegramLockRuntime<TContext>,
+): TelegramLockOwnershipGuard<TContext> {
+  return {
+    ownsCurrentProcess: () => lock.owns(),
+    ownsContext: (ctx) => lock.owns(ctx),
   };
 }
 

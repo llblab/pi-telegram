@@ -118,6 +118,7 @@ function createPreviewRuntimeHarness(state?: {
         );
         return messageId;
       },
+      canSend: undefined as undefined | (() => boolean),
     },
   };
 }
@@ -713,6 +714,20 @@ test("Preview runtime can still use and clear plain draft previews", async () =>
   assert.equal(harness.getDraftSupport(), "supported");
   await clearTelegramPreview(7, harness.deps);
   assert.deepEqual(harness.events, ["draft:7:10:hello"]);
+  assert.equal(harness.getState(), undefined);
+});
+
+test("Preview runtime clears without sending when Telegram lock moved away", async () => {
+  const timer = setTimeout(() => {}, 1000);
+  const harness = createPreviewRuntimeHarness({
+    mode: "draft",
+    pendingText: "**hello**",
+    lastSentText: "",
+    flushTimer: timer,
+  });
+  harness.deps.canSend = () => false;
+  await flushTelegramPreview(7, harness.deps);
+  assert.deepEqual(harness.events, []);
   assert.equal(harness.getState(), undefined);
 });
 

@@ -279,7 +279,7 @@ test("Menu runtime builds menu state from settings and model-registry ports", as
 });
 
 test("Menu helpers expose UI constants", () => {
-  assert.equal(MODEL_MENU_TITLE, "<b>Choose a model:</b>");
+  assert.equal(MODEL_MENU_TITLE, "<b>🤖 Choose a model:</b>");
   assert.equal(MODEL_PAGE_MENU_TITLE, "<b>Choose a page:</b>");
   assert.equal(TELEGRAM_MODEL_PAGE_SIZE, 6);
 });
@@ -1203,7 +1203,7 @@ test("Menu helpers build pure render payloads before transport", () => {
     "medium",
   );
   assert.equal(modelPayload.nextMode, "model");
-  assert.equal(modelPayload.text, "<b>Choose a model:</b>");
+  assert.equal(modelPayload.text, "<b>🤖 Choose a model:</b>");
   assert.equal(modelPayload.mode, "html");
   const pageState = createMenuState(3, {
     scope: "all",
@@ -1215,7 +1215,7 @@ test("Menu helpers build pure render payloads before transport", () => {
   assert.equal(pagePayload.text, "<b>Choose a page:</b>");
   assert.equal(pagePayload.mode, "html");
   assert.equal(thinkingPayload.nextMode, "thinking");
-  assert.equal(thinkingPayload.text, "<b>Choose a thinking level:</b>");
+  assert.equal(thinkingPayload.text, "<b>🧠 Choose a thinking level:</b>");
   assert.equal(thinkingPayload.mode, "html");
   assert.equal(statusPayload.nextMode, "status");
   assert.equal(statusPayload.text, "<b>Status</b>");
@@ -1257,12 +1257,12 @@ test("Menu action runtime opens and updates interactive menu messages", async ()
   await runtime.updateStatusMessage(state, "ctx");
   await runtime.sendStatusMessage(1, 2, "ctx");
   await runtime.openModelMenu(1, 2, "ctx");
-  assert.equal(events[0], "edit:1:2:html:<b>Choose a model:</b>");
-  assert.equal(events[1], "edit:1:2:html:<b>Choose a thinking level:</b>");
+  assert.equal(events[0], "edit:1:2:html:<b>🤖 Choose a model:</b>");
+  assert.equal(events[1], "edit:1:2:html:<b>🧠 Choose a thinking level:</b>");
   assert.equal(events[2], "edit:1:2:html:<b>Status ctx</b>");
   assert.equal(events[3], "send:1:html:<b>Status ctx</b>");
   assert.equal(events[4], "store:99");
-  assert.equal(events[5], "send:1:html:<b>Choose a model:</b>");
+  assert.equal(events[5], "send:1:html:<b>🤖 Choose a model:</b>");
   assert.equal(events[6], "store:99");
 });
 
@@ -1323,7 +1323,7 @@ test("Menu action runtime with state builder opens menus from settings runtime",
   assert.deepEqual(events, [
     "reload:/repo",
     "patterns:1",
-    "send:<b>Choose a model:</b>",
+    "send:<b>🤖 Choose a model:</b>",
     "store:99",
   ]);
 });
@@ -1373,11 +1373,11 @@ test("Menu helpers update and send interactive menu messages", async () => {
   const sentModelId = await sendTelegramModelMenuMessage(state, modelA, deps);
   assert.equal(sentStatusId, 99);
   assert.equal(sentModelId, 99);
-  assert.equal(events[0], "edit:1:2:html:<b>Choose a model:</b>");
-  assert.equal(events[1], "edit:1:2:html:<b>Choose a thinking level:</b>");
+  assert.equal(events[0], "edit:1:2:html:<b>🤖 Choose a model:</b>");
+  assert.equal(events[1], "edit:1:2:html:<b>🧠 Choose a thinking level:</b>");
   assert.equal(events[2], "edit:1:2:html:<b>Status</b>");
   assert.equal(events[3], "send:1:html:<b>Status</b>");
-  assert.equal(events[4], "send:1:html:<b>Choose a model:</b>");
+  assert.equal(events[4], "send:1:html:<b>🤖 Choose a model:</b>");
 });
 
 test("Queue menu keeps main-menu navigation on top", async () => {
@@ -1688,7 +1688,7 @@ test("Menu helpers build model, thinking, and status UI payloads", () => {
     "model:pick:0",
   );
   const thinkingText = buildThinkingMenuText();
-  assert.equal(thinkingText, "<b>Choose a thinking level:</b>");
+  assert.equal(thinkingText, "<b>🧠 Choose a thinking level:</b>");
   const thinkingMarkup = buildThinkingMenuReplyMarkup("medium");
   assert.equal(thinkingMarkup.inline_keyboard[0]?.[0]?.text, "⬆️ Main menu");
   assert.equal(

@@ -258,6 +258,15 @@ function getRemainingTelegramInboundTimeout(
   return Math.max(1, timeout - (Date.now() - startedAt));
 }
 
+function getTelegramInboundInitialCompositionStepTimeout(
+  handler: TelegramInboundHandlerConfig,
+  step: TelegramInboundCommandTemplateConfig,
+): number {
+  const timeout = getTelegramInboundHandlerTimeout(handler);
+  const stepTimeout = getTelegramInboundHandlerConfiguredTimeout(step);
+  return stepTimeout === undefined ? timeout : Math.min(stepTimeout, timeout);
+}
+
 function getTelegramInboundCompositionStepTimeout(
   handler: TelegramInboundHandlerConfig,
   step: TelegramInboundCommandTemplateConfig,
@@ -421,7 +430,9 @@ async function executeTelegramTextHandler(
         output,
         cwd,
         deps,
-        getTelegramInboundCompositionStepTimeout(handler, step, startedAt),
+        index === 0
+          ? getTelegramInboundInitialCompositionStepTimeout(handler, step)
+          : getTelegramInboundCompositionStepTimeout(handler, step, startedAt),
       );
     } catch (error) {
       if (typeof step === "object" && step.critical) throw error;
@@ -498,7 +509,9 @@ async function executeTelegramInboundHandler(
         cwd,
         deps,
         false,
-        getTelegramInboundCompositionStepTimeout(handler, step, startedAt),
+        index === 0
+          ? getTelegramInboundInitialCompositionStepTimeout(handler, step)
+          : getTelegramInboundCompositionStepTimeout(handler, step, startedAt),
         index === 0 ? undefined : output,
       );
     } catch (error) {

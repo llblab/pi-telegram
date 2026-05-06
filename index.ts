@@ -49,6 +49,8 @@ export default function (pi: Pi.ExtensionAPI) {
   const { abort, lifecycle, queue, setup, typing } = bridgeRuntime;
   const configStore = Config.createTelegramConfigStore();
   const lockRuntime = Locks.createTelegramLockRuntime<Pi.ExtensionContext>();
+  const lockOwnershipGuard =
+    Locks.createTelegramLockOwnershipGuard(lockRuntime);
   const activeTurnRuntime = Queue.createTelegramActiveTurnStore();
   const buttonActionStore = OutboundHandlers.createTelegramButtonActionStore();
   const pendingModelSwitchStore =
@@ -198,6 +200,7 @@ export default function (pi: Pi.ExtensionAPI) {
     sendDraft: sendMessageDraft,
     sendMessage,
     editMessageText: editTelegramMessageText,
+    canSend: lockOwnershipGuard.ownsCurrentProcess,
     ...replyTransport,
   });
   const { finalizeMarkdownPreview } =
@@ -459,6 +462,7 @@ export default function (pi: Pi.ExtensionAPI) {
     sendQueuedAttachments: queuedAttachmentSender,
     planOutboundReply: outboundReplyPlanner,
     sendOutboundReplyArtifacts: outboundReplyArtifactSender,
+    isCurrentOwner: lockOwnershipGuard.ownsContext,
     getActiveToolExecutions: lifecycle.getActiveToolExecutions,
     setActiveToolExecutions: lifecycle.setActiveToolExecutions,
     triggerPendingModelSwitchAbort: modelSwitchController.triggerPendingAbort,

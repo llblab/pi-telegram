@@ -771,6 +771,7 @@ export interface TelegramAgentEndRuntimeDeps<
   preserveQueuedTurnsAsHistory: boolean;
   resetRuntimeState: () => void;
   updateStatus: () => void;
+  isCurrentOwner?: () => boolean;
   dispatchNextQueuedTelegramTurn: () => void;
   clearPreview: (chatId: number) => Promise<void>;
   setPreviewPendingText: (text: string) => void;
@@ -815,6 +816,7 @@ export interface TelegramAgentEndHookRuntimeDeps<
   getPreserveQueuedTurnsAsHistory: () => boolean;
   resetRuntimeState: () => void;
   updateStatus: (ctx: TContext) => void;
+  isCurrentOwner?: (ctx: TContext) => boolean;
   dispatchNextQueuedTelegramTurn: (ctx: TContext) => void;
   requestDeferredDispatchNextQueuedTelegramTurn: (
     dispatch: (ctx: TContext) => void,
@@ -932,6 +934,9 @@ export function createTelegramAgentEndHook<
       preserveQueuedTurnsAsHistory: deps.getPreserveQueuedTurnsAsHistory(),
       resetRuntimeState: deps.resetRuntimeState,
       updateStatus: () => deps.updateStatus(ctx),
+      isCurrentOwner: deps.isCurrentOwner
+        ? () => deps.isCurrentOwner?.(ctx) ?? false
+        : undefined,
       dispatchNextQueuedTelegramTurn: () => {
         deps.requestDeferredDispatchNextQueuedTelegramTurn(
           deps.dispatchNextQueuedTelegramTurn,
@@ -964,6 +969,10 @@ export async function handleTelegramAgentEndRuntime<
   const replyMarkup = outboundReply?.replyMarkup;
   deps.resetRuntimeState();
   deps.updateStatus();
+  if (turn && deps.isCurrentOwner && !deps.isCurrentOwner()) {
+    await deps.clearPreview(turn.chatId);
+    return;
+  }
   const endPlan = buildTelegramAgentEndPlan({
     hasTurn: !!turn,
     stopReason: assistant.stopReason,

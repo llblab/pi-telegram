@@ -1118,7 +1118,7 @@ test("Extension runtime opens immediate model menu before queued prompt after ag
     );
     await waitForCondition(() => runtimeEvents.length >= 3);
     assert.equal(runtimeEvents[0], "dispatch:[telegram] first request");
-    assert.equal(runtimeEvents[1], "send:<b>Choose a model:</b>");
+    assert.equal(runtimeEvents[1], "send:<b>🤖 Choose a model:</b>");
     assert.equal(runtimeEvents[2], "dispatch:[telegram] follow up after model");
     await handlers.get("session_shutdown")?.({}, idleCtx);
   } finally {
@@ -1677,7 +1677,7 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
     await waitForCondition(() =>
-      runtimeEvents.some((event) => event === "send:<b>Choose a model:</b>"),
+      runtimeEvents.some((event) => event === "send:<b>🤖 Choose a model:</b>"),
     );
     const statusCountBeforePick = statusEvents.length;
     secondUpdates.resolve(
@@ -1800,7 +1800,7 @@ test("Extension runtime switches model in flight and dispatches a continuation t
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
     await waitForCondition(() =>
-      runtimeEvents.some((event) => event === "send:<b>Choose a model:</b>"),
+      runtimeEvents.some((event) => event === "send:<b>🤖 Choose a model:</b>"),
     );
     secondUpdates.resolve(
       createRuntimeTelegramApiResponse([
@@ -1969,7 +1969,7 @@ test("Extension runtime delays model-switch abort until the active tool finishes
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
     await waitForCondition(() =>
-      runtimeEvents.some((event) => event === "send:<b>Choose a model:</b>"),
+      runtimeEvents.some((event) => event === "send:<b>🤖 Choose a model:</b>"),
     );
     secondUpdates.resolve(
       createRuntimeTelegramApiResponse([
