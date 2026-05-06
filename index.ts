@@ -400,6 +400,8 @@ export default function (pi: Pi.ExtensionAPI) {
     startPolling: lockedPollingRuntime.start,
     stopPolling: lockedPollingRuntime.stop,
     updateStatus,
+    getConfig: configStore.get,
+    setConfig: Config.createPersistingConfigSetter(configStore),
   });
 
   // --- Lifecycle Hooks ---
@@ -466,6 +468,11 @@ export default function (pi: Pi.ExtensionAPI) {
     getActiveToolExecutions: lifecycle.getActiveToolExecutions,
     setActiveToolExecutions: lifecycle.setActiveToolExecutions,
     triggerPendingModelSwitchAbort: modelSwitchController.triggerPendingAbort,
+    getDefaultChatId: Config.createProactivePushChatIdGetter(
+      configStore,
+      activeTurnRuntime.getChatId,
+    ),
+    isProactivePushEnabled: Config.createProactivePushChecker(configStore),
   });
   // Wire transport-level reply dedup reset via lifecycle
   Lifecycle.setResetTransportReplyDedup(Replies.resetTransportReplyDedup);

@@ -51,6 +51,7 @@ export function buildTelegramReplyParameters(
   messageId: number | undefined,
 ): TelegramReplyParameters | undefined {
   if (messageId === undefined) return undefined;
+  if (messageId <= 0) return undefined;
   if (messageId === lastRepliedToMessageId) return undefined;
   lastRepliedToMessageId = messageId;
   return { message_id: messageId, allow_sending_without_reply: true };

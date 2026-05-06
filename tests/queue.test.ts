@@ -857,6 +857,90 @@ test("Agent end runtime stays silent when Telegram lock moved away", async () =>
   assert.deepEqual(events, ["reset", "status", "clear:1"]);
 });
 
+test("Agent end runtime pushes proactive reply when enabled without active turn", async () => {
+  const events: string[] = [];
+  await handleTelegramAgentEndRuntime({
+    turn: undefined,
+    assistant: { text: "task done" },
+    preserveQueuedTurnsAsHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async (chatId, replyToMessageId, markdown) => {
+      events.push(`markdown:${chatId}:${replyToMessageId}:${markdown}`);
+    },
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    getDefaultChatId: () => 12345,
+    isProactivePushEnabled: () => true,
+  });
+  assert.deepEqual(events, [
+    "reset",
+    "status",
+    "markdown:12345:0:task done",
+    "dispatch",
+  ]);
+});
+
+test("Agent end runtime skips proactive push when disabled", async () => {
+  const events: string[] = [];
+  await handleTelegramAgentEndRuntime({
+    turn: undefined,
+    assistant: { text: "task done" },
+    preserveQueuedTurnsAsHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {
+      events.push("should-not-fire");
+    },
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    getDefaultChatId: () => 12345,
+    isProactivePushEnabled: () => false,
+  });
+  assert.deepEqual(events, ["reset"]);
+});
+
+test("Agent end runtime skips proactive push when no chat id available", async () => {
+  const events: string[] = [];
+  await handleTelegramAgentEndRuntime({
+    turn: undefined,
+    assistant: { text: "task done" },
+    preserveQueuedTurnsAsHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {
+      events.push("should-not-fire");
+    },
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    getDefaultChatId: () => undefined,
+    isProactivePushEnabled: () => true,
+  });
+  assert.deepEqual(events, ["reset"]);
+});
+
 test("Agent end runtime passes assistant button markup to final text delivery", async () => {
   const events: unknown[] = [];
   const replyMarkup = {

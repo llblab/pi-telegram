@@ -801,6 +801,10 @@ export interface TelegramAgentEndRuntimeDeps<
     plan: TelegramAgentEndOutboundReplyPlan,
     options?: { replyToPrompt?: boolean },
   ) => Promise<void>;
+  /** Get the default Telegram chat ID for proactive push when no active turn */
+  getDefaultChatId?: () => number | undefined;
+  /** Check if proactive push is enabled */
+  isProactivePushEnabled?: () => boolean;
 }
 
 export interface TelegramAgentEndHookRuntimeDeps<
@@ -838,6 +842,10 @@ export interface TelegramAgentEndHookRuntimeDeps<
     TReplyMarkup
   >["planOutboundReply"];
   sendOutboundReplyArtifacts?: TelegramAgentEndRuntimeDeps<TTurn>["sendOutboundReplyArtifacts"];
+  /** Get the default Telegram chat ID for proactive push when no active turn */
+  getDefaultChatId?: () => number | undefined;
+  /** Check if proactive push is enabled */
+  isProactivePushEnabled?: () => boolean;
 }
 
 export interface TelegramAgentEndHookEvent<TMessage> {
@@ -928,9 +936,11 @@ export function createTelegramAgentEndHook<
     ctx: TContext,
   ): Promise<void> {
     const turn = deps.getActiveTurn();
+    const proactiveEnabled = deps.isProactivePushEnabled?.() ?? false;
     await handleTelegramAgentEndRuntime({
       turn,
-      assistant: turn ? deps.extractAssistant(event.messages) : {},
+      assistant:
+        turn || proactiveEnabled ? deps.extractAssistant(event.messages) : {},
       preserveQueuedTurnsAsHistory: deps.getPreserveQueuedTurnsAsHistory(),
       resetRuntimeState: deps.resetRuntimeState,
       updateStatus: () => deps.updateStatus(ctx),
@@ -950,6 +960,8 @@ export function createTelegramAgentEndHook<
       sendQueuedAttachments: deps.sendQueuedAttachments,
       planOutboundReply: deps.planOutboundReply,
       sendOutboundReplyArtifacts: deps.sendOutboundReplyArtifacts,
+      getDefaultChatId: deps.getDefaultChatId,
+      isProactivePushEnabled: deps.isProactivePushEnabled,
     });
   };
 }
@@ -981,6 +993,21 @@ export async function handleTelegramAgentEndRuntime<
     preserveQueuedTurnsAsHistory: deps.preserveQueuedTurnsAsHistory,
   });
   if (!turn) {
+    // Proactive push: send task completion to Telegram even when initiated from pi TUI
+    if (
+      deps.isProactivePushEnabled?.() &&
+      finalText &&
+      !assistant.errorMessage
+    ) {
+      const defaultChatId = deps.getDefaultChatId?.();
+      if (defaultChatId !== undefined) {
+        try {
+          await deps.sendMarkdownReply(defaultChatId, 0, finalText);
+        } catch {
+          // Silently ignore proactive push failures
+        }
+      }
+    }
     if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
     return;
   }

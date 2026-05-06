@@ -42,6 +42,8 @@ export interface TelegramConfig {
   inboundHandlers?: TelegramInboundHandlerConfig[];
   attachmentHandlers?: TelegramInboundHandlerConfig[];
   outboundHandlers?: TelegramOutboundHandlerConfig[];
+  /** Enable proactive push of task completion results to Telegram */
+  proactivePush?: boolean;
 }
 
 export interface TelegramConfigStore {
@@ -121,6 +123,36 @@ export function createTelegramConfigStore(
     persist: async (nextConfig = config) => {
       await writeTelegramConfig(agentDir, configPath, nextConfig);
     },
+  };
+}
+
+export function createProactivePushChecker(
+  configStore: TelegramConfigStore,
+): () => boolean {
+  return function isProactivePushEnabled(): boolean {
+    return configStore.get().proactivePush ?? false;
+  };
+}
+
+export function createProactivePushChatIdGetter(
+  configStore: TelegramConfigStore,
+  activeTurnChatIdGetter: () => number | undefined,
+): () => number | undefined {
+  return function getProactivePushChatId(): number | undefined {
+    const activeChatId = activeTurnChatIdGetter();
+    if (activeChatId !== undefined) return activeChatId;
+    return configStore.getAllowedUserId();
+  };
+}
+
+export function createPersistingConfigSetter(
+  configStore: TelegramConfigStore,
+): (config: TelegramConfig) => Promise<void> {
+  return async function setAndPersistConfig(
+    config: TelegramConfig,
+  ): Promise<void> {
+    configStore.set(config);
+    await configStore.persist(config);
   };
 }
 

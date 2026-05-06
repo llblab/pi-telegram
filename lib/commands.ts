@@ -149,6 +149,8 @@ export interface TelegramBridgeCommandRegistrationDeps {
     | TelegramBridgeCommandStartPollingResult;
   stopPolling: () => Promise<void | string>;
   updateStatus: (ctx: ExtensionCommandContext) => void;
+  getConfig: () => import("./config.ts").TelegramConfig;
+  setConfig: (config: import("./config.ts").TelegramConfig) => Promise<void>;
 }
 
 function formatTelegramTakeoverTitle(ctx: ExtensionCommandContext): string {
@@ -216,6 +218,19 @@ export function registerTelegramBridgeCommands(
       const message = await deps.stopPolling();
       if (message) ctx.ui.notify(message, "info");
       deps.updateStatus(ctx);
+    },
+  });
+  pi.registerCommand("telegram-proactive", {
+    description: "Toggle proactive push of task completion to Telegram",
+    handler: async (_args, ctx) => {
+      await deps.reloadConfig();
+      const config = deps.getConfig();
+      const newValue = !(config.proactivePush ?? false);
+      await deps.setConfig({ ...config, proactivePush: newValue });
+      ctx.ui.notify(
+        `Proactive push ${newValue ? "enabled" : "disabled"}`,
+        "info",
+      );
     },
   });
 }

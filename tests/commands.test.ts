@@ -143,6 +143,8 @@ test("Command helpers register pi setup and status commands", async () => {
     updateStatus: () => {
       events.push("update-status");
     },
+    getConfig: () => ({}),
+    setConfig: async () => {},
   });
   const notifications: string[] = [];
   const ctx = createBridgeCommandContext((message) => {
@@ -179,6 +181,8 @@ test("Command helpers register pi connect and disconnect commands", async () => 
     updateStatus: () => {
       events.push("update-status");
     },
+    getConfig: () => ({}),
+    setConfig: async () => {},
   });
   const ctx = createBridgeCommandContext();
   await getRequiredCommand(harness.commands, "telegram-connect").handler(
@@ -225,6 +229,8 @@ test("Command helpers move pi polling ownership after confirmation", async () =>
     updateStatus: () => {
       events.push("update-status");
     },
+    getConfig: () => ({}),
+    setConfig: async () => {},
   });
   const notifications: string[] = [];
   const ctx = createBridgeCommandContext(
