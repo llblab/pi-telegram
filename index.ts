@@ -5,18 +5,19 @@
  */
 
 import * as Api from "./lib/api.ts";
-import * as AttachmentHandlers from "./lib/attachment-handlers.ts";
-import * as Attachments from "./lib/attachments.ts";
-import * as Commands from "./lib/commands.ts";
+import * as OutboundAttachments from "./lib/outbound-attachments.ts";
 import * as CommandTemplates from "./lib/command-templates.ts";
+import * as Commands from "./lib/commands.ts";
 import * as Config from "./lib/config.ts";
+import * as InboundHandlers from "./lib/inbound-handlers.ts";
 import * as Keyboard from "./lib/keyboard.ts";
 import * as Lifecycle from "./lib/lifecycle.ts";
 import * as Locks from "./lib/locks.ts";
 import * as Media from "./lib/media.ts";
-import * as Menu from "./lib/menu.ts";
 import * as MenuQueue from "./lib/menu-queue.ts";
+import * as Menu from "./lib/menu.ts";
 import * as Model from "./lib/model.ts";
+import * as OutboundHandlers from "./lib/outbound-handlers.ts";
 import * as Pi from "./lib/pi.ts";
 import * as Polling from "./lib/polling.ts";
 import * as Preview from "./lib/preview.ts";
@@ -24,10 +25,9 @@ import * as PromptTemplates from "./lib/prompt-templates.ts";
 import * as Prompts from "./lib/prompts.ts";
 import * as Queue from "./lib/queue.ts";
 import * as Replies from "./lib/replies.ts";
-import * as Runtime from "./lib/runtime.ts";
 import * as Routing from "./lib/routing.ts";
+import * as Runtime from "./lib/runtime.ts";
 import * as Setup from "./lib/setup.ts";
-import * as OutboundHandlers from "./lib/outbound-handlers.ts";
 import * as Status from "./lib/status.ts";
 import * as TextGroups from "./lib/text-groups.ts";
 
@@ -114,15 +114,13 @@ export default function (pi: Pi.ExtensionAPI) {
         queue.incrementNextPriorityReactionOrder,
       updateStatus,
     });
-  const attachmentHandlerRuntime =
-    AttachmentHandlers.createTelegramAttachmentHandlerRuntime<Pi.ExtensionContext>(
-      {
-        getHandlers: configStore.getAttachmentHandlers,
-        execCommand: CommandTemplates.execCommandTemplate,
-        getCwd: Pi.getExtensionContextCwd,
-        recordRuntimeEvent,
-      },
-    );
+  const inboundHandlerRuntime =
+    InboundHandlers.createTelegramInboundHandlerRuntime<Pi.ExtensionContext>({
+      getHandlers: configStore.getInboundHandlers,
+      execCommand: CommandTemplates.execCommandTemplate,
+      getCwd: Pi.getExtensionContextCwd,
+      recordRuntimeEvent,
+    });
 
   // --- Telegram API ---
 
@@ -157,19 +155,23 @@ export default function (pi: Pi.ExtensionAPI) {
 
   // --- Reply Runtime Wiring ---
 
-  const {
-    replyTransport,
-    sendTextReply,
-    sendMarkdownReply,
-    editInteractiveMessage,
-    sendInteractiveMessage,
-  } =
+  const replyRuntime =
     Replies.createTelegramRenderedMessageDeliveryRuntime<Keyboard.TelegramInlineKeyboardMarkup>(
       {
         sendMessage,
         editMessage: editTelegramMessageText,
       },
     );
+  const { replyTransport, editInteractiveMessage, sendInteractiveMessage } =
+    replyRuntime;
+  const { sendTextReply, sendMarkdownReply } =
+    OutboundHandlers.createTelegramOutboundTextReplyRuntime({
+      sendTextReply: replyRuntime.sendTextReply,
+      sendMarkdownReply: replyRuntime.sendMarkdownReply,
+      execCommand: CommandTemplates.execCommandTemplate,
+      getHandlers: configStore.getOutboundHandlers,
+      recordRuntimeEvent,
+    });
   const dispatchNextQueuedTelegramTurn =
     Queue.createTelegramQueueDispatchRuntime<Pi.ExtensionContext>({
       ...telegramQueueStore,
@@ -198,6 +200,13 @@ export default function (pi: Pi.ExtensionAPI) {
     editMessageText: editTelegramMessageText,
     ...replyTransport,
   });
+  const { finalizeMarkdownPreview } =
+    OutboundHandlers.createTelegramOutboundTextPreviewRuntime({
+      finalizeMarkdownPreview: previewRuntime.finalizeMarkdown,
+      execCommand: CommandTemplates.execCommandTemplate,
+      getHandlers: configStore.getOutboundHandlers,
+      recordRuntimeEvent,
+    });
 
   // --- Bridge Setup ---
 
@@ -218,9 +227,8 @@ export default function (pi: Pi.ExtensionAPI) {
       appendQueuedItem: queueMutationRuntime.append,
       updateStatus,
     });
-  const getQueueItemCount = Queue.createTelegramQueueItemCountGetter(
-    telegramQueueStore,
-  );
+  const getQueueItemCount =
+    Queue.createTelegramQueueItemCountGetter(telegramQueueStore);
   const getPromptTemplateCommands =
     PromptTemplates.createTelegramPromptTemplateCommandGetter({
       getCommands,
@@ -292,7 +300,7 @@ export default function (pi: Pi.ExtensionAPI) {
     openQueueMenu: queueMenuRuntime.openQueueMenu,
     queueMenuCallbackHandler: queueMenuRuntime.handleCallbackQuery,
     buttonActionStore,
-    attachmentHandlerRuntime,
+    inboundHandlerRuntime,
     updateStatus,
     dispatchNextQueuedTelegramTurn,
     answerCallbackQuery,
@@ -367,7 +375,7 @@ export default function (pi: Pi.ExtensionAPI) {
 
   // --- Extension API Bindings ---
 
-  Attachments.registerTelegramAttachmentTool(pi, {
+  OutboundAttachments.registerTelegramOutboundAttachmentTool(pi, {
     getActiveTurn: activeTurnRuntime.get,
     recordRuntimeEvent,
   });
@@ -402,7 +410,7 @@ export default function (pi: Pi.ExtensionAPI) {
     clearDispatchPending: lifecycle.clearDispatchPending,
   });
   const queuedAttachmentSender =
-    Attachments.createTelegramQueuedAttachmentSender({
+    OutboundAttachments.createTelegramQueuedOutboundAttachmentSender({
       sendMultipart: callMultipart,
       sendTextReply,
       recordRuntimeEvent,
@@ -437,14 +445,15 @@ export default function (pi: Pi.ExtensionAPI) {
     updateStatus,
     getActiveTurn: activeTurnRuntime.get,
     extractAssistant: Replies.extractLatestAssistantMessageText,
-    getPreserveQueuedTurnsAsHistory: lifecycle.shouldPreserveQueuedTurnsAsHistory,
+    getPreserveQueuedTurnsAsHistory:
+      lifecycle.shouldPreserveQueuedTurnsAsHistory,
     resetRuntimeState: agentEndResetter,
     dispatchNextQueuedTelegramTurn,
     requestDeferredDispatchNextQueuedTelegramTurn:
       deferredQueueDispatchRuntime.request,
     clearPreview: previewRuntime.clear,
     setPreviewPendingText: previewRuntime.setPendingText,
-    finalizeMarkdownPreview: previewRuntime.finalizeMarkdown,
+    finalizeMarkdownPreview,
     sendMarkdownReply,
     sendTextReply,
     sendQueuedAttachments: queuedAttachmentSender,
@@ -456,7 +465,9 @@ export default function (pi: Pi.ExtensionAPI) {
   });
   // Wire transport-level reply dedup reset via lifecycle
   Lifecycle.setResetTransportReplyDedup(Replies.resetTransportReplyDedup);
-  const agentStartWithDedupReset = Lifecycle.createAgentStartDedupHook(agentLifecycleHooks.onAgentStart);
+  const agentStartWithDedupReset = Lifecycle.createAgentStartDedupHook(
+    agentLifecycleHooks.onAgentStart,
+  );
   Lifecycle.registerTelegramLifecycleHooks(pi, {
     ...sessionLifecycleRuntime,
     ...agentLifecycleHooks,

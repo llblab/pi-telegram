@@ -9,7 +9,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
-import type { TelegramAttachmentHandlerConfig } from "./attachment-handlers.ts";
+import type { TelegramInboundHandlerConfig } from "./inbound-handlers.ts";
 import type { CommandTemplateObjectConfig } from "./command-templates.ts";
 
 function getAgentDir(): string {
@@ -39,7 +39,8 @@ export interface TelegramConfig {
   botId?: number;
   allowedUserId?: number;
   lastUpdateId?: number;
-  attachmentHandlers?: TelegramAttachmentHandlerConfig[];
+  inboundHandlers?: TelegramInboundHandlerConfig[];
+  attachmentHandlers?: TelegramInboundHandlerConfig[];
   outboundHandlers?: TelegramOutboundHandlerConfig[];
 }
 
@@ -50,7 +51,8 @@ export interface TelegramConfigStore {
   getBotToken: () => string | undefined;
   hasBotToken: () => boolean;
   getAllowedUserId: () => number | undefined;
-  getAttachmentHandlers: () => TelegramAttachmentHandlerConfig[] | undefined;
+  getInboundHandlers: () => TelegramInboundHandlerConfig[] | undefined;
+  getAttachmentHandlers: () => TelegramInboundHandlerConfig[] | undefined;
   getOutboundHandlers: () => TelegramOutboundHandlerConfig[] | undefined;
   setAllowedUserId: (userId: number) => void;
   load: () => Promise<void>;
@@ -104,6 +106,10 @@ export function createTelegramConfigStore(
     getBotToken: () => config.botToken,
     hasBotToken: () => !!config.botToken,
     getAllowedUserId: () => config.allowedUserId,
+    getInboundHandlers: () => [
+      ...(config.inboundHandlers ?? []),
+      ...(config.attachmentHandlers ?? []),
+    ],
     getAttachmentHandlers: () => config.attachmentHandlers,
     getOutboundHandlers: () => config.outboundHandlers,
     setAllowedUserId: (userId) => {

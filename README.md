@@ -18,7 +18,7 @@ This repository is an actively maintained fork of [`badlogic/pi-telegram`](https
 - **In-flight Model Switching**: Change the active model mid-generation. The agent gracefully pauses, applies the new model, and restarts its response without losing context.
 - **Smart Message Queue**: Messages sent while the agent is busy are queued and previewed in the π status bar, and queued turns can be reprioritized or removed with Telegram reactions or the queue section of the inline application menu.
 - **Mobile-Optimized Rendering**: Tables and lists are formatted for narrow screens, table padding accounts for emoji grapheme and wide Unicode display width, and Telegram-originated runs prompt the assistant to prefer narrow table columns for phone readability. Markdown is correctly parsed and split to fit Telegram's limits without breaking HTML structures or code blocks, block spacing stays faithful to the original Markdown with readable heading separation, supported absolute links stay clickable, and unsupported link forms degrade safely.
-- **File Handling & Attachments**: Send images and files to the agent, transcribe or transform inbound files with configured attachment handlers, or ask π to generate and return artifacts. Inbound downloads and outbound attachments are size-limited by default, and outbound files are delivered automatically via the `telegram_attach` tool.
+- **File Handling & Attachments**: Send images and files to the agent, transcribe or transform inbound text/media with configured inbound handlers, or ask π to generate and return artifacts. Inbound downloads and outbound attachments are size-limited by default, and outbound files are delivered automatically via the `telegram_attach` tool.
 - **Streaming Responses**: Closed Markdown blocks stream back as rich Telegram HTML while π is generating, and the still-growing tail stays readable until the final fully rendered reply lands.
 
 ## Install
@@ -111,26 +111,36 @@ Run these inside π, not Telegram:
 - Inbound images, albums, and files are saved to `~/.pi/agent/tmp/telegram`. Unhandled local file paths are included in the prompt, handled attachment output is injected into the prompt text, and inbound images are forwarded to π as image inputs. Inbound downloads default to a 50 MiB limit and can be adjusted with `PI_TELEGRAM_INBOUND_FILE_MAX_BYTES` or `TELEGRAM_MAX_FILE_SIZE_BYTES`.
 - Queue reactions depend on Telegram delivering `message_reaction` updates for your bot and chat type.
 
-### Inbound Attachment Handlers
+### Inbound Handlers
 
-`telegram.json` can define ordered `attachmentHandlers` for common preprocessing such as voice transcription. Matching handlers run after download and before the Telegram turn enters the π queue. If a matching handler fails, the next matching handler is tried as a fallback.
+`telegram.json` can define ordered `inboundHandlers` for Telegram → π preprocessing such as text translation, voice transcription, OCR, or PDF extraction. Matching handlers run before the Telegram turn enters the π queue. If a matching media/file handler fails, the next matching handler is tried as a fallback. Legacy `attachmentHandlers` still work as a deprecated compatibility alias and are appended after `inboundHandlers`.
 
 ```json
 {
-  "attachmentHandlers": [
+  "inboundHandlers": [
+    {
+      "type": "text",
+      "template": "/path/to/translate --lang {lang=en} --text \"{text}\""
+    },
     {
       "type": "voice",
-      "template": "/path/to/stt1 --file {file} --lang {lang=ru}"
+      "template": [
+        "/path/to/stt --file {file} --lang {lang=ru}",
+        "/path/to/translate-stdin --lang {lang=en}"
+      ]
     },
     {
       "mime": "audio/*",
-      "template": "/path/to/stt2 --file {file} --lang {lang=ru}"
+      "template": [
+        "/path/to/stt-fallback --file {file} --lang {lang=ru}",
+        "/path/to/translate-stdin --lang {lang=en}"
+      ]
     }
   ]
 }
 ```
 
-Matching supports `mime`, `type`, or `match`; wildcards like `audio/*` are accepted. Handlers use `template`: a string is one command, and an array is ordered composition. Template placeholders are substituted into command args, not shell text: `{file}` is the downloaded file path, `{mime}` is the MIME type, `{type}` is the Telegram attachment type, and `defaults` or inline defaults such as `{lang=ru}` can provide additional values. Examples use explicit flag-style CLIs for readability; positional script forms are also supported when the script itself supports them. Local attachments stay in the prompt under `[attachments] <directory>` with relative file entries; successful handler stdout is added under `[outputs]`; failed handlers record diagnostics and fall back to the next matching handler. The portable command-template contract is documented in [`docs/command-templates.md`](./docs/command-templates.md); Telegram-specific handler config is documented in [`docs/attachment-handlers.md`](./docs/attachment-handlers.md).
+Matching supports optional `mime`, `type`, or `match`; `mime` can be used without `type`, and wildcards like `audio/*` or `text/*` are accepted. Raw Telegram text can match `type: "text"`, `mime: "text/plain"`, or `mime: "text/*"`; it is passed on stdin and as `{text}`, and non-empty stdout replaces the prompt text. Media/file handlers receive `{file}`, `{mime}`, and `{type}`; local attachments stay in the prompt under `[attachments] <directory>` with relative file entries, and successful media/file handler stdout is added under `[outputs]`. Attached `text/plain`/`text/*` files have a built-in fail-open reader that injects UTF-8 content into `[outputs]` when no configured handler produced output. Failed handlers record diagnostics and fall back safely. The portable command-template contract is documented in [`docs/command-templates.md`](./docs/command-templates.md); Telegram-specific inbound config is documented in [`docs/inbound-handlers.md`](./docs/inbound-handlers.md).
 
 ### Requesting Files
 
@@ -156,9 +166,22 @@ Text to synthesize as a Telegram voice message.
 <!-- telegram_voice: Short spoken companion summary. -->
 ```
 
-Outbound voice is disabled unless a matching `outboundHandlers[]` entry is configured. Multiple `telegram_voice` blocks in one reply are synthesized and sent independently, preserving each block's attributes. The bridge uses the same [command-template contract](./docs/command-templates.md) as inbound attachment handlers: split the template into args, substitute placeholders, execute without a shell, and use stdout as the result channel for a single template.
+Outbound `type: "text"` handlers can transform final text/Markdown before Telegram rendering and delivery, using stdin and `{text}` as input and non-empty stdout as replacement text. They are a good fit for machine translation, tone normalization, redaction, glossary expansion, or any other final text rewrite that should happen outside the agent prompt. The transform also applies when the bridge finalizes an already streamed rich preview, so Telegram may briefly show the pre-transform preview before the final edited message lands. Inline button labels are transformed too, while callback data and prompts stay unchanged.
 
-A TTS plus MP3-to-OGG setup can be expressed as `template: [...]`. The bridge provides `{text}`, `{mp3}`, and `{ogg}` to every step; top-level `args`/`defaults` apply to all steps unless a step defines private values, the default command timeout applies automatically, and each step's stdout is passed to the next step's stdin by default. Use `"output": "ogg"` when the artifact path should come from the generated `{ogg}` value instead of final stdout:
+```json
+{
+  "outboundHandlers": [
+    {
+      "type": "text",
+      "template": "/path/to/translate --lang {lang=ru} --text {text}"
+    }
+  ]
+}
+```
+
+Outbound voice is disabled unless a matching `outboundHandlers[]` entry is configured. Multiple `telegram_voice` blocks in one reply are synthesized and sent independently, preserving each block's attributes. The bridge uses the same [command-template contract](./docs/command-templates.md) as inbound handlers: split the template into args, substitute placeholders, execute without a shell, and use stdout as the result channel for a single template.
+
+A composed voice setup can translate the hidden `telegram_voice` text, synthesize it, and convert MP3 to Telegram-native OGG/Opus in one pipeline. The bridge provides `{text}`, `{mp3}`, and `{ogg}` to every step; top-level `args`/`defaults` apply to all steps unless a step defines private values, the default command timeout applies automatically, and each step's stdout is passed to the next step's stdin by default. Use `"output": "ogg"` when the artifact path should come from the generated `{ogg}` value instead of final stdout:
 
 ```json
 {
@@ -166,7 +189,8 @@ A TTS plus MP3-to-OGG setup can be expressed as `template: [...]`. The bridge pr
     {
       "type": "voice",
       "template": [
-        "/path/to/tts --text {text} --lang {lang=ru} --rate {rate=+30%} --write-media {mp3}",
+        "/path/to/translate-stdin --lang {lang=ru}",
+        "/path/to/tts-from-stdin --lang {lang=ru} --rate {rate=+30%} --write-media {mp3}",
         "ffmpeg -y -i {mp3} -c:a libopus -b:a 32k -ar 16000 -ac 1 -vbr on {ogg}"
       ],
       "output": "ogg"

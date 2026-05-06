@@ -23,7 +23,7 @@
 ## 3. Project Topology
 
 - `/index.ts`: Main extension entrypoint and runtime composition layer for the bridge
-- `/lib/*.ts`: Flat domain modules for reusable runtime logic. Favor domain files such as queueing/runtime, replies, polling, updates, attachments, commands, lifecycle hooks, prompts, prompt-templates, pi SDK adapter, Telegram API, config, turns, media, setup, rendering, app menu, menu-model, menu-thinking, menu-queue, status/model-resolution support, and other cohesive bridge subsystems; use `shared` only when a type or constant truly spans multiple domains
+- `/lib/*.ts`: Flat domain modules for reusable runtime logic. Favor domain files such as queueing/runtime, replies, polling, updates, outbound-attachments, commands, lifecycle hooks, prompts, prompt-templates, pi SDK adapter, Telegram API, config, turns, media, setup, rendering, app menu, menu-model, menu-thinking, menu-queue, status/model-resolution support, and other cohesive bridge subsystems; use `shared` only when a type or constant truly spans multiple domains
 - `/tests/*.test.ts`: Domain-mirrored regression suites that follow the same flat naming as `/lib`
 - `/docs/README.md`: Documentation index for technical project docs
 - `/docs/architecture.md`: Runtime and subsystem overview for the bridge
@@ -100,8 +100,8 @@
 The canonical detailed ownership map lives in [`docs/architecture.md`](./docs/architecture.md). Keep this section as a compact agent-facing index, not a second copy of the full map.
 
 - Scheduling and lifecycle: `queue`, `runtime`, `lifecycle`, `locks`
-- Telegram transport and inbound flow: `api`, `polling`, `updates`, `routing`, `media`, `turns`, `attachment-handlers`, `config`, `setup`
-- Response surfaces: `preview`, `replies`, `rendering`, `keyboard`, `attachments`, `outbound-handlers`, `status`
+- Telegram transport and inbound flow: `api`, `polling`, `updates`, `routing`, `media`, `turns`, `inbound-handlers`, `config`, `setup`
+- Response surfaces: `preview`, `replies`, `rendering`, `keyboard`, `outbound-attachments`, `outbound-handlers`, `status`
 - Controls and application menu UI: `commands`, `menu`, `menu-model`, `menu-thinking`, `menu-status`, `menu-queue`, `model`, `prompts`
 - Pi SDK boundary: `pi` owns direct pi imports and bound extension API ports
 
@@ -131,9 +131,9 @@ The canonical detailed ownership map lives in [`docs/architecture.md`](./docs/ar
 - For `/telegram-setup`, prefer the locally saved bot token over environment variables on repeat setup runs; env vars are the bootstrap path when no local token exists, and persisted `telegram.json` writes must remain atomic plus private because status/setup/polling paths may read it concurrently
 - Command help plus prompt-template commands and status/model/thinking/queue controls are driven through `/start`'s Telegram inline application menu and callback queries; the Queue button shows the queued-item count, model-menu scope/pagination controls stay at the top under Main menu, the model pagination indicator opens a compact page picker, and thinking-menu text stays a compact heading because the current level is marked by button state; `/status`, `/model`, `/thinking`, and `/queue` are hidden compatibility shortcuts
 - Shared inline-keyboard structure belongs to `keyboard`; application-control button labels, callback data, and callback behavior stay in `menu`/`menu-model`/`menu-thinking`/`menu-status`/`menu-queue` while core queue mechanics stay in `queue`
-- Inbound files may become π image inputs or configured attachment-handler text before queueing; outbound files must flow through `telegram_attach`
+- Inbound text/media may be transformed through configured `inboundHandlers` before queueing; legacy `attachmentHandlers` are deprecated compatibility aliases appended after `inboundHandlers`; outbound files must flow through `telegram_attach`
 - Long Telegram text split recovery belongs to `text-groups`: keep it conservative, short-debounced, same chat/user/message-id contiguous, and gated by near-limit human text so normal rapid follow-ups and slash commands stay separate
-- Inbound attachment handlers and command-backed outbound handlers use command templates as the standard integration contract; built-in outbound buttons use inline keyboards plus callback routing because no external command execution is needed
+- Inbound handlers and command-backed outbound handlers use command templates as the standard integration contract; built-in outbound buttons use inline keyboards plus callback routing because no external command execution is needed
 - Telegram prompt-template commands are discovered from π slash commands with `source: "prompt"`; π template names are mapped to Bot API-compatible aliases (`fix-tests` → `/fix_tests`), aliases that conflict with built-in bridge commands or hidden shortcuts are not displayed, prompt-template aliases stay out of the Telegram bot command menu, and the bridge expands template files before queueing because extension-originated `sendUserMessage()` bypasses π's interactive template expansion
 - Unknown callback data not owned by pi-telegram prefixes (`tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`) may be forwarded as `[callback] <data>` after built-in handlers decline it; external extensions should follow `docs/callback-namespaces.md` and must not poll the same bot independently
 - Command templates stay compact and shell-free: no `command` field, no shell execution, inline defaults are allowed as `{name=default}`, `template` may be a string or an ordered composition array, only `args`/`defaults` inherit into leaves, top-level `timeout` wraps composed sequences, stdout pipes to the next step's stdin by default, and multi-step work should use `template: [...]` rather than provider-specific fields; `pipe` is only a legacy local alias

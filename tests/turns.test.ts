@@ -154,7 +154,7 @@ test("Turn runtime builder injects Telegram reply context into prompt turns", as
   );
 });
 
-test("Turn runtime builder routes attachment handler output into prompt text", async () => {
+test("Turn runtime builder routes inbound handler output into prompt text", async () => {
   const buildTurn = createTelegramPromptTurnRuntimeBuilder<
     {
       message_id: number;

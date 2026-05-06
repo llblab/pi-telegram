@@ -126,7 +126,7 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
     menuActions,
     openQueueMenu: async () => undefined,
     queueMenuCallbackHandler: async () => false,
-    attachmentHandlerRuntime: {
+    inboundHandlerRuntime: {
       process: async (files, rawText) => ({
         rawText,
         promptFiles: files,

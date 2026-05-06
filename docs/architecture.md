@@ -30,14 +30,14 @@ Current runtime areas use these ownership boundaries:
 | `config` / `setup`                        | Persisted bot/session pairing state, authorization, first-user pairing, token prompting, env fallback, validation, config persistence                             |
 | `locks` / `polling`                       | Singleton `locks.json` ownership, takeover/restart semantics, long-poll controller state, update offset persistence, poll-loop runtime wiring                     |
 | `updates` / `routing`                     | Update classification/execution planning, paired authorization, reactions, edits, callbacks, and inbound route composition                                        |
-| `media` / `text-groups` / `turns` / `attachment-handlers` | Text/media extraction, media-group debounce, long-text split coalescing, inbound downloads, turn building/editing, image reads, attachment-handler matching/execution/fallback output |
+| `media` / `text-groups` / `turns` / `inbound-handlers` | Text/media extraction, media-group debounce, long-text split coalescing, inbound downloads, inbound text/media handler execution, turn building/editing, image reads, legacy `attachmentHandlers` compatibility |
 | `queue`                                   | Queue item contracts, lane admission/order, stores, mutations, dispatch readiness/runtime, prompt/control enqueueing, session and agent/tool lifecycle sequencing |
 | `runtime`                                 | Session-local coordination primitives: counters, lifecycle flags, setup guard, abort handler, typing-loop timers, prompt-dispatch flags, agent-end reset binding  |
 | `model` / `menu-model` / `menu-thinking` / `menu-status` / `menu` / `menu-queue` / `commands` | Model identity/thinking levels, scoped model resolution, in-flight switching, model-menu UI, thinking-menu UI, status-menu UI, inline application callback composition, queue-menu UI, slash commands, bot command registration |
 | `keyboard`                                | Shared Telegram inline-keyboard reply-markup structure; feature domains own callback semantics and button construction                                           |
 | `preview` / `replies` / `rendering`       | Preview lifecycle/transports, final reply delivery and reply parameters, Telegram HTML Markdown rendering, chunking, stable-preview snapshots                     |
-| `outbound-handlers`                       | Assistant-authored outbound comments, generated reply artifacts, inline-keyboard callbacks, and post-`agent_end` outbound action delivery                         |
-| `attachments`                             | `telegram_attach` registration, outbound attachment queueing, stat/limit checks, photo/document delivery classification                                           |
+| `outbound-handlers`                       | Outbound text transformation, assistant-authored outbound comments, generated reply artifacts, inline-keyboard callbacks, and post-`agent_end` outbound action delivery |
+| `outbound-attachments`                    | `telegram_attach` registration, outbound attachment queueing, stat/limit checks, photo/document delivery classification                                           |
 | `status`                                  | Status-bar/status-message rendering, queue-lane status views, redacted runtime event ring, grouped π diagnostics                                                  |
 | `lifecycle` / `prompts` / `prompt-templates` / `pi` | π hook registration, Telegram-specific before-agent prompt injection, π prompt-template discovery/expansion, centralized direct pi SDK imports and context adapters |
 | `command-templates`                       | Portable shell-free command-template standard helpers, composition expansion, placeholder substitution, and executable resolution                                 |
@@ -50,7 +50,7 @@ Boundary invariants:
 - Preview appearance stays in `rendering`; preview transport/lifecycle stays in `preview`
 - Direct `node:*` file-operation imports stay in owning domains, not in `index.ts`
 - `index.ts` uses namespace imports for local bridge domains so orchestration reads as `Queue.*`, `Turns.*`, and `Rendering.*`
-- Architecture-invariant tests guard the acyclic import graph, pi SDK centralization, entrypoint purity, runtime-domain isolation, structural leaf-domain isolation, menu/model boundaries, API/config separation, media/update/API separation, and attachment boundary isolation
+- Architecture-invariant tests guard the acyclic import graph, pi SDK centralization, entrypoint purity, runtime-domain isolation, structural leaf-domain isolation, menu/model boundaries, API/config separation, media/update/API separation, and outbound-attachment boundary isolation
 - Mirrored domain regression coverage lives in `/tests/*.test.ts`; test helpers stay local to the mirrored suite by default, and shared fixture folders are justified only by reuse across multiple domain suites
 
 ## Configuration UX
@@ -77,8 +77,8 @@ Telegram bot configuration stays in `~/.pi/agent/telegram.json`; singleton runti
 4. Media groups are coalesced into a single Telegram turn when needed
 5. Slash command parsing uses only the new message text/caption, while Telegram `reply_to_message` text/caption is injected later as prompt-only `[reply]` context for normal queued turns
 6. Files are streamed into `~/.pi/agent/tmp/telegram` with a default 50 MiB size limit, partial-download cleanup on failures, and stale temp cleanup on session start; operators can tune the limit with `PI_TELEGRAM_INBOUND_FILE_MAX_BYTES` or `TELEGRAM_MAX_FILE_SIZE_BYTES`
-7. Configured inbound attachment handlers may run on downloaded files by MIME wildcard, Telegram attachment type, or generic match selector; command templates receive safe command-arg substitution for `{file}`/`{mime}`/`{type}`
-8. Matching handlers are tried in config order: a non-zero exit records diagnostics and falls back to the next matching handler, while the first successful handler stops the chain
+7. Configured inbound handlers may run on raw text or downloaded files by MIME wildcard, Telegram attachment type, or generic match selector; command templates receive safe command-arg substitution for `{text}`, `{file}`, `{mime}`, and `{type}` where applicable
+8. Matching media/file handlers are tried in config order: a non-zero exit records diagnostics and falls back to the next matching handler, while the first successful handler stops the chain
 9. Local attachments stay visible under `[attachments] <directory>` with relative file entries, and handler stdout is appended under `[outputs]` before the agent sees the turn; failed handlers omit output while keeping the attachment entry
 10. A `PendingTelegramTurn` is created and queued locally
 11. Telegram `edited_message` updates are routed separately and update a matching queued turn when the original message has not been dispatched yet

@@ -70,7 +70,7 @@ test("Prompt helpers build before-agent-start hooks", () => {
   assert.match(defaultSystemPrompt, /not a new instruction by itself/);
   assert.match(
     defaultSystemPrompt,
-    /`\[outputs\]` contains attachment-handler stdout/,
+    /`\[outputs\]` contains inbound-handler stdout/,
   );
   assert.match(defaultSystemPrompt, /telegram_attach/);
   assert.match(defaultSystemPrompt, /telegram_voice text="Short summary"/);

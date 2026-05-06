@@ -1,18 +1,21 @@
 /**
- * Regression tests for inbound Telegram attachment handlers
+ * Regression tests for inbound Telegram handlers
  * Covers MIME/type matching, template substitution, fallback failures, and prompt-text routing
  */
 
 import assert from "node:assert/strict";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
-  buildTelegramAttachmentHandlerInvocation,
-  processTelegramAttachmentHandlers,
-  telegramAttachmentHandlerMatchesFile,
-} from "../lib/attachment-handlers.ts";
+  buildTelegramInboundHandlerInvocation,
+  processTelegramInboundHandlers,
+  telegramInboundHandlerMatchesFile,
+} from "../lib/inbound-handlers.ts";
 
-test("Attachment handlers match MIME wildcards and Telegram file types", () => {
+test("Inbound handlers match MIME wildcards and Telegram file types", () => {
   const voiceFile = {
     path: "/tmp/voice.ogg",
     fileName: "voice.ogg",
@@ -20,24 +23,24 @@ test("Attachment handlers match MIME wildcards and Telegram file types", () => {
     kind: "voice",
   };
   assert.equal(
-    telegramAttachmentHandlerMatchesFile({ mime: "audio/*" }, voiceFile),
+    telegramInboundHandlerMatchesFile({ mime: "audio/*" }, voiceFile),
     true,
   );
   assert.equal(
-    telegramAttachmentHandlerMatchesFile({ type: "voice" }, voiceFile),
+    telegramInboundHandlerMatchesFile({ type: "voice" }, voiceFile),
     true,
   );
   assert.equal(
-    telegramAttachmentHandlerMatchesFile(
+    telegramInboundHandlerMatchesFile(
       { match: "application/pdf" },
       voiceFile,
     ),
     false,
   );
-  assert.equal(telegramAttachmentHandlerMatchesFile({}, voiceFile), true);
+  assert.equal(telegramInboundHandlerMatchesFile({}, voiceFile), true);
 });
 
-test("Attachment template handlers substitute paths without shell interpolation", async () => {
+test("Inbound template handlers substitute paths without shell interpolation", async () => {
   const calls: Array<{ command: string; args: string[]; cwd?: string }> = [];
   const file = {
     path: "/tmp/voice one.ogg",
@@ -45,7 +48,7 @@ test("Attachment template handlers substitute paths without shell interpolation"
     mimeType: "audio/ogg",
     kind: "voice",
   };
-  const result = await processTelegramAttachmentHandlers({
+  const result = await processTelegramInboundHandlers({
     files: [file],
     rawText: "please summarize",
     handlers: [
@@ -83,7 +86,7 @@ test("Attachment template handlers substitute paths without shell interpolation"
   assert.deepEqual(result.handlerOutputs, ["hello from voice"]);
 });
 
-test("Attachment template handlers apply declared defaults", async () => {
+test("Inbound template handlers apply declared defaults", async () => {
   const calls: Array<{ command: string; args: string[] }> = [];
   const file = {
     path: "/tmp/voice one.ogg",
@@ -91,7 +94,7 @@ test("Attachment template handlers apply declared defaults", async () => {
     mimeType: "audio/ogg",
     kind: "voice",
   };
-  const result = await processTelegramAttachmentHandlers({
+  const result = await processTelegramInboundHandlers({
     files: [file],
     rawText: "",
     handlers: [
@@ -117,8 +120,123 @@ test("Attachment template handlers apply declared defaults", async () => {
   assert.deepEqual(result.handlerOutputs, ["voice transcript"]);
 });
 
-test("Attachment template invocation keeps args as name declarations only", () => {
-  const invocation = buildTelegramAttachmentHandlerInvocation(
+test("Inbound text handlers transform raw prompt text through stdin", async () => {
+  const calls: Array<{ command: string; args: string[]; stdin?: string }> = [];
+  const result = await processTelegramInboundHandlers({
+    files: [],
+    rawText: "привет",
+    handlers: [
+      {
+        type: "text",
+        template: "/tools/translate --to en --type {type} --mime {mime}",
+      },
+    ],
+    cwd: "/work",
+    execCommand: async (command, args, options) => {
+      calls.push({ command, args, stdin: options?.stdin });
+      return { stdout: "hello", stderr: "", code: 0, killed: false };
+    },
+  });
+  assert.deepEqual(calls, [
+    {
+      command: "/tools/translate",
+      args: ["--to", "en", "--type", "text", "--mime", "text/plain"],
+      stdin: "привет",
+    },
+  ]);
+  assert.equal(result.rawText, "hello");
+  assert.deepEqual(result.promptFiles, []);
+});
+
+test("Inbound text handlers can match raw text by MIME only", async () => {
+  const result = await processTelegramInboundHandlers({
+    files: [],
+    rawText: "bonjour",
+    handlers: [
+      {
+        mime: "text/plain",
+        template: "/tools/translate",
+      },
+    ],
+    cwd: "/work",
+    execCommand: async (_command, _args, options) => ({
+      stdout: `translated:${options?.stdin ?? ""}`,
+      stderr: "",
+      code: 0,
+      killed: false,
+    }),
+  });
+  assert.equal(result.rawText, "translated:bonjour");
+});
+
+test("Inbound text handlers keep original text on empty or failed output", async () => {
+  const events: string[] = [];
+  const result = await processTelegramInboundHandlers({
+    files: [],
+    rawText: "original",
+    handlers: [
+      { type: "text", template: "/tools/empty" },
+      { type: "text", template: "/tools/fail" },
+    ],
+    cwd: "/work",
+    execCommand: async (command) => ({
+      stdout: "",
+      stderr: command,
+      code: command.endsWith("fail") ? 1 : 0,
+      killed: false,
+    }),
+    recordRuntimeEvent: (category) => {
+      events.push(category);
+    },
+  });
+  assert.equal(result.rawText, "original");
+  assert.deepEqual(events, ["inbound-text-handler"]);
+});
+
+test("Built-in text attachment handling injects text files into outputs", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-text-attachment-"));
+  const filePath = join(dir, "note.txt");
+  await writeFile(filePath, "hello from file\n", "utf8");
+  const result = await processTelegramInboundHandlers({
+    files: [
+      {
+        path: filePath,
+        fileName: "note.txt",
+        mimeType: "text/plain",
+        kind: "document",
+      },
+    ],
+    rawText: "see attached",
+    handlers: [],
+    cwd: "/work",
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+  });
+  assert.deepEqual(result.handlerOutputs, ["[note.txt]\nhello from file"]);
+});
+
+test("Built-in text attachment handling accepts text wildcards", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-text-attachment-"));
+  const filePath = join(dir, "note.md");
+  await writeFile(filePath, "# Hello\n", "utf8");
+  const result = await processTelegramInboundHandlers({
+    files: [
+      {
+        path: filePath,
+        fileName: "note.md",
+        mimeType: "text/markdown",
+        kind: "document",
+      },
+    ],
+    rawText: "see attached",
+    handlers: [],
+    cwd: "/work",
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+  });
+  assert.deepEqual(result.handlerOutputs, ["[note.md]\n# Hello"]);
+});
+
+test("Inbound template invocation keeps args as name declarations only", () => {
+  const invocation = buildTelegramInboundHandlerInvocation(
     {
       template: "./scripts/transcribe {file} {lang=ru}",
       args: ["file", "lang"],
@@ -132,8 +250,8 @@ test("Attachment template invocation keeps args as name declarations only", () =
   });
 });
 
-test("Attachment template invocation supports inline placeholder defaults", () => {
-  const invocation = buildTelegramAttachmentHandlerInvocation(
+test("Inbound template invocation supports inline placeholder defaults", () => {
+  const invocation = buildTelegramInboundHandlerInvocation(
     {
       template:
         "./scripts/transcribe {file} {lang=ru} {model=voxtral-mini-latest}",
@@ -147,8 +265,8 @@ test("Attachment template invocation supports inline placeholder defaults", () =
   });
 });
 
-test("Attachment template handlers resolve relative commands", () => {
-  const invocation = buildTelegramAttachmentHandlerInvocation(
+test("Inbound template handlers resolve relative commands", () => {
+  const invocation = buildTelegramInboundHandlerInvocation(
     { template: "./scripts/transcribe {file} ru" },
     { path: "/tmp/a.ogg" },
     "/work",
@@ -159,8 +277,8 @@ test("Attachment template handlers resolve relative commands", () => {
   });
 });
 
-test("Attachment template handlers append the path when no placeholder is present", () => {
-  const invocation = buildTelegramAttachmentHandlerInvocation(
+test("Inbound template handlers append the path when no placeholder is present", () => {
+  const invocation = buildTelegramInboundHandlerInvocation(
     { template: "./scripts/transcribe --lang ru" },
     { path: "/tmp/a.ogg" },
     "/work",
@@ -171,7 +289,7 @@ test("Attachment template handlers append the path when no placeholder is presen
   });
 });
 
-test("Attachment template composition handlers execute steps in order", async () => {
+test("Inbound template composition handlers execute steps in order", async () => {
   const calls: Array<{ command: string; args: string[] }> = [];
   const file = {
     path: "/tmp/voice one.ogg",
@@ -179,7 +297,7 @@ test("Attachment template composition handlers execute steps in order", async ()
     mimeType: "audio/ogg",
     kind: "voice",
   };
-  const result = await processTelegramAttachmentHandlers({
+  const result = await processTelegramInboundHandlers({
     files: [file],
     rawText: "",
     handlers: [
@@ -213,10 +331,10 @@ test("Attachment template composition handlers execute steps in order", async ()
   assert.deepEqual(result.handlerOutputs, ["pipe transcript"]);
 });
 
-test("Attachment template composition wraps timeout and pipes stdout to stdin", async () => {
+test("Inbound template composition wraps timeout and pipes stdout to stdin", async () => {
   const calls: Array<{ command: string; stdin?: string; timeout?: number }> =
     [];
-  const result = await processTelegramAttachmentHandlers({
+  const result = await processTelegramInboundHandlers({
     files: [{ path: "/tmp/voice.ogg", mimeType: "audio/ogg", kind: "voice" }],
     rawText: "",
     handlers: [
@@ -254,7 +372,7 @@ test("Attachment template composition wraps timeout and pipes stdout to stdin", 
   assert.deepEqual(result.handlerOutputs, ["seen:raw transcript"]);
 });
 
-test("Attachment handlers fall back to the next matching handler on failure", async () => {
+test("Inbound handlers fall back to the next matching handler on failure", async () => {
   const calls: string[] = [];
   const events: Array<{ category: string; details?: Record<string, unknown> }> =
     [];
@@ -264,7 +382,7 @@ test("Attachment handlers fall back to the next matching handler on failure", as
     mimeType: "audio/ogg",
     kind: "voice",
   };
-  const result = await processTelegramAttachmentHandlers({
+  const result = await processTelegramInboundHandlers({
     files: [file],
     rawText: "",
     handlers: [
@@ -292,13 +410,13 @@ test("Attachment handlers fall back to the next matching handler on failure", as
   assert.deepEqual(result.handlerOutputs, ["fallback transcript"]);
   assert.deepEqual(events, [
     {
-      category: "attachment-handler",
+      category: "inbound-handler",
       details: { fileName: "voice.ogg", handler: "template" },
     },
   ]);
 });
 
-test("Attachment handler failures fall back to normal attachment prompts", async () => {
+test("Inbound handler failures fall back to normal inbound prompts", async () => {
   const events: Array<{ category: string; details?: Record<string, unknown> }> =
     [];
   const file = {
@@ -307,7 +425,7 @@ test("Attachment handler failures fall back to normal attachment prompts", async
     mimeType: "application/pdf",
     kind: "document",
   };
-  const result = await processTelegramAttachmentHandlers({
+  const result = await processTelegramInboundHandlers({
     files: [file],
     rawText: "read this",
     handlers: [
@@ -329,7 +447,7 @@ test("Attachment handler failures fall back to normal attachment prompts", async
   assert.deepEqual(result.promptFiles, [file]);
   assert.deepEqual(events, [
     {
-      category: "attachment-handler",
+      category: "inbound-handler",
       details: { fileName: "report.pdf", handler: "template" },
     },
   ]);
@@ -337,9 +455,9 @@ test("Attachment handler failures fall back to normal attachment prompts", async
 
 // --- Critical-step composition tests ---
 
-test("Attachment handler composition: non-critical failure continues to next step", async () => {
+test("Inbound handler composition: non-critical failure continues to next step", async () => {
   const calls: string[] = [];
-  const result = await processTelegramAttachmentHandlers({
+  const result = await processTelegramInboundHandlers({
     files: [{ path: "/tmp/in.ogg", mimeType: "audio/ogg", kind: "voice" }],
     rawText: "",
     handlers: [
@@ -360,9 +478,9 @@ test("Attachment handler composition: non-critical failure continues to next ste
   assert.deepEqual(result.handlerOutputs, ["transcribed"]);
 });
 
-test("Attachment handler composition: critical failure aborts composition", async () => {
+test("Inbound handler composition: critical failure aborts composition", async () => {
   const calls: string[] = [];
-  const result = await processTelegramAttachmentHandlers({
+  const result = await processTelegramInboundHandlers({
     files: [{ path: "/tmp/in.ogg", mimeType: "audio/ogg", kind: "voice" }],
     rawText: "",
     handlers: [
@@ -387,9 +505,9 @@ test("Attachment handler composition: critical failure aborts composition", asyn
   assert.deepEqual(result.handlerOutputs, []);
 });
 
-test("Attachment handler composition: non-critical failure continues, critical stops", async () => {
+test("Inbound handler composition: non-critical failure continues, critical stops", async () => {
   const calls: string[] = [];
-  const result = await processTelegramAttachmentHandlers({
+  const result = await processTelegramInboundHandlers({
     files: [{ path: "/tmp/in.ogg", mimeType: "audio/ogg", kind: "voice" }],
     rawText: "",
     handlers: [

@@ -97,6 +97,55 @@ export interface TelegramVoiceReplySenderDeps {
   ) => void;
 }
 
+export interface TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup = unknown> {
+  execCommand: TelegramVoiceReplySenderDeps["execCommand"];
+  getHandlers?: () => TelegramOutboundHandlerConfig[] | undefined;
+  sendTextReply: (
+    chatId: number,
+    replyToMessageId: number | undefined,
+    text: string,
+    options?: { parseMode?: "HTML" },
+  ) => Promise<number | undefined>;
+  sendMarkdownReply: (
+    chatId: number,
+    replyToMessageId: number | undefined,
+    markdown: string,
+    options?: { replyMarkup?: TReplyMarkup },
+  ) => Promise<number | undefined>;
+  cwd?: string;
+  recordRuntimeEvent?: TelegramVoiceReplySenderDeps["recordRuntimeEvent"];
+}
+
+export interface TelegramInlineKeyboardLike {
+  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+}
+
+export interface TelegramOutboundTextTransformOptions<TReplyMarkup = unknown> {
+  handlers?: TelegramOutboundHandlerConfig[];
+  cwd?: string;
+  execCommand: TelegramVoiceReplySenderDeps["execCommand"];
+  recordRuntimeEvent?: TelegramVoiceReplySenderDeps["recordRuntimeEvent"];
+  replyMarkup?: TReplyMarkup;
+}
+
+export interface TelegramOutboundTextTransformResult<TReplyMarkup = unknown> {
+  text: string;
+  replyMarkup?: TReplyMarkup;
+}
+
+export interface TelegramOutboundTextPreviewRuntimeDeps<TReplyMarkup = unknown> {
+  execCommand: TelegramVoiceReplySenderDeps["execCommand"];
+  getHandlers?: () => TelegramOutboundHandlerConfig[] | undefined;
+  finalizeMarkdownPreview: (
+    chatId: number,
+    markdown: string,
+    replyToMessageId: number,
+    options?: { replyMarkup?: TReplyMarkup },
+  ) => Promise<boolean>;
+  cwd?: string;
+  recordRuntimeEvent?: TelegramVoiceReplySenderDeps["recordRuntimeEvent"];
+}
+
 interface TelegramTopLevelHtmlComment {
   raw: string;
   content: string;
@@ -663,6 +712,202 @@ export async function generateTelegramVoiceReplyFile(
     timeout: getVoiceReplyTimeout(handler),
     execCommand: options.execCommand,
   });
+}
+
+function getOutboundTextTemplateValues(text: string): Record<string, string> {
+  return { text, type: "text" };
+}
+
+async function transformTelegramOutboundTextWithHandler(
+  text: string,
+  options: {
+    handler: TelegramOutboundHandlerConfig;
+    cwd: string;
+    execCommand: TelegramVoiceReplySenderDeps["execCommand"];
+  },
+): Promise<string> {
+  const values = getOutboundTextTemplateValues(text);
+  const steps = getTelegramVoiceHandlerCompositionSteps(options.handler);
+  if (steps.length > 0) {
+    const startedAt = Date.now();
+    let stdout = text;
+    for (const [index, step] of steps.entries()) {
+      try {
+        const result = await runVoiceReplyCommand(
+          `Outbound text template step ${index + 1}`,
+          step,
+          values,
+          {
+            cwd: options.cwd,
+            timeout: getVoiceReplyCompositionStepTimeout(
+              getVoiceReplyTimeout(options.handler),
+              step,
+              startedAt,
+            ),
+            execCommand: options.execCommand,
+            stdin: stdout,
+          },
+        );
+        stdout = result.stdout;
+      } catch (error) {
+        if (typeof step === "object" && step.critical) throw error;
+        stdout = "";
+      }
+      if (!stdout) stdout = text;
+    }
+    return stdout.trim() || text;
+  }
+  const result = await runVoiceReplyCommand(
+    "Outbound text template",
+    options.handler,
+    values,
+    {
+      cwd: options.cwd,
+      timeout: getVoiceReplyTimeout(options.handler),
+      execCommand: options.execCommand,
+      stdin: text,
+    },
+  );
+  return result.stdout.trim() || text;
+}
+
+export async function transformTelegramOutboundText(
+  text: string,
+  options: {
+    handlers?: TelegramOutboundHandlerConfig[];
+    cwd?: string;
+    execCommand: TelegramVoiceReplySenderDeps["execCommand"];
+    recordRuntimeEvent?: TelegramVoiceReplySenderDeps["recordRuntimeEvent"];
+  },
+): Promise<string> {
+  let transformed = text;
+  for (const handler of findTelegramOutboundHandlers(options.handlers, "text")) {
+    try {
+      transformed = await transformTelegramOutboundTextWithHandler(
+        transformed,
+        {
+          handler,
+          cwd: options.cwd ?? process.cwd(),
+          execCommand: options.execCommand,
+        },
+      );
+    } catch (error) {
+      options.recordRuntimeEvent?.("outbound-text-handler", error, {
+        handler: outboundHandlerMatchesType(handler, "text") ? "text" : "unknown",
+      });
+    }
+  }
+  return transformed;
+}
+
+function isTelegramInlineKeyboardLike(
+  replyMarkup: unknown,
+): replyMarkup is TelegramInlineKeyboardLike {
+  if (!replyMarkup || typeof replyMarkup !== "object") return false;
+  const keyboard = (replyMarkup as { inline_keyboard?: unknown }).inline_keyboard;
+  return Array.isArray(keyboard);
+}
+
+async function transformTelegramOutboundReplyMarkup<TReplyMarkup>(
+  replyMarkup: TReplyMarkup | undefined,
+  options: Omit<TelegramOutboundTextTransformOptions, "replyMarkup">,
+): Promise<TReplyMarkup | undefined> {
+  if (!isTelegramInlineKeyboardLike(replyMarkup)) return replyMarkup;
+  const translatedRows = [];
+  for (const row of replyMarkup.inline_keyboard) {
+    const translatedRow = [];
+    for (const button of row) {
+      const text = await transformTelegramOutboundText(button.text, options);
+      translatedRow.push({ ...button, text });
+    }
+    translatedRows.push(translatedRow);
+  }
+  return { ...replyMarkup, inline_keyboard: translatedRows } as TReplyMarkup;
+}
+
+export async function transformTelegramOutboundTextReply<TReplyMarkup = unknown>(
+  text: string,
+  options: TelegramOutboundTextTransformOptions<TReplyMarkup>,
+): Promise<TelegramOutboundTextTransformResult<TReplyMarkup>> {
+  const transformOptions = {
+    handlers: options.handlers,
+    cwd: options.cwd,
+    execCommand: options.execCommand,
+    recordRuntimeEvent: options.recordRuntimeEvent,
+  };
+  const transformedText = await transformTelegramOutboundText(
+    text,
+    transformOptions,
+  );
+  const replyMarkup = await transformTelegramOutboundReplyMarkup(
+    options.replyMarkup,
+    transformOptions,
+  );
+  return { text: transformedText, ...(replyMarkup ? { replyMarkup } : {}) };
+}
+
+export function createTelegramOutboundTextReplyRuntime<TReplyMarkup = unknown>(
+  deps: TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup>,
+): Pick<
+  TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup>,
+  "sendTextReply" | "sendMarkdownReply"
+> {
+  return {
+    sendTextReply: async (chatId, replyToMessageId, text, options) => {
+      const transformed = await transformTelegramOutboundText(text, {
+        handlers: deps.getHandlers?.(),
+        cwd: deps.cwd,
+        execCommand: deps.execCommand,
+        recordRuntimeEvent: deps.recordRuntimeEvent,
+      });
+      return deps.sendTextReply(chatId, replyToMessageId, transformed, options);
+    },
+    sendMarkdownReply: async (chatId, replyToMessageId, markdown, options) => {
+      const transformed = await transformTelegramOutboundTextReply(markdown, {
+        handlers: deps.getHandlers?.(),
+        cwd: deps.cwd,
+        execCommand: deps.execCommand,
+        recordRuntimeEvent: deps.recordRuntimeEvent,
+        replyMarkup: options?.replyMarkup,
+      });
+      return deps.sendMarkdownReply(chatId, replyToMessageId, transformed.text, {
+        ...options,
+        ...(transformed.replyMarkup
+          ? { replyMarkup: transformed.replyMarkup }
+          : {}),
+      });
+    },
+  };
+}
+
+export function createTelegramOutboundTextPreviewRuntime<TReplyMarkup = unknown>(
+  deps: TelegramOutboundTextPreviewRuntimeDeps<TReplyMarkup>,
+): Pick<
+  TelegramOutboundTextPreviewRuntimeDeps<TReplyMarkup>,
+  "finalizeMarkdownPreview"
+> {
+  return {
+    finalizeMarkdownPreview: async (chatId, markdown, replyToMessageId, options) => {
+      const transformed = await transformTelegramOutboundTextReply(markdown, {
+        handlers: deps.getHandlers?.(),
+        cwd: deps.cwd,
+        execCommand: deps.execCommand,
+        recordRuntimeEvent: deps.recordRuntimeEvent,
+        replyMarkup: options?.replyMarkup,
+      });
+      return deps.finalizeMarkdownPreview(
+        chatId,
+        transformed.text,
+        replyToMessageId,
+        {
+          ...options,
+          ...(transformed.replyMarkup
+            ? { replyMarkup: transformed.replyMarkup }
+            : {}),
+        },
+      );
+    },
+  };
 }
 
 export interface TelegramOutboundReplyPlan<TReplyMarkup = unknown> {

@@ -59,6 +59,7 @@ test("Telegram config store owns load, mutation, and persistence", async () => {
   const store = createTelegramConfigStore({
     initialConfig: {
       botToken: "initial",
+      inboundHandlers: [{ type: "text", template: "translate" }],
       attachmentHandlers: [{ mime: "audio/*", template: "transcribe {file}" }],
     },
     agentDir,
@@ -66,6 +67,7 @@ test("Telegram config store owns load, mutation, and persistence", async () => {
   });
   assert.deepEqual(store.get(), {
     botToken: "initial",
+    inboundHandlers: [{ type: "text", template: "translate" }],
     attachmentHandlers: [{ mime: "audio/*", template: "transcribe {file}" }],
   });
   store.update((config) => {
@@ -74,6 +76,10 @@ test("Telegram config store owns load, mutation, and persistence", async () => {
   assert.equal(store.getBotToken(), "initial");
   assert.equal(store.hasBotToken(), true);
   assert.equal(store.getAllowedUserId(), 42);
+  assert.deepEqual(store.getInboundHandlers(), [
+    { type: "text", template: "translate" },
+    { mime: "audio/*", template: "transcribe {file}" },
+  ]);
   assert.deepEqual(store.getAttachmentHandlers(), [
     { mime: "audio/*", template: "transcribe {file}" },
   ]);
@@ -82,6 +88,7 @@ test("Telegram config store owns load, mutation, and persistence", async () => {
   await store.persist();
   assert.deepEqual(await readTelegramConfig(configPath), {
     botToken: "initial",
+    inboundHandlers: [{ type: "text", template: "translate" }],
     attachmentHandlers: [{ mime: "audio/*", template: "transcribe {file}" }],
     allowedUserId: 43,
   });
@@ -90,6 +97,7 @@ test("Telegram config store owns load, mutation, and persistence", async () => {
   await store.load();
   assert.deepEqual(store.get(), {
     botToken: "initial",
+    inboundHandlers: [{ type: "text", template: "translate" }],
     attachmentHandlers: [{ mime: "audio/*", template: "transcribe {file}" }],
     allowedUserId: 43,
   });

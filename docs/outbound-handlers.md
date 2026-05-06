@@ -8,14 +8,49 @@ This document is the local outbound adaptation of the portable [Command Template
 
 ## Standard
 
-An outbound handler is selected by `type`. Assistant markup maps to handler types:
+An outbound handler is selected by `type`. Text replies and assistant markup map to handler types:
 
-| Markup            | Handler type | Telegram action                                    |
+| Source            | Handler type | Telegram action                                    |
 | ----------------- | ------------ | -------------------------------------------------- |
+| Final text reply  | `text`       | Transform text/Markdown before Telegram rendering  |
 | `telegram_voice`  | `voice`      | Generate OGG/Opus and call `sendVoice`             |
 | `telegram_button` | Built-in     | Attach an inline keyboard button to the final text |
 
 Configured command-template handlers provide `template`. A string is one command; an array is ordered composition. Top-level `args` and `defaults` apply to all composed steps unless a step defines private values. The command-template default timeout applies automatically. `output` selects the primary artifact path when the handler produces a file instead of stdout text. Legacy configs may still use `pipe`, but `template: [...]` is the preferred standard shape.
+
+## Text Handler Config
+
+`type: "text"` handlers transform final text replies before rendering and delivery. The source text is provided on stdin and as `{text}`. Successful non-empty stdout replaces the current text. Empty stdout or handler failure keeps the previous text and records diagnostics.
+
+This is ideal for machine translation, tone normalization, redaction, glossary expansion, compliance footers, or any other final text rewrite that should be configured outside the agent prompt. Text handlers run before Markdown/HTML rendering, so a Markdown reply remains Markdown input to the handler. They also run when the bridge finalizes an already streamed rich preview; in that path Telegram can briefly show a pre-transform preview before the final edited message is replaced with the handler output. Inline buttons are built as reply markup: visible button labels pass through the same text handler, while callback data and callback prompts remain unchanged.
+
+Simple machine-translation handler with explicit text placeholder:
+
+```json
+{
+  "outboundHandlers": [
+    {
+      "type": "text",
+      "template": "/path/to/translate --lang {lang=ru} --text \"{text}\""
+    }
+  ]
+}
+```
+
+Stdin-based or subagent-backed translation can omit `{text}` from the template because the bridge also provides the source reply on stdin:
+
+```json
+{
+  "outboundHandlers": [
+    {
+      "type": "text",
+      "template": "/path/to/translate-stdin --lang {lang=ru}"
+    }
+  ]
+}
+```
+
+A text handler should preserve the full message unless shortening is intentional; for translation prompts, explicitly ask the tool to keep Markdown, line breaks, and details unchanged.
 
 ## Voice Handler Config
 
@@ -27,7 +62,8 @@ Configured command-template handlers provide `template`. A string is one command
     {
       "type": "voice",
       "template": [
-        "/path/to/tts --text {text} --lang {lang=ru} --rate {rate=+30%} --write-media {mp3}",
+        "/path/to/translate-stdin --lang {lang=ru}",
+        "/path/to/tts-from-stdin --lang {lang=ru} --rate {rate=+30%} --write-media {mp3}",
         "ffmpeg -y -i {mp3} -c:a libopus -b:a 32k -ar 16000 -ac 1 -vbr on {ogg}"
       ],
       "output": "ogg"
@@ -36,7 +72,7 @@ Configured command-template handlers provide `template`. A string is one command
 }
 ```
 
-If a matching voice handler fails, the bridge tries the next matching `type: "voice"` handler.
+In this example, the first step receives the `telegram_voice` text on stdin and returns translated text; the second step reads that translated text from stdin and writes `{mp3}`; the final step converts `{mp3}` to Telegram-ready `{ogg}`. If you do not need voice translation, omit the first step and call a TTS command that accepts `{text}` directly. If a matching voice handler fails, the bridge tries the next matching `type: "voice"` handler.
 
 ## Voice Markup
 

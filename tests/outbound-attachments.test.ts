@@ -1,6 +1,6 @@
 /**
- * Regression tests for the Telegram attachments domain
- * Covers attachment queueing and attachment delivery behavior in one domain-level suite
+ * Regression tests for the Telegram outbound attachments domain
+ * Covers outbound attachment queueing and delivery behavior in one domain-level suite
  */
 
 import assert from "node:assert/strict";
@@ -10,26 +10,26 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
-  createTelegramQueuedAttachmentSender,
-  getTelegramAttachmentByteLimitFromEnv,
-  queueTelegramAttachments,
-  registerTelegramAttachmentTool,
-  sendQueuedTelegramAttachments,
+  createTelegramQueuedOutboundAttachmentSender,
+  getTelegramOutboundAttachmentByteLimitFromEnv,
+  queueTelegramOutboundAttachments,
+  registerTelegramOutboundAttachmentTool,
+  sendQueuedTelegramOutboundAttachments,
   TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES,
-  type TelegramAttachmentQueueTargetView,
-  type TelegramQueuedAttachmentTurnView,
-} from "../lib/attachments.ts";
+  type TelegramOutboundAttachmentQueueTargetView,
+  type TelegramQueuedOutboundAttachmentTurnView,
+} from "../lib/outbound-attachments.ts";
 import type { ExtensionAPI } from "../lib/pi.ts";
 
 function createAttachmentQueueTarget(
-  queuedAttachments: TelegramAttachmentQueueTargetView["queuedAttachments"] = [],
-): TelegramAttachmentQueueTargetView {
+  queuedAttachments: TelegramOutboundAttachmentQueueTargetView["queuedAttachments"] = [],
+): TelegramOutboundAttachmentQueueTargetView {
   return { queuedAttachments };
 }
 
 function createAttachmentTurn(
   queuedAttachments = [{ path: "/tmp/a.png", fileName: "a.png" }],
-): TelegramQueuedAttachmentTurnView {
+): TelegramQueuedOutboundAttachmentTurnView {
   return { chatId: 1, replyToMessageId: 2, queuedAttachments };
 }
 
@@ -41,13 +41,13 @@ type RegisteredAttachmentTool = {
   ) => Promise<{ details: { paths: string[] } }>;
 };
 
-test("Attachment byte-limit helpers own the outbound file default", () => {
+test("Outbound attachment byte-limit helpers own the outbound file default", () => {
   assert.equal(
     TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES,
     50 * 1024 * 1024,
   );
   assert.equal(
-    getTelegramAttachmentByteLimitFromEnv(
+    getTelegramOutboundAttachmentByteLimitFromEnv(
       { PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES: "12345" },
       ["PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES"],
       99,
@@ -55,7 +55,7 @@ test("Attachment byte-limit helpers own the outbound file default", () => {
     12345,
   );
   assert.equal(
-    getTelegramAttachmentByteLimitFromEnv(
+    getTelegramOutboundAttachmentByteLimitFromEnv(
       {
         PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES: "0",
         TELEGRAM_MAX_ATTACHMENT_SIZE_BYTES: "bad",
@@ -70,7 +70,7 @@ test("Attachment byte-limit helpers own the outbound file default", () => {
   );
 });
 
-test("Attachment tool registration delegates queueing", async () => {
+test("Outbound attachment tool registration delegates queueing", async () => {
   let tool: RegisteredAttachmentTool | undefined;
   const api = {
     registerTool: (definition: RegisteredAttachmentTool) => {
@@ -78,7 +78,7 @@ test("Attachment tool registration delegates queueing", async () => {
     },
   } as unknown as ExtensionAPI;
   const activeTurn = createAttachmentQueueTarget();
-  registerTelegramAttachmentTool(api, {
+  registerTelegramOutboundAttachmentTool(api, {
     maxAttachmentsPerTurn: 2,
     getActiveTurn: () => activeTurn,
     statPath: async () => ({ isFile: () => true }),
@@ -92,9 +92,9 @@ test("Attachment tool registration delegates queueing", async () => {
   assert.deepEqual(result.details.paths, ["/tmp/report.md"]);
 });
 
-test("Attachment queueing adds files to the active Telegram turn", async () => {
+test("Outbound attachment queueing adds files to the active Telegram turn", async () => {
   const activeTurn = createAttachmentQueueTarget();
-  const result = await queueTelegramAttachments({
+  const result = await queueTelegramOutboundAttachments({
     activeTurn,
     paths: ["/tmp/demo.txt"],
     maxAttachmentsPerTurn: 2,
@@ -107,14 +107,14 @@ test("Attachment queueing adds files to the active Telegram turn", async () => {
   assert.equal(result.content[0]?.text, "\nQueued 1 Telegram attachment(s).");
 });
 
-test("Attachment queueing uses the domain stat fallback", async () => {
+test("Outbound attachment queueing uses the domain stat fallback", async () => {
   const tempDir = await mkdtemp(
     join(tmpdir(), "pi-telegram-attachment-queue-"),
   );
   const filePath = join(tempDir, "demo.txt");
   await writeFile(filePath, "demo", "utf8");
   const activeTurn = createAttachmentQueueTarget();
-  const result = await queueTelegramAttachments({
+  const result = await queueTelegramOutboundAttachments({
     activeTurn,
     paths: [filePath],
     maxAttachmentsPerTurn: 1,
@@ -122,10 +122,10 @@ test("Attachment queueing uses the domain stat fallback", async () => {
   assert.deepEqual(result.details.paths, [filePath]);
 });
 
-test("Attachment queueing rejects oversized files", async () => {
+test("Outbound attachment queueing rejects oversized files", async () => {
   await assert.rejects(
     () =>
-      queueTelegramAttachments({
+      queueTelegramOutboundAttachments({
         activeTurn: createAttachmentQueueTarget(),
         paths: ["/tmp/large.bin"],
         maxAttachmentsPerTurn: 1,
@@ -139,11 +139,11 @@ test("Attachment queueing rejects oversized files", async () => {
   );
 });
 
-test("Attachment queueing stays atomic when a later file is rejected", async () => {
+test("Outbound attachment queueing stays atomic when a later file is rejected", async () => {
   const activeTurn = createAttachmentQueueTarget();
   await assert.rejects(
     () =>
-      queueTelegramAttachments({
+      queueTelegramOutboundAttachments({
         activeTurn,
         paths: ["/tmp/ok.txt", "/tmp/large.bin"],
         maxAttachmentsPerTurn: 2,
@@ -161,10 +161,10 @@ test("Attachment queueing stays atomic when a later file is rejected", async () 
   assert.deepEqual(activeTurn.queuedAttachments, []);
 });
 
-test("Attachment queueing rejects missing turns, non-files, and full queues", async () => {
+test("Outbound attachment queueing rejects missing turns, non-files, and full queues", async () => {
   await assert.rejects(
     () =>
-      queueTelegramAttachments({
+      queueTelegramOutboundAttachments({
         activeTurn: undefined,
         paths: ["/tmp/demo.txt"],
         maxAttachmentsPerTurn: 1,
@@ -174,7 +174,7 @@ test("Attachment queueing rejects missing turns, non-files, and full queues", as
   );
   await assert.rejects(
     () =>
-      queueTelegramAttachments({
+      queueTelegramOutboundAttachments({
         activeTurn: createAttachmentQueueTarget(),
         paths: ["/tmp/demo.txt"],
         maxAttachmentsPerTurn: 1,
@@ -184,7 +184,7 @@ test("Attachment queueing rejects missing turns, non-files, and full queues", as
   );
   await assert.rejects(
     () =>
-      queueTelegramAttachments({
+      queueTelegramOutboundAttachments({
         activeTurn: createAttachmentQueueTarget([
           { path: "/tmp/a.txt", fileName: "a.txt" },
         ]),
@@ -196,9 +196,9 @@ test("Attachment queueing rejects missing turns, non-files, and full queues", as
   );
 });
 
-test("Attachment delivery includes reply parameters for uploads", async () => {
+test("Outbound attachment delivery includes reply parameters for uploads", async () => {
   const sentFields: Array<Record<string, string>> = [];
-  await sendQueuedTelegramAttachments(createAttachmentTurn(), {
+  await sendQueuedTelegramOutboundAttachments(createAttachmentTurn(), {
     sendMultipart: async (_method, fields) => {
       sentFields.push(fields);
     },
@@ -215,9 +215,9 @@ test("Attachment delivery includes reply parameters for uploads", async () => {
   ]);
 });
 
-test("Attachment delivery chooses photo vs document methods from file paths", async () => {
+test("Outbound attachment delivery chooses photo vs document methods from file paths", async () => {
   const sent: Array<string> = [];
-  await sendQueuedTelegramAttachments(
+  await sendQueuedTelegramOutboundAttachments(
     createAttachmentTurn([
       { path: "/tmp/a.png", fileName: "a.png" },
       { path: "/tmp/b.txt", fileName: "b.txt" },
@@ -241,12 +241,12 @@ test("Attachment delivery chooses photo vs document methods from file paths", as
   ]);
 });
 
-test("Attachment delivery uses the domain stat fallback for size checks", async () => {
+test("Outbound attachment delivery uses the domain stat fallback for size checks", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-attachment-"));
   const filePath = join(tempDir, "large.txt");
   await writeFile(filePath, "too large", "utf8");
   const replies: string[] = [];
-  await sendQueuedTelegramAttachments(
+  await sendQueuedTelegramOutboundAttachments(
     createAttachmentTurn([{ path: filePath, fileName: "large.txt" }]),
     {
       sendMultipart: async () => {
@@ -263,10 +263,10 @@ test("Attachment delivery uses the domain stat fallback for size checks", async 
   ]);
 });
 
-test("Attachment delivery checks attachment sizes before upload", async () => {
+test("Outbound attachment delivery checks attachment sizes before upload", async () => {
   const replies: string[] = [];
   const sent: string[] = [];
-  await sendQueuedTelegramAttachments(createAttachmentTurn(), {
+  await sendQueuedTelegramOutboundAttachments(createAttachmentTurn(), {
     maxAttachmentSizeBytes: 10,
     statPath: async () => ({ size: 11 }),
     sendMultipart: async () => {
@@ -283,10 +283,10 @@ test("Attachment delivery checks attachment sizes before upload", async () => {
   ]);
 });
 
-test("Attachment delivery reports per-file failures via text replies", async () => {
+test("Outbound attachment delivery reports per-file failures via text replies", async () => {
   const replies: string[] = [];
   const runtimeEvents: string[] = [];
-  await sendQueuedTelegramAttachments(createAttachmentTurn(), {
+  await sendQueuedTelegramOutboundAttachments(createAttachmentTurn(), {
     sendMultipart: async () => {
       throw new Error("upload failed");
     },
@@ -303,9 +303,9 @@ test("Attachment delivery reports per-file failures via text replies", async () 
   assert.deepEqual(runtimeEvents, ["attachment:upload failed:a.png"]);
 });
 
-test("Attachment sender runtime binds delivery ports", async () => {
+test("Outbound attachment sender runtime binds delivery ports", async () => {
   const sent: string[] = [];
-  const sendQueuedAttachments = createTelegramQueuedAttachmentSender({
+  const sendQueuedAttachments = createTelegramQueuedOutboundAttachmentSender({
     sendMultipart: async (method, _fields, fileField, _filePath, fileName) => {
       sent.push(`${method}:${fileField}:${fileName}`);
     },
@@ -316,9 +316,9 @@ test("Attachment sender runtime binds delivery ports", async () => {
   assert.deepEqual(sent, ["sendPhoto:photo:a.png"]);
 });
 
-test("Attachment sender runtime applies the default outbound size limit", async () => {
+test("Outbound attachment sender runtime applies the default outbound size limit", async () => {
   const replies: string[] = [];
-  const sendQueuedAttachments = createTelegramQueuedAttachmentSender({
+  const sendQueuedAttachments = createTelegramQueuedOutboundAttachmentSender({
     sendMultipart: async () => {
       throw new Error("unexpected upload");
     },

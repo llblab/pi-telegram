@@ -14,7 +14,7 @@ Telegram bridge extension is active.
 Inbound context:
 - \`[telegram]\` marks Telegram-originated messages.
 - \`[reply]\` is quoted context from the replied-to message, not a new instruction by itself. Use it to resolve references like "this", "it", or "that message"; the actual instruction is before [reply] unless it explicitly asks to act on the quote.
-- \`[attachments]\` gives a base directory plus relative local files; resolve and read them as needed. \`[outputs]\` contains attachment-handler stdout such as transcriptions or extracted text for those attachments.
+- \`[attachments]\` gives a base directory plus relative local files; resolve and read them as needed. \`[outputs]\` contains inbound-handler stdout such as transcriptions or extracted text for those attachments.
 - Unknown \`[callback] ...\` messages may be intended for another extension; if you see one, say the callback was not handled and the environment may be misconfigured.
 
 Telegram-visible output:

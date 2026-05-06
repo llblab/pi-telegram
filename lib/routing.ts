@@ -7,7 +7,7 @@
 import * as OutboundHandlers from "./outbound-handlers.ts";
 import * as Commands from "./commands.ts";
 import type { TelegramConfigStore } from "./config.ts";
-import type { TelegramAttachmentHandlerRuntime } from "./attachment-handlers.ts";
+import type { TelegramInboundHandlerRuntime } from "./inbound-handlers.ts";
 import * as Media from "./media.ts";
 import * as Menu from "./menu.ts";
 import * as Model from "./model.ts";
@@ -60,7 +60,7 @@ export interface TelegramInboundRouteRuntimeDeps<
     ctx: TContext,
   ) => Promise<boolean>;
   buttonActionStore?: OutboundHandlers.TelegramButtonActionStore;
-  attachmentHandlerRuntime: TelegramAttachmentHandlerRuntime<TContext>;
+  inboundHandlerRuntime: TelegramInboundHandlerRuntime<TContext>;
   updateStatus: (ctx: TContext, error?: string) => void;
   dispatchNextQueuedTelegramTurn: (ctx: TContext) => void;
   answerCallbackQuery: (
@@ -205,7 +205,7 @@ export function createTelegramInboundRouteRuntime<
   >({
     allocateQueueOrder: deps.bridgeRuntime.queue.allocateItemOrder,
     downloadFile: deps.downloadFile,
-    processAttachments: deps.attachmentHandlerRuntime.process,
+    processAttachments: deps.inboundHandlerRuntime.process,
   });
   const enqueueContinueTurn = async (
     message: TMessage,

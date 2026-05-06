@@ -14,6 +14,8 @@ import {
   createTelegramButtonActionStore,
   createTelegramButtonPromptTurn,
   createTelegramOutboundReplyArtifactSender,
+  createTelegramOutboundTextPreviewRuntime,
+  createTelegramOutboundTextReplyRuntime,
   createTelegramVoiceReplySender,
   generateTelegramVoiceReplyFile,
   handleTelegramButtonCallbackQuery,
@@ -26,6 +28,157 @@ import {
 const testReplyMarkup = {
   inline_keyboard: [[{ text: "Continue", callback_data: "btn:1" }]],
 };
+
+test("Outbound text handler transforms text and markdown replies", async () => {
+  const sent: string[] = [];
+  const markdownOptions: unknown[] = [];
+  const calls: Array<{ command: string; stdin?: string }> = [];
+  const runtime = createTelegramOutboundTextReplyRuntime({
+    getHandlers: () => [{ type: "text", template: "/tools/translate" }],
+    execCommand: async (command, _args, options) => {
+      calls.push({ command, stdin: options?.stdin });
+      return {
+        stdout: `translated:${options?.stdin ?? ""}`,
+        stderr: "",
+        code: 0,
+        killed: false,
+      };
+    },
+    sendTextReply: async (_chatId, _replyToMessageId, text) => {
+      sent.push(`text:${text}`);
+      return 1;
+    },
+    sendMarkdownReply: async (_chatId, _replyToMessageId, markdown, options) => {
+      sent.push(`markdown:${markdown}`);
+      markdownOptions.push(options);
+      return 2;
+    },
+  });
+  assert.equal(await runtime.sendTextReply(1, 2, "hello"), 1);
+  assert.equal(
+    await runtime.sendMarkdownReply(1, 2, "**hello**", {
+      replyMarkup: testReplyMarkup,
+    }),
+    2,
+  );
+  assert.deepEqual(calls, [
+    { command: "/tools/translate", stdin: "hello" },
+    { command: "/tools/translate", stdin: "**hello**" },
+    { command: "/tools/translate", stdin: "Continue" },
+  ]);
+  assert.deepEqual(sent, ["text:translated:hello", "markdown:translated:**hello**"]);
+  assert.deepEqual(markdownOptions, [
+    {
+      replyMarkup: {
+        inline_keyboard: [
+          [{ text: "translated:Continue", callback_data: "btn:1" }],
+        ],
+      },
+    },
+  ]);
+});
+
+test("Outbound text handler preserves inline buttons on transformed replies", async () => {
+  const sent: Array<{ markdown: string; replyMarkup: unknown }> = [];
+  const actions: unknown[] = [];
+  const plan = planTelegramButtonReply(
+    ["Answer.", "", "<!-- telegram_button: Continue -->"].join("\n"),
+    {
+      registerAction: (action) => {
+        actions.push(action);
+        return `btn:${actions.length}`;
+      },
+    },
+  );
+  const runtime = createTelegramOutboundTextReplyRuntime({
+    getHandlers: () => [{ type: "text", template: "/tools/translate" }],
+    execCommand: async (_command, _args, options) => ({
+      stdout: `translated:${options?.stdin ?? ""}`,
+      stderr: "",
+      code: 0,
+      killed: false,
+    }),
+    sendTextReply: async () => 1,
+    sendMarkdownReply: async (_chatId, _replyToMessageId, markdown, options) => {
+      sent.push({ markdown, replyMarkup: options?.replyMarkup });
+      return 2;
+    },
+  });
+  await runtime.sendMarkdownReply(1, 2, plan.markdown, {
+    replyMarkup: plan.replyMarkup,
+  });
+  assert.deepEqual(actions, [{ text: "Continue", prompt: "Continue" }]);
+  assert.deepEqual(sent, [
+    {
+      markdown: "translated:Answer.",
+      replyMarkup: {
+        inline_keyboard: [
+          [{ text: "translated:Continue", callback_data: "btn:1" }],
+        ],
+      },
+    },
+  ]);
+});
+
+test("Outbound text handler transforms finalized markdown previews", async () => {
+  const finalized: string[] = [];
+  const previewOptions: unknown[] = [];
+  const runtime = createTelegramOutboundTextPreviewRuntime({
+    getHandlers: () => [{ type: "text", template: "/tools/translate" }],
+    execCommand: async (_command, _args, options) => ({
+      stdout: `translated:${options?.stdin ?? ""}`,
+      stderr: "",
+      code: 0,
+      killed: false,
+    }),
+    finalizeMarkdownPreview: async (_chatId, markdown, _replyToMessageId, options) => {
+      finalized.push(markdown);
+      previewOptions.push(options);
+      return true;
+    },
+  });
+  assert.equal(
+    await runtime.finalizeMarkdownPreview(1, "**hello**", 2, {
+      replyMarkup: testReplyMarkup,
+    }),
+    true,
+  );
+  assert.deepEqual(finalized, ["translated:**hello**"]);
+  assert.deepEqual(previewOptions, [
+    {
+      replyMarkup: {
+        inline_keyboard: [
+          [{ text: "translated:Continue", callback_data: "btn:1" }],
+        ],
+      },
+    },
+  ]);
+});
+
+test("Outbound text handler keeps original reply on failure", async () => {
+  const events: string[] = [];
+  const sent: string[] = [];
+  const runtime = createTelegramOutboundTextReplyRuntime({
+    getHandlers: () => [{ type: "text", template: "/tools/fail" }],
+    execCommand: async () => ({
+      stdout: "",
+      stderr: "boom",
+      code: 1,
+      killed: false,
+    }),
+    sendTextReply: async (_chatId, _replyToMessageId, text) => {
+      sent.push(text);
+      return 1;
+    },
+    sendMarkdownReply: async () => 2,
+    recordRuntimeEvent: (category) => {
+      events.push(category);
+    },
+  });
+  assert.equal(await runtime.sendTextReply(1, 2, "original"), 1);
+  assert.deepEqual(sent, ["original"]);
+  assert.deepEqual(events, ["outbound-text-handler"]);
+});
 
 test("Voice reply planner extracts multiline telegram_voice comments", () => {
   const plan = planTelegramVoiceReply(

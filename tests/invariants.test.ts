@@ -262,8 +262,8 @@ test("Structural update and media domains stay decoupled from concrete API trans
   });
 });
 
-test("Attachment delivery stays decoupled from queue, inbound media, and API helpers", () => {
-  const attachmentImports = getImportSpecifiers(join("lib", "attachments.ts"));
+test("Outbound attachment delivery stays decoupled from queue, inbound media, and API helpers", () => {
+  const attachmentImports = getImportSpecifiers(join("lib", "outbound-attachments.ts"));
   assert.equal(attachmentImports.includes("./queue.ts"), false);
   assert.equal(attachmentImports.includes("./media.ts"), false);
   assert.equal(attachmentImports.includes("./api.ts"), false);

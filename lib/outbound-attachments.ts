@@ -1,7 +1,7 @@
 /**
- * Telegram attachment domain helpers
+ * Telegram outbound attachment helpers
  * Zones: telegram outbound, pi agent tool, filesystem
- * Owns telegram_attach registration, attachment queueing, and attachment delivery so Telegram file output stays in one domain module
+ * Owns telegram_attach registration, outbound attachment queueing, and delivery so Telegram file output stays in one domain module
  */
 
 import { stat } from "node:fs/promises";
@@ -16,7 +16,7 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 
 export const TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
 
-export function getTelegramAttachmentByteLimitFromEnv(
+export function getTelegramOutboundAttachmentByteLimitFromEnv(
   env: NodeJS.ProcessEnv,
   names: string[],
   defaultValue = TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES,
@@ -31,17 +31,17 @@ export function getTelegramAttachmentByteLimitFromEnv(
 }
 
 export const TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES =
-  getTelegramAttachmentByteLimitFromEnv(process.env, [
+  getTelegramOutboundAttachmentByteLimitFromEnv(process.env, [
     "PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES",
     "TELEGRAM_MAX_ATTACHMENT_SIZE_BYTES",
   ]);
 
-export interface TelegramAttachmentToolResult {
+export interface TelegramOutboundAttachmentToolResult {
   content: Array<{ type: "text"; text: string }>;
   details: { paths: string[] };
 }
 
-export interface TelegramAttachmentRuntimeEventRecorderPort {
+export interface TelegramOutboundAttachmentRuntimeEventRecorderPort {
   recordRuntimeEvent?: (
     category: string,
     error: unknown,
@@ -49,28 +49,28 @@ export interface TelegramAttachmentRuntimeEventRecorderPort {
   ) => void;
 }
 
-export interface TelegramAttachmentToolRegistrationDeps extends TelegramAttachmentRuntimeEventRecorderPort {
+export interface TelegramOutboundAttachmentToolRegistrationDeps extends TelegramOutboundAttachmentRuntimeEventRecorderPort {
   maxAttachmentsPerTurn?: number;
   maxAttachmentSizeBytes?: number;
-  getActiveTurn: () => TelegramAttachmentQueueTargetView | undefined;
+  getActiveTurn: () => TelegramOutboundAttachmentQueueTargetView | undefined;
   statPath?: (path: string) => Promise<{ isFile(): boolean; size?: number }>;
 }
 
-export interface TelegramQueuedAttachmentView {
+export interface TelegramQueuedOutboundAttachmentView {
   path: string;
   fileName: string;
 }
 
-export interface TelegramAttachmentQueueTargetView {
-  queuedAttachments: TelegramQueuedAttachmentView[];
+export interface TelegramOutboundAttachmentQueueTargetView {
+  queuedAttachments: TelegramQueuedOutboundAttachmentView[];
 }
 
-export interface TelegramQueuedAttachmentTurnView extends TelegramAttachmentQueueTargetView {
+export interface TelegramQueuedOutboundAttachmentTurnView extends TelegramOutboundAttachmentQueueTargetView {
   chatId: number;
   replyToMessageId: number;
 }
 
-function isTelegramPhotoAttachmentPath(path: string): boolean {
+function isTelegramOutboundPhotoAttachmentPath(path: string): boolean {
   const normalized = path.toLowerCase();
   return (
     normalized.endsWith(".jpg") ||
@@ -81,7 +81,7 @@ function isTelegramPhotoAttachmentPath(path: string): boolean {
   );
 }
 
-function formatTelegramAttachmentSizeLimitError(
+function formatTelegramOutboundAttachmentSizeLimitError(
   size: number,
   maxSize: number,
   path?: string,
@@ -90,14 +90,14 @@ function formatTelegramAttachmentSizeLimitError(
   return path ? `${message}: ${path}` : message;
 }
 
-function formatTelegramAttachmentToolResultText(count: number): string {
+function formatTelegramOutboundAttachmentToolResultText(count: number): string {
   // Pi's compact tool rows need an empty first line to visually separate header and result
   return ["", `Queued ${count} Telegram attachment(s).`].join("\n");
 }
 
-export function registerTelegramAttachmentTool(
+export function registerTelegramOutboundAttachmentTool(
   pi: ExtensionAPI,
-  deps: TelegramAttachmentToolRegistrationDeps,
+  deps: TelegramOutboundAttachmentToolRegistrationDeps,
 ): void {
   const maxAttachmentsPerTurn =
     deps.maxAttachmentsPerTurn ?? MAX_ATTACHMENTS_PER_TURN;
@@ -120,7 +120,7 @@ export function registerTelegramAttachmentTool(
     }),
     async execute(_toolCallId, params) {
       try {
-        return await queueTelegramAttachments({
+        return await queueTelegramOutboundAttachments({
           activeTurn: deps.getActiveTurn(),
           paths: params.paths,
           maxAttachmentsPerTurn,
@@ -138,7 +138,7 @@ export function registerTelegramAttachmentTool(
   });
 }
 
-export interface TelegramQueuedAttachmentDeliveryDeps {
+export interface TelegramQueuedOutboundAttachmentDeliveryDeps {
   sendMultipart: (
     method: string,
     fields: Record<string, string>,
@@ -160,13 +160,13 @@ export interface TelegramQueuedAttachmentDeliveryDeps {
   maxAttachmentSizeBytes?: number;
 }
 
-export async function queueTelegramAttachments(options: {
-  activeTurn: TelegramAttachmentQueueTargetView | undefined;
+export async function queueTelegramOutboundAttachments(options: {
+  activeTurn: TelegramOutboundAttachmentQueueTargetView | undefined;
   paths: string[];
   maxAttachmentsPerTurn: number;
   maxAttachmentSizeBytes?: number;
   statPath?: (path: string) => Promise<{ isFile(): boolean; size?: number }>;
-}): Promise<TelegramAttachmentToolResult> {
+}): Promise<TelegramOutboundAttachmentToolResult> {
   if (!options.activeTurn) {
     throw new Error(
       "telegram_attach can only be used while replying to an active Telegram turn",
@@ -180,7 +180,7 @@ export async function queueTelegramAttachments(options: {
       `Attachment limit reached (${options.maxAttachmentsPerTurn})`,
     );
   }
-  const pendingAttachments: TelegramQueuedAttachmentView[] = [];
+  const pendingAttachments: TelegramQueuedOutboundAttachmentView[] = [];
   for (const inputPath of options.paths) {
     const stats = await (options.statPath ?? stat)(inputPath);
     if (!stats.isFile()) {
@@ -192,7 +192,7 @@ export async function queueTelegramAttachments(options: {
       stats.size > options.maxAttachmentSizeBytes
     ) {
       throw new Error(
-        formatTelegramAttachmentSizeLimitError(
+        formatTelegramOutboundAttachmentSizeLimitError(
           stats.size,
           options.maxAttachmentSizeBytes,
           inputPath,
@@ -210,20 +210,20 @@ export async function queueTelegramAttachments(options: {
     content: [
       {
         type: "text",
-        text: formatTelegramAttachmentToolResultText(added.length),
+        text: formatTelegramOutboundAttachmentToolResultText(added.length),
       },
     ],
     details: { paths: added },
   };
 }
 
-export function createTelegramQueuedAttachmentSender(
-  deps: TelegramQueuedAttachmentDeliveryDeps,
+export function createTelegramQueuedOutboundAttachmentSender(
+  deps: TelegramQueuedOutboundAttachmentDeliveryDeps,
 ) {
   return async function sendQueuedAttachments(
-    turn: TelegramQueuedAttachmentTurnView,
+    turn: TelegramQueuedOutboundAttachmentTurnView,
   ): Promise<void> {
-    await sendQueuedTelegramAttachments(turn, {
+    await sendQueuedTelegramOutboundAttachments(turn, {
       ...deps,
       maxAttachmentSizeBytes:
         deps.maxAttachmentSizeBytes ?? TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES,
@@ -231,9 +231,9 @@ export function createTelegramQueuedAttachmentSender(
   };
 }
 
-export async function sendQueuedTelegramAttachments(
-  turn: TelegramQueuedAttachmentTurnView,
-  deps: TelegramQueuedAttachmentDeliveryDeps,
+export async function sendQueuedTelegramOutboundAttachments(
+  turn: TelegramQueuedOutboundAttachmentTurnView,
+  deps: TelegramQueuedOutboundAttachmentDeliveryDeps,
 ): Promise<void> {
   for (const attachment of turn.queuedAttachments) {
     try {
@@ -241,14 +241,14 @@ export async function sendQueuedTelegramAttachments(
         const stats = await (deps.statPath ?? stat)(attachment.path);
         if (stats.size > deps.maxAttachmentSizeBytes) {
           throw new Error(
-            formatTelegramAttachmentSizeLimitError(
+            formatTelegramOutboundAttachmentSizeLimitError(
               stats.size,
               deps.maxAttachmentSizeBytes,
             ),
           );
         }
       }
-      const isPhoto = isTelegramPhotoAttachmentPath(attachment.path);
+      const isPhoto = isTelegramOutboundPhotoAttachmentPath(attachment.path);
       const method = isPhoto ? "sendPhoto" : "sendDocument";
       const fieldName = isPhoto ? "photo" : "document";
       const replyParameters = buildTelegramMultipartReplyParameters(
