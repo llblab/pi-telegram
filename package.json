@@ -1,6 +1,6 @@
 {
   "name": "@llblab/pi-telegram",
-  "version": "0.6.3-vividfish.1",
+  "version": "0.6.3-vividfish.2",
   "private": false,
   "description": "Better Telegram DM bridge extension for pi",
   "type": "module",

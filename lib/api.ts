@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { createWriteStream, openAsBlob } from "node:fs";
 import { mkdir, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -27,7 +27,12 @@ export function getTelegramInboundFileByteLimitFromEnv(
   return defaultValue;
 }
 
-const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
+function getTempDir(): string {
+  const agentDir = process.env.PI_CODING_AGENT_DIR
+    ? resolve(process.env.PI_CODING_AGENT_DIR)
+    : join(homedir(), ".pi", "agent");
+  return join(agentDir, "tmp", "telegram");
+}
 const TELEGRAM_TEMP_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const TELEGRAM_INBOUND_FILE_MAX_BYTES = getTelegramInboundFileByteLimitFromEnv(
   process.env,
@@ -640,7 +645,7 @@ export function createDefaultTelegramBridgeApiRuntime(deps: {
 }): TelegramBridgeApiRuntime {
   return createTelegramBridgeApiRuntime({
     client: createTelegramApiClient(deps.getBotToken),
-    tempDir: TEMP_DIR,
+    tempDir: getTempDir(),
     maxFileSizeBytes: TELEGRAM_INBOUND_FILE_MAX_BYTES,
     tempFileMaxAgeMs: TELEGRAM_TEMP_FILE_MAX_AGE_MS,
     recordRuntimeEvent: deps.recordRuntimeEvent,
