@@ -236,6 +236,14 @@ Import from `@llblab/pi-telegram`, call `registerTelegramSection()`, and return 
 - Replies to Telegram prompts are sent as Telegram replies to the source message when possible; if the source message is unavailable, delivery falls back to a normal message.
 - Temporary inbound Telegram files are cleaned up on later session starts.
 
+## Companion Extensions
+
+Third-party extensions that integrate with `pi-telegram`:
+
+| Extension | Description | Install |
+|-----------|-------------|---------|
+| [`pi-telegram-tool-status`](https://github.com/Timur00Kh/pi-telegram-tool-status) | Live-updating service message listing tools used by the agent. One message per Telegram prompt, edited in-place as tools execute. | `pi install npm:pi-telegram-tool-status` |
+
 ## License
 
 MIT
