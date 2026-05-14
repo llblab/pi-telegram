@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.3: Dependency Audit Hotfix
+
+- `[Dependencies]` Refreshed the lockfile transitive dependency set to resolve current `protobufjs` / `@protobufjs/utf8` npm audit advisories inherited through development peer installs. Impact: `npm run validate` is green again without changing runtime API or bridge behavior.
+
 ## 0.10.2: Delete Message Port Hotfix
 
 - `[ctx.deleteMessage()]` Added `deleteMessage()` to `TelegramSectionContext` and `TelegramSectionCallbackContext`. Extensions can now delete the message that triggered a callback — useful for cleaning up confirmation dialogs after the user makes a choice.
