@@ -18,6 +18,7 @@ import * as Queue from "./queue.ts";
 import type { TelegramBridgeRuntime } from "./runtime.ts";
 import * as TextGroups from "./text-groups.ts";
 import * as Turns from "./turns.ts";
+import { getTelegramVoiceReplyMode } from "./voice.ts";
 import type { TelegramUser } from "./updates.ts";
 import * as Updates from "./updates.ts";
 
@@ -38,7 +39,7 @@ export interface TelegramInboundRouteRuntimeDeps<
 > {
   configStore: Pick<
     TelegramConfigStore,
-    "getAllowedUserId" | "setAllowedUserId" | "persist"
+    "get" | "getAllowedUserId" | "setAllowedUserId" | "persist"
   >;
   bridgeRuntime: TelegramBridgeRuntime;
   activeTurnRuntime: Queue.TelegramActiveTurnStore;
@@ -286,6 +287,9 @@ export function createTelegramInboundRouteRuntime<
     allocateQueueOrder: deps.bridgeRuntime.queue.allocateItemOrder,
     downloadFile: deps.downloadFile,
     processAttachments: deps.inboundHandlerRuntime.process,
+
+    // Voice policy for the current turn (from config + active voice provider)
+    getVoiceReplyMode: () => getTelegramVoiceReplyMode(deps.configStore.get()),
   });
   const enqueueContinueTurn = async (
     message: TMessage,

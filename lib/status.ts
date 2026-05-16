@@ -4,6 +4,8 @@
  * Builds usage, cost, and context summaries for the interactive Telegram status view
  */
 
+import { getTelegramSectionDiagnostics } from "./extension-sections.ts";
+
 export type TelegramStatusQueueLane = "control" | "priority" | "default";
 
 export interface TelegramUsageStats {
@@ -470,6 +472,7 @@ export function buildTelegramBridgeStatusLines(
     `- queued turns: ${state.queuedItems.length}`,
     `- lanes: control=${controlQueueCount}, priority=${priorityQueueCount}, default=${defaultQueueCount}`,
     "",
+    ...buildTelegramSectionDiagnosticsLines(),
     ...buildTelegramRuntimeEventLines(state.recentRuntimeEvents),
   ];
 }
@@ -487,6 +490,29 @@ function formatTokens(count: number): string {
   if (count < 1000000) return `${Math.round(count / 1000)}k`;
   if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
   return `${Math.round(count / 1000000)}M`;
+}
+
+function formatSectionDiagnostic(d: any): string {
+  const label = d.label || "no label";
+  if (d.lastError) {
+    return `- ${d.id} (${label}) [${d.status}] — Error: ${d.lastError}`;
+  }
+  return `- ${d.id} (${label}) [${d.status}]`;
+}
+
+function buildTelegramSectionDiagnosticsLines(): string[] {
+  try {
+    const diags = getTelegramSectionDiagnostics();
+    if (diags.length === 0) return [];
+
+    const lines: string[] = ["sections:"];
+    for (const d of diags) {
+      lines.push(formatSectionDiagnostic(d));
+    }
+    return lines;
+  } catch {
+    return [];
+  }
 }
 
 function collectUsageStats(ctx: TelegramStatusContext): TelegramUsageStats {
@@ -575,5 +601,17 @@ export function buildStatusHtml(
     lines.push(buildStatusRow("Cost", costSummary));
   }
   lines.push(buildStatusRow("Context", buildContextSummary(ctx, activeModel)));
+
+  // Extension Sections (e.g. Voice menu)
+  try {
+    const diags = getTelegramSectionDiagnostics();
+    if (diags.length > 0) {
+      lines.push("Registered Sections:");
+      for (const d of diags) {
+        lines.push(formatSectionDiagnostic(d));
+      }
+    }
+  } catch {}
+
   return lines.join("\n");
 }

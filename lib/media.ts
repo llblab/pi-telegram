@@ -463,6 +463,7 @@ export function collectTelegramFileInfos(
         isImage: false,
       });
     }
+    // Generic audio files (e.g. MP3 uploads) — can also trigger voice replies in "mirror" mode
     if (message.audio) {
       const fileName =
         message.audio.file_name ||
@@ -478,6 +479,8 @@ export function collectTelegramFileInfos(
         isImage: false,
       });
     }
+
+    // Voice messages (recorded via microphone) — primary trigger for "mirror" voice reply mode
     if (message.voice) {
       files.push({
         file_id: message.voice.file_id,

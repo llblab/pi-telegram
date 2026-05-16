@@ -239,6 +239,7 @@ export interface TelegramMenuCallbackRuntimeDeps<
   ) => Promise<number | undefined>;
   enqueueSectionPrompt?: (prompt: string, ctx: TContext) => Promise<void>;
   deleteMessage?: (chatId: number, messageId: number) => Promise<void>;
+  isVoiceReplyActive?: () => boolean;
 }
 
 export interface TelegramMenuActionRuntimeDeps<
@@ -262,6 +263,7 @@ export interface TelegramMenuActionRuntimeDeps<
     text: string,
   ) => Promise<unknown>;
   sectionRegistry?: TelegramSectionRegistry;
+  isVoiceReplyActive?: () => boolean;
 }
 
 export interface TelegramMenuActionRuntime<
@@ -639,6 +641,7 @@ export async function handleTelegramMenuCallbackRuntime<
           updateSettingsMenuMessage: () =>
             deps.updateSettingsMenuMessage?.(state, ctx) ?? Promise.resolve(),
           answerCallbackQuery: deps.answerCallbackQuery,
+          isVoiceReplyActive: deps.isVoiceReplyActive,
         },
       ),
     handleThinkingAction: async (state) =>
@@ -654,6 +657,7 @@ export async function handleTelegramMenuCallbackRuntime<
           getCurrentThinkingLevel: deps.getThinkingLevel,
           updateStatusMessage: () => deps.updateStatusMessage(state, ctx),
           answerCallbackQuery: deps.answerCallbackQuery,
+          isVoiceReplyActive: deps.isVoiceReplyActive,
         },
       ),
     handleModelAction: async (state) => {
@@ -708,7 +712,9 @@ export interface TelegramMenuActionRuntimeWithStateBuilderDeps<
 >
   extends
     Omit<TelegramMenuActionRuntimeDeps<TContext, TModel>, "getModelMenuState">,
-    TelegramModelMenuStateBuilderDeps<TModel, TContext> {}
+    TelegramModelMenuStateBuilderDeps<TModel, TContext> {
+  isVoiceReplyActive?: () => boolean;
+}
 
 export function createTelegramMenuActionRuntimeWithStateBuilder<
   TModel extends MenuModel = MenuModel,
@@ -762,6 +768,7 @@ export function createTelegramMenuActionRuntime<
         deps,
         deps.getQueueItemCount?.() ?? 0,
         deps.sectionRegistry,
+        deps.isVoiceReplyActive?.(),
       ),
     sendStatusMessage: (chatId, replyToMessageId, ctx) =>
       openTelegramStatusMenu({
@@ -793,6 +800,7 @@ export function createTelegramMenuActionRuntime<
             deps,
             queueItemCount,
             deps.sectionRegistry,
+            deps.isVoiceReplyActive?.(),
           ),
         storeModelMenuState: deps.storeModelMenuState,
       }),
@@ -829,6 +837,7 @@ export function createTelegramMenuActionRuntime<
         storeModelMenuState: deps.storeModelMenuState,
         editInteractiveMessage: deps.editInteractiveMessage,
         sendInteractiveMessage: deps.sendInteractiveMessage,
+        isVoiceReplyActive: deps.isVoiceReplyActive,
       }),
   };
 }

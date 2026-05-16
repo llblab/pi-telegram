@@ -455,6 +455,68 @@ test("Assistant preview runtime binds controller and message hooks", async () =>
   assert.deepEqual(events, []);
 });
 
+test("Assistant preview runtime suppresses text preview for voice-tagged turns", async () => {
+  const events: string[] = [];
+  const activeTurn = { chatId: 7, voiceReplyPreferred: true };
+  const runtime = createTelegramAssistantPreviewRuntime<{
+    role: string;
+    text?: string;
+  }>({
+    getActiveTurn: () => activeTurn,
+    isAssistantMessage: (message) => message.role === "assistant",
+    getMessageText: (message) => message.text ?? "",
+    maxMessageLength: 100,
+    renderPreviewText: (markdown) => markdown,
+    sendDraft: async () => {
+      events.push("draft");
+    },
+    sendMessage: async () => ({ message_id: 22 }),
+    editMessageText: async () => {},
+    buildReplyParameters: () => undefined,
+    renderTelegramMessage: () => [{ text: "done" }],
+    sendRenderedChunks: async () => undefined,
+    editRenderedMessage: async () => undefined,
+  });
+  await runtime.onMessageStart({ message: { role: "assistant" } });
+  assert.equal(runtime.getState(), undefined);
+  await runtime.onMessageUpdate({
+    message: { role: "assistant", text: "hello" },
+  });
+  assert.equal(runtime.getState(), undefined);
+  assert.deepEqual(events, []);
+});
+
+test("Assistant preview runtime suppresses text preview for voice-required turns", async () => {
+  const events: string[] = [];
+  const activeTurn = { chatId: 7, voiceReplyRequired: true };
+  const runtime = createTelegramAssistantPreviewRuntime<{
+    role: string;
+    text?: string;
+  }>({
+    getActiveTurn: () => activeTurn,
+    isAssistantMessage: (message) => message.role === "assistant",
+    getMessageText: (message) => message.text ?? "",
+    maxMessageLength: 100,
+    renderPreviewText: (markdown) => markdown,
+    sendDraft: async () => {
+      events.push("draft");
+    },
+    sendMessage: async () => ({ message_id: 22 }),
+    editMessageText: async () => {},
+    buildReplyParameters: () => undefined,
+    renderTelegramMessage: () => [{ text: "done" }],
+    sendRenderedChunks: async () => undefined,
+    editRenderedMessage: async () => undefined,
+  });
+  await runtime.onMessageStart({ message: { role: "assistant" } });
+  assert.equal(runtime.getState(), undefined);
+  await runtime.onMessageUpdate({
+    message: { role: "assistant", text: "hello" },
+  });
+  assert.equal(runtime.getState(), undefined);
+  assert.deepEqual(events, []);
+});
+
 test("Preview controller runtime binds Bot API and rendered-chunk transports", async () => {
   const calls: unknown[] = [];
   const controller = createTelegramPreviewControllerRuntime({

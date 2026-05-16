@@ -20,12 +20,31 @@ import {
   guessMediaType,
   type TelegramMediaMessage,
 } from "./media.ts";
+import type { TelegramConfig } from "./config.ts";
 import type {
   PendingTelegramTurn,
   TelegramPromptContent,
   TelegramQueueItem,
   TelegramQueueStore,
 } from "./queue.ts";
+
+import {
+  getTelegramVoiceProviders,
+  type TelegramVoiceTurnView,
+} from "./outbound-handlers.ts";
+
+import {
+  getTelegramVoiceReplyMode,
+  computeVoicePromptContribution,
+  computeVoiceTurnFlags,
+  TELEGRAM_VOICE_REPLY_MODES,
+  type TelegramVoiceReplyMode,
+} from "./voice.ts";
+
+// Re-export for backward compatibility with existing namespace imports (e.g. Turns.getTelegramVoiceReplyMode in routing.ts)
+export { getTelegramVoiceReplyMode, TELEGRAM_VOICE_REPLY_MODES, type TelegramVoiceReplyMode };
+
+
 
 export const TELEGRAM_PREFIX = "[telegram]";
 
@@ -36,23 +55,8 @@ export interface TelegramTurnMessage {
 
 export type DownloadedTelegramTurnFile = DownloadedTelegramMessageFile;
 
-export function truncateTelegramQueueSummary(
-  text: string,
-  maxWords = 5,
-  maxLength = 40,
-): string {
-  const normalized = text.replace(/\s+/g, " ").trim();
-  if (!normalized) return "";
-  const words = normalized.split(" ");
-  let summary = words.slice(0, maxWords).join(" ");
-  if (summary.length === 0) summary = normalized;
-  if (summary.length > maxLength) {
-    summary = summary.slice(0, maxLength).trimEnd();
-  }
-  return summary.length < normalized.length || words.length > maxWords
-    ? `${summary}…`
-    : summary;
-}
+import { truncateTelegramQueueSummary } from "./queue.ts";
+export { truncateTelegramQueueSummary };
 
 export function formatTelegramTurnStatusSummary(
   rawText: string,
@@ -103,6 +107,12 @@ function appendTelegramPromptText(prompt: string, rawText: string): string {
   return `${prompt} ${rawText}`;
 }
 
+
+// ======================================================
+// === Voice Policy & Tagging
+// ======================================================
+
+
 export function buildTelegramTurnPrompt(options: {
   telegramPrefix: string;
   rawText: string;
@@ -128,6 +138,9 @@ export function buildTelegramTurnPrompt(options: {
   }
   const promptFiles = options.promptFiles ?? options.files;
   prompt = appendTelegramAttachmentSection(prompt, promptFiles);
+  if (promptFiles.some((f) => f.kind === "voice")) {
+    prompt += "\n\n[The user sent a voice message.]";
+  }
   prompt = appendTelegramListSection(
     prompt,
     "outputs",
@@ -311,6 +324,10 @@ export interface BuildTelegramPromptTurnOptions {
   handlerOutputs?: string[];
   readBinaryFile: (path: string) => Promise<Uint8Array>;
   inferImageMimeType: (path: string) => string | undefined;
+  voiceReplyMode?: TelegramVoiceReplyMode;
+  /** Voice-specific instructions (e.g. "Reply ONLY with the spoken text") supplied by a provider. */
+  /** Optional instructions from a voice provider (e.g. "Reply ONLY with the spoken text"). */
+  voicePromptContribution?: string;
 }
 
 export type BuildTelegramPromptTurnRuntimeOptions = Omit<
@@ -331,6 +348,7 @@ export interface TelegramPromptTurnRuntimeBuilderDeps<
     promptFiles?: DownloadedTelegramTurnFile[];
     handlerOutputs?: string[];
   }>;
+  getVoiceReplyMode?: () => TelegramVoiceReplyMode;
 }
 
 export function createTelegramPromptTurnRuntimeBuilder<
@@ -358,6 +376,10 @@ export function createTelegramPromptTurnRuntimeBuilder<
       processed.rawText,
       replyContext,
     );
+
+    // Compute voice mode once and pass it to both the turn builder and the prompt contribution helper
+    const voiceReplyMode = deps.getVoiceReplyMode?.();
+
     return buildTelegramPromptTurnRuntime({
       telegramPrefix: TELEGRAM_PREFIX,
       messages,
@@ -369,9 +391,16 @@ export function createTelegramPromptTurnRuntimeBuilder<
       promptFiles: processed.promptFiles,
       handlerOutputs: processed.handlerOutputs,
       inferImageMimeType: guessMediaType,
+      voiceReplyMode,
+      voicePromptContribution: computeVoicePromptContribution(
+        voiceReplyMode,
+        files,
+        rawText,
+      ),
     });
   };
 }
+
 
 export async function buildTelegramPromptTurn(
   options: BuildTelegramPromptTurnOptions,
@@ -404,6 +433,19 @@ export async function buildTelegramPromptTurn(
       mimeType: mediaType,
     });
   }
+  // --- Voice-specific handling for this turn ---
+  // Treat both native voice notes and generic audio uploads as voice input
+  // for mirror/voice reply modes (important for users who send audio files instead of using the mic).
+  const hasVoiceFile = options.files.some((f) => f.kind === "voice" || f.kind === "audio");
+  const voiceReplyMode = options.voiceReplyMode ?? getTelegramVoiceReplyMode();
+
+  if (options.voicePromptContribution?.trim()) {
+    const textItem = content.find((c) => c.type === "text") as { type: "text"; text: string } | undefined;
+    if (textItem) {
+      textItem.text = `${textItem.text}\n\n${options.voicePromptContribution.trim()}`;
+    }
+  }
+
   return {
     kind: "prompt",
     chatId: firstMessage.chat.id,
@@ -424,6 +466,9 @@ export async function buildTelegramPromptTurn(
       options.promptFiles ?? options.files,
       options.handlerOutputs,
     ),
+
+    // Voice tagging (used for preview suppression and prompt guidance)
+    ...computeVoiceTurnFlags(voiceReplyMode, hasVoiceFile),
   };
 }
 

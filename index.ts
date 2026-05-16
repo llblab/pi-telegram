@@ -9,8 +9,13 @@ import * as CommandTemplates from "./lib/command-templates.ts";
 import * as Commands from "./lib/commands.ts";
 import * as Config from "./lib/config.ts";
 import {
+  ALL_PI_TELEGRAM_GLOBAL_KEYS,
+  VOICE_EVENT_RECORDER_KEY,
+} from "./lib/globals.ts";
+import {
   createTelegramExtensionSectionRegistry,
   setGlobalTelegramSectionRegistry,
+  registerTelegramSection,
   type TelegramSectionRegistry,
 } from "./lib/extension-sections.ts";
 import { createTelegramExternalHandleUpdate } from "./lib/external-handlers.ts";
@@ -34,12 +39,51 @@ import * as Queue from "./lib/queue.ts";
 import * as Replies from "./lib/replies.ts";
 import * as Routing from "./lib/routing.ts";
 import * as Runtime from "./lib/runtime.ts";
+import * as Shutdown from "./lib/shutdown.ts";
 import * as Setup from "./lib/setup.ts";
 import * as Status from "./lib/status.ts";
 import * as TextGroups from "./lib/text-groups.ts";
+import * as Voice from "./lib/voice.ts";
 
 type ActivePiModel = NonNullable<Pi.ExtensionContext["model"]>;
 type RuntimeTelegramQueueItem = Queue.TelegramQueueItem<Pi.ExtensionContext>;
+
+export {
+  registerTelegramOutboundHandler,
+  hasTelegramOutboundHandler,
+  getTelegramOutboundProgrammaticHandlers,
+  recordTelegramRuntimeEvent,
+} from "./lib/outbound-handlers.ts";
+
+// Voice Domain (policy, tagging, provider registry, markup parsing)
+// The full Voice surface is re-exported from outbound-handlers.ts (which
+// re-exports the new policy layer from voice.ts for clean ownership in Commit 2).
+export {
+  registerTelegramVoiceProvider,
+  getTelegramVoiceProviders,
+  hasTelegramVoiceProvider,
+  clearTelegramVoiceProviders,
+  planTelegramVoiceReply,
+  getTelegramVoiceReplyMode,
+  computeVoiceTurnFlags,
+  isVoiceTurn,
+  shouldSuppressPreviewForVoice,
+  computeVoicePromptContribution,
+  type TelegramVoiceProvider,
+  type TelegramVoiceTurnView,
+  type TelegramVoiceProviderResult,
+  type TelegramVoiceReplyMode,
+} from "./lib/outbound-handlers.ts";
+
+// Extension Section / Menu APIs (Voice Extension Sections and other menus)
+export {
+  registerTelegramSection,
+  type TelegramSectionRegistration,
+  type TelegramSectionContext,
+  type TelegramSectionCallbackContext,
+  type TelegramSectionView,
+  type TelegramSectionSettingsRegistration,
+} from "./lib/extension-sections.ts";
 
 // --- Extension Runtime ---
 
@@ -77,10 +121,15 @@ export default function (pi: Pi.ExtensionAPI) {
   const sectionRegistry: TelegramSectionRegistry =
     createTelegramExtensionSectionRegistry();
   setGlobalTelegramSectionRegistry(sectionRegistry);
+
+
   const runtimeEvents = Status.createTelegramRuntimeEventRecorder({
     getBotToken: configStore.getBotToken,
   });
   const recordRuntimeEvent = runtimeEvents.record;
+  (globalThis as Record<string, unknown>)[
+    VOICE_EVENT_RECORDER_KEY
+  ] = recordRuntimeEvent;
   const getContextModel = Pi.getExtensionContextModel;
   const isIdle = Pi.isExtensionContextIdle;
   const hasPendingMessages = Pi.hasExtensionContextPendingMessages;
@@ -151,6 +200,8 @@ export default function (pi: Pi.ExtensionAPI) {
     getUpdates,
     setMyCommands,
     sendTypingAction,
+    sendChatAction,
+    sendRecordVoiceAction,
     sendMessageDraft,
     sendMessage,
     downloadFile: downloadTelegramBridgeFile,
@@ -287,6 +338,12 @@ export default function (pi: Pi.ExtensionAPI) {
     editInteractiveMessage,
     sendInteractiveMessage,
     sectionRegistry,
+
+    // Used by the menu/status system to know whether the current turn is a voice reply
+    isVoiceReplyActive: function () {
+      const turn = activeTurnRuntime.get();
+      return Voice.isVoiceTurn(turn);
+    },
   });
 
   // --- Queue Menu ---
@@ -433,8 +490,13 @@ export default function (pi: Pi.ExtensionAPI) {
   });
   const sessionLifecycleRuntime = Lifecycle.appendTelegramLifecycleHooks(
     queueSessionLifecycle,
-    { onSessionStart: lockedPollingRuntime.onSessionStart },
+    {
+      onSessionStart: lockedPollingRuntime.onSessionStart,
+    },
   );
+
+  // Clean shutdown: clear all pi-telegram globalThis references to avoid stale state on reload.
+  Shutdown.registerTelegramBridgeShutdownHandlers(pi, ALL_PI_TELEGRAM_GLOBAL_KEYS);
 
   // --- Extension API Bindings ---
 
@@ -485,6 +547,8 @@ export default function (pi: Pi.ExtensionAPI) {
       execCommand: CommandTemplates.execCommandTemplate,
       sendMultipart: callMultipart,
       sendTextReply,
+      sendChatAction,
+      sendRecordVoiceAction,
       getHandlers: configStore.getOutboundHandlers,
       recordRuntimeEvent,
     });

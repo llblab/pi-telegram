@@ -104,6 +104,7 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
     TestModel
   >({
     configStore: {
+      get: () => ({}),
       getAllowedUserId: () => 7,
       setAllowedUserId: () => undefined,
       persist: async () => undefined,

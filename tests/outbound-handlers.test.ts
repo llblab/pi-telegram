@@ -8,7 +8,10 @@ import test from "node:test";
 
 import { resetTransportReplyDedup } from "../lib/replies.ts";
 
-test.beforeEach(() => resetTransportReplyDedup());
+test.beforeEach(() => {
+  resetTransportReplyDedup();
+  clearTelegramVoiceProviders();
+});
 
 import {
   createTelegramButtonActionStore,
@@ -17,10 +20,16 @@ import {
   createTelegramOutboundTextPreviewRuntime,
   createTelegramOutboundTextReplyRuntime,
   createTelegramVoiceReplySender,
-  generateTelegramVoiceReplyFile,
+  getTelegramOutboundProgrammaticHandlers,
   handleTelegramButtonCallbackQuery,
+  hasTelegramOutboundHandler,
   planTelegramButtonReply,
   planTelegramVoiceReply,
+  registerTelegramOutboundHandler,
+  registerTelegramVoiceProvider,
+  getTelegramVoiceProviders,
+  hasTelegramVoiceProvider,
+  clearTelegramVoiceProviders,
   stripTelegramCommentMarkupForPreview,
   stripTelegramVoiceMarkupForPreview,
 } from "../lib/outbound-handlers.ts";
@@ -718,186 +727,14 @@ test("Button prompt turns use Telegram prompt content", () => {
   });
 });
 
-test("Voice reply generator invokes configured template and returns stdout path", async () => {
-  const calls: unknown[] = [];
-  const path = await generateTelegramVoiceReplyFile("hello world", {
-    lang: "en",
-    rate: "+10%",
-    handler: {
-      type: "voice",
-      template: "/bin/voice {text} {lang=ru} {rate=+30%}",
-      timeout: 1234,
-    },
-    execCommand: async (command, args, options) => {
-      calls.push({ command, args, options });
-      return { stdout: "/tmp/a.ogg\n", stderr: "", code: 0, killed: false };
-    },
-  });
-  assert.equal(path, "/tmp/a.ogg");
-  assert.deepEqual(calls, [
-    {
-      command: "/bin/voice",
-      args: ["hello world", "en", "+10%"],
-      options: { cwd: process.cwd(), timeout: 1234 },
-    },
-  ]);
-});
-
-test("Voice reply generator uses inline placeholder defaults", async () => {
-  const calls: unknown[] = [];
-  const path = await generateTelegramVoiceReplyFile("hello", {
-    handler: {
-      type: "voice",
-      template: "/bin/voice {text} {lang=ru} {rate=+30%}",
-    },
-    execCommand: async (command, args, options) => {
-      calls.push({ command, args, options });
-      return {
-        stdout: "/tmp/default.ogg\n",
-        stderr: "",
-        code: 0,
-        killed: false,
-      };
-    },
-  });
-  assert.equal(path, "/tmp/default.ogg");
-  assert.deepEqual(calls, [
-    {
-      command: "/bin/voice",
-      args: ["hello", "ru", "+30%"],
-      options: { cwd: process.cwd(), timeout: 120000 },
-    },
-  ]);
-});
-
-test("Voice reply generator skips voice when no outbound template is configured", async () => {
-  const calls: unknown[] = [];
-  const path = await generateTelegramVoiceReplyFile("hello", {
-    execCommand: async (command, args, options) => {
-      calls.push({ command, args, options });
-      return { stdout: "", stderr: "", code: 0, killed: false };
-    },
-  });
-  assert.equal(path, undefined);
-  assert.deepEqual(calls, []);
-});
-
-test("Voice reply generator runs configured TTS to OGG pipe", async () => {
-  const calls: Array<{ command: string; args: string[]; options: unknown }> =
-    [];
-  const path = await generateTelegramVoiceReplyFile("hello", {
-    handler: {
-      type: "voice",
-      template: [
-        "/tools/edge-say.mjs --text {text} --lang {lang} --rate {rate} --write-media {mp3}",
-        "/usr/bin/ffmpeg -y -i {mp3} -c:a libopus -b:a 32k -ar 16000 -ac 1 -vbr on {ogg}",
-      ],
-      defaults: { lang: "ru", rate: "+30%" },
-      output: "ogg",
-      timeout: 1234,
-    },
-    execCommand: async (command, args, options) => {
-      calls.push({ command, args, options });
-      return { stdout: "", stderr: "", code: 0, killed: false };
-    },
-  });
-  assert.equal(calls.length, 2);
-  assert.equal(calls[0]?.command, "/tools/edge-say.mjs");
-  assert.deepEqual(calls[0]?.args.slice(0, 6), [
-    "--text",
-    "hello",
-    "--lang",
-    "ru",
-    "--rate",
-    "+30%",
-  ]);
-  const mp3Path = calls[0]?.args.at(-1);
-  assert.equal(calls[0]?.args.at(-2), "--write-media");
-  assert.equal(calls[1]?.command, "/usr/bin/ffmpeg");
-  assert.deepEqual(calls[1]?.args.slice(0, 11), [
-    "-y",
-    "-i",
-    mp3Path,
-    "-c:a",
-    "libopus",
-    "-b:a",
-    "32k",
-    "-ar",
-    "16000",
-    "-ac",
-    "1",
-  ]);
-  assert.equal(calls[1]?.args.at(-3), "-vbr");
-  assert.equal(calls[1]?.args.at(-2), "on");
-  assert.equal(calls[1]?.args.at(-1), path);
-  assert.ok(path);
-  assert.match(path, /[0-9a-f-]+-voice\.ogg$/);
-});
-
-test("Voice reply generator pipes initial text and stdout to stdin", async () => {
-  const calls: Array<{
-    command: string;
-    args: string[];
-    stdin?: string;
-    timeout?: number;
-  }> = [];
-  const path = await generateTelegramVoiceReplyFile("hello", {
-    handler: {
-      type: "voice",
-      template: [
-        "/bin/prepare {text}",
-        { template: "/bin/render", timeout: 222 },
-      ],
-      timeout: 111000,
-    },
-    execCommand: async (command, args, options) => {
-      calls.push({
-        command,
-        args,
-        stdin: options?.stdin,
-        timeout: options?.timeout,
-      });
-      return {
-        stdout:
-          command === "/bin/prepare"
-            ? "prepared text\n"
-            : `/tmp/${options?.stdin?.trim()}.ogg\n`,
-        stderr: "",
-        code: 0,
-        killed: false,
-      };
-    },
-  });
-  assert.equal(path, "/tmp/prepared text.ogg");
-  assert.deepEqual(calls, [
-    {
-      command: "/bin/prepare",
-      args: ["hello"],
-      stdin: "hello",
-      timeout: 111000,
-    },
-    {
-      command: "/bin/render",
-      args: [],
-      stdin: "prepared text\n",
-      timeout: 222,
-    },
-  ]);
-});
-
 test("Voice reply sender can suppress prompt reply metadata for secondary voice", async () => {
   const events: unknown[] = [];
+  const dispose = registerTelegramVoiceProvider(async () => "/tmp/voice.opus");
   const sendVoiceReply = createTelegramVoiceReplySender({
-    execCommand: async () => ({
-      stdout: "/tmp/voice.ogg\n",
-      stderr: "",
-      code: 0,
-      killed: false,
-    }),
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
     sendMultipart: async (method, fields, fileField, filePath, fileName) => {
       events.push({ method, fields, fileField, filePath, fileName });
     },
-    getHandlers: () => [{ type: "voice", template: "/bin/voice {text}" }],
   });
   await sendVoiceReply({ chatId: 10, replyToMessageId: 20 }, "hello", {
     replyToPrompt: false,
@@ -907,27 +744,23 @@ test("Voice reply sender can suppress prompt reply metadata for secondary voice"
       method: "sendVoice",
       fields: { chat_id: "10" },
       fileField: "voice",
-      filePath: "/tmp/voice.ogg",
-      fileName: "voice.ogg",
+      filePath: "/tmp/voice.opus",
+      fileName: "voice.opus",
     },
   ]);
+  dispose();
 });
 
 test("Outbound artifact sender sends multiple voice replies independently", async () => {
   const events: unknown[] = [];
+  const dispose = registerTelegramVoiceProvider(async (text) => {
+    return `/tmp/${text}.opus`;
+  });
   const sendOutboundReplyArtifacts = createTelegramOutboundReplyArtifactSender({
-    execCommand: async (_command, args) => ({
-      stdout: `/tmp/${args[0]}.ogg\n`,
-      stderr: "",
-      code: 0,
-      killed: false,
-    }),
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
     sendMultipart: async (method, fields, fileField, filePath, fileName) => {
       events.push({ method, fields, fileField, filePath, fileName });
     },
-    getHandlers: () => [
-      { type: "voice", template: "/bin/voice {text} {lang=ru}" },
-    ],
   });
   await sendOutboundReplyArtifacts(
     { chatId: 10, replyToMessageId: 20 },
@@ -948,34 +781,33 @@ test("Outbound artifact sender sends multiple voice replies independently", asyn
           '{"message_id":20,"allow_sending_without_reply":true}',
       },
       fileField: "voice",
-      filePath: "/tmp/one.ogg",
-      fileName: "one.ogg",
+      filePath: "/tmp/one.opus",
+      fileName: "one.opus",
     },
     {
       method: "sendVoice",
       fields: { chat_id: "10" },
       fileField: "voice",
-      filePath: "/tmp/two.ogg",
-      fileName: "two.ogg",
+      filePath: "/tmp/two.opus",
+      fileName: "two.opus",
     },
   ]);
+  dispose();
 });
 
-test("Voice reply sender falls back to the next matching outbound handler", async () => {
+test("Voice reply sender falls back to the next voice provider", async () => {
   const events: unknown[] = [];
+  const dispose1 = registerTelegramVoiceProvider(async () => {
+    throw new Error("provider 1 failed");
+  });
+  const dispose2 = registerTelegramVoiceProvider(async () => {
+    return "/tmp/good.opus";
+  });
   const sendVoiceReply = createTelegramVoiceReplySender({
-    execCommand: async (command) => {
-      if (command === "/bin/bad")
-        return { stdout: "", stderr: "bad", code: 1, killed: false };
-      return { stdout: "/tmp/good.ogg\n", stderr: "", code: 0, killed: false };
-    },
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
     sendMultipart: async (method, fields, fileField, filePath, fileName) => {
       events.push({ method, fields, fileField, filePath, fileName });
     },
-    getHandlers: () => [
-      { type: "voice", template: "/bin/bad {text}" },
-      { type: "voice", template: "/bin/good {text}" },
-    ],
   });
   await sendVoiceReply({ chatId: 10, replyToMessageId: 20 }, "hello");
   assert.deepEqual(events, [
@@ -987,25 +819,22 @@ test("Voice reply sender falls back to the next matching outbound handler", asyn
           '{"message_id":20,"allow_sending_without_reply":true}',
       },
       fileField: "voice",
-      filePath: "/tmp/good.ogg",
-      fileName: "good.ogg",
+      filePath: "/tmp/good.opus",
+      fileName: "good.opus",
     },
   ]);
+  dispose1();
+  dispose2();
 });
 
 test("Voice reply sender uploads generated ogg via sendVoice", async () => {
   const events: unknown[] = [];
+  const dispose = registerTelegramVoiceProvider(async () => "/tmp/voice.opus");
   const sendVoiceReply = createTelegramVoiceReplySender({
-    execCommand: async () => ({
-      stdout: "/tmp/voice.ogg\n",
-      stderr: "",
-      code: 0,
-      killed: false,
-    }),
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
     sendMultipart: async (method, fields, fileField, filePath, fileName) => {
       events.push({ method, fields, fileField, filePath, fileName });
     },
-    getHandlers: () => [{ type: "voice", template: "/bin/voice {text}" }],
   });
   await sendVoiceReply({ chatId: 10, replyToMessageId: 20 }, "hello");
   assert.deepEqual(events, [
@@ -1017,112 +846,324 @@ test("Voice reply sender uploads generated ogg via sendVoice", async () => {
           '{"message_id":20,"allow_sending_without_reply":true}',
       },
       fileField: "voice",
-      filePath: "/tmp/voice.ogg",
-      fileName: "voice.ogg",
+      filePath: "/tmp/voice.opus",
+      fileName: "voice.opus",
     },
   ]);
 });
 
 // --- Critical-step composition tests ---
 
-test("Voice reply composition: non-critical failure continues to next step", async () => {
-  const calls: string[] = [];
-  const path = await generateTelegramVoiceReplyFile("hello", {
-    handler: {
-      type: "voice",
-      template: ["preprocess {text}", "synthesize {text}"],
-    },
-    execCommand: async (command) => {
-      calls.push(command);
-      if (command === "preprocess")
-        return { stdout: "", stderr: "skip", code: 1, killed: false };
-      return { stdout: "/tmp/out.ogg\n", stderr: "", code: 0, killed: false };
-    },
-  });
-  assert.equal(path, "/tmp/out.ogg");
-  assert.deepEqual(calls, ["preprocess", "synthesize"]);
-});
-
-test("Voice reply composition: critical failure aborts composition", async () => {
-  const calls: string[] = [];
-  let caught: Error | undefined;
-  try {
-    await generateTelegramVoiceReplyFile("hello", {
-      handler: {
-        type: "voice",
-        template: [
-          { template: "preprocess {text}", critical: true },
-          "synthesize {text}",
-          "finalize {text}",
-        ],
-      },
-      execCommand: async (command) => {
-        calls.push(command);
-        if (command === "preprocess")
-          return { stdout: "", stderr: "fatal", code: 1, killed: false };
-        return { stdout: "/tmp/ok.ogg\n", stderr: "", code: 0, killed: false };
-      },
-    });
-  } catch (e) {
-    caught = e as Error;
-  }
-  assert.ok(caught);
-  assert.ok(caught.message.includes("code 1"));
-  assert.deepEqual(calls, ["preprocess"]);
-});
-
 // --- Combined profile: CI-like pipeline (composition + retry + critical) ---
 
-test("Voice reply composition: full CI-like pipeline with retry and critical", async () => {
-  let testCalls = 0;
-  const execOnce = async () => {
-    testCalls++;
-    return { stdout: "", stderr: "flake", code: 1, killed: false };
-  };
-  let caught: Error | undefined;
-  try {
-    await generateTelegramVoiceReplyFile("ship", {
-      handler: {
-        type: "voice",
-        template: [
-          { template: "build", critical: true },
-          "lint",
-          { template: "test --suite {text}", critical: true, retry: 2 },
-          { template: "deploy", critical: true },
-        ],
-      },
-      execCommand: async (command, _args, options) => {
-        if (command === "build")
-          return { stdout: "built\n", stderr: "", code: 0, killed: false };
-        if (command === "lint")
-          return { stdout: "", stderr: "warnings", code: 1, killed: false };
-        if (command === "test") {
-          const max = options?.retry ?? 1;
-          for (let i = 0; i < max; i++) {
-            const result = await execOnce();
-            if (result.code === 0) return result;
-          }
-          return {
-            stdout: "",
-            stderr: "all retries exhausted",
-            code: 1,
-            killed: false,
-          };
-        }
-        return {
-          stdout: "/tmp/shipped.ogg\n",
-          stderr: "",
-          code: 0,
-          killed: false,
-        };
-      },
-    });
-  } catch (e) {
-    caught = e as Error;
-  }
-  // build (critical, succeeds) → lint (non-critical, fails, continues) →
-  // test (critical, retry=2, both fail → abort) → deploy unreached
-  assert.ok(caught);
-  assert.ok(caught.message.includes("Outbound voice template step"));
-  assert.equal(testCalls, 2);
+test("Voice provider registration and invocation", async () => {
+  clearTelegramVoiceProviders();
+  const calls: string[] = [];
+  assert.equal(hasTelegramVoiceProvider(), false);
+  const dispose = registerTelegramVoiceProvider(async (text) => {
+    calls.push(text);
+    return `/tmp/voice-${text.length}.opus`;
+  });
+  assert.equal(hasTelegramVoiceProvider(), true);
+  const providers = getTelegramVoiceProviders();
+  assert.equal(providers.length, 1);
+  const result = await providers[0]("hello", {});
+  assert.equal(result, "/tmp/voice-5.opus");
+  assert.deepEqual(calls, ["hello"]);
+  dispose();
+  assert.equal(hasTelegramVoiceProvider(), false);
+});
+
+test("Voice provider registry supports multiple providers", async () => {
+  clearTelegramVoiceProviders();
+  assert.equal(getTelegramVoiceProviders().length, 0);
+  const dispose1 = registerTelegramVoiceProvider(async () => "/tmp/voice1.opus");
+  const dispose2 = registerTelegramVoiceProvider(async () => "/tmp/voice2.opus");
+  assert.equal(getTelegramVoiceProviders().length, 2);
+  assert.equal(hasTelegramVoiceProvider(), true);
+  // returned array should be a copy
+  const providers = getTelegramVoiceProviders();
+  providers.pop();
+  assert.equal(getTelegramVoiceProviders().length, 2);
+  dispose1();
+  assert.equal(getTelegramVoiceProviders().length, 1);
+  dispose2();
+  assert.equal(getTelegramVoiceProviders().length, 0);
+});
+
+test("Voice reply sender passes replyMarkup to sendMultipart", async () => {
+  const fields: Record<string, unknown>[] = [];
+  const dispose = registerTelegramVoiceProvider( async () => "/tmp/voice.opus");
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({
+      stdout: "",
+      stderr: "",
+      code: 0,
+      killed: false,
+    }),
+    sendMultipart: async (_method, f) => {
+      fields.push(f);
+    },
+    recordRuntimeEvent: () => {},
+  });
+  await sendVoiceReply(
+    { chatId: 10, replyToMessageId: 20 },
+    "hello",
+    {
+      replyMarkup: { inline_keyboard: [[{ text: "OK", callback_data: "btn:1" }]] },
+    },
+  );
+  assert.equal(fields.length, 1);
+  assert.ok(
+    typeof (fields[0] as Record<string, unknown>).reply_markup === "string",
+  );
+  dispose();
+});
+
+test("Voice reply sender only passes replyMarkup to first successful voice reply", async () => {
+  const fields: Record<string, unknown>[] = [];
+  const disposeFail = registerTelegramVoiceProvider(async () => {
+    throw new Error("Provider 1 failed");
+  });
+  const disposeSuccess = registerTelegramVoiceProvider(async () => "/tmp/voice.opus");
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({
+      stdout: "",
+      stderr: "",
+      code: 0,
+      killed: false,
+    }),
+    sendMultipart: async (_method, f) => {
+      fields.push(f);
+    },
+    recordRuntimeEvent: () => {},
+  });
+  await sendVoiceReply(
+    { chatId: 10, replyToMessageId: 20 },
+    "hello",
+    {
+      replyMarkup: { inline_keyboard: [[{ text: "OK", callback_data: "btn:1" }]] },
+    },
+  );
+  assert.equal(fields.length, 1);
+  assert.ok(
+    typeof (fields[0] as Record<string, unknown>).reply_markup === "string",
+  );
+  disposeFail();
+  disposeSuccess();
+});
+
+test("Voice reply sender throws when every handler fails", async () => {
+  clearTelegramVoiceProviders();
+  const events: unknown[] = [];
+  const dispose = registerTelegramVoiceProvider( async () => {
+    throw new Error("handler 1 failed");
+  });
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({ stdout: "", stderr: "", code: 1, killed: false }),
+    sendMultipart: async () => {
+      events.push("sendMultipart");
+    },
+    recordRuntimeEvent: (category, error) => {
+      events.push(`error:${category}:${(error as Error).message}`);
+    },
+  });
+  await assert.rejects(
+    async () =>
+      await sendVoiceReply(
+        { chatId: 1, replyToMessageId: 2 },
+        "hello",
+        { replyToPrompt: false },
+      ),
+    /Failed to send voice reply: every voice provider failed/,
+  );
+  dispose();
+  assert.equal(hasTelegramVoiceProvider(), false);
+  assert.ok(events.length >= 2);
+  assert.ok(events.some((e) => (e as string).includes("handler 1 failed")));
+  assert.ok(events.some((e) => (e as string).includes("every voice provider failed")));
+});
+
+test("Voice reply sender skips provider that returns undefined and tries next", async () => {
+  const events: unknown[] = [];
+  const dispose1 = registerTelegramVoiceProvider(async () => undefined);
+  const dispose2 = registerTelegramVoiceProvider(async () => "/tmp/voice.opus");
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    sendMultipart: async (method, fields, fileField, filePath, fileName) => {
+      events.push({ method, fields, fileField, filePath, fileName });
+    },
+    recordRuntimeEvent: () => {},
+  });
+  await sendVoiceReply(
+    { chatId: 10, replyToMessageId: 20 },
+    "hello",
+  );
+  assert.equal(events.length, 1);
+  assert.equal((events[0] as Record<string, unknown>).filePath, "/tmp/voice.opus");
+  dispose1();
+  dispose2();
+});
+
+test("Voice reply sender records event when provider returns empty string", async () => {
+  const events: unknown[] = [];
+  const dispose1 = registerTelegramVoiceProvider(async () => "");
+  const dispose2 = registerTelegramVoiceProvider(async () => "/tmp/voice.opus");
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({
+      stdout: "",
+      stderr: "",
+      code: 0,
+      killed: false,
+    }),
+    sendMultipart: async () => {},
+    recordRuntimeEvent: (category, error, details) => {
+      events.push(`error:${category}:${(error as Error).message}:${details?.phase}`);
+    },
+  });
+  await sendVoiceReply(
+    { chatId: 10, replyToMessageId: 20 },
+    "hello",
+  );
+  assert.ok(events.some((e) => (e as string).includes("voice-provider-skip")));
+  dispose1();
+  dispose2();
+});
+
+test("Voice reply sender accepts Opus files", async () => {
+  const events: unknown[] = [];
+  const dispose = registerTelegramVoiceProvider(async () => "/tmp/response.opus");
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    sendMultipart: async (_method, _fields, _fileField, filePath, fileName) => {
+      events.push({ filePath, fileName });
+    },
+    recordRuntimeEvent: () => {},
+  });
+  await sendVoiceReply(
+    { chatId: 10, replyToMessageId: 20 },
+    "hello",
+  );
+  const fileEvent = events.find((e) =>
+    (e as Record<string, unknown>).filePath !== undefined,
+  ) as Record<string, unknown>;
+  assert.equal(fileEvent.filePath, "/tmp/response.opus");
+  assert.equal(fileEvent.fileName, "response.opus");
+  dispose();
+});
+
+test("Voice reply sender accepts OGG files", async () => {
+  const events: unknown[] = [];
+  const dispose = registerTelegramVoiceProvider(async () => "/tmp/response.ogg");
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    sendMultipart: async (_method, _fields, _fileField, filePath, fileName) => {
+      events.push({ filePath, fileName });
+    },
+    recordRuntimeEvent: () => {},
+  });
+  await sendVoiceReply(
+    { chatId: 10, replyToMessageId: 20 },
+    "hello",
+  );
+  const fileEvent = events.find((e) =>
+    (e as Record<string, unknown>).filePath !== undefined,
+  ) as Record<string, unknown>;
+  assert.equal(fileEvent.filePath, "/tmp/response.ogg");
+  assert.equal(fileEvent.fileName, "response.ogg");
+  dispose();
+});
+
+test("Voice reply sender throws for non-ogg files", async () => {
+  const dispose = registerTelegramVoiceProvider(async () => "/tmp/response.mp3");
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    sendMultipart: async () => {
+      throw new Error("should not be called");
+    },
+    recordRuntimeEvent: () => {},
+  });
+  await assert.rejects(
+    sendVoiceReply(
+      { chatId: 10, replyToMessageId: 20 },
+      "hello",
+    ),
+    /Failed to send voice reply: every voice provider failed./,
+  );
+  dispose();
+});
+
+test("Voice reply sender falls back to next handler when sendMultipart throws", async () => {
+  const fields: Record<string, unknown>[] = [];
+  let callCount = 0;
+  const dispose1 = registerTelegramVoiceProvider( async () => "/tmp/voice1.opus");
+  const dispose2 = registerTelegramVoiceProvider( async () => "/tmp/voice2.opus");
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({
+      stdout: "",
+      stderr: "",
+      code: 0,
+      killed: false,
+    }),
+    sendMultipart: async (_method, f) => {
+      callCount++;
+      if (callCount === 1) throw new Error("network error");
+      fields.push(f);
+    },
+    recordRuntimeEvent: () => {},
+  });
+  await sendVoiceReply(
+    { chatId: 10, replyToMessageId: 20 },
+    "hello",
+  );
+  assert.equal(callCount, 2);
+  assert.equal(fields.length, 1);
+  assert.equal((fields[0] as Record<string, unknown>).chat_id, "10");
+  dispose1();
+  dispose2();
+});
+
+test("Voice reply sender accepts provider returning { audioPath }", async () => {
+  const events: unknown[] = [];
+  const dispose = registerTelegramVoiceProvider(async () => ({ audioPath: "/tmp/response.ogg" }));
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    sendMultipart: async (_method, _fields, _fileField, filePath, fileName) => {
+      events.push({ filePath, fileName });
+    },
+    recordRuntimeEvent: () => {},
+  });
+  await sendVoiceReply(
+    { chatId: 10, replyToMessageId: 20 },
+    "hello",
+  );
+  const fileEvent = events.find((e) =>
+    (e as Record<string, unknown>).filePath !== undefined,
+  ) as Record<string, unknown>;
+  assert.equal(fileEvent.filePath, "/tmp/response.ogg");
+  assert.equal(fileEvent.fileName, "response.ogg");
+  dispose();
+});
+
+test("Voice reply sender passes transcriptText as caption", async () => {
+  const fields: Record<string, unknown>[] = [];
+  const dispose = registerTelegramVoiceProvider(async () => ({
+    audioPath: "/tmp/response.ogg",
+    transcriptText: "Clean text without speech tags",
+  }));
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    sendMultipart: async (_method, f) => {
+      fields.push(f);
+    },
+    recordRuntimeEvent: () => {},
+  });
+  await sendVoiceReply(
+    { chatId: 10, replyToMessageId: 20 },
+    "hello",
+  );
+  assert.equal(fields.length, 1);
+  assert.equal((fields[0] as Record<string, unknown>).chat_id, "10");
+  assert.equal((fields[0] as Record<string, unknown>).caption, "Clean text without speech tags");
+  dispose();
 });

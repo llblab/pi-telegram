@@ -39,7 +39,9 @@ export interface TelegramExternalHandlerRegistry {
   dispatch: (update: unknown) => Promise<TelegramExternalHandlerVerdict>;
 }
 
-const REGISTRY_KEY = "__piTelegramExternalHandlerRegistry__";
+import { EXTERNAL_HANDLER_REGISTRY_KEY } from "./globals.ts";
+
+const REGISTRY_KEY = EXTERNAL_HANDLER_REGISTRY_KEY;
 
 /**
  * Validate that a value on `globalThis` matches the full v1 registry contract.
@@ -156,7 +158,7 @@ export function createTelegramExternalHandleUpdate<TUpdate, TContext>(
  * ```
  *
  * Extensions that prefer zero coupling can also reach the registry directly
- * via `globalThis.__piTelegramExternalHandlerRegistry__` (versioned object,
+ * via `globalThis[EXTERNAL_HANDLER_REGISTRY_KEY]` (versioned object,
  * see {@link TelegramExternalHandlerRegistry}). This avoids importing
  * `@llblab/pi-telegram` and tolerates either install order.
  */

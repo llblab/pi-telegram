@@ -201,6 +201,45 @@ A composed voice pipeline can translate, synthesize, and convert in one pass:
 
 The agent writes intent; the adapter owns transport. Text remains readable, voice becomes native Telegram media, and buttons route back as queued prompts.
 
+### Voice reply policies
+
+The bridge can automatically convert agent text replies into Telegram voice messages without requiring explicit `<!-- telegram_voice -->` markup in every response. Set `voice.replyMode` in `telegram.json`:
+
+| Mode | Behavior |
+|------|----------|
+| `manual` (default) | Agent must use `<!-- telegram_voice -->` markup for voice replies. No automatic conversion. |
+| `mirror` | When the user sends a voice message, the next reply is automatically converted to voice (text preview suppressed). |
+| `voice` | Every reply is automatically converted to voice (text preview suppressed). |
+
+In `mirror` and `voice` modes, the bridge transparently intercepts agent text responses and routes them through registered voice providers. If voice generation fails, the bridge falls back to sending the text reply instead.
+
+Voice provider extensions (e.g. `pi-xai-voice`) register a TTS backend at runtime:
+
+```typescript
+import { registerTelegramVoiceProvider, recordTelegramRuntimeEvent } from "@llblab/pi-telegram";
+
+// Return path only (backward compatible)
+const dispose = registerTelegramVoiceProvider(async (text, { lang, rate }) => {
+  const path = await myTTS(text, { language: lang });
+  return path; // must be .ogg or .opus
+});
+
+// Return path + transcript caption
+const dispose2 = registerTelegramVoiceProvider(async (text, { lang, rate }) => {
+  const rewritten = rewriteWithSpeechTags(text); // internal TTS optimization
+  const path = await myTTS(rewritten, { language: lang });
+  return { audioPath: path, transcriptText: text };
+});
+
+// Surface diagnostics in /telegram-status
+recordTelegramRuntimeEvent("xai-voice", new Error("TTS complete"), {
+  phase: "tts",
+  durationMs: 1200,
+});
+```
+
+Multiple providers can be registered; the bridge tries each in order until one succeeds. Providers receive the text to synthesize and optional `lang`/`rate` hints from `<!-- telegram_voice -->` markup or the automatic interception path. Providers must return `.ogg` or `.opus` files — format conversion is the provider's responsibility.
+
 ### Extension interop
 
 Unknown inline-button callbacks are forwarded to π as `[callback] <data>` when they do not belong to pi-telegram, so other extensions can namespace and handle Telegram buttons without polling the bot themselves. Layered extensions that need synchronous update handling can register a runtime interceptor on the shared update registry.
@@ -224,6 +263,7 @@ Import from `@llblab/pi-telegram`, call `registerTelegramSection()`, and return 
 - [Architecture](./docs/architecture.md): runtime and subsystem overview.
 - [Inbound Handlers](./docs/inbound-handlers.md): Telegram → π preprocessing.
 - [Outbound Handlers](./docs/outbound-handlers.md): final text, voice, and artifact pipelines.
+- [Voice Integration](./docs/voice.md): voice reply policies, transparent interception, and provider extension API.
 - [Command Templates](./docs/command-templates.md): portable command-template contract.
 - [Callback Namespaces](./docs/callback-namespaces.md): callback interop for layered extensions.
 - [External Handlers](./docs/external-handlers.md): shared update interception.
