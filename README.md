@@ -85,7 +85,7 @@ What it feels like:
 Use these inside the Telegram DM with your bot. The main entrypoint is `/start`: it opens the operator menu and exposes many of the important agent controls that normally live in the CLI, adapted for Telegram.
 
 - **`/start`**: Pair the first Telegram user when needed, register bot commands, and open the inline application menu with command help, prompt-template commands, status rows, model controls, thinking controls, settings, and queue controls.
-- **`/compact`**: Start session compaction when the session is idle.
+- **`/compact`**: Start session compaction when the session is idle; Telegram shows the native typing indicator while compaction is running.
 - **`/next`**: Dispatch the next queued turn, aborting π first if needed.
 - **`/continue`**: Enqueue a priority `continue` prompt.
 - **`/abort`**: Abort the active run without touching the queue.

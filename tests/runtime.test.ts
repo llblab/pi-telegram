@@ -1266,6 +1266,10 @@ test("Extension runtime keeps queued turns blocked until compaction completes", 
         message_id: 100 + runtimeEvents.length,
       });
     }
+    if (method === "sendChatAction") {
+      runtimeEvents.push(`typing:${String(body?.chat_id ?? "")}:${String(body?.action ?? "")}`);
+      return createRuntimeTelegramApiResponse(true);
+    }
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
   try {
@@ -1287,7 +1291,15 @@ test("Extension runtime keeps queued turns blocked until compaction completes", 
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
     await waitForCondition(() => runtimeEvents.includes("compact:start"));
-    assert.equal(runtimeEvents.includes("send:Compaction started."), true);
+    await waitForCondition(() =>
+      runtimeEvents.includes("send:Compaction started.") &&
+      runtimeEvents.includes("typing:99:typing"),
+    );
+    assert.equal(
+      runtimeEvents.indexOf("send:Compaction started.") <
+        runtimeEvents.indexOf("typing:99:typing"),
+      true,
+    );
     secondUpdates.resolve(
       createRuntimeTelegramApiResponse([
         {

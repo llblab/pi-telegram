@@ -57,6 +57,7 @@
 - The bridge is session-local, paired to one allowed Telegram user, and owns a local queue aligned with π lifecycle hooks
 - Queue admission is explicit and validated: immediate commands, control lane, priority lane, and default lane must preserve allowed kind/lane pairings
 - Dispatch is gated by active turns, pending dispatch, unsettled control work, compaction, `ctx.isIdle()`, and π pending messages; dispatched prompts remain queued until `agent_start` consumes them
+- Telegram `/compact` owns a native `typing` keepalive for the compaction window so phone clients show activity between the started/completed notices; stop it on both completion and failure
 - `/stop`, `/abort`, `/next`, and `/continue` have distinct contracts: reset queue and abort; abort while preserving queue; force next queued turn; enqueue a priority `continue` prompt
 - `/start`, `/help`, and `/status` open the unified command-help/status-row/control menu; `/model`, `/thinking`, and `/queue` jump to sections directly; visible bot commands are `/start`, `/compact`, `/next`, `/continue`, `/abort`, `/stop`
 - Command/menu emoji are fixed UI adornments owned by the `commands` map; do not add a persisted emoji toggle or Settings menu until there is a real setting to own

@@ -320,6 +320,8 @@ export interface TelegramCompactCommandDeps extends TelegramRuntimeEventRecorder
   requestDeferredDispatchNextQueuedTelegramTurn?: (
     dispatch: () => void,
   ) => void;
+  startTypingLoop?: () => void;
+  stopTypingLoop?: () => void;
   compact: (callbacks: {
     onComplete: () => void;
     onError: (error: unknown) => void;
@@ -553,6 +555,8 @@ export interface TelegramCommandRuntimeDeps<
   requestDeferredDispatchNextQueuedTelegramTurn?: (
     dispatch: (ctx: TContext) => void,
   ) => void;
+  startTypingLoop?: (ctx: TContext, chatId?: number) => void;
+  stopTypingLoop?: () => void;
   enqueueContinueTurn: (message: TMessage, ctx: TContext) => Promise<void>;
   compact: (
     ctx: TContext,
@@ -798,15 +802,20 @@ export async function handleTelegramCompactCommand(
   }
   deps.setCompactionInProgress(true);
   deps.updateStatus();
+  let compactionStillInProgress = true;
   try {
     deps.compact({
       onComplete: () => {
+        compactionStillInProgress = false;
+        deps.stopTypingLoop?.();
         deps.setCompactionInProgress(false);
         deps.updateStatus();
         dispatchNextQueuedTelegramTurnAfterCompact(deps);
         void deps.sendTextReply("Compaction completed.");
       },
       onError: (error) => {
+        compactionStillInProgress = false;
+        deps.stopTypingLoop?.();
         deps.setCompactionInProgress(false);
         deps.updateStatus();
         dispatchNextQueuedTelegramTurnAfterCompact(deps);
@@ -816,6 +825,8 @@ export async function handleTelegramCompactCommand(
       },
     });
   } catch (error) {
+    compactionStillInProgress = false;
+    deps.stopTypingLoop?.();
     deps.setCompactionInProgress(false);
     deps.updateStatus();
     deps.recordRuntimeEvent?.("compact", error);
@@ -824,6 +835,7 @@ export async function handleTelegramCompactCommand(
     return;
   }
   await deps.sendTextReply("Compaction started.");
+  if (compactionStillInProgress) deps.startTypingLoop?.();
 }
 
 function isTelegramStaleContextError(error: unknown): boolean {
@@ -962,6 +974,8 @@ export function createTelegramCommandHandlerTargetRuntime<
     setCompactionInProgress: deps.setCompactionInProgress,
     updateStatus: deps.updateStatus,
     dispatchNextQueuedTelegramTurn: deps.dispatchNextQueuedTelegramTurn,
+    startTypingLoop: deps.startTypingLoop,
+    stopTypingLoop: deps.stopTypingLoop,
     enqueueContinueTurn: deps.enqueueContinueTurn,
     compact: deps.compact,
     enqueueControlItem: commandTargetRuntime.enqueueControlItem,
@@ -1115,6 +1129,10 @@ async function handleTelegramCommandRuntime<
                   )
               : undefined,
           compact: (callbacks) => deps.compact(commandCtx, callbacks),
+          startTypingLoop: deps.startTypingLoop
+            ? () => deps.startTypingLoop?.(commandCtx, nextMessage.chat.id)
+            : undefined,
+          stopTypingLoop: deps.stopTypingLoop,
           sendTextReply: sendReplyFor(nextMessage),
           recordRuntimeEvent: deps.recordRuntimeEvent,
         });

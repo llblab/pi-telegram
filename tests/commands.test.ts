@@ -600,6 +600,12 @@ test("Command helpers guard and complete compact command flow", async () => {
       events.push("compact");
       complete = callbacks.onComplete;
     },
+    startTypingLoop: () => {
+      events.push("typing:start");
+    },
+    stopTypingLoop: () => {
+      events.push("typing:stop");
+    },
     sendTextReply: async (text) => {
       events.push(`reply:${text}`);
     },
@@ -611,6 +617,8 @@ test("Command helpers guard and complete compact command flow", async () => {
     "status",
     "compact",
     "reply:Compaction started.",
+    "typing:start",
+    "typing:stop",
     "set:false",
     "status",
     "dispatch",
@@ -646,6 +654,12 @@ test("Command helpers defer compact-complete queue dispatch", async () => {
       events.push("compact");
       complete = callbacks.onComplete;
     },
+    startTypingLoop: () => {
+      events.push("typing:start");
+    },
+    stopTypingLoop: () => {
+      events.push("typing:stop");
+    },
     sendTextReply: async (text) => {
       events.push(`reply:${text}`);
     },
@@ -656,6 +670,8 @@ test("Command helpers defer compact-complete queue dispatch", async () => {
     "status",
     "compact",
     "reply:Compaction started.",
+    "typing:start",
+    "typing:stop",
     "set:false",
     "status",
     "defer",
@@ -692,6 +708,12 @@ test("Command helpers report compact errors", async () => {
       events.push("compact");
       fail = callbacks.onError;
     },
+    startTypingLoop: () => {
+      events.push("typing:start");
+    },
+    stopTypingLoop: () => {
+      events.push("typing:stop");
+    },
     sendTextReply: async (text) => {
       events.push(`reply:${text}`);
     },
@@ -715,6 +737,12 @@ test("Command helpers report compact errors", async () => {
     compact: () => {
       throw new Error("sync boom");
     },
+    startTypingLoop: () => {
+      events.push("throw-typing:start");
+    },
+    stopTypingLoop: () => {
+      events.push("throw-typing:stop");
+    },
     sendTextReply: async (text) => {
       events.push(`reply:${text}`);
     },
@@ -725,6 +753,8 @@ test("Command helpers report compact errors", async () => {
     "status",
     "compact",
     "reply:Compaction started.",
+    "typing:start",
+    "typing:stop",
     "set:false",
     "status",
     "dispatch",
@@ -732,6 +762,7 @@ test("Command helpers report compact errors", async () => {
     "reply:Compaction failed: boom",
     "throw-set:true",
     "throw-status",
+    "throw-typing:stop",
     "throw-set:false",
     "throw-status",
     "event:compact:sync boom",
@@ -891,6 +922,12 @@ test("Command runtime routes commands through runtime ports", async () => {
       events.push("compact:start");
       compactComplete = callbacks.onComplete;
     },
+    startTypingLoop: (_ctx: { idle: boolean }, chatId?: number) => {
+      events.push(`typing:start:${chatId ?? "default"}`);
+    },
+    stopTypingLoop: () => {
+      events.push("typing:stop");
+    },
     enqueueControlItem: async (
       nextMessage: typeof message,
       _ctx: { idle: boolean },
@@ -964,6 +1001,8 @@ test("Command runtime routes commands through runtime ports", async () => {
     "status",
     "compact:start",
     "reply:99:Compaction started.",
+    "typing:start:42",
+    "typing:stop",
     "compact:false",
     "status",
     "dispatch",
