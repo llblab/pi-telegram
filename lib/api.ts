@@ -298,8 +298,9 @@ export interface TelegramBridgeApiRuntime {
   setMyCommands: (
     commands: readonly { command: string; description: string }[],
   ) => Promise<boolean>;
-  sendChatAction: (chatId: number, action: "typing") => Promise<boolean>;
+  sendChatAction: (chatId: number, action: string) => Promise<boolean>;
   sendTypingAction: (chatId: number) => Promise<unknown>;
+  sendRecordVoiceAction: (chatId: number) => Promise<unknown>;
   sendMessageDraft: (
     chatId: number,
     draftId: number,
@@ -780,6 +781,14 @@ export function createTelegramBridgeApiRuntime(
           action,
         }),
       "typing",
+    ),
+    sendRecordVoiceAction: createTelegramChatActionSender(
+      (chatId, action) =>
+        callRecorded<boolean>("sendChatAction", {
+          chat_id: chatId,
+          action,
+        }),
+      "record_voice",
     ),
     sendMessageDraft: (chatId, draftId, text, options) => {
       const body: Record<string, unknown> = {

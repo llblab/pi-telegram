@@ -6,10 +6,20 @@
 
 import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
 
+import {
+  SECTION_REGISTRY_KEY,
+  VOICE_EVENT_RECORDER_KEY,
+} from "./globals.ts";
+
 // --- Core Types ---
 
+/** @internal */
 export type TelegramSectionId = string;
+
+/** @internal */
 export type TelegramSectionToken = string;
+
+/** @internal */
 export type TelegramSectionCallbackResult = "handled" | "pass";
 
 export interface TelegramSectionView {
@@ -71,6 +81,7 @@ export interface TelegramSectionCallbackContext {
   deleteMessage(): Promise<void>;
 }
 
+/** @internal */
 export interface RegisteredTelegramSection {
   id: TelegramSectionId;
   token: TelegramSectionToken;
@@ -79,6 +90,7 @@ export interface RegisteredTelegramSection {
   registration: TelegramSectionRegistration;
 }
 
+/** @internal */
 export interface TelegramSectionDiagnostic {
   id: TelegramSectionId;
   token: TelegramSectionToken;
@@ -87,6 +99,7 @@ export interface TelegramSectionDiagnostic {
   lastError?: string;
 }
 
+/** @internal */
 export interface TelegramSectionRegistry {
   register(section: TelegramSectionRegistration): () => void;
   getSections(): RegisteredTelegramSection[];
@@ -97,11 +110,13 @@ export interface TelegramSectionRegistry {
   clear(): void;
 }
 
+/** @internal */
 export interface TelegramSectionMainMenuRow {
   text: string;
   callback_data: string;
 }
 
+/** @internal */
 export interface TelegramSectionSettingsRow {
   label: string;
   callback_data: string;
@@ -109,6 +124,7 @@ export interface TelegramSectionSettingsRow {
 
 // --- Runtime Port Builders ---
 
+/** @internal */
 export interface TelegramSectionRuntimeDeps {
   answerCallbackQuery: (id: string, text?: string) => Promise<void>;
   editInteractiveMessage: (
@@ -229,40 +245,47 @@ function buildTelegramSectionCallbackContext(
 
 // --- GlobalThis Bridge ---
 
-const GLOBAL_SECTION_REGISTRY_KEY = "__piTelegramSectionRegistry__" as const;
-
-declare global {
-  // eslint-disable-next-line no-var
-  var __piTelegramSectionRegistry__: TelegramSectionRegistry | undefined;
-}
-
+/** @internal */
 export function setGlobalTelegramSectionRegistry(
   registry: TelegramSectionRegistry,
 ): void {
-  globalThis[GLOBAL_SECTION_REGISTRY_KEY] = registry;
+  globalThis[SECTION_REGISTRY_KEY] = registry;
 }
 
 /**
  * Register a Telegram Extension Section from any pi extension.
  * Returns a disposer. Throws if no section registry is active.
+ *
+
  */
 export function registerTelegramSection(
   section: TelegramSectionRegistration,
 ): () => void {
-  const registry = globalThis[GLOBAL_SECTION_REGISTRY_KEY];
+  const registry = globalThis[SECTION_REGISTRY_KEY];
   if (!registry) {
-    throw new Error(
-      "Telegram section registry not available. Is pi-telegram loaded?",
-    );
+    // If no registry is ready yet, we simply can't register.
+    // This should normally not happen in normal usage.
+    try {
+      const record = (globalThis as any)[VOICE_EVENT_RECORDER_KEY];
+      if (typeof record === "function") {
+        record("section-registration", new Error("Registry not ready yet"), {
+          id: section.id,
+        });
+      }
+    } catch {}
+
+    return () => {};
   }
+
   return registry.register(section);
 }
 
 /**
  * Get current section diagnostics. Returns empty array when registry is absent.
  */
+/** @internal */
 export function getTelegramSectionDiagnostics(): TelegramSectionDiagnostic[] {
-  const registry = globalThis[GLOBAL_SECTION_REGISTRY_KEY];
+  const registry = globalThis[SECTION_REGISTRY_KEY];
   return registry ? registry.getDiagnostics() : [];
 }
 
@@ -298,6 +321,7 @@ function prependBackRow(
   };
 }
 
+/** @internal */
 export function createTelegramExtensionSectionRegistry(): TelegramSectionRegistry {
   const sections = new Map<TelegramSectionToken, RegisteredTelegramSection>();
   const errors = new Map<TelegramSectionToken, string>();
@@ -351,15 +375,7 @@ export function createTelegramExtensionSectionRegistry(): TelegramSectionRegistr
   return { register, getSections, getByToken, getDiagnostics, clear };
 }
 
-export function getTelegramSectionMainMenuRows(
-  registry: TelegramSectionRegistry,
-): TelegramSectionMainMenuRow[] {
-  return registry.getSections().map((s) => ({
-    text: s.label,
-    callback_data: `section:${s.token}:open`,
-  }));
-}
-
+/** @internal */
 export function getTelegramExtensionSettingsRows(
   registry: TelegramSectionRegistry,
 ): TelegramSectionSettingsRow[] {
@@ -379,6 +395,17 @@ export function getTelegramExtensionSettingsRows(
     }));
 }
 
+/** @internal */
+export function getTelegramSectionMainMenuRows(
+  registry: TelegramSectionRegistry,
+): TelegramSectionMainMenuRow[] {
+  return registry.getSections().map((s) => ({
+    text: s.label,
+    callback_data: `section:${s.token}:open`,
+  }));
+}
+
+/** @internal */
 export function parseTelegramSectionCallback(
   data: string,
 ): { token: string; action: string; payload: string } | undefined {
@@ -399,6 +426,7 @@ export function parseTelegramSectionCallback(
   };
 }
 
+/** @internal */
 export interface TelegramSectionCallbackHandlerDeps {
   answerCallbackQuery: (id: string, text?: string) => Promise<void>;
   editInteractiveMessage: (

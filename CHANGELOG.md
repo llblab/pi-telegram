@@ -28,6 +28,64 @@
 ## 0.10.3: Dependency Audit Hotfix
 
 - `[Dependencies]` Refreshed the lockfile transitive dependency set to resolve current `protobufjs` / `@protobufjs/utf8` npm audit advisories inherited through development peer installs. Impact: `npm run validate` is green again without changing runtime API or bridge behavior.
+## Unreleased — Voice v2: Minimal Bridge + Provider Ownership
+
+Significant cleanup and architectural tightening to keep `pi-telegram` as a thin, stable interface:
+
+- The bridge now offers only the core seams:
+  - `registerTelegramVoiceProvider`
+  - `registerTelegramSection`
+  - `recordTelegramRuntimeEvent`
+  - `sendVoice` delivery + `record_voice` action
+  - `voice.replyMode` + transparent interception and preview suppression
+
+- Voice providers are now fully responsible for:
+  - Speech rewriting and tag handling
+  - TTS + conversion to OGG/Opus
+  - `transcriptText` and `sendTranscriptAsMessage` decisions
+
+- A `getVoicePromptContribution(view)` hook exists in the `TelegramVoiceProvider` interface. Automatic injection by the bridge is planned but not yet implemented.
+
+- Major iteration debt removed:
+  - Entire "persistent registration" system (`persistent?` option, `reRegisterPersistent*` functions, auto-restore logic) deleted
+  - Local development resolver (`lib/dev.ts`) removed from the public package
+  - GlobalThis pollution significantly reduced
+
+- `record_voice` chat action is now used during voice delivery.
+- Transcript is always produced by the provider; the `sendTranscript` setting only controls the optional extra text message.
+
+**Breaking for providers**: Must return `.ogg` or `.opus`. Non-OGG files are rejected and fall back to text delivery. Old MP3 return paths are no longer supported.
+
+See `docs/voice.md` for the updated contract.
+
+- `[Voice Architecture]` Removed ffmpeg conversion from pi-telegram. Format conversion now lives in the voice provider extension (e.g. `pi-xai-voice`). The bridge expects providers to return `.ogg` or `.opus` files directly. Non-OGG files are rejected and the runtime falls back to text delivery.
+  - `lib/outbound-handlers.ts` — `ensureTelegramVoiceFileFormat` simplified to a format validator that accepts `.ogg` and `.opus` only. Removed `execCommand` parameter, ffmpeg conversion pipeline, and `sendAudio` fallback.
+  - `lib/outbound-handlers.ts` — `sendVoiceReply` no longer calls ffmpeg or falls back to `sendAudio`. Provider failures now throw directly, caught by queue runtime for text fallback.
+  - `tests/outbound-handlers.test.ts` — removed 6 conversion/fallback tests (MP3→OGG, sendAudio fallback, OGG ffmpeg, M4A fallback). Added 3 validation tests: accepts Opus, accepts OGG, throws for non-ogg files.
+- `[Voice API]` Extended `registerTelegramVoiceProvider` contract to accept `{ audioPath, transcriptText }` return values. Backward compatible: `string` returns work as before.
+  - `lib/outbound-handlers.ts` — `TelegramVoiceProvider` type updated to `Promise<string | { audioPath: string; transcriptText?: string } | undefined>`.
+  - `lib/outbound-handlers.ts` — `sendVoiceReply` extracts `audioPath` and optional `transcriptText` from provider result. `transcriptText` is sent as `caption` in the Telegram `sendVoice` multipart form.
+  - `tests/outbound-handlers.test.ts` — added tests for `{ audioPath }` and `{ audioPath, transcriptText }` return paths.
+- `[Voice Cleanup]` Removed `[VOICE-DEBUG]` console.log calls from voice pipeline (23 occurrences across `lib/outbound-handlers.ts`, `lib/queue.ts`, `lib/turns.ts`).
+- `[Validation]` Fixed protobuf audit vulnerabilities via `npm audit fix`.
+- `[Voice Bug Fixes]` Hardened voice delivery pipeline:
+  - `lib/outbound-handlers.ts` — `ensureTelegramVoiceFileFormat` now checks `result.code !== 0` after `execCommand("ffmpeg", ...)`. Previously the function ignored the ffmpeg exit code, returning a path to a non-existent file when conversion failed. The `sendAudio` fallback was therefore unreachable in production.
+  - `lib/outbound-handlers.ts` — `sendVoiceReply` now cleans up converted `.voice.ogg` temp files in a `finally` block after `sendMultipart` (success or failure). Previously every converted voice reply leaked a temp file.
+  - `lib/outbound-handlers.ts` — `ensureTelegramVoiceFileFormat` no longer trusts `.ogg` files to already contain Opus codec. Only `.opus` files skip conversion; `.ogg` and all other extensions are now passed through ffmpeg to ensure valid OGG/Opus output for Telegram `sendVoice`. `.ogg` files that fail conversion fall back to `sendAudio` (alongside `.mp3` and `.m4a`).
+  - `lib/outbound-handlers.ts` — removed unused `tempDir` field from `TelegramVoiceReplySenderDeps`.
+  - `tests/outbound-handlers.test.ts` — updated `sendAudio` fallback test to mock `execCommand` returning `{code: 1}` instead of throwing, matching real `CommandTemplates.execCommandTemplate` behavior. Added `.m4a` fallback test, `.ogg` conversion test, and sendAudio-fallback-failure test.
+- `[Voice Bug Fixes]` Hardened voice-mode menu/status suppression across the bridge:
+  - `lib/menu-thinking.ts` — `openTelegramThinkingMenu` and `updateTelegramThinkingMenuMessage` now early-return when `isVoiceReplyActive()` is true, preventing the thinking menu from opening or updating during voice replies.
+  - `lib/menu-status.ts` — `buildStatusReplyMarkup` already hides the Thinking button; `handleTelegramStatusMenuCallbackAction` already declines thinking callbacks with a voice-mode message. Both behaviors are now fully wired through `isVoiceReplyActive` in `TelegramStatusMenuCallbackDeps`.
+  - `lib/menu.ts` — `isVoiceReplyActive` is now threaded through `TelegramMenuCallbackRuntimeDeps`, `TelegramMenuActionRuntimeDeps`, and the runtime builder so all menu subsystems can access the active turn's voice flags.
+  - `index.ts` — exposes `isVoiceReplyActive` to the menu action runtime so status/thinking/queue menus can react to voice-tagged turns.
+- `[Voice Reply Policy]` Added configurable voice reply policies (`manual` / `mirror` / `voice`) with transparent text-to-voice interception. When active, the bridge suppresses text previews and converts agent text replies to voice messages automatically.
+- `[Voice Turn Tagging]` `PendingTelegramTurn` now carries `voiceReplyPreferred` and `voiceReplyRequired` flags. The bridge tags turns at construction based on `voice.replyMode` in `TelegramConfig`, read via `getTelegramVoiceReplyMode()`.
+- `[Transparent Interception]` In `mirror` and `voice` modes, agent text responses without explicit `<!-- telegram_voice -->` markup are transparently intercepted and routed through registered voice providers.
+- `[Voice Fallback]` When voice delivery fails (no providers registered or all providers failed), the voice sender throws and the runtime catches the error, falling back to sending the planned text reply (outbound markup stripped, replyMarkup preserved). Applies to both `voiceReplyPreferred` and `voiceReplyRequired` turns.
+- `[Extension API]` `registerTelegramVoiceProvider()` allows voice provider extensions (e.g. `pi-xai-voice`) to register TTS backends dynamically.
+- `[Validation]` `getTelegramVoiceReplyMode()` validates and normalizes the shared voice config, ensuring `replyMode: "manual"` default.
+- `[Docs]` New `docs/voice.md` with architecture, mode reference, registration examples, handler contract, and Telegram voice limits.
 
 ## 0.10.2: Delete Message Port Hotfix
 

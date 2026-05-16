@@ -38,7 +38,7 @@ export interface TelegramInboundRouteRuntimeDeps<
 > {
   configStore: Pick<
     TelegramConfigStore,
-    "getAllowedUserId" | "setAllowedUserId" | "persist"
+    "get" | "getAllowedUserId" | "setAllowedUserId" | "persist"
   >;
   bridgeRuntime: TelegramBridgeRuntime;
   activeTurnRuntime: Queue.TelegramActiveTurnStore;
@@ -284,6 +284,7 @@ export function createTelegramInboundRouteRuntime<
     allocateQueueOrder: deps.bridgeRuntime.queue.allocateItemOrder,
     downloadFile: deps.downloadFile,
     processAttachments: deps.inboundHandlerRuntime.process,
+    getVoiceReplyMode: () => Turns.getTelegramVoiceReplyMode(deps.configStore.get()),
   });
   const enqueueContinueTurn = async (
     message: TMessage,

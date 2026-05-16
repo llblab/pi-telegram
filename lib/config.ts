@@ -43,6 +43,9 @@ export interface TelegramConfig {
   attachmentHandlers?: TelegramInboundHandlerConfig[];
   outboundHandlers?: TelegramOutboundHandlerConfig[];
   proactivePush?: boolean;
+  voice?: {
+    replyMode?: "manual" | "mirror" | "voice";
+  };
 }
 
 export interface TelegramConfigStore {

@@ -30,6 +30,7 @@ export interface TelegramStatusMenuCallbackDeps {
     callbackQueryId: string,
     text?: string,
   ) => Promise<void>;
+  isVoiceReplyActive?: () => boolean;
 }
 
 export interface TelegramStatusMenuOpenDeps<
@@ -131,6 +132,13 @@ export async function handleTelegramStatusMenuCallbackAction(
     return true;
   }
   if (!isTelegramStatusMenuCallbackAction(data, "thinking")) return false;
+  if (deps.isVoiceReplyActive?.()) {
+    await deps.answerCallbackQuery(
+      callbackQueryId,
+      "Thinking controls are disabled during voice replies.",
+    );
+    return true;
+  }
   if (!activeModel?.reasoning) {
     await deps.answerCallbackQuery(
       callbackQueryId,
@@ -148,6 +156,7 @@ export function buildStatusReplyMarkup(
   currentThinkingLevel: ThinkingLevel,
   queueItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
+  isVoiceReplyActive?: boolean,
 ): TelegramReplyMarkup {
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
   rows.push([
@@ -159,7 +168,7 @@ export function buildStatusReplyMarkup(
       callback_data: "menu:model",
     },
   ]);
-  if (activeModel?.reasoning) {
+  if (activeModel?.reasoning && !isVoiceReplyActive) {
     rows.push([
       {
         text: formatStatusButtonLabel(
@@ -176,11 +185,10 @@ export function buildStatusReplyMarkup(
       callback_data: "menu:queue",
     },
   ]);
-  // Extension section rows before Settings
   if (sectionRegistry) {
     const sectionRows = getTelegramSectionMainMenuRows(sectionRegistry);
     for (const row of sectionRows) {
-      rows.push([{ text: row.text, callback_data: row.callback_data }]);
+      rows.push([row]);
     }
   }
   rows.push([
@@ -198,6 +206,7 @@ export function buildTelegramStatusMenuRenderPayload(
   currentThinkingLevel: ThinkingLevel,
   queueItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
+  isVoiceReplyActive?: boolean,
 ): TelegramMenuRenderPayload {
   return {
     nextMode: "status",
@@ -208,6 +217,7 @@ export function buildTelegramStatusMenuRenderPayload(
       currentThinkingLevel,
       queueItemCount,
       sectionRegistry,
+      isVoiceReplyActive,
     ),
   };
 }
@@ -220,6 +230,7 @@ export async function updateTelegramStatusMessage(
   deps: TelegramMenuMessageRuntimeDeps,
   queueItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
+  isVoiceReplyActive?: boolean,
 ): Promise<void> {
   await editTelegramMenuMessage(
     state,
@@ -229,6 +240,7 @@ export async function updateTelegramStatusMessage(
       currentThinkingLevel,
       queueItemCount,
       sectionRegistry,
+      isVoiceReplyActive,
     ),
     deps,
   );
@@ -242,6 +254,7 @@ export function sendTelegramStatusMessage(
   deps: TelegramMenuMessageRuntimeDeps,
   queueItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
+  isVoiceReplyActive?: boolean,
 ): Promise<number | undefined> {
   return sendTelegramMenuMessage(
     state,
@@ -251,6 +264,7 @@ export function sendTelegramStatusMessage(
       currentThinkingLevel,
       queueItemCount,
       sectionRegistry,
+      isVoiceReplyActive,
     ),
     deps,
   );

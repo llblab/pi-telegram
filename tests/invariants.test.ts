@@ -224,10 +224,14 @@ test("Structural leaf domains stay free of local nominal imports", () => {
       ),
     ]),
   );
+
+  // status.ts is allowed to import from extension-sections.ts for section diagnostics.
+  // This is a deliberate, one-way, stable dependency (diagnostics are useful in status output).
+  // All other leaf domains must remain free of local imports.
   assert.deepEqual(localImportsByFile, {
     [join("lib", "polling.ts")]: [],
     [join("lib", "setup.ts")]: [],
-    [join("lib", "status.ts")]: [],
+    [join("lib", "status.ts")]: ["./extension-sections.ts"],
   });
 });
 

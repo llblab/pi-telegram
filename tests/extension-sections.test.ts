@@ -7,7 +7,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   createTelegramExtensionSectionRegistry,
-  getTelegramSectionMainMenuRows,
   getTelegramExtensionSettingsRows,
   parseTelegramSectionCallback,
   handleTelegramSectionOpen,
@@ -119,24 +118,6 @@ test("Registry diagnostics reports active and error states", () => {
   assert.equal(diags.length, 1);
   assert.equal(diags[0].status, "active");
   assert.equal(diags[0].id, "@test/a");
-});
-
-// --- Main Menu Rows ---
-
-test("getTelegramSectionMainMenuRows returns rows with section:token:open callbacks", () => {
-  const registry = createTelegramExtensionSectionRegistry();
-  registry.register(stubSection("@test/a", "🗂 A"));
-  registry.register(stubSection("@test/b", "🔧 B"));
-  const rows = getTelegramSectionMainMenuRows(registry);
-  assert.equal(rows.length, 2);
-  assert.equal(rows[0].text, "🗂 A");
-  assert.ok(rows[0].callback_data.startsWith("section:"));
-  assert.ok(rows[0].callback_data.endsWith(":open"));
-});
-
-test("getTelegramSectionMainMenuRows returns empty when no sections", () => {
-  const registry = createTelegramExtensionSectionRegistry();
-  assert.equal(getTelegramSectionMainMenuRows(registry).length, 0);
 });
 
 // --- Settings Rows ---
@@ -472,12 +453,13 @@ test("handleTelegramSectionSettingsOpen handles section without settings gracefu
 
 // --- Integration: menu-status rows ---
 
-test("buildStatusReplyMarkup injects section rows before Settings", async () => {
+
+test("buildStatusReplyMarkup includes extension section rows before Settings", async () => {
   // Import dynamically to avoid circular deps in test
   const { buildStatusReplyMarkup } = await import("../lib/menu-status.ts");
   const registry = createTelegramExtensionSectionRegistry();
-  registry.register(stubSection("@test/a", "🗂 Explorer"));
-  registry.register(stubSection("@test/b", "📊 Status"));
+  registry.register(stubSection("@test/a", "Explorer"));
+  registry.register(stubSection("@test/b", "Status"));
 
   const markup = buildStatusReplyMarkup(undefined, "off" as never, 0, registry);
   const rows = markup.inline_keyboard;
@@ -487,9 +469,13 @@ test("buildStatusReplyMarkup injects section rows before Settings", async () => 
     (r) => r[0].callback_data === "menu:settings",
   );
   assert.ok(settingsIdx > 0);
-  // Section rows should be immediately before Settings
-  assert.equal(rows[settingsIdx - 2][0].text, "🗂 Explorer");
-  assert.equal(rows[settingsIdx - 1][0].text, "📊 Status");
+  // Queue should be before section rows
+  assert.equal(rows[settingsIdx - 3][0].text, "⌛ Queue: 0");
+  // Section rows injected between Queue and Settings
+  assert.equal(rows[settingsIdx - 2][0].text, "Explorer");
+  assert.equal(rows[settingsIdx - 2][0].callback_data, "section:0:open");
+  assert.equal(rows[settingsIdx - 1][0].text, "Status");
+  assert.equal(rows[settingsIdx - 1][0].callback_data, "section:1:open");
 });
 
 // --- Integration: menu-settings rows ---

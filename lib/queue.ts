@@ -80,6 +80,16 @@ export interface PendingTelegramTurn extends TelegramQueueItemBase {
   content: TelegramPromptContent[];
   historyText: string;
   priorityEmoji?: string;
+
+  /** Turn should preferably be delivered as voice (mirror mode + user sent voice) */
+  voiceReplyPreferred?: boolean;
+  /** Turn must be delivered as voice (voice mode) */
+  voiceReplyRequired?: boolean;
+}
+
+/** Small helper used across queue, turns, and preview to check voice-tagged turns */
+function isVoiceTurn(turn: { voiceReplyPreferred?: boolean; voiceReplyRequired?: boolean } | null | undefined): boolean {
+  return !!(turn?.voiceReplyPreferred || turn?.voiceReplyRequired);
 }
 
 export interface PendingTelegramControlItem<
@@ -369,6 +379,24 @@ export function formatQueuedTelegramItemsStatus<TContext = unknown>(
   items: TelegramQueueItem<TContext>[],
 ): string {
   return items.length === 0 ? "" : ` +${items.length}`;
+}
+
+export function truncateTelegramQueueSummary(
+  text: string,
+  maxWords = 5,
+  maxLength = 40,
+): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  const words = normalized.split(" ");
+  let summary = words.slice(0, maxWords).join(" ");
+  if (summary.length === 0) summary = normalized;
+  if (summary.length > maxLength) {
+    summary = summary.slice(0, maxLength).trimEnd();
+  }
+  return summary.length < normalized.length || words.length > maxWords
+    ? `${summary}…`
+    : summary;
 }
 
 export function canDispatchTelegramTurnState(
@@ -976,9 +1004,35 @@ export async function handleTelegramAgentEndRuntime<
 >(deps: TelegramAgentEndRuntimeDeps<TTurn, TReplyMarkup>): Promise<void> {
   const { turn, assistant } = deps;
   const rawFinalText = assistant.text;
-  const outboundReply = rawFinalText
+  let outboundReply = rawFinalText
     ? deps.planOutboundReply?.(rawFinalText)
     : undefined;
+  // Preserve the planned reply so voice-fallback can use stripped markdown + replyMarkup
+  const plannedReply = outboundReply;
+
+  // Transparent voice interception: when the turn is voice-tagged and the agent
+  // did not explicitly use <!-- telegram_voice --> markup, we automatically
+  // convert the whole response to voice.
+  const voiceInterceptionGuard =
+    turn &&
+    isVoiceTurn(turn) &&
+    rawFinalText?.trim() &&
+    deps.planOutboundReply &&
+    (!outboundReply ||
+      (!outboundReply.voiceText && !outboundReply.voiceReplies?.length));
+  if (voiceInterceptionGuard) {
+    deps.recordRuntimeEvent?.("voice-debug", new Error("Voice interception triggered"), {
+      phase: "interception",
+      voiceText: plannedReply !== undefined ? plannedReply.markdown?.trim() : rawFinalText ?? "",
+    });
+    const voiceText = plannedReply !== undefined
+      ? (plannedReply.markdown?.trim() || "")
+      : (rawFinalText ?? "");
+    outboundReply = outboundReply
+      ? { ...outboundReply, voiceText, markdown: "" }
+      : { markdown: "", voiceText };
+  }
+
   const finalText = outboundReply ? outboundReply.markdown : rawFinalText;
   const hasOutboundArtifacts =
     !!outboundReply?.voiceText || !!outboundReply?.voiceReplies?.length;
@@ -1080,9 +1134,35 @@ export async function handleTelegramAgentEndRuntime<
     }
   }
   if (outboundReply && deps.sendOutboundReplyArtifacts) {
-    await deps.sendOutboundReplyArtifacts(turn, outboundReply, {
-      replyToPrompt: !finalText,
-    });
+    try {
+      await deps.sendOutboundReplyArtifacts(turn, outboundReply, {
+        replyToPrompt: !finalText,
+      });
+    } catch (error) {
+      deps.recordRuntimeEvent?.("delivery", error, {
+        phase: "voice-artifacts",
+        chatId: turn.chatId,
+      });
+      // Fallback to planned text when voice delivery fails and text wasn't already delivered
+      if (rawFinalText?.trim() && !finalText && hasOutboundArtifacts) {
+        try {
+          const fallbackMarkdown = plannedReply?.markdown || outboundReply?.voiceText || rawFinalText;
+          await deps.sendMarkdownReply(
+            turn.chatId,
+            turn.replyToMessageId,
+            fallbackMarkdown,
+            plannedReply?.replyMarkup
+              ? { replyMarkup: plannedReply.replyMarkup }
+              : undefined,
+          );
+        } catch (fallbackError) {
+          deps.recordRuntimeEvent?.("delivery", fallbackError, {
+            phase: "voice-fallback-text",
+            chatId: turn.chatId,
+          });
+        }
+      }
+    }
   }
   if (endPlan.shouldSendAttachmentNotice) {
     await deps.sendTextReply(
