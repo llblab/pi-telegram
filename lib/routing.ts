@@ -110,6 +110,7 @@ export interface TelegramInboundRouteRuntimeDeps<
     text: string,
   ) => Promise<number | undefined>;
   setMyCommands: Commands.TelegramBotCommandRegistrationDeps["setMyCommands"];
+  getExtraCommands?: Commands.TelegramBotCommandRegistrationDeps["getExtraCommands"];
   getCommands: () => Parameters<
     typeof PromptTemplates.getTelegramPromptTemplateCommands
   >[0];
@@ -409,6 +410,7 @@ export function createTelegramInboundRouteRuntime<
     getAllowedUserId: deps.configStore.getAllowedUserId,
     setAllowedUserId: deps.configStore.setAllowedUserId,
     setMyCommands: deps.setMyCommands,
+    getExtraCommands: deps.getExtraCommands,
     getPromptTemplateCommands,
     persistConfig: deps.configStore.persist,
     sendTextReply: deps.sendTextReply,

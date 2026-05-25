@@ -217,6 +217,29 @@ Import `registerTelegramSection()` from `@llblab/pi-telegram/sections` and retur
 
 `telegram.json` can set `proactivePush: true` to send successful local non-Telegram final replies to the paired Telegram chat when no Telegram turn is active. Local prompt text is not mirrored because the bot does not own terminal user messages. The mode is off by default and can be toggled from settings.
 
+### Extra bot commands (autocomplete)
+
+By default the bridge registers a fixed set of bot commands with Telegram's `setMyCommands` API (the blue `/` autocomplete menu): `/start`, `/compact`, `/next`, `/continue`, `/abort`, `/stop`. Add `extraBotCommands` to `telegram.json` to append your own — useful for surfacing pi CLI slash commands (e.g. `/models`, `/new`) or extension-provided commands in autocomplete.
+
+```json
+{
+  "extraBotCommands": [
+    { "command": "models", "description": "Open model selector" },
+    { "command": "new", "description": "Start a new session" },
+    { "command": "om_status", "description": "Observational memory status" }
+  ]
+}
+```
+
+Rules (per the Telegram Bot API):
+
+- Names must match `[a-z0-9_]{1,32}` — hyphens, spaces, uppercase, and a leading `/` are normalized or rejected.
+- Names cannot override builtins (`start`, `compact`, `next`, `continue`, `abort`, `stop`) or clash with reserved bridge commands (`status`, `queue`, `model`, `thinking`, `settings`, `help`).
+- Descriptions are trimmed and capped at 256 characters; empty descriptions are dropped.
+- Invalid or duplicate entries are silently dropped from the registered list; the rest are appended after the builtins.
+
+The registered list is refreshed on bridge startup and on every `setMyCommands` call. Manual `@BotFather → /setcommands` edits are overwritten by the next bridge start.
+
 ### Time context
 
 `telegram.json` can opt into a compact `[time]` line in Telegram-originated prompts so π has a wall-clock reference for requests such as "today", "now", or scheduling. It is hidden by default and uses the system timezone; the mode can also be changed from Settings → `🕒 Time injection`.

@@ -343,6 +343,7 @@ export default function (pi: Pi.ExtensionAPI) {
     answerGuestQuery,
     sendTextReply,
     setMyCommands,
+    getExtraCommands: configStore.getExtraBotCommands,
     getCommands,
     downloadFile: downloadTelegramBridgeFile,
     resolveTimeLine: timeInjectionRuntime.resolveLine,

@@ -106,16 +106,117 @@ export const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinitio
 
 export const TELEGRAM_BOT_COMMANDS = TELEGRAM_BUILTIN_BOT_COMMANDS;
 
+/**
+ * Telegram Bot API constraints for setMyCommands entries.
+ * @see https://core.telegram.org/bots/api#botcommand
+ */
+export const MAX_TELEGRAM_BOT_COMMAND_NAME_LENGTH = 32;
+export const MAX_TELEGRAM_BOT_COMMAND_DESCRIPTION_LENGTH = 256;
+export const TELEGRAM_BOT_COMMAND_NAME_PATTERN = /^[a-z0-9_]{1,32}$/;
+
+const TELEGRAM_BUILTIN_BOT_COMMAND_NAME_SET = new Set<string>(
+  TELEGRAM_BUILTIN_BOT_COMMANDS.map((entry) => entry.command),
+);
+
+export interface NormalizedTelegramExtraBotCommandsResult {
+  accepted: TelegramBotCommandDefinition[];
+  rejected: { entry: unknown; reason: string }[];
+}
+
+/**
+ * Validate, dedupe, and sanitize user-supplied extra bot commands.
+ * Builtin commands always win — extras with the same name are dropped.
+ * Names must match TELEGRAM_BOT_COMMAND_NAME_PATTERN and not clash with reserved names.
+ * Descriptions are trimmed and capped at MAX_TELEGRAM_BOT_COMMAND_DESCRIPTION_LENGTH.
+ */
+export function normalizeExtraTelegramBotCommands(
+  extras: readonly unknown[] | undefined,
+): NormalizedTelegramExtraBotCommandsResult {
+  const accepted: TelegramBotCommandDefinition[] = [];
+  const rejected: { entry: unknown; reason: string }[] = [];
+  if (!extras) {
+    return { accepted, rejected };
+  }
+  const seenNames = new Set<string>();
+  for (const entry of extras) {
+    if (!entry || typeof entry !== "object") {
+      rejected.push({ entry, reason: "not an object" });
+      continue;
+    }
+    const candidate = entry as { command?: unknown; description?: unknown };
+    if (typeof candidate.command !== "string") {
+      rejected.push({ entry, reason: "command is not a string" });
+      continue;
+    }
+    if (typeof candidate.description !== "string") {
+      rejected.push({ entry, reason: "description is not a string" });
+      continue;
+    }
+    const rawCommand = candidate.command.trim().replace(/^\//, "");
+    const command = rawCommand.toLowerCase();
+    if (!TELEGRAM_BOT_COMMAND_NAME_PATTERN.test(command)) {
+      rejected.push({
+        entry,
+        reason: `command "${candidate.command}" must match a-z0-9_ and be 1-${MAX_TELEGRAM_BOT_COMMAND_NAME_LENGTH} chars`,
+      });
+      continue;
+    }
+    if (TELEGRAM_BUILTIN_BOT_COMMAND_NAME_SET.has(command)) {
+      rejected.push({
+        entry,
+        reason: `command "${command}" is a builtin and cannot be overridden`,
+      });
+      continue;
+    }
+    if (TELEGRAM_RESERVED_COMMAND_NAME_SET.has(command)) {
+      rejected.push({
+        entry,
+        reason: `command "${command}" is reserved by the bridge`,
+      });
+      continue;
+    }
+    if (seenNames.has(command)) {
+      rejected.push({
+        entry,
+        reason: `duplicate command "${command}"`,
+      });
+      continue;
+    }
+    const description = candidate.description
+      .trim()
+      .slice(0, MAX_TELEGRAM_BOT_COMMAND_DESCRIPTION_LENGTH);
+    if (description.length === 0) {
+      rejected.push({ entry, reason: "description is empty after trim" });
+      continue;
+    }
+    seenNames.add(command);
+    accepted.push({ command, description });
+  }
+  return { accepted, rejected };
+}
+
 export interface TelegramBotCommandRegistrationDeps {
   setMyCommands: (
     commands: readonly TelegramBotCommandDefinition[],
   ) => Promise<unknown>;
+  /**
+   * Optional getter for user-defined extra bot commands. Returns raw entries
+   * from config; they are validated and merged with builtins on each registration.
+   * Invalid entries are dropped silently from the registered list (callers may log).
+   */
+  getExtraCommands?: () => readonly unknown[] | undefined;
 }
 
 export async function registerTelegramBotCommands(
   deps: TelegramBotCommandRegistrationDeps,
 ): Promise<void> {
-  await deps.setMyCommands(TELEGRAM_BOT_COMMANDS);
+  const extras = deps.getExtraCommands?.();
+  const { accepted } = normalizeExtraTelegramBotCommands(extras);
+  const merged =
+    accepted.length === 0
+      ? TELEGRAM_BOT_COMMANDS
+      : [...TELEGRAM_BOT_COMMANDS, ...accepted];
+  await deps.setMyCommands(merged);
 }
 
 export function createTelegramBotCommandRegistrar(
@@ -1095,6 +1196,7 @@ export function createTelegramCommandHandlerTargetRuntime<
     setAllowedUserId: deps.setAllowedUserId,
     registerBotCommands: createTelegramBotCommandRegistrar({
       setMyCommands: deps.setMyCommands,
+      getExtraCommands: deps.getExtraCommands,
     }),
     persistConfig: deps.persistConfig,
     sendTextReply: commandTargetRuntime.sendTextReply,

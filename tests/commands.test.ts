@@ -29,6 +29,7 @@ import {
   handleTelegramStatusCommand,
   handleTelegramStopCommand,
   parseTelegramCommand,
+  normalizeExtraTelegramBotCommands,
   registerTelegramBotCommands,
   registerTelegramBridgeCommands,
   TELEGRAM_APP_MENU_INTRO_HTML,
@@ -123,6 +124,72 @@ test("Command helpers register Telegram bot commands through deps", async () => 
     },
   })();
   assert.deepEqual(calls, [TELEGRAM_BOT_COMMANDS, TELEGRAM_BOT_COMMANDS]);
+});
+
+test("Command helpers append validated extra bot commands to builtins", async () => {
+  const calls: readonly unknown[][] = [];
+  await registerTelegramBotCommands({
+    setMyCommands: async (commands) => {
+      (calls as unknown[][]).push([...commands]);
+    },
+    getExtraCommands: () => [
+      { command: "models", description: "Pi model selector" },
+      { command: "om-status", description: "hyphen not allowed by Bot API" },
+      { command: "/om_status", description: "Observational memory status" },
+      { command: "compact", description: "override attempt" },
+      { command: "model", description: "reserved attempt" },
+      { command: "help", description: "reserved attempt" },
+      { command: "BadCase", description: "normalized" },
+      { command: "models", description: "duplicate" },
+      { command: "", description: "empty" },
+      { command: "ok", description: "   " },
+      "not-an-object",
+      { command: "valid_name", description: "a".repeat(400) },
+    ],
+  });
+  const registered = calls[0]!;
+  const names = registered.map((entry: any) => entry.command);
+  assert.ok(names.includes("models"));
+  assert.ok(!names.includes("om-status"), "hyphen not in name pattern");
+  assert.ok(names.includes("om_status"));
+  assert.ok(names.includes("badcase"));
+  assert.ok(names.includes("valid_name"));
+  // builtin/reserved/duplicate/empty rejected
+  assert.equal(names.filter((n: string) => n === "compact").length, 1);
+  assert.equal(names.filter((n: string) => n === "models").length, 1);
+  assert.ok(!names.includes("model"), "reserved \"model\" rejected");
+  assert.ok(!names.includes("help"), "reserved \"help\" rejected");
+  // description capped at 256
+  const longEntry = (registered as any[]).find(
+    (entry) => entry.command === "valid_name",
+  );
+  assert.equal(longEntry.description.length, 256);
+  // builtins still first and in original order
+  const builtinNames = TELEGRAM_BOT_COMMANDS.map((entry) => entry.command);
+  assert.deepEqual(names.slice(0, builtinNames.length), builtinNames);
+});
+
+test("normalizeExtraTelegramBotCommands reports rejection reasons", () => {
+  const { accepted, rejected } = normalizeExtraTelegramBotCommands([
+    { command: "valid", description: "ok" },
+    { command: "start", description: "builtin" },
+    { command: "model", description: "reserved" },
+    { command: "BAD CASE", description: "bad" },
+    null,
+  ]);
+  assert.deepEqual(
+    accepted.map((entry) => entry.command),
+    ["valid"],
+  );
+  assert.equal(rejected.length, 4);
+  assert.match(rejected[0]!.reason, /builtin/);
+  assert.match(rejected[1]!.reason, /reserved/);
+});
+
+test("normalizeExtraTelegramBotCommands handles undefined input", () => {
+  const result = normalizeExtraTelegramBotCommands(undefined);
+  assert.deepEqual(result.accepted, []);
+  assert.deepEqual(result.rejected, []);
 });
 
 test("Command helpers register pi setup and status commands", async () => {

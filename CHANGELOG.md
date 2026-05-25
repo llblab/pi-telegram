@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `[Bot Commands]` Added an opt-in `extraBotCommands` field in `telegram.json` so operators can append extra entries to Telegram's `setMyCommands` autocomplete list (the blue `/` menu) without forking the bridge. Names are validated against the Bot API pattern (`[a-z0-9_]{1,32}`), normalized to lowercase, deduped, and blocked from overriding builtins or reserved bridge commands; descriptions are trimmed and capped at 256 chars. Impact: pi CLI slash commands and extension-provided commands (e.g. `/models`, `/new`, `/om_status`) can be surfaced in Telegram autocomplete via config alone, while builtins and reserved names stay protected.
+
 ## 0.13.0: Command Template Standard, Voice Hardening, And Domain Cleanup (2026-05-22)
 
 - `[Architecture]` Extracted outbound assistant-action markup parsing into `lib/outbound-markup.ts` and removed the temporary Voice/Outbound/Queue import-cycle allowance. Impact: project source imports are fully acyclic again while preserving existing voice and outbound helper exports.

@@ -63,6 +63,14 @@ export interface TelegramConfig {
     sendTranscript?: boolean;
   };
   time?: TelegramTimeConfig;
+  /**
+   * Optional user-supplied bot commands to append to the registered Telegram
+   * setMyCommands list (the blue `/` autocomplete). Each entry is
+   * `{ command, description }`. Names must match `[a-z0-9_]{1,32}` and may not
+   * clash with builtin or reserved bridge commands; invalid entries are dropped
+   * silently by the registrar. Descriptions are trimmed and capped at 256 chars.
+   */
+  extraBotCommands?: { command: string; description: string }[];
 }
 
 export interface TelegramConfigStore {
@@ -75,6 +83,9 @@ export interface TelegramConfigStore {
   getInboundHandlers: () => TelegramInboundHandlerConfig[] | undefined;
   getAttachmentHandlers: () => TelegramInboundHandlerConfig[] | undefined;
   getOutboundHandlers: () => TelegramOutboundHandlerConfig[] | undefined;
+  getExtraBotCommands: () =>
+    | NonNullable<TelegramConfig["extraBotCommands"]>
+    | undefined;
   setAllowedUserId: (userId: number) => void;
   load: () => Promise<void>;
   persist: (config?: TelegramConfig) => Promise<void>;
@@ -172,6 +183,7 @@ export function createTelegramConfigStore(
     ],
     getAttachmentHandlers: () => config.attachmentHandlers,
     getOutboundHandlers: () => config.outboundHandlers,
+    getExtraBotCommands: () => config.extraBotCommands,
     setAllowedUserId: (userId) => {
       config.allowedUserId = userId;
     },
