@@ -462,7 +462,7 @@ export function buildTelegramStatusBarText(
     ? theme.fg("success", state.queuedStatus)
     : "";
   if (state.compactionInProgress) {
-    return `${label} ${theme.fg("accent", "compacting")}${queued}`;
+    return `${label} ${theme.fg("warning", "compacting")}${queued}`;
   }
   if (state.processing) {
     const processingStatus = state.queuedStatus

@@ -102,6 +102,40 @@ export interface TelegramSessionLifecycleHooks {
   ) => Promise<void>;
 }
 
+export interface TelegramSessionContextStore<TContext> {
+  get: () => TContext | undefined;
+  set: (ctx: TContext) => void;
+  clear: () => void;
+}
+
+export function createTelegramSessionContextStore<
+  TContext,
+>(): TelegramSessionContextStore<TContext> {
+  let currentContext: TContext | undefined;
+  return {
+    get: () => currentContext,
+    set: (ctx) => {
+      currentContext = ctx;
+    },
+    clear: () => {
+      currentContext = undefined;
+    },
+  };
+}
+
+export function createTelegramSessionContextTracker(
+  store: Pick<TelegramSessionContextStore<ExtensionContext>, "set" | "clear">,
+): TelegramSessionLifecycleHooks {
+  return {
+    onSessionStart: async (_event, ctx) => {
+      store.set(ctx);
+    },
+    onSessionShutdown: async () => {
+      store.clear();
+    },
+  };
+}
+
 type TelegramLifecycleTimer = number | ReturnType<typeof setTimeout>;
 
 export interface TelegramCompactionObserverRuntimeDeps<TContext> {

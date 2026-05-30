@@ -14,6 +14,7 @@ import {
   getTelegramOutboundAttachmentByteLimitFromEnv,
   queueTelegramOutboundAttachments,
   registerTelegramOutboundAttachmentTool,
+  registerTelegramOutboundMessageTool,
   sendQueuedTelegramOutboundAttachments,
   TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES,
   type TelegramOutboundAttachmentQueueTargetView,
@@ -37,8 +38,13 @@ type RegisteredAttachmentTool = {
   name?: string;
   execute: (
     toolCallId: string,
-    params: { paths: string[] },
-  ) => Promise<{ details: { paths: string[] } }>;
+    params: { paths: string[]; chat_id?: number; caption?: string },
+  ) => Promise<{ details: { paths: string[]; chatId?: number } }>;
+};
+
+type RegisteredAnyTool = {
+  name?: string;
+  execute: (toolCallId: string, params: Record<string, unknown>) => Promise<unknown>;
 };
 
 test("Outbound attachment byte-limit helpers own the outbound file default", () => {
@@ -91,6 +97,109 @@ test("Outbound attachment tool registration delegates queueing", async () => {
   ]);
   assert.deepEqual(result.details.paths, ["/tmp/report.md"]);
 });
+
+test("Outbound attachment tool sends immediately when no Telegram turn is active", async () => {
+  let tool: RegisteredAttachmentTool | undefined;
+  const sent: string[] = [];
+  const api = {
+    registerTool: (definition: RegisteredAttachmentTool) => {
+      tool = definition;
+    },
+  } as unknown as ExtensionAPI;
+  registerTelegramOutboundAttachmentTool(api, {
+    maxAttachmentsPerTurn: 2,
+    getActiveTurn: () => undefined,
+    getDefaultChatId: () => 77,
+    canSendDirect: () => true,
+    sendMultipart: async (method, fields, fileField, _filePath, fileName) => {
+      sent.push(`${method}:${fields.chat_id}:${fields.caption}:${fileField}:${fileName}`);
+    },
+    statPath: async () => ({ isFile: () => true, size: 1 }),
+  });
+  const result = await tool?.execute("tool-call", {
+    paths: ["/tmp/report.md"],
+    caption: "done",
+  });
+  assert.deepEqual(sent, ["sendDocument:77:done:document:report.md"]);
+  assert.deepEqual(result?.details, { paths: ["/tmp/report.md"], chatId: 77 });
+});
+
+test("Outbound message tool sends direct Telegram markdown with parsed buttons", async () => {
+  const tools = new Map<string, RegisteredAnyTool>();
+  const sent: Array<{ chatId: number; markdown: string; replyMarkup?: unknown }> = [];
+  const api = {
+    registerTool: (definition: RegisteredAnyTool) => {
+      if (definition.name) tools.set(definition.name, definition);
+    },
+  } as unknown as ExtensionAPI;
+  registerTelegramOutboundMessageTool(api, {
+    getDefaultChatId: () => 7,
+    canSendDirect: () => true,
+    planMessage: (markdown) => ({
+      markdown: markdown.replace(/<!-- telegram_button: Continue -->/, "").trim(),
+      replyMarkup: {
+        inline_keyboard: [
+          [{ text: "Continue", callback_data: "button:1" }],
+        ],
+      },
+    }),
+    sendMarkdownMessage: async (chatId, markdown, options) => {
+      sent.push({ chatId, markdown, replyMarkup: options?.replyMarkup });
+      return 9;
+    },
+  });
+  await tools.get("telegram_message")?.execute("tool-call", {
+    text: "**hello**\n\n<!-- telegram_button: Continue -->",
+  });
+  assert.deepEqual(sent, [
+    {
+      chatId: 7,
+      markdown: "**hello**",
+      replyMarkup: {
+        inline_keyboard: [
+          [{ text: "Continue", callback_data: "button:1" }],
+        ],
+      },
+    },
+  ]);
+});
+
+test("Direct Telegram tools require local polling lock ownership", async () => {
+  await assert.rejects(
+    () =>
+      queueTelegramOutboundAttachments({
+        activeTurn: undefined,
+        paths: ["/tmp/report.md"],
+        maxAttachmentsPerTurn: 2,
+        sendMultipart: async () => undefined,
+        getDefaultChatId: () => 77,
+        canSendDirect: () => false,
+        statPath: async () => ({ isFile: () => true, size: 1 }),
+      }),
+    { message: /requires this π instance to own \/telegram-connect/ },
+  );
+  await assert.rejects(
+    () =>
+      toolsMessageWithoutOwnership(),
+    { message: /requires this π instance to own \/telegram-connect/ },
+  );
+});
+
+async function toolsMessageWithoutOwnership(): Promise<unknown> {
+  let tool: RegisteredAnyTool | undefined;
+  const api = {
+    registerTool: (definition: RegisteredAnyTool) => {
+      tool = definition;
+    },
+  } as unknown as ExtensionAPI;
+  registerTelegramOutboundMessageTool(api, {
+    getDefaultChatId: () => 7,
+    canSendDirect: () => false,
+    planMessage: (markdown) => ({ markdown }),
+    sendMarkdownMessage: async () => 9,
+  });
+  return tool?.execute("tool-call", { text: "hello" });
+}
 
 test("Outbound attachment queueing adds files to the active Telegram turn", async () => {
   const activeTurn = createAttachmentQueueTarget();

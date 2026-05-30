@@ -293,7 +293,7 @@ export interface TelegramStopCommandDeps {
   hasAbortHandler: () => boolean;
   clearPendingModelSwitch: () => void;
   clearQueuedTelegramItems: () => number;
-  setPreserveQueuedTurnsAsHistory: (preserve: boolean) => void;
+  setFoldQueuedPromptsIntoHistory: (fold: boolean) => void;
   abortCurrentTurn: () => void;
   updateStatus: () => void;
   sendTextReply: (text: string) => Promise<void>;
@@ -582,7 +582,7 @@ export interface TelegramCommandRuntimeDeps<
   clearPendingModelSwitch: () => void;
   hasQueuedTelegramItems: () => boolean;
   clearQueuedTelegramItems: (ctx: TContext) => number;
-  setPreserveQueuedTurnsAsHistory: (preserve: boolean) => void;
+  setFoldQueuedPromptsIntoHistory: (fold: boolean) => void;
   abortCurrentTurn: () => void;
   isIdle: (ctx: TContext) => boolean;
   hasPendingMessages: (ctx: TContext) => boolean;
@@ -727,7 +727,7 @@ export async function handleTelegramStopCommand(
 ): Promise<void> {
   deps.clearPendingModelSwitch();
   const clearedCount = deps.clearQueuedTelegramItems();
-  deps.setPreserveQueuedTurnsAsHistory(false);
+  deps.setFoldQueuedPromptsIntoHistory(false);
   if (!deps.hasAbortHandler()) {
     const clearedSuffix =
       clearedCount > 0
@@ -748,9 +748,10 @@ export async function handleTelegramStopCommand(
 
 export async function handleTelegramAbortCommand(deps: {
   hasAbortHandler: () => boolean;
+  hasActiveTelegramTurn: () => boolean;
   clearPendingModelSwitch: () => void;
   abortCurrentTurn: () => void;
-  setPreserveForIdle: () => void;
+  setFoldQueuedPromptsIntoHistory: (fold: boolean) => void;
   updateStatus: () => void;
   sendTextReply: (text: string) => Promise<void>;
 }): Promise<void> {
@@ -759,7 +760,7 @@ export async function handleTelegramAbortCommand(deps: {
     await deps.sendTextReply("No active turn.");
     return;
   }
-  deps.setPreserveForIdle();
+  deps.setFoldQueuedPromptsIntoHistory(deps.hasActiveTelegramTurn());
   deps.abortCurrentTurn();
   deps.updateStatus();
   await deps.sendTextReply("Aborted current turn.");
@@ -772,7 +773,7 @@ export async function handleTelegramNextCommand(deps: {
   clearPendingModelSwitch: () => void;
   abortCurrentTurn: () => void;
   dispatchNextQueuedTurn: () => void;
-  setPreserveForDispatch: () => void;
+  clearFoldForDispatch: () => void;
   updateStatus: () => void;
   sendTextReply: (text: string) => Promise<void>;
 }): Promise<void> {
@@ -782,7 +783,7 @@ export async function handleTelegramNextCommand(deps: {
     return;
   }
   if (!deps.isIdle() && deps.hasAbortHandler()) {
-    deps.setPreserveForDispatch();
+    deps.clearFoldForDispatch();
     deps.abortCurrentTurn();
     deps.updateStatus();
     await deps.sendTextReply(
@@ -1070,7 +1071,7 @@ export function createTelegramCommandHandlerTargetRuntime<
     clearPendingModelSwitch: deps.clearPendingModelSwitch,
     hasQueuedTelegramItems: deps.hasQueuedTelegramItems,
     clearQueuedTelegramItems: deps.clearQueuedTelegramItems,
-    setPreserveQueuedTurnsAsHistory: deps.setPreserveQueuedTurnsAsHistory,
+    setFoldQueuedPromptsIntoHistory: deps.setFoldQueuedPromptsIntoHistory,
     abortCurrentTurn: deps.abortCurrentTurn,
     isIdle: deps.isIdle,
     hasPendingMessages: deps.hasPendingMessages,
@@ -1177,7 +1178,7 @@ async function handleTelegramCommandRuntime<
           clearPendingModelSwitch: deps.clearPendingModelSwitch,
           clearQueuedTelegramItems: () =>
             deps.clearQueuedTelegramItems(commandCtx),
-          setPreserveQueuedTurnsAsHistory: deps.setPreserveQueuedTurnsAsHistory,
+          setFoldQueuedPromptsIntoHistory: deps.setFoldQueuedPromptsIntoHistory,
           abortCurrentTurn: deps.abortCurrentTurn,
           updateStatus: updateStatusFor(commandCtx),
           sendTextReply: sendReplyFor(nextMessage),
@@ -1186,9 +1187,10 @@ async function handleTelegramCommandRuntime<
       handleAbort: async (nextMessage, commandCtx) => {
         await handleTelegramAbortCommand({
           hasAbortHandler: deps.hasAbortHandler,
+          hasActiveTelegramTurn: deps.hasActiveTelegramTurn,
           clearPendingModelSwitch: deps.clearPendingModelSwitch,
           abortCurrentTurn: deps.abortCurrentTurn,
-          setPreserveForIdle: () => deps.setPreserveQueuedTurnsAsHistory(true),
+          setFoldQueuedPromptsIntoHistory: deps.setFoldQueuedPromptsIntoHistory,
           updateStatus: updateStatusFor(commandCtx),
           sendTextReply: sendReplyFor(nextMessage),
         });
@@ -1202,8 +1204,8 @@ async function handleTelegramCommandRuntime<
           abortCurrentTurn: deps.abortCurrentTurn,
           dispatchNextQueuedTurn: () =>
             deps.dispatchNextQueuedTelegramTurn(commandCtx),
-          setPreserveForDispatch: () =>
-            deps.setPreserveQueuedTurnsAsHistory(false),
+          clearFoldForDispatch: () =>
+            deps.setFoldQueuedPromptsIntoHistory(false),
           updateStatus: updateStatusFor(commandCtx),
           sendTextReply: sendReplyFor(nextMessage),
         });

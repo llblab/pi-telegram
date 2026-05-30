@@ -10,6 +10,7 @@ import {
   buildCommandTemplateInvocation,
   execCommandTemplate,
   expandCommandTemplateConfigs,
+  getCommandTemplateRiskLabels,
   getCommandTemplateWarnings,
   shouldRunCommandTemplateNode,
   splitCommandTemplate,
@@ -143,17 +144,26 @@ test("Command template repeat expands numbered defaults", () => {
 });
 
 test("Command templates detect high-risk trusted executable shapes", () => {
-  const warnings = getCommandTemplateWarnings({
+  const config = {
     template: [
       "bash -c {script}",
       "node -e {code}",
       "rm -rf {work_dir}",
+      "npm publish",
     ],
-  });
+  };
+  const warnings = getCommandTemplateWarnings(config);
   assert.equal(warnings.length, 3);
   assert.match(warnings[0], /bash/);
   assert.match(warnings[1], /eval/);
   assert.match(warnings[2], /removes filesystem paths/);
+  assert.deepEqual(getCommandTemplateRiskLabels(config), [
+    "risk.shell",
+    "risk.eval",
+    "risk.destructive_fs",
+    "risk.external_side_effect",
+    "risk.network",
+  ]);
 });
 
 test("Command templates resolve typed inline placeholders", () => {

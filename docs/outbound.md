@@ -2,7 +2,7 @@
 
 `pi-telegram` maps hidden assistant-authored HTML comments to Telegram-native outbound actions.
 
-This is intentionally prompt-driven: the agent writes normal Markdown plus small hidden top-level blocks, and the bridge performs the transport work after `agent_end`. `telegram_voice` and `telegram_button` are not π tools. Outbound behavior is an emergent result of the assistant prompt, text command-template handlers, registered voice synthesis providers, generated artifacts, and reply delivery. That avoids extra agent-side tool calls, avoids fragile parameter plumbing inside the conversation, and minimizes latency because text, voice, and buttons are planned in one standard assistant reply.
+Normal Telegram-turn replies are intentionally prompt-driven: the agent writes Markdown plus small hidden top-level blocks, and the bridge performs transport after `agent_end`. `telegram_voice` and `telegram_button` are not π tools. For local/TUI-initiated work where the user explicitly asks to send something to Telegram, the bridge also exposes direct tools: `telegram_message` for Markdown text and `telegram_attach` for file delivery when no Telegram turn is active. Direct local/TUI delivery requires this π instance to own `/telegram-connect`; if polling/control ownership moved elsewhere, the tools fail instead of bypassing the singleton lock. Outbound behavior combines assistant prompt markup, text command-template handlers, registered voice synthesis providers, generated artifacts, direct Telegram tools, and reply delivery. Direct `telegram_message` text is planned through the same reply markup path, so embedded top-level `telegram_button` comments become buttons attached to that text message.
 
 Text handlers use the portable [Command Template Standard](./command-templates.md). Programmatic outbound handlers use `registerTelegramOutboundHandler(kind, handler)`. Voice replies can use configured command-template handlers or the provider API described in [Voice Integration](./voice.md).
 
@@ -121,10 +121,12 @@ Rules:
 - `telegram_button: Label` creates one independent label-only button row whose prompt equals the label.
 - `telegram_button label="Label" prompt="Prompt"` creates one independent button row whose prompt is the `prompt` attribute.
 - `telegram_button label="Label"` with a body creates one independent button row whose prompt is the block body.
-- The opening `<!-- telegram_button` marker must start at column zero on a top-level line outside fenced code, quotes, and lists; otherwise it is rendered as literal Markdown.
+- The opening `<!-- telegram_button` marker must start at column zero on a top-level line outside fenced code, quotes, lists, and indented examples; otherwise it is literal Markdown.
 - Keep the canonical body form as `<!-- telegram_button label="Label"` + body + `-->`; closed heads must use `prompt="..."` or the colon shorthand to create a button.
 - Use one block per button; this mirrors HTML's singular element model and avoids a nested button DSL inside comments.
 - Button actions are stored in memory with short `callback_data`; Telegram never sees the full prompt in the button payload.
+
+Do not emit JSON button specs, inline comments after visible text, standalone button actions, or tool calls for ordinary Telegram-turn buttons. The agent writes Markdown plus hidden comments; the bridge strips comments and attaches Telegram `reply_markup` after `agent_end`. For local/TUI-originated direct sends, put the same Markdown and `telegram_button` comments in `telegram_message(text)`.
 
 Buttons are built in and do not need a command template because they are pure Telegram reply markup plus callback routing.
 
@@ -135,6 +137,7 @@ The extension injects Telegram-specific system prompt guidance so agents know th
 - Write the full technical answer as normal Markdown.
 - Add `telegram_voice` when a Telegram-native voice message is useful; use body text, `text="..."`, or colon shorthand for the text to synthesize. A companion summary is optional, no specific summary format is required.
 - Add `telegram_button: ...` when label equals prompt, `telegram_button label="..." prompt="..."` for one-line prompts, or `telegram_button label="..."` with a body for multiline prompts. If the reply contains only button/voice comment blocks, add a short visible marker (for example `Choose one:`) before them so Telegram always has a visible parent message for attachment.
-- Do not call Telegram transport tools for voice or buttons; the bridge owns delivery, while registered voice synthesis providers own TTS and OGG/Opus conversion.
+- For ordinary Telegram-turn replies, do not call transport tools for voice or buttons; the bridge owns delivery, while registered voice synthesis providers own TTS and OGG/Opus conversion. For explicit local/TUI direct sends, `telegram_message` may include top-level `telegram_button` comments in its Markdown text because those buttons are attached to that text message.
+- Never send buttons without visible parent text. If the answer would contain only hidden comments, add a compact line such as `Choose one:` first.
 
 This keeps the agent focused on semantics and lets the bridge handle low-latency Telegram adaptation.

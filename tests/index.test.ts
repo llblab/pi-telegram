@@ -24,7 +24,7 @@ type RegisteredIndexHandler = (
 ) => Promise<unknown> | unknown;
 
 function createIndexApiHarness() {
-  let tool: RegisteredIndexTool | undefined;
+  const tools = new Map<string, RegisteredIndexTool>();
   const commands = new Map<string, RegisteredIndexCommand>();
   const handlers = new Map<string, RegisteredIndexHandler>();
   const api = {
@@ -32,13 +32,13 @@ function createIndexApiHarness() {
       handlers.set(event, handler);
     },
     registerTool: (definition: RegisteredIndexTool) => {
-      tool = definition;
+      if (definition.name) tools.set(definition.name, definition);
     },
     registerCommand: (name: string, definition: RegisteredIndexCommand) => {
       commands.set(name, definition);
     },
   } as unknown as ExtensionAPI;
-  return { tool: () => tool, commands, handlers, api };
+  return { tools, commands, handlers, api };
 }
 
 function getRequiredIndexHandler(
@@ -68,7 +68,10 @@ test("Extension entrypoint exposes only the default composition root", () => {
 test("Extension entrypoint wires domain bindings into the pi API", () => {
   const harness = createIndexApiHarness();
   telegramExtension(harness.api);
-  assert.equal(harness.tool()?.name, "telegram_attach");
+  assert.deepEqual([...harness.tools.keys()], [
+    "telegram_attach",
+    "telegram_message",
+  ]);
   assert.deepEqual(
     [...harness.commands.keys()],
     [

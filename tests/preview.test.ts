@@ -786,7 +786,7 @@ test("Preview runtime can still use and clear plain draft previews", async () =>
   assert.equal(harness.getState(), undefined);
 });
 
-test("Preview runtime clears without sending when Telegram lock moved away", async () => {
+test("Preview runtime optional send gate clears without sending", async () => {
   const timer = setTimeout(() => {}, 1000);
   const harness = createPreviewRuntimeHarness({
     mode: "draft",

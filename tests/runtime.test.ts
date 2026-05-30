@@ -254,7 +254,7 @@ test("Runtime facade binds grouped operations to one bridge state", () => {
   runtime.lifecycle.setDispatchPending(true);
   runtime.lifecycle.setCompactionInProgress(true);
   runtime.lifecycle.setActiveToolExecutions(3);
-  runtime.lifecycle.setPreserveQueuedTurnsAsHistory(true);
+  runtime.lifecycle.setFoldQueuedPromptsIntoHistory(true);
   assert.equal(runtime.lifecycle.hasDispatchPending(), true);
   assert.equal(runtime.lifecycle.isCompactionInProgress(), true);
   assert.equal(runtime.lifecycle.getActiveToolExecutions(), 3);
@@ -262,7 +262,7 @@ test("Runtime facade binds grouped operations to one bridge state", () => {
   runtime.lifecycle.resetActiveToolExecutions();
   assert.equal(runtime.lifecycle.hasDispatchPending(), false);
   assert.equal(runtime.lifecycle.getActiveToolExecutions(), 0);
-  assert.equal(runtime.lifecycle.shouldPreserveQueuedTurnsAsHistory(), true);
+  assert.equal(runtime.lifecycle.shouldFoldQueuedPromptsIntoHistory(), true);
   assert.equal(runtime.setup.start(), true);
   assert.equal(runtime.setup.isInProgress(), true);
   runtime.setup.finish();
@@ -297,24 +297,24 @@ test("Runtime state helpers allocate queue order and manage typing loops", async
   assert.equal(Runtime.hasTelegramDispatchPending(state), false);
   assert.equal(Runtime.isTelegramCompactionInProgress(state), false);
   assert.equal(Runtime.getActiveTelegramToolExecutions(state), 0);
-  assert.equal(Runtime.shouldPreserveQueuedTurnsAsHistory(state), false);
+  assert.equal(Runtime.shouldFoldQueuedPromptsIntoHistory(state), false);
   Runtime.syncTelegramLifecycleRuntimeFlags(state, {
     activeTelegramToolExecutions: 2,
     telegramTurnDispatchPending: true,
     compactionInProgress: true,
-    preserveQueuedTurnsAsHistory: true,
+    foldQueuedPromptsIntoHistory: true,
   });
   assert.equal(Runtime.hasTelegramDispatchPending(state), true);
   assert.equal(Runtime.isTelegramCompactionInProgress(state), true);
   assert.equal(Runtime.getActiveTelegramToolExecutions(state), 2);
-  assert.equal(Runtime.shouldPreserveQueuedTurnsAsHistory(state), true);
+  assert.equal(Runtime.shouldFoldQueuedPromptsIntoHistory(state), true);
   Runtime.clearTelegramDispatchPending(state);
   Runtime.setTelegramCompactionInProgress(state, false);
   Runtime.resetActiveTelegramToolExecutions(state);
   assert.equal(Runtime.hasTelegramDispatchPending(state), false);
   assert.equal(Runtime.getActiveTelegramToolExecutions(state), 0);
   Runtime.setActiveTelegramToolExecutions(state, 1);
-  Runtime.setPreserveQueuedTurnsAsHistory(state, false);
+  Runtime.setFoldQueuedPromptsIntoHistory(state, false);
   assert.equal(Runtime.startTelegramSetup(state), true);
   assert.equal(Runtime.startTelegramSetup(state), false);
   assert.equal(Runtime.isTelegramSetupInProgress(state), true);
@@ -335,7 +335,7 @@ test("Runtime state helpers allocate queue order and manage typing loops", async
   assert.equal(Runtime.hasTelegramDispatchPending(state), false);
   assert.equal(Runtime.isTelegramCompactionInProgress(state), false);
   assert.equal(Runtime.getActiveTelegramToolExecutions(state), 1);
-  assert.equal(Runtime.shouldPreserveQueuedTurnsAsHistory(state), false);
+  assert.equal(Runtime.shouldFoldQueuedPromptsIntoHistory(state), false);
   const typingActions: number[] = [];
   assert.equal(
     Runtime.startTelegramTypingLoop(state, {
@@ -369,8 +369,19 @@ test("Runtime state helpers allocate queue order and manage typing loops", async
     }),
     false,
   );
+  assert.deepEqual(typingActions, [42]);
   assert.equal(Runtime.stopTelegramTypingLoop(state), true);
   assert.equal(Runtime.stopTelegramTypingLoop(state), false);
+});
+
+test("Typing loop idle wait is bounded for slow in-flight chat actions", async () => {
+  const state = Runtime.createTelegramBridgeRuntimeState();
+  state.typingInFlight = new Promise(() => {});
+  const startedAt = Date.now();
+
+  await Runtime.waitForTelegramTypingLoopIdle(state, 1);
+
+  assert.ok(Date.now() - startedAt < 100);
 });
 
 async function waitForCondition(
@@ -521,6 +532,7 @@ test("Typing loop starter uses a conservative native keepalive interval", () => 
         return true;
       },
       stop: () => true,
+      waitForIdle: async () => {},
     },
     getDefaultChatId: () => 7,
     sendTypingAction: async () => {},
@@ -529,7 +541,7 @@ test("Typing loop starter uses a conservative native keepalive interval", () => 
 
   startTypingLoop({ id: "ctx" });
 
-  assert.equal(capturedIntervalMs, 2500);
+  assert.equal(capturedIntervalMs, 3000);
 });
 
 test("Typing loop starter binds default chat and reports failures", async () => {
@@ -687,7 +699,7 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
   }
 });
 
-test("Extension runtime finalizes a drafted preview into the final Telegram reply on agent end", async () => {
+test("Extension runtime finalizes queued turn after polling ownership moves away", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   let resolveDispatch: (() => void) | undefined;
   const dispatched = new Promise<void>((resolve) => {
@@ -760,6 +772,22 @@ test("Extension runtime finalizes a drafted preview into the final Telegram repl
     await commands.get("telegram-connect")?.handler("", ctx);
     await dispatched;
     await handlers.get("agent_start")?.({}, ctx);
+    await writeFile(
+      join(await ensureRuntimeAgentDir(), "locks.json"),
+      JSON.stringify(
+        {
+          "@llblab/pi-telegram": {
+            pid: process.pid + 1_000_000,
+            cwd: "/tmp/other-pi-instance",
+          },
+        },
+        null,
+        "\t",
+      ) + "\n",
+      "utf8",
+    );
+    mock.timers.tick(1100);
+    await flushMicrotasks(20);
     await handlers.get("message_update")?.(
       {
         message: {

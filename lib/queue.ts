@@ -242,12 +242,12 @@ export function partitionTelegramQueueItemsForHistory<TContext = unknown>(
 
 export function planTelegramPromptEnqueue<TContext = unknown>(
   items: TelegramQueueItem<TContext>[],
-  preserveQueuedTurnsAsHistory: boolean,
+  foldQueuedPromptsIntoHistory: boolean,
 ): {
   historyTurns: PendingTelegramTurn[];
   remainingItems: TelegramQueueItem<TContext>[];
 } {
-  if (!preserveQueuedTurnsAsHistory) {
+  if (!foldQueuedPromptsIntoHistory) {
     return { historyTurns: [], remainingItems: items };
   }
   return partitionTelegramQueueItemsForHistory(items);
@@ -512,11 +512,11 @@ export function planNextTelegramQueueAction<TContext = unknown>(
 export function shouldDispatchAfterTelegramAgentEnd(options: {
   hasTurn: boolean;
   stopReason?: string;
-  preserveQueuedTurnsAsHistory: boolean;
+  foldQueuedPromptsIntoHistory: boolean;
 }): boolean {
   if (!options.hasTurn) return true;
   if (options.stopReason === "aborted") {
-    return !options.preserveQueuedTurnsAsHistory;
+    return !options.foldQueuedPromptsIntoHistory;
   }
   return true;
 }
@@ -529,6 +529,7 @@ export interface TelegramAgentStartPlan<TContext = unknown> {
   shouldResetPendingModelSwitch: boolean;
   shouldResetToolExecutions: boolean;
   shouldClearDispatchPending: boolean;
+  shouldClearAbortHistory: boolean;
 }
 
 export interface TelegramAgentStartRuntimeDeps<
@@ -542,6 +543,7 @@ export interface TelegramAgentStartRuntimeDeps<
   resetPendingModelSwitch: () => void;
   setQueuedItems: (items: TelegramQueueItem<TContext>[]) => void;
   clearDispatchPending: () => void;
+  setFoldQueuedPromptsIntoHistory: (fold: boolean) => void;
   setActiveTurn: (turn: TTurn) => void;
   createPreviewState: () => void;
   startTypingLoop: () => void;
@@ -560,6 +562,7 @@ export interface TelegramAgentStartHookRuntimeDeps<
   resetPendingModelSwitch: () => void;
   setQueuedItems: (items: TelegramQueueItem<TContext>[]) => void;
   clearDispatchPending: () => void;
+  setFoldQueuedPromptsIntoHistory: (fold: boolean) => void;
   setActiveTurn: (turn: TTurn) => void;
   createPreviewState: () => void;
   startTypingLoop: (ctx: TContext) => void;
@@ -598,6 +601,8 @@ export function buildTelegramAgentStartPlan<TContext = unknown>(options: {
       shouldResetPendingModelSwitch: true,
       shouldResetToolExecutions: true,
       shouldClearDispatchPending: options.hasPendingDispatch,
+      shouldClearAbortHistory:
+        !options.hasActiveTurn && !options.hasPendingDispatch,
     };
   }
   const nextDispatch = consumeDispatchedTelegramPrompt(
@@ -610,6 +615,7 @@ export function buildTelegramAgentStartPlan<TContext = unknown>(options: {
     shouldResetPendingModelSwitch: true,
     shouldResetToolExecutions: true,
     shouldClearDispatchPending: options.hasPendingDispatch,
+    shouldClearAbortHistory: false,
   };
 }
 
@@ -624,6 +630,9 @@ export function handleTelegramAgentStartRuntime<
   });
   if (startPlan.shouldResetToolExecutions) deps.resetToolExecutions();
   if (startPlan.shouldResetPendingModelSwitch) deps.resetPendingModelSwitch();
+  if (startPlan.shouldClearAbortHistory) {
+    deps.setFoldQueuedPromptsIntoHistory(false);
+  }
   deps.setQueuedItems(startPlan.remainingItems);
   if (startPlan.shouldClearDispatchPending) deps.clearDispatchPending();
   if (startPlan.activeTurn) {
@@ -651,6 +660,7 @@ export function createTelegramAgentStartHook<
       resetPendingModelSwitch: deps.resetPendingModelSwitch,
       setQueuedItems: deps.setQueuedItems,
       clearDispatchPending: deps.clearDispatchPending,
+      setFoldQueuedPromptsIntoHistory: deps.setFoldQueuedPromptsIntoHistory,
       setActiveTurn: deps.setActiveTurn,
       createPreviewState: deps.createPreviewState,
       startTypingLoop: () => deps.startTypingLoop(ctx),
@@ -791,10 +801,10 @@ export interface TelegramAgentEndRuntimeDeps<
 > {
   turn: TTurn | undefined;
   assistant: TelegramAgentEndAssistantResult;
-  preserveQueuedTurnsAsHistory: boolean;
+  foldQueuedPromptsIntoHistory: boolean;
   resetRuntimeState: () => void;
+  waitForTypingIdle?: () => Promise<void>;
   updateStatus: () => void;
-  isCurrentOwner?: () => boolean;
   dispatchNextQueuedTelegramTurn: () => void;
   clearPreview: (chatId: number) => Promise<void>;
   setPreviewPendingText: (text: string) => void;
@@ -849,10 +859,10 @@ export interface TelegramAgentEndHookRuntimeDeps<
   extractAssistant: (
     messages: readonly TMessage[],
   ) => TelegramAgentEndAssistantResult;
-  getPreserveQueuedTurnsAsHistory: () => boolean;
+  getFoldQueuedPromptsIntoHistory: () => boolean;
   resetRuntimeState: () => void;
+  waitForTypingIdle?: () => Promise<void>;
   updateStatus: (ctx: TContext) => void;
-  isCurrentOwner?: (ctx: TContext) => boolean;
   dispatchNextQueuedTelegramTurn: (ctx: TContext) => void;
   requestDeferredDispatchNextQueuedTelegramTurn: (
     dispatch: (ctx: TContext) => void,
@@ -890,12 +900,12 @@ export function buildTelegramAgentEndPlan(options: {
   stopReason?: string;
   hasFinalText: boolean;
   hasQueuedAttachments: boolean;
-  preserveQueuedTurnsAsHistory: boolean;
+  foldQueuedPromptsIntoHistory: boolean;
 }): TelegramAgentEndPlan {
   const shouldDispatchNext = shouldDispatchAfterTelegramAgentEnd({
     hasTurn: options.hasTurn,
     stopReason: options.stopReason,
-    preserveQueuedTurnsAsHistory: options.preserveQueuedTurnsAsHistory,
+    foldQueuedPromptsIntoHistory: options.foldQueuedPromptsIntoHistory,
   });
   if (!options.hasTurn) {
     return {
@@ -974,12 +984,10 @@ export function createTelegramAgentEndHook<
       turn,
       assistant:
         turn || proactiveEnabled ? deps.extractAssistant(event.messages) : {},
-      preserveQueuedTurnsAsHistory: deps.getPreserveQueuedTurnsAsHistory(),
+      foldQueuedPromptsIntoHistory: deps.getFoldQueuedPromptsIntoHistory(),
       resetRuntimeState: deps.resetRuntimeState,
+      waitForTypingIdle: deps.waitForTypingIdle,
       updateStatus: () => deps.updateStatus(ctx),
-      isCurrentOwner: deps.isCurrentOwner
-        ? () => deps.isCurrentOwner?.(ctx) ?? false
-        : undefined,
       dispatchNextQueuedTelegramTurn: () => {
         deps.requestDeferredDispatchNextQueuedTelegramTurn(
           deps.dispatchNextQueuedTelegramTurn,
@@ -1039,17 +1047,14 @@ export async function handleTelegramAgentEndRuntime<
     !!outboundReply?.voiceText || !!outboundReply?.voiceReplies?.length;
   const replyMarkup = outboundReply?.replyMarkup;
   deps.resetRuntimeState();
+  await deps.waitForTypingIdle?.();
   deps.updateStatus();
-  if (deps.isCurrentOwner && !deps.isCurrentOwner()) {
-    if (turn) await deps.clearPreview(turn.chatId);
-    return;
-  }
   const endPlan = buildTelegramAgentEndPlan({
     hasTurn: !!turn,
     stopReason: assistant.stopReason,
     hasFinalText: !!finalText || hasOutboundArtifacts,
     hasQueuedAttachments: (turn?.queuedAttachments.length ?? 0) > 0,
-    preserveQueuedTurnsAsHistory: deps.preserveQueuedTurnsAsHistory,
+    foldQueuedPromptsIntoHistory: deps.foldQueuedPromptsIntoHistory,
   });
   if (!turn) {
     if (
@@ -1072,10 +1077,6 @@ export async function handleTelegramAgentEndRuntime<
     return;
   }
   if (turn.guestQueryId) {
-    if (deps.isCurrentOwner && !deps.isCurrentOwner()) {
-      if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
-      return;
-    }
     if (assistant.errorMessage) {
       await deps.answerGuestQuery?.(
         turn.guestQueryId,
@@ -1199,7 +1200,7 @@ export interface TelegramSessionShutdownState<TQueueItem> {
   pendingTelegramModelSwitch: undefined;
   telegramTurnDispatchPending: boolean;
   compactionInProgress: boolean;
-  preserveQueuedTurnsAsHistory: boolean;
+  foldQueuedPromptsIntoHistory: boolean;
 }
 
 export interface TelegramSessionRuntimeCounterState {
@@ -1212,7 +1213,7 @@ export interface TelegramSessionRuntimeFlagState {
   activeTelegramToolExecutions?: number;
   telegramTurnDispatchPending?: boolean;
   compactionInProgress?: boolean;
-  preserveQueuedTurnsAsHistory?: boolean;
+  foldQueuedPromptsIntoHistory?: boolean;
 }
 
 export interface TelegramSessionStateApplierDeps<TQueueItem, TModel> {
@@ -1342,8 +1343,8 @@ export interface TelegramPromptEnqueueRuntimeDeps<
   TMessage,
   TContext = unknown,
 > extends TelegramQueueStore<TContext> {
-  getPreserveQueuedTurnsAsHistory: () => boolean;
-  setPreserveQueuedTurnsAsHistory: (preserve: boolean) => void;
+  getFoldQueuedPromptsIntoHistory: () => boolean;
+  setFoldQueuedPromptsIntoHistory: (fold: boolean) => void;
   createTurn: (
     messages: TMessage[],
     historyTurns: PendingTelegramTurn[],
@@ -1356,8 +1357,8 @@ export interface TelegramPromptEnqueueControllerDeps<
   TMessage,
   TContext = unknown,
 > extends TelegramQueueStore<TContext> {
-  getPreserveQueuedTurnsAsHistory: () => boolean;
-  setPreserveQueuedTurnsAsHistory: (preserve: boolean) => void;
+  getFoldQueuedPromptsIntoHistory: () => boolean;
+  setFoldQueuedPromptsIntoHistory: (fold: boolean) => void;
   createTurn: (
     messages: TMessage[],
     historyTurns: PendingTelegramTurn[],
@@ -1406,7 +1407,7 @@ export function buildTelegramSessionShutdownState<
     pendingTelegramModelSwitch: undefined,
     telegramTurnDispatchPending: false,
     compactionInProgress: false,
-    preserveQueuedTurnsAsHistory: false,
+    foldQueuedPromptsIntoHistory: false,
   };
 }
 
@@ -1654,9 +1655,9 @@ export async function enqueueTelegramPromptTurnRuntime<
 ): Promise<void> {
   const enqueuePlan = planTelegramPromptEnqueue(
     deps.getQueuedItems(),
-    deps.getPreserveQueuedTurnsAsHistory(),
+    deps.getFoldQueuedPromptsIntoHistory(),
   );
-  deps.setPreserveQueuedTurnsAsHistory(false);
+  deps.setFoldQueuedPromptsIntoHistory(false);
   const turn = await deps.createTurn(messages, enqueuePlan.historyTurns);
   deps.setQueuedItems(
     appendTelegramQueueItem(enqueuePlan.remainingItems, turn),

@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   createTelegramExtensionSectionRegistry,
   getTelegramExtensionSettingsRows,
+  getTelegramSectionMainMenuRows,
   parseTelegramSectionCallback,
   handleTelegramSectionOpen,
   handleTelegramSectionCallback,
@@ -123,10 +124,16 @@ test("Registry clear removes all sections and resets tokens", () => {
 test("Registry diagnostics reports active and error states", () => {
   const registry = createTelegramExtensionSectionRegistry();
   registry.register(stubSection("@test/a", "A"));
-  const diags = registry.getDiagnostics();
+  let diags = registry.getDiagnostics();
   assert.equal(diags.length, 1);
   assert.equal(diags[0].status, "active");
   assert.equal(diags[0].id, "@test/a");
+  registry.recordError("0", "boom");
+  diags = registry.getDiagnostics();
+  assert.equal(diags[0].status, "error");
+  assert.equal(diags[0].lastError, "boom");
+  registry.clearError("0");
+  assert.equal(registry.getDiagnostics()[0].status, "active");
 });
 
 // --- Settings Rows ---
@@ -164,6 +171,61 @@ test("getTelegramExtensionSettingsRows sorts by settings order", () => {
   const rows = getTelegramExtensionSettingsRows(registry);
   assert.equal(rows[0].label, "A");
   assert.equal(rows[1].label, "C");
+});
+
+// --- Menu Rows ---
+
+test("getTelegramSectionMainMenuRows omits sections with failing labels", () => {
+  const registry = createTelegramExtensionSectionRegistry();
+  registry.register(stubSection("@test/a", "A"));
+  registry.register(
+    stubSection("@test/b", "B", {
+      getLabel: () => {
+        throw new Error("label failed");
+      },
+    }),
+  );
+  const rows = getTelegramSectionMainMenuRows(registry);
+  assert.deepEqual(rows.map((row) => row.text), ["A"]);
+  const diagnostics = registry.getDiagnostics();
+  assert.equal(diagnostics[1].status, "error");
+  assert.equal(diagnostics[1].lastError, "label failed");
+});
+
+test("getTelegramExtensionSettingsRows omits settings with failing labels", () => {
+  const registry = createTelegramExtensionSectionRegistry();
+  registry.register(
+    stubSection("@test/a", "A", {
+      settings: { label: "A", open: async () => ({ text: "A" }) },
+    }),
+  );
+  registry.register(
+    stubSection("@test/b", "B", {
+      settings: {
+        label: "B",
+        getLabel: () => {
+          throw new Error("settings label failed");
+        },
+        open: async () => ({ text: "B" }),
+      },
+    }),
+  );
+  const rows = getTelegramExtensionSettingsRows(registry);
+  assert.deepEqual(rows.map((row) => row.label), ["A"]);
+  const diagnostics = registry.getDiagnostics();
+  assert.equal(diagnostics[1].status, "error");
+  assert.equal(diagnostics[1].lastError, "settings label failed");
+});
+
+test("successful labels do not clear unrelated runtime diagnostics", () => {
+  const registry = createTelegramExtensionSectionRegistry();
+  registry.register(stubSection("@test/a", "A"));
+  registry.recordError("0", "callback failed", "callback");
+  assert.equal(getTelegramSectionMainMenuRows(registry)[0].text, "A");
+  assert.equal(registry.getDiagnostics()[0].status, "error");
+  assert.equal(registry.getDiagnostics()[0].lastError, "callback failed");
+  registry.clearError("0", "callback");
+  assert.equal(registry.getDiagnostics()[0].status, "active");
 });
 
 // --- Callback Parsing ---
@@ -324,6 +386,25 @@ test("handleTelegramSectionOpen handles stale token gracefully", async () => {
   assert.ok(answeredText.includes("no longer available"));
 });
 
+test("handleTelegramSectionOpen records and clears render errors", async () => {
+  const registry = createTelegramExtensionSectionRegistry();
+  let fail = true;
+  registry.register(
+    stubSection("@test/a", "A", {
+      render: async () => {
+        if (fail) throw new Error("render failed");
+        return { text: "ok" };
+      },
+    }),
+  );
+  await handleTelegramSectionOpen(registry, "0", 123, 456, "cb-id", stubDeps());
+  assert.equal(registry.getDiagnostics()[0].status, "error");
+  assert.equal(registry.getDiagnostics()[0].lastError, "render failed");
+  fail = false;
+  await handleTelegramSectionOpen(registry, "0", 123, 456, "cb-id", stubDeps());
+  assert.equal(registry.getDiagnostics()[0].status, "active");
+});
+
 // --- Section Callback ---
 
 test("handleTelegramSectionCallback dispatches to section handler", async () => {
@@ -383,6 +464,43 @@ test("handleTelegramSectionCallback falls back to settings handler", async () =>
     deps,
   );
   assert.equal(settingsAction, "toggle");
+});
+
+test("handleTelegramSectionCallback gives settings-only handlers settings navigation", async () => {
+  const registry = createTelegramExtensionSectionRegistry();
+  registry.register(
+    stubSection("@test/a", "A", {
+      settings: {
+        label: "Settings",
+        open: async () => ({ text: "settings" }),
+        handleCallback: async (ctx) => {
+          await ctx.edit({ text: "settings detail" });
+          return "handled" as const;
+        },
+      },
+    }),
+  );
+  let editedMarkup: unknown;
+  const deps = stubDeps({
+    editInteractiveMessage: async (_chat, _message, _text, _mode, markup) => {
+      editedMarkup = markup;
+    },
+  });
+  await handleTelegramSectionCallback(
+    registry,
+    "0",
+    "toggle",
+    "off",
+    123,
+    456,
+    "cb-id",
+    deps,
+  );
+  const markup = editedMarkup as {
+    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  };
+  assert.equal(markup.inline_keyboard[0][0].text, "⬆️ Back");
+  assert.equal(markup.inline_keyboard[0][0].callback_data, "settings:list");
 });
 
 test("handleTelegramSectionCallback answers when no handler exists", async () => {

@@ -174,7 +174,7 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
     "[telegram] hello from telegram",
   );
   assert.deepEqual(events, ["status", "dispatch"]);
-  bridgeRuntime.lifecycle.setPreserveQueuedTurnsAsHistory(true);
+  bridgeRuntime.lifecycle.setFoldQueuedPromptsIntoHistory(true);
   await routeRuntime.handleUpdate(
     {
       message: {
@@ -208,7 +208,7 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
     "[telegram] hello from telegram",
   );
   assert.equal(
-    bridgeRuntime.lifecycle.shouldPreserveQueuedTurnsAsHistory(),
+    bridgeRuntime.lifecycle.shouldFoldQueuedPromptsIntoHistory(),
     false,
   );
   await routeRuntime.handleUpdate(

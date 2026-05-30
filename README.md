@@ -47,7 +47,7 @@ Paste your bot token when prompted. If a bot token is already saved in `~/.pi/ag
 /telegram-connect
 ```
 
-The adapter is session-local: only one π instance polls Telegram at a time. `/telegram-connect` records polling ownership in `~/.pi/agent/locks.json`; live ownership moves require confirmation, while `/new` and same-`cwd` process restarts resume automatically.
+The adapter is session-local: only one π instance polls Telegram at a time. `/telegram-connect` records only external control/polling ownership in `~/.pi/agent/locks.json`; live ownership moves require confirmation, while `/new` and same-`cwd` restarts resume automatically. Local queue and reply state stay per Pi instance, so an instance that loses Telegram control still finishes work it already accepted.
 
 ### 4. Pair your Telegram account
 
@@ -78,7 +78,7 @@ What it feels like:
 - Switch models from Telegram mid-run; the adapter schedules a safe continuation instead of tearing state apart.
 - Send a voice note; a configured inbound handler or registered STT provider transcribes it; π answers in the same chat.
 - Drop a screenshot and ask, "what is broken here?" The image payload reaches π with the local file context.
-- Ask for a generated file; when π calls `telegram_attach`, the artifact returns to Telegram with the next reply.
+- Ask for a generated file; when π calls `telegram_attach`, the artifact returns with the active Telegram reply or is sent directly to the paired/default chat from local work.
 
 ### Telegram controls
 
@@ -88,7 +88,7 @@ Use these inside the Telegram DM with your bot. The main entrypoint is `/start`:
 - **`/compact`**: Ask for inline confirmation, then start session compaction when the session is idle; Telegram shows the native typing indicator while manual or automatic compaction is running.
 - **`/next`**: Dispatch the next queued turn, aborting π first if needed.
 - **`/continue`**: Enqueue a priority `continue` prompt.
-- **`/abort`**: Abort the active run without touching the queue.
+- **`/abort`**: Abort the active run without touching the queue. Abort-history applies only to Telegram-owned active turns; later local prompts do not make the next Telegram prompt absorb older queue items.
 - **`/stop`**: Abort the active run and clear waiting Telegram queue items.
 
 Hidden compatibility shortcuts: `/help` and `/status` open the main application menu, `/model` opens model controls, `/thinking` opens reasoning controls, `/queue` opens queue controls, and `/settings` opens bridge settings.
@@ -108,7 +108,7 @@ Run these inside π, not Telegram:
 
 Send files or images directly to the bot. Inbound downloads are saved under `<agent-dir>/tmp/telegram` and default to a 50 MiB limit. The agent dir is `~/.pi/agent` unless `PI_CODING_AGENT_DIR` overrides it.
 
-If you ask π for a generated file, π can call the `telegram_attach` tool and the adapter sends the file with the next Telegram reply. Outbound attachments also default to a 50 MiB limit. Environment variables for both limits are listed in [Environment-only configuration](#environment-only-configuration).
+If you ask π for a generated file, π can call `telegram_attach`: during a Telegram-originated turn the adapter sends it with the next Telegram reply, and during local/TUI work it sends directly to the paired/default chat or explicit `chat_id`. Local work can also use `telegram_message` when you explicitly ask the agent to push a Markdown text message to Telegram; embedded `telegram_button` comments are parsed and attached to that message. Direct local/TUI delivery requires the current π instance to own `/telegram-connect`; if the lock belongs elsewhere, take over before sending. Outbound attachments default to a 50 MiB limit. Environment variables for both limits are listed in [Environment-only configuration](#environment-only-configuration).
 
 ## Core features
 
@@ -118,7 +118,7 @@ The inline application menu is the primary operator surface. It exposes status, 
 
 ### Queue runtime
 
-Messages sent while π is busy enter the prompt queue and are processed in order. Control actions and model-switch continuation turns use higher-priority lanes so operational commands can resume before normal prompts.
+Messages sent while π is busy enter the prompt queue and are processed in order. Control actions and model-switch continuation turns use higher-priority lanes. Queue processing and reply delivery stay local to the Pi instance that accepted the work, even if `/telegram-connect` later moves elsewhere.
 
 The menu is the primary way to inspect and mutate the queue. Reactions are an extra shortcut when Telegram delivers `message_reaction` updates for the chat. The same rules apply to text, voice, files, images, and media groups:
 
@@ -168,7 +168,7 @@ A practical voice setup is simple: Telegram `.ogg` arrives, STT runs locally or 
 
 ### Outbound handlers, voice synthesis providers, and buttons
 
-Assistant replies can include hidden outbound blocks. `telegram_voice` and `telegram_button` are not π tools; they are assistant-authored HTML comments that the adapter removes from Telegram text and handles after `agent_end`. Recognized blocks must start at column zero on a top-level line outside fenced code, quotes, and lists.
+Assistant replies can include hidden outbound blocks. `telegram_voice` and `telegram_button` are not π tools; they are assistant-authored HTML comments that the adapter removes from Telegram text and handles after `agent_end`. Recognized blocks must start at column zero on a top-level line outside fenced code, quotes, lists, and indented examples. Do not use JSON button specs, inline comments after visible text, or standalone button tool calls; write normal Markdown plus hidden comments, and add visible parent text if buttons would otherwise be the only output.
 
 ```md
 Full technical answer stays readable as text.

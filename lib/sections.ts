@@ -94,7 +94,7 @@ export interface TelegramSectionDiagnostic {
   id: TelegramSectionId;
   token: TelegramSectionToken;
   label: string;
-  status: "active" | "stale" | "error";
+  status: "active" | "error";
   lastError?: string;
 }
 
@@ -106,6 +106,12 @@ export interface TelegramSectionRegistry {
     token: TelegramSectionToken,
   ): RegisteredTelegramSection | undefined;
   getDiagnostics(): TelegramSectionDiagnostic[];
+  recordError(
+    token: TelegramSectionToken,
+    message: string,
+    source?: string,
+  ): void;
+  clearError(token: TelegramSectionToken, source?: string): void;
   clear(): void;
 }
 
@@ -299,6 +305,10 @@ function getUtf8ByteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
+function sectionErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function buildTelegramSectionCallbackData(
   token: TelegramSectionToken,
   action: string,
@@ -340,7 +350,10 @@ function prependBackRow(
 /** @internal */
 export function createTelegramExtensionSectionRegistry(): TelegramSectionRegistry {
   const sections = new Map<TelegramSectionToken, RegisteredTelegramSection>();
-  const errors = new Map<TelegramSectionToken, string>();
+  const errors = new Map<
+    TelegramSectionToken,
+    { message: string; source: string }
+  >();
   let nextToken = 0;
 
   function register(section: TelegramSectionRegistration): () => void {
@@ -382,8 +395,21 @@ export function createTelegramExtensionSectionRegistry(): TelegramSectionRegistr
       token: s.token,
       label: s.label,
       status: errors.has(s.token) ? "error" : "active",
-      lastError: errors.get(s.token),
+      lastError: errors.get(s.token)?.message,
     }));
+  }
+
+  function recordError(
+    token: TelegramSectionToken,
+    message: string,
+    source = "runtime",
+  ): void {
+    if (sections.has(token)) errors.set(token, { message, source });
+  }
+
+  function clearError(token: TelegramSectionToken, source?: string): void {
+    const current = errors.get(token);
+    if (!source || !current || current.source === source) errors.delete(token);
   }
 
   function clear(): void {
@@ -392,14 +418,23 @@ export function createTelegramExtensionSectionRegistry(): TelegramSectionRegistr
     nextToken = 0;
   }
 
-  return { register, getSections, getByToken, getDiagnostics, clear };
+  return {
+    register,
+    getSections,
+    getByToken,
+    getDiagnostics,
+    recordError,
+    clearError,
+    clear,
+  };
 }
 
 /** @internal */
 export function getTelegramExtensionSettingsRows(
   registry: TelegramSectionRegistry,
 ): TelegramSectionSettingsRow[] {
-  return registry
+  const rows: TelegramSectionSettingsRow[] = [];
+  for (const section of registry
     .getSections()
     .filter((s) => s.registration.settings)
     .sort((a, b) => {
@@ -407,22 +442,47 @@ export function getTelegramExtensionSettingsRows(
       const orderB = b.registration.settings!.order ?? 0;
       if (orderA !== orderB) return orderA - orderB;
       return a.id.localeCompare(b.id);
-    })
-    .map((s) => ({
-      label:
-        s.registration.settings!.getLabel?.() ?? s.registration.settings!.label,
-      callback_data: `section:${s.token}:settings:open`,
-    }));
+    })) {
+    try {
+      rows.push({
+        label:
+          section.registration.settings!.getLabel?.() ??
+          section.registration.settings!.label,
+        callback_data: `section:${section.token}:settings:open`,
+      });
+      registry.clearError(section.token, "settings_label");
+    } catch (error) {
+      registry.recordError(
+        section.token,
+        sectionErrorMessage(error),
+        "settings_label",
+      );
+    }
+  }
+  return rows;
 }
 
 /** @internal */
 export function getTelegramSectionMainMenuRows(
   registry: TelegramSectionRegistry,
 ): TelegramSectionMainMenuRow[] {
-  return registry.getSections().map((s) => ({
-    text: s.registration.getLabel?.() ?? s.label,
-    callback_data: `section:${s.token}:open`,
-  }));
+  const rows: TelegramSectionMainMenuRow[] = [];
+  for (const section of registry.getSections()) {
+    try {
+      rows.push({
+        text: section.registration.getLabel?.() ?? section.label,
+        callback_data: `section:${section.token}:open`,
+      });
+      registry.clearError(section.token, "main_label");
+    } catch (error) {
+      registry.recordError(
+        section.token,
+        sectionErrorMessage(error),
+        "main_label",
+      );
+    }
+  }
+  return rows;
 }
 
 /** @internal */
@@ -508,9 +568,11 @@ export async function handleTelegramSectionOpen(
       viewWithBack.replyMarkup,
     );
     await deps.answerCallbackQuery(callbackQueryId);
+    registry.clearError(token, "render");
     return true;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = sectionErrorMessage(error);
+    registry.recordError(token, message, "render");
     await deps.answerCallbackQuery(
       callbackQueryId,
       `Section error: ${message}`,
@@ -537,10 +599,10 @@ export async function handleTelegramSectionCallback(
     );
     return true;
   }
-  // Try main handleCallback first, then settings handleCallback as fallback
-  const handler =
-    section.registration.handleCallback ??
-    section.registration.settings?.handleCallback;
+  // Try main handleCallback first, then settings handleCallback as fallback.
+  const mainHandler = section.registration.handleCallback;
+  const settingsHandler = section.registration.settings?.handleCallback;
+  const handler = mainHandler ?? settingsHandler;
   if (!handler) {
     await deps.answerCallbackQuery(callbackQueryId);
     return true;
@@ -555,16 +617,12 @@ export async function handleTelegramSectionCallback(
       payload,
       callbackQueryId,
       deps,
-      `section:${token}:open`,
+      mainHandler ? `section:${token}:open` : "settings:list",
     );
     let result = await handler(ctx);
     // Fallback: if main handler passed and settings handler exists, try settings
-    // with the correct navigation context (back → settings list)
-    if (
-      result === "pass" &&
-      handler !== section.registration.settings?.handleCallback &&
-      section.registration.settings?.handleCallback
-    ) {
+    // with the correct navigation context (back → settings list).
+    if (result === "pass" && mainHandler && settingsHandler) {
       const settingsCtx = buildTelegramSectionCallbackContext(
         section.id,
         token,
@@ -576,14 +634,16 @@ export async function handleTelegramSectionCallback(
         deps,
         "settings:list",
       );
-      result = await section.registration.settings.handleCallback(settingsCtx);
+      result = await settingsHandler(settingsCtx);
     }
     if (result === "pass") {
       await deps.answerCallbackQuery(callbackQueryId);
     }
+    registry.clearError(token, "callback");
     return true;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = sectionErrorMessage(error);
+    registry.recordError(token, message, "callback");
     await deps.answerCallbackQuery(
       callbackQueryId,
       `Section error: ${message}`,
@@ -632,9 +692,11 @@ export async function handleTelegramSectionSettingsOpen(
       viewWithBack.replyMarkup,
     );
     await deps.answerCallbackQuery(callbackQueryId);
+    registry.clearError(token, "settings_open");
     return true;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = sectionErrorMessage(error);
+    registry.recordError(token, message, "settings_open");
     await deps.answerCallbackQuery(
       callbackQueryId,
       `Section error: ${message}`,
@@ -677,9 +739,11 @@ export async function handleTelegramSectionSettingsCallback(
     if (result === "pass") {
       await deps.answerCallbackQuery(callbackQueryId);
     }
+    registry.clearError(token, "settings_callback");
     return true;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = sectionErrorMessage(error);
+    registry.recordError(token, message, "settings_callback");
     await deps.answerCallbackQuery(
       callbackQueryId,
       `Section error: ${message}`,

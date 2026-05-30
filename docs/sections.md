@@ -157,7 +157,7 @@ Section rows are injected **before the ⚙️ Settings row**. Ordered by `order`
 ⚙️ Settings
 ```
 
-Built-in core rows keep priority. Section errors do not break menu rendering — a failed section is omitted with a diagnostic entry.
+Built-in core rows keep priority. Section errors do not break menu rendering — a failed dynamic label is omitted with a diagnostic entry until a later label render succeeds.
 
 ### Settings submenu
 
@@ -222,7 +222,7 @@ If a section is unregistered or a token is unknown, the callback is answered wit
 
 > "This section is no longer available."
 
-Section errors are caught and surfaced as popup text. No unhandled exceptions leak to polling.
+Section render and callback errors are caught, surfaced as popup text, and stored in section diagnostics until the matching surface later succeeds. No unhandled exceptions leak to polling.
 
 ## 8. Navigation Hierarchy
 
@@ -397,12 +397,12 @@ interface TelegramSectionDiagnostic {
   id: string;
   token: string;
   label: string;
-  status: "active" | "stale" | "error";
+  status: "active" | "error";
   lastError?: string;
 }
 ```
 
-Available programmatically via `getTelegramSectionDiagnostics()`. Section runtime state is not shown in Telegram status text; sections should surface user-facing state through dynamic button labels and their own submenus.
+Available programmatically via `getTelegramSectionDiagnostics()`. Main-menu/settings dynamic label failures, section render failures, and callback failures set `status: "error"` with `lastError`; the entry returns to `active` only after the matching label render, section render, or callback succeeds for that token. Section runtime state is not shown in Telegram status text; sections should surface user-facing state through dynamic button labels and their own submenus.
 
 ## 13. Purpose and Non-Goals
 

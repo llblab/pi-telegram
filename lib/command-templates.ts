@@ -1,7 +1,7 @@
 /**
- * Command-template standard helpers
- * Zones: shared utils, local process execution, automation standard
- * Owns shell-free command-template splitting, placeholder defaults, composition expansion, executable path expansion, and direct execution
+ * Command-template execution standard.
+ * Zones: shell-free command parsing, placeholder expansion, local process execution, composition semantics
+ * Owns portable command-template parsing, expansion, risk checks, retries, timeouts, and direct execution.
  */
 
 import { spawn } from "node:child_process";
@@ -10,7 +10,16 @@ import { isAbsolute, resolve } from "node:path";
 
 export type CommandTemplateFailureScope = "continue" | "branch" | "root";
 
+export interface CommandTemplateActorRecipeContext {
+  alias?: string;
+  file?: string;
+  name?: string;
+  path?: string;
+  role?: string;
+}
+
 export interface CommandTemplateObjectConfig {
+  actorRecipeContext?: CommandTemplateActorRecipeContext;
   label?: string;
   parallel?: boolean;
   when?: boolean | string;
@@ -57,6 +66,29 @@ export interface CommandTemplateExecResult {
   code: number;
   killed: boolean;
 }
+
+export type CommandTemplateRiskLabel =
+  | "risk.shell"
+  | "risk.eval"
+  | "risk.broad_fs_write"
+  | "risk.destructive_fs"
+  | "risk.network"
+  | "risk.external_side_effect"
+  | "risk.long_running"
+  | "risk.platform_specific"
+  | "risk.secret_touching";
+
+const COMMAND_TEMPLATE_RISK_LABEL_ORDER: CommandTemplateRiskLabel[] = [
+  "risk.shell",
+  "risk.eval",
+  "risk.destructive_fs",
+  "risk.broad_fs_write",
+  "risk.external_side_effect",
+  "risk.secret_touching",
+  "risk.network",
+  "risk.long_running",
+  "risk.platform_specific",
+];
 
 export type CommandTemplateExecCommand = (
   command: string,
@@ -148,8 +180,15 @@ function getExecutableName(command: string | undefined): string {
   return command.split(/[\\/]/).pop()?.toLowerCase() ?? "";
 }
 
+function matchesFlag(arg: string, flag: string): boolean {
+  if (arg === flag) return true;
+  if (/^-[A-Za-z]$/.test(flag) && /^-[A-Za-z]+$/.test(arg))
+    return arg.slice(1).includes(flag.slice(1));
+  return false;
+}
+
 function hasAnyFlag(args: string[], flags: string[]): boolean {
-  return args.some((arg) => flags.includes(arg));
+  return args.some((arg) => flags.some((flag) => matchesFlag(arg, flag)));
 }
 
 function hasRiskyPathArg(args: string[]): boolean {
@@ -165,6 +204,97 @@ function hasRiskyPathArg(args: string[]): boolean {
   );
 }
 
+function sortRiskLabels(
+  labels: Iterable<CommandTemplateRiskLabel>,
+): CommandTemplateRiskLabel[] {
+  const unique = new Set(labels);
+  return COMMAND_TEMPLATE_RISK_LABEL_ORDER.filter((label) => unique.has(label));
+}
+
+function hasAnyArg(args: string[], values: string[]): boolean {
+  return args.some((arg) => values.includes(arg.toLowerCase()));
+}
+
+function hasSecretTouchingText(parts: string[]): boolean {
+  return parts.some((part) =>
+    /(^|[{}._\-\s/])(?:secret|token|password|passwd|credential|api[_-]?key|private[_-]?key|\.env|ssh[_-]?key)(?:[{}._\-\s/]|$)/i.test(
+      part,
+    ),
+  );
+}
+
+function getLeafCommandTemplateRiskLabels(
+  config: CommandTemplateLeafConfig,
+): CommandTemplateRiskLabel[] {
+  const parts = splitCommandTemplate(config.template);
+  const command = getExecutableName(parts[0]);
+  const args = parts.slice(1);
+  const labels = new Set<CommandTemplateRiskLabel>();
+  if (["bash", "sh", "zsh", "fish"].includes(command)) {
+    labels.add("risk.shell");
+    if (hasAnyFlag(args, ["-c"])) labels.add("risk.eval");
+  }
+  if (
+    ["node", "deno", "bun"].includes(command) &&
+    hasAnyFlag(args, ["-e", "--eval"])
+  ) {
+    labels.add("risk.eval");
+  }
+  if (
+    ["python", "python3", "perl", "ruby"].includes(command) &&
+    hasAnyFlag(args, ["-c", "-e"])
+  ) {
+    labels.add("risk.eval");
+  }
+  if (
+    command === "rm" &&
+    (args.some((arg) => /^-[^-]*r/.test(arg) || /^-[^-]*f/.test(arg)) ||
+      hasRiskyPathArg(args))
+  ) {
+    labels.add("risk.destructive_fs");
+  }
+  if (["mv", "cp", "rsync"].includes(command) && hasRiskyPathArg(args)) {
+    labels.add("risk.broad_fs_write");
+  }
+  if (
+    ["curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "telnet", "ftp"].includes(
+      command,
+    ) ||
+    (command === "git" &&
+      hasAnyArg(args, ["clone", "fetch", "pull", "push", "ls-remote"])) ||
+    ["npm", "pnpm", "yarn", "pip", "cargo"].includes(command)
+  ) {
+    labels.add("risk.network");
+  }
+  if (
+    ["gh", "glab", "hub", "kubectl", "terraform"].includes(command) ||
+    (command === "git" && hasAnyArg(args, ["push"])) ||
+    (["npm", "pnpm", "yarn"].includes(command) &&
+      hasAnyArg(args, ["publish", "login", "logout", "deprecate"]))
+  ) {
+    labels.add("risk.external_side_effect");
+  }
+  if (
+    command === "sleep" ||
+    command === "watch" ||
+    (command === "tail" && hasAnyFlag(args, ["-f"])) ||
+    hasAnyArg(args, ["--watch", "--serve", "serve"])
+  ) {
+    labels.add("risk.long_running");
+  }
+  if (
+    ["systemctl", "launchctl", "osascript", "open", "xdg-open", "powershell", "pwsh", "cmd.exe", "apt", "apt-get", "dnf", "yum", "brew", "pacman", "apk", "xclip", "wl-copy"].includes(
+      command,
+    )
+  ) {
+    labels.add("risk.platform_specific");
+  }
+  if (["pass", "gpg", "ssh-add"].includes(command) || hasSecretTouchingText(parts)) {
+    labels.add("risk.secret_touching");
+  }
+  return sortRiskLabels(labels);
+}
+
 function getLeafCommandTemplateWarnings(
   config: CommandTemplateLeafConfig,
 ): string[] {
@@ -177,7 +307,7 @@ function getLeafCommandTemplateWarnings(
       ? "shell command strings"
       : "shell scripts";
     warnings.push(
-      `${config.label ?? command}: invokes ${command}; ${shellContent} are trusted executable content and are not sandboxed by command-template argv splitting.`,
+      `${config.label ?? command}: invokes ${command}; ${shellContent} are trusted executable content and are not sandboxed by command-template argv splitting. Mitigation: keep scripts local, reviewed, and parameterized with explicit placeholders.`,
     );
   }
   if (
@@ -185,7 +315,7 @@ function getLeafCommandTemplateWarnings(
     hasAnyFlag(args, ["-e", "--eval"])
   ) {
     warnings.push(
-      `${config.label ?? command}: invokes ${command} eval mode; code strings are trusted executable content and are not sandboxed.`,
+      `${config.label ?? command}: invokes ${command} eval mode; code strings are trusted executable content and are not sandboxed. Mitigation: prefer a checked-in script file or keep eval input fixed and reviewed.`,
     );
   }
   if (
@@ -193,7 +323,7 @@ function getLeafCommandTemplateWarnings(
     hasAnyFlag(args, ["-c", "-e"])
   ) {
     warnings.push(
-      `${config.label ?? command}: invokes ${command} code-eval mode; code strings are trusted executable content and are not sandboxed.`,
+      `${config.label ?? command}: invokes ${command} code-eval mode; code strings are trusted executable content and are not sandboxed. Mitigation: prefer a checked-in script file or keep eval input fixed and reviewed.`,
     );
   }
   if (
@@ -202,12 +332,12 @@ function getLeafCommandTemplateWarnings(
       hasRiskyPathArg(args))
   ) {
     warnings.push(
-      `${config.label ?? command}: removes filesystem paths; verify placeholders and paths before running trusted destructive commands.`,
+      `${config.label ?? command}: removes filesystem paths; verify placeholders and paths before running trusted destructive commands. Mitigation: constrain path placeholders and consider dry-run or explicit confirmation.`,
     );
   }
   if (["mv", "cp", "rsync"].includes(command) && hasRiskyPathArg(args)) {
     warnings.push(
-      `${config.label ?? command}: mutates broad filesystem paths; verify placeholders and paths before running trusted commands.`,
+      `${config.label ?? command}: mutates broad filesystem paths; verify placeholders and paths before running trusted commands. Mitigation: constrain path placeholders and prefer narrow source/destination paths.`,
     );
   }
   return warnings;
@@ -329,6 +459,16 @@ export function getCommandTemplateWarnings(
       ),
     ),
   ];
+}
+
+export function getCommandTemplateRiskLabels(
+  config: CommandTemplateConfig,
+): CommandTemplateRiskLabel[] {
+  return sortRiskLabels(
+    expandCommandTemplateConfigs(config).flatMap((leaf) =>
+      getLeafCommandTemplateRiskLabels(leaf),
+    ),
+  );
 }
 
 function parseCommandTemplateArgToken(value: string): {
@@ -541,7 +681,12 @@ function shouldResolveEmbeddedCommandTemplateToken(
 function isFalsyCommandTemplateValue(value: unknown): boolean {
   if (value === undefined || value === null || value === false) return true;
   const normalized = String(value).trim().toLowerCase();
-  return normalized === "" || normalized === "0" || normalized === "false" || normalized === "no";
+  return (
+    normalized === "" ||
+    normalized === "0" ||
+    normalized === "false" ||
+    normalized === "no"
+  );
 }
 
 function resolveCommandTemplateCondition(

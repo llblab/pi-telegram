@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+No open changes.
+
+## 0.14.0: Direct Telegram Delivery, Queue Semantics, And Section Diagnostics
+
+- `[Prompt Guidance]` Tightened agent context for Telegram buttons: use normal Markdown plus top-level hidden `telegram_button` comments, never JSON button specs or standalone button actions, and keep comments out of code/quotes/lists/indented examples. Impact: agents immediately know how to author visible Telegram text, inline buttons, and direct `telegram_message` payloads without transport hacks.
+- `[Command Templates]` Synced `lib/command-templates.ts` with the current `pi-actors` standard, including advisory risk labels, actor recipe context metadata, bundled short-flag detection, and fuller trusted-executable mitigation text. Impact: pi-telegram command-template tooling no longer lags the actor recipe/tooling implementation.
+- `[Tools]` Telegram is now a first-class local delivery target: `telegram_attach` sends files immediately to the paired/default chat when no Telegram turn is active, and new `telegram_message` supports explicit local/TUI requests to push Markdown text messages. `telegram_message` reuses the normal `telegram_button` comment planner, so direct buttons are authored exactly like ordinary Telegram replies and always attach to a real message. Direct local/TUI delivery is gated by `/telegram-connect` ownership, while active-turn reply delivery remains session-local. Impact: agents can deliver requested artifacts or notices to Telegram from terminal-originated work without bypassing singleton polling/control ownership.
+- `[Status]` TUI status now renders `compacting` with the same warning color used for `active`, while keeping the `telegram` domain label accented. Native typing cleanup now gives the last in-flight `sendChatAction` a short bounded drain before final reply delivery, and the typing keepalive interval is relaxed to 3s while staying below Telegram's typical chat-action TTL. Impact: manual or automatic context compaction reads as active model work, and Telegram typing is less likely to outlive a completed agent turn.
+- `[Queue]` Telegram queue and reply delivery now stay per Pi instance, independent from the singleton polling/control lock. `/abort` only enables abort-history preservation for Telegram-owned turns, and local/non-Telegram agent starts clear stale abort-history mode. Impact: moving `/telegram-connect` no longer silences an already accepted queue, and local prompts after abort no longer fold old queued turns into the next Telegram prompt.
+- `[Sections]` Section label, render, and callback failures now record source-scoped diagnostics and recover only when the matching surface succeeds. Section diagnostics expose only `active`/`error`, and settings-only callbacks keep Settings-level Back navigation. Impact: one broken companion section cannot break menu rendering or hide unrelated diagnostics.
+
 ## 0.13.2: Config Recovery And Inbound Output Bounds Hotfix
 
 - `[Config]` Invalid `telegram.json` now recovers on session startup by renaming the broken file to an `.invalid-*` recovery path, loading safe empty defaults, and recording a runtime diagnostic. Impact: a hand-edited or partially written config no longer bricks `/telegram-setup` or session startup.
@@ -12,7 +23,7 @@
 
 - `[Rendering]` Fixed Telegram HTML rendering for Markdown bold/italic spans that cross soft line breaks, so assistant replies like `**first line\nsecond line**` render as bold text instead of showing raw asterisks. Added a regression for the guest-mode-style multiline bold reply shape.
 - `[Typing Status]` Hardened assistant message activity hooks so transient preview/provider transport failures are recorded but do not break the native Telegram `typing` keepalive while an active turn continues.
-- `[Continue Queue]` `/continue` now enqueues as a control-lane resume prompt and explicitly clears preserved-abort history mode, so queued Telegram prompts stay separate and the continuation runs ahead of queued prompt work after abort or compaction recovery.
+- `[Continue Queue]` `/continue` now enqueues as a control-lane resume prompt and explicitly clears abort-history mode, so queued Telegram prompts stay separate and the continuation runs ahead of queued prompt work after abort or compaction recovery.
 
 ## 0.13.0: Command Template Standard, Voice Hardening, And Domain Cleanup
 

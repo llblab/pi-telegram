@@ -23,13 +23,13 @@ Telegram-visible output:
 - Telegram is often phone-width; keep tables, dense list items, and compact text blocks at or below 37 visible cells when possible.
 - Count display width, not raw characters: emoji and some glyphs are wide, so prefer shorter labels when unsure.
 - Wide monospace blocks can become unreadable on mobile; use them only when structure or literal code requires them.
-- For requested/generated files, call tool \`telegram_attach(local_path)\`; mentioning a local path in text does not send it.
+- For requested/generated files, call \`telegram_attach(local_path)\`; during Telegram turns it attaches files to the active reply, and during explicit local/TUI Telegram-delivery requests it sends files directly to the paired/default chat or an explicit \`chat_id\`. If a local/TUI user explicitly asks to send a text message to Telegram, use \`telegram_message\` with Markdown text; embed the same top-level \`telegram_button\` comments when inline prompt buttons are needed, because Telegram buttons must belong to a message. Direct local/TUI Telegram delivery requires this π instance to own \`/telegram-connect\`; if ownership is elsewhere, connect/take over first instead of bypassing the lock.
 
 Native outbound actions:
-- Use top-level column-zero hidden Markdown comments outside code, quotes, and lists; the bridge handles them after agent_end, so do not call or register transport/TTS/text-to-OGG tools.
+- Use normal Markdown for visible text. Use top-level column-zero hidden Markdown comments outside code, quotes, and lists only for native actions; the bridge strips them after agent_end and turns them into Telegram-native artifacts/reply_markup. Do not render button JSON, do not invent standalone button tools, and do not call/register transport/TTS/text-to-OGG tools for ordinary Telegram-turn voice/buttons.
 - \`telegram_voice\`: text is synthesized by the registered voice synthesis provider and delivered by pi-telegram. Use body text for multiline voice, \`<!-- telegram_voice text="Short summary" -->\` for explicit one-line voice, or \`<!-- telegram_voice: Short summary -->\` for one-line voice with no attributes. A companion summary is optional, no specific summary format is required. Keep it TTS-friendly; avoid raw Markdown, code, formulas, tables, or long lists.
-- \`telegram_button\`: callback prompt is routed back as a normal Telegram turn. Use \`<!-- telegram_button: OK -->\` when prompt equals label, \`<!-- telegram_button label=Continue prompt="Continue with the current plan." -->\` for one-line prompts, or body form \`<!-- telegram_button label="Show risks"\nList the main risks first.\n-->\` for multiline prompts.
-- If only hidden action comments would remain, add visible parent text like "Choose one:".
+- \`telegram_button\`: callback prompt is routed back as a normal Telegram turn. Use \`<!-- telegram_button: OK -->\` when prompt equals label, \`<!-- telegram_button label=Continue prompt="Continue with the current plan." -->\` for one-line prompts, or body form \`<!-- telegram_button label="Show risks"\nList the main risks first.\n-->\` for multiline prompts. Do not put button comments inline after visible text, inside code fences, block quotes, lists, or indented examples; those are literal Markdown, not buttons.
+- If only hidden action comments would remain, add visible parent text like "Choose one:" so Telegram has a message to attach buttons to.
 `;
 
 export function buildTelegramBridgeSystemPrompt(options: {

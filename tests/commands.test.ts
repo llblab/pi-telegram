@@ -23,6 +23,7 @@ import {
   executeTelegramCommandAction,
   getTelegramCommandExecutionMode,
   getTelegramCommandMessageTarget,
+  handleTelegramAbortCommand,
   handleTelegramCompactCommand,
   handleTelegramCompactConfirmationCallback,
   handleTelegramModelCommand,
@@ -505,8 +506,8 @@ test("Command helpers run stop command side effects", async () => {
       events.push("clear-queue:2");
       return 2;
     },
-    setPreserveQueuedTurnsAsHistory: (preserve) => {
-      events.push(`preserve:${preserve}`);
+    setFoldQueuedPromptsIntoHistory: (fold) => {
+      events.push(`fold:${fold}`);
     },
     abortCurrentTurn: () => {
       events.push("unexpected:abort");
@@ -527,8 +528,8 @@ test("Command helpers run stop command side effects", async () => {
       events.push("clear-queue:1");
       return 1;
     },
-    setPreserveQueuedTurnsAsHistory: (preserve) => {
-      events.push(`preserve:${preserve}`);
+    setFoldQueuedPromptsIntoHistory: (fold) => {
+      events.push(`fold:${fold}`);
     },
     abortCurrentTurn: () => {
       events.push("abort");
@@ -543,15 +544,57 @@ test("Command helpers run stop command side effects", async () => {
   assert.deepEqual(events, [
     "clear",
     "clear-queue:2",
-    "preserve:false",
+    "fold:false",
     "status",
     "reply:No active turn. Cleared 2 queued turns.",
     "clear",
     "clear-queue:1",
-    "preserve:false",
+    "fold:false",
     "abort",
     "status",
     "reply:Aborted current turn. Cleared 1 queued turn.",
+  ]);
+});
+
+test("Command helpers scope abort history preservation to Telegram-owned turns", async () => {
+  const events: string[] = [];
+  const baseDeps = {
+    hasAbortHandler: () => true,
+    clearPendingModelSwitch: () => {
+      events.push("clear");
+    },
+    abortCurrentTurn: () => {
+      events.push("abort");
+    },
+    setFoldQueuedPromptsIntoHistory: (fold: boolean) => {
+      events.push(`fold:${fold}`);
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    sendTextReply: async (text: string) => {
+      events.push(`reply:${text}`);
+    },
+  };
+  await handleTelegramAbortCommand({
+    ...baseDeps,
+    hasActiveTelegramTurn: () => true,
+  });
+  await handleTelegramAbortCommand({
+    ...baseDeps,
+    hasActiveTelegramTurn: () => false,
+  });
+  assert.deepEqual(events, [
+    "clear",
+    "fold:true",
+    "abort",
+    "status",
+    "reply:Aborted current turn.",
+    "clear",
+    "fold:false",
+    "abort",
+    "status",
+    "reply:Aborted current turn.",
   ]);
 });
 
@@ -635,7 +678,7 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
     clearPendingModelSwitch: () => {},
     hasQueuedTelegramItems: () => false,
     clearQueuedTelegramItems: () => 0,
-    setPreserveQueuedTurnsAsHistory: () => {},
+    setFoldQueuedPromptsIntoHistory: () => {},
     abortCurrentTurn: () => {},
     isIdle: () => true,
     hasPendingMessages: () => false,
@@ -939,7 +982,7 @@ test("Command handler target runtime binds command targets into command handling
     clearPendingModelSwitch: () => {},
     hasQueuedTelegramItems: () => false,
     clearQueuedTelegramItems: () => 0,
-    setPreserveQueuedTurnsAsHistory: () => {},
+    setFoldQueuedPromptsIntoHistory: () => {},
     abortCurrentTurn: () => {},
     isIdle: () => true,
     hasPendingMessages: () => false,
@@ -996,8 +1039,8 @@ test("Command runtime routes commands through runtime ports", async () => {
       events.push("clear-queue");
       return 0;
     },
-    setPreserveQueuedTurnsAsHistory: (preserve: boolean) => {
-      events.push(`preserve:${preserve}`);
+    setFoldQueuedPromptsIntoHistory: (fold: boolean) => {
+      events.push(`fold:${fold}`);
     },
     abortCurrentTurn: () => {
       events.push("abort");
@@ -1110,7 +1153,7 @@ test("Command runtime routes commands through runtime ports", async () => {
     "reply:99:Compaction completed.",
     "clear-switch",
     "clear-queue",
-    "preserve:false",
+    "fold:false",
     "abort",
     "status",
     "reply:99:Aborted current turn.",

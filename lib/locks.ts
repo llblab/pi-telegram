@@ -62,8 +62,11 @@ export interface TelegramLockRuntime<TContext extends TelegramLockContext> {
 }
 
 export interface TelegramLockOwnershipGuard<TContext extends TelegramLockContext> {
-  ownsCurrentProcess: () => boolean;
   ownsContext: (ctx: TContext) => boolean;
+}
+
+export interface TelegramLockContextStore<TContext extends TelegramLockContext> {
+  get: () => TContext | undefined;
 }
 
 export interface TelegramLockRuntimeOptions {
@@ -248,8 +251,19 @@ export function createTelegramLockOwnershipGuard<
   lock: TelegramLockRuntime<TContext>,
 ): TelegramLockOwnershipGuard<TContext> {
   return {
-    ownsCurrentProcess: () => lock.owns(),
     ownsContext: (ctx) => lock.owns(ctx),
+  };
+}
+
+export function createTelegramDirectDeliveryOwnershipChecker<
+  TContext extends TelegramLockContext,
+>(deps: {
+  lock: TelegramLockRuntime<TContext>;
+  contextStore: TelegramLockContextStore<TContext>;
+}): () => boolean {
+  return () => {
+    const ctx = deps.contextStore.get();
+    return ctx ? deps.lock.owns(ctx) : false;
   };
 }
 

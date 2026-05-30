@@ -342,7 +342,7 @@ export function createTelegramInboundRouteRuntime<
     message: TMessage,
     ctx: TContext,
   ): Promise<void> => {
-    deps.bridgeRuntime.lifecycle.setPreserveQueuedTurnsAsHistory(false);
+    deps.bridgeRuntime.lifecycle.setFoldQueuedPromptsIntoHistory(false);
     const continueMessage = {
       ...message,
       text: "continue",
@@ -374,8 +374,8 @@ export function createTelegramInboundRouteRuntime<
     clearPendingModelSwitch: deps.modelSwitchController.clearPendingSwitch,
     hasQueuedTelegramItems: deps.telegramQueueStore.hasQueuedItems,
     clearQueuedTelegramItems: deps.queueMutationRuntime.clear,
-    setPreserveQueuedTurnsAsHistory:
-      deps.bridgeRuntime.lifecycle.setPreserveQueuedTurnsAsHistory,
+    setFoldQueuedPromptsIntoHistory:
+      deps.bridgeRuntime.lifecycle.setFoldQueuedPromptsIntoHistory,
     abortCurrentTurn: deps.bridgeRuntime.abort.abortTurn,
     isIdle: deps.isIdle,
     hasPendingMessages: deps.hasPendingMessages,
@@ -420,10 +420,10 @@ export function createTelegramInboundRouteRuntime<
     TContext
   >({
     ...deps.telegramQueueStore,
-    getPreserveQueuedTurnsAsHistory:
-      deps.bridgeRuntime.lifecycle.shouldPreserveQueuedTurnsAsHistory,
-    setPreserveQueuedTurnsAsHistory:
-      deps.bridgeRuntime.lifecycle.setPreserveQueuedTurnsAsHistory,
+    getFoldQueuedPromptsIntoHistory:
+      deps.bridgeRuntime.lifecycle.shouldFoldQueuedPromptsIntoHistory,
+    setFoldQueuedPromptsIntoHistory:
+      deps.bridgeRuntime.lifecycle.setFoldQueuedPromptsIntoHistory,
     createTurn: promptTurnBuilder,
     updateStatus: deps.updateStatus,
     dispatchNextQueuedTelegramTurn: deps.dispatchNextQueuedTelegramTurn,

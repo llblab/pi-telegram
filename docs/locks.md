@@ -107,7 +107,7 @@ Start/connect commands should make singleton moves easy:
 1. If no live owner exists, take ownership without an extra prompt
 2. If a live polling owner exists, ask whether to move singleton ownership to this pi instance
 3. On confirmation, write the current `{ "pid": ..., "cwd": ... }` to this extension's key in `locks.json`
-4. The previous owner must notice that `locks.json` no longer points at its own `pid`/`cwd` and stop local runtime work without deleting the new lock
+4. The previous owner must notice that `locks.json` no longer points at its own `pid`/`cwd` and stop singleton-owned work such as polling/watchers without deleting the new lock or unrelated session-local queues
 
 Takeover prompts should use the extension name as the dialog title, then the question, a blank line, and source/target lines:
 
@@ -121,7 +121,9 @@ to: /new
 
 Avoid repeating the extension name in the body. Color is encouraged: extension title/name accent, question warning, `from:`/`to:` muted.
 
-The previous owner may use `fs.watch`, mtime polling, or an existing status/timer tick. Long-lived watchers should compare against a snapshotted `pid`/`cwd` identity rather than a live pi context object, because session replacement such as `/new` makes captured contexts stale. The important contract is graceful local shutdown after ownership mismatch.
+The previous owner may use `fs.watch`, mtime polling, or an existing status/timer tick. Long-lived watchers should compare against a snapshotted `pid`/`cwd` identity rather than a live pi context object, because session replacement such as `/new` makes captured contexts stale. The important contract is graceful singleton-runtime shutdown after ownership mismatch while session-local state that does not require polling remains owned by its original instance.
+
+For `pi-telegram`, direct local/TUI delivery tools (`telegram_message` and no-active-turn `telegram_attach`) are singleton-controlled and require current `/telegram-connect` ownership. They must fail when the lock is inactive or active elsewhere. Already accepted Telegram-turn reply delivery, previews, queued attachments, and queue finalization remain session-local and may complete after polling ownership moves away.
 
 ## Reset
 

@@ -85,12 +85,13 @@ Telegram configuration lives in `~/.pi/agent/telegram.json`. Polling ownership l
 
 ### Runtime Ownership
 
-- `/telegram-connect` acquires or moves singleton ownership before polling starts.
+- `/telegram-connect` acquires or moves singleton polling ownership before polling starts.
 - `/telegram-disconnect` stops polling and releases ownership.
 - Session start resumes polling only when the existing lock already points at the current `pid`/`cwd`, or when a stale same-`cwd` lock can be safely replaced after process restart.
 - Session replacement suspends polling/watchers without releasing ownership so the next session-start hook in the same process can resume.
 - Live polling owners require explicit takeover confirmation.
-- Long-lived timers use snapshotted ownership context and stop local polling when the lock no longer points at their own process.
+- Long-lived polling timers use snapshotted ownership context and stop local polling when the lock no longer points at their own process.
+- `locks.json` owns only external Telegram control/polling. Local extension and queue state are per Pi instance: losing the lock stops live Telegram control here, but does not drain or silence this instance's accepted queue, previews, final delivery, or dispatch.
 
 Deleting `locks.json` resets runtime ownership without deleting Telegram configuration.
 
@@ -137,7 +138,7 @@ Dispatch requires:
 
 A dispatched prompt remains queued until `agent_start` consumes it. This keeps the active Telegram turn bound for previews, attachments, aborts, and final replies.
 
-Post-agent-end queue dispatch uses a session-bound deferred dispatcher. It is activated on session start, clears timers on shutdown, and skips callbacks from older generations before touching `ExtensionContext`.
+Post-agent-end queue dispatch uses a session-bound deferred dispatcher. It is activated on session start, clears timers on shutdown, and skips callbacks from older generations before touching `ExtensionContext`. Dispatch stays session-bound after polling ownership moves elsewhere.
 
 ### Controls And Menus
 
@@ -149,7 +150,7 @@ Immediate controls:
 - `/model`, `/thinking`, `/queue`, and `/settings` are hidden shortcuts to menu sections.
 - `/compact` opens an inline confirmation dialog and then runs compaction when the bridge is idle.
 - `/next` dispatches the next queued turn, aborting π first when needed.
-- `/abort` aborts the active Telegram-owned run while preserving queued items.
+- `/abort` aborts active work while preserving queued items. Abort-history preservation is enabled only for Telegram-owned active turns; later local/non-Telegram agent starts clear stale abort-history mode so the next Telegram prompt appends instead of absorbing old queued turns as history.
 - `/stop` aborts and clears waiting Telegram queue items.
 
 Queued controls:
@@ -190,7 +191,7 @@ Final delivery attaches reply metadata only where requested. Reply parameters ap
 
 ### Outbound Artifacts And Assistant Actions
 
-Outbound files are delivered after the active Telegram turn completes. They must be staged with `telegram_attach`, are checked atomically per tool call, and use configurable size limits before photo/document upload.
+Outbound files staged during an active Telegram turn are delivered after that turn completes. They use `telegram_attach`, are checked atomically per tool call, and use configurable size limits before photo/document upload. When no Telegram turn is active, `telegram_attach` sends files immediately to the paired/default chat or explicit `chat_id`; `telegram_message` provides direct local/TUI Markdown text delivery for explicit user requests and runs the same `telegram_button` markup planner so buttons attach to that text message. Direct local/TUI delivery is singleton-controlled: it requires this π instance to own `/telegram-connect`, while already accepted active-turn reply/attachment delivery remains session-local.
 
 Assistant-authored final-message actions use hidden top-level comments:
 

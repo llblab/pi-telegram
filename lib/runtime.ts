@@ -4,7 +4,8 @@
  * Owns small session-local runtime primitives that are shared by orchestration but are not specific to queueing, rendering, polling, or Telegram transport
  */
 
-const TELEGRAM_TYPING_ACTION_INTERVAL_MS = 2500;
+const TELEGRAM_TYPING_ACTION_INTERVAL_MS = 3000;
+const TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS = 300;
 
 export interface TelegramRuntimeQueueCounters {
   nextQueuedTelegramItemOrder: number;
@@ -16,7 +17,7 @@ export interface TelegramRuntimeLifecycleFlags {
   activeTelegramToolExecutions: number;
   telegramTurnDispatchPending: boolean;
   compactionInProgress: boolean;
-  preserveQueuedTurnsAsHistory: boolean;
+  foldQueuedPromptsIntoHistory: boolean;
   setupInProgress: boolean;
 }
 
@@ -24,6 +25,7 @@ export interface TelegramBridgeRuntimeState
   extends TelegramRuntimeQueueCounters, TelegramRuntimeLifecycleFlags {
   abortHandler?: () => void;
   typingInterval?: ReturnType<typeof setInterval>;
+  typingInFlight?: Promise<void>;
 }
 
 export interface TelegramRuntimeQueuePort {
@@ -44,8 +46,8 @@ export interface TelegramRuntimeLifecyclePort {
   clearDispatchPending: () => void;
   isCompactionInProgress: () => boolean;
   setCompactionInProgress: (inProgress: boolean) => void;
-  shouldPreserveQueuedTurnsAsHistory: () => boolean;
-  setPreserveQueuedTurnsAsHistory: (preserve: boolean) => void;
+  shouldFoldQueuedPromptsIntoHistory: () => boolean;
+  setFoldQueuedPromptsIntoHistory: (fold: boolean) => void;
 }
 
 export interface TelegramRuntimeSetupPort {
@@ -65,6 +67,7 @@ export interface TelegramRuntimeAbortPort {
 export interface TelegramRuntimeTypingPort {
   start: (deps: TelegramTypingLoopDeps) => boolean;
   stop: () => boolean;
+  waitForIdle: () => Promise<void>;
 }
 
 export interface TelegramBridgeRuntime {
@@ -84,7 +87,7 @@ export function createTelegramBridgeRuntimeState(): TelegramBridgeRuntimeState {
     activeTelegramToolExecutions: 0,
     telegramTurnDispatchPending: false,
     compactionInProgress: false,
-    preserveQueuedTurnsAsHistory: false,
+    foldQueuedPromptsIntoHistory: false,
     setupInProgress: false,
   };
 }
@@ -117,10 +120,10 @@ export function createTelegramBridgeRuntime(
       isCompactionInProgress: () => isTelegramCompactionInProgress(state),
       setCompactionInProgress: (inProgress) =>
         setTelegramCompactionInProgress(state, inProgress),
-      shouldPreserveQueuedTurnsAsHistory: () =>
-        shouldPreserveQueuedTurnsAsHistory(state),
-      setPreserveQueuedTurnsAsHistory: (preserve) =>
-        setPreserveQueuedTurnsAsHistory(state, preserve),
+      shouldFoldQueuedPromptsIntoHistory: () =>
+        shouldFoldQueuedPromptsIntoHistory(state),
+      setFoldQueuedPromptsIntoHistory: (fold) =>
+        setFoldQueuedPromptsIntoHistory(state, fold),
     },
     setup: {
       isInProgress: () => isTelegramSetupInProgress(state),
@@ -138,6 +141,7 @@ export function createTelegramBridgeRuntime(
     typing: {
       start: (deps) => startTelegramTypingLoop(state, deps),
       stop: () => stopTelegramTypingLoop(state),
+      waitForIdle: () => waitForTelegramTypingLoopIdle(state),
     },
   };
 }
@@ -195,8 +199,8 @@ export function syncTelegramLifecycleRuntimeFlags(
   if (flags.compactionInProgress !== undefined) {
     state.compactionInProgress = flags.compactionInProgress;
   }
-  if (flags.preserveQueuedTurnsAsHistory !== undefined) {
-    state.preserveQueuedTurnsAsHistory = flags.preserveQueuedTurnsAsHistory;
+  if (flags.foldQueuedPromptsIntoHistory !== undefined) {
+    state.foldQueuedPromptsIntoHistory = flags.foldQueuedPromptsIntoHistory;
   }
   if (flags.setupInProgress !== undefined) {
     state.setupInProgress = flags.setupInProgress;
@@ -254,17 +258,17 @@ export function setTelegramCompactionInProgress(
   state.compactionInProgress = inProgress;
 }
 
-export function shouldPreserveQueuedTurnsAsHistory(
+export function shouldFoldQueuedPromptsIntoHistory(
   state: TelegramBridgeRuntimeState,
 ): boolean {
-  return state.preserveQueuedTurnsAsHistory;
+  return state.foldQueuedPromptsIntoHistory;
 }
 
-export function setPreserveQueuedTurnsAsHistory(
+export function setFoldQueuedPromptsIntoHistory(
   state: TelegramBridgeRuntimeState,
-  preserve: boolean,
+  fold: boolean,
 ): void {
-  state.preserveQueuedTurnsAsHistory = preserve;
+  state.foldQueuedPromptsIntoHistory = fold;
 }
 
 export function isTelegramSetupInProgress(
@@ -392,7 +396,13 @@ export function startTelegramTypingLoop(
   if (state.typingInterval || deps.chatId === undefined || deps.chatId === 0)
     return false;
   const sendTyping = (): void => {
-    void deps.sendTypingAction(deps.chatId as number);
+    const typing = Promise.resolve(deps.sendTypingAction(deps.chatId as number))
+      .then(() => undefined)
+      .catch(() => undefined);
+    state.typingInFlight = typing;
+    void typing.finally(() => {
+      if (state.typingInFlight === typing) state.typingInFlight = undefined;
+    });
   };
   sendTyping();
   state.typingInterval = setInterval(sendTyping, deps.intervalMs);
@@ -406,6 +416,24 @@ export function stopTelegramTypingLoop(
   clearInterval(state.typingInterval);
   state.typingInterval = undefined;
   return true;
+}
+
+export async function waitForTelegramTypingLoopIdle(
+  state: TelegramBridgeRuntimeState,
+  timeoutMs = TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS,
+): Promise<void> {
+  const inFlight = state.typingInFlight;
+  if (!inFlight) return;
+  if (timeoutMs <= 0) {
+    await Promise.race([inFlight, Promise.resolve()]);
+    return;
+  }
+  await Promise.race([
+    inFlight,
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, timeoutMs);
+    }),
+  ]);
 }
 
 export function createTelegramContextAbortHandlerSetter<

@@ -62,6 +62,13 @@ export default function (pi: Pi.ExtensionAPI) {
   const lockRuntime = Locks.createTelegramLockRuntime<Pi.ExtensionContext>();
   const lockOwnershipGuard =
     Locks.createTelegramLockOwnershipGuard(lockRuntime);
+  const telegramSessionContextStore =
+    Lifecycle.createTelegramSessionContextStore<Pi.ExtensionContext>();
+  const ownsTelegramDirectDelivery =
+    Locks.createTelegramDirectDeliveryOwnershipChecker({
+      lock: lockRuntime,
+      contextStore: telegramSessionContextStore,
+    });
   const activeTurnRuntime = Queue.createTelegramActiveTurnStore();
   const proactivePushChatIdGetter =
     Config.createTelegramProactivePushChatIdGetter({
@@ -101,11 +108,10 @@ export default function (pi: Pi.ExtensionAPI) {
       recordRuntimeEvent,
     });
   const pollingControllerState = Polling.createTelegramPollingControllerState();
-  const { getStatusLines, updateStatus } =
-    Status.createTelegramBridgeStatusRuntime<
-      Pi.ExtensionContext,
-      Queue.TelegramQueueItem<Pi.ExtensionContext>
-    >({
+  const statusRuntime = Status.createTelegramBridgeStatusRuntime<
+    Pi.ExtensionContext,
+    Queue.TelegramQueueItem<Pi.ExtensionContext>
+  >({
       getConfig: configStore.get,
       isPollingActive: Polling.createTelegramPollingActivityReader(
         pollingControllerState,
@@ -121,17 +127,7 @@ export default function (pi: Pi.ExtensionAPI) {
       getRecentRuntimeEvents: runtimeEvents.getEvents,
       getRuntimeLockState: lockRuntime.getStatusLabel,
     });
-  const currentModelRuntime = Model.createCurrentModelRuntime({
-    getContextModel,
-    updateStatus,
-  });
-  const queueMutationRuntime = Queue.createTelegramQueueMutationController({
-    ...telegramQueueStore,
-    getNextPriorityReactionOrder: queue.getNextPriorityReactionOrder,
-    incrementNextPriorityReactionOrder:
-      queue.incrementNextPriorityReactionOrder,
-    updateStatus,
-  });
+  const { getStatusLines, updateStatus } = statusRuntime;
   const inboundHandlerRuntime = Inbound.createTelegramInboundHandlerRuntime({
     getHandlers: configStore.getInboundHandlers,
     execCommand: CommandTemplates.execCommandTemplate,
@@ -177,6 +173,17 @@ export default function (pi: Pi.ExtensionAPI) {
     updateStatus,
     recordRuntimeEvent,
   });
+  const currentModelRuntime = Model.createCurrentModelRuntime({
+    getContextModel,
+    updateStatus,
+  });
+  const queueMutationRuntime = Queue.createTelegramQueueMutationController({
+    ...telegramQueueStore,
+    getNextPriorityReactionOrder: queue.getNextPriorityReactionOrder,
+    incrementNextPriorityReactionOrder:
+      queue.incrementNextPriorityReactionOrder,
+    updateStatus,
+  });
 
   // --- Reply Runtime & Preview ---
 
@@ -217,7 +224,6 @@ export default function (pi: Pi.ExtensionAPI) {
     sendDraft: sendMessageDraft,
     sendMessage,
     editMessageText: editTelegramMessageText,
-    canSend: lockOwnershipGuard.ownsCurrentProcess,
     recordRuntimeEvent,
     ...replyTransport,
   });
@@ -409,11 +415,15 @@ export default function (pi: Pi.ExtensionAPI) {
     stopPolling: lockedPollingRuntime.suspend,
     recordRuntimeEvent,
   });
-  const sessionLifecycleRuntime = Lifecycle.appendTelegramLifecycleHooks(
+  const baseSessionLifecycleRuntime = Lifecycle.appendTelegramLifecycleHooks(
     queueSessionLifecycle,
     {
       onSessionStart: lockedPollingRuntime.onSessionStart,
     },
+  );
+  const sessionLifecycleRuntime = Lifecycle.appendTelegramLifecycleHooks(
+    baseSessionLifecycleRuntime,
+    Lifecycle.createTelegramSessionContextTracker(telegramSessionContextStore),
   );
 
   // --- Extension API Bindings ---
@@ -425,6 +435,11 @@ export default function (pi: Pi.ExtensionAPI) {
     activeTurnRuntime,
     lockedPollingRuntime,
     getStatusLines,
+    buttonActionStore,
+    sendMarkdownReply,
+    callMultipart,
+    getDefaultChatId: proactivePushChatIdGetter,
+    canSendDirect: ownsTelegramDirectDelivery,
     updateStatus,
     recordRuntimeEvent,
   });

@@ -34,8 +34,8 @@ import {
 Stable commands inside π:
 
 - `/telegram-setup` — configure/update the bot token.
-- `/telegram-connect` — start polling in the current session and acquire ownership.
-- `/telegram-disconnect` — stop polling and release ownership.
+- `/telegram-connect` — start polling here and acquire external Telegram control ownership. Accepted queue/reply state stays local if ownership later moves elsewhere.
+- `/telegram-disconnect` — stop polling and release ownership without deleting or silencing accepted local queue state.
 - `/telegram-status` — show connection, polling, execution, queue, and recent event diagnostics.
 
 ### Telegram commands
@@ -46,16 +46,17 @@ Stable commands inside the paired Telegram DM:
 - `/compact` — open confirmation and compact when idle.
 - `/next` — dispatch the next queued turn, aborting active work first when needed.
 - `/continue` — enqueue a priority `continue` prompt.
-- `/abort` — abort active Telegram-owned work and keep the queue.
+- `/abort` — abort active work and keep the queue; abort-history is scoped to Telegram-owned active turns.
 - `/stop` — abort active Telegram-owned work and clear waiting Telegram queue items.
 
 Hidden compatibility shortcuts may open sections directly: `/help`, `/status`, `/model`, `/thinking`, `/queue`, and `/settings`.
 
 ### Tools and assistant-authored actions
 
-- `telegram_attach(paths)` is the stable artifact delivery tool for generated files.
+- `telegram_attach(paths, chat_id?, caption?)` is the stable artifact delivery tool for generated files. During Telegram turns it queues files for the active reply; outside Telegram turns it sends files directly to the paired/default chat or explicit `chat_id` when this π instance owns `/telegram-connect`.
+- `telegram_message(text, chat_id?)` sends a direct Telegram Markdown message from local/TUI-initiated work when this π instance owns `/telegram-connect`. Top-level `telegram_button` comments inside `text` are parsed with the same planner used for normal replies and attached to that message; buttons are never standalone Telegram messages.
 - `telegram_voice` hidden comments request Telegram-native voice delivery.
-- `telegram_button` hidden comments create inline buttons whose taps enqueue prompts.
+- `telegram_button` hidden comments create inline buttons whose taps enqueue prompts. Use top-level column-zero comments outside code, quotes, lists, and indented examples; do not emit JSON button specs or standalone button actions.
 
 See [Outbound Handlers](./outbound.md) for exact markup forms.
 
@@ -160,7 +161,7 @@ Contract:
 - `id` is unique per active registry. Duplicate ids are rejected.
 - `ctx.callbackData(action, payload?)` builds compact `section:` callbacks and validates Telegram's 64-byte limit.
 - `ctx.edit()` auto-prepends the correct Back/Main-menu row. `ctx.open()` sends a standalone chat message without auto-navigation.
-- Section errors are isolated and surfaced as callback popups/diagnostics.
+- Section dynamic-label, render, and callback errors are isolated, surfaced as callback popups where applicable, and reflected by `getTelegramSectionDiagnostics()` until the matching surface succeeds.
 
 Full behavior: [Extension Sections](./sections.md).
 

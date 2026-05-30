@@ -80,12 +80,17 @@ test("Prompt helpers build before-agent-start hooks", () => {
   assert.match(defaultSystemPrompt, /`mirror` means voice input prefers a voice reply/);
   assert.match(defaultSystemPrompt, /`always` means the final reply is expected to be converted to voice/);
   assert.match(defaultSystemPrompt, /telegram_attach/);
+  assert.match(defaultSystemPrompt, /telegram_message/);
+  assert.match(defaultSystemPrompt, /buttons/);
   assert.match(defaultSystemPrompt, /telegram_voice text="Short summary"/);
   assert.match(defaultSystemPrompt, /telegram_button: OK/);
   assert.match(defaultSystemPrompt, /telegram_button label=Continue prompt=/);
+  assert.match(defaultSystemPrompt, /Do not render button JSON/);
+  assert.match(defaultSystemPrompt, /do not invent standalone button tools/);
+  assert.match(defaultSystemPrompt, /inside code fences, block quotes, lists/);
   assert.match(
     defaultSystemPrompt,
-    /do not call or register transport\/TTS\/text-to-OGG tools/,
+    /do not call\/register transport\/TTS\/text-to-OGG tools/,
   );
   assert.match(defaultSystemPrompt, /no specific summary format is required/);
 });
