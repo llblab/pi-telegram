@@ -1,6 +1,6 @@
 {
   "name": "@llblab/pi-telegram",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "private": false,
   "publishConfig": {
     "access": "public"
@@ -50,6 +50,7 @@
     "./outbound": "./api/outbound.ts",
     "./updates": "./api/updates.ts",
     "./sections": "./api/sections.ts",
+    "./status": "./api/status.ts",
     "./voice": "./api/voice.ts",
     "./keyboard": "./api/keyboard.ts"
   },

@@ -36,8 +36,23 @@ interface TelegramContextUsage {
 }
 
 export interface TelegramStatusActiveModel {
+  provider?: string;
+  id?: string;
   contextWindow?: number;
 }
+
+export interface TelegramStatusLineProviderContext {
+  activeModel: TelegramStatusActiveModel | undefined;
+}
+
+export interface TelegramStatusLineProviderResult {
+  label: string;
+  value: string;
+}
+
+export type TelegramStatusLineProvider = (
+  ctx: TelegramStatusLineProviderContext,
+) => TelegramStatusLineProviderResult | undefined;
 
 export interface TelegramStatusContext {
   sessionManager: { getEntries(): TelegramStatusSessionEntry[] };
@@ -52,6 +67,8 @@ export interface TelegramStatusContext {
 
 export type TelegramRuntimeEventDetailValue = string | number | boolean | null;
 
+const TELEGRAM_STATUS_LINE_PROVIDER_REGISTRY_KEY =
+  "__piTelegramStatusLineProviders__";
 const MAX_RECENT_TELEGRAM_RUNTIME_EVENTS = 10;
 const MAX_TELEGRAM_RUNTIME_EVENT_MESSAGE_LENGTH = 1000;
 const MAX_TELEGRAM_RUNTIME_EVENT_DETAIL_LENGTH = 1000;
@@ -166,7 +183,10 @@ export interface TelegramStatusRuntime<
   getStatusLines: () => string[];
 }
 
-function truncateTelegramRuntimeEventText(text: string, maxLength: number): string {
+function truncateTelegramRuntimeEventText(
+  text: string,
+  maxLength: number,
+): string {
   if (text.length <= maxLength) return text;
   return `${text.slice(0, maxLength).trimEnd()}… [truncated ${text.length - maxLength} chars]`;
 }
@@ -262,6 +282,61 @@ export function recordTelegramRuntimeEvent(
   recordStructuredTelegramRuntimeEvent(events, { category, error }, options);
 }
 
+function getOrCreateTelegramStatusLineProviderRegistry(): Map<
+  string,
+  TelegramStatusLineProvider
+> {
+  const existing = (globalThis as Record<string, unknown>)[
+    TELEGRAM_STATUS_LINE_PROVIDER_REGISTRY_KEY
+  ];
+  if (existing instanceof Map)
+    return existing as Map<string, TelegramStatusLineProvider>;
+  const registry = new Map<string, TelegramStatusLineProvider>();
+  (globalThis as Record<string, unknown>)[
+    TELEGRAM_STATUS_LINE_PROVIDER_REGISTRY_KEY
+  ] = registry;
+  return registry;
+}
+
+/**
+ * Register a compact companion-extension line for the Telegram status menu.
+ *
+ * Providers are synchronous and should return undefined when their line is not
+ * relevant for the active model. Errors are isolated so optional companion
+ * status cannot break the core Telegram menu.
+ */
+export function registerTelegramStatusLineProvider(
+  provider: TelegramStatusLineProvider,
+  options: { id: string },
+): () => void {
+  const registry = getOrCreateTelegramStatusLineProviderRegistry();
+  registry.set(options.id, provider);
+  return () => {
+    if (registry.get(options.id) === provider) registry.delete(options.id);
+  };
+}
+
+export function getTelegramStatusLineProviderResults(
+  ctx: TelegramStatusLineProviderContext,
+): TelegramStatusLineProviderResult[] {
+  const results: TelegramStatusLineProviderResult[] = [];
+  const registry = getOrCreateTelegramStatusLineProviderRegistry();
+  for (const provider of registry.values()) {
+    try {
+      const result = provider(ctx);
+      if (!result?.label || !result.value) continue;
+      results.push(result);
+    } catch {
+      continue;
+    }
+  }
+  return results;
+}
+
+export function clearTelegramStatusLineProviders(): void {
+  getOrCreateTelegramStatusLineProviderRegistry().clear();
+}
+
 export function createTelegramRuntimeEventRecorder(
   options: TelegramRuntimeEventRecorderOptions,
 ): TelegramRuntimeEventRecorder {
@@ -314,7 +389,9 @@ function formatTelegramRuntimeEvent(event: TelegramRuntimeEvent): string {
   return `${new Date(event.at).toISOString()} ${formatTelegramRuntimeEventSummary(event)}`;
 }
 
-function buildTelegramRuntimeEventSummary(events: TelegramRuntimeEvent[]): string {
+function buildTelegramRuntimeEventSummary(
+  events: TelegramRuntimeEvent[],
+): string {
   const counts = new Map<string, number>();
   for (const event of events) {
     const category = formatTelegramRuntimeEventCategory(event);
@@ -553,8 +630,13 @@ function collectUsageStats(ctx: TelegramStatusContext): TelegramUsageStats {
   return stats;
 }
 
+function formatStatusRowLabel(label: string): string {
+  if (!label) return label;
+  return `${label[0]?.toUpperCase() ?? ""}${label.slice(1)}`;
+}
+
 function buildStatusRow(label: string, value: string): string {
-  return `<b>${escapeHtml(label)}:</b> <code>${escapeHtml(value)}</code>`;
+  return `<b>${escapeHtml(formatStatusRowLabel(label))}:</b> <code>${escapeHtml(value)}</code>`;
 }
 
 function buildUsageSummary(stats: TelegramUsageStats): string | undefined {
@@ -613,5 +695,8 @@ export function buildStatusHtml(
     lines.push(buildStatusRow("Cost", costSummary));
   }
   lines.push(buildStatusRow("Context", buildContextSummary(ctx, activeModel)));
+  for (const row of getTelegramStatusLineProviderResults({ activeModel })) {
+    lines.push(buildStatusRow(row.label, row.value));
+  }
   return lines.join("\n");
 }
