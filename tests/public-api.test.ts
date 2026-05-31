@@ -18,13 +18,14 @@ async function assertPackagePathNotExported(specifier: string): Promise<void> {
 }
 
 test("Public package subpaths expose the stable companion-extension API", async () => {
-  const [root, inbound, outbound, updates, sections, voice, keyboard] =
+  const [root, inbound, outbound, updates, sections, status, voice, keyboard] =
     await Promise.all([
       import("@llblab/pi-telegram"),
       import("@llblab/pi-telegram/inbound"),
       import("@llblab/pi-telegram/outbound"),
       import("@llblab/pi-telegram/updates"),
       import("@llblab/pi-telegram/sections"),
+      import("@llblab/pi-telegram/status"),
       import("@llblab/pi-telegram/voice"),
       import("@llblab/pi-telegram/keyboard"),
     ]);
@@ -43,6 +44,9 @@ test("Public package subpaths expose the stable companion-extension API", async 
   assert.deepEqual(Object.keys(sections).sort(), [
     "getTelegramSectionDiagnostics",
     "registerTelegramSection",
+  ]);
+  assert.deepEqual(Object.keys(status).sort(), [
+    "registerTelegramStatusLineProvider",
   ]);
   assert.deepEqual(Object.keys(voice).sort(), [
     "TELEGRAM_VOICE_REPLY_MODES",

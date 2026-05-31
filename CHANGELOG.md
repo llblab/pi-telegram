@@ -4,6 +4,11 @@
 
 No open changes.
 
+## 0.15.0: Companion Status Lines
+
+- `[API]` Added `registerTelegramStatusLineProvider()` on the public `/status` subpath so companion extensions can append compact rows to the `/start` menu status text. Providers are synchronous, model-aware, isolated on failure, and rendered with Telegram-style capitalized labels. Impact: quota/status widgets can progressively enhance the Telegram operator menu without owning polling, transport, or core menu rendering.
+- `[Docs]` Documented the status-line provider with an abstract companion-extension example and listed `pi-codex-usage` as a companion extension. Impact: the public API docs stay implementation-neutral while the README still points operators to the concrete Codex quota widget.
+
 ## 0.14.0: Direct Telegram Delivery, Queue Semantics, And Section Diagnostics
 
 - `[Prompt Guidance]` Tightened agent context for Telegram buttons: use normal Markdown plus top-level hidden `telegram_button` comments, never JSON button specs or standalone button actions, and keep comments out of code/quotes/lists/indented examples. Impact: agents immediately know how to author visible Telegram text, inline buttons, and direct `telegram_message` payloads without transport hacks.

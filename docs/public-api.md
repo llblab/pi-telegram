@@ -16,6 +16,7 @@ Preferred public imports:
 ```ts
 import telegram from "@llblab/pi-telegram";
 import { registerTelegramSection } from "@llblab/pi-telegram/sections";
+import { registerTelegramStatusLineProvider } from "@llblab/pi-telegram/status";
 import { registerTelegramUpdateHandler } from "@llblab/pi-telegram/updates";
 import { registerTelegramInboundHandler } from "@llblab/pi-telegram/inbound";
 import { registerTelegramOutboundHandler } from "@llblab/pi-telegram/outbound";
@@ -102,6 +103,9 @@ High-level stable APIs:
 - `registerTelegramSection()`
   - Identity: required `id`.
   - Purpose: managed menu/settings UI surfaces.
+- `registerTelegramStatusLineProvider()`
+  - Identity: required `id`.
+  - Purpose: compact companion status rows in the `/start` menu status text.
 - `registerTelegramVoiceTranscriptionProvider()`
   - Identity: required stable `id` for new code.
   - Purpose: STT fallback for voice/audio input.
@@ -164,6 +168,27 @@ Contract:
 - Section dynamic-label, render, and callback errors are isolated, surfaced as callback popups where applicable, and reflected by `getTelegramSectionDiagnostics()` until the matching surface succeeds.
 
 Full behavior: [Extension Sections](./sections.md).
+
+## Status Lines
+
+Import from `@llblab/pi-telegram/status`.
+
+```ts
+const off = registerTelegramStatusLineProvider(
+  ({ activeModel }) => {
+    if (activeModel?.provider !== "example-provider") return undefined;
+    return { label: "service", value: "ready" };
+  },
+  { id: "@scope/example-status" },
+);
+```
+
+Contract:
+
+- Providers are synchronous because `/start` status text is rendered inline with the menu.
+- Return `undefined` when the line is not relevant for the active model.
+- Provider failures are isolated and skipped so optional companion status cannot break the core Telegram menu.
+- The bridge renders rows as `<Label>: <value>` in the same HTML status block as Status, Usage, Cost, and Context, capitalizing the first label character for Telegram UI consistency.
 
 ## Updates
 

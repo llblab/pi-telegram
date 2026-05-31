@@ -209,7 +209,7 @@ Unknown inline-button callbacks are forwarded to π as `[callback] <data>` when 
 
 ### Extension Sections
 
-Ordinary pi extensions can register structured UI sections that appear in the main Telegram menu and Settings submenu without owning a second polling loop. Each section gets a narrow typed context with `edit`, `open`, `enqueuePrompt`, `answerCallback`, and `callbackData()` — enough to build interactive Telegram-native surfaces while `pi-telegram` owns transport, callback routing, navigation hierarchy, and diagnostics.
+Ordinary pi extensions can register structured UI sections that appear in the main Telegram menu and Settings submenu without owning a second polling loop. Companion extensions can also register compact status lines for the `/start` menu status text, allowing widgets such as quota indicators to appear beside Status, Usage, Cost, and Context only when relevant to the active model. Each section gets a narrow typed context with `edit`, `open`, `enqueuePrompt`, `answerCallback`, and `callbackData()` — enough to build interactive Telegram-native surfaces while `pi-telegram` owns transport, callback routing, navigation hierarchy, and diagnostics.
 
 Import `registerTelegramSection()` from `@llblab/pi-telegram/sections` and return a disposer on shutdown. Sections can send interactive messages directly into the chat via `ctx.open()` — confirmation dialogs, approve/deny gates, and multi-step forms live outside the menu hierarchy while callbacks route through the same typed handler. See [`@llblab/pi-telegram-extension-demo`](https://github.com/llblab/pi-telegram-extension-demo) for a working reference and the [Extension Sections Standard](./docs/sections.md) for the full contract.
 
@@ -259,6 +259,12 @@ Modes are `hidden`, `always`, and `interval`. `hidden` means no time line is add
 ## Companion Extensions
 
 Third-party extensions that integrate with `pi-telegram`:
+
+- [`pi-codex-usage`](https://github.com/llblab/pi-codex-usage) — Compact Codex subscription quota/status widget for the Pi statusline and the inline menu status text opened by `/start`.
+
+```bash
+pi install npm:@llblab/pi-codex-usage
+```
 
 - [`pi-telegram-tool-status`](https://github.com/Timur00Kh/pi-telegram-tool-status) — Live-updating service messages that list tools used by the agent. It keeps one message per Telegram prompt and edits it in place as tools execute.
 

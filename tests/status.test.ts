@@ -10,6 +10,7 @@ import {
   buildTelegramBridgeStatusLines,
   buildTelegramRuntimeEventLines,
   buildTelegramStatusBarText,
+  clearTelegramStatusLineProviders,
   createTelegramBridgeStatusRuntime,
   createTelegramRuntimeEventRecorder,
   createTelegramStatusHtmlBuilder,
@@ -17,6 +18,7 @@ import {
   getTelegramStatusBarProcessingStatus,
   recordStructuredTelegramRuntimeEvent,
   recordTelegramRuntimeEvent,
+  registerTelegramStatusLineProvider,
   type TelegramRuntimeEvent,
 } from "../lib/status.ts";
 
@@ -382,6 +384,40 @@ test("Status HTML builder binds active model lookup", () => {
   });
   assert.match(html, /Status.*idle/s);
   assert.match(html, /Context.*0\.0%\/1\.0k/s);
+});
+
+test("Status HTML builder includes companion status lines", () => {
+  clearTelegramStatusLineProviders();
+  const unregisterCodex = registerTelegramStatusLineProvider(
+    ({ activeModel }) =>
+      activeModel?.contextWindow === 1000
+        ? { label: "codex", value: "████ 23.7h" }
+        : undefined,
+    { id: "@scope/codex" },
+  );
+  const unregisterBroken = registerTelegramStatusLineProvider(
+    () => {
+      throw new Error("optional provider failed");
+    },
+    { id: "@scope/broken" },
+  );
+  try {
+    const buildStatusHtml = createTelegramStatusHtmlBuilder({
+      getActiveModel: () => ({ contextWindow: 1000 }),
+    });
+    const html = buildStatusHtml({
+      sessionManager: { getEntries: () => [] },
+      getContextUsage: () => ({ percent: 0, contextWindow: undefined }),
+      isIdle: () => true,
+      modelRegistry: { isUsingOAuth: () => false },
+    });
+    assert.match(html, /Context.*0\.0%\/1\.0k/s);
+    assert.match(html, /Codex.*████ 23\.7h/s);
+  } finally {
+    unregisterCodex();
+    unregisterBroken();
+    clearTelegramStatusLineProviders();
+  }
 });
 
 test("Status HTML builder shows compacting while compact is running", () => {
