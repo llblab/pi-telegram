@@ -4,6 +4,7 @@
  * Owns pi-facing tool, command, and lifecycle hook registration for the entrypoint
  */
 
+import * as AskUser from "./ask-user.ts";
 import * as CommandTemplates from "./command-templates.ts";
 import * as Commands from "./commands.ts";
 import * as Config from "./config.ts";
@@ -231,6 +232,13 @@ export function registerTelegramLifecycleRuntimeHooks({
     });
   const outboundReplyPlanner =
     OutboundHandlers.createTelegramOutboundReplyPlanner(buttonActionStore);
+  const askUserToolCallGuard = AskUser.createTelegramAskUserToolCallGuard({
+    getActiveTurn: activeTurnRuntime.get,
+    registerButtonAction: buttonActionStore.register,
+    sendMarkdownReply,
+    sendGuestReply,
+    recordRuntimeEvent,
+  });
   const outboundReplyArtifactSender =
     OutboundHandlers.createTelegramOutboundReplyArtifactSender({
       execCommand: CommandTemplates.execCommandTemplate,
@@ -319,6 +327,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     onSessionBeforeCompact: compactionObserver.onSessionBeforeCompact,
     onSessionCompact: compactionObserver.onSessionCompact,
     onAgentStart: agentStartWithDedupReset,
+    onToolCall: askUserToolCallGuard,
     onBeforeAgentStart: Prompts.createTelegramProactiveBeforeAgentStartHook({
       isConfigured: configStore.hasBotToken,
       isProactivePushEnabled,

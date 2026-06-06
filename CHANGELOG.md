@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `[ask_user]` Forward active Telegram-turn `ask_user` tool calls to Telegram-visible question messages, with inline buttons for non-guest single-select options, then block local tool execution so pi-ask-user does not open a hidden TUI/RPC dialog. Impact: Telegram-only operators can see and answer decision gates from pi-ask-user workflows.
+
 ## 0.16.6: Telegram Review Hardening Hotfix
 
 - `[Guest Mode]` Deny `guest_message` updates until the bridge already has a paired Telegram user. Impact: guest mode can no longer become the first pairing surface or trigger guest file/handler processing before explicit DM pairing.

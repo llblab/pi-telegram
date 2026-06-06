@@ -59,6 +59,7 @@ The repository uses a **Flat Domain DAG**:
 - `sections`: Telegram menu-section registry, opaque section callback tokens, render/callback dispatch, safe section ports, and diagnostics.
 - `keyboard`: shared inline-keyboard reply-markup shape only; feature domains own labels, callback data, and behavior.
 - `preview` / `replies` / `rendering`: streaming preview lifecycle, final reply delivery, reply parameters, Telegram HTML rendering, chunking, and stable preview snapshots.
+- `ask-user`: active-turn `ask_user` tool-call fallback that forwards questions to Telegram and prevents hidden local UI prompts.
 - `outbound-markup`: top-level assistant action comment parsing, attribute parsing, voice reply planning, and preview/delivery stripping.
 - `outbound`: outbound text transformations, voice/button artifact delivery, and generated callback actions.
 - `outbound-attachments`: `telegram_attach`, queued outbound files, stat/limit checks, and photo/document delivery classification.
@@ -189,7 +190,7 @@ Manual `/compact` requires inline confirmation because accidental taps are disru
 
 During active Telegram-owned turns, assistant message start/update hooks re-arm typing so transient provider/model errors do not leave a continuing run without Telegram activity feedback.
 
-### Rendering And Delivery
+### Rendering, Delivery, And Interactive Questions
 
 Telegram replies are rendered as Telegram HTML, not raw Markdown. The renderer is Telegram-specific and regression-prone.
 
@@ -204,6 +205,8 @@ Key guarantees:
 - Preview flushes are serialized so older edits cannot race newer snapshots.
 
 Final delivery attaches reply metadata only where requested. Reply parameters apply only to the first chunk of split messages; continuation chunks are adjacent normal messages. Media-group turns reply to the representative message id.
+
+When a Telegram-owned active turn calls the `ask_user` tool, the bridge catches the tool call before execution, sends the question back to the same Telegram surface, plans non-guest single-select options through the normal `telegram_button` callback store, and blocks the original tool call. Guest-mode turns receive the visible question through guest reply delivery without inline buttons. This prevents pi-ask-user from opening a local dialog that the Telegram operator cannot see. The operator's button tap or Telegram reply becomes a normal queued follow-up turn.
 
 ### Outbound Artifacts And Assistant Actions
 

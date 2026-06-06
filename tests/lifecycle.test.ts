@@ -290,6 +290,10 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
     onAgentStart: async () => {
       events.push("agent-start");
     },
+    onToolCall: () => {
+      events.push("tool-call");
+      return { block: true, reason: "blocked" };
+    },
     onToolExecutionStart: () => {
       events.push("tool-start");
     },
@@ -316,6 +320,7 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
       "before_agent_start",
       "model_select",
       "agent_start",
+      "tool_call",
       "tool_execution_start",
       "tool_execution_end",
       "message_start",
@@ -343,6 +348,10 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
   )({}, ctx);
   await getRequiredLifecycleHandler(harness.handlers, "model_select")({}, ctx);
   await getRequiredLifecycleHandler(harness.handlers, "agent_start")({}, ctx);
+  assert.deepEqual(
+    await getRequiredLifecycleHandler(harness.handlers, "tool_call")({}, ctx),
+    { block: true, reason: "blocked" },
+  );
   await getRequiredLifecycleHandler(harness.handlers, "tool_execution_start")(
     {},
     ctx,
@@ -366,6 +375,7 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
     "before-agent-start",
     "model-select",
     "agent-start",
+    "tool-call",
     "tool-start",
     "tool-end",
     "message-start",

@@ -87,6 +87,7 @@ The core product loop is mobile continuation: start or supervise work in the ter
 - Outbound voice delivery is one fallback pipeline: configured `outboundHandlers` with `type: "voice"` run first in `telegram.json` order, then programmatic voice handlers, then registered voice synthesis providers as zero-config progressive fallbacks; provider extensions must not override operator-configured handlers
 - `telegram_voice` text is arbitrary TTS-target text: use body form for multiline text, `<!-- telegram_voice text="Short summary" -->` for explicit one-line text, or `<!-- telegram_voice: Short summary -->` for one-line text with no attributes
 - `telegram_button` has three canonical forms: `<!-- telegram_button: OK -->` for label-only buttons, `<!-- telegram_button label=Continue prompt="Continue with the current plan." -->` for one-line prompts, or `<!-- telegram_button label="Show risks"\nList the main risks first.\n-->` for multiline prompts. Do not author JSON button specs, inline-after-text comments, standalone button tools, or comments inside code/quotes/lists/indented examples; write normal Markdown plus top-level hidden comments, and add visible parent text when buttons would otherwise be the only output
+- `ask_user` tool calls during active Telegram-owned turns must be forwarded to Telegram-visible question messages and blocked before local execution, because the pi-ask-user UI may otherwise appear only in the local/TUI session
 
 ## 6. Engineering Conventions
 
@@ -116,7 +117,7 @@ The canonical detailed ownership map lives in [`docs/architecture.md`](./docs/ar
 
 - Scheduling and lifecycle: `queue`, `runtime`, `lifecycle`, `locks`
 - Telegram transport and inbound flow: `api`, `polling`, `updates`, `routing`, `media`, `turns`, `inbound`, `config`, `setup`
-- Response surfaces: `preview`, `replies`, `rendering`, `keyboard`, `outbound-markup`, `outbound-attachments`, `outbound`, `voice`, `status`
+- Response surfaces: `preview`, `replies`, `rendering`, `keyboard`, `ask-user`, `outbound-markup`, `outbound-attachments`, `outbound`, `voice`, `status`
 - Controls and application menu UI: `commands`, `menu`, `menu-model`, `menu-thinking`, `menu-status`, `menu-queue`, `model`, `prompts`
 - Extension platform: `sections` owns section registry, token mapping, callback dispatch, context building, and its globalThis bridge; `voice` owns the voice-provider registry and its globalThis bridge
 - Pi SDK boundary: `pi` owns direct pi imports and bound extension API ports; `bindings` owns pi-facing command/tool/lifecycle registration wiring extracted from the entrypoint

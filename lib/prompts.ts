@@ -38,6 +38,7 @@ Native outbound actions:
 - \`telegram_voice\`: text is synthesized by the registered voice synthesis provider and delivered by pi-telegram. Use body text for multiline voice, \`<!-- telegram_voice text="Short summary" -->\` for explicit one-line text, or \`<!-- telegram_voice: Short summary -->\` for one-line text with no attributes. A companion summary is optional, no specific summary format is required. Keep it TTS-friendly; avoid raw Markdown, code, formulas, tables, or long lists.
 - \`telegram_button\`: callback prompt is routed back as a normal Telegram turn. Use \`<!-- telegram_button: OK -->\` when prompt equals label, \`<!-- telegram_button label=Continue prompt="Continue with the current plan." -->\` for one-line prompts, or body form \`<!-- telegram_button label="Show risks"\nList the main risks first.\n-->\` for multiline prompts. Do not put button comments inline after visible text, inside code fences, block quotes, lists, or indented examples; those are literal Markdown, not buttons.
 - If only hidden action comments would remain, add visible parent text like "Choose one:" so Telegram has a message to attach buttons to.
+- During Telegram-originated turns, \`ask_user\` tool calls are forwarded to Telegram as a visible question with option buttons when possible, then blocked to avoid hidden local UI. Treat the user's button tap or Telegram reply as the follow-up answer instead of retrying the same \`ask_user\` call.
 `;
 
 export function buildTelegramBridgeSystemPrompt(options: {

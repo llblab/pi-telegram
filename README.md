@@ -130,6 +130,10 @@ The menu is the primary way to inspect and mutate the queue. Reactions are an ex
 - Priority shortcuts: `👍`, `⚡️`, `❤️`, `🕊`, and `🔥` promote waiting work.
 - Removal shortcuts: `👎`, `👻`, `💔`, `💩`, and `🗑` remove waiting work from the queue.
 
+### Interactive `ask_user` prompts
+
+When an agent calls the `ask_user` tool during an active Telegram-originated turn, the bridge forwards the question to Telegram instead of opening a hidden local/TUI dialog. Single-select options become inline buttons when possible; otherwise the user can answer by replying in Telegram. Button taps and replies re-enter the normal Telegram prompt queue as follow-up work.
+
 ### Streaming and Telegram HTML rendering
 
 Closed Markdown blocks stream back as rich Telegram HTML while π is generating. The growing tail stays conservative until the final rendered reply lands. Long replies are split below Telegram limits without intentionally breaking HTML structures, links, code blocks, blockquotes, lists, or code fences.

@@ -91,6 +91,7 @@ test("Extension entrypoint wires domain bindings into the pi API", () => {
       "before_agent_start",
       "model_select",
       "agent_start",
+      "tool_call",
       "tool_execution_start",
       "tool_execution_end",
       "message_start",

@@ -16,6 +16,8 @@ import {
   type SessionShutdownEvent,
   type SessionStartEvent,
   type SlashCommandInfo,
+  type ToolCallEvent,
+  type ToolCallEventResult,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 
@@ -31,6 +33,8 @@ export type {
   SessionShutdownEvent,
   SessionStartEvent,
   SlashCommandInfo,
+  ToolCallEvent,
+  ToolCallEventResult,
 };
 
 export interface PiSettingsManager {

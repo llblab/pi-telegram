@@ -14,6 +14,8 @@ import type {
   SessionCompactEvent,
   SessionShutdownEvent,
   SessionStartEvent,
+  ToolCallEvent,
+  ToolCallEventResult,
 } from "./pi.ts";
 
 let resetTransportReplyDedupFn: (() => void) | undefined;
@@ -72,6 +74,10 @@ export interface TelegramLifecycleRegistrationDeps {
     event: AgentStartEvent,
     ctx: ExtensionContext,
   ) => Promise<void>;
+  onToolCall?: (
+    event: ToolCallEvent,
+    ctx: ExtensionContext,
+  ) => Promise<ToolCallEventResult | undefined> | ToolCallEventResult | undefined;
   onToolExecutionStart: (
     event: unknown,
     ctx: ExtensionContext,
@@ -325,6 +331,9 @@ export function registerTelegramLifecycleHooks(
   });
   pi.on("agent_start", async (event, ctx) => {
     await deps.onAgentStart(event, ctx);
+  });
+  pi.on("tool_call", async (event, ctx) => {
+    return deps.onToolCall?.(event, ctx);
   });
   pi.on("tool_execution_start", async (event, ctx) => {
     await deps.onToolExecutionStart(event, ctx);
