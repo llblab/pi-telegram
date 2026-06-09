@@ -113,10 +113,6 @@ interface TelegramLifecycleBindingDeps {
     Lifecycle.TelegramLifecycleRegistrationDeps,
     "onSessionStart" | "onSessionShutdown" | "onModelSelect"
   >;
-  queueSessionLifecycle: Pick<
-    Lifecycle.TelegramLifecycleRegistrationDeps,
-    "onSessionShutdown"
-  >;
   configStore: Pick<Config.TelegramConfigStore, "getOutboundHandlers">;
   abort: Runtime.TelegramRuntimeAbortPort;
   typing: Runtime.TelegramRuntimeTypingPort;
@@ -190,7 +186,6 @@ interface TelegramLifecycleBindingDeps {
 export function registerTelegramLifecycleRuntimeHooks({
   pi,
   sessionLifecycleRuntime,
-  queueSessionLifecycle,
   configStore,
   abort,
   typing,
@@ -283,6 +278,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     sendOutboundReplyArtifacts: outboundReplyArtifactSender,
     getDefaultChatId: proactivePushChatIdGetter,
     isProactivePushEnabled,
+    canSendProactivePush: lockOwnershipGuard.ownsContext,
     recordRuntimeEvent,
     getActiveToolExecutions: lifecycle.getActiveToolExecutions,
     setActiveToolExecutions: lifecycle.setActiveToolExecutions,
@@ -315,7 +311,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     ...agentLifecycleHooks,
     async onSessionShutdown(event, ctx) {
       compactionObserver.onSessionShutdown();
-      await queueSessionLifecycle.onSessionShutdown(event, ctx);
+      await sessionLifecycleRuntime.onSessionShutdown(event, ctx);
     },
     onSessionBeforeCompact: compactionObserver.onSessionBeforeCompact,
     onSessionCompact: compactionObserver.onSessionCompact,

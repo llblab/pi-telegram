@@ -47,7 +47,7 @@ Paste your bot token when prompted. If a bot token is already saved in `~/.pi/ag
 /telegram-connect
 ```
 
-The adapter is session-local: only one π instance polls Telegram at a time. `/telegram-connect` records only external control/polling ownership in `~/.pi/agent/locks.json`; live ownership moves require confirmation, while `/new` and same-`cwd` restarts resume automatically. Local queue and reply state stay per Pi instance, so an instance that loses Telegram control still finishes work it already accepted.
+The adapter is session-local: only one π instance polls Telegram at a time. `/telegram-connect` records only external control/polling ownership in `~/.pi/agent/locks.json`; live ownership moves require confirmation, inherited child sessions do not start polling unless they take ownership, and `/new` plus same-`cwd` restarts resume automatically. Local queue and reply state stay per Pi instance, so an instance that loses Telegram control still finishes work it already accepted.
 
 ### 4. Pair your Telegram account
 
@@ -215,7 +215,7 @@ Import `registerTelegramSection()` from `@llblab/pi-telegram/sections` and retur
 
 ### Proactive push
 
-`telegram.json` can set `proactivePush: true` to send successful local non-Telegram final replies to the paired Telegram chat when no Telegram turn is active. Local prompt text is not mirrored because the bot does not own terminal user messages. The mode is off by default and can be toggled from settings.
+`telegram.json` can set `proactivePush: true` to send successful local non-Telegram final replies to the paired Telegram chat when no Telegram turn is active and this π instance currently owns `/telegram-connect`. Non-owners skip proactive delivery instead of pushing unrelated local/headless results through a bot they no longer control. Local prompt text is not mirrored because the bot does not own terminal user messages. The mode is off by default and can be toggled from settings.
 
 ### Time context
 

@@ -406,6 +406,7 @@ export function startTelegramTypingLoop(
   };
   sendTyping();
   state.typingInterval = setInterval(sendTyping, deps.intervalMs);
+  state.typingInterval.unref?.();
   return true;
 }
 
@@ -431,7 +432,8 @@ export async function waitForTelegramTypingLoopIdle(
   await Promise.race([
     inFlight,
     new Promise<void>((resolve) => {
-      setTimeout(resolve, timeoutMs);
+      const timer = setTimeout(resolve, timeoutMs);
+      timer.unref?.();
     }),
   ]);
 }

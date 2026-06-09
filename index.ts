@@ -452,7 +452,6 @@ export default function (pi: Pi.ExtensionAPI) {
       ...sessionLifecycleRuntime,
       onModelSelect: currentModelRuntime.onModelSelect,
     },
-    queueSessionLifecycle,
     configStore,
     abort,
     typing,

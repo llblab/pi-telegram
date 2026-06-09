@@ -132,6 +132,7 @@ export function queueTelegramTextGroupMessage<
     if (!queued || queued.context === undefined) return;
     options.dispatchMessages(queued.messages, queued.context);
   }, options.debounceMs);
+  state.flushTimer.unref?.();
   options.groups.set(key, state);
   return true;
 }

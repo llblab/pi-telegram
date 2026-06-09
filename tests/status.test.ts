@@ -348,6 +348,28 @@ test("Bridge status runtime builds status state from live ports", () => {
   ]);
 });
 
+test("Bridge status lines distinguish unknown bot identity from missing config", () => {
+  const base = {
+    allowedUserId: 42,
+    pollingActive: true,
+    lastUpdateId: 100,
+    pendingDispatch: false,
+    compactionInProgress: false,
+    activeToolExecutions: 0,
+    pendingModelSwitch: false,
+    queuedItems: [],
+    recentRuntimeEvents: [],
+  };
+  assert.equal(
+    buildTelegramBridgeStatusLines({ ...base, hasBotToken: true })[1],
+    "- bot: unknown",
+  );
+  assert.equal(
+    buildTelegramBridgeStatusLines({ ...base, hasBotToken: false })[1],
+    "- bot: not configured",
+  );
+});
+
 test("Bridge status lines include queue lanes and recent runtime events", () => {
   const lines = buildTelegramBridgeStatusLines({
     botUsername: "demo_bot",

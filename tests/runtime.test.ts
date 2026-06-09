@@ -102,6 +102,18 @@ async function createRuntimeTelegramConfigFixture() {
   };
 }
 
+async function writeRuntimeTelegramLocks(
+  locks: Record<string, unknown>,
+): Promise<void> {
+  const agentDir = await ensureRuntimeAgentDir();
+  await mkdir(agentDir, { recursive: true });
+  await writeFile(
+    join(agentDir, "locks.json"),
+    JSON.stringify(locks, null, "\t") + "\n",
+    "utf8",
+  );
+}
+
 function createRuntimeDeferredResponse() {
   let resolve: (value: Response) => void = () => {};
   const promise = new Promise<Response>((promiseResolve) => {
@@ -821,6 +833,322 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
     await handlers.get("session_shutdown")?.({}, ctx);
   } finally {
     mock.timers.reset();
+    restoreFetch();
+    await telegramConfig.restore();
+  }
+});
+
+test("Extension runtime dispatches accepted queued work after polling ownership moves away", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const sentMessages: RuntimeHarnessMessage[] = [];
+  const sentBodies: Array<Record<string, unknown>> = [];
+  const { handlers, commands, pi } = createRuntimePiHarness({
+    sendUserMessage: (content) => {
+      sentMessages.push(content);
+    },
+  });
+  let getUpdatesCalls = 0;
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    const body = parseJsonRequestBody(init);
+    if (method === "deleteWebhook") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "getUpdates") {
+      getUpdatesCalls += 1;
+      if (getUpdatesCalls === 1) {
+        return createRuntimeTelegramApiResponse([
+          {
+            _: "other",
+            update_id: 1,
+            message: {
+              message_id: 7,
+              chat: { id: 99, type: "private" },
+              from: { id: 77, is_bot: false, first_name: "Test" },
+              text: "first accepted",
+            },
+          },
+          {
+            _: "other",
+            update_id: 2,
+            message: {
+              message_id: 8,
+              chat: { id: 99, type: "private" },
+              from: { id: 77, is_bot: false, first_name: "Test" },
+              text: "second queued",
+            },
+          },
+        ]);
+      }
+      throw new DOMException("stop", "AbortError");
+    }
+    if (method === "sendMessage") {
+      sentBodies.push(body ?? {});
+      return createRuntimeTelegramApiResponse({ message_id: 100 });
+    }
+    if (method === "sendChatAction") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+    });
+    await writeRuntimeTelegramLocks({});
+    (await getRuntimeTelegramExtension())(pi);
+    const ctx = createRuntimeExtensionContext({
+      cwd: "/repo/queue-owner-a",
+    });
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    await waitForEventLoopCondition(() => sentMessages.length === 1);
+    assert.match(
+      getRuntimeHarnessMessageText(sentMessages[0] as RuntimeHarnessMessage),
+      /^\[telegram\] first accepted$/,
+    );
+    await handlers.get("agent_start")?.({}, ctx);
+    await writeRuntimeTelegramLocks({
+      "@llblab/pi-telegram": {
+        pid: process.pid + 1_000_000,
+        cwd: "/repo/queue-owner-b",
+      },
+    });
+    await handlers.get("agent_end")?.(
+      {
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "First **final**" }],
+          },
+        ],
+      },
+      ctx,
+    );
+    await waitForEventLoopCondition(() => sentMessages.length === 2);
+    assert.match(String(sentBodies[0]?.text ?? ""), /First final/);
+    assert.match(
+      getRuntimeHarnessMessageText(sentMessages[1] as RuntimeHarnessMessage),
+      /^\[telegram\] second queued$/,
+    );
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    restoreFetch();
+    await telegramConfig.restore();
+  }
+});
+
+test("Extension runtime keeps proactive local result disabled even with Telegram lock ownership", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const sentBodies: Array<Record<string, unknown>> = [];
+  const { handlers, commands, pi } = createRuntimePiHarness();
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "deleteWebhook") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "getUpdates") {
+      throw new DOMException("stop", "AbortError");
+    }
+    if (method === "sendMessage") {
+      sentBodies.push(parseJsonRequestBody(init) ?? {});
+      return createRuntimeTelegramApiResponse({ message_id: 100 });
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+      proactivePush: false,
+    });
+    await writeRuntimeTelegramLocks({});
+    (await getRuntimeTelegramExtension())(pi);
+    const ctx = createRuntimeExtensionContext({
+      cwd: "/repo/proactive-disabled-owner",
+    });
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    await flushMicrotasks(20);
+    await handlers.get("agent_end")?.(
+      {
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "Local **done**" }],
+          },
+        ],
+      },
+      ctx,
+    );
+    assert.deepEqual(sentBodies, []);
+    await commands.get("telegram-disconnect")?.handler("", ctx);
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    restoreFetch();
+    await telegramConfig.restore();
+  }
+});
+
+test("Extension runtime resolves stale same-cwd lock before proactive local result", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const sentBodies: Array<Record<string, unknown>> = [];
+  const { handlers, pi } = createRuntimePiHarness();
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "deleteWebhook") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "getUpdates") {
+      throw new DOMException("stop", "AbortError");
+    }
+    if (method === "sendMessage") {
+      sentBodies.push(parseJsonRequestBody(init) ?? {});
+      return createRuntimeTelegramApiResponse({ message_id: 100 });
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    const cwd = "/repo/proactive-stale-owner";
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+      proactivePush: true,
+    });
+    await writeRuntimeTelegramLocks({
+      "@llblab/pi-telegram": {
+        pid: process.pid + 1_000_000,
+        cwd,
+      },
+    });
+    (await getRuntimeTelegramExtension())(pi);
+    const ctx = createRuntimeExtensionContext({ cwd });
+    await handlers.get("session_start")?.({}, ctx);
+    await flushMicrotasks(20);
+    await handlers.get("agent_end")?.(
+      {
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "Local **done**" }],
+          },
+        ],
+      },
+      ctx,
+    );
+    assert.equal(sentBodies.length, 1);
+    assert.equal(sentBodies[0]?.chat_id, 77);
+    assert.match(String(sentBodies[0]?.text ?? ""), /Local <b>done<\/b>/);
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    restoreFetch();
+    await telegramConfig.restore();
+  }
+});
+
+test("Extension runtime sends proactive local result only while owning Telegram lock", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const sentBodies: Array<Record<string, unknown>> = [];
+  const { handlers, commands, pi } = createRuntimePiHarness();
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "deleteWebhook") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "getUpdates") {
+      throw new DOMException("stop", "AbortError");
+    }
+    if (method === "sendMessage") {
+      sentBodies.push(parseJsonRequestBody(init) ?? {});
+      return createRuntimeTelegramApiResponse({ message_id: 100 });
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+      proactivePush: true,
+    });
+    await writeRuntimeTelegramLocks({});
+    (await getRuntimeTelegramExtension())(pi);
+    const ctx = createRuntimeExtensionContext({
+      cwd: "/repo/proactive-owner",
+    });
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    await flushMicrotasks(20);
+    await handlers.get("agent_end")?.(
+      {
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "Local **done**" }],
+          },
+        ],
+      },
+      ctx,
+    );
+    assert.equal(sentBodies.length, 1);
+    assert.equal(sentBodies[0]?.chat_id, 77);
+    assert.match(String(sentBodies[0]?.text ?? ""), /Local <b>done<\/b>/);
+    await commands.get("telegram-disconnect")?.handler("", ctx);
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    restoreFetch();
+    await telegramConfig.restore();
+  }
+});
+
+test("Extension runtime skips proactive local result without Telegram lock ownership", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const sentBodies: Array<Record<string, unknown>> = [];
+  const { handlers, pi } = createRuntimePiHarness();
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "sendMessage") {
+      sentBodies.push(parseJsonRequestBody(init) ?? {});
+      return createRuntimeTelegramApiResponse({ message_id: 100 });
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+      proactivePush: true,
+    });
+    await writeRuntimeTelegramLocks({
+      "@llblab/pi-telegram": {
+        pid: process.pid + 1_000_000,
+        cwd: "/repo/another-instance",
+      },
+    });
+    (await getRuntimeTelegramExtension())(pi);
+    const ctx = createRuntimeExtensionContext({
+      cwd: "/repo/proactive-non-owner",
+    });
+    await handlers.get("session_start")?.({}, ctx);
+    await handlers.get("agent_end")?.(
+      {
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "Local **done**" }],
+          },
+        ],
+      },
+      ctx,
+    );
+    assert.deepEqual(sentBodies, []);
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
     restoreFetch();
     await telegramConfig.restore();
   }

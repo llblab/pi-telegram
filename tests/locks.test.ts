@@ -119,6 +119,66 @@ test("Lock runtime replaces stale owners", () => {
   }
 });
 
+test("Locked polling runtime prevents inherited child sessions from polling the same agent dir", async () => {
+  const temp = createTempLockPath();
+  try {
+    const events: string[] = [];
+    const parentLock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+    });
+    const childLock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 11,
+      isProcessAlive: (pid) => pid === 10,
+    });
+    const parentRuntime = createTelegramLockedPollingRuntime({
+      lock: parentLock,
+      hasBotToken: () => true,
+      startPolling: async () => {
+        events.push("parent:start");
+      },
+      stopPolling: async () => {
+        events.push("parent:stop");
+      },
+      updateStatus: () => {
+        events.push("parent:status");
+      },
+    });
+    const childRuntime = createTelegramLockedPollingRuntime({
+      lock: childLock,
+      hasBotToken: () => true,
+      startPolling: async () => {
+        events.push("child:start");
+      },
+      stopPolling: async () => {
+        events.push("child:stop");
+      },
+      updateStatus: () => {
+        events.push("child:status");
+      },
+    });
+    assert.equal((await parentRuntime.start({ cwd: "/repo" })).ok, true);
+    await childRuntime.onSessionStart({}, { cwd: "/repo" });
+    const blocked = await childRuntime.start({ cwd: "/repo" });
+    assert.deepEqual(blocked, {
+      ok: false,
+      canTakeover: true,
+      owner: "pid 10, cwd /repo",
+      message:
+        "Telegram bridge is active in another π instance (pid 10, cwd /repo).",
+    });
+    assert.deepEqual(events, ["parent:start", "parent:status"]);
+    assert.deepEqual(readLocks(temp.path)[TELEGRAM_LOCK_KEY], {
+      pid: 10,
+      cwd: "/repo",
+    });
+    assert.equal(await parentRuntime.stop(), "Telegram bridge disconnected.");
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
 test("Locked polling runtime can force takeover of live polling owners", async () => {
   const temp = createTempLockPath();
   try {

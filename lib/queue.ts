@@ -842,6 +842,7 @@ export interface TelegramAgentEndRuntimeDeps<
   ) => Promise<void>;
   getDefaultChatId?: () => number | undefined;
   isProactivePushEnabled?: () => boolean;
+  canSendProactivePush?: () => boolean;
   recordRuntimeEvent?: (
     category: string,
     error: unknown,
@@ -888,6 +889,7 @@ export interface TelegramAgentEndHookRuntimeDeps<
   sendOutboundReplyArtifacts?: TelegramAgentEndRuntimeDeps<TTurn>["sendOutboundReplyArtifacts"];
   getDefaultChatId?: TelegramAgentEndRuntimeDeps<TTurn>["getDefaultChatId"];
   isProactivePushEnabled?: TelegramAgentEndRuntimeDeps<TTurn>["isProactivePushEnabled"];
+  canSendProactivePush?: (ctx: TContext) => boolean;
   recordRuntimeEvent?: TelegramAgentEndRuntimeDeps<TTurn>["recordRuntimeEvent"];
 }
 
@@ -980,6 +982,7 @@ export function createTelegramAgentEndHook<
   ): Promise<void> {
     const turn = deps.getActiveTurn();
     const proactiveEnabled = deps.isProactivePushEnabled?.() ?? false;
+    const canProactivePush = deps.canSendProactivePush?.(ctx) ?? false;
     await handleTelegramAgentEndRuntime({
       turn,
       assistant:
@@ -1005,6 +1008,7 @@ export function createTelegramAgentEndHook<
       sendOutboundReplyArtifacts: deps.sendOutboundReplyArtifacts,
       getDefaultChatId: deps.getDefaultChatId,
       isProactivePushEnabled: deps.isProactivePushEnabled,
+      canSendProactivePush: () => canProactivePush,
       recordRuntimeEvent: deps.recordRuntimeEvent,
     });
   };
@@ -1057,20 +1061,26 @@ export async function handleTelegramAgentEndRuntime<
     foldQueuedPromptsIntoHistory: deps.foldQueuedPromptsIntoHistory,
   });
   if (!turn) {
-    if (
-      deps.isProactivePushEnabled?.() &&
-      finalText &&
-      !assistant.errorMessage
-    ) {
-      const defaultChatId = deps.getDefaultChatId?.();
-      if (defaultChatId !== undefined) {
-        try {
-          await deps.sendMarkdownReply(defaultChatId, undefined, finalText);
-        } catch (error) {
-          deps.recordRuntimeEvent?.("proactive-push", error, {
-            chatId: defaultChatId,
-          });
+    const proactiveEnabled = deps.isProactivePushEnabled?.() ?? false;
+    const canProactivePush = deps.canSendProactivePush?.() ?? false;
+    if (proactiveEnabled && finalText && !assistant.errorMessage) {
+      if (canProactivePush) {
+        const defaultChatId = deps.getDefaultChatId?.();
+        if (defaultChatId !== undefined) {
+          try {
+            await deps.sendMarkdownReply(defaultChatId, undefined, finalText);
+          } catch (error) {
+            deps.recordRuntimeEvent?.("proactive-push", error, {
+              chatId: defaultChatId,
+            });
+          }
         }
+      } else {
+        deps.recordRuntimeEvent?.(
+          "proactive-push",
+          new Error("Proactive push skipped because this instance does not own Telegram polling."),
+          { phase: "ownership" },
+        );
       }
     }
     if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
@@ -1802,6 +1812,7 @@ export function createTelegramDeferredQueueDispatchRuntime<TContext = unknown>(
           return;
         dispatchNextQueuedTelegramTurn(boundContext);
       }, delayMs);
+      timer.unref?.();
       timers.add(timer);
     },
   };

@@ -104,6 +104,7 @@ export interface TelegramRuntimeEventRecorderOptions {
 }
 
 export interface TelegramBridgeStatusLineState {
+  hasBotToken?: boolean;
   botUsername?: string;
   allowedUserId?: number;
   lockState?: string;
@@ -488,6 +489,7 @@ export function createTelegramBridgeStatusRuntime<
     getBridgeStatusLineState: () => {
       const config = deps.getConfig();
       return {
+        hasBotToken: Boolean(config.botToken),
         botUsername: config.botUsername,
         allowedUserId: config.allowedUserId,
         lockState: deps.getRuntimeLockState?.(),
@@ -552,6 +554,13 @@ export function buildTelegramStatusBarText(
   return `${label} ${theme.fg("success", "connected")}`;
 }
 
+function formatTelegramBridgeBotStatus(
+  state: Pick<TelegramBridgeStatusLineState, "hasBotToken" | "botUsername">,
+): string {
+  if (state.botUsername) return `@${state.botUsername}`;
+  return state.hasBotToken ? "unknown" : "not configured";
+}
+
 export function buildTelegramBridgeStatusLines(
   state: TelegramBridgeStatusLineState,
 ): string[] {
@@ -566,7 +575,7 @@ export function buildTelegramBridgeStatusLines(
   ).length;
   return [
     "connection:",
-    `- bot: ${state.botUsername ? `@${state.botUsername}` : "not configured"}`,
+    `- bot: ${formatTelegramBridgeBotStatus(state)}`,
     `- allowed user: ${state.allowedUserId ?? "not paired"}`,
     ...(state.lockState ? [`- owner: ${state.lockState}`] : []),
     "",

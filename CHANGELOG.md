@@ -1,8 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.16.3: Ownership And Shutdown Hotfix
 
-No open changes.
+- `[Ownership]` Lock-gated proactive local/headless final-result push so only the current `/telegram-connect` owner can send non-Telegram agent-end replies to the paired chat, while accepted Telegram turns and queued work still finalize session-locally after polling ownership moves away. Impact: child/headless/non-owner instances no longer leak unrelated local results into Telegram.
+- `[Shutdown]` Made polling retry sleep abort-aware, `unref()`ed non-critical Telegram housekeeping timers, and routed registered session shutdown through the composed lifecycle runtime so session context cleanup runs with queue and polling cleanup. Impact: shutdown and print/headless runs are less likely to stay alive on retry/debounce/typing/preview timers, and direct-delivery ownership context is cleared at the session boundary.
+- `[Tests]` Added regressions for inherited child lock refusal, child-process no-poll ownership, child-process direct-tool non-owner refusal, proactive owner/non-owner/stale/off states, queued dispatch after lock movement, abort-during-retry polling sleep, process-level session shutdown, and real `pi -p` exit/no-leak paths with a local custom provider. Impact: the cross-instance ownership, queue, and shutdown contracts are pinned from unit coverage through CLI smoke coverage.
+- `[Status]` Changed `/telegram-status` bot identity fallback from `not configured` to `unknown` when a bot token exists but the bot username is absent. Impact: live sessions that are paired and polling no longer look unconfigured only because identity metadata is missing.
+- `[Docs]` Documented ownership, proactive-push, timer/shutdown, and multi-extension prompt-boundary contracts in README and `/docs`. Impact: companion extensions get clearer boundaries without adding a core question/prompt-mirroring API.
 
 ## 0.16.2: Screenshot Refresh Hotfix
 

@@ -923,11 +923,51 @@ test("Agent end runtime sends proactive local result", async () => {
     sendQueuedAttachments: async () => {},
     getDefaultChatId: () => 7,
     isProactivePushEnabled: () => true,
+    canSendProactivePush: () => true,
   });
   assert.deepEqual(events, [
     "reset",
     "status",
     "markdown:7:undefined:done",
+    "dispatch",
+  ]);
+});
+
+test("Agent end runtime skips proactive local result without ownership", async () => {
+  const events: string[] = [];
+  await handleTelegramAgentEndRuntime({
+    turn: undefined,
+    assistant: { text: "done" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {
+      events.push("unexpected:markdown");
+    },
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    getDefaultChatId: () => 7,
+    isProactivePushEnabled: () => true,
+    canSendProactivePush: () => false,
+    recordRuntimeEvent: (category, error, details) => {
+      const message = error instanceof Error ? error.message : String(error);
+      events.push(`${category}:${details?.phase}:${message}`);
+    },
+  });
+  assert.deepEqual(events, [
+    "reset",
+    "status",
+    "proactive-push:ownership:Proactive push skipped because this instance does not own Telegram polling.",
     "dispatch",
   ]);
 });

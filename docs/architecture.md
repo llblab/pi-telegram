@@ -88,10 +88,12 @@ Telegram configuration lives in `~/.pi/agent/telegram.json`. Polling ownership l
 - `/telegram-connect` acquires or moves singleton polling ownership before polling starts.
 - `/telegram-disconnect` stops polling and releases ownership.
 - Session start resumes polling only when the existing lock already points at the current `pid`/`cwd`, or when a stale same-`cwd` lock can be safely replaced after process restart.
+- Inherited child sessions that see the same `telegram.json` but do not own the `pid`/`cwd` lock must not auto-start polling or call `getUpdates` unless the operator force-takes ownership.
 - Session replacement suspends polling/watchers without releasing ownership so the next session-start hook in the same process can resume.
 - Live polling owners require explicit takeover confirmation.
 - Long-lived polling timers use snapshotted ownership context and stop local polling when the lock no longer points at their own process.
 - `locks.json` owns only external Telegram control/polling. Local extension and queue state are per Pi instance: losing the lock stops live Telegram control here, but does not drain or silence this instance's accepted queue, previews, final delivery, or dispatch.
+- Proactive local/headless final-result push is not accepted-turn delivery. It is allowed only when proactive push is enabled and this instance currently owns the Telegram lock.
 
 Deleting `locks.json` resets runtime ownership without deleting Telegram configuration.
 
@@ -159,7 +161,7 @@ Queued controls:
 - Prompt-template commands expand Telegram-safe π template aliases before entering the prompt queue.
 - Model-switch continuation uses the control lane when an in-flight Telegram-owned run must be stopped and resumed.
 
-UI label, navigation, tab, toggle, card, and dialog rules are defined in [UI Style](./ui-style.md). Callback prefix ownership is defined in [Callback Namespaces](./callback-namespaces.md).
+Queue and menu mutations are reachable through Telegram updates handled by the current polling owner. After ownership moves, the old instance keeps processing its accepted local queue, but it no longer receives new menu callbacks or control updates for remote mutation. UI label, navigation, tab, toggle, card, and dialog rules are defined in [UI Style](./ui-style.md). Callback prefix ownership is defined in [Callback Namespaces](./callback-namespaces.md).
 
 ### Compaction And Typing Status
 
@@ -215,6 +217,8 @@ Unknown callback data outside owned prefixes is forwarded as `[callback] <data>`
 
 Extension callbacks must avoid `pi-telegram` owned prefixes such as `compact:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `settings:`, and `section:`. Workflow-specific Telegram slash commands should use the public command registry instead of becoming new core built-ins unless they are bridge lifecycle, transport ownership, queue safety, or essential operator controls.
 
+The bridge does not mirror arbitrary `ctx.ui.confirm/input/select/custom` prompts from other extensions into Telegram. Companion extensions that need Telegram operation should expose a Telegram-native command, section, settings row, callback, status line, inbound/update handler, or assistant action-markup path instead of relying on hidden TUI-only prompts.
+
 ## Diagnostics And Operational Behavior
 
 Status rendering distinguishes connected, active, dispatching, queued, tool-running, model-switching, and compacting states. If a queue mutation removes the last waiting item while Telegram-owned work still has running tools, status remains active instead of degrading to connected.
@@ -223,7 +227,7 @@ Queue reactions are shortcut controls for waiting turns. Promotion reactions (`�
 
 `/telegram-status` records grouped diagnostics for transport/API, polling/update, prompt dispatch, controls, typing, compaction, setup, session lifecycle, attachment queue/delivery, and recent redacted runtime events. Expected preview noise such as unchanged edit responses is filtered out.
 
-When proactive push is enabled, successful local non-Telegram final replies are sent to the paired chat. Local prompt text is not mirrored because the bot does not own terminal user messages.
+When proactive push is enabled and this instance owns the Telegram lock, successful local non-Telegram final replies are sent to the paired chat. Non-owners skip proactive delivery and record a runtime diagnostic. Local prompt text is not mirrored because the bot does not own terminal user messages.
 
 Telegram prompt guidance asks assistants to keep dense mobile-visible text around 37 display cells where possible, because emoji and wide Unicode make raw character counts misleading.
 
@@ -237,6 +241,14 @@ When `/model` is used during an active Telegram-owned run, the bridge can emulat
 4. Dispatch the continuation after abort completion.
 
 This is limited to Telegram-owned runs. If π is busy with non-Telegram work, the bridge refuses the switch instead of hijacking unrelated activity.
+
+## Shutdown And Timer Lifecycle
+
+`session_shutdown` is the hard boundary for session-bound runtime work. It suspends Telegram polling through the locked polling runtime, aborts the poll controller, stops native typing, unbinds deferred queue dispatch, clears pending media/text-group input, clears preview state, clears active turns, and drops the active abort handler.
+
+Non-critical timers are `unref()`ed so print/headless processes are not kept alive only by Telegram housekeeping. This includes typing keepalive intervals, bounded typing-idle waits, deferred queue dispatch, media/text-group debounce windows, preview flush timers, and polling retry sleeps. Polling retry sleep is abort-aware, so shutdown does not wait for the normal retry delay after a polling error.
+
+Non-interactive `pi -p` runs must remain passive unless π provides a live Telegram session lifecycle. Loading the extension with `telegram.json`, proactive push settings, or existing lock state must not by itself keep the print-mode process alive or let a non-owner send proactive Telegram output.
 
 ## Related
 

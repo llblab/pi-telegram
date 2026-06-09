@@ -19,6 +19,7 @@ import {
   runTelegramPollLoop,
   shouldStartTelegramPolling,
   shouldStopTelegramPolling,
+  sleepTelegramPollingRetry,
   startTelegramPollingRuntime,
   stopTelegramPollingRuntime,
   TELEGRAM_ALLOWED_UPDATES,
@@ -482,6 +483,43 @@ test("Poll loop skips repeatedly failing updates after the configured threshold"
     "polling:handler failed:handleUpdate:1",
     "polling:handler failed:handleUpdate:2",
   ]);
+});
+
+test("Polling retry sleep resolves immediately when aborted", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await sleepTelegramPollingRetry(3000, controller.signal);
+});
+
+test("Poll loop stops without status reset when aborted during retry sleep", async () => {
+  const config = { botToken: "123:abc", lastUpdateId: 1 };
+  const controller = new AbortController();
+  const statusMessages: string[] = [];
+  let calls = 0;
+  await runTelegramPollLoop({
+    ctx: TEST_CONTEXT,
+    signal: controller.signal,
+    config,
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      calls += 1;
+      throw new Error("network down");
+    },
+    persistConfig: async () => {},
+    handleUpdate: async () => {},
+    onErrorStatus: (message) => {
+      statusMessages.push(`error:${message}`);
+    },
+    onStatusReset: () => {
+      statusMessages.push("unexpected:reset");
+    },
+    sleep: async (_ms, signal) => {
+      assert.equal(signal, controller.signal);
+      controller.abort();
+    },
+  });
+  assert.equal(calls, 1);
+  assert.deepEqual(statusMessages, ["error:network down"]);
 });
 
 test("Poll loop reports retryable errors and sleeps before retrying", async () => {

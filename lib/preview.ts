@@ -467,6 +467,7 @@ export function createTelegramPreviewController<
       state.flushTimer = setTimer(() => {
         void flushTelegramPreview(chatId, getRuntimeDeps());
       }, throttleMs);
+      state.flushTimer.unref?.();
     },
     finalize: (chatId, replyToMessageId) =>
       finalizeTelegramPreview(chatId, getRuntimeDeps(replyToMessageId)),

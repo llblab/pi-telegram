@@ -261,7 +261,7 @@ export interface TelegramPollLoopDeps<
   handleUpdate: (update: TUpdate, ctx: TContext) => Promise<void>;
   onErrorStatus: (message: string) => void;
   onStatusReset: () => void;
-  sleep: (ms: number) => Promise<void>;
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   maxUpdateFailures?: number;
 }
 
@@ -278,8 +278,33 @@ export interface TelegramPollLoopRunnerDeps<
   persistConfig: () => Promise<void>;
   handleUpdate: (update: TUpdate, ctx: TContext) => Promise<void>;
   updateStatus: (ctx: TContext, message?: string) => void;
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   maxUpdateFailures?: number;
+}
+
+export function sleepTelegramPollingRetry(
+  ms: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const onAbort = () => {
+      clearTimeout(timer);
+      finish();
+    };
+    timer = setTimeout(finish, ms);
+    timer.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 }
 
 export function createTelegramPollLoopRunner<
@@ -288,12 +313,7 @@ export function createTelegramPollLoopRunner<
 >(
   deps: TelegramPollLoopRunnerDeps<TUpdate, TContext>,
 ): (ctx: TContext, signal: AbortSignal) => Promise<void> {
-  const sleep =
-    deps.sleep ??
-    ((ms: number) =>
-      new Promise<void>((resolve) => {
-        setTimeout(resolve, ms);
-      }));
+  const sleep = deps.sleep ?? sleepTelegramPollingRetry;
   return (ctx, signal) =>
     runTelegramPollLoop({
       ctx,
@@ -393,7 +413,8 @@ export async function runTelegramPollLoop<
         deps.recordRuntimeEvent?.("polling", error, { phase: "loop" });
       }
       deps.onErrorStatus(getTelegramPollingErrorMessage(error));
-      await deps.sleep(3000);
+      await deps.sleep(3000, deps.signal);
+      if (deps.signal.aborted) return;
       deps.onStatusReset();
     }
   }

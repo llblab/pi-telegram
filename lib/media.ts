@@ -299,6 +299,7 @@ export function queueTelegramMediaGroupMessage<
     if (!state) return;
     options.dispatchMessages(state.messages, state.context);
   }, options.debounceMs);
+  existing.flushTimer.unref?.();
   options.groups.set(key, existing);
   return true;
 }
