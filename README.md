@@ -68,6 +68,8 @@ Most day-to-day controls live in the Telegram menu or π commands. A few importa
 - **Inbound file limit**: `PI_TELEGRAM_INBOUND_FILE_MAX_BYTES` or `TELEGRAM_MAX_FILE_SIZE_BYTES` changes the default 50 MiB Telegram download limit.
 - **Outbound attachment limit**: `PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES` or `TELEGRAM_MAX_ATTACHMENT_SIZE_BYTES` changes the default 50 MiB `telegram_attach` delivery limit.
 
+Set these variables before launching π. Some transport defaults (notably Telegram temp directory and inbound/outbound byte-limit constants) are intentionally captured when the extension modules load, while setup-token defaults and agent-dir lookups used by config/locks are read through their runtime helpers.
+
 ## Use
 
 Once paired, chat with your bot in Telegram. Text, images, files, replies, edits, media groups, and configured handler output are forwarded into π as Telegram-originated turns.

@@ -384,14 +384,30 @@ test("Telegram API helpers reject malformed successful responses", async () => {
   }
 });
 
-test("answerTelegramCallbackQuery ignores Telegram API failures", async () => {
+test("answerTelegramCallbackQuery records Telegram API failures without throwing", async () => {
+  const events: Array<Record<string, unknown>> = [];
   const restoreFetch = setApiTestFetch(async () => {
     throw new Error("network down");
   });
   try {
     await assert.doesNotReject(() =>
-      answerTelegramCallbackQuery("123:abc", "callback-id", "ok"),
+      answerTelegramCallbackQuery("123:abc", "callback-id", "ok", {
+        recordRuntimeEvent: (kind, error, details) => {
+          events.push({
+            kind,
+            message: error instanceof Error ? error.message : String(error),
+            details,
+          });
+        },
+      }),
     );
+    assert.deepEqual(events, [
+      {
+        kind: "api",
+        message: "network down",
+        details: { method: "answerCallbackQuery" },
+      },
+    ]);
   } finally {
     restoreFetch();
   }
@@ -477,7 +493,7 @@ test("Telegram bridge API runtime records structured failures", async () => {
         throw new Error("download failed");
       },
       answerCallbackQuery: async () => {
-        events.push({ kind: "answer" });
+        throw new Error("answer failed");
       },
     }),
   });
@@ -510,7 +526,11 @@ test("Telegram bridge API runtime records structured failures", async () => {
       message: "download failed",
       details: { suggestedName: "demo.txt" },
     },
-    { kind: "answer" },
+    {
+      kind: "api",
+      message: "answer failed",
+      details: { method: "answerCallbackQuery" },
+    },
   ]);
 });
 

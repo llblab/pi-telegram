@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.16.6: Telegram Review Hardening Hotfix
+
+- `[Guest Mode]` Deny `guest_message` updates until the bridge already has a paired Telegram user. Impact: guest mode can no longer become the first pairing surface or trigger guest file/handler processing before explicit DM pairing.
+- `[Lifecycle]` Unref the compaction observer fallback timer when the host timer supports it. Impact: headless or shutdown paths are less likely to linger until the 5-minute safety timeout.
+- `[Shutdown]` Stop polling before clearing active-turn/abort state, keep the abort controller visible until the polling promise settles, and record typing-cleanup failures without skipping polling abort. Impact: session shutdown and polling cleanup ordering is more deterministic.
+- `[Replies]` Scope transport-level reply deduplication by chat id. Impact: equal Telegram message ids in different chats no longer suppress valid reply metadata for each other.
+- `[Buttons]` Consume one-shot `telegram_button` callback actions after the first successful resolve. Impact: repeated taps on an old assistant-authored button no longer enqueue duplicate prompts.
+- `[Buttons]` Centralized Telegram `callback_data` byte-limit guards for generated inline keyboards outside the section helper path. Impact: oversized generated button callbacks fail locally before Telegram rejects the message.
+- `[Diagnostics]` Record `answerCallbackQuery` transport failures in runtime API diagnostics while keeping callback handling non-fatal. Impact: `/telegram-status` can explain failed Telegram callback acknowledgements instead of losing the signal silently.
+- `[Tests]` Added regressions for shutdown during pending control, long-text, and media-group dispatch, for settings menu callbacks persisting voice/time changes to `telegram.json`, for malformed/boundary Markdown rendering, and for runtime outbound delivery retrying a transient Telegram API failure. Impact: high-risk queue/timer/settings/rendering/API paths are pinned at the bridge boundary.
+- `[Docs]` Documented which environment-driven transport defaults should be set before launch because module-load constants intentionally capture them.
+- `[Backlog]` Captured and narrowed the non-blocking 2026-06 review-swarm follow-ups for lifecycle shutdown hardening, reply/callback/button state cleanup, validation coverage, and bindings maintainability.
+
 ## 0.16.5: Context-Aware Prompt Guidance Hotfix
 
 - `[Prompt Guidance]` Made before-agent-start Telegram guidance context-aware: unconfigured sessions receive no bridge suffix, local/TUI prompts receive only explicit direct-delivery guidance, and Telegram-originated turns keep the full inbound, phone-width, voice, and button contract. Impact: ordinary local replies no longer get raw Telegram action-comment syntax unless the current turn actually comes from Telegram.

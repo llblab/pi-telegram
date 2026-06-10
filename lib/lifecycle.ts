@@ -138,6 +138,11 @@ export function createTelegramSessionContextTracker(
 
 type TelegramLifecycleTimer = number | ReturnType<typeof setTimeout>;
 
+function unrefTelegramLifecycleTimer(timer: TelegramLifecycleTimer): void {
+  if (!timer || typeof timer !== "object") return;
+  if (typeof timer.unref === "function") timer.unref();
+}
+
 export interface TelegramCompactionObserverRuntimeDeps<TContext> {
   setCompactionInProgress: (inProgress: boolean) => void;
   updateStatus: (ctx: TContext) => void;
@@ -196,6 +201,7 @@ export function createTelegramCompactionObserverRuntime<TContext>(
         );
         requestDispatch();
       }, timeoutMs);
+      unrefTelegramLifecycleTimer(fallbackTimer);
     },
     onSessionCompact: (_event, ctx) => {
       clearFallbackTimer();

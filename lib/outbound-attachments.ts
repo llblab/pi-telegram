@@ -474,6 +474,7 @@ export async function sendQueuedTelegramOutboundAttachments(
       const method = isPhoto ? "sendPhoto" : "sendDocument";
       const fieldName = isPhoto ? "photo" : "document";
       const replyParameters = buildTelegramMultipartReplyParameters(
+        turn.chatId,
         turn.replyToMessageId,
       );
       await deps.sendMultipart(

@@ -1439,6 +1439,7 @@ export async function shutdownTelegramSessionRuntime<TQueueItem>(
   deps: TelegramSessionShutdownRuntimeDeps<TQueueItem>,
 ): Promise<void> {
   deps.unbindDeferredDispatchContext?.();
+  await deps.stopPolling();
   deps.applyState(buildTelegramSessionShutdownState<TQueueItem>());
   deps.clearPendingMediaGroups();
   deps.clearModelMenuState();
@@ -1448,7 +1449,6 @@ export async function shutdownTelegramSessionRuntime<TQueueItem>(
   }
   deps.clearActiveTurn();
   deps.clearAbort();
-  await deps.stopPolling();
 }
 
 export type TelegramSessionLifecycleRuntimeDeps<

@@ -38,6 +38,39 @@ test("HTML helpers do not reopen void tags across chunks", () => {
   assert.deepEqual(chunks, ["a<br>bbb", "bbbbbbbb".slice(0, 7)]);
 });
 
+test("Malformed and boundary markdown renders safely", () => {
+  const cases = [
+    "",
+    "```ts\nconst raw = '**not bold**'",
+    `${"x".repeat(MAX_MESSAGE_LENGTH + 250)} end`,
+    `surrogate-boundary: ${"🙂".repeat(120)}\uD83D`,
+    [
+      "> level 1",
+      "> > level 2",
+      "> > > level 3",
+      "> > > > level 4",
+      "> **bold quote",
+    ].join("\n"),
+  ];
+
+  for (const markdown of cases) {
+    let chunks: ReturnType<typeof renderTelegramMessage> = [];
+    assert.doesNotThrow(() => {
+      chunks = renderTelegramMessage(markdown, { mode: "markdown" });
+    });
+    for (const chunk of chunks) {
+      assert.ok(chunk.text.length <= MAX_MESSAGE_LENGTH);
+      assert.equal(
+        countMatches(chunk.text, /<blockquote>/g),
+        countMatches(chunk.text, /<\/blockquote>/g),
+      );
+      assert.equal(countMatches(chunk.text, /<b>/g), countMatches(chunk.text, /<\/b>/g));
+      assert.equal(countMatches(chunk.text, /<i>/g), countMatches(chunk.text, /<\/i>/g));
+      assert.equal(countMatches(chunk.text, /<pre>/g), countMatches(chunk.text, /<\/pre>/g));
+    }
+  }
+});
+
 test("Nested lists stay out of code blocks", () => {
   const chunks = renderTelegramMessage(
     "- Level 1\n  - Level 2\n    - Level 3 with **bold** text",

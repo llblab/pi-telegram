@@ -117,7 +117,7 @@ Deleting `locks.json` resets runtime ownership without deleting Telegram configu
 
 1. Poll updates through `getUpdates`.
 2. Persist update offsets only after successful handling; repeated handler failures are bounded.
-3. Filter to the paired private user.
+3. Filter to the paired private user; guest-mode updates require an existing paired user and cannot establish first pairing.
 4. Dispatch owned callbacks and controls before fallback prompt forwarding.
 5. Coalesce media groups and likely split long text when needed.
 6. Download files into `~/.pi/agent/tmp/telegram` with size limits and partial-download cleanup.

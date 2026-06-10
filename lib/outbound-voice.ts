@@ -7,6 +7,7 @@
 import { unlink } from "node:fs/promises";
 import { basename, extname } from "node:path";
 
+import { assertTelegramInlineKeyboardCallbackData } from "./keyboard.ts";
 import { getTelegramVoiceSynthesisProviders } from "./voice.ts";
 
 export interface TelegramVoiceReplyTurnView {
@@ -125,6 +126,7 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
     },
   ): Promise<void> {
     const voiceFilePath = await ensureTelegramVoiceFileFormat(filePath);
+    assertTelegramInlineKeyboardCallbackData(options?.replyMarkup);
     await sendVoiceChatAction(deps, turn.chatId);
     const replyParameters = buildVoiceReplyParameters(
       options?.replyToPrompt,

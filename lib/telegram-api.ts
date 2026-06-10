@@ -234,6 +234,14 @@ export interface TelegramFileDownloadOptions {
   maxFileSizeBytes?: number;
 }
 
+export interface TelegramAnswerCallbackQueryOptions {
+  recordRuntimeEvent?: (
+    kind: "api",
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
+}
+
 export interface TelegramApiClient {
   call: <TResponse>(
     method: string,
@@ -664,6 +672,7 @@ export async function answerTelegramCallbackQuery(
   botToken: string | undefined,
   callbackQueryId: string,
   text?: string,
+  options: TelegramAnswerCallbackQueryOptions = {},
 ): Promise<void> {
   try {
     await callTelegram<boolean>(
@@ -673,8 +682,10 @@ export async function answerTelegramCallbackQuery(
         ? { callback_query_id: callbackQueryId, text }
         : { callback_query_id: callbackQueryId },
     );
-  } catch {
-    // ignore
+  } catch (error) {
+    options.recordRuntimeEvent?.("api", error, {
+      method: "answerCallbackQuery",
+    });
   }
 }
 
@@ -705,7 +716,9 @@ export function createDefaultTelegramBridgeApiRuntime(deps: {
   recordRuntimeEvent: TelegramBridgeApiRuntimeDeps["recordRuntimeEvent"];
 }): TelegramBridgeApiRuntime {
   return createTelegramBridgeApiRuntime({
-    client: createTelegramApiClient(deps.getBotToken),
+    client: createTelegramApiClient(deps.getBotToken, {
+      recordRuntimeEvent: deps.recordRuntimeEvent,
+    }),
     tempDir: getTelegramApiTempDir(),
     maxFileSizeBytes: TELEGRAM_INBOUND_FILE_MAX_BYTES,
     tempFileMaxAgeMs: TELEGRAM_TEMP_FILE_MAX_AGE_MS,
@@ -834,8 +847,14 @@ export function createTelegramBridgeApiRuntime(
         throw error;
       }
     },
-    answerCallbackQuery: (callbackQueryId, text) => {
-      return deps.client.answerCallbackQuery(callbackQueryId, text);
+    answerCallbackQuery: async (callbackQueryId, text) => {
+      try {
+        await deps.client.answerCallbackQuery(callbackQueryId, text);
+      } catch (error) {
+        deps.recordRuntimeEvent("api", error, {
+          method: "answerCallbackQuery",
+        });
+      }
     },
     answerGuestQuery: (
       guestQueryId: string,
@@ -876,6 +895,7 @@ export function createTelegramBridgeApiRuntime(
  */
 export function createTelegramApiClient(
   getBotToken: () => string | undefined,
+  options: TelegramAnswerCallbackQueryOptions = {},
 ): TelegramApiClient {
   return {
     call: async (method, body, options) => {
@@ -909,7 +929,12 @@ export function createTelegramApiClient(
       );
     },
     answerCallbackQuery: async (callbackQueryId, text) => {
-      await answerTelegramCallbackQuery(getBotToken(), callbackQueryId, text);
+      await answerTelegramCallbackQuery(
+        getBotToken(),
+        callbackQueryId,
+        text,
+        options,
+      );
     },
   };
 }

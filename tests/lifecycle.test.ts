@@ -123,6 +123,27 @@ test("Compaction observer mirrors active work with native typing", () => {
   ]);
 });
 
+test("Compaction observer unrefs fallback timers when supported", () => {
+  const events: string[] = [];
+  const observer = createTelegramCompactionObserverRuntime({
+    setCompactionInProgress: () => {},
+    updateStatus: () => {},
+    requestDeferredDispatchNextQueuedTelegramTurn: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+    setTimer(callback) {
+      assert.equal(typeof callback, "function");
+      return {
+        unref() {
+          events.push("unref");
+        },
+      } as ReturnType<typeof setTimeout>;
+    },
+    clearTimer() {},
+  });
+  observer.onSessionBeforeCompact({} as never, createLifecycleContext());
+  assert.deepEqual(events, ["unref"]);
+});
+
 test("Compaction observer stops typing on timeout and shutdown", () => {
   const events: string[] = [];
   let timerCallback: (() => void) | undefined;

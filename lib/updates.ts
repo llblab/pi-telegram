@@ -406,7 +406,8 @@ export function buildTelegramUpdateExecutionPlan<
       return {
         kind: "guest",
         guestMessage: action.guestMessage,
-        shouldDeny: action.authorization.kind === "deny",
+        // Guest mode is an extension of an already paired bridge, not a pairing surface.
+        shouldDeny: action.authorization.kind !== "allow",
       };
   }
 }

@@ -11,6 +11,7 @@ import test from "node:test";
 
 import type { TelegramConfig } from "../lib/config.ts";
 import {
+  createTelegramConfigControls,
   createTelegramConfigStore,
   createTelegramTimeInjectionModeGetter,
   createTelegramTimeInjectionModeSetter,
@@ -25,6 +26,7 @@ import {
   updateTelegramVoiceConfig,
   writeTelegramConfig,
 } from "../lib/config.ts";
+import { createTelegramSettingsMenuRuntime } from "../lib/menu-settings.ts";
 import {
   createTelegramSetupPromptRuntime,
   getTelegramBotTokenInputDefault,
@@ -129,6 +131,64 @@ test("Telegram voice reply mode setter persists telegram.json", async () => {
   assert.equal(store.get().voice, undefined);
   assert.deepEqual(await readTelegramConfig(configPath), {
     botToken: "123:abc",
+  });
+});
+
+test("Telegram settings menu callbacks persist voice and time settings to telegram.json", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-settings-callbacks-"));
+  const configPath = join(agentDir, "telegram.json");
+  const store = createTelegramConfigStore({
+    initialConfig: { botToken: "123:abc" },
+    agentDir,
+    configPath,
+  });
+  const controls = createTelegramConfigControls(store);
+  const state = {
+    chatId: 1,
+    messageId: 2,
+    mode: "settings" as const,
+    page: 0,
+    scope: "all" as const,
+    scopedModels: [],
+    allModels: [],
+  };
+  const runtime = createTelegramSettingsMenuRuntime({
+    ...controls,
+    getModelMenuState: async () => state,
+    getStoredModelMenuState: () => state,
+    storeModelMenuState: () => {},
+    editInteractiveMessage: async () => {},
+    sendInteractiveMessage: async () => state.messageId,
+    answerCallbackQuery: async () => {},
+  });
+
+  assert.equal(
+    await runtime.handleCallbackQuery(
+      {
+        id: "voice",
+        data: "settings:set:voice-reply:mirror",
+        message: { message_id: state.messageId },
+      },
+      {},
+    ),
+    true,
+  );
+  assert.equal(
+    await runtime.handleCallbackQuery(
+      {
+        id: "time",
+        data: "settings:set:time-injection:always",
+        message: { message_id: state.messageId },
+      },
+      {},
+    ),
+    true,
+  );
+
+  assert.deepEqual(await readTelegramConfig(configPath), {
+    botToken: "123:abc",
+    voice: { replyMode: "mirror" },
+    time: { injectionMode: "always" },
   });
 });
 

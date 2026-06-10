@@ -116,7 +116,8 @@ test("Polling runtime starts and stops polling through state ports", async () =>
   assert.equal(!!pollingPromise, true);
   assert.equal(!!pollingController, true);
   const stopPromise = stopTelegramPollingRuntime(deps);
-  assert.equal(pollingController, undefined);
+  assert.equal(pollingController?.signal.aborted, true);
+  assert.equal(!!pollingController, true);
   finishPollLoop?.();
   await stopPromise;
   assert.deepEqual(events, [
@@ -125,11 +126,65 @@ test("Polling runtime starts and stops polling through state ports", async () =>
     "promise:set",
     "status:ctx",
     "typing:stop",
-    "controller:clear",
     "promise:clear",
     "controller:clear",
     "status:ctx",
+  ]);
+});
+
+test("Polling runtime still aborts and settles when typing cleanup fails", async () => {
+  const events: string[] = [];
+  let pollingPromise: Promise<void> | undefined;
+  let pollingController: AbortController | undefined;
+  let finishPollLoop: (() => void) | undefined;
+  const deps = {
+    hasBotToken: () => true,
+    getPollingPromise: () => pollingPromise,
+    setPollingPromise: (promise: Promise<void> | undefined) => {
+      pollingPromise = promise;
+      events.push(`promise:${promise ? "set" : "clear"}`);
+    },
+    getPollingController: () => pollingController,
+    setPollingController: (controller: AbortController | undefined) => {
+      pollingController = controller;
+      events.push(`controller:${controller ? "set" : "clear"}`);
+    },
+    stopTypingLoop: () => {
+      events.push("typing:throw");
+      throw new Error("typing cleanup failed");
+    },
+    runPollLoop: async (_ctx: string, signal: AbortSignal) => {
+      await new Promise<void>((resolve) => {
+        finishPollLoop = () => {
+          events.push(`run-finish:${signal.aborted}`);
+          resolve();
+        };
+      });
+    },
+    updateStatus: () => {},
+    recordRuntimeEvent: (
+      category: string,
+      error: unknown,
+      details?: Record<string, unknown>,
+    ) => {
+      events.push(
+        `${category}:${error instanceof Error ? error.message : String(error)}:${details?.phase}`,
+      );
+    },
+  };
+  startTelegramPollingRuntime("ctx", deps);
+  const stopPromise = stopTelegramPollingRuntime(deps);
+  assert.equal(pollingController?.signal.aborted, true);
+  finishPollLoop?.();
+  await stopPromise;
+  assert.deepEqual(events, [
+    "controller:set",
+    "promise:set",
+    "typing:throw",
+    "polling:typing cleanup failed:typing-stop",
+    "run-finish:true",
     "promise:clear",
+    "controller:clear",
   ]);
 });
 

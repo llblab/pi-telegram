@@ -2320,13 +2320,13 @@ test("Session runtime helper runs shutdown side effects in order", async () => {
   });
   assert.deepEqual(events, [
     "unbind",
+    "polling",
     "state:0",
     "media",
     "menus",
     "preview:42",
     "turn",
     "abort",
-    "polling",
   ]);
 });
 
@@ -3024,6 +3024,66 @@ test("Queue dispatch controller blocks reentrant prompt dispatch while control i
   ]);
 });
 
+test("Queue dispatch controller does not resume prompts after shutdown clears context during control", async () => {
+  const events: string[] = [];
+  let dispatchContextActive = true;
+  let releaseControl: () => void = () => {};
+  const controlSettled = new Promise<void>((resolve) => {
+    releaseControl = resolve;
+  });
+  let queuedItems: TelegramQueueItem<string>[] = [
+    createQueueTestControlItem<string>({
+      queueOrder: 1,
+      laneOrder: 1,
+      execute: async () => {
+        events.push("control:start");
+        await controlSettled;
+        events.push("control:end");
+      },
+    }),
+    createQueueTestPromptTurn({
+      chatId: 3,
+      replyToMessageId: 4,
+      sourceMessageIds: [4],
+      queueOrder: 2,
+      laneOrder: 2,
+    }),
+  ];
+  const controller = createTelegramQueueDispatchController<string>({
+    hasDispatchContext: () => dispatchContextActive,
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => {
+      queuedItems = items;
+      events.push(`items:${items.length}`);
+    },
+    canDispatch: () => true,
+    updateStatus: (_ctx, error) => {
+      events.push(`status:${error ?? "ok"}`);
+    },
+    sendTextReply: async () => undefined,
+    onPromptDispatchStart: (_ctx, chatId) => {
+      events.push(`start:${chatId}`);
+    },
+    sendUserMessage: () => {
+      events.push("send");
+    },
+    onPromptDispatchFailure: () => {
+      events.push("unexpected:failure");
+    },
+  });
+  controller.dispatchNext("ctx");
+  dispatchContextActive = false;
+  queuedItems = [];
+  releaseControl();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [
+    "items:1",
+    "status:ok",
+    "control:start",
+    "control:end",
+  ]);
+});
+
 test("Session runtime helper resets session start state", () => {
   const currentModel = createQueueTestModel();
   const state = buildTelegramSessionStartState(currentModel);
@@ -3179,6 +3239,7 @@ test("Session lifecycle runtime binds state applier into lifecycle hooks", async
     "bind:ctx",
     "status:ctx",
     "unbind",
+    "polling:stop",
     "queued:0",
     "counters",
     "flags",
@@ -3188,7 +3249,6 @@ test("Session lifecycle runtime binds state applier into lifecycle hooks", async
     "menu:clear",
     "turn:clear",
     "abort:clear",
-    "polling:stop",
   ]);
 });
 
@@ -3250,12 +3310,12 @@ test("Session lifecycle hooks bind start and shutdown runtime ports", async () =
     "bind:gpt-5",
     "status:gpt-5",
     "unbind",
+    "poll",
     "shutdown:0",
     "media",
     "menu",
     "preview:7",
     "turn",
     "abort",
-    "poll",
   ]);
 });

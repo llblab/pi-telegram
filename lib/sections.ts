@@ -4,10 +4,12 @@
  * Owns section registration, global registry binding, token mapping, main-menu/settings row injection, and section callback dispatch
  */
 
-import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
+import {
+  assertTelegramCallbackData,
+  type TelegramInlineKeyboardMarkup,
+} from "./keyboard.ts";
 
 const SECTION_REGISTRY_KEY = "__piTelegramSectionRegistry__";
-const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
 
 // --- Core Types ---
 
@@ -301,10 +303,6 @@ const BACK_NAV_ROW = {
   text: "⬆️ Back",
 } as const;
 
-function getUtf8ByteLength(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
-}
-
 function sectionErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -317,13 +315,7 @@ function buildTelegramSectionCallbackData(
   const data = payload
     ? `section:${token}:${action}:${payload}`
     : `section:${token}:${action}`;
-  const byteLength = getUtf8ByteLength(data);
-  if (byteLength > TELEGRAM_CALLBACK_DATA_MAX_BYTES) {
-    throw new Error(
-      `Telegram section callback_data exceeds ${TELEGRAM_CALLBACK_DATA_MAX_BYTES} bytes (${byteLength}). Use a shorter action/payload or store state behind a compact key.`,
-    );
-  }
-  return data;
+  return assertTelegramCallbackData(data, "Telegram section callback_data");
 }
 
 function prependBackRow(

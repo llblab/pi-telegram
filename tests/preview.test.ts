@@ -354,7 +354,7 @@ test("Preview message transport adapts Bot API bodies and reply metadata", async
       calls.push(body);
       return "edited";
     },
-    buildReplyParameters: (messageId) =>
+    buildReplyParameters: (_chatId, messageId) =>
       messageId === undefined
         ? undefined
         : { message_id: messageId, allow_sending_without_reply: true },
@@ -531,7 +531,7 @@ test("Preview controller runtime binds Bot API and rendered-chunk transports", a
     editMessageText: async (body) => {
       calls.push(body);
     },
-    buildReplyParameters: (messageId) =>
+    buildReplyParameters: (_chatId, messageId) =>
       messageId === undefined
         ? undefined
         : { message_id: messageId, allow_sending_without_reply: true },

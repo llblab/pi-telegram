@@ -365,23 +365,30 @@ test("Update execution plan preserves deleted and reaction actions", () => {
 });
 
 test("Update execution plan maps guest authorization to deny flag", () => {
+  const guestMessage = {
+    guest_query_id: "gq-1",
+    chat: { type: "supergroup" },
+    from: { id: 1, is_bot: false },
+  };
   const guestPlan = buildTelegramUpdateExecutionPlan({
     kind: "guest",
-    guestMessage: {
-      guest_query_id: "gq-1",
-      chat: { type: "supergroup" },
-      from: { id: 1, is_bot: false },
-    },
+    guestMessage,
     authorization: { kind: "allow" },
   });
   assert.deepEqual(guestPlan, {
     kind: "guest",
-    guestMessage: {
-      guest_query_id: "gq-1",
-      chat: { type: "supergroup" },
-      from: { id: 1, is_bot: false },
-    },
+    guestMessage,
     shouldDeny: false,
+  });
+  const unpairedGuestPlan = buildTelegramUpdateExecutionPlan({
+    kind: "guest",
+    guestMessage,
+    authorization: { kind: "pair", userId: 1 },
+  });
+  assert.deepEqual(unpairedGuestPlan, {
+    kind: "guest",
+    guestMessage,
+    shouldDeny: true,
   });
 });
 
@@ -498,6 +505,40 @@ test("Update runtime routes guest messages through guest handler", async () => {
     "ctx",
   );
   assert.deepEqual(events, ["guest:gq-1"]);
+});
+
+test("Update runtime denies guest messages before pairing", async () => {
+  const events: string[] = [];
+  const runtime = createTelegramUpdateRuntime({
+    getAllowedUserId: () => undefined,
+    removePendingMediaGroupMessages: () => {},
+    removeQueuedTelegramTurnsByMessageIds: () => 0,
+    clearQueuedTelegramTurnPriorityByMessageId: () => true,
+    prioritizeQueuedTelegramTurnByMessageId: () => true,
+    pairTelegramUserIfNeeded: async () => false,
+    answerCallbackQuery: async () => {},
+    answerGuestQuery: async (id, text) => {
+      events.push(`guest-deny:${id}:${text ?? ""}`);
+    },
+    handleAuthorizedTelegramCallbackQuery: async () => {},
+    sendTextReply: async () => 1,
+    handleAuthorizedTelegramMessage: async () => {},
+    handleAuthorizedTelegramEditedMessage: async () => {},
+    handleAuthorizedTelegramGuestMessage: async () => {
+      events.push("guest-handled");
+    },
+  });
+  await runtime.handleUpdate(
+    {
+      guest_message: {
+        guest_query_id: "gq-unpaired",
+        chat: { type: "supergroup" },
+        from: { id: 42, is_bot: false },
+      },
+    },
+    "ctx",
+  );
+  assert.deepEqual(events, ["guest-deny:gq-unpaired:Access denied."]);
 });
 
 test("Update runtime answers guest query with access denied for unauthorized users", async () => {

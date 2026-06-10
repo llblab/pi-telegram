@@ -12,6 +12,7 @@ test.beforeEach(() => {
 });
 
 import {
+  buildTelegramReplyParameters,
   buildTelegramReplyTransport,
   createReplyDedupRuntime,
   createTelegramRenderedMessageDeliveryRuntime,
@@ -97,6 +98,31 @@ test("Reply delivery sends chunks and applies reply markup only to the last chun
       },
     },
   ]);
+});
+
+test("Reply delivery rejects generated buttons above Telegram callback limit", async () => {
+  const sentBodies: Array<Record<string, unknown>> = [];
+  await assert.rejects(
+    () =>
+      sendTelegramRenderedChunks(
+        7,
+        [{ text: "one" }],
+        {
+          sendMessage: async (body) => {
+            sentBodies.push(body);
+            return { message_id: sentBodies.length };
+          },
+          editMessage: async () => {},
+        },
+        {
+          replyMarkup: {
+            inline_keyboard: [[{ text: "Too long", callback_data: "x".repeat(65) }]],
+          },
+        },
+      ),
+    /exceeds 64 bytes/,
+  );
+  assert.deepEqual(sentBodies, []);
 });
 
 test("Reply delivery applies reply parameters only to the first chunk", async () => {
@@ -268,6 +294,23 @@ test("Reply runtime falls back to plain delivery when markdown rendering yields 
   });
   assert.equal(messageId, 9);
   assert.deepEqual(calls, ["plain"]);
+});
+
+test("Transport reply dedup scopes repeated prompt message ids by chat", () => {
+  assert.deepEqual(buildTelegramReplyParameters(1, 42), {
+    message_id: 42,
+    allow_sending_without_reply: true,
+  });
+  assert.equal(buildTelegramReplyParameters(1, 42), undefined);
+  assert.deepEqual(buildTelegramReplyParameters(2, 42), {
+    message_id: 42,
+    allow_sending_without_reply: true,
+  });
+  resetTransportReplyDedup();
+  assert.deepEqual(buildTelegramReplyParameters(1, 42), {
+    message_id: 42,
+    allow_sending_without_reply: true,
+  });
 });
 
 test("Reply dedup tracks first reply per prompt message id and resets", () => {

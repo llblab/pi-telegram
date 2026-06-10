@@ -187,11 +187,21 @@ export function shouldStartTelegramPolling(
 export async function stopTelegramPollingRuntime<TContext>(
   deps: TelegramPollingRuntimeDeps<TContext>,
 ): Promise<void> {
-  deps.stopTypingLoop();
-  deps.getPollingController()?.abort();
-  deps.setPollingController(undefined);
-  await deps.getPollingPromise()?.catch(() => undefined);
-  deps.setPollingPromise(undefined);
+  const pollingPromise = deps.getPollingPromise();
+  const pollingController = deps.getPollingController();
+  try {
+    deps.stopTypingLoop();
+  } catch (error) {
+    deps.recordRuntimeEvent?.("polling", error, { phase: "typing-stop" });
+  }
+  pollingController?.abort();
+  await pollingPromise?.catch(() => undefined);
+  if (deps.getPollingPromise() === pollingPromise) {
+    deps.setPollingPromise(undefined);
+  }
+  if (deps.getPollingController() === pollingController) {
+    deps.setPollingController(undefined);
+  }
 }
 
 function updateTelegramPollingStatusSafely<TContext>(
@@ -224,9 +234,12 @@ export function startTelegramPollingRuntime<TContext>(
   }
   const controller = deps.createAbortController?.() ?? new AbortController();
   deps.setPollingController(controller);
-  const promise = deps.runPollLoop(ctx, controller.signal).finally(() => {
-    deps.setPollingPromise(undefined);
-    deps.setPollingController(undefined);
+  let promise: Promise<void>;
+  promise = deps.runPollLoop(ctx, controller.signal).finally(() => {
+    if (deps.getPollingPromise() === promise) deps.setPollingPromise(undefined);
+    if (deps.getPollingController() === controller) {
+      deps.setPollingController(undefined);
+    }
     updateTelegramPollingStatusSafely(deps.updateStatus, ctx, {
       recordRuntimeEvent: deps.recordRuntimeEvent,
     });

@@ -40,12 +40,23 @@ test("Button reply planner strips telegram_button markup and registers actions",
   });
 });
 
-test("Button action store resolves registered actions and expires old entries", () => {
-  const store = createTelegramButtonActionStore({ ttlMs: -1 });
+test("Button action store resolves registered actions once and expires old entries", () => {
+  const store = createTelegramButtonActionStore();
   const callbackData = store.register({ text: "Run", prompt: "Do it." });
 
+  assert.deepEqual(store.resolve(callbackData), {
+    text: "Run",
+    prompt: "Do it.",
+  });
   assert.equal(store.resolve(callbackData), undefined);
   assert.equal(store.resolve("other:callback"), undefined);
+
+  const expiringStore = createTelegramButtonActionStore({ ttlMs: -1 });
+  const expiredCallbackData = expiringStore.register({
+    text: "Expired",
+    prompt: "Too late.",
+  });
+  assert.equal(expiringStore.resolve(expiredCallbackData), undefined);
 });
 
 test("Button prompt turn preserves prompt text and queue metadata", () => {

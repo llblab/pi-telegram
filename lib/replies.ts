@@ -4,6 +4,7 @@
  * Owns rendered-message delivery, reply transport wiring, and plain or markdown final replies
  */
 
+import { assertTelegramInlineKeyboardCallbackData } from "./keyboard.ts";
 import type {
   TelegramReplyParameters,
   TelegramSentMessage,
@@ -50,25 +51,29 @@ export function createReplyDedupRuntime(): ReplyDedupRuntime {
 
 // --- Transport-level dedup ---
 
-let lastRepliedToMessageId: number | undefined;
+const lastRepliedToMessageIdByChat = new Map<number, number>();
 
 export function resetTransportReplyDedup(): void {
-  lastRepliedToMessageId = undefined;
+  lastRepliedToMessageIdByChat.clear();
 }
 
 export function buildTelegramReplyParameters(
+  chatId: number,
   messageId: number | undefined,
 ): TelegramReplyParameters | undefined {
   if (messageId === undefined) return undefined;
-  if (messageId === lastRepliedToMessageId) return undefined;
-  lastRepliedToMessageId = messageId;
+  if (lastRepliedToMessageIdByChat.get(chatId) === messageId) {
+    return undefined;
+  }
+  lastRepliedToMessageIdByChat.set(chatId, messageId);
   return { message_id: messageId, allow_sending_without_reply: true };
 }
 
 export function buildTelegramMultipartReplyParameters(
+  chatId: number,
   messageId: number | undefined,
 ): string | undefined {
-  const parameters = buildTelegramReplyParameters(messageId);
+  const parameters = buildTelegramReplyParameters(chatId, messageId);
   return parameters ? JSON.stringify(parameters) : undefined;
 }
 
@@ -178,11 +183,12 @@ export async function sendTelegramRenderedChunks<TReplyMarkup>(
   deps: TelegramReplyDeliveryDeps<TReplyMarkup>,
   options?: { replyMarkup?: TReplyMarkup; replyToMessageId?: number },
 ): Promise<number | undefined> {
+  assertTelegramInlineKeyboardCallbackData(options?.replyMarkup);
   let lastMessageId: number | undefined;
   for (const [index, chunk] of chunks.entries()) {
     const replyParameters =
       index === 0
-        ? buildTelegramReplyParameters(options?.replyToMessageId)
+        ? buildTelegramReplyParameters(chatId, options?.replyToMessageId)
         : undefined;
     const sent = await deps.sendMessage({
       chat_id: chatId,
@@ -204,6 +210,7 @@ export async function editTelegramRenderedMessage<TReplyMarkup>(
   deps: TelegramReplyDeliveryDeps<TReplyMarkup>,
   options?: { replyMarkup?: TReplyMarkup },
 ): Promise<number | undefined> {
+  assertTelegramInlineKeyboardCallbackData(options?.replyMarkup);
   if (chunks.length === 0) return messageId;
   const [firstChunk, ...remainingChunks] = chunks;
   await deps.editMessage({

@@ -241,6 +241,7 @@ export interface TelegramPreviewMessageTransportDeps {
   sendMessage: (body: TelegramSendMessageBody) => Promise<TelegramSentMessage>;
   editMessageText: (body: TelegramEditMessageTextBody) => Promise<unknown>;
   buildReplyParameters?: (
+    chatId: number,
     replyToMessageId: number | undefined,
   ) => TelegramReplyParameters | undefined;
 }
@@ -252,7 +253,7 @@ export function createTelegramPreviewMessageTransport(
     deps.buildReplyParameters ?? buildTelegramReplyParameters;
   return {
     sendMessage: (chatId, text, options, replyToMessageId) => {
-      const replyParameters = getReplyParameters(replyToMessageId);
+      const replyParameters = getReplyParameters(chatId, replyToMessageId);
       return deps.sendMessage({
         chat_id: chatId,
         text,

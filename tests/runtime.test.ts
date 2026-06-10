@@ -126,6 +126,18 @@ function createRuntimeTelegramApiResponse(result: unknown): Response {
   return { json: async () => ({ ok: true, result }) } as Response;
 }
 
+function createRuntimeTelegramApiErrorResponse(
+  status: number,
+  description: string,
+): Response {
+  return {
+    ok: false,
+    status,
+    headers: new Headers({ "retry-after": "0" }),
+    text: async () => JSON.stringify({ ok: false, description }),
+  } as Response;
+}
+
 function createRuntimeExtensionContext(
   overrides: Record<string, unknown> = {},
 ) {
@@ -657,6 +669,7 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     },
   });
   let getUpdatesCalls = 0;
+  let sendMessageCalls = 0;
   const apiCalls: string[] = [];
   const restoreFetch = setRuntimeTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
@@ -683,6 +696,10 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
       throw new DOMException("stop", "AbortError");
     }
     if (method === "sendMessage") {
+      sendMessageCalls += 1;
+      if (sendMessageCalls === 1) {
+        return createRuntimeTelegramApiErrorResponse(500, "temporary send failure");
+      }
       return createRuntimeTelegramApiResponse({ message_id: 100 });
     }
     if (method === "sendChatAction") {
@@ -700,6 +717,7 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     assert.equal(sentMessages.length, 1);
     assert.equal(Array.isArray(dispatchedContent), true);
     assert.equal(apiCalls.includes("sendMessage"), true);
+    assert.equal(sendMessageCalls, 2);
     assert.equal(apiCalls.includes("sendChatAction"), true);
     const promptBlock = getRuntimeHarnessTextBlock(dispatchedContent);
     assert.equal(promptBlock.type, "text");
@@ -2026,6 +2044,61 @@ test("Extension runtime clears pending split-text dispatch on shutdown", async (
     await waitForEventLoopCondition(() => getUpdatesCalls >= 2, 5000);
     await handlers.get("session_shutdown")?.({}, ctx);
     await new Promise((resolve) => setTimeout(resolve, 900));
+    assert.deepEqual(runtimeEvents, []);
+  } finally {
+    restoreFetch();
+    await telegramConfig.restore();
+  }
+});
+
+test("Extension runtime clears pending media-group dispatch on shutdown", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const runtimeEvents: string[] = [];
+  const { handlers, commands, pi } = createRuntimePiHarness({
+    sendUserMessage: (content) => {
+      recordRuntimeDispatchEvent(runtimeEvents, content);
+    },
+  });
+  let getUpdatesCalls = 0;
+  const restoreFetch = setRuntimeTestFetch(async (input) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "deleteWebhook") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "getUpdates") {
+      getUpdatesCalls += 1;
+      if (getUpdatesCalls === 1) {
+        return createRuntimeTelegramApiResponse([
+          {
+            _: "other",
+            update_id: 1,
+            message: {
+              message_id: 61,
+              chat: { id: 99, type: "private" },
+              from: { id: 77, is_bot: false, first_name: "Test" },
+              media_group_id: "album-1",
+              text: "album item",
+            },
+          },
+        ]);
+      }
+      throw new DOMException("stop", "AbortError");
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+    });
+    (await getRuntimeTelegramExtension())(pi);
+    const ctx = createRuntimeExtensionContext();
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    await waitForEventLoopCondition(() => getUpdatesCalls >= 2, 5000);
+    await handlers.get("session_shutdown")?.({}, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
     assert.deepEqual(runtimeEvents, []);
   } finally {
     restoreFetch();

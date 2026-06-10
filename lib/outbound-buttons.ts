@@ -135,6 +135,7 @@ export function createTelegramButtonActionStore(
       cleanup(currentTime);
       const action = actions.get(callbackData);
       if (!action) return undefined;
+      actions.delete(callbackData);
       return { text: action.text, prompt: action.prompt };
     },
   };
