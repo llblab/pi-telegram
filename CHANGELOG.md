@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+## 0.16.5: Context-Aware Prompt Guidance Hotfix
+
+- `[Prompt Guidance]` Made before-agent-start Telegram guidance context-aware: unconfigured sessions receive no bridge suffix, local/TUI prompts receive only explicit direct-delivery guidance, and Telegram-originated turns keep the full inbound, phone-width, voice, and button contract. Impact: ordinary local replies no longer get raw Telegram action-comment syntax unless the current turn actually comes from Telegram.
+- `[Docs]` Recorded the product boundary that `pi-telegram` is a mobile companion for a live Pi session, not a remote terminal, PTY supervisor, or process launcher. Telegram controls should stay within Pi's extension-facing APIs; true session replacement such as Telegram `/new` should wait for a public Pi hook that preserves interactive runtime and TUI semantics.
+
 ## 0.16.4: Follow-Up And Runtime Mode Hotfix
 
 - `[Runtime]` Feature-detect Pi `ctx.mode` and keep `print`/`json` runs passive by blocking polling start/resume in those modes. Impact: CLI/headless sessions can finish local work without inheriting Telegram polling, while `tui`/`rpc` and older Pi runtimes keep existing behavior.
@@ -23,7 +30,7 @@
 
 ## 0.16.0: Telegram Extension Commands
 
-- `[API]` Added `registerTelegramCommand()` on the public `/commands` subpath so companion extensions can explicitly provide Telegram-native slash commands without adding workflow-specific commands to core. Built-in bridge commands stay reserved, extension command names must be Bot API safe, duplicate extension names are rejected, commands stay hidden unless `showInMenu` is enabled, visible commands must provide an emoji used in `/start` help and Bot API descriptions, extension-command descriptions are shown in `/start`, visible extension commands are inserted after `/compact` before queue-control commands, prompt-template commands remain separated in `/start`, handler failures are isolated with runtime diagnostics, and routing precedence is built-ins → extension commands → prompt-template aliases. Impact: commands such as fresh-session controls can live in companion extensions while `pi-telegram` remains a lightweight Telegram shell.
+- `[API]` Added `registerTelegramCommand()` on the public `/commands` subpath so companion extensions can explicitly provide Telegram-native slash commands without adding workflow-specific commands to core. Built-in bridge commands stay reserved, extension command names must be Bot API safe, duplicate extension names are rejected, commands stay hidden unless `showInMenu` is enabled, visible commands must provide an emoji used in `/start` help and Bot API descriptions, extension-command descriptions are shown in `/start`, visible extension commands are inserted after `/compact` before queue-control commands, prompt-template commands remain separated in `/start`, handler failures are isolated with runtime diagnostics, and routing precedence is built-ins → extension commands → prompt-template aliases. Impact: workflow-specific controls can live in companion extensions while `pi-telegram` remains a lightweight Telegram shell.
 
 ## 0.15.1: Typing Keepalive Cadence
 

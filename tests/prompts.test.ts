@@ -23,17 +23,18 @@ function createBeforeAgentStartEvent(
   return { prompt, systemPrompt } as BeforeAgentStartHookEvent;
 }
 
-test("Prompt helpers append Telegram-aware system prompt suffixes", () => {
+test("Prompt helpers append context-aware system prompt suffixes", () => {
   assert.deepEqual(
     buildTelegramBridgeSystemPrompt({
       prompt: " [telegram] hello",
       systemPrompt: "base",
       telegramPrefix: "[telegram]",
-      systemPromptSuffix: "\nbridge active",
+      localSystemPromptSuffix: "\nlocal bridge available",
+      telegramTurnSystemPromptSuffix: "\ntelegram turn contract",
     }),
     {
       systemPrompt:
-        "base\nbridge active\n- The current user message came from Telegram.",
+        "base\nlocal bridge available\ntelegram turn contract\n- The current user message came from Telegram.",
     },
   );
   assert.deepEqual(
@@ -41,22 +42,37 @@ test("Prompt helpers append Telegram-aware system prompt suffixes", () => {
       prompt: "local hello",
       systemPrompt: "base",
       telegramPrefix: "[telegram]",
-      systemPromptSuffix: "\nbridge active",
+      localSystemPromptSuffix: "\nlocal bridge available",
+      telegramTurnSystemPromptSuffix: "\ntelegram turn contract",
     }),
-    { systemPrompt: "base\nbridge active" },
+    { systemPrompt: "base\nlocal bridge available" },
   );
 });
 
-test("Prompt helpers build before-agent-start hooks", () => {
+test("Prompt helpers keep local prompts on direct-delivery guidance only", () => {
+  const result = createTelegramBeforeAgentStartHook()(
+    createBeforeAgentStartEvent("local hello", "base"),
+  ).systemPrompt;
+  assert.match(result, /Telegram bridge extension is available/);
+  assert.match(result, /telegram_attach/);
+  assert.match(result, /telegram_message/);
+  assert.doesNotMatch(result, /37 visible cells/);
+  assert.doesNotMatch(result, /telegram_voice text="Short summary"/);
+  assert.doesNotMatch(result, /telegram_button: OK/);
+  assert.doesNotMatch(result, /The current user message came from Telegram/);
+});
+
+test("Prompt helpers add full Telegram-turn guidance for Telegram prompts", () => {
   const hook = createTelegramBeforeAgentStartHook({
     telegramPrefix: "[telegram]",
-    systemPromptSuffix: "\nbridge active",
+    localSystemPromptSuffix: "\nlocal bridge available",
+    telegramTurnSystemPromptSuffix: "\ntelegram turn contract",
   });
   assert.deepEqual(
     hook(createBeforeAgentStartEvent(" [telegram] hello", "base")),
     {
       systemPrompt:
-        "base\nbridge active\n- The current user message came from Telegram.",
+        "base\nlocal bridge available\ntelegram turn contract\n- The current user message came from Telegram.",
     },
   );
   const defaultSystemPrompt = createTelegramBeforeAgentStartHook()(
@@ -99,8 +115,10 @@ test("Prompt helpers leave local prompts private for proactive result push", asy
   const hook = createTelegramProactiveBeforeAgentStartHook({
     baseHook: createTelegramBeforeAgentStartHook({
       telegramPrefix: "[telegram]",
-      systemPromptSuffix: "\nbridge active",
+      localSystemPromptSuffix: "\nlocal bridge available",
+      telegramTurnSystemPromptSuffix: "\ntelegram turn contract",
     }),
+    isConfigured: () => true,
     isProactivePushEnabled: () => true,
     isCurrentOwner: () => true,
   });
@@ -108,5 +126,23 @@ test("Prompt helpers leave local prompts private for proactive result push", asy
     createBeforeAgentStartEvent("local prompt", "base"),
     "ctx",
   );
-  assert.deepEqual(result, { systemPrompt: "base\nbridge active" });
+  assert.deepEqual(result, { systemPrompt: "base\nlocal bridge available" });
+});
+
+test("Prompt helpers skip suffix injection when Telegram is not configured", async () => {
+  const hook = createTelegramProactiveBeforeAgentStartHook({
+    baseHook: createTelegramBeforeAgentStartHook({
+      telegramPrefix: "[telegram]",
+      localSystemPromptSuffix: "\nlocal bridge available",
+      telegramTurnSystemPromptSuffix: "\ntelegram turn contract",
+    }),
+    isConfigured: () => false,
+    isProactivePushEnabled: () => true,
+    isCurrentOwner: () => true,
+  });
+  const result = await hook(
+    createBeforeAgentStartEvent("[telegram] hello", "base"),
+    "ctx",
+  );
+  assert.deepEqual(result, { systemPrompt: "base" });
 });

@@ -113,7 +113,10 @@ interface TelegramLifecycleBindingDeps {
     Lifecycle.TelegramLifecycleRegistrationDeps,
     "onSessionStart" | "onSessionShutdown" | "onModelSelect"
   >;
-  configStore: Pick<Config.TelegramConfigStore, "getOutboundHandlers">;
+  configStore: Pick<
+    Config.TelegramConfigStore,
+    "getOutboundHandlers" | "hasBotToken"
+  >;
   abort: Runtime.TelegramRuntimeAbortPort;
   typing: Runtime.TelegramRuntimeTypingPort;
   lifecycle: Runtime.TelegramRuntimeLifecyclePort;
@@ -317,6 +320,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     onSessionCompact: compactionObserver.onSessionCompact,
     onAgentStart: agentStartWithDedupReset,
     onBeforeAgentStart: Prompts.createTelegramProactiveBeforeAgentStartHook({
+      isConfigured: configStore.hasBotToken,
       isProactivePushEnabled,
       isCurrentOwner: lockOwnershipGuard.ownsContext,
     }),

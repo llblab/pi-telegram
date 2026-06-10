@@ -53,12 +53,16 @@ Stable commands inside the paired Telegram DM:
 
 Hidden compatibility shortcuts may open sections directly: `/help`, `/status`, `/model`, `/thinking`, `/queue`, and `/settings`.
 
+This command surface is a mobile companion subset, not a raw terminal-command bridge. Commands that depend on Pi's interactive runtime owning session replacement, TUI transcript clearing, or arbitrary slash-command dispatch stay out of the stable Telegram API unless Pi exposes a safe public extension hook for them.
+
 ### Tools and assistant-authored actions
 
 - `telegram_attach(paths, chat_id?, caption?)` is the stable artifact delivery tool for generated files. During Telegram turns it queues files for the active reply; outside Telegram turns it sends files directly to the paired/default chat or explicit `chat_id` when this π instance owns `/telegram-connect`.
 - `telegram_message(text, chat_id?)` sends a direct Telegram Markdown message from local/TUI-initiated work when this π instance owns `/telegram-connect`. Top-level `telegram_button` comments inside `text` are parsed with the same planner used for normal replies and attached to that message; buttons are never standalone Telegram messages.
 - `telegram_voice` hidden comments request Telegram-native voice delivery.
 - `telegram_button` hidden comments create inline buttons whose taps enqueue prompts. Use top-level column-zero comments outside code, quotes, lists, and indented examples; do not emit JSON button specs or standalone button actions.
+
+Prompt guidance is context-aware: local/TUI prompts see only explicit direct-delivery guidance, while Telegram-originated turns receive the full action-comment syntax and phone-width output contract.
 
 See [Outbound Handlers](./outbound.md) for exact markup forms.
 
@@ -143,12 +147,12 @@ Import from `@llblab/pi-telegram/commands`. This registers Telegram slash comman
 
 ```ts
 const off = registerTelegramCommand({
-  name: "new",
-  description: "Start fresh",
+  name: "review",
+  description: "Review queued work",
   showInMenu: true,
-  emoji: "🆕",
+  emoji: "🧩",
   handler: async (ctx) => {
-    await ctx.reply("Starting a fresh session is handled by my extension.");
+    await ctx.enqueuePrompt(`Review this work: ${ctx.args}`);
   },
 });
 ```

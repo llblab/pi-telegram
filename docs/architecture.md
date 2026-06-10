@@ -9,6 +9,8 @@
 - Stream previews and deliver final π responses back to Telegram.
 - Provide Telegram-native controls for queueing, model/thinking/settings menus, compaction, abort/stop, prompt templates, reactions, and outbound artifacts.
 
+The bridge is a mobile companion for a live Pi session, not a remote terminal. It should let an operator start work in the TUI and continue supervising from Telegram, while staying inside Pi's extension-facing contracts.
+
 This document is the architectural map. Focused behavior standards live in sibling docs:
 
 - [Public API](./public-api.md) — stable commands, config, package entrypoints, assistant markup, extension APIs, and compatibility boundaries.
@@ -22,6 +24,17 @@ This document is the architectural map. Focused behavior standards live in sibli
 ## Runtime Topology
 
 `index.ts` is the only composition root. It wires live π ports, Telegram Bot API ports, session-local stores, lifecycle hooks, and domain runtimes. Reusable logic lives in flat `/lib/*.ts` domain modules rather than a deep local module tree.
+
+### Extension Boundary Vs Supervisor Control
+
+`pi-telegram` runs inside the current Pi process as an extension. That gives it safe access to public extension APIs such as aborting work, compacting, sending follow-up prompts, observing lifecycle events, and rendering Telegram-native controls. It does not own the terminal, the interactive-mode chat transcript, or the process lifecycle.
+
+Keep this boundary explicit:
+
+- Do not use raw TTY injection, ANSI terminal clearing, private TUI container mutation, or a shadow `pi` subprocess to simulate interactive commands.
+- Do not treat Telegram as a generic remote shell for every Pi slash command.
+- Commands that require interactive session replacement or TUI rerendering, such as a true Telegram `/new`, need a public Pi API that invokes the same runtime path as the terminal command.
+- A separate PTY supervisor or daemon could choose to own those risks, but that would be a different product mode rather than this extension's runtime contract.
 
 The repository uses a **Flat Domain DAG**:
 
@@ -230,7 +243,7 @@ Queue reactions are shortcut controls for waiting turns. Promotion reactions (`�
 
 When proactive push is enabled and this instance owns the Telegram lock, successful local non-Telegram final replies are sent to the paired chat. Non-owners skip proactive delivery and record a runtime diagnostic. Local prompt text is not mirrored because the bot does not own terminal user messages.
 
-Telegram prompt guidance asks assistants to keep dense mobile-visible text around 37 display cells where possible, because emoji and wide Unicode make raw character counts misleading.
+Telegram prompt guidance is context-aware. Unconfigured sessions receive no bridge suffix. Local/TUI prompts receive only explicit direct-delivery guidance so ordinary terminal replies do not learn raw Telegram action-comment syntax. Telegram-originated turns receive the full inbound context, phone-width output, and native action contract, including the 37-display-cell mobile readability hint.
 
 ## In-Flight Model Switching
 

@@ -6,6 +6,8 @@
 
 `pi-telegram` turns a private Telegram DM into a session-local operator console for π. It admits work, preserves context, streams readable replies, keeps busy sessions usable through queues, lets other extensions share one bot, and turns assistant-authored intent into native Telegram artifacts. It is also a voice-provider platform: companion extensions can supply Telegram transcription and synthesis providers while `pi-telegram` keeps ownership of transport, queueing, and reply policy.
 
+The product shape is a mobile companion for a live Pi session: start work in the terminal, then continue from Telegram on the couch or outside. It is not a remote terminal, PTY supervisor, or process launcher, and it intentionally avoids pretending to own Pi's interactive TUI.
+
 This repository is an actively maintained fork of [`badlogic/pi-telegram`](https://github.com/badlogic/pi-telegram). It started from upstream commit [`cb34008`](https://github.com/badlogic/pi-telegram/commit/cb34008460b6c1ca036d92322f69d87f626be0fc) and has since diverged substantially.
 
 ## Install
@@ -47,7 +49,7 @@ Paste your bot token when prompted. If a bot token is already saved in `~/.pi/ag
 /telegram-connect
 ```
 
-The adapter is session-local: only one π instance polls Telegram at a time. `/telegram-connect` records only external control/polling ownership in `~/.pi/agent/locks.json`; live ownership moves require confirmation, inherited child sessions do not start polling unless they take ownership, and `/new` plus same-`cwd` restarts resume automatically. Local queue and reply state stay per Pi instance, so an instance that loses Telegram control still finishes work it already accepted.
+The adapter is session-local: only one π instance polls Telegram at a time. `/telegram-connect` records only external control/polling ownership in `~/.pi/agent/locks.json`; live ownership moves require confirmation, inherited child sessions do not start polling unless they take ownership, and same-`cwd` restarts resume automatically. Local queue and reply state stay per Pi instance, so an instance that loses Telegram control still finishes work it already accepted.
 
 ### 4. Pair your Telegram account
 
@@ -72,6 +74,7 @@ Once paired, chat with your bot in Telegram. Text, images, files, replies, edits
 
 What it feels like:
 
+- Start work in the terminal, walk away, and keep supervising the same live π session from Telegram.
 - Open `/start` and get a Telegram control panel for the running π session: status, prompt templates, model, thinking, settings, and queue.
 - Fire off three tasks while π is busy. They become visible queue items instead of terminal noise.
 - Open Queue from the menu, inspect waiting work, delete stale prompts, or move important work forward.
@@ -82,7 +85,7 @@ What it feels like:
 
 ### Telegram controls
 
-Use these inside the Telegram DM with your bot. The main entrypoint is `/start`: it opens the operator menu and exposes many of the important agent controls that normally live in the CLI, adapted for Telegram.
+Use these inside the Telegram DM with your bot. The main entrypoint is `/start`: it opens the operator menu and exposes many of the important agent controls that can be safely adapted through Pi's extension APIs. The bot does not forward arbitrary terminal slash commands or emulate TUI-only session controls.
 
 - **`/start`**: Pair the first Telegram user when needed, register bot commands, and open the inline application menu with command help, prompt-template commands, status rows, model controls, thinking controls, settings, and queue controls.
 - **`/compact`**: Ask for inline confirmation, then start session compaction when the session is idle; Telegram shows the native typing indicator while manual or automatic compaction is running.
@@ -170,6 +173,8 @@ A practical voice setup is simple: Telegram `.ogg` arrives, STT runs locally or 
 
 Assistant replies can include hidden outbound blocks. `telegram_voice` and `telegram_button` are not π tools; they are assistant-authored HTML comments that the adapter removes from Telegram text and handles after `agent_end`. Recognized blocks must start at column zero on a top-level line outside fenced code, quotes, lists, and indented examples. Do not use JSON button specs, inline comments after visible text, or standalone button tool calls; write normal Markdown plus hidden comments, and add visible parent text if buttons would otherwise be the only output.
 
+Prompt guidance is context-aware: unconfigured sessions receive no Telegram suffix, local/TUI prompts only get explicit direct-delivery guidance, and Telegram-originated turns get the full phone-width output and action-comment contract.
+
 ```md
 Full technical answer stays readable as text.
 
@@ -209,7 +214,7 @@ Unknown inline-button callbacks are forwarded to π as `[callback] <data>` when 
 
 ### Extension Sections
 
-Ordinary pi extensions can register Telegram-native slash commands, structured UI sections, and compact status lines without owning a second polling loop. Slash commands use explicit opt-in registration from `@llblab/pi-telegram/commands`, so workflow-specific commands such as a fresh-session control can live in companion extensions instead of expanding the core bridge command set. UI sections appear in the main Telegram menu and Settings submenu, while status lines allow widgets such as quota indicators to appear beside Status, Usage, Cost, and Context only when relevant to the active model. Each section gets a narrow typed context with `edit`, `open`, `enqueuePrompt`, `answerCallback`, and `callbackData()` — enough to build interactive Telegram-native surfaces while `pi-telegram` owns transport, callback routing, navigation hierarchy, and diagnostics.
+Ordinary pi extensions can register Telegram-native slash commands, structured UI sections, and compact status lines without owning a second polling loop. Slash commands use explicit opt-in registration from `@llblab/pi-telegram/commands`, so workflow-specific commands can live in companion extensions instead of expanding the core bridge command set. UI sections appear in the main Telegram menu and Settings submenu, while status lines allow widgets such as quota indicators to appear beside Status, Usage, Cost, and Context only when relevant to the active model. Each section gets a narrow typed context with `edit`, `open`, `enqueuePrompt`, `answerCallback`, and `callbackData()` — enough to build interactive Telegram-native surfaces while `pi-telegram` owns transport, callback routing, navigation hierarchy, and diagnostics.
 
 Import `registerTelegramSection()` from `@llblab/pi-telegram/sections` and return a disposer on shutdown. Sections can send interactive messages directly into the chat via `ctx.open()` — confirmation dialogs, approve/deny gates, and multi-step forms live outside the menu hierarchy while callbacks route through the same typed handler. See [`@llblab/pi-telegram-extension-demo`](https://github.com/llblab/pi-telegram-extension-demo) for a working reference and the [Extension Sections Standard](./docs/sections.md) for the full contract.
 

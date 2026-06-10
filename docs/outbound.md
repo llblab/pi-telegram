@@ -132,12 +132,14 @@ Buttons are built in and do not need a command template because they are pure Te
 
 ## Prompt Contract
 
-The extension injects Telegram-specific system prompt guidance so agents know the fast path:
+The extension injects prompt guidance by context:
 
-- Write the full technical answer as normal Markdown.
+- If no bot token is configured, no Telegram bridge suffix is injected.
+- For ordinary local/TUI prompts, the agent only sees explicit direct-delivery guidance: use `telegram_attach` or `telegram_message` when the user asks to send something to Telegram, and otherwise answer locally as normal.
+- For Telegram-originated turns, write the full technical answer as normal Markdown.
 - Add `telegram_voice` when a Telegram-native voice message is useful; use body text, `text="..."`, or colon shorthand for the text to synthesize. A companion summary is optional, no specific summary format is required.
 - Add `telegram_button: ...` when label equals prompt, `telegram_button label="..." prompt="..."` for one-line prompts, or `telegram_button label="..."` with a body for multiline prompts. If the reply contains only button/voice comment blocks, add a short visible marker (for example `Choose one:`) before them so Telegram always has a visible parent message for attachment.
 - For ordinary Telegram-turn replies, do not call transport tools for voice or buttons; the bridge owns delivery, while registered voice synthesis providers own TTS and OGG/Opus conversion. For explicit local/TUI direct sends, `telegram_message` may include top-level `telegram_button` comments in its Markdown text because those buttons are attached to that text message.
 - Never send buttons without visible parent text. If the answer would contain only hidden comments, add a compact line such as `Choose one:` first.
 
-This keeps the agent focused on semantics and lets the bridge handle low-latency Telegram adaptation.
+This keeps the agent focused on semantics, prevents Telegram action syntax from leaking into normal local replies, and lets the bridge handle low-latency Telegram adaptation.

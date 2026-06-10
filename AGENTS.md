@@ -7,11 +7,14 @@
 - `Boundary Clarity`: Separate Telegram transport concerns, π integration concerns, rendering behavior, and release/documentation state
 - `Progressive Enhancement + Graceful Degradation`: Prefer behavior that upgrades automatically when richer runtime context exists, but always preserves a useful fallback path when it does not
 - `Runtime Safety`: Prefer queue and rendering behavior that fails predictably over clever behavior that can desynchronize the Telegram bridge from π session state
+- `Mobile Companion Boundary`: `pi-telegram` extends a live Pi session for phone use; it is not a remote terminal, PTY supervisor, or process launcher. Do not add terminal-control tricks to make Telegram pretend to be the TUI.
 - `Pi-Native Extensibility`: `pi-telegram` should inherit π's own extension philosophy. It is not only a Telegram adapter; it should become a small, convenient, composable Telegram shell for π extensions, where new capabilities plug into stable contracts instead of forking polling, transport, or menu ownership.
 
 ## 1. Concept
 
 `pi-telegram` is a Telegram runtime adapter for π: a session-local operator console that turns a private Telegram DM into a runtime surface for prompt intake, streaming previews, queue management, model/thinking/settings controls, inbound/outbound handler pipelines, voice/buttons, artifacts, and extension callback interop. Treat it as a Telegram membrane around π, not a narrow message pipe.
+
+The core product loop is mobile continuation: start or supervise work in the terminal, then continue from Telegram while away from the keyboard. Telegram controls should be a safe extension-facing subset of the live session, not a replacement for Pi's interactive TUI.
 
 ## 2. Identity & Naming Contract
 
@@ -67,6 +70,7 @@
 - Command/menu emoji are fixed UI adornments owned by the `commands` map; do not add a persisted emoji toggle or Settings menu until there is a real setting to own
 - Telegram `reply_to_message` context is prompt-only and must not affect slash-command parsing
 - Long-lived timers, pollers, watchers, and deferred queue dispatch must be session-bound and avoid stale live π contexts after session replacement
+- Do not add Telegram commands that imitate Pi interactive session replacement, navigation, or TUI rendering through private internals, ANSI terminal clearing, raw TTY injection, or a shadow `pi` subprocess. Features such as a real Telegram `/new` require a public Pi API that runs the same session-replacement path as the terminal command.
 - In-flight `/model` switching is limited to Telegram-owned active turns; if a tool call is active, abort is delayed until the tool finishes
 
 ## 5.3 Telegram Delivery Semantics
@@ -75,6 +79,7 @@
 - Real code blocks must stay literal and escaped
 - `telegram_attach` is the canonical outbound file-delivery path for Telegram-originated requests; outside active Telegram turns it may send immediately to the paired/default chat for explicit local/TUI delivery requests only when this π instance owns `/telegram-connect`. `telegram_message` is the first-class direct Telegram Markdown text tool for local/TUI prompts and is also gated by `/telegram-connect`; neither direct tool replaces normal active-turn replies. It reuses top-level `telegram_button` comments for inline buttons; buttons must be attached to a text message, never sent as standalone actions
 - Telegram delivery strips top-level HTML comments from preview/final text; column-zero top-level `<!-- telegram_voice ... -->` and `<!-- telegram_button ... -->` blocks are special outbound comments handled after `agent_end` without requiring agent-side transport tool calls, while comments inside code, quotes, lists, or indented examples stay literal
+- Telegram prompt guidance is layered: unconfigured sessions receive no bridge suffix, local/TUI prompts receive only explicit direct-delivery guidance, and Telegram-originated turns receive the full inbound/phone-width/output-action contract
 - `telegram_voice` and `telegram_button` are not π tools; keep prompts/docs explicit that agents should author markup while voice synthesis provider extensions own TTS/OGG conversion, and pi-telegram owns button routing plus Telegram delivery
 - Voice reply policy and prompt context are owned by pi-telegram's `telegram.json` `voice.replyMode`: missing/invalid config behaves as `manual` but does not add a `[voice]` prompt-context block; only an explicit valid `voice.replyMode` renders context. Render a single voice field as `[voice] reply mode: manual|mirror|always`, and render multiple fields as a `[voice]` list; place voice context after `[outputs]` when handler output exists, otherwise after `[attachments]`; provider prompt contributions are optional provider-specific additions, not the default policy channel
 - Optional `telegram.json` `time` may add `[time] YYYY-MM-DD HH:mm:ss <timezone>` to Telegram-originated prompts for wall-clock context. It is hidden by default, uses `time.injectionMode` values `hidden|always|interval`, stores `time.interval` in milliseconds, uses the system timezone, and should render last after `[attachments]`, `[outputs]`, and `[voice]` sections. The Settings row `🕒 Time injection: hidden|always|interval` controls `time.injectionMode` only.

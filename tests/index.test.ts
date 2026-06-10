@@ -100,7 +100,7 @@ test("Extension entrypoint wires domain bindings into the pi API", () => {
   );
 });
 
-test("Extension before-agent-start hook appends Telegram-specific guidance", async () => {
+test("Extension before-agent-start hook skips Telegram guidance when unconfigured", async () => {
   const harness = createIndexApiHarness();
   telegramExtension(harness.api);
   const handler = getRequiredIndexHandler(
@@ -118,10 +118,6 @@ test("Extension before-agent-start hook appends Telegram-specific guidance", asy
   );
   assertSystemPromptResult(telegramResult);
   assertSystemPromptResult(localResult);
-  assert.match(
-    telegramResult.systemPrompt,
-    /current user message came from Telegram/,
-  );
-  assert.match(telegramResult.systemPrompt, /telegram_attach/);
-  assert.equal(localResult.systemPrompt.includes("came from Telegram"), false);
+  assert.equal(telegramResult.systemPrompt, basePrompt);
+  assert.equal(localResult.systemPrompt, basePrompt);
 });

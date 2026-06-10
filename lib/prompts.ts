@@ -7,11 +7,19 @@
 import type { BeforeAgentStartEvent } from "./pi.ts";
 import { TELEGRAM_PREFIX } from "./turns.ts";
 
-const SYSTEM_PROMPT_SUFFIX = `
+const LOCAL_SYSTEM_PROMPT_SUFFIX = `
 
-Telegram bridge extension is active.
+Telegram bridge extension is available.
 
-Inbound context:
+Local/TUI Telegram delivery:
+- Answer ordinary local prompts normally; do not add Telegram action comments unless the user explicitly asks for Telegram delivery.
+- For explicit Telegram file delivery, call \`telegram_attach(local_path)\`. For explicit Telegram text delivery, call \`telegram_message(...)\`.
+- Direct local/TUI Telegram delivery requires this π instance to own \`/telegram-connect\`; if ownership is elsewhere, connect/take over first instead of bypassing the lock.
+`;
+
+const TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX = `
+
+Telegram-originated turn context:
 - \`[telegram]\` marks Telegram-originated messages. Suffixes \`|from:user\` (sender) and \`|guest:group\` (guest mode — message from another chat where the bot is not a member) may be present; the bot sees the message as if forwarded from that user/chat.
 - \`[reply]\` is quoted context from the replied-to message, not a new instruction by itself. Suffix \`|from:user\` identifies the original author in guest-mode replies. Use it to resolve references like "this", "it", or "that message"; the actual instruction is before [reply] unless it explicitly asks to act on the quote.
 - \`[attachments]\` gives a base directory plus relative local files; resolve and read them as needed. \`[outputs]\` contains inbound-handler stdout such as transcriptions or extracted text for those attachments.
@@ -27,7 +35,7 @@ Telegram-visible output:
 
 Native outbound actions:
 - Use normal Markdown for visible text. Use top-level column-zero hidden Markdown comments outside code, quotes, and lists only for native actions; the bridge strips them after agent_end and turns them into Telegram-native artifacts/reply_markup. Do not render button JSON, do not invent standalone button tools, and do not call/register transport/TTS/text-to-OGG tools for ordinary Telegram-turn voice/buttons.
-- \`telegram_voice\`: text is synthesized by the registered voice synthesis provider and delivered by pi-telegram. Use body text for multiline voice, \`<!-- telegram_voice text="Short summary" -->\` for explicit one-line voice, or \`<!-- telegram_voice: Short summary -->\` for one-line voice with no attributes. A companion summary is optional, no specific summary format is required. Keep it TTS-friendly; avoid raw Markdown, code, formulas, tables, or long lists.
+- \`telegram_voice\`: text is synthesized by the registered voice synthesis provider and delivered by pi-telegram. Use body text for multiline voice, \`<!-- telegram_voice text="Short summary" -->\` for explicit one-line text, or \`<!-- telegram_voice: Short summary -->\` for one-line text with no attributes. A companion summary is optional, no specific summary format is required. Keep it TTS-friendly; avoid raw Markdown, code, formulas, tables, or long lists.
 - \`telegram_button\`: callback prompt is routed back as a normal Telegram turn. Use \`<!-- telegram_button: OK -->\` when prompt equals label, \`<!-- telegram_button label=Continue prompt="Continue with the current plan." -->\` for one-line prompts, or body form \`<!-- telegram_button label="Show risks"\nList the main risks first.\n-->\` for multiline prompts. Do not put button comments inline after visible text, inside code fences, block quotes, lists, or indented examples; those are literal Markdown, not buttons.
 - If only hidden action comments would remain, add visible parent text like "Choose one:" so Telegram has a message to attach buttons to.
 `;
@@ -36,19 +44,25 @@ export function buildTelegramBridgeSystemPrompt(options: {
   prompt: string;
   systemPrompt: string;
   telegramPrefix?: string;
-  systemPromptSuffix: string;
+  localSystemPromptSuffix: string;
+  telegramTurnSystemPromptSuffix: string;
 }): { systemPrompt: string } {
   const telegramPrefix = options.telegramPrefix ?? TELEGRAM_PREFIX;
-  const suffix = options.prompt.trimStart().startsWith(telegramPrefix)
-    ? `${options.systemPromptSuffix}\n- The current user message came from Telegram.`
-    : options.systemPromptSuffix;
-  return { systemPrompt: options.systemPrompt + suffix };
+  const telegramTurn = options.prompt.trimStart().startsWith(telegramPrefix);
+  const telegramSuffix = telegramTurn
+    ? `${options.telegramTurnSystemPromptSuffix}\n- The current user message came from Telegram.`
+    : "";
+  return {
+    systemPrompt:
+      options.systemPrompt + options.localSystemPromptSuffix + telegramSuffix,
+  };
 }
 
 export function createTelegramBeforeAgentStartHook(
   options: {
     telegramPrefix?: string;
-    systemPromptSuffix?: string;
+    localSystemPromptSuffix?: string;
+    telegramTurnSystemPromptSuffix?: string;
   } = {},
 ): (event: BeforeAgentStartEvent) => { systemPrompt: string } {
   return (event) =>
@@ -56,12 +70,17 @@ export function createTelegramBeforeAgentStartHook(
       prompt: event.prompt,
       systemPrompt: event.systemPrompt,
       telegramPrefix: options.telegramPrefix,
-      systemPromptSuffix: options.systemPromptSuffix ?? SYSTEM_PROMPT_SUFFIX,
+      localSystemPromptSuffix:
+        options.localSystemPromptSuffix ?? LOCAL_SYSTEM_PROMPT_SUFFIX,
+      telegramTurnSystemPromptSuffix:
+        options.telegramTurnSystemPromptSuffix ??
+        TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX,
     });
 }
 
 export interface TelegramProactivePromptHookDeps<TContext> {
   baseHook?: (event: BeforeAgentStartEvent) => { systemPrompt: string };
+  isConfigured: () => boolean;
   isProactivePushEnabled: () => boolean;
   isCurrentOwner: (ctx: TContext) => boolean;
 }
@@ -74,6 +93,7 @@ export function createTelegramProactiveBeforeAgentStartHook<TContext>(
 ) => Promise<{ systemPrompt: string }> {
   const baseHook = deps.baseHook ?? createTelegramBeforeAgentStartHook();
   return async function onBeforeAgentStart(event, ctx) {
+    if (!deps.isConfigured()) return { systemPrompt: event.systemPrompt };
     const result = baseHook(event);
     if (!deps.isProactivePushEnabled()) return result;
     if (!deps.isCurrentOwner(ctx)) return result;
