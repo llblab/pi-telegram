@@ -101,6 +101,7 @@ test("Prompt helpers leave local prompts private for proactive result push", asy
       telegramPrefix: "[telegram]",
       systemPromptSuffix: "\nbridge active",
     }),
+    isConfigured: () => true,
     isProactivePushEnabled: () => true,
     isCurrentOwner: () => true,
   });
@@ -109,4 +110,21 @@ test("Prompt helpers leave local prompts private for proactive result push", asy
     "ctx",
   );
   assert.deepEqual(result, { systemPrompt: "base\nbridge active" });
+});
+
+test("Prompt helpers skip suffix injection when Telegram is not configured", async () => {
+  const hook = createTelegramProactiveBeforeAgentStartHook({
+    baseHook: createTelegramBeforeAgentStartHook({
+      telegramPrefix: "[telegram]",
+      systemPromptSuffix: "\nbridge active",
+    }),
+    isConfigured: () => false,
+    isProactivePushEnabled: () => true,
+    isCurrentOwner: () => true,
+  });
+  const result = await hook(
+    createBeforeAgentStartEvent("local prompt", "base"),
+    "ctx",
+  );
+  assert.deepEqual(result, { systemPrompt: "base" });
 });
