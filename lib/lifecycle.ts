@@ -14,6 +14,9 @@ import type {
   SessionCompactEvent,
   SessionShutdownEvent,
   SessionStartEvent,
+  ToolExecutionEndEvent,
+  ToolExecutionStartEvent,
+  ToolExecutionUpdateEvent,
 } from "./pi.ts";
 
 let resetTransportReplyDedupFn: (() => void) | undefined;
@@ -25,7 +28,7 @@ export function setResetTransportReplyDedup(fn: () => void): void {
 export function createAgentStartDedupHook(
   inner: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>,
 ): (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void> {
-  return async function onAgentStartDedup(event, ctx) {
+  return async (event, ctx) => {
     if (resetTransportReplyDedupFn) resetTransportReplyDedupFn();
     return inner(event, ctx);
   };
@@ -73,11 +76,15 @@ export interface TelegramLifecycleRegistrationDeps {
     ctx: ExtensionContext,
   ) => Promise<void>;
   onToolExecutionStart: (
-    event: unknown,
+    event: ToolExecutionStartEvent,
+    ctx: ExtensionContext,
+  ) => Promise<void> | void;
+  onToolExecutionUpdate?: (
+    event: ToolExecutionUpdateEvent,
     ctx: ExtensionContext,
   ) => Promise<void> | void;
   onToolExecutionEnd: (
-    event: unknown,
+    event: ToolExecutionEndEvent,
     ctx: ExtensionContext,
   ) => Promise<void> | void;
   onMessageStart: (
@@ -148,6 +155,7 @@ export interface TelegramCompactionObserverRuntimeDeps<TContext> {
   updateStatus: (ctx: TContext) => void;
   startTypingLoop?: (ctx: TContext) => void;
   stopTypingLoop?: () => void;
+  shouldStartTypingLoop?: () => boolean;
   requestDeferredDispatchNextQueuedTelegramTurn: (
     dispatch: (ctx: TContext) => void,
   ) => void;
@@ -174,6 +182,7 @@ export function createTelegramCompactionObserverRuntime<TContext>(
   const setTimer = deps.setTimer ?? setTimeout;
   const clearTimer = deps.clearTimer ?? clearTimeout;
   let fallbackTimer: TelegramLifecycleTimer | undefined;
+  let typingStartedByObserver = false;
   const clearFallbackTimer = (): void => {
     if (!fallbackTimer) return;
     clearTimer(fallbackTimer);
@@ -187,13 +196,15 @@ export function createTelegramCompactionObserverRuntime<TContext>(
   return {
     onSessionBeforeCompact: (_event, ctx) => {
       deps.setCompactionInProgress(true);
-      deps.startTypingLoop?.(ctx);
+      typingStartedByObserver = deps.shouldStartTypingLoop?.() ?? true;
+      if (typingStartedByObserver) deps.startTypingLoop?.(ctx);
       deps.updateStatus(ctx);
       clearFallbackTimer();
       fallbackTimer = setTimer(() => {
         fallbackTimer = undefined;
         deps.setCompactionInProgress(false);
-        deps.stopTypingLoop?.();
+        if (typingStartedByObserver) deps.stopTypingLoop?.();
+        typingStartedByObserver = false;
         deps.updateStatus(ctx);
         deps.recordRuntimeEvent?.(
           "compact",
@@ -206,13 +217,15 @@ export function createTelegramCompactionObserverRuntime<TContext>(
     onSessionCompact: (_event, ctx) => {
       clearFallbackTimer();
       deps.setCompactionInProgress(false);
-      deps.stopTypingLoop?.();
+      if (typingStartedByObserver) deps.stopTypingLoop?.();
+      typingStartedByObserver = false;
       deps.updateStatus(ctx);
       requestDispatch();
     },
     onSessionShutdown: () => {
       clearFallbackTimer();
-      deps.stopTypingLoop?.();
+      if (typingStartedByObserver) deps.stopTypingLoop?.();
+      typingStartedByObserver = false;
     },
   };
 }
@@ -328,6 +341,9 @@ export function registerTelegramLifecycleHooks(
   });
   pi.on("tool_execution_start", async (event, ctx) => {
     await deps.onToolExecutionStart(event, ctx);
+  });
+  pi.on("tool_execution_update", async (event, ctx) => {
+    await deps.onToolExecutionUpdate?.(event, ctx);
   });
   pi.on("tool_execution_end", async (event, ctx) => {
     await deps.onToolExecutionEnd(event, ctx);

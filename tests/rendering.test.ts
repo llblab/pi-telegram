@@ -62,9 +62,18 @@ test("Malformed and boundary markdown renders safely", () => {
         countMatches(chunk.text, /<blockquote>/g),
         countMatches(chunk.text, /<\/blockquote>/g),
       );
-      assert.equal(countMatches(chunk.text, /<b>/g), countMatches(chunk.text, /<\/b>/g));
-      assert.equal(countMatches(chunk.text, /<i>/g), countMatches(chunk.text, /<\/i>/g));
-      assert.equal(countMatches(chunk.text, /<pre>/g), countMatches(chunk.text, /<\/pre>/g));
+      assert.equal(
+        countMatches(chunk.text, /<b>/g),
+        countMatches(chunk.text, /<\/b>/g),
+      );
+      assert.equal(
+        countMatches(chunk.text, /<i>/g),
+        countMatches(chunk.text, /<\/i>/g),
+      );
+      assert.equal(
+        countMatches(chunk.text, /<pre>/g),
+        countMatches(chunk.text, /<\/pre>/g),
+      );
     }
   }
 });

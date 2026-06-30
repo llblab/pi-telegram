@@ -27,7 +27,7 @@ myext:page:2
 
 ## pi-telegram fallback
 
-If `pi-telegram` receives callback data that is not owned by its built-in prefixes and no built-in handler consumes it, it forwards the click to π as:
+If `pi-telegram` receives callback data that is not owned by its built-in prefixes and no built-in handler consumes it, it forwards the click to Pi as:
 
 ```text
 [callback] <callback_data>

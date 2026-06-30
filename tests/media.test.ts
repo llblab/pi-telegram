@@ -202,7 +202,16 @@ test("Media helpers key messages by chat and media group", () => {
       chat: { id: 7 },
       media_group_id: "album",
     }),
-    "7:album",
+    "7:private:album",
+  );
+  assert.equal(
+    getTelegramMediaGroupKey({
+      message_id: 1,
+      chat: { id: 7 },
+      message_thread_id: 42,
+      media_group_id: "album",
+    }),
+    "7:thread:42:album",
   );
   assert.equal(
     getTelegramMediaGroupKey({ message_id: 1, chat: { id: 7 } }),

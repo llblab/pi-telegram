@@ -4,6 +4,8 @@
  * Owns polling request builders, stop conditions, and the long-poll loop runtime for Telegram updates
  */
 
+type MaybePromise<T> = T | Promise<T>;
+
 export interface TelegramPollingConfig {
   botToken?: string;
   lastUpdateId?: number;
@@ -12,6 +14,19 @@ export interface TelegramPollingConfig {
 export interface TelegramUpdate {
   update_id: number;
 }
+
+const TELEGRAM_INITIAL_SYNC_OFFSET = -1;
+const TELEGRAM_INITIAL_SYNC_LIMIT = 1;
+const TELEGRAM_INITIAL_SYNC_TIMEOUT_SECONDS = 0;
+const TELEGRAM_LONG_POLL_LIMIT = 10;
+const TELEGRAM_LONG_POLL_TIMEOUT_SECONDS = 30;
+const TELEGRAM_THREAD_CAPABILITY_MONITOR_INTERVAL_MS = 5_000;
+const TELEGRAM_THREAD_CAPABILITY_DISABLED_CONFIRMATION_PROBES = 2;
+const TELEGRAM_POLLING_DEFAULT_MAX_UPDATE_FAILURES = 3;
+const TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT = 3;
+const TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_MS = 1_000;
+const TELEGRAM_GET_UPDATES_CONFLICT_SLOW_RETRY_MS = 3_000;
+const TELEGRAM_POLLING_RETRY_MS = 3_000;
 
 // Standard Telegram DM polling does not expose ordinary message-deletion events,
 // so queue removal stays reaction-driven while delete-like business updates remain defensive-only.
@@ -29,9 +44,9 @@ export function buildTelegramInitialSyncRequest(): {
   timeout: number;
 } {
   return {
-    offset: -1,
-    limit: 1,
-    timeout: 0,
+    offset: TELEGRAM_INITIAL_SYNC_OFFSET,
+    limit: TELEGRAM_INITIAL_SYNC_LIMIT,
+    timeout: TELEGRAM_INITIAL_SYNC_TIMEOUT_SECONDS,
   };
 }
 
@@ -43,8 +58,8 @@ export function buildTelegramLongPollRequest(lastUpdateId?: number): {
 } {
   return {
     offset: lastUpdateId !== undefined ? lastUpdateId + 1 : undefined,
-    limit: 10,
-    timeout: 30,
+    limit: TELEGRAM_LONG_POLL_LIMIT,
+    timeout: TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
     allowed_updates: TELEGRAM_ALLOWED_UPDATES,
   };
 }
@@ -258,6 +273,438 @@ export interface TelegramRuntimeEventRecorderPort {
   ) => void;
 }
 
+export type TelegramThreadCapabilityMode = "enabled" | "disabled" | "unknown";
+
+export interface TelegramThreadCapabilityState {
+  threadMode?: TelegramThreadCapabilityMode;
+  updatedAtMs?: number;
+  lastSlot?: string;
+  lastReconcileAction?: string;
+}
+
+export interface TelegramThreadCapabilityRecordView {
+  status?: string;
+  target?: { chatId?: number; threadId?: number };
+}
+
+export interface TelegramThreadCapabilityStore {
+  load: () => Promise<void>;
+  persist: () => Promise<void>;
+  getBotState: () => TelegramThreadCapabilityState;
+  setBotState: (state: TelegramThreadCapabilityState) => void;
+  list?: () => TelegramThreadCapabilityRecordView[];
+}
+
+export interface TelegramThreadCapabilityReaderDeps {
+  getAllowedUserId: () => number | undefined;
+  callApi: <TResponse>(
+    method: string,
+    body: Record<string, unknown>,
+  ) => Promise<TResponse>;
+}
+
+export interface TelegramStartupThreadCapabilityProbeDeps extends TelegramThreadCapabilityReaderDeps {
+  topicTargetStore: TelegramThreadCapabilityStore;
+  recordEvent: (
+    category: string,
+    message: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
+  setTopicModeUnavailable: (unavailable: boolean) => void;
+  getNowMs?: () => number;
+}
+
+export interface TelegramThreadCapabilityRuntimeDeps<
+  TContext,
+> extends TelegramThreadCapabilityReaderDeps {
+  topicTargetStore: TelegramThreadCapabilityStore;
+  isBusConfigured: () => boolean;
+  ownsLock: (ctx: TContext) => boolean;
+  getPollingStartedWithTelegramBus: () => boolean;
+  setPollingStartedWithTelegramBus: (started: boolean) => void;
+  setTopicModeUnavailable: (unavailable: boolean) => void;
+  stopFollowerRegistration: () => void;
+  startClassicPolling: (ctx: TContext) => MaybePromise<void>;
+  stopClassicPolling: () => MaybePromise<void>;
+  startBusPolling: (ctx: TContext) => MaybePromise<void>;
+  stopBusPolling: () => MaybePromise<void>;
+  startLeaderHealth: () => void;
+  stopLeaderHealth: () => void;
+  isTopicModeUnavailableError?: (error: unknown) => boolean;
+  updateStatus: (ctx: TContext) => void;
+  recordEvent: (
+    category: string,
+    message: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
+  getNowMs?: () => number;
+  intervalMs?: number;
+}
+
+export interface TelegramThreadCapabilityMonitor<TContext> {
+  start: (ctx: TContext) => void;
+  stop: () => void;
+}
+
+export type TelegramThreadTargetObservationHandler<TContext> = (
+  ctx: TContext,
+) => Promise<void>;
+
+export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
+  startPolling: (
+    ctx: TContext,
+    options?: { forceFreshLeaderThread?: boolean },
+  ) => Promise<void>;
+  stopPolling: () => Promise<void>;
+  registerFollowerWithOwner: (
+    ctx: TContext,
+    owner: TOwner,
+  ) => Promise<boolean | undefined>;
+  stopFollowerRegistration: () => void;
+}
+
+export interface TelegramThreadAwarePollingDeps<
+  TContext,
+  TOwner,
+> extends TelegramStartupThreadCapabilityProbeDeps {
+  isBusConfigured: () => boolean;
+  isBusRuntimeEnabled: () => boolean;
+  isTopicModeUnavailableError: (error: unknown) => boolean;
+  getPollingStartedWithTelegramBus: () => boolean;
+  setPollingStartedWithTelegramBus: (started: boolean) => void;
+  setForceFreshLeaderThreadOnNextStart: (forceFresh: boolean) => void;
+  startClassicPolling: (ctx: TContext) => MaybePromise<void>;
+  stopClassicPolling: () => Promise<void>;
+  startBusLeaderPolling: (ctx: TContext) => Promise<void>;
+  stopBusLeaderPolling: () => Promise<void>;
+  startLeaderHealth: () => void;
+  stopLeaderHealth: () => void;
+  registerFollowerWithLeader: (
+    ctx: TContext,
+    owner: TOwner,
+  ) => Promise<boolean | undefined>;
+  stopFollowerRegistration: () => void;
+}
+
+export async function readTelegramThreadCapability(
+  deps: TelegramThreadCapabilityReaderDeps,
+): Promise<boolean | undefined> {
+  const bot = await deps.callApi<{ has_topics_enabled?: boolean }>("getMe", {});
+  if (bot.has_topics_enabled === true) return true;
+  if (bot.has_topics_enabled === false) return false;
+  return undefined;
+}
+
+export async function probeTelegramStartupThreadCapability(
+  deps: TelegramStartupThreadCapabilityProbeDeps,
+): Promise<boolean | undefined> {
+  const threadModeEnabled = await readTelegramThreadCapability(deps);
+  const nowMs = (deps.getNowMs ?? Date.now)();
+  if (threadModeEnabled === false) {
+    deps.topicTargetStore.setBotState({
+      threadMode: "disabled",
+      updatedAtMs: nowMs,
+      lastReconcileAction: "startup-bot-topics-disabled",
+    });
+    await deps.topicTargetStore.persist();
+    deps.recordEvent("bus", "Telegram Threaded Mode unavailable on startup", {
+      phase: "startup-bot-topics-disabled",
+    });
+    deps.setTopicModeUnavailable(true);
+    return threadModeEnabled;
+  }
+  if (threadModeEnabled === true) {
+    deps.topicTargetStore.setBotState({
+      ...deps.topicTargetStore.getBotState(),
+      threadMode: "enabled",
+      updatedAtMs: nowMs,
+      lastReconcileAction: "startup-bot-topics-enabled",
+    });
+    await deps.topicTargetStore.persist();
+    deps.setTopicModeUnavailable(false);
+  }
+  return threadModeEnabled;
+}
+
+function hasTelegramThreadCapabilityBindings(
+  store: TelegramThreadCapabilityStore,
+): boolean {
+  return (
+    store.list?.().some((record) => {
+      return (
+        typeof record.target?.chatId === "number" &&
+        typeof record.target.threadId === "number" &&
+        record.status !== "deleted" &&
+        record.status !== "offline" &&
+        record.status !== "stale"
+      );
+    }) ?? false
+  );
+}
+
+export async function applyTelegramThreadCapability<TContext>(
+  ctx: TContext,
+  threadModeEnabled: boolean,
+  phase: string,
+  deps: TelegramThreadCapabilityRuntimeDeps<TContext>,
+): Promise<void> {
+  await deps.topicTargetStore.load();
+  if (!deps.isBusConfigured()) return;
+  const nowMs = (deps.getNowMs ?? Date.now)();
+  if (!threadModeEnabled) {
+    if (
+      hasTelegramThreadCapabilityBindings(deps.topicTargetStore) &&
+      !phase.endsWith("-confirmed")
+    ) {
+      deps.recordEvent("bus", "Telegram Threaded Mode probe deferred", {
+        phase,
+        reason: "active-thread-bindings-present",
+      });
+      return;
+    }
+    deps.topicTargetStore.setBotState({
+      threadMode: "disabled",
+      updatedAtMs: nowMs,
+      lastReconcileAction: phase,
+    });
+    await deps.topicTargetStore.persist();
+    deps.setTopicModeUnavailable(true);
+    deps.stopFollowerRegistration();
+    if (deps.getPollingStartedWithTelegramBus()) {
+      deps.stopLeaderHealth();
+      await deps.stopBusPolling();
+      deps.setPollingStartedWithTelegramBus(false);
+      await deps.startClassicPolling(ctx);
+    }
+    deps.updateStatus(ctx);
+    return;
+  }
+  deps.topicTargetStore.setBotState({
+    ...deps.topicTargetStore.getBotState(),
+    threadMode: "enabled",
+    updatedAtMs: nowMs,
+    lastReconcileAction: phase,
+  });
+  await deps.topicTargetStore.persist();
+  deps.setTopicModeUnavailable(false);
+  if (!deps.getPollingStartedWithTelegramBus() && deps.ownsLock(ctx)) {
+    await deps.stopClassicPolling();
+    deps.setPollingStartedWithTelegramBus(true);
+    try {
+      await deps.startBusPolling(ctx);
+      deps.startLeaderHealth();
+    } catch (error) {
+      deps.setPollingStartedWithTelegramBus(false);
+      const threadModeUnavailable =
+        deps.isTopicModeUnavailableError?.(error) === true;
+      if (threadModeUnavailable) {
+        deps.topicTargetStore.setBotState({
+          threadMode: "disabled",
+          updatedAtMs: nowMs,
+          lastReconcileAction: `${phase}-unavailable`,
+        });
+        await deps.topicTargetStore.persist();
+        deps.setTopicModeUnavailable(true);
+      }
+      try {
+        await deps.startClassicPolling(ctx);
+      } catch (classicError) {
+        deps.recordEvent("bus", classicError, {
+          phase: `${phase}-classic-restore`,
+        });
+      }
+      deps.updateStatus(ctx);
+      if (threadModeUnavailable) return;
+      throw error;
+    }
+  }
+  deps.updateStatus(ctx);
+}
+
+export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
+  deps: TelegramThreadAwarePollingDeps<TContext, TOwner>,
+): TelegramThreadAwarePollingPorts<TContext, TOwner> {
+  const startPolling = async (
+    ctx: TContext,
+    options?: { forceFreshLeaderThread?: boolean },
+  ): Promise<void> => {
+    if (deps.isBusConfigured()) {
+      await deps.topicTargetStore.load();
+      let startupThreadCapability: boolean | undefined;
+      try {
+        startupThreadCapability =
+          await probeTelegramStartupThreadCapability(deps);
+      } catch (error) {
+        deps.recordEvent("bus", error, { phase: "startup-thread-mode-probe" });
+      }
+      deps.setTopicModeUnavailable(startupThreadCapability !== true);
+    }
+    if (deps.isBusRuntimeEnabled()) {
+      deps.setTopicModeUnavailable(false);
+      try {
+        deps.setPollingStartedWithTelegramBus(true);
+        deps.setForceFreshLeaderThreadOnNextStart(
+          !!options?.forceFreshLeaderThread,
+        );
+        await deps.startBusLeaderPolling(ctx);
+        deps.startLeaderHealth();
+        return;
+      } catch (error) {
+        deps.setPollingStartedWithTelegramBus(false);
+        if (!deps.isTopicModeUnavailableError(error)) throw error;
+        deps.setTopicModeUnavailable(true);
+        await deps.topicTargetStore.load();
+        deps.topicTargetStore.setBotState({
+          threadMode: "disabled",
+          updatedAtMs: Date.now(),
+          lastReconcileAction: "thread-mode-unavailable",
+        });
+        await deps.topicTargetStore.persist();
+        deps.recordEvent("bus", error, { phase: "thread-mode-unavailable" });
+      } finally {
+        deps.setForceFreshLeaderThreadOnNextStart(false);
+      }
+    }
+    deps.setPollingStartedWithTelegramBus(false);
+    await deps.startClassicPolling(ctx);
+  };
+  const stopPolling = async (): Promise<void> => {
+    if (deps.getPollingStartedWithTelegramBus()) {
+      deps.stopLeaderHealth();
+      await deps.stopBusLeaderPolling();
+      deps.setPollingStartedWithTelegramBus(false);
+      return;
+    }
+    await deps.stopClassicPolling();
+  };
+  const registerFollowerWithOwner = async (
+    ctx: TContext,
+    owner: TOwner,
+  ): Promise<boolean | undefined> => {
+    await deps.topicTargetStore.load();
+    if (deps.topicTargetStore.getBotState().threadMode !== "enabled") {
+      return undefined;
+    }
+    if (!deps.isBusRuntimeEnabled()) return undefined;
+    return deps.registerFollowerWithLeader(ctx, owner);
+  };
+  return {
+    startPolling,
+    stopPolling,
+    registerFollowerWithOwner,
+    stopFollowerRegistration: deps.stopFollowerRegistration,
+  };
+}
+
+export function createTelegramThreadTargetObservationHandler<TContext>(
+  deps: TelegramThreadCapabilityRuntimeDeps<TContext>,
+): TelegramThreadTargetObservationHandler<TContext> {
+  let transitionPending = false;
+  return async (ctx) => {
+    if (transitionPending) return;
+    if (deps.topicTargetStore.getBotState().threadMode === "enabled") return;
+    transitionPending = true;
+    try {
+      await applyTelegramThreadCapability(
+        ctx,
+        true,
+        "thread-target-observed",
+        deps,
+      );
+    } catch (error) {
+      deps.recordEvent("bus", error, { phase: "thread-target-observed" });
+    } finally {
+      transitionPending = false;
+    }
+  };
+}
+
+export function createTelegramThreadCapabilityMonitor<TContext>(
+  deps: TelegramThreadCapabilityRuntimeDeps<TContext>,
+): TelegramThreadCapabilityMonitor<TContext> {
+  const intervalMs =
+    deps.intervalMs ?? TELEGRAM_THREAD_CAPABILITY_MONITOR_INTERVAL_MS;
+  let interval: ReturnType<typeof setInterval> | undefined;
+  let transitionPending = false;
+  let consecutiveDisabledProbes = 0;
+  const stop = (): void => {
+    if (!interval) return;
+    clearInterval(interval);
+    interval = undefined;
+  };
+  const check = (ctx: TContext): void => {
+    if (transitionPending) return;
+    transitionPending = true;
+    void readTelegramThreadCapability(deps)
+      .then(async (threadModeEnabled) => {
+        if (threadModeEnabled === undefined) {
+          if (
+            deps.topicTargetStore.getBotState().threadMode !== "enabled" &&
+            !deps.getPollingStartedWithTelegramBus() &&
+            deps.ownsLock(ctx)
+          ) {
+            await applyTelegramThreadCapability(
+              ctx,
+              true,
+              "capability-monitor-retry",
+              deps,
+            );
+          }
+          return;
+        }
+        if (threadModeEnabled) consecutiveDisabledProbes = 0;
+        const current = deps.topicTargetStore.getBotState().threadMode;
+        if (threadModeEnabled && current === "enabled") return;
+        if (!threadModeEnabled && current === "disabled") return;
+        if (
+          !threadModeEnabled &&
+          hasTelegramThreadCapabilityBindings(deps.topicTargetStore)
+        ) {
+          consecutiveDisabledProbes += 1;
+          if (
+            consecutiveDisabledProbes <
+            TELEGRAM_THREAD_CAPABILITY_DISABLED_CONFIRMATION_PROBES
+          ) {
+            deps.recordEvent("bus", "Telegram Threaded Mode probe deferred", {
+              phase: "capability-monitor-disabled",
+              reason: "active-thread-bindings-present",
+              consecutiveDisabledProbes,
+            });
+            return;
+          }
+        }
+        await applyTelegramThreadCapability(
+          ctx,
+          threadModeEnabled,
+          threadModeEnabled
+            ? "capability-monitor-enabled"
+            : consecutiveDisabledProbes >=
+                TELEGRAM_THREAD_CAPABILITY_DISABLED_CONFIRMATION_PROBES
+              ? "capability-monitor-disabled-confirmed"
+              : "capability-monitor-disabled",
+          deps,
+        );
+      })
+      .catch((error) => {
+        deps.recordEvent("bus", error, { phase: "capability-monitor" });
+      })
+      .finally(() => {
+        transitionPending = false;
+      });
+  };
+  return {
+    start(ctx) {
+      stop();
+      if (!deps.isBusConfigured()) return;
+      interval = setInterval(() => {
+        check(ctx);
+      }, intervalMs);
+      interval.unref?.();
+    },
+    stop,
+  };
+}
+
 export interface TelegramPollLoopDeps<
   TUpdate extends TelegramUpdate,
   TContext = unknown,
@@ -357,6 +804,12 @@ function getTelegramPollingErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+export function isTelegramGetUpdatesConflictError(error: unknown): boolean {
+  return getTelegramPollingErrorMessage(error).includes(
+    "Conflict: terminated by other getUpdates request",
+  );
+}
+
 export async function runTelegramPollLoop<
   TUpdate extends TelegramUpdate,
   TContext = unknown,
@@ -382,15 +835,20 @@ export async function runTelegramPollLoop<
       // ignore
     }
   }
-  const maxUpdateFailures = Math.max(1, deps.maxUpdateFailures ?? 3);
+  const maxUpdateFailures = Math.max(
+    1,
+    deps.maxUpdateFailures ?? TELEGRAM_POLLING_DEFAULT_MAX_UPDATE_FAILURES,
+  );
   const updateFailures = new Map<number, number>();
   let handledUpdateFailureRethrown = false;
+  let consecutiveGetUpdatesConflicts = 0;
   while (!deps.signal.aborted) {
     try {
       const updates = await deps.getUpdates(
         buildTelegramLongPollRequest(deps.config.lastUpdateId),
         deps.signal,
       );
+      consecutiveGetUpdatesConflicts = 0;
       for (const update of updates) {
         try {
           await deps.handleUpdate(update, deps.ctx);
@@ -425,8 +883,20 @@ export async function runTelegramPollLoop<
       } else {
         deps.recordRuntimeEvent?.("polling", error, { phase: "loop" });
       }
+      if (isTelegramGetUpdatesConflictError(error)) {
+        consecutiveGetUpdatesConflicts += 1;
+        await deps.sleep(
+          consecutiveGetUpdatesConflicts <
+            TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT
+            ? TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_MS
+            : TELEGRAM_GET_UPDATES_CONFLICT_SLOW_RETRY_MS,
+          deps.signal,
+        );
+        continue;
+      }
+      consecutiveGetUpdatesConflicts = 0;
       deps.onErrorStatus(getTelegramPollingErrorMessage(error));
-      await deps.sleep(3000, deps.signal);
+      await deps.sleep(TELEGRAM_POLLING_RETRY_MS, deps.signal);
       if (deps.signal.aborted) return;
       deps.onStatusReset();
     }

@@ -63,6 +63,7 @@ export interface TelegramMediaMessage {
 export interface TelegramMediaGroupMessage {
   message_id: number;
   chat: { id: number };
+  message_thread_id?: number;
   media_group_id?: string;
 }
 
@@ -232,7 +233,9 @@ function extractTelegramRichBlockText(block: unknown): string {
         .map((row) =>
           Array.isArray(row)
             ? row
-                .map((cell) => extractTelegramRichText(getObjectField(cell, "text")))
+                .map((cell) =>
+                  extractTelegramRichText(getObjectField(cell, "text")),
+                )
                 .filter(Boolean)
                 .join(" | ")
             : "",
@@ -328,6 +331,27 @@ export function extractFirstTelegramMessageText(
   return messages.map(extractTelegramMessageText).find(Boolean) ?? "";
 }
 
+export function hasTelegramMessagePromptContent(
+  message: TelegramMediaMessage,
+): boolean {
+  return (
+    !!extractTelegramMessageText(message) ||
+    (Array.isArray(message.photo) && message.photo.length > 0) ||
+    !!message.document ||
+    !!message.video ||
+    !!message.audio ||
+    !!message.voice ||
+    !!message.animation ||
+    !!message.sticker
+  );
+}
+
+export function hasTelegramMessagesPromptContent(
+  messages: TelegramMediaMessage[],
+): boolean {
+  return messages.some(hasTelegramMessagePromptContent);
+}
+
 export function collectTelegramMessageIds(
   messages: TelegramMediaMessage[],
 ): number[] {
@@ -338,7 +362,11 @@ export function getTelegramMediaGroupKey(
   message: TelegramMediaGroupMessage,
 ): string | undefined {
   if (!message.media_group_id) return undefined;
-  return `${message.chat.id}:${message.media_group_id}`;
+  const threadKey =
+    typeof message.message_thread_id === "number"
+      ? `thread:${message.message_thread_id}`
+      : "private";
+  return `${message.chat.id}:${threadKey}:${message.media_group_id}`;
 }
 
 export function removePendingTelegramMediaGroupMessages<

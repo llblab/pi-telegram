@@ -11,6 +11,82 @@ Small standard for inline buttons, menu rows, state controls, cards, and confirm
 - Prefer minimal, clear configuration UI over exhaustive explanation.
 - Preserve domain-owned callback prefixes and behavior in the owning module.
 
+## Emoji Semantics
+
+Use emoji as stable semantic markers, not decoration. Emoji carry transportable meaning across command descriptions, inline menu rows, message headings, status copy, and tests. Before adding a new UI emoji, either reuse one below or extend this registry in the same change.
+
+### Domain Markers
+
+| Emoji | Meaning | Canonical surfaces | Notes |
+| --- | --- | --- | --- |
+| `🧵` | Telegram/Pi thread routing | Thread chooser headings, unbound-thread warnings, thread lifecycle/status copy | Canonical thread marker. Do not add it to every concrete target button; target buttons use `threadName` or slot fallback. |
+| `📡` | Telegram transport / bridge connection | Instance connected notices, polling/transport role, bridge online copy | Transport is not thread identity; use `🧵` for thread concepts. |
+| `📊` | Status / overview | `/status` command description, status cards or status rows | Use for status summaries, not queue priority. |
+| `🤖` | Model selection | `/model`, model menu headings, model status rows | Keep model-control surfaces visually distinct from thinking. |
+| `🧠` | Thinking level | `/thinking`, thinking menu headings, thinking status rows | Use only for reasoning/thinking controls. |
+| `🔢` | Queue list / ordered work | `/queue`, queue menu entrypoints | Queue item rows may also use numeric labels. |
+| `⏱️` | Queue is ticking / current work is active | Inline main-menu Queue row only | Running-clock queue state: the narrow present moment is being worked now. |
+| `⏳` | Queue has waiting prompts | Inline main-menu Queue row only | Hourglass queue state: sand above the neck is future work still waiting. |
+| `⌛` | Queue is empty / standing idle | Inline main-menu Queue row only | Standing hourglass queue state: no future work is waiting above the neck. |
+| `⚙️` | Settings / configuration | Settings menu headings and Settings navigation rows | Extension-injected rows appear before the built-in `⚙️ Settings` row. |
+| `🧩` | Extension-provided surface | Extension command examples, extension section examples | Companion extensions may choose their own emoji, but `🧩` means generic extension/plugin. |
+| `👄` | Voice reply policy | Voice reply settings row and detail card | Not a generic audio attachment marker. |
+| `🕒` | Time injection / wall-clock context | Time injection settings row and detail card | Clock-face marker with hands; not a generic duration/progress marker. |
+| `📌` | Proactive push / pinned behavior | Proactive push settings row and detail card | Not generic active/selected state. |
+| `📎` | Attachment | Attachment summaries, queue rows for attachment-only turns | Not for thread binding. |
+
+### Command And Control Actions
+
+| Emoji | Meaning | Canonical surfaces | Notes |
+| --- | --- | --- | --- |
+| `🟢` | Start / active / current positive state | `/start`, active row, current selected option, active `On` toggle | In command context it means “open/start menu”; in state context it means selected/active. |
+| `🗜` | Compact session | `/compact`, compact confirmation action | Do not use for generic cleanup/delete. |
+| `⏩` | Force next queued turn | `/next` command and matching menu action | Means skip/advance to next waiting item. |
+| `▶️` | Continue/resume generation | `/continue` command and matching menu action | Means resume/continue current session flow, not force-next. |
+| `⏹️` | Abort current Pi work | `/abort` command description | Stops active work but is not a destructive queue clear by itself. |
+| `🟥` | Stop / abort-and-clear danger | `/stop` command description | Stronger than `⏹️`; use for disruptive stop/clear semantics. |
+| `🆕` | New session / fresh start | Reserved visible extension command example for `/new`-like flows | Same-thread Telegram `/new` is currently blocked by Pi core API; keep this meaning reserved. |
+| `🌀` | Refresh | Queue refresh row and future refresh buttons | Re-fetch/re-render current surface, not transport reconnect. |
+| `↪️` | Reroute to an existing target | Thread chooser buttons that send a captured command/message from one thread to another live thread | Curved arrow means the message arrived here but bends to another target. |
+| `🔁` | Replace/restore mode | Thread replace/restore chooser entrypoints | Opens a second step for moving a Pi instance binding to the current source thread. |
+| `➡️` | Choose replacement target | Thread replace/restore target buttons that select which Pi instance should move to the current thread | Use inside the second replace/restore chooser, not for ordinary reroutes. |
+| `☑️` | Activate / choose this item | Model detail activation action | Positive action; use `🟢 Active` for already-current state. |
+| `❌` | No / cancel | Confirmation cancel buttons | Use for safe cancellation, not destructive removal. |
+| `🗑` | Delete / remove | Queue delete actions, destructive confirmations, remove reaction | Use only when something is removed/closed/deleted. |
+
+### State Indicators And Button Grammars
+
+| Emoji | Meaning | Canonical surfaces | Notes |
+| --- | --- | --- | --- |
+| `🟢` | Current/active/enabled `On` | Current option in vertical lists, active state rows, active `On` toggle | One strong current marker per option list. |
+| `🟡` | Active `Off` or elevated/filter state | Active `Off` toggle, Priority/Scoped active tab | Yellow means intentionally not-normal or off/default-caution, not error. |
+| `🟣` | Normal/default active tab | Normal priority tab, All/default scope tab, active page picker | Use for neutral active tabs. |
+| `⚫️` | Inactive placeholder | Inactive toggle values and inactive tabs | Keeps row width stable. |
+| `⬆️` | Navigate upward | `⬆️ Main menu`, `⬆️ Back` | Always first row in submenus. |
+
+### Queue Reaction Shortcuts
+
+Queue reactions are shortcut controls for waiting turns. Preserve their semantics across Telegram reactions, queue-menu rows, status previews, and tests.
+
+| Emoji | Meaning | Canonical surfaces | Notes |
+| --- | --- | --- | --- |
+| `👍` | Promote to priority | Queue reaction shortcut | Normalized from variants like `👍️`. |
+| `⚡` | Promote to priority / fast lane | Queue reaction shortcut, priority fallback badge | Also used as the default priority badge when no specific priority emoji is stored. |
+| `❤` / `❤️` | Promote to priority | Queue reaction shortcut | Normalize display consistently where code normalizes reactions. |
+| `🕊` / `🕊️` | Promote to priority | Queue reaction shortcut | Soft/peaceful promotion gesture. |
+| `🔥` | Promote to priority | Queue reaction shortcut | Urgent/hot promotion gesture. |
+| `👎` | Remove waiting turn | Queue reaction shortcut | Removal, not negative feedback to the agent. |
+| `👻` | Remove waiting turn | Queue reaction shortcut | Disappear/remove metaphor. |
+| `💔` | Remove waiting turn | Queue reaction shortcut | Removal/cancel metaphor. |
+| `💩` | Remove waiting turn | Queue reaction shortcut | Removal/reject metaphor. |
+| `🗑` | Remove/delete waiting turn | Queue reaction shortcut and queue delete UI | Same destructive semantics as delete buttons. |
+
+### Decorative Or Local-Example Emoji
+
+Some emoji are intentionally local examples or decorative variants, not global semantics. Empty-queue rotating messages (`🫙`, `🍃`, `🕳`, `🦗`, `🌙`, `🧘`, `🪐`, `🧺`, `🔭`, `🫧`, `🛸`) are copy flavor only and must not become controls. Example extension icons such as `🧪`, `🔧`, and `🗂` are documentation fixtures for companion extensions, not built-in pi-telegram meanings.
+
+Thread UI rule: when a message heading, chooser, or status line is specifically about Telegram/Pi threads or target thread selection, start the heading with `🧵`. Button labels for concrete thread targets should stay clean (`threadName` or slot fallback) and should not add `🧵` to every target button unless the row would otherwise be ambiguous.
+
 ## Action Buttons
 
 Action buttons perform an operation.

@@ -104,11 +104,11 @@ test("Command helpers expose Telegram bot command definitions", () => {
     },
     {
       command: "abort",
-      description: "⏹️ Abort π",
+      description: "⏹️ Abort Pi",
     },
     {
       command: "stop",
-      description: "🟥 Abort π & Clear queue",
+      description: "🟥 Abort Pi & Clear queue",
     },
   ];
   assert.deepEqual(TELEGRAM_BOT_COMMANDS, expectedBuiltins);
@@ -364,7 +364,15 @@ test("Command helpers ignore non-command input and empty names", () => {
 test("Command helpers resolve message reply targets", () => {
   assert.deepEqual(
     getTelegramCommandMessageTarget({ chat: { id: 1 }, message_id: 2 }),
-    { chatId: 1, replyToMessageId: 2 },
+    { chatId: 1, replyToMessageId: 2, threadId: undefined },
+  );
+  assert.deepEqual(
+    getTelegramCommandMessageTarget({
+      chat: { id: 1 },
+      message_id: 2,
+      message_thread_id: 42,
+    }),
+    { chatId: 1, replyToMessageId: 2, threadId: 42 },
   );
 });
 
@@ -487,17 +495,19 @@ test("Command target runtime binds chat reply targets to command ports", async (
       );
       void execute(ctx);
     },
-    showStatus: async (chatId, replyToMessageId, ctx) => {
-      calls.push(`status:${chatId}:${replyToMessageId}:${ctx}`);
+    showStatus: async (chatId, replyToMessageId, ctx, threadId) => {
+      calls.push(`status:${chatId}:${replyToMessageId}:${ctx}:${threadId}`);
     },
-    openModelMenu: async (chatId, replyToMessageId, ctx) => {
-      calls.push(`model:${chatId}:${replyToMessageId}:${ctx}`);
+    openModelMenu: async (chatId, replyToMessageId, ctx, threadId) => {
+      calls.push(`model:${chatId}:${replyToMessageId}:${ctx}:${threadId}`);
     },
-    sendTextReply: async (chatId, replyToMessageId, text) => {
-      calls.push(`reply:${chatId}:${replyToMessageId}:${text}`);
+    sendTextReply: async (chatId, replyToMessageId, text, options) => {
+      calls.push(
+        `reply:${chatId}:${replyToMessageId}:${text}:${options?.target?.threadId}`,
+      );
     },
   });
-  const message = { chat: { id: 7 }, message_id: 11 };
+  const message = { chat: { id: 7 }, message_id: 11, message_thread_id: 42 };
   runtime.enqueueControlItem(
     message,
     "ctx",
@@ -509,13 +519,15 @@ test("Command target runtime binds chat reply targets to command ports", async (
   );
   await runtime.showStatus(message, "ctx");
   await runtime.openModelMenu(message, "ctx");
+  await runtime.openSettingsMenu(message, "ctx");
   await runtime.sendTextReply(message, "hello");
   assert.deepEqual(calls, [
     "enqueue:7:11:ctx:status:⚡ status",
     "execute",
-    "status:7:11:ctx",
-    "model:7:11:ctx",
-    "reply:7:11:hello",
+    "status:7:11:ctx:42",
+    "model:7:11:ctx:42",
+    "reply:7:11:Settings menu is unavailable.:42",
+    "reply:7:11:hello:42",
   ]);
 });
 
@@ -747,23 +759,23 @@ test("Command helpers guard and complete compact command flow", async () => {
   });
   complete?.();
   assert.deepEqual(events, [
-    "reply:Cannot compact while π or the Telegram queue is busy. Wait for queued turns to finish or send /abort first.",
+    "reply:Cannot compact while Pi or the Telegram queue is busy. Wait for queued turns to finish or send /abort first.",
     "set:true",
     "status",
-    "compact",
-    "reply:Compaction started.",
     "typing:start",
+    "compact",
+    "reply:🗜 Compaction started.",
     "typing:stop",
     "set:false",
     "status",
     "dispatch",
-    "reply:Compaction completed.",
+    "reply:✅ Compaction completed.",
   ]);
 });
 
 test("Command helpers open compact confirmation and handle callbacks", async () => {
   const events: string[] = [];
-  const message = { chat: { id: 42 }, message_id: 99 };
+  const message = { chat: { id: 42 }, message_id: 99, message_thread_id: 123 };
   const handleCommand = createTelegramCommandHandler({
     hasAbortHandler: () => false,
     clearPendingModelSwitch: () => {},
@@ -793,9 +805,16 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
     registerBotCommands: async () => {},
     persistConfig: async () => {},
     sendTextReply: async () => {},
-    sendInteractiveMessage: async (chatId, text, mode, replyMarkup) => {
+    sendInteractiveMessage: async (
+      chatId,
+      text,
+      mode,
+      replyMarkup,
+      options,
+    ) => {
       events.push(`${chatId}:${mode}:${text}`);
       events.push(JSON.stringify(replyMarkup.inline_keyboard));
+      events.push(JSON.stringify(options));
       return 77;
     },
   });
@@ -803,6 +822,7 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
   assert.deepEqual(events, [
     "42:html:<b>Compact session?</b>",
     '[[{"text":"🗜 Yes, compact","callback_data":"compact:confirm"},{"text":"❌ No","callback_data":"compact:cancel"}]]',
+    '{"target":{"chatId":42,"threadId":123}}',
   ]);
   events.length = 0;
   const cancelled = await handleTelegramCompactConfirmationCallback(
@@ -836,7 +856,7 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
     {
       id: "cb-confirm",
       data: "compact:confirm",
-      message: { chat: { id: 42 }, message_id: 77 },
+      message: { chat: { id: 42 }, message_id: 77, message_thread_id: 123 },
     },
     {
       ctx: { id: "ctx" },
@@ -847,17 +867,19 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
         events.push(`${chatId}:${messageId}:${mode}:${text}`);
         events.push(JSON.stringify(markup.inline_keyboard));
       },
-      runCompact: async (ctx, chatId, messageId) => {
-        events.push(`run:${(ctx as { id: string }).id}:${chatId}:${messageId}`);
+      runCompact: async (ctx, chatId, messageId, target) => {
+        events.push(
+          `run:${(ctx as { id: string }).id}:${chatId}:${messageId}:${target?.chatId}:${target?.threadId}`,
+        );
       },
     },
   );
   assert.equal(confirmed, true);
   assert.deepEqual(events, [
-    "42:77:plain:Compaction started.",
+    "42:77:plain:🗜 Compaction started.",
     "[]",
     "answer:cb-confirm",
-    "run:ctx:42:77",
+    "run:ctx:42:77:42:123",
   ]);
 });
 
@@ -903,14 +925,14 @@ test("Command helpers defer compact-complete queue dispatch", async () => {
   assert.deepEqual(events, [
     "set:true",
     "status",
-    "compact",
-    "reply:Compaction started.",
     "typing:start",
+    "compact",
+    "reply:🗜 Compaction started.",
     "typing:stop",
     "set:false",
     "status",
     "defer",
-    "reply:Compaction completed.",
+    "reply:✅ Compaction completed.",
   ]);
   deferredDispatch?.();
   assert.deepEqual(events.at(-1), "dispatch");
@@ -986,9 +1008,9 @@ test("Command helpers report compact errors", async () => {
   assert.deepEqual(events, [
     "set:true",
     "status",
-    "compact",
-    "reply:Compaction started.",
     "typing:start",
+    "compact",
+    "reply:🗜 Compaction started.",
     "typing:stop",
     "set:false",
     "status",
@@ -997,6 +1019,7 @@ test("Command helpers report compact errors", async () => {
     "reply:Compaction failed: boom",
     "throw-set:true",
     "throw-status",
+    "throw-typing:start",
     "throw-typing:stop",
     "throw-set:false",
     "throw-status",
@@ -1090,7 +1113,11 @@ test("Command helpers build the unified app menu from commands and status", () =
 test("Command handler target runtime binds command targets into command handling", async () => {
   const calls: string[] = [];
   const handleCommand = createTelegramCommandHandlerTargetRuntime<
-    { chat: { id: number }; message_id: number },
+    {
+      chat: { id: number; type?: string };
+      message_id: number;
+      from?: { id?: number };
+    },
     string
   >({
     hasAbortHandler: () => false,
@@ -1126,22 +1153,41 @@ test("Command handler target runtime binds command targets into command handling
     openModelMenu: async () => {},
     openThinkingMenu: async () => {},
     openQueueMenu: async () => {},
-    getAllowedUserId: () => undefined,
+    getAllowedUserId: () => 7,
     setAllowedUserId: () => {},
     setMyCommands: async () => {},
     persistConfig: async () => {},
-    sendTextReply: async () => {},
+    sendTextReply: async (_chatId, _replyToMessageId, text) => {
+      calls.push(`reply:${text}`);
+    },
   });
   assert.equal(
     await handleCommand("status", { chat: { id: 7 }, message_id: 11 }, "ctx"),
     true,
   );
-  assert.deepEqual(calls, ["show:ctx"]);
+  assert.equal(
+    await handleCommand(
+      "start",
+      {
+        chat: { id: -1007, type: "supergroup" },
+        message_id: 12,
+        from: { id: 7 },
+      },
+      "ctx",
+    ),
+    true,
+  );
+  assert.deepEqual(calls, ["show:ctx", "show:ctx"]);
 });
 
 test("Command runtime routes commands through runtime ports", async () => {
   const events: string[] = [];
-  const message = { chat: { id: 42 }, message_id: 99, from: { id: 7 } };
+  const message = {
+    chat: { id: 42 },
+    message_id: 99,
+    message_thread_id: 123,
+    from: { id: 7 },
+  };
   let allowedUserId: number | undefined;
   let compactComplete: (() => void) | undefined;
   const deps = {
@@ -1181,8 +1227,14 @@ test("Command runtime routes commands through runtime ports", async () => {
       events.push("compact:start");
       compactComplete = callbacks.onComplete;
     },
-    startTypingLoop: (_ctx: { idle: boolean }, chatId?: number) => {
-      events.push(`typing:start:${chatId ?? "default"}`);
+    startTypingLoop: (
+      _ctx: { idle: boolean },
+      chatId?: number,
+      options?: { target?: { chatId: number; threadId?: number } },
+    ) => {
+      events.push(
+        `typing:start:${chatId ?? "default"}:${options?.target?.chatId ?? "none"}:${options?.target?.threadId ?? "all"}`,
+      );
     },
     stopTypingLoop: () => {
       events.push("typing:stop");
@@ -1258,14 +1310,14 @@ test("Command runtime routes commands through runtime ports", async () => {
     "continue:99",
     "compact:true",
     "status",
+    "typing:start:42:42:123",
     "compact:start",
-    "reply:99:Compaction started.",
-    "typing:start:42",
+    "reply:99:🗜 Compaction started.",
     "typing:stop",
     "compact:false",
     "status",
     "dispatch",
-    "reply:99:Compaction completed.",
+    "reply:99:✅ Compaction completed.",
     "clear-switch",
     "clear-queue",
     "fold:false",
@@ -1273,6 +1325,61 @@ test("Command runtime routes commands through runtime ports", async () => {
     "status",
     "reply:99:Aborted current turn.",
   ]);
+});
+
+test("Command runtime does not first-pair from group start", async () => {
+  const events: string[] = [];
+  let allowedUserId: number | undefined;
+  const message = {
+    chat: { id: -1001, type: "supergroup" },
+    message_id: 55,
+    from: { id: 77 },
+  };
+  const handleCommand = createTelegramCommandHandler({
+    hasAbortHandler: () => false,
+    clearPendingModelSwitch: () => {},
+    hasQueuedTelegramItems: () => false,
+    clearQueuedTelegramItems: () => 0,
+    setFoldQueuedPromptsIntoHistory: () => {},
+    abortCurrentTurn: () => {},
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    hasActiveTelegramTurn: () => false,
+    hasDispatchPending: () => false,
+    isCompactionInProgress: () => false,
+    setCompactionInProgress: () => {},
+    updateStatus: () => {
+      events.push("status");
+    },
+    dispatchNextQueuedTelegramTurn: () => {},
+    enqueueContinueTurn: async () => {},
+    compact: () => {},
+    enqueueControlItem: () => {},
+    showStatus: async () => {
+      events.push("show");
+    },
+    openModelMenu: async () => {},
+    openThinkingMenu: async () => {},
+    openQueueMenu: async () => {},
+    getAllowedUserId: () => allowedUserId,
+    setAllowedUserId: (userId: number) => {
+      allowedUserId = userId;
+      events.push(`pair:${userId}`);
+    },
+    registerBotCommands: async () => {
+      events.push("register");
+    },
+    persistConfig: async () => {
+      events.push("persist");
+    },
+    sendTextReply: async (_message: typeof message, text: string) => {
+      events.push(`reply:${text}`);
+    },
+  });
+
+  assert.equal(await handleCommand("start", message, {}), true);
+  assert.equal(allowedUserId, undefined);
+  assert.deepEqual(events, ["register", "show"]);
 });
 
 test("Command or prompt runtime routes commands before enqueue fallback", async () => {
@@ -1288,7 +1395,9 @@ test("Command or prompt runtime routes commands before enqueue fallback", async 
       return commandName === "status";
     },
     executeExtensionCommand: async (command, message, ctx) => {
-      events.push(`extension:${command.name}:${command.args}:${message.text}:${ctx.id}`);
+      events.push(
+        `extension:${command.name}:${command.args}:${message.text}:${ctx.id}`,
+      );
       return command.name === "review";
     },
     expandPromptTemplateCommand: (commandName, args) =>
@@ -1313,6 +1422,32 @@ test("Command or prompt runtime routes commands before enqueue fallback", async 
     "command:none:hello:ctx",
     "enqueue:1:hello:ctx",
   ]);
+});
+
+test("Command or prompt runtime can ignore non-prompt message batches", async () => {
+  const events: string[] = [];
+  const runtime = createTelegramCommandOrPromptRuntime<
+    { text?: string; service?: boolean },
+    { id: string }
+  >({
+    extractRawText: (messages) =>
+      messages.map((message) => message.text ?? "").join(" "),
+    shouldIgnoreMessages: (messages) =>
+      messages.every((message) => message.service && !message.text),
+    handleCommand: async () => {
+      events.push("command");
+      return false;
+    },
+    replaceMessageText: (message, text) => ({ ...message, text }),
+    enqueueTurn: async (messages) => {
+      events.push(`enqueue:${messages.length}`);
+    },
+  });
+  await runtime.dispatchMessages([{ service: true }], { id: "ctx" });
+  await runtime.dispatchMessages([{ service: true, text: "hello" }], {
+    id: "ctx",
+  });
+  assert.deepEqual(events, ["command", "enqueue:1"]);
 });
 
 test("Command helpers execute command actions through provided handlers", async () => {

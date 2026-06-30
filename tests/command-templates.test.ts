@@ -113,7 +113,8 @@ test("Template composition expansion preserves retry and failure scope on step o
 test("Command template repeat expands numbered defaults", () => {
   const steps = expandCommandTemplateConfigs({
     repeat: 3,
-    template: "render page{_(index+1)}.html prev=page{_(prev+1)}.html next=page{_(next+1)}.html raw={index}/{repeat}"
+    template:
+      "render page{_(index+1)}.html prev=page{_(prev+1)}.html next=page{_(next+1)}.html raw={index}/{repeat}",
   });
   assert.equal(steps.length, 3);
   assert.deepEqual(
@@ -139,8 +140,18 @@ test("Command template repeat expands numbered defaults", () => {
     },
   );
   const invocation = buildCommandTemplateInvocation(steps[0], {}, "/work");
-  assert.deepEqual(invocation.args, ["page01.html", "prev=page03.html", "next=page02.html", "raw=0/3"]);
-  assert.deepEqual(buildCommandTemplateInvocation(steps[2], {}, "/work").args, ["page03.html", "prev=page02.html", "next=page01.html", "raw=2/3"]);
+  assert.deepEqual(invocation.args, [
+    "page01.html",
+    "prev=page03.html",
+    "next=page02.html",
+    "raw=0/3",
+  ]);
+  assert.deepEqual(buildCommandTemplateInvocation(steps[2], {}, "/work").args, [
+    "page03.html",
+    "prev=page02.html",
+    "next=page01.html",
+    "raw=2/3",
+  ]);
 });
 
 test("Command templates detect high-risk trusted executable shapes", () => {
@@ -207,9 +218,18 @@ test("Command templates resolve inherited default references and when guards", (
     template: [{ template: "echo {child}", defaults: { child: "{base}" } }],
   });
   assert.deepEqual(steps[0]?.defaults, { base: "parent", child: "parent" });
-  assert.equal(shouldRunCommandTemplateNode("enabled", { enabled: "yes" }), true);
-  assert.equal(shouldRunCommandTemplateNode("!enabled", { enabled: "no" }), true);
-  assert.equal(shouldRunCommandTemplateNode("{enabled?yes:}", { enabled: false }), false);
+  assert.equal(
+    shouldRunCommandTemplateNode("enabled", { enabled: "yes" }),
+    true,
+  );
+  assert.equal(
+    shouldRunCommandTemplateNode("!enabled", { enabled: "no" }),
+    true,
+  );
+  assert.equal(
+    shouldRunCommandTemplateNode("{enabled?yes:}", { enabled: false }),
+    false,
+  );
 });
 
 test("Command template arrays preserve modern control fields", () => {
@@ -286,11 +306,10 @@ test("Command template retry succeeds on second attempt", async () => {
     fs.writeFileSync(p, String(n));
     if (n < 2) process.exit(1);
   `;
-  const result = await execCommandTemplate(
-    process.execPath,
-    ["-e", script],
-    { retry: 2, killGrace: 10 },
-  );
+  const result = await execCommandTemplate(process.execPath, ["-e", script], {
+    retry: 2,
+    killGrace: 10,
+  });
   assert.equal(result.code, 0);
   assert.equal(readFileSync(counterFile, "utf8").trim(), "2");
   unlinkSync(counterFile);

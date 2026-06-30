@@ -21,6 +21,7 @@ import * as Replies from "./replies.ts";
 import * as Runtime from "./runtime.ts";
 import * as Setup from "./setup.ts";
 import * as Status from "./status.ts";
+import * as Target from "./target.ts";
 import * as TelegramApi from "./telegram-api.ts";
 
 type ActivePiModel = NonNullable<Pi.ExtensionContext["model"]>;
@@ -37,10 +38,12 @@ type TelegramBridgeStatusUpdater =
 interface TelegramCommandsAndToolsBindingDeps {
   pi: Pi.ExtensionAPI;
   configStore: Config.TelegramConfigStore;
+  persistConfig: () => Promise<void>;
   setup: Setup.TelegramSetupGuard;
   activeTurnRuntime: Queue.TelegramActiveTurnStore<Queue.PendingTelegramTurn>;
   lockedPollingRuntime: Locks.TelegramLockedPollingRuntime<Pi.ExtensionContext>;
-  getStatusLines: () => string[];
+  stopPolling?: () => Promise<void | string>;
+  getStatusLines: (options?: Status.TelegramBridgeStatusLineOptions) => string[];
   buttonActionStore: OutboundHandlers.TelegramButtonActionStore;
   sendMarkdownReply: (
     chatId: number,
@@ -50,6 +53,7 @@ interface TelegramCommandsAndToolsBindingDeps {
   ) => Promise<number | undefined>;
   callMultipart: OutboundHandlers.TelegramVoiceReplySenderDeps["sendMultipart"];
   getDefaultChatId: () => number | undefined;
+  getDefaultTarget?: () => OutboundAttachments.TelegramQueuedOutboundAttachmentTurnView["target"];
   canSendDirect: () => boolean;
   updateStatus: TelegramBridgeStatusUpdater;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
@@ -58,14 +62,17 @@ interface TelegramCommandsAndToolsBindingDeps {
 export function registerTelegramCommandsAndTools({
   pi,
   configStore,
+  persistConfig,
   setup,
   activeTurnRuntime,
   lockedPollingRuntime,
+  stopPolling,
   getStatusLines,
   buttonActionStore,
   sendMarkdownReply,
   callMultipart,
   getDefaultChatId,
+  getDefaultTarget,
   canSendDirect,
   updateStatus,
   recordRuntimeEvent,
@@ -73,27 +80,29 @@ export function registerTelegramCommandsAndTools({
   OutboundAttachments.registerTelegramOutboundAttachmentTool(pi, {
     getActiveTurn: activeTurnRuntime.get,
     getDefaultChatId,
+    getDefaultTarget,
     canSendDirect,
     sendMultipart: callMultipart,
     recordRuntimeEvent,
   });
   OutboundAttachments.registerTelegramOutboundMessageTool(pi, {
     getDefaultChatId,
+    getDefaultTarget,
     canSendDirect,
-    planMessage: OutboundHandlers.createTelegramOutboundReplyPlanner(
-      buttonActionStore,
-    ),
+    planMessage:
+      OutboundHandlers.createTelegramOutboundReplyPlanner(buttonActionStore),
     sendMarkdownMessage: (chatId, markdown, options) =>
       sendMarkdownReply(chatId, undefined, markdown, options),
     recordRuntimeEvent,
   });
+  Prompts.registerTelegramHelpTool(pi);
   Commands.registerTelegramBridgeCommands(pi, {
     promptForConfig: Setup.createTelegramSetupPromptRuntime({
       getConfig: configStore.get,
       setConfig: configStore.set,
       setupGuard: setup,
       getMe: TelegramApi.fetchTelegramBotIdentity,
-      persistConfig: configStore.persist,
+      persistConfig,
       startPolling: lockedPollingRuntime.start,
       updateStatus,
       recordRuntimeEvent,
@@ -102,7 +111,7 @@ export function registerTelegramCommandsAndTools({
     reloadConfig: configStore.load,
     hasBotToken: configStore.hasBotToken,
     startPolling: lockedPollingRuntime.start,
-    stopPolling: lockedPollingRuntime.stop,
+    stopPolling: stopPolling ?? lockedPollingRuntime.stop,
     updateStatus,
   });
 }
@@ -115,7 +124,7 @@ interface TelegramLifecycleBindingDeps {
   >;
   configStore: Pick<
     Config.TelegramConfigStore,
-    "getOutboundHandlers" | "hasBotToken"
+    "get" | "getOutboundHandlers" | "hasBotToken" | "load"
   >;
   abort: Runtime.TelegramRuntimeAbortPort;
   typing: Runtime.TelegramRuntimeTypingPort;
@@ -157,6 +166,14 @@ interface TelegramLifecycleBindingDeps {
     Keyboard.TelegramInlineKeyboardMarkup
   >["sendTextReply"] &
     NonNullable<OutboundHandlers.TelegramVoiceReplySenderDeps["sendTextReply"]>;
+  editInteractiveMessage: (
+    chatId: number,
+    messageId: number,
+    text: string,
+    mode: "html" | "markdown",
+    replyMarkup: Keyboard.TelegramInlineKeyboardMarkup,
+  ) => Promise<void>;
+  deleteMessage: (chatId: number, messageId: number) => Promise<void>;
   dispatchNextQueuedTelegramTurn: (ctx: Pi.ExtensionContext) => void;
   answerGuestQuery: NonNullable<
     Queue.TelegramAgentEndHookRuntimeDeps<
@@ -181,7 +198,9 @@ interface TelegramLifecycleBindingDeps {
     Keyboard.TelegramInlineKeyboardMarkup
   >["finalizeMarkdownPreview"];
   proactivePushChatIdGetter: () => number | undefined;
+  proactivePushTargetGetter: () => Queue.TelegramQueueTarget | undefined;
   isProactivePushEnabled: () => boolean;
+  canSendProactivePush: (ctx: Pi.ExtensionContext) => boolean;
   updateStatus: TelegramBridgeStatusUpdater;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }
@@ -206,12 +225,16 @@ export function registerTelegramLifecycleRuntimeHooks({
   sendRecordVoiceAction,
   sendMarkdownReply,
   sendTextReply,
+  editInteractiveMessage,
+  deleteMessage,
   dispatchNextQueuedTelegramTurn,
   answerGuestQuery,
   sendGuestReply,
   finalizeMarkdownPreview,
   proactivePushChatIdGetter,
+  proactivePushTargetGetter,
   isProactivePushEnabled,
+  canSendProactivePush,
   updateStatus,
   recordRuntimeEvent,
 }: TelegramLifecycleBindingDeps): void {
@@ -258,9 +281,15 @@ export function registerTelegramLifecycleRuntimeHooks({
     setFoldQueuedPromptsIntoHistory: lifecycle.setFoldQueuedPromptsIntoHistory,
     setActiveTurn: activeTurnRuntime.set,
     createPreviewState: previewRuntime.resetState,
-    startTypingLoop: promptDispatchRuntime.startTypingLoop,
+    startTypingLoop: (ctx) => {
+      const turn = activeTurnRuntime.get();
+      promptDispatchRuntime.startTypingLoop(ctx, turn?.chatId, {
+        target: turn?.target,
+      });
+    },
     updateStatus,
     getActiveTurn: activeTurnRuntime.get,
+    loadConfig: configStore.load,
     extractAssistant: Replies.extractLatestAssistantMessageText,
     getFoldQueuedPromptsIntoHistory:
       lifecycle.shouldFoldQueuedPromptsIntoHistory,
@@ -269,6 +298,16 @@ export function registerTelegramLifecycleRuntimeHooks({
     dispatchNextQueuedTelegramTurn,
     requestDeferredDispatchNextQueuedTelegramTurn:
       deferredQueueDispatchRuntime.request,
+    scheduleActiveTurnDelivery(task) {
+      const timer = setTimeout(() => {
+        void task().catch((error) => {
+          recordRuntimeEvent("delivery", error, {
+            phase: "agent-end-background-delivery",
+          });
+        });
+      }, 0);
+      timer.unref?.();
+    },
     clearPreview: previewRuntime.clear,
     setPreviewPendingText: previewRuntime.setPendingText,
     finalizeMarkdownPreview,
@@ -280,8 +319,9 @@ export function registerTelegramLifecycleRuntimeHooks({
     planOutboundReply: outboundReplyPlanner,
     sendOutboundReplyArtifacts: outboundReplyArtifactSender,
     getDefaultChatId: proactivePushChatIdGetter,
+    getDefaultTarget: proactivePushTargetGetter,
     isProactivePushEnabled,
-    canSendProactivePush: lockOwnershipGuard.ownsContext,
+    canSendProactivePush,
     recordRuntimeEvent,
     getActiveToolExecutions: lifecycle.getActiveToolExecutions,
     setActiveToolExecutions: lifecycle.setActiveToolExecutions,
@@ -291,11 +331,18 @@ export function registerTelegramLifecycleRuntimeHooks({
   const agentStartWithDedupReset = Lifecycle.createAgentStartDedupHook(
     agentLifecycleHooks.onAgentStart,
   );
+  const startActiveTurnTypingLoop = (ctx: Pi.ExtensionContext): void => {
+    const turn = activeTurnRuntime.get();
+    promptDispatchRuntime.startTypingLoop(ctx, turn?.chatId, {
+      target: turn?.target,
+    });
+  };
   const compactionObserver = Lifecycle.createTelegramCompactionObserverRuntime({
     setCompactionInProgress: lifecycle.setCompactionInProgress,
     updateStatus,
-    startTypingLoop: promptDispatchRuntime.startTypingLoop,
+    startTypingLoop: startActiveTurnTypingLoop,
     stopTypingLoop: typing.stop,
+    shouldStartTypingLoop: activeTurnRuntime.has,
     requestDeferredDispatchNextQueuedTelegramTurn:
       deferredQueueDispatchRuntime.request,
     dispatchNextQueuedTelegramTurn,
@@ -304,11 +351,12 @@ export function registerTelegramLifecycleRuntimeHooks({
   const messageActivityTypingHooks =
     Lifecycle.createTelegramMessageActivityTypingHooks({
       hasActiveTurn: activeTurnRuntime.has,
-      startTypingLoop: promptDispatchRuntime.startTypingLoop,
+      startTypingLoop: startActiveTurnTypingLoop,
       onMessageStart: previewRuntime.onMessageStart,
       onMessageUpdate: previewRuntime.onMessageUpdate,
       recordRuntimeEvent,
     });
+  const messageActivityHooks = messageActivityTypingHooks;
   Lifecycle.registerTelegramLifecycleHooks(pi, {
     ...sessionLifecycleRuntime,
     ...agentLifecycleHooks,
@@ -319,11 +367,19 @@ export function registerTelegramLifecycleRuntimeHooks({
     onSessionBeforeCompact: compactionObserver.onSessionBeforeCompact,
     onSessionCompact: compactionObserver.onSessionCompact,
     onAgentStart: agentStartWithDedupReset,
+    async onToolExecutionStart(event, _ctx) {
+      agentLifecycleHooks.onToolExecutionStart();
+    },
+    onToolExecutionUpdate() {},
+    async onToolExecutionEnd(event, ctx) {
+      agentLifecycleHooks.onToolExecutionEnd(event, ctx);
+    },
+    onAgentEnd: agentLifecycleHooks.onAgentEnd,
     onBeforeAgentStart: Prompts.createTelegramProactiveBeforeAgentStartHook({
       isConfigured: configStore.hasBotToken,
       isProactivePushEnabled,
       isCurrentOwner: lockOwnershipGuard.ownsContext,
     }),
-    ...messageActivityTypingHooks,
+    ...messageActivityHooks,
   });
 }

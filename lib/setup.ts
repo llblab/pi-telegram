@@ -162,7 +162,7 @@ export async function runTelegramSetup(
 export function createTelegramSetupPromptRuntime<
   TContext extends TelegramSetupPromptContext,
 >(deps: TelegramSetupPromptRuntimeDeps<TContext>) {
-  return async function promptForConfig(ctx: TContext): Promise<void> {
+  return async (ctx: TContext): Promise<void> => {
     if (!ctx.hasUI || !deps.setupGuard.start()) return;
     try {
       const nextConfig = await runTelegramSetup({

@@ -32,8 +32,9 @@ test("Thinking menu text and reply markup expose all levels with current marker"
     true,
   );
   assert.equal(
-    markup.inline_keyboard.every((row, index) =>
-      index === 0 || row[0]?.callback_data.startsWith("thinking:set:"),
+    markup.inline_keyboard.every(
+      (row, index) =>
+        index === 0 || row[0]?.callback_data.startsWith("thinking:set:"),
     ),
     true,
   );
@@ -140,7 +141,8 @@ test("Thinking menu open and update helpers apply thinking mode and respect voic
     getModelMenuState: async () => state,
     getActiveModel: () => reasoningModel,
     getThinkingLevel: () => "medium" as const,
-    storeModelMenuState: (nextState: unknown) => messages.push(["store", nextState]),
+    storeModelMenuState: (nextState: unknown) =>
+      messages.push(["store", nextState]),
     editInteractiveMessage: async (...args: unknown[]) => {
       messages.push(["edit", ...args]);
     },

@@ -1,6 +1,6 @@
 # Inbound Handlers
 
-`pi-telegram` can run ordered inbound handlers before a Telegram turn enters the π queue. Inbound handlers are the provider-neutral Telegram → π transformation bus for raw text and downloaded media/files. Extensions can also register programmatic inbound handlers with `registerTelegramInboundHandler()`, and voice extensions can register STT providers as a zero-config fallback for Telegram voice/audio files.
+`pi-telegram` can run ordered inbound handlers before a Telegram turn enters the Pi queue. Inbound handlers are the provider-neutral Telegram → Pi transformation bus for raw text and downloaded media/files. Extensions can also register programmatic inbound handlers with `registerTelegramInboundHandler()`, and voice extensions can register STT providers as a zero-config fallback for Telegram voice/audio files.
 
 This document is the local inbound adaptation of the portable [Command Template Standard](./command-templates.md). It is also the canonical home for the legacy `attachmentHandlers` compatibility config.
 

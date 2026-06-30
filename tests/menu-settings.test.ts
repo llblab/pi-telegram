@@ -37,9 +37,12 @@ test("Settings menu text and reply markup expose built-in controls", () => {
       "settings:open:proactive",
     ],
   );
-  assert.equal(markup.inline_keyboard[1]?.[0]?.text, "👄 Voice reply: Hidden");
-  assert.equal(markup.inline_keyboard[2]?.[0]?.text, "🕒 Time injection: Hidden");
-  assert.equal(markup.inline_keyboard[3]?.[0]?.text, "📌 Proactive push: On");
+  assert.equal(markup.inline_keyboard[1]?.[0]?.text, "👄 Voice reply: hidden");
+  assert.equal(
+    markup.inline_keyboard[2]?.[0]?.text,
+    "🕒 Time injection: hidden",
+  );
+  assert.equal(markup.inline_keyboard[3]?.[0]?.text, "📌 Proactive push: on");
 });
 
 test("Settings detail markups show active values", () => {
@@ -49,18 +52,18 @@ test("Settings detail markups show active values", () => {
     "🟡 Off",
   );
   assert.equal(
-    buildTimeInjectionModeSettingsReplyMarkup("interval").inline_keyboard[3]?.[0]
-      ?.text,
+    buildTimeInjectionModeSettingsReplyMarkup("interval")
+      .inline_keyboard[3]?.[0]?.text,
     "🟢 interval",
   );
   assert.equal(
-    buildVoiceReplyModeSettingsReplyMarkup("mirror", true).inline_keyboard[3]?.[0]
-      ?.text,
+    buildVoiceReplyModeSettingsReplyMarkup("mirror", true)
+      .inline_keyboard[3]?.[0]?.text,
     "🟢 mirror",
   );
   assert.equal(
-    buildVoiceReplyModeSettingsReplyMarkup("manual", false).inline_keyboard[1]?.[0]
-      ?.text,
+    buildVoiceReplyModeSettingsReplyMarkup("manual", false)
+      .inline_keyboard[1]?.[0]?.text,
     "🟢 hidden",
   );
 });
@@ -75,7 +78,9 @@ test("Settings callback action mutates voice, time, and proactive settings", asy
     setProactivePushEnabled: async (enabled: boolean) => {
       calls.push(`proactive:${enabled}`);
     },
-    setVoiceReplyMode: async (mode: "manual" | "mirror" | "always" | undefined) => {
+    setVoiceReplyMode: async (
+      mode: "manual" | "mirror" | "always" | undefined,
+    ) => {
       calls.push(`voice:${mode ?? "hidden"}`);
     },
     setTimeInjectionMode: async (mode: "hidden" | "always" | "interval") => {
@@ -107,14 +112,14 @@ test("Settings callback action mutates voice, time, and proactive settings", asy
   );
   assert.equal(
     await handleTelegramSettingsMenuCallbackAction(
-      "q3",
+      "q4",
       "settings:set:proactive:on",
       deps,
     ),
     true,
   );
   assert.equal(
-    await handleTelegramSettingsMenuCallbackAction("q4", "other", deps),
+    await handleTelegramSettingsMenuCallbackAction("q5", "other", deps),
     false,
   );
 

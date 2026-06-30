@@ -13,6 +13,7 @@ import type { TelegramConfig } from "../lib/config.ts";
 import {
   createTelegramConfigControls,
   createTelegramConfigStore,
+  createTelegramProactivePushTargetGetter,
   createTelegramTimeInjectionModeGetter,
   createTelegramTimeInjectionModeSetter,
   createTelegramUserPairingRuntime,
@@ -40,6 +41,29 @@ test("Telegram config helper returns empty config when file is absent", async ()
     await readTelegramConfig(join(agentDir, "telegram.json")),
     {},
   );
+});
+
+test("Telegram proactive target getter prefers active then assigned targets", () => {
+  const target = createTelegramProactivePushTargetGetter({
+    getActiveTurnTarget: () => undefined,
+    getAssignedTarget: () => ({ chatId: -1007, threadId: 42 }),
+    getAllowedUserId: () => 7,
+  });
+  assert.deepEqual(target(), { chatId: -1007, threadId: 42 });
+
+  const activeTarget = createTelegramProactivePushTargetGetter({
+    getActiveTurnTarget: () => ({ chatId: -1008, threadId: 99 }),
+    getAssignedTarget: () => ({ chatId: -1007, threadId: 42 }),
+    getAllowedUserId: () => 7,
+  });
+  assert.deepEqual(activeTarget(), { chatId: -1008, threadId: 99 });
+
+  const privateTarget = createTelegramProactivePushTargetGetter({
+    getActiveTurnTarget: () => undefined,
+    getAssignedTarget: () => undefined,
+    getAllowedUserId: () => 7,
+  });
+  assert.deepEqual(privateTarget(), { chatId: 7 });
 });
 
 test("Telegram config helpers persist and reload config", async () => {
@@ -82,9 +106,14 @@ test("Telegram config load recovers invalid JSON and records a diagnostic", asyn
 
   assert.deepEqual(store.get(), {});
   const entries = await readdir(agentDir);
-  const recovery = entries.find((entry) => entry.startsWith("telegram.json.invalid-"));
+  const recovery = entries.find((entry) =>
+    entry.startsWith("telegram.json.invalid-"),
+  );
   assert.ok(recovery);
-  assert.equal(await readFile(join(agentDir, recovery), "utf8"), "{not valid json");
+  assert.equal(
+    await readFile(join(agentDir, recovery), "utf8"),
+    "{not valid json",
+  );
   assert.equal(entries.includes("telegram.json"), false);
   assert.equal(events.length, 1);
   assert.match(events[0] ?? "", /^config:SyntaxError:load:/);
@@ -134,8 +163,36 @@ test("Telegram voice reply mode setter persists telegram.json", async () => {
   });
 });
 
+test("Telegram settings setters reload before scoped writes to preserve shared config changes", async () => {
+  const agentDir = await mkdtemp(
+    join(tmpdir(), "pi-telegram-shared-settings-"),
+  );
+  const configPath = join(agentDir, "telegram.json");
+  await writeTelegramConfig(agentDir, configPath, { botToken: "123:abc" });
+  const firstStore = createTelegramConfigStore({ agentDir, configPath });
+  const secondStore = createTelegramConfigStore({ agentDir, configPath });
+  await firstStore.load();
+  await secondStore.load();
+
+  const setVoiceMode = createTelegramVoiceReplyModeSetter(firstStore);
+  const setProactivePush =
+    createTelegramConfigControls(secondStore).setProactivePushEnabled;
+
+  await setVoiceMode("mirror");
+  await setProactivePush(true);
+
+  assert.deepEqual(await readTelegramConfig(configPath), {
+    botToken: "123:abc",
+    proactivePush: true,
+    voice: { replyMode: "mirror" },
+  });
+  assert.deepEqual(secondStore.get().voice, { replyMode: "mirror" });
+});
+
 test("Telegram settings menu callbacks persist voice and time settings to telegram.json", async () => {
-  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-settings-callbacks-"));
+  const agentDir = await mkdtemp(
+    join(tmpdir(), "pi-telegram-settings-callbacks-"),
+  );
   const configPath = join(agentDir, "telegram.json");
   const store = createTelegramConfigStore({
     initialConfig: { botToken: "123:abc" },
@@ -184,7 +241,6 @@ test("Telegram settings menu callbacks persist voice and time settings to telegr
     ),
     true,
   );
-
   assert.deepEqual(await readTelegramConfig(configPath), {
     botToken: "123:abc",
     voice: { replyMode: "mirror" },

@@ -579,15 +579,13 @@ function evaluateCommandTemplateExpression(
 ): number {
   let index = 0;
   const source = expression.replace(/\s+/g, "");
-  function peek(): string | undefined {
-    return source[index];
-  }
-  function consume(char: string): boolean {
+  const peek = (): string | undefined => source[index];
+  const consume = (char: string): boolean => {
     if (peek() !== char) return false;
     index += 1;
     return true;
-  }
-  function parsePrimary(): number {
+  };
+  const parsePrimary = (): number => {
     if (consume("(")) {
       const value = parseExpression();
       if (!consume(")"))
@@ -610,8 +608,8 @@ function evaluateCommandTemplateExpression(
       return Number(value);
     }
     throw new Error(`Invalid command template expression: ${expression}`);
-  }
-  function parseTerm(): number {
+  };
+  const parseTerm = (): number => {
     let value = parsePrimary();
     while (true) {
       if (consume("*")) value *= parsePrimary();
@@ -619,15 +617,15 @@ function evaluateCommandTemplateExpression(
       else if (consume("%")) value %= parsePrimary();
       else return value;
     }
-  }
-  function parseExpression(): number {
+  };
+  const parseExpression = (): number => {
     let value = parseTerm();
     while (true) {
       if (consume("+")) value += parseTerm();
       else if (consume("-")) value -= parseTerm();
       else return value;
     }
-  }
+  };
   const value = parseExpression();
   if (index !== source.length)
     throw new Error(`Invalid command template expression: ${expression}`);

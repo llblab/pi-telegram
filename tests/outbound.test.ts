@@ -21,12 +21,9 @@ import {
   createTelegramOutboundTextPreviewRuntime,
   createTelegramOutboundTextReplyRuntime,
   createTelegramVoiceReplySender,
-  getTelegramOutboundProgrammaticHandlers,
   handleTelegramButtonCallbackQuery,
-  hasTelegramOutboundHandler,
   planTelegramButtonReply,
   planTelegramVoiceReply,
-  registerTelegramOutboundHandler,
   registerTelegramVoiceSynthesisProvider,
   getTelegramVoiceSynthesisProviders,
   hasTelegramVoiceSynthesisProvider,
@@ -755,6 +752,44 @@ test("Button prompt turns use Telegram prompt content", () => {
   });
 });
 
+test("Voice reply sender includes thread target fields and scoped reply parameters", async () => {
+  const events: unknown[] = [];
+  const dispose = registerTelegramVoiceSynthesisProvider(
+    async () => "/tmp/voice.opus",
+  );
+  const sendVoiceReply = createTelegramVoiceReplySender({
+    execCommand: async () => ({
+      stdout: "",
+      stderr: "",
+      code: 0,
+      killed: false,
+    }),
+    sendMultipart: async (method, fields, fileField, filePath, fileName) => {
+      events.push({ method, fields, fileField, filePath, fileName });
+    },
+  });
+  await sendVoiceReply(
+    { chatId: 10, replyToMessageId: 20, target: { chatId: 10, threadId: 42 } },
+    "hello",
+    { replyToPrompt: true },
+  );
+  assert.deepEqual(events, [
+    {
+      method: "sendVoice",
+      fields: {
+        chat_id: "10",
+        message_thread_id: "42",
+        reply_parameters:
+          '{"message_id":20,"allow_sending_without_reply":true}',
+      },
+      fileField: "voice",
+      filePath: "/tmp/voice.opus",
+      fileName: "voice.opus",
+    },
+  ]);
+  dispose();
+});
+
 test("Voice reply sender can suppress prompt reply metadata for secondary voice", async () => {
   const events: unknown[] = [];
   const dispose = registerTelegramVoiceSynthesisProvider(
@@ -1028,6 +1063,7 @@ test("Voice reply sender uploads generated ogg via sendVoice", async () => {
     },
   });
   await sendVoiceReply({ chatId: 10, replyToMessageId: 20 }, "hello");
+  dispose();
   assert.deepEqual(events, [
     {
       method: "sendVoice",

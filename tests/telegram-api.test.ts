@@ -31,6 +31,7 @@ import {
   fetchTelegramBotIdentity,
   getTelegramInboundFileByteLimitFromEnv,
   isTelegramMessageNotModifiedError,
+  setTelegramApiHttpsFetchForTesting,
   prepareTelegramTempDir,
   TELEGRAM_FILE_MAX_BYTES,
   type TelegramApiClient,
@@ -81,6 +82,38 @@ function setApiTestFetch(fetchImpl: typeof fetch): () => void {
   return () => {
     globalThis.fetch = originalFetch;
   };
+}
+
+function setApiTestNetworkFamily(value: string | undefined): () => void {
+  const previous = process.env.PI_TELEGRAM_NETWORK_FAMILY;
+  if (value === undefined) delete process.env.PI_TELEGRAM_NETWORK_FAMILY;
+  else process.env.PI_TELEGRAM_NETWORK_FAMILY = value;
+  return () => {
+    if (previous === undefined) delete process.env.PI_TELEGRAM_NETWORK_FAMILY;
+    else process.env.PI_TELEGRAM_NETWORK_FAMILY = previous;
+  };
+}
+
+function createSyntheticFetchFailure(): TypeError {
+  const ipv6Error = Object.assign(new Error("connect ENETUNREACH"), {
+    code: "ENETUNREACH",
+    address: "2a0a:f280::1",
+    port: 443,
+    family: 6,
+  });
+  const ipv4Error = Object.assign(new Error("connect ETIMEDOUT"), {
+    code: "ETIMEDOUT",
+    address: "149.154.167.220",
+    port: 443,
+    family: 4,
+  });
+  return new TypeError("fetch failed", {
+    cause: new AggregateError([ipv6Error, ipv4Error], "connect failed"),
+  });
+}
+
+function hasApiTestFamily(family: unknown): boolean {
+  return family === 4 || family === 6;
 }
 
 function createApiRuntimeClient(
@@ -136,12 +169,46 @@ test("Telegram API helpers detect unchanged edit errors", () => {
 });
 
 test("Telegram API chat-action sender binds a fixed action", async () => {
-  const calls: Array<[number, string]> = [];
-  const sendTyping = createTelegramChatActionSender(async (chatId, action) => {
-    calls.push([chatId, action]);
-  }, "typing");
-  await sendTyping(7);
-  assert.deepEqual(calls, [[7, "typing"]]);
+  const calls: Array<[number, string, number | undefined]> = [];
+  const sendTyping = createTelegramChatActionSender(
+    async (chatId, action, options) => {
+      calls.push([chatId, action, options?.message_thread_id]);
+    },
+    "typing",
+  );
+  await sendTyping(7, { message_thread_id: 42 });
+  assert.deepEqual(calls, [[7, "typing", 42]]);
+});
+
+test("Telegram bridge API runtime includes thread target on chat actions", async () => {
+  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+  const runtime = createTelegramBridgeApiRuntime({
+    client: createApiRuntimeClient({
+      call: async <TResponse>(
+        method: string,
+        body: Record<string, unknown>,
+      ) => {
+        calls.push({ method, body });
+        return true as TResponse;
+      },
+    }),
+    tempDir: "/tmp",
+    maxFileSizeBytes: 1,
+    tempFileMaxAgeMs: 1,
+    recordRuntimeEvent: () => {},
+  });
+  await runtime.sendTypingAction(7, { message_thread_id: 42 });
+  await runtime.sendChatAction(7, "upload_document", { message_thread_id: 42 });
+  assert.deepEqual(calls, [
+    {
+      method: "sendChatAction",
+      body: { chat_id: 7, action: "typing", message_thread_id: 42 },
+    },
+    {
+      method: "sendChatAction",
+      body: { chat_id: 7, action: "upload_document", message_thread_id: 42 },
+    },
+  ]);
 });
 
 test("Telegram native Markdown draft sender disables automatic entity detection", async () => {
@@ -284,6 +351,195 @@ test("Telegram API helpers retry 429 and 5xx responses", async () => {
   } finally {
     restoreFetch();
   }
+});
+
+test("Telegram API transport falls back to IPv4 once for fetch failures", async () => {
+  const familySeen: boolean[] = [];
+  let calls = 0;
+  const restoreEnv = setApiTestNetworkFamily("ipv4-fallback");
+  const restoreFetch = setApiTestFetch(async () => {
+    calls += 1;
+    familySeen.push(false);
+    throw createSyntheticFetchFailure();
+  });
+  const restoreHttpsFetch = setTelegramApiHttpsFetchForTesting(
+    async (_input, _init, family) => {
+      calls += 1;
+      familySeen.push(hasApiTestFamily(family));
+      return createApiJsonResponse("sent");
+    },
+  );
+  try {
+    assert.equal(
+      await callTelegram<string>(
+        "123:abc",
+        "sendMessage",
+        {},
+        {
+          maxAttempts: 1,
+        },
+      ),
+      "sent",
+    );
+    assert.equal(calls, 2);
+    assert.deepEqual(familySeen, [false, true]);
+  } finally {
+    restoreHttpsFetch();
+    restoreFetch();
+    restoreEnv();
+  }
+});
+
+test("Telegram API transport does not IPv4-fallback retry HTTP 400", async () => {
+  const familySeen: boolean[] = [];
+  const restoreEnv = setApiTestNetworkFamily("ipv4-fallback");
+  const restoreFetch = setApiTestFetch(async () => {
+    familySeen.push(false);
+    return createApiErrorResponse(400, "Bad Request");
+  });
+  try {
+    await assert.rejects(
+      () => callTelegram("123:abc", "sendMessage", {}, { maxAttempts: 1 }),
+      {
+        message: "Telegram API sendMessage failed: HTTP 400: Bad Request",
+      },
+    );
+    assert.deepEqual(familySeen, [false]);
+  } finally {
+    restoreFetch();
+    restoreEnv();
+  }
+});
+
+test("Telegram multipart API rebuilds forms for transport fallback", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-upload-fallback-"));
+  const filePath = join(tempDir, "demo.txt");
+  await writeFile(filePath, "hello", "utf8");
+  const formStates: string[] = [];
+  const forms = new Set<FormData>();
+  let calls = 0;
+  const restoreEnv = setApiTestNetworkFamily("ipv4-fallback");
+  const restoreFetch = setApiTestFetch(async (_input, init) => {
+    calls += 1;
+    const form = init?.body as FormData;
+    forms.add(form);
+    formStates.push(
+      `auto:${form.get("document") instanceof Blob ? "blob" : "missing"}`,
+    );
+    throw createSyntheticFetchFailure();
+  });
+  const restoreHttpsFetch = setTelegramApiHttpsFetchForTesting(
+    async (_input, init, family) => {
+      calls += 1;
+      formStates.push(
+        `${hasApiTestFamily(family) ? "ipv4" : "auto"}:${
+          init.body instanceof Uint8Array ? "buffer" : "missing"
+        }`,
+      );
+      return createApiJsonResponse(true);
+    },
+  );
+  try {
+    assert.equal(
+      await callTelegramMultipart<boolean>(
+        "123:abc",
+        "sendDocument",
+        { chat_id: "1" },
+        "document",
+        filePath,
+        "demo.txt",
+        { maxAttempts: 1 },
+      ),
+      true,
+    );
+    assert.deepEqual(formStates, ["auto:blob", "ipv4:buffer"]);
+    assert.equal(forms.size, 1);
+  } finally {
+    restoreHttpsFetch();
+    restoreFetch();
+    restoreEnv();
+  }
+});
+
+test("Telegram file downloads use transport fallback for file content", async () => {
+  const tempDir = await mkdtemp(
+    join(tmpdir(), "pi-telegram-download-fallback-"),
+  );
+  const calls: string[] = [];
+  const restoreEnv = setApiTestNetworkFamily("ipv4-fallback");
+  const restoreFetch = setApiTestFetch(async (input) => {
+    const url = getApiTestFetchUrl(input);
+    if (url.includes("/getFile")) {
+      return createApiJsonResponse({ file_path: "files/demo" });
+    }
+    calls.push("auto");
+    throw createSyntheticFetchFailure();
+  });
+  const restoreHttpsFetch = setTelegramApiHttpsFetchForTesting(
+    async (_input, _init, family) => {
+      calls.push(hasApiTestFamily(family) ? "ipv4" : "auto");
+      return new Response("hello", { status: 200 });
+    },
+  );
+  try {
+    const path = await downloadTelegramFile(
+      "123:abc",
+      "file-id",
+      "demo.txt",
+      tempDir,
+    );
+    assert.deepEqual(calls, ["auto", "ipv4"]);
+    assert.equal(await readFile(path, "utf8"), "hello");
+  } finally {
+    restoreHttpsFetch();
+    restoreFetch();
+    restoreEnv();
+  }
+});
+
+test("Telegram transport diagnostics serialize nested fetch causes", async () => {
+  const events: Array<Record<string, unknown>> = [];
+  const runtime = createTelegramBridgeApiRuntime({
+    tempDir: "/tmp/telegram",
+    maxFileSizeBytes: 123,
+    tempFileMaxAgeMs: 60_000,
+    recordRuntimeEvent: (_kind, _error, details) => {
+      events.push(details ?? {});
+    },
+    client: createApiRuntimeClient({
+      call: async () => {
+        throw createSyntheticFetchFailure();
+      },
+    }),
+  });
+  await assert.rejects(() => runtime.call("sendMessage", {}), {
+    message: "fetch failed",
+  });
+  assert.deepEqual(events, [
+    {
+      method: "sendMessage",
+      transport: {
+        error: { name: "TypeError", message: "fetch failed" },
+        cause: { name: "AggregateError", message: "connect failed" },
+        attempts: [
+          {
+            name: "Error",
+            code: "ENETUNREACH",
+            address: "2a0a:f280::1",
+            port: 443,
+            family: 6,
+          },
+          {
+            name: "Error",
+            code: "ETIMEDOUT",
+            address: "149.154.167.220",
+            port: 443,
+            family: 4,
+          },
+        ],
+      },
+    },
+  ]);
 });
 
 test("Telegram multipart API rebuilds forms for retryable responses", async () => {
@@ -657,7 +913,10 @@ test("Telegram bridge API runtime exposes typed Bot API helpers", async () => {
           id: "1",
           title: "Response",
           input_message_content: {
-            rich_message: { markdown: "**hello**", skip_entity_detection: true },
+            rich_message: {
+              markdown: "**hello**",
+              skip_entity_detection: true,
+            },
           },
         },
       },
@@ -692,7 +951,11 @@ test("Telegram bridge API runtime exposes typed Bot API helpers", async () => {
     },
     {
       method: "sendRichMessageDraft",
-      body: { chat_id: 1, draft_id: 3, rich_message: { markdown: "**draft**" } },
+      body: {
+        chat_id: 1,
+        draft_id: 3,
+        rich_message: { markdown: "**draft**" },
+      },
     },
   ]);
 });

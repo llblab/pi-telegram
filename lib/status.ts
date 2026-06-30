@@ -103,10 +103,80 @@ export interface TelegramRuntimeEventRecorderOptions {
   now?: () => number;
 }
 
+export interface TelegramBridgeStatusBusFollower {
+  instanceId: string;
+  cwd?: string;
+  lastHeartbeatMs: number;
+  target?: { chatId: number; threadId?: number };
+  slot?: string;
+  threadName?: string;
+  status?: string;
+}
+
+export interface TelegramBridgeStatusTopicTarget {
+  instanceId?: string;
+  status?: string;
+  target?: { chatId: number; threadId?: number };
+  slot?: string;
+  threadName?: string;
+  syncStatus?: string;
+  lastSyncObservedAtMs?: number;
+  lastSyncProbeAtMs?: number;
+  lastSyncError?: string;
+  lastReconcileAction?: string;
+}
+
+export interface TelegramBridgeStatusThreadReservation {
+  target?: { chatId: number; threadId?: number };
+  slot?: string;
+  reason?: string;
+  instanceId?: string;
+  expiresAtMs?: number;
+  lastReconcileAction?: string;
+}
+
+export interface TelegramBridgeStatusSyncObservation {
+  target?: { chatId: number; threadId?: number };
+  syncStatus: string;
+  observedAtMs: number;
+  instanceId?: string;
+  slot?: string;
+  lastSyncError?: string;
+  lastReconcileAction?: string;
+}
+
+export interface TelegramBridgeStatusSyncSlice {
+  status: string;
+  updatedAtMs?: number;
+  suspectAtMs?: number;
+  reason?: string;
+  lastReconcileAction?: string;
+}
+
+export interface TelegramBridgeThreadReconciliationState {
+  phase: string;
+  event: string;
+  atMs: number;
+  leaderEpoch?: number | string;
+  pendingProvisionCount: number;
+  syncActionCount: number;
+  cleanupActionCount: number;
+}
+
+export type TelegramBridgeBusRole = "leader" | "follower";
+export type TelegramBridgeBusLifecyclePhase = "electing";
+
 export interface TelegramBridgeStatusLineState {
   hasBotToken?: boolean;
   botUsername?: string;
   allowedUserId?: number;
+  botThreadMode?: "unknown" | "enabled" | "disabled";
+  botThreadModeUpdatedAtMs?: number;
+  botThreadModeAction?: string;
+  busRole?: TelegramBridgeBusRole;
+  busLifecyclePhase?: TelegramBridgeBusLifecyclePhase;
+  instanceSlot?: string;
+  instanceThreadName?: string;
   lockState?: string;
   pollingActive: boolean;
   lastUpdateId?: number;
@@ -116,6 +186,13 @@ export interface TelegramBridgeStatusLineState {
   activeToolExecutions: number;
   pendingModelSwitch: boolean;
   queuedItems: Array<{ queueLane: TelegramStatusQueueLane }>;
+  busFollowers?: TelegramBridgeStatusBusFollower[];
+  topicTargets?: TelegramBridgeStatusTopicTarget[];
+  threadReservations?: TelegramBridgeStatusThreadReservation[];
+  topicSyncObservations?: TelegramBridgeStatusSyncObservation[];
+  syncState?: Record<string, TelegramBridgeStatusSyncSlice | undefined>;
+  threadReconciliation?: TelegramBridgeThreadReconciliationState;
+  busNowMs?: number;
   recentRuntimeEvents: TelegramRuntimeEvent[];
 }
 
@@ -130,6 +207,10 @@ export interface TelegramStatusBarState {
   hasBotToken: boolean;
   pollingActive: boolean;
   paired: boolean;
+  busRole?: TelegramBridgeBusRole;
+  busLifecyclePhase?: TelegramBridgeBusLifecyclePhase;
+  instanceSlot?: string;
+  instanceThreadName?: string;
   compactionInProgress: boolean;
   processing: boolean;
   processingStatus?: string;
@@ -175,13 +256,41 @@ export interface TelegramBridgeStatusRuntimeDeps<
   formatQueuedStatus: (items: TQueueItem[]) => string;
   getRecentRuntimeEvents: () => TelegramRuntimeEvent[];
   getRuntimeLockState?: () => string;
+  getBusRole?: () => TelegramBridgeBusRole | undefined;
+  getBusLifecyclePhase?: () => TelegramBridgeBusLifecyclePhase | undefined;
+  getBotThreadMode?: () =>
+    | {
+        threadMode: "unknown" | "enabled" | "disabled";
+        updatedAtMs?: number;
+        lastReconcileAction?: string;
+      }
+    | undefined;
+  getBusFollowers?: () => TelegramBridgeStatusBusFollower[];
+  getTopicTargets?: () => TelegramBridgeStatusTopicTarget[];
+  getThreadReservations?: () => TelegramBridgeStatusThreadReservation[];
+  getTopicSyncObservations?: () => TelegramBridgeStatusSyncObservation[];
+  getSyncState?: () => Record<
+    string,
+    TelegramBridgeStatusSyncSlice | undefined
+  >;
+  getThreadReconciliationState?: () =>
+    | TelegramBridgeThreadReconciliationState
+    | undefined;
+  getInstanceSlot?: () => string | undefined;
+  getInstanceThreadName?: () => string | undefined;
+  getNowMs?: () => number;
+}
+
+export interface TelegramBridgeStatusLineOptions {
+  verbose?: boolean;
 }
 
 export interface TelegramStatusRuntime<
   TContext extends TelegramStatusRuntimeContext,
 > {
   updateStatus: (ctx: TContext, error?: string) => void;
-  getStatusLines: () => string[];
+  getStatusLines: (options?: TelegramBridgeStatusLineOptions) => string[];
+  getStatusState: () => TelegramBridgeStatusLineState;
 }
 
 function truncateTelegramRuntimeEventText(
@@ -421,11 +530,13 @@ export function buildTelegramRuntimeEventLines(
 export function createTelegramStatusHtmlBuilder<TContext>(deps: {
   getActiveModel: (ctx: TContext) => TelegramStatusActiveModel | undefined;
   isCompactionInProgress?: () => boolean;
+  getBridgeStatusLineState?: () => TelegramBridgeStatusLineState;
 }): (ctx: TContext & TelegramStatusContext) => string {
   return (ctx) =>
     buildStatusHtml(
       { ...ctx, isCompactionInProgress: deps.isCompactionInProgress },
       deps.getActiveModel(ctx),
+      deps.getBridgeStatusLineState?.(),
     );
 }
 
@@ -443,8 +554,9 @@ export function createTelegramStatusRuntime<
         ),
       );
     },
-    getStatusLines: () =>
-      buildTelegramBridgeStatusLines(deps.getBridgeStatusLineState()),
+    getStatusLines: (options) =>
+      buildTelegramBridgeStatusLines(deps.getBridgeStatusLineState(), options),
+    getStatusState: deps.getBridgeStatusLineState,
   };
 }
 
@@ -468,6 +580,10 @@ export function createTelegramBridgeStatusRuntime<
         hasBotToken: !!config.botToken,
         pollingActive: deps.isPollingActive(),
         paired: !!config.allowedUserId,
+        busRole: deps.getBusRole?.(),
+        busLifecyclePhase: deps.getBusLifecyclePhase?.(),
+        instanceSlot: deps.getInstanceSlot?.(),
+        instanceThreadName: deps.getInstanceThreadName?.(),
         compactionInProgress,
         processing:
           hasActiveTurn ||
@@ -488,10 +604,18 @@ export function createTelegramBridgeStatusRuntime<
     },
     getBridgeStatusLineState: () => {
       const config = deps.getConfig();
+      const botThreadMode = deps.getBotThreadMode?.();
       return {
         hasBotToken: Boolean(config.botToken),
         botUsername: config.botUsername,
         allowedUserId: config.allowedUserId,
+        botThreadMode: botThreadMode?.threadMode,
+        botThreadModeUpdatedAtMs: botThreadMode?.updatedAtMs,
+        botThreadModeAction: botThreadMode?.lastReconcileAction,
+        busRole: deps.getBusRole?.(),
+        busLifecyclePhase: deps.getBusLifecyclePhase?.(),
+        instanceSlot: deps.getInstanceSlot?.(),
+        instanceThreadName: deps.getInstanceThreadName?.(),
         lockState: deps.getRuntimeLockState?.(),
         pollingActive: deps.isPollingActive(),
         lastUpdateId: config.lastUpdateId,
@@ -501,10 +625,94 @@ export function createTelegramBridgeStatusRuntime<
         activeToolExecutions: deps.getActiveToolExecutions(),
         pendingModelSwitch: deps.hasPendingModelSwitch(),
         queuedItems: deps.getQueuedItems(),
+        busFollowers: deps.getBusFollowers?.(),
+        topicTargets: deps.getTopicTargets?.(),
+        threadReservations: deps.getThreadReservations?.(),
+        topicSyncObservations: deps.getTopicSyncObservations?.(),
+        syncState: deps.getSyncState?.(),
+        threadReconciliation: deps.getThreadReconciliationState?.(),
+        busNowMs: deps.getNowMs?.(),
         recentRuntimeEvents: deps.getRecentRuntimeEvents(),
       };
     },
   });
+}
+
+export interface TelegramRuntimeLogScope extends Record<string, unknown> {
+  instanceId: string;
+  role: string;
+  slot?: string;
+  threadName?: string;
+  lockState?: string;
+}
+
+export function createTelegramRuntimeLogScope(input: {
+  state: TelegramBridgeStatusLineState;
+  instanceId: string;
+}): TelegramRuntimeLogScope {
+  return {
+    instanceId: input.instanceId,
+    role: input.state.busRole ?? "classic-or-disconnected",
+    slot: input.state.instanceSlot,
+    threadName: input.state.instanceThreadName,
+    lockState: input.state.lockState,
+  };
+}
+
+export function createTelegramStatusSnapshot(
+  state: TelegramBridgeStatusLineState,
+): {
+  runtime: Record<string, unknown>;
+  liveRoster: Record<string, unknown>;
+  diagnostics: Record<string, unknown>;
+} {
+  return {
+    runtime: {
+      busRole: state.busRole,
+      ...(state.busLifecyclePhase
+        ? { busLifecyclePhase: state.busLifecyclePhase }
+        : {}),
+      botThreadMode: state.botThreadMode,
+      botThreadModeUpdatedAtMs: state.botThreadModeUpdatedAtMs,
+      botThreadModeAction: state.botThreadModeAction,
+      instanceSlot: state.instanceSlot,
+      instanceThreadName: state.instanceThreadName,
+      pollingActive: state.pollingActive,
+      lockState: state.lockState,
+    },
+    liveRoster: {
+      busFollowers: state.busFollowers ?? [],
+      topicTargets: state.topicTargets ?? [],
+      reservations: state.threadReservations ?? [],
+      syncObservations: state.topicSyncObservations ?? [],
+    },
+    diagnostics: {
+      pendingDispatch: state.pendingDispatch,
+      compactionInProgress: state.compactionInProgress,
+      activeToolExecutions: state.activeToolExecutions,
+      pendingModelSwitch: state.pendingModelSwitch,
+      syncState: state.syncState,
+      threadReconciliation: state.threadReconciliation,
+      recentRuntimeEvents: state.recentRuntimeEvents,
+    },
+  };
+}
+
+export function createTelegramRuntimeDiagnosticsSnapshotScheduler(deps: {
+  persistSnapshot: () => Promise<void>;
+  recordError: (error: unknown) => void;
+  setTimer?: (callback: () => void, ms: number) => { unref?: () => void };
+}): () => void {
+  const setTimer = deps.setTimer ?? setTimeout;
+  let timer: { unref?: () => void } | number | undefined;
+  return () => {
+    if (timer) return;
+    timer = setTimer(() => {
+      timer = undefined;
+      void deps.persistSnapshot().catch(deps.recordError);
+    }, 0);
+    if (typeof timer !== "number") timer?.unref?.();
+  };
 }
 
 export function getTelegramStatusBarProcessingStatus(state: {
@@ -515,19 +723,25 @@ export function getTelegramStatusBarProcessingStatus(state: {
   queuedItems: number;
 }): string | undefined {
   if (state.hasPendingModelSwitch) return "model";
-  if (state.hasActiveTurn && state.activeToolExecutions > 0)
-    return "tool running";
   if (state.hasActiveTurn || state.activeToolExecutions > 0) return "active";
   if (state.hasPendingDispatch) return "dispatching";
   if (state.queuedItems > 0) return "queued";
   return undefined;
 }
 
+function getTelegramStatusBarLabel(state: TelegramStatusBarState): string {
+  const threadName = state.instanceThreadName?.trim();
+  if (!threadName) return "telegram";
+  const genericLabels = new Set(["telegram", "leader", "follower"]);
+  if (genericLabels.has(threadName.toLowerCase())) return "telegram";
+  return threadName;
+}
+
 export function buildTelegramStatusBarText(
   theme: TelegramStatusBarTheme,
   state: TelegramStatusBarState,
 ): string {
-  const label = theme.fg("accent", "telegram");
+  const label = theme.fg("accent", getTelegramStatusBarLabel(state));
   if (state.error) {
     return `${label} ${theme.fg("error", "error")} ${theme.fg("muted", state.error)}`;
   }
@@ -536,10 +750,14 @@ export function buildTelegramStatusBarText(
     : "";
   if (!state.hasBotToken)
     return `${label} ${theme.fg("muted", "not configured")}${queued}`;
-  if (!state.pollingActive)
-    return `${label} ${theme.fg("muted", "disconnected")}${queued}`;
   if (!state.paired)
     return `${label} ${theme.fg("warning", "awaiting pairing")}${queued}`;
+  if (state.busLifecyclePhase === "electing")
+    return `${label} ${theme.fg("warning", "electing")}${queued}`;
+  if (!state.pollingActive && state.busRole !== "follower")
+    return `${label} ${theme.fg("muted", "disconnected")}${queued}`;
+  if (state.busRole === "follower")
+    return `${label} ${theme.fg("success", "follower")}${queued}`;
   if (state.compactionInProgress) {
     return `${label} ${theme.fg("warning", "compacting")}${queued}`;
   }
@@ -551,6 +769,8 @@ export function buildTelegramStatusBarText(
       processingStatus === "active" ? "warning" : "accent";
     return `${label} ${theme.fg(processingToken, processingStatus)}${queued}`;
   }
+  if (state.busRole === "leader")
+    return `${label} ${theme.fg("success", "leader")}`;
   return `${label} ${theme.fg("success", "connected")}`;
 }
 
@@ -561,7 +781,281 @@ function formatTelegramBridgeBotStatus(
   return state.hasBotToken ? "unknown" : "not configured";
 }
 
+function formatTelegramStatusTarget(
+  target: { chatId: number; threadId?: number } | undefined,
+): string {
+  if (!target) return "";
+  return target.threadId === undefined
+    ? ` target ${target.chatId}`
+    : ` target ${target.chatId}:${target.threadId}`;
+}
+
+function formatTelegramThreadStatusLabel(input: {
+  threadName?: string;
+  slot?: string;
+}): string {
+  const threadName = input.threadName?.trim();
+  if (threadName) return threadName;
+  return input.slot ? `[${input.slot}]` : "";
+}
+
+function buildTelegramBusFollowerLines(
+  state: Pick<TelegramBridgeStatusLineState, "busFollowers" | "busNowMs">,
+): string[] {
+  const followers = state.busFollowers ?? [];
+  if (followers.length === 0) return [];
+  const nowMs = state.busNowMs ?? Date.now();
+  return [
+    "",
+    "bus:",
+    `- followers: ${followers.length}`,
+    ...followers.map((follower) => {
+      const ageSeconds = Math.max(
+        0,
+        Math.round((nowMs - follower.lastHeartbeatMs) / 1000),
+      );
+      const label = formatTelegramThreadStatusLabel(follower);
+      const labelSuffix = label ? ` ${label}` : "";
+      const statusLabel = follower.status ? ` (${follower.status})` : "";
+      const cwd = follower.cwd ? ` ${follower.cwd}` : "";
+      const target = formatTelegramStatusTarget(follower.target);
+      return `- ${follower.instanceId}:${labelSuffix} heartbeat ${ageSeconds}s ago${statusLabel}${target}${cwd}`;
+    }),
+  ];
+}
+
+function buildTelegramSyncSliceLines(
+  state: Pick<TelegramBridgeStatusLineState, "syncState">,
+): string[] {
+  const syncState = state.syncState;
+  if (!syncState || Object.keys(syncState).length === 0) return [];
+  return [
+    "sync:",
+    ...Object.entries(syncState).map(([slice, value]) => {
+      const status = value?.status ?? "unknown";
+      const action = value?.lastReconcileAction
+        ? ` reconcile=${value.lastReconcileAction}`
+        : "";
+      const reason = value?.reason ? ` reason=${value.reason}` : "";
+      return `- ${slice}: ${status}${action}${reason}`;
+    }),
+  ];
+}
+
+function buildTelegramThreadReconciliationLines(
+  state: Pick<TelegramBridgeStatusLineState, "threadReconciliation">,
+): string[] {
+  const reconciliation = state.threadReconciliation;
+  if (!reconciliation) return [];
+  const epoch =
+    reconciliation.leaderEpoch !== undefined
+      ? ` epoch=${reconciliation.leaderEpoch}`
+      : "";
+  return [
+    "reconciliation:",
+    `- phase: ${reconciliation.phase} event=${reconciliation.event}${epoch}`,
+    `- counts: pending=${reconciliation.pendingProvisionCount}, sync=${reconciliation.syncActionCount}, cleanup=${reconciliation.cleanupActionCount}`,
+  ];
+}
+
+function buildTelegramTopicTargetDiagnosticLines(
+  state: Pick<
+    TelegramBridgeStatusLineState,
+    "topicTargets" | "threadReservations" | "topicSyncObservations"
+  >,
+): string[] {
+  const activeTargets = (state.topicTargets ?? []).filter(
+    (record) =>
+      !!record.instanceId &&
+      (record.status === "active" || record.status === "starting"),
+  );
+  const reservations = state.threadReservations ?? [];
+  const observations = state.topicSyncObservations ?? [];
+  if (
+    activeTargets.length === 0 &&
+    reservations.length === 0 &&
+    observations.length === 0
+  )
+    return [];
+  const byInstance = new Map<string, TelegramBridgeStatusTopicTarget[]>();
+  for (const record of activeTargets) {
+    const key = record.instanceId;
+    if (!key) continue;
+    const records = byInstance.get(key) ?? [];
+    records.push(record);
+    byInstance.set(key, records);
+  }
+  const duplicateLines = Array.from(byInstance.entries())
+    .filter(([, records]) => records.length > 1)
+    .map(([instanceId, records]) => {
+      const targets = records
+        .map((record) => {
+          const label = formatTelegramThreadStatusLabel(record);
+          return `${label}${formatTelegramStatusTarget(record.target) || " unknown"}`.trim();
+        })
+        .join(", ");
+      return `- duplicate ${instanceId}: ${records.length} active threads ${targets}`;
+    });
+  const twinLines = activeTargets.map((record) => {
+    const label = formatTelegramThreadStatusLabel(record);
+    const target = formatTelegramStatusTarget(record.target) || " unknown";
+    const sync = record.syncStatus ? ` sync=${record.syncStatus}` : "";
+    const observed = record.lastSyncObservedAtMs
+      ? ` observed=${new Date(record.lastSyncObservedAtMs).toISOString()}`
+      : "";
+    const probe = record.lastSyncProbeAtMs
+      ? ` probed=${new Date(record.lastSyncProbeAtMs).toISOString()}`
+      : "";
+    const error = record.lastSyncError
+      ? ` syncError=${record.lastSyncError}`
+      : "";
+    const action = record.lastReconcileAction
+      ? ` reconcile=${record.lastReconcileAction}`
+      : "";
+    return `- ${label}${target}${sync}${observed}${probe}${error}${action}`.trim();
+  });
+  const reservationLines = reservations.map((reservation) => {
+    const slot = reservation.slot ? `[${reservation.slot}]` : "";
+    const target = formatTelegramStatusTarget(reservation.target) || " unknown";
+    const reason = reservation.reason ? ` reason=${reservation.reason}` : "";
+    const instance = reservation.instanceId
+      ? ` instance=${reservation.instanceId}`
+      : "";
+    const action = reservation.lastReconcileAction
+      ? ` reconcile=${reservation.lastReconcileAction}`
+      : "";
+    return `- reservation ${slot}${target}${reason}${instance}${action}`.trim();
+  });
+  const observationLines = observations.map((observation) => {
+    const slot = observation.slot ? `[${observation.slot}]` : "";
+    const target = formatTelegramStatusTarget(observation.target) || " unknown";
+    const observed = ` observed=${new Date(observation.observedAtMs).toISOString()}`;
+    const instance = observation.instanceId
+      ? ` instance=${observation.instanceId}`
+      : "";
+    const error = observation.lastSyncError
+      ? ` syncError=${observation.lastSyncError}`
+      : "";
+    const action = observation.lastReconcileAction
+      ? ` reconcile=${observation.lastReconcileAction}`
+      : "";
+    return `- sync ${slot}${target} sync=${observation.syncStatus}${observed}${instance}${error}${action}`.trim();
+  });
+  return [
+    "topics:",
+    `- active bindings: instances=${byInstance.size}, targets=${activeTargets.length}`,
+    ...duplicateLines,
+    ...twinLines,
+    ...reservationLines,
+    ...observationLines,
+  ];
+}
+
+function buildTelegramBridgeCompactThreadLines(
+  state: Pick<
+    TelegramBridgeStatusLineState,
+    | "busFollowers"
+    | "topicTargets"
+    | "threadReservations"
+    | "topicSyncObservations"
+  >,
+): string[] {
+  const activeTargets = (state.topicTargets ?? []).filter(
+    (record) =>
+      !!record.instanceId &&
+      (record.status === "active" || record.status === "starting"),
+  );
+  const activeLabels = activeTargets
+    .map(formatTelegramThreadStatusLabel)
+    .filter((label) => label.length > 0);
+  const followers = state.busFollowers ?? [];
+  const reservations = state.threadReservations ?? [];
+  const observations = state.topicSyncObservations ?? [];
+  if (
+    activeLabels.length === 0 &&
+    followers.length === 0 &&
+    reservations.length === 0 &&
+    observations.length === 0
+  ) {
+    return [];
+  }
+  const lines = ["threads:"];
+  if (activeLabels.length > 0)
+    lines.push(`- active: ${activeLabels.join(", ")}`);
+  if (followers.length > 0) lines.push(`- followers: ${followers.length}`);
+  if (reservations.length > 0) lines.push(`- reserved: ${reservations.length}`);
+  const syncIssueCount = observations.filter(
+    (observation) => observation.syncStatus !== "open",
+  ).length;
+  if (syncIssueCount > 0) lines.push(`- sync issues: ${syncIssueCount}`);
+  return lines;
+}
+
+function buildTelegramBridgeCompactStatusLines(
+  state: TelegramBridgeStatusLineState,
+): string[] {
+  const controlQueueCount = state.queuedItems.filter(
+    (item) => item.queueLane === "control",
+  ).length;
+  const priorityQueueCount = state.queuedItems.filter(
+    (item) => item.queueLane === "priority",
+  ).length;
+  const defaultQueueCount = state.queuedItems.filter(
+    (item) => item.queueLane === "default",
+  ).length;
+  const queueLine = `- queued turns: ${state.queuedItems.length}${
+    state.queuedItems.length > 0
+      ? ` (control=${controlQueueCount}, priority=${priorityQueueCount}, default=${defaultQueueCount})`
+      : ""
+  }`;
+  const executionState = state.compactionInProgress
+    ? "compacting"
+    : state.pendingDispatch
+      ? "pending dispatch"
+      : state.activeSourceMessageIds?.length
+        ? "active"
+        : "idle";
+  return [
+    "connection:",
+    `- bot: ${formatTelegramBridgeBotStatus(state)}`,
+    `- user: ${state.allowedUserId ?? "not paired"}`,
+    ...(state.botThreadMode ? [`- thread mode: ${state.botThreadMode}`] : []),
+    ...(state.busRole ? [`- role: ${state.busRole}`] : []),
+    ...(state.busLifecyclePhase
+      ? [`- lifecycle: ${state.busLifecyclePhase}`]
+      : []),
+    ...(state.instanceThreadName || state.instanceSlot
+      ? [`- instance: ${state.instanceThreadName ?? state.instanceSlot}`]
+      : []),
+    ...(state.lockState ? [`- owner: ${state.lockState}`] : []),
+    "",
+    "health:",
+    `- polling: ${state.pollingActive ? "running" : "stopped"}`,
+    `- state: ${executionState}`,
+    queueLine,
+    ...(state.activeToolExecutions > 0
+      ? [`- active tools: ${state.activeToolExecutions}`]
+      : []),
+    ...(state.pendingModelSwitch ? ["- pending model switch: yes"] : []),
+    ...buildTelegramBridgeCompactThreadLines(state),
+    ...buildTelegramThreadReconciliationLines(state),
+    "",
+    "diagnostics:",
+    "- state: ~/.pi/agent/tmp/telegram/state.json",
+    "- logs: ~/.pi/agent/tmp/telegram/logs.jsonl",
+    "- full dump: /telegram-status --debug",
+  ];
+}
+
 export function buildTelegramBridgeStatusLines(
+  state: TelegramBridgeStatusLineState,
+  options: TelegramBridgeStatusLineOptions = {},
+): string[] {
+  if (options.verbose) return buildTelegramBridgeDiagnosticStatusLines(state);
+  return buildTelegramBridgeCompactStatusLines(state);
+}
+
+export function buildTelegramBridgeDiagnosticStatusLines(
   state: TelegramBridgeStatusLineState,
 ): string[] {
   const controlQueueCount = state.queuedItems.filter(
@@ -577,6 +1071,18 @@ export function buildTelegramBridgeStatusLines(
     "connection:",
     `- bot: ${formatTelegramBridgeBotStatus(state)}`,
     `- allowed user: ${state.allowedUserId ?? "not paired"}`,
+    ...(state.botThreadMode
+      ? [
+          `- thread mode: ${state.botThreadMode}${state.botThreadModeAction ? ` reconcile=${state.botThreadModeAction}` : ""}`,
+        ]
+      : []),
+    ...(state.busRole ? [`- bus role: ${state.busRole}`] : []),
+    ...(state.busLifecyclePhase
+      ? [`- bus lifecycle: ${state.busLifecyclePhase}`]
+      : []),
+    ...(state.instanceThreadName || state.instanceSlot
+      ? [`- instance: ${state.instanceThreadName ?? state.instanceSlot}`]
+      : []),
     ...(state.lockState ? [`- owner: ${state.lockState}`] : []),
     "",
     "polling:",
@@ -593,6 +1099,10 @@ export function buildTelegramBridgeStatusLines(
     "queue:",
     `- queued turns: ${state.queuedItems.length}`,
     `- lanes: control=${controlQueueCount}, priority=${priorityQueueCount}, default=${defaultQueueCount}`,
+    ...buildTelegramBusFollowerLines(state),
+    ...buildTelegramTopicTargetDiagnosticLines(state),
+    ...buildTelegramThreadReconciliationLines(state),
+    ...buildTelegramSyncSliceLines(state),
     "",
     ...buildTelegramRuntimeEventLines(state.recentRuntimeEvents),
   ];
@@ -686,15 +1196,28 @@ function buildStatusSummary(ctx: TelegramStatusContext): string {
   return "unknown";
 }
 
+function buildTelegramStatusRoleSuffix(
+  state: TelegramBridgeStatusLineState | undefined,
+): string {
+  if (state?.botThreadMode !== "enabled" || !state.busRole) return "";
+  return ` @${state.busRole}`;
+}
+
 export function buildStatusHtml(
   ctx: TelegramStatusContext,
   activeModel: TelegramStatusActiveModel | undefined,
+  bridgeStatus?: TelegramBridgeStatusLineState,
 ): string {
   const stats = collectUsageStats(ctx);
   const usesSubscription = activeModel
     ? ctx.modelRegistry.isUsingOAuth(activeModel)
     : false;
-  const lines: string[] = [buildStatusRow("Status", buildStatusSummary(ctx))];
+  const lines: string[] = [
+    buildStatusRow(
+      "Status",
+      `${buildStatusSummary(ctx)}${buildTelegramStatusRoleSuffix(bridgeStatus)}`,
+    ),
+  ];
   const usageSummary = buildUsageSummary(stats);
   const costSummary = buildCostSummary(stats, usesSubscription);
   if (usageSummary) {

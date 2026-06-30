@@ -4,7 +4,7 @@
  * Owns small session-local runtime primitives that are shared by orchestration but are not specific to queueing, rendering, polling, or Telegram transport
  */
 
-const TELEGRAM_TYPING_ACTION_INTERVAL_MS = 2500;
+const TELEGRAM_TYPING_ACTION_INTERVAL_MS = 1500;
 const TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS = 250;
 
 export interface TelegramRuntimeQueueCounters {
@@ -26,6 +26,8 @@ export interface TelegramBridgeRuntimeState
   abortHandler?: () => void;
   typingInterval?: ReturnType<typeof setInterval>;
   typingInFlight?: Promise<void>;
+  typingLoopDeps?: TelegramTypingLoopDeps;
+  typingLoopKey?: string;
 }
 
 export interface TelegramRuntimeQueuePort {
@@ -318,10 +320,29 @@ export function abortTelegramTurn(state: TelegramBridgeRuntimeState): boolean {
   return true;
 }
 
+export interface TelegramTypingLoopTarget {
+  chatId: number;
+  threadId?: number;
+}
+
+function getTelegramTypingLoopThreadParams(
+  target: TelegramTypingLoopTarget | undefined,
+): { message_thread_id?: number } | undefined {
+  const threadId = target?.threadId;
+  return Number.isInteger(threadId)
+    ? { message_thread_id: threadId }
+    : undefined;
+}
+
 export interface TelegramTypingLoopDeps {
   chatId: number | undefined;
+  target?: TelegramTypingLoopTarget;
   intervalMs: number;
-  sendTypingAction: (chatId: number) => Promise<unknown>;
+  sendTypingAction: (
+    chatId: number,
+    options?: { message_thread_id?: number },
+  ) => Promise<unknown>;
+  sendAggregateTypingAction?: (chatId: number) => Promise<unknown>;
 }
 
 export interface TelegramRuntimeEventRecorderPort {
@@ -356,21 +377,34 @@ export interface TelegramTypingLoopStarterDeps<
 > extends TelegramRuntimeEventRecorderPort {
   typing: TelegramRuntimeTypingPort;
   getDefaultChatId: () => number | undefined;
-  sendTypingAction: (chatId: number) => Promise<unknown>;
+  sendTypingAction: (
+    chatId: number,
+    options?: { message_thread_id?: number },
+  ) => Promise<unknown>;
+  sendAggregateTypingAction?: (chatId: number) => Promise<unknown>;
   updateStatus: (ctx: TContext, error?: string) => void;
   intervalMs?: number;
 }
 
 export function createTelegramTypingLoopStarter<TContext>(
   deps: TelegramTypingLoopStarterDeps<TContext>,
-): (ctx: TContext, chatId?: number) => void {
-  return (ctx, chatId) => {
+): (
+  ctx: TContext,
+  chatId?: number,
+  options?: { target?: TelegramTypingLoopTarget },
+) => void {
+  return (ctx, chatId, options) => {
     deps.typing.start({
       chatId: chatId ?? deps.getDefaultChatId(),
+      target: options?.target,
       intervalMs: deps.intervalMs ?? TELEGRAM_TYPING_ACTION_INTERVAL_MS,
       sendTypingAction: async (targetChatId) => {
         try {
-          await deps.sendTypingAction(targetChatId);
+          const threadParams = getTelegramTypingLoopThreadParams(options?.target);
+          await deps.sendTypingAction(targetChatId, threadParams);
+          if (threadParams?.message_thread_id !== undefined) {
+            await deps.sendAggregateTypingAction?.(targetChatId);
+          }
         } catch (error) {
           const message =
             error instanceof Error ? error.message : String(error);
@@ -389,14 +423,33 @@ export function createTelegramTypingLoopStarter<TContext>(
   };
 }
 
+function getTelegramTypingLoopKey(deps: TelegramTypingLoopDeps): string {
+  const threadId = deps.target?.threadId;
+  return `${deps.chatId ?? 0}:${Number.isInteger(threadId) ? threadId : "all"}`;
+}
+
 export function startTelegramTypingLoop(
   state: TelegramBridgeRuntimeState,
   deps: TelegramTypingLoopDeps,
 ): boolean {
-  if (state.typingInterval || deps.chatId === undefined || deps.chatId === 0)
-    return false;
+  if (deps.chatId === undefined || deps.chatId === 0) return false;
+  const previousKey = state.typingLoopKey;
+  const nextKey = getTelegramTypingLoopKey(deps);
+  state.typingLoopDeps = deps;
+  state.typingLoopKey = nextKey;
   const sendTyping = (): void => {
-    const typing = Promise.resolve(deps.sendTypingAction(deps.chatId as number))
+    const activeDeps = state.typingLoopDeps;
+    if (!activeDeps || activeDeps.chatId === undefined || activeDeps.chatId === 0)
+      return;
+    const targetChatId = activeDeps.chatId;
+    const threadParams = getTelegramTypingLoopThreadParams(activeDeps.target);
+    const typing = Promise.resolve()
+      .then(async () => {
+        await activeDeps.sendTypingAction(targetChatId, threadParams);
+        if (threadParams?.message_thread_id !== undefined) {
+          await activeDeps.sendAggregateTypingAction?.(targetChatId);
+        }
+      })
       .then(() => undefined)
       .catch(() => undefined);
     state.typingInFlight = typing;
@@ -404,6 +457,11 @@ export function startTelegramTypingLoop(
       if (state.typingInFlight === typing) state.typingInFlight = undefined;
     });
   };
+  if (state.typingInterval) {
+    if (previousKey === nextKey) return false;
+    sendTyping();
+    return true;
+  }
   sendTyping();
   state.typingInterval = setInterval(sendTyping, deps.intervalMs);
   state.typingInterval.unref?.();
@@ -416,6 +474,8 @@ export function stopTelegramTypingLoop(
   if (!state.typingInterval) return false;
   clearInterval(state.typingInterval);
   state.typingInterval = undefined;
+  state.typingLoopDeps = undefined;
+  state.typingLoopKey = undefined;
   return true;
 }
 
@@ -478,7 +538,11 @@ export interface TelegramPromptDispatchLifecycleDeps<
     "setDispatchPending" | "clearDispatchPending"
   >;
   typing: Pick<TelegramRuntimeTypingPort, "stop">;
-  startTypingLoop: (ctx: TContext, chatId?: number) => void;
+  startTypingLoop: (
+    ctx: TContext,
+    chatId?: number,
+    options?: { target?: TelegramTypingLoopTarget },
+  ) => void;
   updateStatus: (ctx: TContext, error?: string) => void;
 }
 
@@ -488,13 +552,21 @@ export interface TelegramPromptDispatchRuntimeDeps<
   lifecycle: TelegramPromptDispatchLifecycleDeps<TContext>["lifecycle"];
   typing: TelegramRuntimeTypingPort;
   getDefaultChatId: () => number | undefined;
-  sendTypingAction: (chatId: number) => Promise<unknown>;
+  sendTypingAction: (
+    chatId: number,
+    options?: { message_thread_id?: number },
+  ) => Promise<unknown>;
+  sendAggregateTypingAction?: (chatId: number) => Promise<unknown>;
   updateStatus: (ctx: TContext, error?: string) => void;
   intervalMs?: number;
 }
 
 export interface TelegramPromptDispatchRuntime<TContext> {
-  startTypingLoop: (ctx: TContext, chatId?: number) => void;
+  startTypingLoop: (
+    ctx: TContext,
+    chatId?: number,
+    options?: { target?: TelegramTypingLoopTarget },
+  ) => void;
   onPromptDispatchStart: (ctx: TContext, chatId?: number) => void;
   onPromptDispatchFailure: (ctx: TContext, message: string) => void;
 }

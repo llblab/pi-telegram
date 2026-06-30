@@ -120,8 +120,33 @@ export function updateTelegramVoiceConfig(
   return true;
 }
 
+type TelegramMutableConfigStore = Pick<
+  TelegramConfigStore,
+  "get" | "set" | "persist"
+> & {
+  load?: () => Promise<void>;
+};
+
+function isEmptyTelegramConfig(config: TelegramConfig): boolean {
+  return Object.keys(config).length === 0;
+}
+
+async function loadLatestTelegramConfig(
+  configStore: TelegramMutableConfigStore,
+): Promise<void> {
+  if (!configStore.load) return;
+  const before = configStore.get();
+  await configStore.load();
+  if (
+    !isEmptyTelegramConfig(before) &&
+    isEmptyTelegramConfig(configStore.get())
+  ) {
+    configStore.set(before);
+  }
+}
+
 export function bindGlobalTelegramConfigRuntime(
-  configStore: Pick<TelegramConfigStore, "get" | "set" | "persist">,
+  configStore: TelegramMutableConfigStore,
 ): void {
   setGlobalTelegramConfigRuntime({
     updateVoiceConfig(voice) {
@@ -224,9 +249,10 @@ export function createTelegramProactivePushChecker(
 }
 
 export function createTelegramProactivePushSetter(
-  configStore: Pick<TelegramConfigStore, "get" | "set" | "persist">,
+  configStore: TelegramMutableConfigStore,
 ): (enabled: boolean) => Promise<void> {
   return async (enabled) => {
+    await loadLatestTelegramConfig(configStore);
     const config = { ...configStore.get(), proactivePush: enabled };
     configStore.set(config);
     await configStore.persist(config);
@@ -254,9 +280,10 @@ export function createTelegramVoiceReplyModeConfiguredChecker(
 }
 
 export function createTelegramVoiceReplyModeSetter(
-  configStore: Pick<TelegramConfigStore, "get" | "set" | "persist">,
+  configStore: TelegramMutableConfigStore,
 ): (replyMode: "manual" | "mirror" | "always" | undefined) => Promise<void> {
   return async (replyMode) => {
+    await loadLatestTelegramConfig(configStore);
     const current = configStore.get();
     if (replyMode === undefined) {
       const { replyMode: _replyMode, ...remainingVoice } = current.voice ?? {};
@@ -310,9 +337,10 @@ export function createTelegramTimeInjectionModeGetter(
 }
 
 export function createTelegramTimeInjectionModeSetter(
-  configStore: Pick<TelegramConfigStore, "get" | "set" | "persist">,
+  configStore: TelegramMutableConfigStore,
 ): (injectionMode: TelegramTimeMode) => Promise<void> {
   return async (injectionMode) => {
+    await loadLatestTelegramConfig(configStore);
     const current = configStore.get();
     if (injectionMode === "hidden") {
       const { injectionMode: _injectionMode, ...remainingTime } =
@@ -333,6 +361,11 @@ export function createTelegramTimeInjectionModeSetter(
   };
 }
 
+export interface TelegramProactivePushTarget {
+  chatId: number;
+  threadId?: number;
+}
+
 export function createTelegramProactivePushChatIdGetter(deps: {
   getActiveTurnChatId: () => number | undefined;
   getAllowedUserId: () => number | undefined;
@@ -340,8 +373,23 @@ export function createTelegramProactivePushChatIdGetter(deps: {
   return () => deps.getActiveTurnChatId() ?? deps.getAllowedUserId();
 }
 
+export function createTelegramProactivePushTargetGetter(deps: {
+  getActiveTurnTarget: () => TelegramProactivePushTarget | undefined;
+  getAssignedTarget: () => TelegramProactivePushTarget | undefined;
+  getAllowedUserId: () => number | undefined;
+}): () => TelegramProactivePushTarget | undefined {
+  return () => {
+    const activeTarget = deps.getActiveTurnTarget();
+    if (activeTarget) return activeTarget;
+    const assignedTarget = deps.getAssignedTarget();
+    if (assignedTarget) return assignedTarget;
+    const chatId = deps.getAllowedUserId();
+    return typeof chatId === "number" ? { chatId } : undefined;
+  };
+}
+
 export function createTelegramConfigControls(
-  configStore: Pick<TelegramConfigStore, "get" | "set" | "persist">,
+  configStore: TelegramMutableConfigStore,
 ) {
   return {
     isProactivePushEnabled: createTelegramProactivePushChecker(configStore),

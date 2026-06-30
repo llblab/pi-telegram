@@ -24,6 +24,7 @@ export type TelegramModelScope = "all" | "scoped";
 
 export interface TelegramModelMenuState<TModel extends MenuModel = MenuModel> {
   chatId: number;
+  threadId?: number;
   messageId: number;
   page: number;
   scope: TelegramModelScope;
@@ -91,6 +92,7 @@ export interface TelegramModelMenuRuntimeOptions<
   TModel extends MenuModel = MenuModel,
 > {
   chatId: number;
+  threadId?: number;
   activeModel: TModel | undefined;
   cachedInputs: CachedTelegramModelMenuInputs<TModel> | undefined;
   cacheTtlMs: number;
@@ -136,6 +138,7 @@ export interface TelegramMenuMessageRuntimeDeps {
     text: string,
     mode: "markdown" | "html" | "plain",
     replyMarkup: TelegramReplyMarkup,
+    options?: { target?: { chatId: number; threadId?: number } },
   ) => Promise<number | undefined>;
 }
 
@@ -178,6 +181,7 @@ export interface BuildTelegramModelMenuStateParams<
   TModel extends MenuModel = MenuModel,
 > {
   chatId: number;
+  threadId?: number;
   activeModel: TModel | undefined;
   availableModels: TModel[];
   configuredScopedModelPatterns: string[];
@@ -240,6 +244,7 @@ export interface TelegramModelMenuRuntime<
   storeState: (state: TelegramModelMenuState<TModel>) => void;
   getState: (
     messageId: number | undefined,
+    chatId?: number,
   ) => TelegramModelMenuState<TModel> | undefined;
   clear: () => void;
   clearCachedInputs: () => void;
@@ -336,6 +341,9 @@ function sendTelegramMenuMessage(
     appliedPayload.text,
     appliedPayload.mode,
     appliedPayload.replyMarkup,
+    state.threadId !== undefined
+      ? { target: { chatId: state.chatId, threadId: state.threadId } }
+      : undefined,
   );
 }
 
@@ -364,10 +372,14 @@ export function getModelMenuItems<TModel extends MenuModel = MenuModel>(
     : state.allModels;
 }
 
+function getTelegramMenuStateKey(chatId: number, messageId: number): string {
+  return `${chatId}:${messageId}`;
+}
+
 export function pruneStoredTelegramModelMenus<
   TModel extends MenuModel = MenuModel,
 >(
-  menus: Map<number, StoredTelegramModelMenuState<TModel>>,
+  menus: Map<string, StoredTelegramModelMenuState<TModel>>,
   options: TelegramModelMenuStoreOptions,
 ): void {
   const now = options.now ?? Date.now();
@@ -376,40 +388,51 @@ export function pruneStoredTelegramModelMenus<
     menus.delete(messageId);
   }
   while (menus.size > options.maxStoredMenus) {
-    const oldestMessageId = menus.keys().next().value as number | undefined;
-    if (oldestMessageId === undefined) return;
-    menus.delete(oldestMessageId);
+    const oldestKey = menus.keys().next().value as string | undefined;
+    if (oldestKey === undefined) return;
+    menus.delete(oldestKey);
   }
 }
 
 export function storeTelegramModelMenuState<
   TModel extends MenuModel = MenuModel,
 >(
-  menus: Map<number, StoredTelegramModelMenuState<TModel>>,
+  menus: Map<string, StoredTelegramModelMenuState<TModel>>,
   state: TelegramModelMenuState<TModel>,
   options: TelegramModelMenuStoreOptions,
 ): void {
   const now = options.now ?? Date.now();
   pruneStoredTelegramModelMenus(menus, { ...options, now });
-  menus.set(state.messageId, { state, updatedAt: now });
+  menus.set(getTelegramMenuStateKey(state.chatId, state.messageId), {
+    state,
+    updatedAt: now,
+  });
   pruneStoredTelegramModelMenus(menus, { ...options, now });
 }
 
 export function getStoredTelegramModelMenuState<
   TModel extends MenuModel = MenuModel,
 >(
-  menus: Map<number, StoredTelegramModelMenuState<TModel>>,
+  menus: Map<string, StoredTelegramModelMenuState<TModel>>,
   messageId: number | undefined,
   options: TelegramModelMenuStoreOptions,
+  chatId?: number,
 ): TelegramModelMenuState<TModel> | undefined {
   if (messageId === undefined) return undefined;
   const now = options.now ?? Date.now();
   pruneStoredTelegramModelMenus(menus, { ...options, now });
-  const entry = menus.get(messageId);
+  const key =
+    typeof chatId === "number"
+      ? getTelegramMenuStateKey(chatId, messageId)
+      : [...menus.keys()].find((candidate) =>
+          candidate.endsWith(`:${messageId}`),
+        );
+  if (!key) return undefined;
+  const entry = menus.get(key);
   if (!entry) return undefined;
-  menus.delete(messageId);
+  menus.delete(key);
   entry.updatedAt = now;
-  menus.set(messageId, entry);
+  menus.set(key, entry);
   return entry.state;
 }
 
@@ -418,7 +441,7 @@ export function createTelegramModelMenuRuntime<
 >(
   options: Partial<TelegramModelMenuStoreOptions> = {},
 ): TelegramModelMenuRuntime<TModel> {
-  const menus = new Map<number, StoredTelegramModelMenuState<TModel>>();
+  const menus = new Map<string, StoredTelegramModelMenuState<TModel>>();
   let cachedInputs: CachedTelegramModelMenuInputs<TModel> | undefined;
   const getStoreOptions = (): TelegramModelMenuStoreOptions => ({
     maxAgeMs: options.maxAgeMs ?? TELEGRAM_MODEL_MENU_STATE_TTL_MS,
@@ -429,8 +452,13 @@ export function createTelegramModelMenuRuntime<
     storeState: (state) => {
       storeTelegramModelMenuState(menus, state, getStoreOptions());
     },
-    getState: (messageId) =>
-      getStoredTelegramModelMenuState(menus, messageId, getStoreOptions()),
+    getState: (messageId, chatId) =>
+      getStoredTelegramModelMenuState(
+        menus,
+        messageId,
+        getStoreOptions(),
+        chatId,
+      ),
     clear: () => {
       menus.clear();
       cachedInputs = undefined;
@@ -456,11 +484,12 @@ export function createTelegramModelMenuStateBuilder<
     TelegramModelMenuStateBuilderContext<TModel>,
 >(
   deps: TelegramModelMenuStateBuilderDeps<TModel, TContext>,
-): (chatId: number, ctx: TContext) => Promise<TelegramModelMenuState<TModel>> {
-  return async (chatId, ctx) => {
+): (chatId: number, ctx: TContext, threadId?: number) => Promise<TelegramModelMenuState<TModel>> {
+  return async (chatId, ctx, threadId) => {
     const settingsManager = deps.createSettingsManager(ctx.cwd);
     return deps.runtime.buildState({
       chatId,
+      threadId,
       activeModel: deps.getActiveModel(ctx),
       ctx,
       reloadSettings: () => settingsManager.reload(),
@@ -521,6 +550,7 @@ export function buildTelegramModelMenuState<
   }
   return {
     chatId: params.chatId,
+    threadId: params.threadId,
     messageId: 0,
     page: 0,
     scope: scopedModels.length > 0 ? "scoped" : "all",
@@ -562,6 +592,7 @@ export async function buildTelegramModelMenuStateRuntime<
     cachedInputs,
     state: buildTelegramModelMenuState({
       chatId: options.chatId,
+      threadId: options.threadId,
       activeModel: options.activeModel,
       availableModels: cachedInputs.availableModels,
       configuredScopedModelPatterns: cachedInputs.configuredScopedModelPatterns,
@@ -844,7 +875,7 @@ export function buildTelegramModelCallbackPlan<
     if (!params.canRestartBusyRun) {
       return {
         kind: "answer",
-        text: "π is busy. Send /abort, /next, or /stop.",
+        text: "Pi is busy. Send /abort, /next, or /stop.",
       };
     }
     return {
@@ -944,7 +975,7 @@ export async function handleTelegramModelMenuCallbackAction<
     if (!restarted) {
       await deps.answerCallbackQuery(
         callbackQueryId,
-        "π is busy. Send /abort, /next, or /stop.",
+        "Pi is busy. Send /abort, /next, or /stop.",
       );
       return true;
     }

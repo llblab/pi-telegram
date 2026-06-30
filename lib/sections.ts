@@ -137,8 +137,15 @@ export interface TelegramSectionSettingsRow {
 // --- Runtime Port Builders ---
 
 /** @internal */
+export interface TelegramSectionTarget {
+  chatId: number;
+  threadId?: number;
+}
+
+/** @internal */
 export interface TelegramSectionRuntimeDeps {
   answerCallbackQuery: (id: string, text?: string) => Promise<void>;
+  target?: TelegramSectionTarget;
   editInteractiveMessage: (
     chatId: number,
     messageId: number,
@@ -151,6 +158,7 @@ export interface TelegramSectionRuntimeDeps {
     text: string,
     mode: "markdown" | "html" | "plain",
     replyMarkup: TelegramInlineKeyboardMarkup,
+    options?: { target?: TelegramSectionTarget },
   ) => Promise<number | undefined>;
   enqueuePrompt: (prompt: string) => Promise<void>;
   deleteMessage: (chatId: number, messageId: number) => Promise<void>;
@@ -191,6 +199,7 @@ function buildTelegramSectionContext(
           view.text,
           view.parseMode ?? "html",
           view.replyMarkup ?? { inline_keyboard: [] },
+          deps.target ? { target: deps.target } : undefined,
         )
         .then(() => {}),
     enqueuePrompt: deps.enqueuePrompt,
@@ -239,6 +248,7 @@ function buildTelegramSectionCallbackContext(
           view.text,
           view.parseMode ?? "html",
           view.replyMarkup ?? { inline_keyboard: [] },
+          deps.target ? { target: deps.target } : undefined,
         )
         .then(() => {}),
     enqueuePrompt: deps.enqueuePrompt,
@@ -299,11 +309,6 @@ export function getTelegramSectionDiagnostics(): TelegramSectionDiagnostic[] {
 
 // --- Registry ---
 
-const MAIN_MENU_ROW = {
-  text: "⬆️ Main menu",
-  callback_data: "menu:back",
-} as const;
-
 const BACK_NAV_ROW = {
   text: "⬆️ Back",
 } as const;
@@ -353,7 +358,7 @@ export function createTelegramExtensionSectionRegistry(): TelegramSectionRegistr
   >();
   let nextToken = 0;
 
-  function register(section: TelegramSectionRegistration): () => void {
+  const register = (section: TelegramSectionRegistration): () => void => {
     const duplicate = [...sections.values()].find((s) => s.id === section.id);
     if (duplicate) {
       throw new Error(`Telegram section id already registered: ${section.id}`);
@@ -371,22 +376,22 @@ export function createTelegramExtensionSectionRegistry(): TelegramSectionRegistr
       sections.delete(token);
       errors.delete(token);
     };
-  }
+  };
 
-  function getSections(): RegisteredTelegramSection[] {
+  const getSections = (): RegisteredTelegramSection[] => {
     return [...sections.values()].sort((a, b) => {
       if (a.order !== b.order) return a.order - b.order;
       return a.id.localeCompare(b.id);
     });
-  }
+  };
 
-  function getByToken(
+  const getByToken = (
     token: TelegramSectionToken,
-  ): RegisteredTelegramSection | undefined {
+  ): RegisteredTelegramSection | undefined => {
     return sections.get(token);
-  }
+  };
 
-  function getDiagnostics(): TelegramSectionDiagnostic[] {
+  const getDiagnostics = (): TelegramSectionDiagnostic[] => {
     return getSections().map((s) => ({
       id: s.id,
       token: s.token,
@@ -394,26 +399,26 @@ export function createTelegramExtensionSectionRegistry(): TelegramSectionRegistr
       status: errors.has(s.token) ? "error" : "active",
       lastError: errors.get(s.token)?.message,
     }));
-  }
+  };
 
-  function recordError(
+  const recordError = (
     token: TelegramSectionToken,
     message: string,
     source = "runtime",
-  ): void {
+  ): void => {
     if (sections.has(token)) errors.set(token, { message, source });
-  }
+  };
 
-  function clearError(token: TelegramSectionToken, source?: string): void {
+  const clearError = (token: TelegramSectionToken, source?: string): void => {
     const current = errors.get(token);
     if (!source || !current || current.source === source) errors.delete(token);
-  }
+  };
 
-  function clear(): void {
+  const clear = (): void => {
     sections.clear();
     errors.clear();
     nextToken = 0;
-  }
+  };
 
   return {
     register,
@@ -506,6 +511,7 @@ export function parseTelegramSectionCallback(
 /** @internal */
 export interface TelegramSectionCallbackHandlerDeps {
   answerCallbackQuery: (id: string, text?: string) => Promise<void>;
+  target?: TelegramSectionTarget;
   editInteractiveMessage: (
     chatId: number,
     messageId: number,
@@ -518,6 +524,7 @@ export interface TelegramSectionCallbackHandlerDeps {
     text: string,
     mode: "markdown" | "html" | "plain",
     replyMarkup: TelegramInlineKeyboardMarkup,
+    options?: { target?: TelegramSectionTarget },
   ) => Promise<number | undefined>;
   enqueuePrompt: (prompt: string) => Promise<void>;
   deleteMessage: (chatId: number, messageId: number) => Promise<void>;

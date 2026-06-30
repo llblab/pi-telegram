@@ -19,6 +19,7 @@ import {
   type TelegramVoiceReplyItem,
 } from "./outbound-markup.ts";
 import { createTelegramVoiceReplySender as createTelegramVoiceReplySenderWithPorts } from "./outbound-voice.ts";
+import type { TelegramTarget } from "./target.ts";
 
 const OUTBOUND_HANDLER_REGISTRY_KEY = "__piTelegramOutboundHandlers__";
 const VOICE_EVENT_RECORDER_KEY = "__piTelegramVoiceEventRecorder__";
@@ -102,6 +103,7 @@ export interface TelegramVoiceExecResult {
 export interface TelegramVoiceReplyTurnView {
   chatId: number;
   replyToMessageId: number;
+  target?: TelegramTarget;
 }
 
 export interface TelegramVoiceReplySenderDeps {
@@ -207,13 +209,13 @@ export interface TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup = unknown> {
     chatId: number,
     replyToMessageId: number | undefined,
     text: string,
-    options?: { parseMode?: "HTML" },
+    options?: { parseMode?: "HTML"; target?: TelegramTarget },
   ) => Promise<number | undefined>;
   sendMarkdownReply: (
     chatId: number,
     replyToMessageId: number | undefined,
     markdown: string,
-    options?: { replyMarkup?: TReplyMarkup },
+    options?: { replyMarkup?: TReplyMarkup; target?: TelegramTarget },
   ) => Promise<number | undefined>;
   cwd?: string;
   recordRuntimeEvent?: TelegramVoiceReplySenderDeps["recordRuntimeEvent"];
@@ -867,14 +869,14 @@ export function createTelegramOutboundReplyArtifactSender(
   deps: TelegramVoiceReplySenderDeps,
 ) {
   const sendVoiceReply = createTelegramVoiceReplySender(deps);
-  return async function sendOutboundReplyArtifacts(
+  return async (
     turn: TelegramVoiceReplyTurnView,
     plan: Pick<
       TelegramOutboundReplyPlan,
       "voiceText" | "voiceReplies" | "lang" | "rate" | "replyMarkup"
     >,
     options?: { replyToPrompt?: boolean },
-  ): Promise<void> {
+  ): Promise<void> => {
     // Normalize voice replies: either use explicit voiceReplies array or fall back to voiceText
     const voiceReplies = plan.voiceReplies?.length
       ? plan.voiceReplies

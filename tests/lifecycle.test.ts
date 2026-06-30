@@ -123,6 +123,59 @@ test("Compaction observer mirrors active work with native typing", () => {
   ]);
 });
 
+test("Compaction observer can suppress native typing for non-turn compaction", () => {
+  const events: string[] = [];
+  let timerCallback: (() => void) | undefined;
+  const observer = createTelegramCompactionObserverRuntime({
+    setCompactionInProgress(inProgress) {
+      events.push(`compact:${String(inProgress)}`);
+    },
+    updateStatus() {
+      events.push("status");
+    },
+    startTypingLoop() {
+      events.push("typing:start");
+    },
+    stopTypingLoop() {
+      events.push("typing:stop");
+    },
+    shouldStartTypingLoop: () => false,
+    requestDeferredDispatchNextQueuedTelegramTurn(dispatch) {
+      events.push("dispatch:request");
+      dispatch(createLifecycleContext());
+    },
+    dispatchNextQueuedTelegramTurn() {
+      events.push("dispatch");
+    },
+    setTimer(callback) {
+      timerCallback = callback;
+      return 1;
+    },
+    clearTimer() {
+      timerCallback = undefined;
+    },
+  });
+  observer.onSessionBeforeCompact({} as never, createLifecycleContext());
+  observer.onSessionCompact({} as never, createLifecycleContext());
+  observer.onSessionBeforeCompact({} as never, createLifecycleContext());
+  timerCallback?.();
+  observer.onSessionShutdown();
+  assert.deepEqual(events, [
+    "compact:true",
+    "status",
+    "compact:false",
+    "status",
+    "dispatch:request",
+    "dispatch",
+    "compact:true",
+    "status",
+    "compact:false",
+    "status",
+    "dispatch:request",
+    "dispatch",
+  ]);
+});
+
 test("Compaction observer unrefs fallback timers when supported", () => {
   const events: string[] = [];
   const observer = createTelegramCompactionObserverRuntime({
@@ -293,6 +346,9 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
     onToolExecutionStart: () => {
       events.push("tool-start");
     },
+    onToolExecutionUpdate: () => {
+      events.push("tool-update");
+    },
     onToolExecutionEnd: () => {
       events.push("tool-end");
     },
@@ -317,6 +373,7 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
       "model_select",
       "agent_start",
       "tool_execution_start",
+      "tool_execution_update",
       "tool_execution_end",
       "message_start",
       "message_update",
@@ -347,6 +404,10 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
     {},
     ctx,
   );
+  await getRequiredLifecycleHandler(harness.handlers, "tool_execution_update")(
+    {},
+    ctx,
+  );
   await getRequiredLifecycleHandler(harness.handlers, "tool_execution_end")(
     {},
     ctx,
@@ -367,6 +428,7 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
     "model-select",
     "agent-start",
     "tool-start",
+    "tool-update",
     "tool-end",
     "message-start",
     "message-update",

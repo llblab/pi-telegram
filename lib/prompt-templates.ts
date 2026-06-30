@@ -1,7 +1,7 @@
 /**
- * π prompt-template bridge helpers
+ * Pi prompt-template bridge helpers
  * Zones: pi agent prompts, telegram controls, filesystem
- * Discovers π prompt-template slash commands and expands them before Telegram queue dispatch
+ * Discovers Pi prompt-template slash commands and expands them before Telegram queue dispatch
  */
 
 import { readFileSync } from "node:fs";
@@ -129,7 +129,7 @@ export function getTelegramPromptTemplateCommands(
 export function createTelegramPromptTemplateCommandGetter(
   deps: TelegramPromptTemplateCommandGetterDeps,
 ): () => TelegramPromptTemplateCommand[] {
-  return function getPromptTemplateCommands() {
+  return () => {
     return getTelegramPromptTemplateCommands(
       deps.getCommands(),
       new Set([

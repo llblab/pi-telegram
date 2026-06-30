@@ -94,6 +94,9 @@ function sendTelegramMenuMessage(
     appliedPayload.text,
     appliedPayload.mode,
     appliedPayload.replyMarkup,
+    state.threadId !== undefined
+      ? { target: { chatId: state.chatId, threadId: state.threadId } }
+      : undefined,
   );
 }
 

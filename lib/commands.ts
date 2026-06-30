@@ -6,6 +6,7 @@
 
 import { pairTelegramUserIfNeeded } from "./config.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
+import type { TelegramBridgeStatusLineOptions } from "./status.ts";
 import {
   createTelegramControlItemBuilder,
   createTelegramControlQueueController,
@@ -158,6 +159,7 @@ export const TELEGRAM_COMMAND_EMOJI = {
   thinking: "🧠",
   compact: "🗜",
   queue: "🔢",
+  thread: "🧵",
   next: "⏩",
   continue: "▶️",
   abort: "⏹️",
@@ -217,13 +219,13 @@ export const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinitio
     },
     {
       command: "abort",
-      description: formatTelegramBotCommandDescription("abort", "Abort π"),
+      description: formatTelegramBotCommandDescription("abort", "Abort Pi"),
     },
     {
       command: "stop",
       description: formatTelegramBotCommandDescription(
         "stop",
-        "Abort π & Clear queue",
+        "Abort Pi & Clear queue",
       ),
     },
   ];
@@ -282,6 +284,7 @@ export function createTelegramBotCommandRegistrar(
 
 export interface TelegramBridgeCommandStartPollingOptions {
   force?: boolean;
+  forceFreshLeaderThread?: boolean;
 }
 
 export interface TelegramBridgeCommandStartPollingResult {
@@ -293,7 +296,7 @@ export interface TelegramBridgeCommandStartPollingResult {
 
 export interface TelegramBridgeCommandRegistrationDeps {
   promptForConfig: (ctx: ExtensionCommandContext) => Promise<void>;
-  getStatusLines: () => string[];
+  getStatusLines: (options?: TelegramBridgeStatusLineOptions) => string[];
   reloadConfig: () => Promise<void>;
   hasBotToken: () => boolean;
   startPolling: (
@@ -319,7 +322,7 @@ function formatTelegramTakeoverPrompt(
   const action = theme.fg("warning", "move singleton lock here?");
   const from = theme.fg("muted", "from:");
   const to = theme.fg("muted", "to:");
-  const source = owner ?? "another π instance";
+  const source = owner ?? "another Pi instance";
   return `${action}\n\n${from} ${source}\n${to} ${ctx.cwd}`;
 }
 
@@ -335,19 +338,24 @@ export function registerTelegramBridgeCommands(
   });
   pi.registerCommand("telegram-status", {
     description: "Show Telegram bridge status",
-    handler: async (_args, ctx) => {
-      ctx.ui.notify(deps.getStatusLines().join("\n"), "info");
+    handler: async (args, ctx) => {
+      const verbose = /(^|\s)(--debug|debug|--verbose|verbose)(\s|$)/i.test(
+        args,
+      );
+      ctx.ui.notify(deps.getStatusLines({ verbose }).join("\n"), "info");
     },
   });
   pi.registerCommand("telegram-connect", {
-    description: "Start the Telegram bridge in this π session",
+    description: "Start the Telegram bridge in this Pi session",
     handler: async (_args, ctx) => {
       await deps.reloadConfig();
       if (!deps.hasBotToken()) {
         await deps.promptForConfig(ctx);
         return;
       }
-      let result = await deps.startPolling(ctx);
+      let result = await deps.startPolling(ctx, {
+        forceFreshLeaderThread: true,
+      });
       if (result && !result.ok && result.canTakeover) {
         const confirmed = await ctx.ui.confirm(
           formatTelegramTakeoverTitle(ctx),
@@ -358,7 +366,10 @@ export function registerTelegramBridgeCommands(
           deps.updateStatus(ctx);
           return;
         }
-        result = await deps.startPolling(ctx, { force: true });
+        result = await deps.startPolling(ctx, {
+          force: true,
+          forceFreshLeaderThread: true,
+        });
       }
       if (result?.message) {
         ctx.ui.notify(result.message, result.ok ? "info" : "warning");
@@ -367,7 +378,7 @@ export function registerTelegramBridgeCommands(
     },
   });
   pi.registerCommand("telegram-disconnect", {
-    description: "Stop the Telegram bridge in this π session",
+    description: "Stop the Telegram bridge in this Pi session",
     handler: async (_args, ctx) => {
       const message = await deps.stopPolling();
       if (message) ctx.ui.notify(message, "info");
@@ -496,13 +507,18 @@ export interface TelegramCompactConfirmationDeps {
     text: string,
     mode: "markdown" | "html" | "plain",
     replyMarkup: TelegramCompactConfirmationReplyMarkup,
+    options?: { target?: { chatId: number; threadId?: number } },
   ) => Promise<number | undefined>;
 }
 
 export interface TelegramCompactConfirmationCallbackQuery {
   id: string;
   data?: string;
-  message?: { chat?: { id?: number }; message_id?: number };
+  message?: {
+    chat?: { id?: number };
+    message_id?: number;
+    message_thread_id?: number;
+  };
 }
 
 export interface TelegramCompactConfirmationCallbackDeps<TContext> {
@@ -522,6 +538,7 @@ export interface TelegramCompactConfirmationCallbackDeps<TContext> {
     ctx: TContext,
     chatId: number,
     replyToMessageId: number,
+    target?: { chatId: number; threadId?: number },
   ) => Promise<void>;
 }
 
@@ -529,14 +546,22 @@ export type TelegramControlCommandType =
   PendingTelegramControlItem<unknown>["controlType"];
 
 export interface TelegramCommandRuntimeMessage {
-  chat: { id: number };
+  chat: { id: number; type?: string; title?: string };
   message_id: number;
+  message_thread_id?: number;
   from?: { id?: number };
 }
 
 export interface TelegramCommandMessageTarget {
   chatId: number;
+  threadId?: number;
   replyToMessageId: number;
+}
+
+function canPairTelegramUserFromCommandMessage(
+  message: TelegramCommandRuntimeMessage,
+): boolean {
+  return message.chat.type === undefined || message.chat.type === "private";
 }
 
 export interface TelegramCommandTargetRuntimeDeps<TContext> {
@@ -551,21 +576,25 @@ export interface TelegramCommandTargetRuntimeDeps<TContext> {
     chatId: number,
     replyToMessageId: number,
     ctx: TContext,
+    threadId?: number,
   ) => Promise<void>;
   openModelMenu: (
     chatId: number,
     replyToMessageId: number,
     ctx: TContext,
+    threadId?: number,
   ) => Promise<void>;
   openSettingsMenu?: (
     chatId: number,
     replyToMessageId: number,
     ctx: TContext,
+    threadId?: number,
   ) => Promise<void>;
   sendTextReply: (
     chatId: number,
     replyToMessageId: number,
     text: string,
+    options?: { target?: { chatId: number; threadId?: number } },
   ) => Promise<unknown>;
 }
 
@@ -591,6 +620,10 @@ export function getTelegramCommandMessageTarget(
 ): TelegramCommandMessageTarget {
   return {
     chatId: message.chat.id,
+    threadId:
+      typeof message.message_thread_id === "number"
+        ? message.message_thread_id
+        : undefined,
     replyToMessageId: message.message_id,
   };
 }
@@ -598,6 +631,7 @@ export function getTelegramCommandMessageTarget(
 export interface TelegramCommandControlQueueRuntimeDeps<TContext> {
   createControlItem: (options: {
     chatId: number;
+    target?: { chatId: number; threadId?: number };
     replyToMessageId: number;
     controlType: TelegramControlCommandType;
     statusSummary: string;
@@ -626,6 +660,7 @@ export function createTelegramCommandControlQueueRuntime<TContext>(
 export function createTelegramCommandControlEnqueueAdapter<TContext>(deps: {
   createControlItem: (options: {
     chatId: number;
+    target?: { chatId: number; threadId?: number };
     replyToMessageId: number;
     controlType: TelegramControlCommandType;
     statusSummary: string;
@@ -690,11 +725,21 @@ export function createTelegramCommandTargetRuntime<
     },
     showStatus: (message, ctx) => {
       const target = getTelegramCommandMessageTarget(message);
-      return deps.showStatus(target.chatId, target.replyToMessageId, ctx);
+      return deps.showStatus(
+        target.chatId,
+        target.replyToMessageId,
+        ctx,
+        target.threadId,
+      );
     },
     openModelMenu: (message, ctx) => {
       const target = getTelegramCommandMessageTarget(message);
-      return deps.openModelMenu(target.chatId, target.replyToMessageId, ctx);
+      return deps.openModelMenu(
+        target.chatId,
+        target.replyToMessageId,
+        ctx,
+        target.threadId,
+      );
     },
     openSettingsMenu: async (message, ctx) => {
       const target = getTelegramCommandMessageTarget(message);
@@ -703,20 +748,29 @@ export function createTelegramCommandTargetRuntime<
           target.chatId,
           target.replyToMessageId,
           "Settings menu is unavailable.",
+          { target },
         );
         return;
       }
-      await deps.openSettingsMenu(target.chatId, target.replyToMessageId, ctx);
+      await deps.openSettingsMenu(
+        target.chatId,
+        target.replyToMessageId,
+        ctx,
+        target.threadId,
+      );
     },
     sendTextReply: async (message, text) => {
       const target = getTelegramCommandMessageTarget(message);
-      await deps.sendTextReply(target.chatId, target.replyToMessageId, text);
+      await deps.sendTextReply(target.chatId, target.replyToMessageId, text, {
+        target,
+      });
     },
   };
 }
 
 export interface TelegramCommandOrPromptRuntimeDeps<TMessage, TContext> {
   extractRawText: (messages: TMessage[]) => string;
+  shouldIgnoreMessages?: (messages: TMessage[]) => boolean;
   handleCommand: (
     commandName: string | undefined,
     message: TMessage,
@@ -756,7 +810,11 @@ export interface TelegramCommandRuntimeDeps<
   requestDeferredDispatchNextQueuedTelegramTurn?: (
     dispatch: (ctx: TContext) => void,
   ) => void;
-  startTypingLoop?: (ctx: TContext, chatId?: number) => void;
+  startTypingLoop?: (
+    ctx: TContext,
+    chatId?: number,
+    options?: { target?: { chatId: number; threadId?: number } },
+  ) => void;
   stopTypingLoop?: () => void;
   enqueueContinueTurn: (message: TMessage, ctx: TContext) => Promise<void>;
   compact: (
@@ -771,6 +829,10 @@ export interface TelegramCommandRuntimeDeps<
     execute: (ctx: TContext) => Promise<void>,
   ) => void;
   showStatus: (message: TMessage, ctx: TContext) => Promise<void>;
+  handleForumBootstrap?: (
+    message: TMessage,
+    ctx: TContext,
+  ) => Promise<string | undefined>;
   openModelMenu: (message: TMessage, ctx: TContext) => Promise<void>;
   openThinkingMenu: (message: TMessage, ctx: TContext) => Promise<void>;
   openQueueMenu: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -785,14 +847,14 @@ export interface TelegramCommandRuntimeDeps<
 }
 
 export const TELEGRAM_APP_MENU_INTRO_HTML = [
-  "<b>π Telegram</b>",
+  "<b>Pi Telegram</b>",
   "",
   `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
   `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
   `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
   `${formatTelegramCommandEmojiPrefix("continue")}/continue — Queue continue prompt`,
-  `${formatTelegramCommandEmojiPrefix("abort")}/abort — Abort π`,
-  `${formatTelegramCommandEmojiPrefix("stop")}/stop — Abort π & Clear queue`,
+  `${formatTelegramCommandEmojiPrefix("abort")}/abort — Abort Pi`,
+  `${formatTelegramCommandEmojiPrefix("stop")}/stop — Abort Pi & Clear queue`,
 ].join("\n");
 
 function escapeTelegramCommandMenuHtml(text: string): string {
@@ -825,15 +887,15 @@ function buildTelegramAppMenuIntroHtml(): string {
   const extensionLines = buildTelegramExtensionCommandMenuLines();
   if (extensionLines.length === 0) return TELEGRAM_APP_MENU_INTRO_HTML;
   return [
-    "<b>π Telegram</b>",
+    "<b>Pi Telegram</b>",
     "",
     `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
     `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
     ...extensionLines,
     `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
     `${formatTelegramCommandEmojiPrefix("continue")}/continue — Queue continue prompt`,
-    `${formatTelegramCommandEmojiPrefix("abort")}/abort — Abort π`,
-    `${formatTelegramCommandEmojiPrefix("stop")}/stop — Abort π & Clear queue`,
+    `${formatTelegramCommandEmojiPrefix("abort")}/abort — Abort Pi`,
+    `${formatTelegramCommandEmojiPrefix("stop")}/stop — Abort Pi & Clear queue`,
   ].join("\n");
 }
 
@@ -852,7 +914,7 @@ export function createTelegramAppMenuHtmlBuilder<TContext>(deps: {
   buildStatusHtml: (ctx: TContext) => string;
   getPromptTemplateCommands?: () => readonly TelegramPromptTemplateMenuCommand[];
 }): (ctx: TContext) => string {
-  return function buildTelegramAppMenuHtmlForContext(ctx) {
+  return (ctx) => {
     return buildTelegramAppMenuHtml(
       deps.buildStatusHtml(ctx),
       deps.getPromptTemplateCommands?.(),
@@ -979,7 +1041,7 @@ export async function handleTelegramNextCommand(deps: {
     return;
   }
   if (!deps.isIdle()) {
-    await deps.sendTextReply("π is busy. Send /abort or /stop first.");
+    await deps.sendTextReply("Pi is busy. Send /abort or /stop first.");
     return;
   }
   deps.dispatchNextQueuedTurn();
@@ -1029,14 +1091,17 @@ export function getTelegramCompactConfirmationHtml(): string {
 }
 
 export async function openTelegramCompactConfirmation(
-  chatId: number,
+  target: TelegramCommandMessageTarget,
   deps: TelegramCompactConfirmationDeps,
 ): Promise<void> {
   await deps.sendInteractiveMessage(
-    chatId,
+    target.chatId,
     getTelegramCompactConfirmationHtml(),
     "html",
     buildTelegramCompactConfirmationReplyMarkup(),
+    target.threadId !== undefined
+      ? { target: { chatId: target.chatId, threadId: target.threadId } }
+      : undefined,
   );
 }
 
@@ -1047,8 +1112,9 @@ export async function handleTelegramCompactConfirmationCallback<TContext>(
   if (query.data !== "compact:confirm" && query.data !== "compact:cancel") {
     return false;
   }
-  const chatId = query.message?.chat?.id;
-  const messageId = query.message?.message_id;
+  const callbackMessage = query.message;
+  const chatId = callbackMessage?.chat?.id;
+  const messageId = callbackMessage?.message_id;
   if (typeof chatId !== "number" || typeof messageId !== "number") {
     await deps.answerCallbackQuery(query.id, "Interactive message expired.");
     return true;
@@ -1067,12 +1133,18 @@ export async function handleTelegramCompactConfirmationCallback<TContext>(
   await deps.editInteractiveMessage(
     chatId,
     messageId,
-    "Compaction started.",
+    `${formatTelegramCommandEmojiPrefix("compact")}Compaction started.`,
     "plain",
     { inline_keyboard: [] },
   );
   await deps.answerCallbackQuery(query.id);
-  await deps.runCompact(deps.ctx, chatId, messageId);
+  const threadId = callbackMessage?.message_thread_id;
+  await deps.runCompact(
+    deps.ctx,
+    chatId,
+    messageId,
+    typeof threadId === "number" ? { chatId, threadId } : { chatId },
+  );
   return true;
 }
 
@@ -1088,25 +1160,23 @@ export async function handleTelegramCompactCommand(
     deps.isCompactionInProgress()
   ) {
     await deps.sendTextReply(
-      "Cannot compact while π or the Telegram queue is busy. Wait for queued turns to finish or send /abort first.",
+      "Cannot compact while Pi or the Telegram queue is busy. Wait for queued turns to finish or send /abort first.",
     );
     return;
   }
   deps.setCompactionInProgress(true);
   deps.updateStatus();
-  let compactionStillInProgress = true;
+  deps.startTypingLoop?.();
   try {
     deps.compact({
       onComplete: () => {
-        compactionStillInProgress = false;
         deps.stopTypingLoop?.();
         deps.setCompactionInProgress(false);
         deps.updateStatus();
         dispatchNextQueuedTelegramTurnAfterCompact(deps);
-        void deps.sendTextReply("Compaction completed.");
+        void deps.sendTextReply("✅ Compaction completed.");
       },
       onError: (error) => {
-        compactionStillInProgress = false;
         deps.stopTypingLoop?.();
         deps.setCompactionInProgress(false);
         deps.updateStatus();
@@ -1117,7 +1187,6 @@ export async function handleTelegramCompactCommand(
       },
     });
   } catch (error) {
-    compactionStillInProgress = false;
     deps.stopTypingLoop?.();
     deps.setCompactionInProgress(false);
     deps.updateStatus();
@@ -1127,9 +1196,10 @@ export async function handleTelegramCompactCommand(
     return;
   }
   if (!deps.suppressStartNotice) {
-    await deps.sendTextReply("Compaction started.");
+    await deps.sendTextReply(
+      `${formatTelegramCommandEmojiPrefix("compact")}Compaction started.`,
+    );
   }
-  if (compactionStillInProgress) deps.startTypingLoop?.();
 }
 
 function isTelegramStaleContextError(error: unknown): boolean {
@@ -1279,6 +1349,7 @@ export function createTelegramCommandHandlerTargetRuntime<
     openThinkingMenu: deps.openThinkingMenu,
     openQueueMenu: deps.openQueueMenu,
     openSettingsMenu: commandTargetRuntime.openSettingsMenu,
+    handleForumBootstrap: deps.handleForumBootstrap,
     getAllowedUserId: deps.getAllowedUserId,
     setAllowedUserId: deps.setAllowedUserId,
     registerBotCommands: createTelegramBotCommandRegistrar({
@@ -1294,11 +1365,11 @@ export function createTelegramCommandHandler<
   TMessage extends TelegramCommandRuntimeMessage,
   TContext,
 >(deps: TelegramCommandRuntimeDeps<TMessage, TContext>) {
-  return async function handleTelegramCommand(
+  return async (
     commandName: string | undefined,
     message: TMessage,
     ctx: TContext,
-  ): Promise<boolean> {
+  ): Promise<boolean> => {
     return handleTelegramCommandRuntime(commandName, message, ctx, deps);
   };
 }
@@ -1313,6 +1384,7 @@ export function createTelegramCommandOrPromptRuntime<TMessage, TContext>(
     ): Promise<void> => {
       const firstMessage = messages[0];
       if (!firstMessage) return;
+      if (deps.shouldIgnoreMessages?.(messages)) return;
       const command = parseTelegramCommand(deps.extractRawText(messages));
       const handled = await deps.handleCommand(
         command?.name,
@@ -1415,9 +1487,10 @@ async function handleTelegramCommandRuntime<
       },
       handleCompact: async (nextMessage, commandCtx) => {
         if (deps.sendInteractiveMessage) {
-          await openTelegramCompactConfirmation(nextMessage.chat.id, {
-            sendInteractiveMessage: deps.sendInteractiveMessage,
-          });
+          await openTelegramCompactConfirmation(
+            getTelegramCommandMessageTarget(nextMessage),
+            { sendInteractiveMessage: deps.sendInteractiveMessage },
+          );
           return;
         }
         await handleTelegramCompactCommand({
@@ -1440,7 +1513,10 @@ async function handleTelegramCommandRuntime<
               : undefined,
           compact: (callbacks) => deps.compact(commandCtx, callbacks),
           startTypingLoop: deps.startTypingLoop
-            ? () => deps.startTypingLoop?.(commandCtx, nextMessage.chat.id)
+            ? () =>
+                deps.startTypingLoop?.(commandCtx, nextMessage.chat.id, {
+                  target: getTelegramCommandMessageTarget(nextMessage),
+                })
             : undefined,
           stopTypingLoop: deps.stopTypingLoop,
           sendTextReply: sendReplyFor(nextMessage),
@@ -1465,7 +1541,7 @@ async function handleTelegramCommandRuntime<
             await deps.openSettingsMenu?.(nextMessage, commandCtx);
           }
         : undefined,
-      handleHelp: async (nextMessage, _nextCommandName, commandCtx) => {
+      handleHelp: async (nextMessage, nextCommandName, commandCtx) => {
         try {
           await deps.registerBotCommands();
         } catch (error) {
@@ -1475,7 +1551,10 @@ async function handleTelegramCommandRuntime<
             `Warning: failed to register bot commands menu: ${errorMessage}`,
           );
         }
-        if (nextMessage.from?.id !== undefined) {
+        if (
+          nextMessage.from?.id !== undefined &&
+          canPairTelegramUserFromCommandMessage(nextMessage)
+        ) {
           await pairTelegramUserIfNeeded(nextMessage.from.id, {
             allowedUserId: deps.getAllowedUserId(),
             ctx: undefined,
@@ -1483,6 +1562,13 @@ async function handleTelegramCommandRuntime<
             persistConfig: deps.persistConfig,
             updateStatus: updateStatusFor(commandCtx),
           });
+        }
+        const forumBootstrapMessage =
+          nextCommandName === "start"
+            ? await deps.handleForumBootstrap?.(nextMessage, commandCtx)
+            : undefined;
+        if (forumBootstrapMessage) {
+          await deps.sendTextReply(nextMessage, forumBootstrapMessage);
         }
         await deps.showStatus(nextMessage, commandCtx);
       },

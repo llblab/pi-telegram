@@ -11,6 +11,10 @@ import { Type } from "@sinclair/typebox";
 
 import type { ExtensionAPI } from "./pi.ts";
 import { buildTelegramMultipartReplyParameters } from "./replies.ts";
+import {
+  getTelegramTargetThreadParams,
+  type TelegramTarget,
+} from "./target.ts";
 
 const MAX_ATTACHMENTS_PER_TURN = 10;
 
@@ -54,6 +58,7 @@ export interface TelegramOutboundAttachmentToolRegistrationDeps extends Telegram
   maxAttachmentSizeBytes?: number;
   getActiveTurn: () => TelegramOutboundAttachmentQueueTargetView | undefined;
   getDefaultChatId?: () => number | undefined;
+  getDefaultTarget?: () => TelegramTarget | undefined;
   canSendDirect?: () => boolean;
   sendMultipart?: TelegramQueuedOutboundAttachmentDeliveryDeps["sendMultipart"];
   statPath?: (path: string) => Promise<{ isFile(): boolean; size?: number }>;
@@ -66,12 +71,13 @@ export interface TelegramOutboundMessagePlan {
 
 export interface TelegramOutboundMessageToolRegistrationDeps extends TelegramOutboundAttachmentRuntimeEventRecorderPort {
   getDefaultChatId: () => number | undefined;
+  getDefaultTarget?: () => TelegramTarget | undefined;
   canSendDirect: () => boolean;
   planMessage: (markdown: string) => TelegramOutboundMessagePlan;
   sendMarkdownMessage: (
     chatId: number,
     markdown: string,
-    options?: { replyMarkup?: unknown },
+    options?: { replyMarkup?: unknown; target?: TelegramTarget },
   ) => Promise<number | undefined>;
 }
 
@@ -87,6 +93,7 @@ export interface TelegramOutboundAttachmentQueueTargetView {
 export interface TelegramQueuedOutboundAttachmentTurnView extends TelegramOutboundAttachmentQueueTargetView {
   chatId: number;
   replyToMessageId: number;
+  target?: TelegramTarget;
 }
 
 function isTelegramOutboundPhotoAttachmentPath(path: string): boolean {
@@ -113,7 +120,7 @@ function formatTelegramOutboundAttachmentToolResultText(
   count: number,
   mode: "queued" | "sent" = "queued",
 ): string {
-  // Pi's compact tool rows need an empty first line to visually separate header and result
+  // Pi's compact tool rows need one leading newline to visually separate header and result.
   const verb = mode === "queued" ? "Queued" : "Sent";
   return ["", `${verb} ${count} Telegram attachment(s).`].join("\n");
 }
@@ -122,26 +129,55 @@ function formatTelegramOutboundMessageToolResultText(chatId: number): string {
   return ["", `Sent Telegram message to ${chatId}.`].join("\n");
 }
 
+function getTelegramMultipartTargetFields(
+  target: TelegramTarget | undefined,
+): Record<string, string> {
+  if (!target) return {};
+  return Object.fromEntries(
+    Object.entries(getTelegramTargetThreadParams(target)).map(
+      ([key, value]) => [key, String(value)],
+    ),
+  );
+}
+
 function assertTelegramDirectDeliveryAllowed(
   canSendDirect: (() => boolean) | undefined,
 ): void {
   if (canSendDirect?.()) return;
   throw new Error(
-    "Telegram direct delivery requires this π instance to own /telegram-connect",
+    "Telegram direct delivery requires this Pi instance to own /telegram-connect or be registered with the Telegram multi-instance bus",
   );
 }
 
-function resolveTelegramOutboundChatId(options: {
+function resolveTelegramOutboundTarget(options: {
   chatId?: number;
+  threadId?: number;
+  target?: TelegramTarget;
   getDefaultChatId?: () => number | undefined;
-}): number {
-  const chatId = options.chatId ?? options.getDefaultChatId?.();
-  if (chatId === undefined) {
+  getDefaultTarget?: () => TelegramTarget | undefined;
+}): { chatId: number; target?: TelegramTarget } {
+  if (options.target)
+    return { chatId: options.target.chatId, target: options.target };
+  if (options.chatId !== undefined) {
+    return {
+      chatId: options.chatId,
+      target:
+        options.threadId !== undefined
+          ? { chatId: options.chatId, threadId: options.threadId }
+          : undefined,
+    };
+  }
+  const defaultTarget = options.getDefaultTarget?.();
+  if (defaultTarget) {
+    return { chatId: defaultTarget.chatId, target: defaultTarget };
+  }
+  const defaultChatId = options.getDefaultChatId?.();
+  if (defaultChatId === undefined) {
     throw new Error(
       "Telegram chat_id is required when no paired/default Telegram chat is available",
     );
   }
-  return chatId;
+  return { chatId: defaultChatId };
 }
 
 async function buildTelegramOutboundAttachmentViews(options: {
@@ -194,6 +230,7 @@ export function registerTelegramOutboundAttachmentTool(
     promptGuidelines: [
       "When handling a [telegram] message and the user asked for a file or generated artifact, call telegram_attach with the local path instead of only mentioning the path in text.",
       "When a local/TUI user explicitly asks to send a generated file to Telegram, telegram_attach can deliver it to the paired/default Telegram chat even without an active Telegram turn.",
+      "For an explicit thread target, provide chat_id plus thread_id; registered multi-instance followers default to their assigned thread target.",
     ],
     parameters: Type.Object({
       paths: Type.Array(
@@ -204,6 +241,12 @@ export function registerTelegramOutboundAttachmentTool(
         Type.Number({
           description:
             "Optional Telegram chat id for immediate delivery when no Telegram turn is active",
+        }),
+      ),
+      thread_id: Type.Optional(
+        Type.Number({
+          description:
+            "Optional Telegram topic thread id for immediate delivery with chat_id",
         }),
       ),
       caption: Type.Optional(
@@ -219,11 +262,13 @@ export function registerTelegramOutboundAttachmentTool(
           activeTurn: deps.getActiveTurn(),
           paths: params.paths,
           chatId: params.chat_id,
+          threadId: params.thread_id,
           caption: params.caption,
           maxAttachmentsPerTurn,
           maxAttachmentSizeBytes,
           sendMultipart: deps.sendMultipart,
           getDefaultChatId: deps.getDefaultChatId,
+          getDefaultTarget: deps.getDefaultTarget,
           canSendDirect: deps.canSendDirect,
           statPath: deps.statPath,
         });
@@ -251,6 +296,7 @@ export function registerTelegramOutboundMessageTool(
       "Send direct Telegram Markdown text when the user explicitly asks for Telegram delivery outside the normal reply flow.",
     promptGuidelines: [
       "Use telegram_message only when the user explicitly asks to send a message to Telegram from the local/TUI side, or names a concrete Telegram delivery target.",
+      "For an explicit thread target, provide chat_id plus thread_id; registered multi-instance followers default to their assigned thread target.",
       "Add buttons by embedding the same top-level telegram_button HTML comments used in normal Telegram replies; Telegram does not support standalone buttons.",
       "Do not use this tool for ordinary Telegram-originated replies; answer normally so the bridge can deliver the active turn reply.",
     ],
@@ -259,13 +305,20 @@ export function registerTelegramOutboundMessageTool(
       chat_id: Type.Optional(
         Type.Number({ description: "Optional Telegram chat id" }),
       ),
+      thread_id: Type.Optional(
+        Type.Number({
+          description: "Optional Telegram topic thread id with chat_id",
+        }),
+      ),
     }),
     async execute(_toolCallId, params) {
       try {
         return await sendTelegramOutboundMessage({
           text: params.text,
           chatId: params.chat_id,
+          threadId: params.thread_id,
           getDefaultChatId: deps.getDefaultChatId,
+          getDefaultTarget: deps.getDefaultTarget,
           canSendDirect: deps.canSendDirect,
           planMessage: deps.planMessage,
           sendMarkdownMessage: deps.sendMarkdownMessage,
@@ -290,6 +343,7 @@ export interface TelegramQueuedOutboundAttachmentDeliveryDeps {
     chatId: number,
     replyToMessageId: number,
     text: string,
+    options?: { target?: TelegramTarget },
   ) => Promise<unknown>;
   recordRuntimeEvent?: (
     category: string,
@@ -304,11 +358,13 @@ export async function queueTelegramOutboundAttachments(options: {
   activeTurn: TelegramOutboundAttachmentQueueTargetView | undefined;
   paths: string[];
   chatId?: number;
+  threadId?: number;
   caption?: string;
   maxAttachmentsPerTurn: number;
   maxAttachmentSizeBytes?: number;
   sendMultipart?: TelegramQueuedOutboundAttachmentDeliveryDeps["sendMultipart"];
   getDefaultChatId?: () => number | undefined;
+  getDefaultTarget?: () => TelegramTarget | undefined;
   canSendDirect?: () => boolean;
   statPath?: (path: string) => Promise<{ isFile(): boolean; size?: number }>;
 }): Promise<TelegramOutboundAttachmentToolResult> {
@@ -321,11 +377,13 @@ export async function queueTelegramOutboundAttachments(options: {
     return sendTelegramOutboundFiles({
       paths: options.paths,
       chatId: options.chatId,
+      threadId: options.threadId,
       caption: options.caption,
       maxAttachmentsPerTurn: options.maxAttachmentsPerTurn,
       maxAttachmentSizeBytes: options.maxAttachmentSizeBytes,
       sendMultipart: options.sendMultipart,
       getDefaultChatId: options.getDefaultChatId,
+      getDefaultTarget: options.getDefaultTarget,
       canSendDirect: options.canSendDirect,
       statPath: options.statPath,
     });
@@ -359,29 +417,41 @@ export async function queueTelegramOutboundAttachments(options: {
 export async function sendTelegramOutboundMessage(options: {
   text: string;
   chatId?: number;
+  threadId?: number;
+  target?: TelegramTarget;
   getDefaultChatId?: () => number | undefined;
+  getDefaultTarget?: () => TelegramTarget | undefined;
   canSendDirect: () => boolean;
   planMessage: (markdown: string) => TelegramOutboundMessagePlan;
   sendMarkdownMessage: (
     chatId: number,
     markdown: string,
-    options?: { replyMarkup?: unknown },
+    options?: { replyMarkup?: unknown; target?: TelegramTarget },
   ) => Promise<number | undefined>;
 }): Promise<{
   content: Array<{ type: "text"; text: string }>;
   details: { chatId: number; messageId?: number };
 }> {
   assertTelegramDirectDeliveryAllowed(options.canSendDirect);
-  const chatId = resolveTelegramOutboundChatId({
+  const { chatId, target } = resolveTelegramOutboundTarget({
     chatId: options.chatId,
+    threadId: options.threadId,
+    target: options.target,
     getDefaultChatId: options.getDefaultChatId,
+    getDefaultTarget: options.getDefaultTarget,
   });
   const plan = options.planMessage(options.text);
   const messageId = await options.sendMarkdownMessage(chatId, plan.markdown, {
     replyMarkup: plan.replyMarkup,
+    target,
   });
   return {
-    content: [{ type: "text", text: formatTelegramOutboundMessageToolResultText(chatId) }],
+    content: [
+      {
+        type: "text",
+        text: formatTelegramOutboundMessageToolResultText(chatId),
+      },
+    ],
     details: { chatId, messageId },
   };
 }
@@ -389,23 +459,33 @@ export async function sendTelegramOutboundMessage(options: {
 export async function sendTelegramOutboundFiles(options: {
   paths: string[];
   chatId?: number;
+  threadId?: number;
+  target?: TelegramTarget;
   caption?: string;
   maxAttachmentsPerTurn: number;
   maxAttachmentSizeBytes?: number;
   sendMultipart: TelegramQueuedOutboundAttachmentDeliveryDeps["sendMultipart"];
   getDefaultChatId?: () => number | undefined;
+  getDefaultTarget?: () => TelegramTarget | undefined;
   canSendDirect?: () => boolean;
   statPath?: (path: string) => Promise<{ isFile(): boolean; size?: number }>;
-}): Promise<TelegramOutboundAttachmentToolResult & { details: { paths: string[]; chatId: number } }> {
+}): Promise<
+  TelegramOutboundAttachmentToolResult & {
+    details: { paths: string[]; chatId: number };
+  }
+> {
   assertTelegramDirectDeliveryAllowed(options.canSendDirect);
   if (options.paths.length > options.maxAttachmentsPerTurn) {
     throw new Error(
       `Attachment limit reached (${options.maxAttachmentsPerTurn})`,
     );
   }
-  const chatId = resolveTelegramOutboundChatId({
+  const { chatId, target } = resolveTelegramOutboundTarget({
     chatId: options.chatId,
+    threadId: options.threadId,
+    target: options.target,
     getDefaultChatId: options.getDefaultChatId,
+    getDefaultTarget: options.getDefaultTarget,
   });
   const pendingAttachments = await buildTelegramOutboundAttachmentViews({
     paths: options.paths,
@@ -421,6 +501,7 @@ export async function sendTelegramOutboundFiles(options: {
       {
         chat_id: String(chatId),
         ...(options.caption && index === 0 ? { caption: options.caption } : {}),
+        ...getTelegramMultipartTargetFields(target),
       },
       fieldName,
       attachment.path,
@@ -432,7 +513,10 @@ export async function sendTelegramOutboundFiles(options: {
     content: [
       {
         type: "text",
-        text: formatTelegramOutboundAttachmentToolResultText(added.length, "sent"),
+        text: formatTelegramOutboundAttachmentToolResultText(
+          added.length,
+          "sent",
+        ),
       },
     ],
     details: { paths: added, chatId },
@@ -442,9 +526,7 @@ export async function sendTelegramOutboundFiles(options: {
 export function createTelegramQueuedOutboundAttachmentSender(
   deps: TelegramQueuedOutboundAttachmentDeliveryDeps,
 ) {
-  return async function sendQueuedAttachments(
-    turn: TelegramQueuedOutboundAttachmentTurnView,
-  ): Promise<void> {
+  return async (turn: TelegramQueuedOutboundAttachmentTurnView): Promise<void> => {
     await sendQueuedTelegramOutboundAttachments(turn, {
       ...deps,
       maxAttachmentSizeBytes:
@@ -476,12 +558,14 @@ export async function sendQueuedTelegramOutboundAttachments(
       const replyParameters = buildTelegramMultipartReplyParameters(
         turn.chatId,
         turn.replyToMessageId,
+        turn.target,
       );
       await deps.sendMultipart(
         method,
         {
           chat_id: String(turn.chatId),
           ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+          ...getTelegramMultipartTargetFields(turn.target),
         },
         fieldName,
         attachment.path,
@@ -496,6 +580,7 @@ export async function sendQueuedTelegramOutboundAttachments(
         turn.chatId,
         turn.replyToMessageId,
         `Failed to send attachment ${attachment.fileName}: ${message}`,
+        { target: turn.target },
       );
     }
   }

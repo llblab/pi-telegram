@@ -65,7 +65,7 @@ export interface TelegramSettingsMenuRuntime<TContext> {
     query: {
       id: string;
       data?: string;
-      message?: { message_id?: number };
+      message?: { message_id?: number; chat?: { id?: number } };
     },
     ctx: TContext,
   ) => Promise<boolean>;
@@ -92,6 +92,7 @@ export interface TelegramSettingsMenuRuntimeDeps<
   ) => Promise<TelegramModelMenuState<TModel>>;
   getStoredModelMenuState: (
     messageId: number | undefined,
+    chatId?: number,
   ) => TelegramModelMenuState<TModel> | undefined;
   storeModelMenuState: (state: TelegramModelMenuState<TModel>) => void;
   editInteractiveMessage: (
@@ -126,7 +127,7 @@ function getVoiceReplyModeLabel(mode: TelegramVoiceReplyModeSetting): string {
 }
 
 function getTelegramSettingsStateValueLabel(value: string): string {
-  return value.length > 0 ? value[0]!.toUpperCase() + value.slice(1) : value;
+  return value.toLowerCase();
 }
 
 function getVoiceReplyModeSetting(
@@ -146,7 +147,7 @@ export function buildProactivePushSettingsText(
   return [
     `${PROACTIVE_PUSH_SETTINGS_TITLE} <code>${proactivePushEnabled ? "on" : "off"}</code>`,
     "",
-    "Send successful local π task results to Telegram when the bridge is connected.",
+    "Send successful local Pi task results to Telegram when the bridge is connected.",
   ].join("\n");
 }
 
@@ -218,7 +219,7 @@ export function buildTelegramSettingsMenuReplyMarkup(
     ],
     [
       {
-        text: `📌 Proactive push: ${proactivePushEnabled ? "On" : "Off"}`,
+        text: `📌 Proactive push: ${proactivePushEnabled ? "on" : "off"}`,
         callback_data: "settings:open:proactive",
       },
     ],
@@ -490,7 +491,10 @@ export function createTelegramSettingsMenuRuntime<
       ),
     handleCallbackQuery: async (query) => {
       if (!query.data?.startsWith("settings:")) return false;
-      const state = deps.getStoredModelMenuState(query.message?.message_id);
+      const state = deps.getStoredModelMenuState(
+        query.message?.message_id,
+        query.message?.chat?.id,
+      );
       if (!state) {
         const voiceMode = query.data.slice("settings:set:voice-reply:".length);
         if (

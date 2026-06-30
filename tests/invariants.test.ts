@@ -139,6 +139,29 @@ test("Source-only invariant scans ignore strings and comments", () => {
   );
 });
 
+test("Domain test filenames mirror their owning lib domain", () => {
+  const libDomains = new Set(
+    readdirSync(join(PROJECT_ROOT, "lib"))
+      .filter((name) => name.endsWith(".ts"))
+      .map((name) => name.replace(/\.ts$/, "")),
+  );
+  const nonLibTestDomains = new Set([
+    "index",
+    "integration",
+    "invariants",
+    "process-shutdown",
+    "public-api",
+  ]);
+  const unmirrored = readdirSync(join(PROJECT_ROOT, "tests"))
+    .filter((name) => name.endsWith(".test.ts"))
+    .map((name) => name.replace(/\.test\.ts$/, ""))
+    .filter(
+      (domain) => !libDomains.has(domain) && !nonLibTestDomains.has(domain),
+    );
+
+  assert.deepEqual(unmirrored, []);
+});
+
 test("Project source imports stay acyclic", () => {
   const graph = buildProjectImportGraph(getProjectSourceFiles());
   const cycles = findImportCycles(graph);
@@ -243,6 +266,40 @@ test("Entrypoint stays a composition root without local runtime adapters", () =>
   assert.equal(source.includes("=>"), false);
   assert.equal(source.includes("process.env"), false);
   assert.equal(/\bpi\./.test(source), false);
+});
+
+test("Visible thread identity never falls back directly to bare slot labels", () => {
+  const forbiddenPatterns: Array<[RegExp, string]> = [
+    [/\bthreadName\s*\?\?\s*slot\b/g, "threadName ?? slot"],
+    [
+      /\brecord\.threadName\s*\?\?\s*record\.slot\b/g,
+      "record.threadName ?? record.slot",
+    ],
+    [/\?\s*[\w.]+\.threadName\s*:\s*[\w.]+\.slot\b/g, "ternary slot fallback"],
+  ];
+  const violations = getProjectSourceFiles().flatMap((file) => {
+    const source = stripSourceTextAndComments(
+      readFileSync(join(PROJECT_ROOT, file), "utf8"),
+    );
+    return forbiddenPatterns.flatMap(([pattern, label]) =>
+      [...source.matchAll(pattern)].map(
+        (match) => `${file}: ${label}: ${match[0].replace(/\s+/g, " ")}`,
+      ),
+    );
+  });
+
+  assert.deepEqual(violations, []);
+});
+
+test("Destructive forum-topic lifecycle cleanup stays in the thread reconciler", () => {
+  const directCleanupFiles = getProjectSourceFiles().filter((file) => {
+    if (file === join("lib", "thread-reconciler.ts")) return false;
+    const source = stripSourceTextAndComments(
+      readFileSync(join(PROJECT_ROOT, file), "utf8"),
+    );
+    return /\b(?:closeForumTopic|deleteForumTopic)\b/.test(source);
+  });
+  assert.deepEqual(directCleanupFiles, []);
 });
 
 test("Runtime state domain stays free of local domain imports", () => {

@@ -1,0 +1,9 @@
+{
+  "sourceRoots": ["scripts"],
+  "entrypoints": ["scripts/validate-domain-dag.mjs"],
+  "requireHeaders": true,
+  "headerSeverity": "error",
+  "flatRoots": true,
+  "flatRootSeverity": "error",
+  "sharedBucketSeverity": "error"
+}

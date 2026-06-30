@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 export const TELEGRAM_LOCK_KEY = "@llblab/pi-telegram";
+export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 5_000;
 
 function getAgentDir(): string {
   return process.env.PI_CODING_AGENT_DIR
@@ -30,6 +31,11 @@ function getLocksPath(): string {
 export interface TelegramLockEntry {
   pid: number;
   cwd?: string;
+  instanceId?: string;
+  heartbeatMs?: number;
+  leaderEpoch?: number;
+  busSocketPath?: string;
+  busSecret?: string;
 }
 
 export interface TelegramLockContext {
@@ -59,13 +65,18 @@ export interface TelegramLockRuntime<TContext extends TelegramLockContext> {
   getState: () => TelegramLockState;
   getStatusLabel: () => string;
   owns: (ctx?: TelegramLockContext) => boolean;
+  refresh: (ctx?: TelegramLockContext) => boolean;
 }
 
-export interface TelegramLockOwnershipGuard<TContext extends TelegramLockContext> {
+export interface TelegramLockOwnershipGuard<
+  TContext extends TelegramLockContext,
+> {
   ownsContext: (ctx: TContext) => boolean;
 }
 
-export interface TelegramLockContextStore<TContext extends TelegramLockContext> {
+export interface TelegramLockContextStore<
+  TContext extends TelegramLockContext,
+> {
   get: () => TContext | undefined;
 }
 
@@ -74,44 +85,11 @@ export interface TelegramLockRuntimeOptions {
   locksPath?: string;
   pid?: number;
   isProcessAlive?: (pid: number) => boolean;
-}
-
-export interface TelegramLockedPollingStartOptions {
-  force?: boolean;
-}
-
-export type TelegramLockedPollingStartResult =
-  | { ok: true; message: string; canTakeover?: false }
-  | { ok: false; message: string; canTakeover?: boolean; owner?: string };
-
-export interface TelegramLockedPollingRuntime<
-  TContext extends TelegramLockContext,
-> {
-  start: (
-    ctx: TContext,
-    options?: TelegramLockedPollingStartOptions,
-  ) => Promise<TelegramLockedPollingStartResult>;
-  stop: () => Promise<string>;
-  suspend: () => Promise<void>;
-  onSessionStart: (_event: unknown, ctx: TContext) => Promise<void>;
-}
-
-export interface TelegramLockedPollingRuntimeDeps<
-  TContext extends TelegramLockContext,
-> {
-  lock: TelegramLockRuntime<TContext>;
-  hasBotToken: () => boolean;
-  canStartPolling?: (ctx: TContext) => boolean;
-  formatStartBlockedMessage?: (ctx: TContext) => string;
-  startPolling: (ctx: TContext) => void | Promise<void>;
-  stopPolling: () => Promise<void>;
-  updateStatus: (ctx: TContext) => void;
-  recordRuntimeEvent?: (
-    category: string,
-    error: unknown,
-    details?: Record<string, unknown>,
-  ) => void;
-  ownershipCheckMs?: number;
+  instanceId?: string;
+  busSocketPath?: string;
+  busSecret?: string;
+  getNowMs?: () => number;
+  staleHeartbeatMs?: number;
 }
 
 export function readLocks(path = getLocksPath()): Record<string, unknown> {
@@ -155,6 +133,18 @@ export function parseTelegramLockEntry(
   return {
     pid: record.pid,
     cwd: typeof record.cwd === "string" ? record.cwd : undefined,
+    instanceId:
+      typeof record.instanceId === "string" ? record.instanceId : undefined,
+    heartbeatMs:
+      typeof record.heartbeatMs === "number" ? record.heartbeatMs : undefined,
+    leaderEpoch:
+      typeof record.leaderEpoch === "number" ? record.leaderEpoch : undefined,
+    busSocketPath:
+      typeof record.busSocketPath === "string"
+        ? record.busSocketPath
+        : undefined,
+    busSecret:
+      typeof record.busSecret === "string" ? record.busSecret : undefined,
   };
 }
 
@@ -168,7 +158,7 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-function formatLock(lock: TelegramLockEntry): string {
+export function formatTelegramLockEntry(lock: TelegramLockEntry): string {
   return lock.cwd ? `pid ${lock.pid}, cwd ${lock.cwd}` : `pid ${lock.pid}`;
 }
 
@@ -176,9 +166,18 @@ function getLockState(
   lock: TelegramLockEntry | undefined,
   pid: number,
   isAlive: (pid: number) => boolean,
+  options: { nowMs?: number; staleHeartbeatMs?: number } = {},
 ): TelegramLockState {
   if (!lock) return { kind: "inactive" };
   if (lock.pid === pid) return { kind: "active-here", lock };
+  if (
+    typeof lock.heartbeatMs === "number" &&
+    typeof options.nowMs === "number" &&
+    typeof options.staleHeartbeatMs === "number" &&
+    options.nowMs - lock.heartbeatMs > options.staleHeartbeatMs
+  ) {
+    return { kind: "stale", lock };
+  }
   if (isAlive(lock.pid)) return { kind: "active-elsewhere", lock };
   return { kind: "stale", lock };
 }
@@ -192,8 +191,26 @@ function ownsLockContext(
   return !lock.cwd || !ctx || lock.cwd === ctx.cwd;
 }
 
-function snapshotLockContext(ctx: TelegramLockContext): TelegramLockContext {
-  return { cwd: ctx.cwd };
+function createLockEntry(
+  pid: number,
+  ctx: TelegramLockContext,
+  options: {
+    instanceId?: string;
+    busSocketPath?: string;
+    busSecret?: string;
+    getNowMs?: () => number;
+  },
+): TelegramLockEntry {
+  const lock: TelegramLockEntry = { pid, cwd: ctx.cwd };
+  if (options.instanceId) {
+    const nowMs = options.getNowMs?.();
+    lock.instanceId = options.instanceId;
+    lock.heartbeatMs = nowMs;
+    lock.leaderEpoch = nowMs;
+  }
+  if (options.busSocketPath) lock.busSocketPath = options.busSocketPath;
+  if (options.busSecret) lock.busSecret = options.busSecret;
+  return lock;
 }
 
 function formatLockState(state: TelegramLockState): string {
@@ -203,9 +220,9 @@ function formatLockState(state: TelegramLockState): string {
     case "active-here":
       return "active here";
     case "active-elsewhere":
-      return `active elsewhere (${formatLock(state.lock)})`;
+      return `active elsewhere (${formatTelegramLockEntry(state.lock)})`;
     case "stale":
-      return `stale (${formatLock(state.lock)})`;
+      return `stale (${formatTelegramLockEntry(state.lock)})`;
   }
 }
 
@@ -216,6 +233,11 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
   const locksPath = options.locksPath ?? getLocksPath();
   const pid = options.pid ?? process.pid;
   const isAlive = options.isProcessAlive ?? isProcessAlive;
+  const getNowMs = options.getNowMs ?? Date.now;
+  const stateOptions = () => ({
+    nowMs: getNowMs(),
+    staleHeartbeatMs: options.staleHeartbeatMs,
+  });
   const readLock = () => parseTelegramLockEntry(readLocks(locksPath)[key]);
   const writeLock = (lock: TelegramLockEntry) => {
     const locks = readLocks(locksPath);
@@ -224,15 +246,20 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
   };
   return {
     acquire: (ctx, acquireOptions = {}) => {
-      const state = getLockState(readLock(), pid, isAlive);
+      const state = getLockState(readLock(), pid, isAlive, stateOptions());
       if (state.kind === "active-elsewhere" && !acquireOptions.force)
         return { ok: false, lock: state.lock };
-      const lock = { pid, cwd: ctx.cwd };
+      const lock = createLockEntry(pid, ctx, {
+        instanceId: options.instanceId,
+        busSocketPath: options.busSocketPath,
+        busSecret: options.busSecret,
+        getNowMs,
+      });
       writeLock(lock);
       return { ok: true, lock, replacedStale: state.kind === "stale" };
     },
     release: () => {
-      const state = getLockState(readLock(), pid, isAlive);
+      const state = getLockState(readLock(), pid, isAlive, stateOptions());
       if (state.kind === "active-here" || state.kind === "stale") {
         const locks = readLocks(locksPath);
         delete locks[key];
@@ -240,18 +267,33 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
       }
       return state;
     },
-    getState: () => getLockState(readLock(), pid, isAlive),
+    getState: () => getLockState(readLock(), pid, isAlive, stateOptions()),
     getStatusLabel: () =>
-      formatLockState(getLockState(readLock(), pid, isAlive)),
+      formatLockState(getLockState(readLock(), pid, isAlive, stateOptions())),
     owns: (ctx) => ownsLockContext(readLock(), pid, ctx),
+    refresh: (ctx) => {
+      const lock = readLock();
+      if (!lock || !ownsLockContext(lock, pid, ctx)) return false;
+      if (!options.instanceId) return true;
+      writeLock({
+        pid: lock.pid,
+        ...(lock.cwd ? { cwd: lock.cwd } : {}),
+        instanceId: options.instanceId,
+        heartbeatMs: getNowMs(),
+        leaderEpoch: lock.leaderEpoch,
+        ...(options.busSocketPath
+          ? { busSocketPath: options.busSocketPath }
+          : {}),
+        busSecret: options.busSecret ?? lock.busSecret,
+      });
+      return true;
+    },
   };
 }
 
 export function createTelegramLockOwnershipGuard<
   TContext extends TelegramLockContext,
->(
-  lock: TelegramLockRuntime<TContext>,
-): TelegramLockOwnershipGuard<TContext> {
+>(lock: TelegramLockRuntime<TContext>): TelegramLockOwnershipGuard<TContext> {
   return {
     ownsContext: (ctx) => lock.owns(ctx),
   };
@@ -269,6 +311,62 @@ export function createTelegramDirectDeliveryOwnershipChecker<
   };
 }
 
+export interface TelegramLockedPollingStartOptions {
+  force?: boolean;
+  forceFreshLeaderThread?: boolean;
+}
+
+export type TelegramLockedPollingStartResult =
+  | { ok: true; message?: string; canTakeover?: false }
+  | { ok: false; message: string; canTakeover?: boolean; owner?: string };
+
+export interface TelegramLockedPollingRuntime<
+  TContext extends TelegramLockContext,
+> {
+  start: (
+    ctx: TContext,
+    options?: TelegramLockedPollingStartOptions,
+  ) => Promise<TelegramLockedPollingStartResult>;
+  stop: () => Promise<string>;
+  suspend: () => Promise<void>;
+  onSessionStart: (_event: unknown, ctx: TContext) => Promise<void>;
+  registerFollowerWithOwner?: (
+    ctx: TContext,
+    owner: TelegramLockEntry,
+  ) => boolean | undefined | Promise<boolean | undefined>;
+  stopFollowerRegistration?: () => void;
+}
+
+export interface TelegramLockedPollingRuntimeDeps<
+  TContext extends TelegramLockContext,
+> {
+  lock: TelegramLockRuntime<TContext>;
+  hasBotToken: () => boolean;
+  canStartPolling?: (ctx: TContext) => boolean;
+  formatStartBlockedMessage?: (ctx: TContext) => string;
+  startPolling: (
+    ctx: TContext,
+    options?: TelegramLockedPollingStartOptions,
+  ) => void | Promise<void>;
+  stopPolling: () => Promise<void>;
+  registerFollowerWithOwner?: (
+    ctx: TContext,
+    owner: TelegramLockEntry,
+  ) => boolean | undefined | Promise<boolean | undefined>;
+  stopFollowerRegistration?: () => void;
+  updateStatus: (ctx: TContext) => void;
+  recordRuntimeEvent?: (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
+  ownershipCheckMs?: number;
+}
+
+function snapshotLockContext(ctx: TelegramLockContext): TelegramLockContext {
+  return { cwd: ctx.cwd };
+}
+
 export function createTelegramLockedPollingRuntime<
   TContext extends TelegramLockContext,
 >(
@@ -276,6 +374,8 @@ export function createTelegramLockedPollingRuntime<
 ): TelegramLockedPollingRuntime<TContext> {
   let ownershipInterval: ReturnType<typeof setInterval> | undefined;
   let ownershipStop: Promise<void> | undefined;
+  let sessionAutoStartRun: Promise<void> | undefined;
+  let sessionAutoStartGeneration = 0;
   const ownershipCheckMs = deps.ownershipCheckMs ?? 1000;
   const stopOwnershipWatcher = () => {
     if (!ownershipInterval) return;
@@ -283,7 +383,12 @@ export function createTelegramLockedPollingRuntime<
     ownershipInterval = undefined;
   };
   const suspendPolling = async () => {
+    sessionAutoStartGeneration += 1;
+    deps.stopFollowerRegistration?.();
     stopOwnershipWatcher();
+    if (sessionAutoStartRun) {
+      await sessionAutoStartRun;
+    }
     if (ownershipStop) {
       await ownershipStop;
       return;
@@ -306,7 +411,7 @@ export function createTelegramLockedPollingRuntime<
     const owner = snapshotLockContext(ctx);
     stopOwnershipWatcher();
     ownershipInterval = setInterval(() => {
-      if (deps.lock.owns(owner)) return;
+      if (deps.lock.refresh(owner)) return;
       stopAfterOwnershipLoss();
     }, ownershipCheckMs);
     ownershipInterval.unref?.();
@@ -315,24 +420,55 @@ export function createTelegramLockedPollingRuntime<
     deps.canStartPolling?.(ctx) ?? true;
   const formatStartBlockedMessage = (ctx: TContext): string =>
     deps.formatStartBlockedMessage?.(ctx) ??
-    "Telegram polling is unavailable in this π run mode.";
+    "Telegram polling is unavailable in this Pi run mode.";
   return {
     start: async (ctx, options = {}) => {
-      if (!deps.hasBotToken())
+      if (!deps.hasBotToken()) {
         return { ok: false, message: "Telegram bot is not configured." };
+      }
       if (!canStartPolling(ctx)) {
         return { ok: false, message: formatStartBlockedMessage(ctx) };
       }
       const acquired = deps.lock.acquire(ctx, options);
       if (!acquired.ok) {
+        if (deps.registerFollowerWithOwner) {
+          let failureMessage: string | undefined;
+          try {
+            const registered = await deps.registerFollowerWithOwner(
+              ctx,
+              acquired.lock,
+            );
+            if (registered) {
+              deps.updateStatus(ctx);
+              return { ok: true, canTakeover: false };
+            }
+            if (registered === false) failureMessage = "not registered";
+          } catch (error) {
+            failureMessage =
+              error instanceof Error ? error.message : String(error);
+            deps.recordRuntimeEvent?.("bus", error, {
+              phase: "follower-register",
+            });
+          }
+          if (failureMessage) {
+            const owner = formatTelegramLockEntry(acquired.lock);
+            return {
+              ok: false,
+              canTakeover: false,
+              owner,
+              message: `Telegram bridge is active in another Pi instance (${owner}); follower registration failed: ${failureMessage}.`,
+            };
+          }
+        }
+        const owner = formatTelegramLockEntry(acquired.lock);
         return {
           ok: false,
           canTakeover: true,
-          owner: formatLock(acquired.lock),
-          message: `Telegram bridge is active in another π instance (${formatLock(acquired.lock)}).`,
+          owner,
+          message: `Telegram bridge is active in another Pi instance (${owner}).`,
         };
       }
-      await deps.startPolling(ctx);
+      await deps.startPolling(ctx, options);
       startOwnershipWatcher(ctx);
       deps.updateStatus(ctx);
       const staleSuffix = acquired.replacedStale ? " Replaced stale lock." : "";
@@ -342,10 +478,11 @@ export function createTelegramLockedPollingRuntime<
       await suspendPolling();
       const state = deps.lock.release();
       if (state.kind === "active-elsewhere") {
-        return `Telegram bridge is active in another π instance (${formatLock(state.lock)}).`;
+        return `Telegram bridge is active in another Pi instance (${formatTelegramLockEntry(state.lock)}).`;
       }
-      if (state.kind === "stale")
-        return `Removed stale Telegram bridge lock (${formatLock(state.lock)}).`;
+      if (state.kind === "stale") {
+        return `Removed stale Telegram bridge lock (${formatTelegramLockEntry(state.lock)}).`;
+      }
       return "Telegram bridge disconnected.";
     },
     suspend: suspendPolling,
@@ -357,17 +494,44 @@ export function createTelegramLockedPollingRuntime<
       const canResumeStaleSameCwd =
         state?.kind === "stale" && state.lock.cwd === ctx.cwd;
       if (!ownsCurrentLock && !canResumeStaleSameCwd) return;
-      try {
+      sessionAutoStartGeneration += 1;
+      const generation = sessionAutoStartGeneration;
+      const startedAtMs = Date.now();
+      deps.recordRuntimeEvent?.("lock", "Telegram auto-start scheduled", {
+        phase: "auto-start-scheduled",
+      });
+      const run = (async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (generation !== sessionAutoStartGeneration) return;
         if (canResumeStaleSameCwd) {
           const acquired = deps.lock.acquire(ctx);
           if (!acquired.ok) return;
         }
+        if (generation !== sessionAutoStartGeneration) return;
         await deps.startPolling(ctx);
+        if (generation !== sessionAutoStartGeneration) return;
         startOwnershipWatcher(ctx);
         deps.updateStatus(ctx);
-      } catch (error) {
-        deps.recordRuntimeEvent?.("lock", error, { phase: "auto-start" });
-      }
+        deps.recordRuntimeEvent?.("lock", "Telegram auto-start completed", {
+          phase: "auto-start-complete",
+          durationMs: Date.now() - startedAtMs,
+        });
+      })()
+        .catch((error) => {
+          deps.recordRuntimeEvent?.("lock", error, { phase: "auto-start" });
+        })
+        .finally(() => {
+          if (sessionAutoStartRun === run) sessionAutoStartRun = undefined;
+        });
+      sessionAutoStartRun = run;
     },
+    registerFollowerWithOwner: deps.registerFollowerWithOwner
+      ? async (ctx, owner) => {
+          const registered = await deps.registerFollowerWithOwner?.(ctx, owner);
+          if (registered) deps.updateStatus(ctx);
+          return registered === true;
+        }
+      : undefined,
+    stopFollowerRegistration: deps.stopFollowerRegistration,
   };
 }

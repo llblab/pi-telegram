@@ -128,6 +128,7 @@ test("Active turn store owns active turn state helpers", () => {
   const store = createTelegramActiveTurnStore();
   const turn: PendingTelegramTurn = createQueueTestPromptTurn({
     chatId: 7,
+    target: { chatId: 7, threadId: 70 },
     replyToMessageId: 8,
     statusSummary: "hello",
     sourceMessageIds: [8, 9],
@@ -141,11 +142,16 @@ test("Active turn store owns active turn state helpers", () => {
   assert.equal(store.has(), true);
   assert.equal(store.get()?.chatId, 7);
   assert.equal(store.getChatId(), 7);
+  assert.deepEqual(store.getTarget(), { chatId: 7, threadId: 70 });
+  const target = store.getTarget();
+  if (target) target.threadId = 99;
+  assert.deepEqual(store.getTarget(), { chatId: 7, threadId: 70 });
   assert.equal(store.getReplyToMessageId(), 8);
   assert.deepEqual(store.getSourceMessageIds(), [8, 9]);
   store.clear();
   assert.equal(store.has(), false);
   assert.equal(store.getChatId(), undefined);
+  assert.equal(store.getTarget(), undefined);
 });
 
 test("Control item builder creates control-lane queue items", () => {
@@ -511,6 +517,58 @@ test("Queue mutation runtime swallows only stale context status errors", () => {
   );
 });
 
+test("Queue mutation helpers scope message-id mutations by chat and thread", () => {
+  const privateTurn = createQueueTestPromptTurn({
+    chatId: 1,
+    sourceMessageIds: [10],
+    statusSummary: "private",
+  });
+  const threadTurn = createQueueTestPromptTurn({
+    chatId: 1,
+    target: { chatId: 1, threadId: 2 },
+    sourceMessageIds: [10],
+    statusSummary: "thread",
+  });
+  const otherChatTurn = createQueueTestPromptTurn({
+    chatId: 2,
+    sourceMessageIds: [10],
+    statusSummary: "other",
+  });
+
+  assert.deepEqual(
+    removeTelegramQueueItemsByMessageIds(
+      [privateTurn, threadTurn, otherChatTurn],
+      [10],
+      { chatId: 1, threadId: 2 },
+    ).items.map((item) => item.statusSummary),
+    ["private", "other"],
+  );
+
+  const prioritized = prioritizeTelegramQueuePrompt(
+    [privateTurn, otherChatTurn],
+    10,
+    5,
+    "⚡",
+    { chatId: 2 },
+  ).items;
+  assert.equal(
+    prioritized[0]?.kind === "prompt" ? prioritized[0].queueLane : undefined,
+    "default",
+  );
+  assert.equal(
+    prioritized[1]?.kind === "prompt" ? prioritized[1].queueLane : undefined,
+    "priority",
+  );
+
+  const cleared = clearTelegramQueuePromptPriority(prioritized, 10, {
+    chatId: 2,
+  }).items;
+  assert.equal(
+    cleared[1]?.kind === "prompt" ? cleared[1].queueLane : undefined,
+    "default",
+  );
+});
+
 test("Queue mutation helpers apply and clear prompt priority without touching control items", () => {
   const promptItem: TelegramQueueItem = createQueueTestPromptTurn({
     replyToMessageId: 1,
@@ -562,7 +620,7 @@ test("Queue priority reactions apply to attachment-only prompt turns", () => {
   assert.equal(prioritized.items[0]?.statusSummary, "📎 voice.ogg");
 });
 
-test("Queued status formatting marks priority prompts in the pi status bar", () => {
+test("Queued status formatting keeps the terminal status bar compact", () => {
   const priorityPrompt: TelegramQueueItem = createQueueTestPromptTurn({
     replyToMessageId: 1,
     sourceMessageIds: [11],
@@ -850,6 +908,104 @@ test("Agent end runtime resets state, finalizes replies, sends attachments, and 
   ]);
 });
 
+test("Agent end runtime can schedule active-turn final delivery without blocking", async () => {
+  const events: string[] = [];
+  let scheduledTask: (() => Promise<void>) | undefined;
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    queuedAttachments: [{ path: "/tmp/demo.txt", fileName: "demo.txt" }],
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "final" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    scheduleActiveTurnDelivery: (task) => {
+      events.push("scheduled");
+      scheduledTask = task;
+    },
+    clearPreview: async (chatId) => {
+      events.push(`clear:${chatId}`);
+    },
+    setPreviewPendingText: (text) => {
+      events.push(`preview:${text}`);
+    },
+    finalizeMarkdownPreview: async (_chatId, markdown) => {
+      events.push(`finalize:${markdown}`);
+      return true;
+    },
+    sendMarkdownReply: async () => {
+      events.push("unexpected:markdown");
+    },
+    sendTextReply: async () => {
+      events.push("unexpected:text");
+    },
+    sendQueuedAttachments: async (nextTurn) => {
+      events.push(`attachments:${nextTurn.queuedAttachments.length}`);
+    },
+  });
+  assert.deepEqual(events, ["reset", "status", "scheduled"]);
+  assert.ok(scheduledTask);
+  await scheduledTask();
+  assert.deepEqual(events, [
+    "reset",
+    "status",
+    "scheduled",
+    "preview:final",
+    "finalize:final",
+    "attachments:1",
+    "dispatch",
+  ]);
+});
+
+test("Agent end runtime keeps plain notices in the active turn target", async () => {
+  const replies: Array<{ text: string; target?: unknown }> = [];
+  const target = { chatId: 1, threadId: 42 };
+  const baseDeps = {
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async (
+      _chatId: number,
+      _replyToMessageId: number,
+      text: string,
+      options?: { target?: unknown },
+    ) => {
+      replies.push({ text, target: options?.target });
+    },
+    sendQueuedAttachments: async () => {},
+  };
+  await handleTelegramAgentEndRuntime({
+    ...baseDeps,
+    turn: createQueueTestPromptTurn({ target }),
+    assistant: { stopReason: "error", errorMessage: "boom" },
+  });
+  await handleTelegramAgentEndRuntime({
+    ...baseDeps,
+    turn: createQueueTestPromptTurn({
+      target,
+      queuedAttachments: [{ path: "/tmp/demo.txt", fileName: "demo.txt" }],
+    }),
+    assistant: {},
+  });
+  assert.deepEqual(replies, [
+    { text: "boom", target },
+    { text: "Attached requested file(s).", target },
+  ]);
+});
+
 test("Agent end runtime records final delivery failures and dispatches", async () => {
   const events: string[] = [];
   const turn: PendingTelegramTurn = createQueueTestPromptTurn();
@@ -916,19 +1072,22 @@ test("Agent end runtime sends proactive local result", async () => {
     clearPreview: async () => {},
     setPreviewPendingText: () => {},
     finalizeMarkdownPreview: async () => false,
-    sendMarkdownReply: async (chatId, replyToMessageId, markdown) => {
-      events.push(`markdown:${chatId}:${replyToMessageId}:${markdown}`);
+    sendMarkdownReply: async (chatId, replyToMessageId, markdown, options) => {
+      events.push(
+        `markdown:${chatId}:${replyToMessageId}:${options?.target?.threadId ?? "none"}:${markdown}`,
+      );
     },
     sendTextReply: async () => {},
     sendQueuedAttachments: async () => {},
     getDefaultChatId: () => 7,
+    getDefaultTarget: () => ({ chatId: 7, threadId: 42 }),
     isProactivePushEnabled: () => true,
     canSendProactivePush: () => true,
   });
   assert.deepEqual(events, [
     "reset",
     "status",
-    "markdown:7:undefined:done",
+    "markdown:7:undefined:42:done",
     "dispatch",
   ]);
 });
@@ -1025,7 +1184,9 @@ test("Agent end runtime keeps queued Telegram turn delivery independent from pol
 
 test("Agent end runtime plans assistant button comments for active Telegram replies", async () => {
   const events: unknown[] = [];
-  const turn: PendingTelegramTurn = createQueueTestPromptTurn();
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    target: { chatId: 1, threadId: 42 },
+  });
   await handleTelegramAgentEndRuntime({
     turn,
     assistant: {
@@ -1048,7 +1209,11 @@ test("Agent end runtime plans assistant button comments for active Telegram repl
       events.push(`preview:${text}`);
     },
     finalizeMarkdownPreview: async (_chatId, markdown, _replyTo, options) => {
-      events.push({ finalize: markdown, replyMarkup: options?.replyMarkup });
+      events.push({
+        finalize: markdown,
+        replyMarkup: options?.replyMarkup,
+        target: options?.target,
+      });
       return true;
     },
     sendMarkdownReply: async () => {
@@ -1071,12 +1236,17 @@ test("Agent end runtime plans assistant button comments for active Telegram repl
   assert.equal(events[5], "dispatch");
   const finalDelivery = events[3] as {
     finalize: string;
+    target?: { chatId: number; threadId?: number };
     replyMarkup?: {
       inline_keyboard?: Array<Array<{ text: string; callback_data: string }>>;
     };
   };
   assert.equal(finalDelivery.finalize, "Choose one:");
-  assert.equal(finalDelivery.replyMarkup?.inline_keyboard?.[0]?.[0]?.text, "Continue");
+  assert.deepEqual(finalDelivery.target, { chatId: 1, threadId: 42 });
+  assert.equal(
+    finalDelivery.replyMarkup?.inline_keyboard?.[0]?.[0]?.text,
+    "Continue",
+  );
   assert.match(
     finalDelivery.replyMarkup?.inline_keyboard?.[0]?.[0]?.callback_data ?? "",
     /^tgbtn:/,
@@ -1205,295 +1375,289 @@ test("Agent end runtime splits assistant voice markup into text and voice delive
 
 test("Agent end transparently intercepts text reply for voice-preferred turn", async () => {
   const events: unknown[] = [];
-    const turn: PendingTelegramTurn = {
-      ...createQueueTestPromptTurn(),
-      voiceReplyPreferred: true,
-    };
-    await handleTelegramAgentEndRuntime({
-      turn,
-      assistant: { text: "Hello from voice reply" },
-      foldQueuedPromptsIntoHistory: false,
-      resetRuntimeState: () => {
-        events.push("reset");
-      },
-      updateStatus: () => {
-        events.push("status");
-      },
-      clearPreview: async () => {
-        events.push("clear");
-      },
-      setPreviewPendingText: () => {
-        events.push("preview");
-      },
-      finalizeMarkdownPreview: async () => {
-        events.push("finalize");
-        return true;
-      },
-      sendMarkdownReply: async () => {
-        events.push("text");
-      },
-      sendTextReply: async () => {
-        events.push("fallback");
-      },
-      sendQueuedAttachments: async () => {
-        events.push("attachments");
-      },
-      planOutboundReply: (markdown) => ({
-        markdown,
-      }),
-      sendOutboundReplyArtifacts: async (_turn, plan, options) => {
-        events.push(`voice:${plan.voiceText}:${options?.replyToPrompt}`);
-      },
-      dispatchNextQueuedTelegramTurn: () => {
-        events.push("dispatch");
-      },
-    });
-    assert.deepEqual(events, [
-      "reset",
-      "status",
-      "clear",
-      "voice:Hello from voice reply:true",
-      "attachments",
-      "dispatch",
-    ]);
-
+  const turn: PendingTelegramTurn = {
+    ...createQueueTestPromptTurn(),
+    voiceReplyPreferred: true,
+  };
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "Hello from voice reply" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    clearPreview: async () => {
+      events.push("clear");
+    },
+    setPreviewPendingText: () => {
+      events.push("preview");
+    },
+    finalizeMarkdownPreview: async () => {
+      events.push("finalize");
+      return true;
+    },
+    sendMarkdownReply: async () => {
+      events.push("text");
+    },
+    sendTextReply: async () => {
+      events.push("fallback");
+    },
+    sendQueuedAttachments: async () => {
+      events.push("attachments");
+    },
+    planOutboundReply: (markdown) => ({
+      markdown,
+    }),
+    sendOutboundReplyArtifacts: async (_turn, plan, options) => {
+      events.push(`voice:${plan.voiceText}:${options?.replyToPrompt}`);
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+  });
+  assert.deepEqual(events, [
+    "reset",
+    "status",
+    "clear",
+    "voice:Hello from voice reply:true",
+    "attachments",
+    "dispatch",
+  ]);
 });
 
 test("Agent end falls back to text when voice handler throws in always mode", async () => {
   const events: unknown[] = [];
-    const turn: PendingTelegramTurn = {
-      ...createQueueTestPromptTurn(),
-      voiceReplyRequired: true,
-    };
-    await handleTelegramAgentEndRuntime({
-      turn,
-      assistant: { text: "Fallback text reply" },
-      foldQueuedPromptsIntoHistory: false,
-      resetRuntimeState: () => {
-        events.push("reset");
-      },
-      updateStatus: () => {
-        events.push("status");
-      },
-      clearPreview: async () => {
-        events.push("clear");
-      },
-      setPreviewPendingText: () => {
-        events.push("preview");
-      },
-      finalizeMarkdownPreview: async () => {
-        events.push("finalize");
-        return true;
-      },
-      sendMarkdownReply: async (chatId, replyToMessageId, markdown) => {
-        events.push(`text:${markdown}`);
-      },
-      sendTextReply: async () => {
-        events.push("fallback");
-      },
-      sendQueuedAttachments: async () => {
-        events.push("attachments");
-      },
-      planOutboundReply: (markdown) => ({ markdown }),
-      sendOutboundReplyArtifacts: async () => {
-        throw new Error("TTS service unavailable");
-      },
-      recordRuntimeEvent: (category, error, details) => {
-        events.push(`error:${category}:${(error as Error).message}`);
-      },
-      dispatchNextQueuedTelegramTurn: () => {
-        events.push("dispatch");
-      },
-    });
-    assert.deepEqual(events, [
-      "reset",
-      "status",
-      "clear",
-      "error:delivery:TTS service unavailable",
-      "text:Fallback text reply",
-      "attachments",
-      "dispatch",
-    ]);
-
+  const turn: PendingTelegramTurn = {
+    ...createQueueTestPromptTurn(),
+    voiceReplyRequired: true,
+  };
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "Fallback text reply" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    clearPreview: async () => {
+      events.push("clear");
+    },
+    setPreviewPendingText: () => {
+      events.push("preview");
+    },
+    finalizeMarkdownPreview: async () => {
+      events.push("finalize");
+      return true;
+    },
+    sendMarkdownReply: async (_chatId, _replyToMessageId, markdown) => {
+      events.push(`text:${markdown}`);
+    },
+    sendTextReply: async () => {
+      events.push("fallback");
+    },
+    sendQueuedAttachments: async () => {
+      events.push("attachments");
+    },
+    planOutboundReply: (markdown) => ({ markdown }),
+    sendOutboundReplyArtifacts: async () => {
+      throw new Error("TTS service unavailable");
+    },
+    recordRuntimeEvent: (category, error, _details) => {
+      events.push(`error:${category}:${(error as Error).message}`);
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+  });
+  assert.deepEqual(events, [
+    "reset",
+    "status",
+    "clear",
+    "error:delivery:TTS service unavailable",
+    "text:Fallback text reply",
+    "attachments",
+    "dispatch",
+  ]);
 });
 
 test("Agent end falls back to text when voice handler throws in voice-received mode", async () => {
   const events: unknown[] = [];
-    const turn: PendingTelegramTurn = {
-      ...createQueueTestPromptTurn(),
-      voiceReplyPreferred: true,
-    };
-    await handleTelegramAgentEndRuntime({
-      turn,
-      assistant: { text: "Fallback text reply" },
-      foldQueuedPromptsIntoHistory: false,
-      resetRuntimeState: () => {
-        events.push("reset");
-      },
-      updateStatus: () => {
-        events.push("status");
-      },
-      clearPreview: async () => {
-        events.push("clear");
-      },
-      setPreviewPendingText: () => {
-        events.push("preview");
-      },
-      finalizeMarkdownPreview: async () => {
-        events.push("finalize");
-        return true;
-      },
-      sendMarkdownReply: async (chatId, replyToMessageId, markdown) => {
-        events.push(`text:${markdown}`);
-      },
-      sendTextReply: async () => {
-        events.push("fallback");
-      },
-      sendQueuedAttachments: async () => {
-        events.push("attachments");
-      },
-      planOutboundReply: (markdown) => ({ markdown }),
-      sendOutboundReplyArtifacts: async () => {
-        throw new Error("TTS service unavailable");
-      },
-      recordRuntimeEvent: (category, error, details) => {
-        events.push(`error:${category}:${(error as Error).message}`);
-      },
-      dispatchNextQueuedTelegramTurn: () => {
-        events.push("dispatch");
-      },
-    });
-    assert.deepEqual(events, [
-      "reset",
-      "status",
-      "clear",
-      "error:delivery:TTS service unavailable",
-      "text:Fallback text reply",
-      "attachments",
-      "dispatch",
-    ]);
-
+  const turn: PendingTelegramTurn = {
+    ...createQueueTestPromptTurn(),
+    voiceReplyPreferred: true,
+  };
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "Fallback text reply" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    clearPreview: async () => {
+      events.push("clear");
+    },
+    setPreviewPendingText: () => {
+      events.push("preview");
+    },
+    finalizeMarkdownPreview: async () => {
+      events.push("finalize");
+      return true;
+    },
+    sendMarkdownReply: async (_chatId, _replyToMessageId, markdown) => {
+      events.push(`text:${markdown}`);
+    },
+    sendTextReply: async () => {
+      events.push("fallback");
+    },
+    sendQueuedAttachments: async () => {
+      events.push("attachments");
+    },
+    planOutboundReply: (markdown) => ({ markdown }),
+    sendOutboundReplyArtifacts: async () => {
+      throw new Error("TTS service unavailable");
+    },
+    recordRuntimeEvent: (category, error, _details) => {
+      events.push(`error:${category}:${(error as Error).message}`);
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+  });
+  assert.deepEqual(events, [
+    "reset",
+    "status",
+    "clear",
+    "error:delivery:TTS service unavailable",
+    "text:Fallback text reply",
+    "attachments",
+    "dispatch",
+  ]);
 });
 
 test("Agent end does not intercept when explicit voice markup exists", async () => {
   const events: unknown[] = [];
-    const turn: PendingTelegramTurn = {
-      ...createQueueTestPromptTurn(),
-      voiceReplyRequired: true,
-    };
-    await handleTelegramAgentEndRuntime({
-      turn,
-      assistant: { text: "Hello with explicit voice" },
-      foldQueuedPromptsIntoHistory: false,
-      resetRuntimeState: () => {
-        events.push("reset");
-      },
-      updateStatus: () => {
-        events.push("status");
-      },
-      clearPreview: async () => {
-        events.push("clear");
-      },
-      setPreviewPendingText: () => {
-        events.push("preview");
-      },
-      finalizeMarkdownPreview: async () => {
-        events.push("finalize");
-        return true;
-      },
-      sendMarkdownReply: async () => {
-        events.push("text");
-      },
-      sendTextReply: async () => {
-        events.push("fallback");
-      },
-      sendQueuedAttachments: async () => {
-        events.push("attachments");
-      },
-      planOutboundReply: () => ({
-        markdown: "",
-        voiceText: "Explicit voice text",
-      }),
-      sendOutboundReplyArtifacts: async (_turn, plan, options) => {
-        events.push(`voice:${plan.voiceText}:${options?.replyToPrompt}`);
-      },
-      dispatchNextQueuedTelegramTurn: () => {
-        events.push("dispatch");
-      },
-    });
-    assert.deepEqual(events, [
-      "reset",
-      "status",
-      "clear",
-      "voice:Explicit voice text:true",
-      "attachments",
-      "dispatch",
-    ]);
-
+  const turn: PendingTelegramTurn = {
+    ...createQueueTestPromptTurn(),
+    voiceReplyRequired: true,
+  };
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "Hello with explicit voice" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    clearPreview: async () => {
+      events.push("clear");
+    },
+    setPreviewPendingText: () => {
+      events.push("preview");
+    },
+    finalizeMarkdownPreview: async () => {
+      events.push("finalize");
+      return true;
+    },
+    sendMarkdownReply: async () => {
+      events.push("text");
+    },
+    sendTextReply: async () => {
+      events.push("fallback");
+    },
+    sendQueuedAttachments: async () => {
+      events.push("attachments");
+    },
+    planOutboundReply: () => ({
+      markdown: "",
+      voiceText: "Explicit voice text",
+    }),
+    sendOutboundReplyArtifacts: async (_turn, plan, options) => {
+      events.push(`voice:${plan.voiceText}:${options?.replyToPrompt}`);
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+  });
+  assert.deepEqual(events, [
+    "reset",
+    "status",
+    "clear",
+    "voice:Explicit voice text:true",
+    "attachments",
+    "dispatch",
+  ]);
 });
 
 test("Agent end does not intercept without planOutboundReply", async () => {
   let voiceArtifactsCalled = false;
-    const turn: PendingTelegramTurn = {
-      ...createQueueTestPromptTurn(),
-      voiceReplyRequired: true,
-    };
-    await handleTelegramAgentEndRuntime({
-      turn,
-      assistant: { text: "Hello with raw markup" },
-      foldQueuedPromptsIntoHistory: false,
-      resetRuntimeState: () => {},
-      updateStatus: () => {},
-      clearPreview: async () => {},
-      setPreviewPendingText: () => {},
-      finalizeMarkdownPreview: async () => true,
-      sendMarkdownReply: async () => {},
-      sendTextReply: async () => {},
-      sendQueuedAttachments: async () => {},
-      sendOutboundReplyArtifacts: async () => {
-        voiceArtifactsCalled = true;
-      },
-      recordRuntimeEvent: () => {},
-      dispatchNextQueuedTelegramTurn: () => {},
-    });
-    assert.equal(voiceArtifactsCalled, false);
-
+  const turn: PendingTelegramTurn = {
+    ...createQueueTestPromptTurn(),
+    voiceReplyRequired: true,
+  };
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "Hello with raw markup" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => true,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    sendOutboundReplyArtifacts: async () => {
+      voiceArtifactsCalled = true;
+    },
+    recordRuntimeEvent: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+  });
+  assert.equal(voiceArtifactsCalled, false);
 });
 
 test("Agent end sends text as reply and voice without reply when both exist", async () => {
   const events: string[] = [];
-    const turn: PendingTelegramTurn = {
-      ...createQueueTestPromptTurn(),
-      voiceReplyRequired: true,
-    };
-    await handleTelegramAgentEndRuntime({
-      turn,
-      assistant: { text: "Hello world" },
-      foldQueuedPromptsIntoHistory: false,
-      resetRuntimeState: () => {},
-      updateStatus: () => {},
-      clearPreview: async () => {},
-      setPreviewPendingText: () => {},
-      finalizeMarkdownPreview: async (_chatId, _text, replyToMessageId) => {
-        events.push(`finalize:${replyToMessageId}`);
-        return true;
-      },
-      planOutboundReply: (text) => ({
-        markdown: text,
-        voiceText: text,
-      }),
-      sendMarkdownReply: async () => {},
-      sendTextReply: async () => {},
-      sendQueuedAttachments: async () => {},
-      sendOutboundReplyArtifacts: async (_turn, _reply, options) => {
-        events.push(`voice:replyToPrompt=${options?.replyToPrompt}`);
-      },
-      recordRuntimeEvent: () => {},
-      dispatchNextQueuedTelegramTurn: () => {},
-    });
-    assert.ok(events.some((e) => e.startsWith("finalize:")));
-    assert.ok(events.some((e) => e === "voice:replyToPrompt=false"));
-
+  const turn: PendingTelegramTurn = {
+    ...createQueueTestPromptTurn(),
+    voiceReplyRequired: true,
+  };
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "Hello world" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async (_chatId, _text, replyToMessageId) => {
+      events.push(`finalize:${replyToMessageId}`);
+      return true;
+    },
+    planOutboundReply: (text) => ({
+      markdown: text,
+      voiceText: text,
+    }),
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    sendOutboundReplyArtifacts: async (_turn, _reply, options) => {
+      events.push(`voice:replyToPrompt=${options?.replyToPrompt}`);
+    },
+    recordRuntimeEvent: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+  });
+  assert.ok(events.some((e) => e.startsWith("finalize:")));
+  assert.ok(events.some((e) => e === "voice:replyToPrompt=false"));
 });
 
 test("Agent end does not intercept when planOutboundReply returns voiceReplies", async () => {
@@ -1519,7 +1683,9 @@ test("Agent end does not intercept when planOutboundReply returns voiceReplies",
       voiceReplies: [{ text, lang: "en" }],
     }),
     sendOutboundReplyArtifacts: async (_turn, reply, options) => {
-      events.push(`voiceReplies:${reply.voiceReplies?.length}:replyToPrompt=${options?.replyToPrompt}`);
+      events.push(
+        `voiceReplies:${reply.voiceReplies?.length}:replyToPrompt=${options?.replyToPrompt}`,
+      );
     },
     recordRuntimeEvent: () => {},
     dispatchNextQueuedTelegramTurn: () => {},
@@ -1553,7 +1719,9 @@ test("Agent end records event when voice fallback text delivery also fails", asy
       throw new Error("TTS service unavailable");
     },
     recordRuntimeEvent: (category, error, details) => {
-      events.push(`error:${category}:${(error as Error).message}:${details?.phase ?? "none"}`);
+      events.push(
+        `error:${category}:${(error as Error).message}:${details?.phase ?? "none"}`,
+      );
     },
     dispatchNextQueuedTelegramTurn: () => {},
   });
@@ -1608,7 +1776,9 @@ test("Agent end uses rawFinalText when plannedReply is undefined", async () => {
     sendQueuedAttachments: async () => {},
     planOutboundReply: () => undefined as any,
     sendOutboundReplyArtifacts: async (_turn, reply, options) => {
-      events.push(`voice:${reply.voiceText}:replyToPrompt=${options?.replyToPrompt}`);
+      events.push(
+        `voice:${reply.voiceText}:replyToPrompt=${options?.replyToPrompt}`,
+      );
     },
     recordRuntimeEvent: () => {},
     dispatchNextQueuedTelegramTurn: () => {},
@@ -3288,8 +3458,9 @@ test("Session lifecycle hooks bind start and shutdown runtime ports", async () =
       events.push("menu");
     },
     getActiveTurnChatId: () => 7,
-    clearPreview: async (chatId) => {
-      events.push(`preview:${chatId}`);
+    getActiveTurnTarget: () => ({ chatId: 7, threadId: 77 }),
+    clearPreview: async (chatId, options) => {
+      events.push(`preview:${chatId}:${options?.target?.threadId ?? "none"}`);
     },
     clearActiveTurn: () => {
       events.push("turn");
@@ -3314,7 +3485,7 @@ test("Session lifecycle hooks bind start and shutdown runtime ports", async () =
     "shutdown:0",
     "media",
     "menu",
-    "preview:7",
+    "preview:7:77",
     "turn",
     "abort",
   ]);

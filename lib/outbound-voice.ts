@@ -8,11 +8,17 @@ import { unlink } from "node:fs/promises";
 import { basename, extname } from "node:path";
 
 import { assertTelegramInlineKeyboardCallbackData } from "./keyboard.ts";
+import { buildTelegramMultipartReplyParameters } from "./replies.ts";
+import {
+  getTelegramTargetThreadParams,
+  type TelegramTarget,
+} from "./target.ts";
 import { getTelegramVoiceSynthesisProviders } from "./voice.ts";
 
 export interface TelegramVoiceReplyTurnView {
   chatId: number;
   replyToMessageId: number;
+  target?: TelegramTarget;
 }
 
 export interface TelegramVoiceReplySenderDeps {
@@ -26,7 +32,12 @@ export interface TelegramVoiceReplySenderDeps {
       stdin?: string;
       retry?: number;
     },
-  ) => Promise<{ stdout: string; stderr: string; code: number; killed: boolean }>;
+  ) => Promise<{
+    stdout: string;
+    stderr: string;
+    code: number;
+    killed: boolean;
+  }>;
   sendMultipart: (
     method: string,
     fields: Record<string, string>,
@@ -68,15 +79,14 @@ export interface TelegramVoiceReplySenderPorts<THandler = unknown> {
 }
 
 function buildVoiceReplyParameters(
+  chatId: number,
   replyToPrompt: boolean | undefined,
   replyToMessageId: number | undefined,
+  target?: TelegramTarget,
 ): string | undefined {
   if (replyToPrompt === false || replyToMessageId === undefined)
     return undefined;
-  return JSON.stringify({
-    message_id: replyToMessageId,
-    allow_sending_without_reply: true,
-  });
+  return buildTelegramMultipartReplyParameters(chatId, replyToMessageId, target);
 }
 
 async function ensureTelegramVoiceFileFormat(
@@ -116,7 +126,7 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
   deps: TelegramVoiceReplySenderDeps,
   ports: TelegramVoiceReplySenderPorts<THandler> = {},
 ) {
-  async function uploadVoiceFile(
+  const uploadVoiceFile = async (
     turn: TelegramVoiceReplyTurnView,
     filePath: string,
     options?: {
@@ -124,13 +134,15 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
       replyMarkup?: unknown;
       transcriptText?: string;
     },
-  ): Promise<void> {
+  ): Promise<void> => {
     const voiceFilePath = await ensureTelegramVoiceFileFormat(filePath);
     assertTelegramInlineKeyboardCallbackData(options?.replyMarkup);
     await sendVoiceChatAction(deps, turn.chatId);
     const replyParameters = buildVoiceReplyParameters(
+      turn.chatId,
       options?.replyToPrompt,
       turn.replyToMessageId,
+      turn.target,
     );
     await deps.sendMultipart(
       "sendVoice",
@@ -138,6 +150,13 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
         chat_id: String(turn.chatId),
         ...(options?.transcriptText ? { caption: options.transcriptText } : {}),
         ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+        ...(turn.target
+          ? Object.fromEntries(
+              Object.entries(getTelegramTargetThreadParams(turn.target)).map(
+                ([key, value]) => [key, String(value)],
+              ),
+            )
+          : {}),
         ...(options?.replyMarkup !== undefined && options.replyMarkup !== null
           ? {
               reply_markup:
@@ -151,9 +170,9 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
       voiceFilePath,
       basename(voiceFilePath),
     );
-  }
+  };
 
-  return async function sendVoiceReply(
+  return async (
     turn: TelegramVoiceReplyTurnView,
     text: string,
     options?: {
@@ -162,8 +181,9 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
       replyToPrompt?: boolean;
       replyMarkup?: unknown;
     },
-  ): Promise<void> {
-    for (const handler of ports.findVoiceHandlers?.(deps.getHandlers?.()) ?? []) {
+  ): Promise<void> => {
+    for (const handler of ports.findVoiceHandlers?.(deps.getHandlers?.()) ??
+      []) {
       try {
         const filePath = await ports.generateVoiceFile?.(text, {
           lang: options?.lang,

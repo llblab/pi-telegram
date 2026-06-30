@@ -51,7 +51,7 @@ test("Pi context mode helpers feature-detect passive run modes", () => {
   assert.equal(canStartPollingInExtensionContext({}), true);
   assert.equal(
     formatPollingStartBlockedByRunMode({ mode: "json" }),
-    "Telegram polling is unavailable in π json mode. Use /telegram-connect from a long-lived π session.",
+    "Telegram polling is unavailable in Pi json mode. Use /telegram-connect from a long-lived Pi session.",
   );
 });
 

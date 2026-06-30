@@ -9,6 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { createWriteStream, openAsBlob } from "node:fs";
 import { mkdir, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { request as requestHttps } from "node:https";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
@@ -44,6 +45,21 @@ const TELEGRAM_INBOUND_FILE_MAX_BYTES = getTelegramInboundFileByteLimitFromEnv(
   ["PI_TELEGRAM_INBOUND_FILE_MAX_BYTES", "TELEGRAM_MAX_FILE_SIZE_BYTES"],
   TELEGRAM_FILE_MAX_BYTES,
 );
+
+export type TelegramNetworkFamilyPolicy =
+  | "auto"
+  | "ipv4"
+  | "ipv6"
+  | "ipv4-fallback";
+
+const TELEGRAM_NETWORK_FAMILY_ENV = "PI_TELEGRAM_NETWORK_FAMILY";
+const TELEGRAM_NETWORK_FAMILY_VALUES = new Set<TelegramNetworkFamilyPolicy>([
+  "auto",
+  "ipv4",
+  "ipv6",
+  "ipv4-fallback",
+]);
+type TelegramNetworkFamily = 4 | 6;
 
 export interface TelegramUser {
   id: number;
@@ -189,7 +205,9 @@ export interface TelegramSentMessage {
 
 export interface TelegramReplyParameters {
   message_id: number;
-  allow_sending_without_reply: true;
+  allow_sending_without_reply?: boolean;
+  chat_id?: number;
+  message_thread_id?: number;
 }
 
 export type TelegramSendMessageBody = Record<string, unknown> & {
@@ -349,9 +367,19 @@ export interface TelegramBridgeApiRuntime {
   setMyCommands: (
     commands: readonly { command: string; description: string }[],
   ) => Promise<boolean>;
-  sendChatAction: (chatId: number, action: string) => Promise<boolean>;
-  sendTypingAction: (chatId: number) => Promise<unknown>;
-  sendRecordVoiceAction: (chatId: number) => Promise<unknown>;
+  sendChatAction: (
+    chatId: number,
+    action: string,
+    options?: { message_thread_id?: number },
+  ) => Promise<boolean>;
+  sendTypingAction: (
+    chatId: number,
+    options?: { message_thread_id?: number },
+  ) => Promise<unknown>;
+  sendRecordVoiceAction: (
+    chatId: number,
+    options?: { message_thread_id?: number },
+  ) => Promise<unknown>;
   sendMessageDraft: (
     chatId: number,
     draftId: number,
@@ -537,9 +565,271 @@ function unwrapTelegramApiResult<TResponse>(
   return data.result;
 }
 
+function getTelegramNetworkFamilyPolicy(
+  env: NodeJS.ProcessEnv = process.env,
+): TelegramNetworkFamilyPolicy {
+  const value = env[TELEGRAM_NETWORK_FAMILY_ENV]?.trim().toLowerCase();
+  if (
+    TELEGRAM_NETWORK_FAMILY_VALUES.has(value as TelegramNetworkFamilyPolicy)
+  ) {
+    return value as TelegramNetworkFamilyPolicy;
+  }
+  return "ipv4-fallback";
+}
+
+function getTelegramNetworkFamily(
+  policy: TelegramNetworkFamilyPolicy,
+): TelegramNetworkFamily | undefined {
+  if (policy === "ipv4") return 4;
+  if (policy === "ipv6") return 6;
+  return undefined;
+}
+
+function isTelegramTransportFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.name === "AbortError") return false;
+  if (error instanceof TypeError && /fetch failed/i.test(error.message)) {
+    return true;
+  }
+  if (error instanceof AggregateError) return true;
+  const code = getErrorCode(error);
+  if (
+    code === "ECONNREFUSED" ||
+    code === "ETIMEDOUT" ||
+    code === "ENETUNREACH" ||
+    code === "EHOSTUNREACH" ||
+    code === "ECONNRESET" ||
+    code === "EAI_AGAIN"
+  ) {
+    return true;
+  }
+  return isTelegramTransportFailure(error.cause);
+}
+
+function getTelegramRequestBodyBuffer(
+  body: BodyInit | null | undefined,
+): Buffer | undefined {
+  if (body === undefined || body === null) return undefined;
+  if (typeof body === "string") return Buffer.from(body);
+  if (body instanceof Uint8Array) return Buffer.from(body);
+  throw new Error("Unsupported Telegram HTTPS request body");
+}
+
+async function buildTelegramMultipartBody(
+  fields: Record<string, string>,
+  fileField: string,
+  fileBlob: Blob,
+  fileName: string,
+): Promise<{ body: Buffer; contentType: string }> {
+  const boundary = `pi-telegram-${randomUUID()}`;
+  const chunks: Buffer[] = [];
+  for (const [key, value] of Object.entries(fields)) {
+    chunks.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`,
+      ),
+    );
+  }
+  chunks.push(
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${fileName}"\r\nContent-Type: ${fileBlob.type || "application/octet-stream"}\r\n\r\n`,
+    ),
+    Buffer.from(await fileBlob.arrayBuffer()),
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  );
+  return {
+    body: Buffer.concat(chunks),
+    contentType: `multipart/form-data; boundary=${boundary}`,
+  };
+}
+
+async function telegramHttpsFetch(
+  input: string | URL | Request,
+  init: RequestInit,
+  family: TelegramNetworkFamily,
+): Promise<Response> {
+  const url = new URL(
+    typeof input === "string" || input instanceof URL ? input : input.url,
+  );
+  const body = getTelegramRequestBodyBuffer(init.body);
+  const headers = new Headers(init.headers);
+  if (body && !headers.has("content-length")) {
+    headers.set("content-length", String(body.byteLength));
+  }
+  return new Promise<Response>((resolve, reject) => {
+    const req = requestHttps(
+      url,
+      {
+        method: init.method ?? "GET",
+        family,
+        headers: Object.fromEntries(headers.entries()),
+      },
+      (res) => {
+        const responseHeaders = new Headers();
+        for (const [key, value] of Object.entries(res.headers)) {
+          if (Array.isArray(value)) responseHeaders.set(key, value.join(", "));
+          else if (value !== undefined) responseHeaders.set(key, String(value));
+        }
+        resolve(
+          new Response(Readable.toWeb(res) as ReadableStream<Uint8Array>, {
+            status: res.statusCode ?? 200,
+            statusText: res.statusMessage,
+            headers: responseHeaders,
+          }),
+        );
+      },
+    );
+    req.on("error", reject);
+    if (init.signal) {
+      if (init.signal.aborted)
+        req.destroy(new DOMException("Aborted", "AbortError"));
+      else {
+        init.signal.addEventListener(
+          "abort",
+          () => req.destroy(new DOMException("Aborted", "AbortError")),
+          { once: true },
+        );
+      }
+    }
+    req.end(body);
+  });
+}
+
+let telegramHttpsFetchForTesting: typeof telegramHttpsFetch | undefined;
+
+export function setTelegramApiHttpsFetchForTesting(
+  fetchImpl: typeof telegramHttpsFetch | undefined,
+): () => void {
+  const previous = telegramHttpsFetchForTesting;
+  telegramHttpsFetchForTesting = fetchImpl;
+  return () => {
+    telegramHttpsFetchForTesting = previous;
+  };
+}
+
+async function telegramFetch(
+  input: string | URL | Request,
+  init: RequestInit = {},
+  family?: TelegramNetworkFamily,
+): Promise<Response> {
+  if (!family) return fetch(input, init);
+  return (telegramHttpsFetchForTesting ?? telegramHttpsFetch)(
+    input,
+    init,
+    family,
+  );
+}
+
+async function callTelegramTransportRequest(
+  request: (family?: TelegramNetworkFamily) => Promise<Response>,
+): Promise<Response> {
+  const policy = getTelegramNetworkFamilyPolicy();
+  if (policy === "auto") return request();
+  const family = getTelegramNetworkFamily(policy);
+  if (family) return request(family);
+  try {
+    return await request();
+  } catch (error) {
+    if (!isTelegramTransportFailure(error)) throw error;
+    return request(4);
+  }
+}
+
+function getErrorCode(error: Error): string | undefined {
+  const maybeCode = (error as { code?: unknown }).code;
+  return typeof maybeCode === "string" ? maybeCode : undefined;
+}
+
+function getErrorAddress(error: Error): string | undefined {
+  const maybeAddress = (error as { address?: unknown }).address;
+  return typeof maybeAddress === "string" ? maybeAddress : undefined;
+}
+
+function getErrorPort(error: Error): number | undefined {
+  const maybePort = (error as { port?: unknown }).port;
+  return typeof maybePort === "number" ? maybePort : undefined;
+}
+
+function getErrorFamily(error: Error): number | string | undefined {
+  const maybeFamily = (error as { family?: unknown }).family;
+  if (typeof maybeFamily === "number" || typeof maybeFamily === "string") {
+    return maybeFamily;
+  }
+  return undefined;
+}
+
+function describeTelegramErrorSummary(error: Error): {
+  name: string;
+  message: string;
+  code?: string;
+} {
+  return {
+    name: error.name,
+    message: error.message,
+    ...(getErrorCode(error) ? { code: getErrorCode(error) } : {}),
+  };
+}
+
+function describeTelegramTransportAttempt(error: Error): {
+  name: string;
+  code?: string;
+  address?: string;
+  port?: number;
+  family?: number | string;
+} {
+  return {
+    name: error.name,
+    ...(getErrorCode(error) ? { code: getErrorCode(error) } : {}),
+    ...(getErrorAddress(error) ? { address: getErrorAddress(error) } : {}),
+    ...(getErrorPort(error) ? { port: getErrorPort(error) } : {}),
+    ...(getErrorFamily(error) ? { family: getErrorFamily(error) } : {}),
+  };
+}
+
+function describeTelegramTransportError(error: unknown):
+  | {
+      error: { name: string; message: string; code?: string };
+      cause?: { name: string; message: string; code?: string };
+      attempts?: Array<{
+        name: string;
+        code?: string;
+        address?: string;
+        port?: number;
+        family?: number | string;
+      }>;
+    }
+  | undefined {
+  if (!isTelegramTransportFailure(error) || !(error instanceof Error)) {
+    return undefined;
+  }
+  const cause = error.cause instanceof Error ? error.cause : undefined;
+  const aggregate =
+    error instanceof AggregateError
+      ? error
+      : cause instanceof AggregateError
+        ? cause
+        : undefined;
+  const attempts = aggregate?.errors
+    .filter((attempt): attempt is Error => attempt instanceof Error)
+    .map(describeTelegramTransportAttempt);
+  return {
+    error: describeTelegramErrorSummary(error),
+    ...(cause ? { cause: describeTelegramErrorSummary(cause) } : {}),
+    ...(attempts && attempts.length > 0 ? { attempts } : {}),
+  };
+}
+
+function withTelegramTransportDiagnostics(
+  error: unknown,
+  details: Record<string, unknown>,
+): Record<string, unknown> {
+  const transport = describeTelegramTransportError(error);
+  return transport ? { ...details, transport } : details;
+}
+
 async function callTelegramWithRetry<TResponse>(
   method: string,
-  request: () => Promise<Response>,
+  request: (family?: TelegramNetworkFamily) => Promise<Response>,
   options: TelegramApiCallOptions | undefined,
 ): Promise<TResponse> {
   const maxAttempts = Math.max(1, options?.maxAttempts ?? 3);
@@ -549,7 +839,10 @@ async function callTelegramWithRetry<TResponse>(
     try {
       return unwrapTelegramApiResult(
         method,
-        await parseTelegramApiResponse<TResponse>(await request(), method),
+        await parseTelegramApiResponse<TResponse>(
+          await callTelegramTransportRequest(request),
+          method,
+        ),
       );
     } catch (error) {
       if (attempt >= maxAttempts - 1 || !isRetryableTelegramApiError(error)) {
@@ -611,13 +904,17 @@ export async function callTelegram<TResponse>(
   const configuredBotToken = assertTelegramBotTokenConfigured(botToken);
   return callTelegramWithRetry(
     method,
-    async () =>
-      fetch(`${TELEGRAM_API_BASE}/bot${configuredBotToken}/${method}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-        signal: options?.signal,
-      }),
+    async (family) =>
+      telegramFetch(
+        `${TELEGRAM_API_BASE}/bot${configuredBotToken}/${method}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+          signal: options?.signal,
+        },
+        family,
+      ),
     options,
   );
 }
@@ -654,17 +951,38 @@ export async function callTelegramMultipart<TResponse>(
   const fileBlob = await openAsBlob(filePath);
   return callTelegramWithRetry(
     method,
-    async () => {
+    async (family) => {
+      if (family) {
+        const multipart = await buildTelegramMultipartBody(
+          fields,
+          fileField,
+          fileBlob,
+          fileName,
+        );
+        return telegramFetch(
+          `${TELEGRAM_API_BASE}/bot${configuredBotToken}/${method}`,
+          {
+            method: "POST",
+            headers: { "content-type": multipart.contentType },
+            body: multipart.body as unknown as BodyInit,
+            signal: options?.signal,
+          },
+          family,
+        );
+      }
       const form = new FormData();
       for (const [key, value] of Object.entries(fields)) {
         form.set(key, value);
       }
       form.set(fileField, fileBlob, fileName);
-      return fetch(`${TELEGRAM_API_BASE}/bot${configuredBotToken}/${method}`, {
-        method: "POST",
-        body: form,
-        signal: options?.signal,
-      });
+      return telegramFetch(
+        `${TELEGRAM_API_BASE}/bot${configuredBotToken}/${method}`,
+        {
+          method: "POST",
+          body: form,
+          signal: options?.signal,
+        },
+      );
     },
     options,
   );
@@ -690,9 +1008,12 @@ export async function downloadTelegramFile(
     tempDir,
     `${randomUUID()}-${sanitizeFileName(suggestedName)}`,
   );
-  const response = await fetch(
-    `${TELEGRAM_API_BASE}/file/bot${configuredBotToken}/${file.file_path}`,
-    { signal: options?.signal },
+  const response = await callTelegramTransportRequest((family) =>
+    telegramFetch(
+      `${TELEGRAM_API_BASE}/file/bot${configuredBotToken}/${file.file_path}`,
+      { signal: options?.signal },
+      family,
+    ),
   );
   if (!response.ok) {
     throw new Error(`Failed to download Telegram file: ${response.status}`);
@@ -730,9 +1051,13 @@ export async function answerTelegramCallbackQuery(
         : { callback_query_id: callbackQueryId },
     );
   } catch (error) {
-    options.recordRuntimeEvent?.("api", error, {
-      method: "answerCallbackQuery",
-    });
+    options.recordRuntimeEvent?.(
+      "api",
+      error,
+      withTelegramTransportDiagnostics(error, {
+        method: "answerCallbackQuery",
+      }),
+    );
   }
 }
 
@@ -752,10 +1077,17 @@ export async function deleteTelegramMessage(
 }
 
 export function createTelegramChatActionSender<TAction extends string>(
-  sendChatAction: (chatId: number, action: TAction) => Promise<unknown>,
+  sendChatAction: (
+    chatId: number,
+    action: TAction,
+    options?: { message_thread_id?: number },
+  ) => Promise<unknown>,
   action: TAction,
-): (chatId: number) => Promise<unknown> {
-  return (chatId) => sendChatAction(chatId, action);
+): (
+  chatId: number,
+  options?: { message_thread_id?: number },
+) => Promise<unknown> {
+  return (chatId, options) => sendChatAction(chatId, action, options);
 }
 
 export function createTelegramNativeMarkdownDraftSender(deps: {
@@ -801,9 +1133,13 @@ export function createTelegramBridgeApiRuntime(
     options?: TelegramApiCallOptions,
   ): Promise<TResponse> => {
     try {
-      return await deps.client.call(method, body, options);
+      return await deps.client.call<TResponse>(method, body, options);
     } catch (error) {
-      deps.recordRuntimeEvent("api", error, { method });
+      deps.recordRuntimeEvent(
+        "api",
+        error,
+        withTelegramTransportDiagnostics(error, { method }),
+      );
       throw error;
     }
   };
@@ -833,7 +1169,11 @@ export function createTelegramBridgeApiRuntime(
           options,
         );
       } catch (error) {
-        deps.recordRuntimeEvent("multipart", error, { method, fileName });
+        deps.recordRuntimeEvent(
+          "multipart",
+          error,
+          withTelegramTransportDiagnostics(error, { method, fileName }),
+        );
         throw error;
       }
     },
@@ -853,7 +1193,11 @@ export function createTelegramBridgeApiRuntime(
           },
         );
       } catch (error) {
-        deps.recordRuntimeEvent("download", error, { suggestedName });
+        deps.recordRuntimeEvent(
+          "download",
+          error,
+          withTelegramTransportDiagnostics(error, { suggestedName }),
+        );
         throw error;
       }
     },
@@ -867,24 +1211,33 @@ export function createTelegramBridgeApiRuntime(
       callRecorded<TelegramUpdate[]>("getUpdates", body, { signal }),
     setMyCommands: (commands) =>
       callRecorded<boolean>("setMyCommands", { commands }),
-    sendChatAction: (chatId, action) =>
+    sendChatAction: (chatId, action, options) =>
       callRecorded<boolean>("sendChatAction", {
         chat_id: chatId,
         action,
+        ...(options?.message_thread_id !== undefined
+          ? { message_thread_id: options.message_thread_id }
+          : {}),
       }),
     sendTypingAction: createTelegramChatActionSender(
-      (chatId, action) =>
+      (chatId, action, options) =>
         callRecorded<boolean>("sendChatAction", {
           chat_id: chatId,
           action,
+          ...(options?.message_thread_id !== undefined
+            ? { message_thread_id: options.message_thread_id }
+            : {}),
         }),
       "typing",
     ),
     sendRecordVoiceAction: createTelegramChatActionSender(
-      (chatId, action) =>
+      (chatId, action, options) =>
         callRecorded<boolean>("sendChatAction", {
           chat_id: chatId,
           action,
+          ...(options?.message_thread_id !== undefined
+            ? { message_thread_id: options.message_thread_id }
+            : {}),
         }),
       "record_voice",
     ),
@@ -913,7 +1266,13 @@ export function createTelegramBridgeApiRuntime(
         return "edited";
       } catch (error) {
         if (isTelegramMessageNotModifiedError(error)) return "unchanged";
-        deps.recordRuntimeEvent("api", error, { method: "editMessageText" });
+        deps.recordRuntimeEvent(
+          "api",
+          error,
+          withTelegramTransportDiagnostics(error, {
+            method: "editMessageText",
+          }),
+        );
         throw error;
       }
     },
@@ -921,15 +1280,21 @@ export function createTelegramBridgeApiRuntime(
       try {
         await deps.client.answerCallbackQuery(callbackQueryId, text);
       } catch (error) {
-        deps.recordRuntimeEvent("api", error, {
-          method: "answerCallbackQuery",
-        });
+        deps.recordRuntimeEvent(
+          "api",
+          error,
+          withTelegramTransportDiagnostics(error, {
+            method: "answerCallbackQuery",
+          }),
+        );
       }
     },
     answerGuestQuery: (
       guestQueryId: string,
       text: string | undefined,
-      options: { parseMode?: string; richMessage?: TelegramInputRichMessage } | undefined,
+      options:
+        | { parseMode?: string; richMessage?: TelegramInputRichMessage }
+        | undefined,
     ) => {
       const body: Record<string, unknown> = { guest_query_id: guestQueryId };
       if (text !== undefined || options?.richMessage) {

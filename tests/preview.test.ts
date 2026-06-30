@@ -20,6 +20,7 @@ import {
   shouldUseTelegramDraftPreview,
   type TelegramPreviewRuntimeState,
 } from "../lib/preview.ts";
+import { createTelegramThreadTarget } from "../lib/target.ts";
 
 function createPreviewRuntimeHarness(state?: TelegramPreviewRuntimeState) {
   let previewState = state;
@@ -47,7 +48,12 @@ function createPreviewRuntimeHarness(state?: TelegramPreviewRuntimeState) {
         draftSupport = support;
       },
       allocateDraftId: () => nextDraftId++,
-      sendDraft: async (chatId: number, draftId: number, text?: string) => {
+      sendDraft: async (
+        chatId: number,
+        draftId: number,
+        text?: string,
+        _options?: { message_thread_id?: number },
+      ) => {
         events.push(`draft:${chatId}:${draftId}:${text}`);
       },
       canSend: undefined as undefined | (() => boolean),
@@ -63,12 +69,7 @@ function createPreviewRuntimeHarness(state?: TelegramPreviewRuntimeState) {
 }
 
 test("Preview helpers create draft-only state and allocate draft ids", () => {
-  assert.deepEqual(createTelegramPreviewRuntimeState("unknown"), {
-    mode: "draft",
-    pendingText: "",
-    lastSentText: "",
-  });
-  assert.deepEqual(createTelegramPreviewRuntimeState("supported"), {
+  assert.deepEqual(createTelegramPreviewRuntimeState(), {
     mode: "draft",
     pendingText: "",
     lastSentText: "",
@@ -106,9 +107,15 @@ test("Preview final text prefers pending text then last sent draft text", () => 
 });
 
 test("Preview helpers always use native rich drafts", () => {
-  assert.equal(shouldUseTelegramDraftPreview({ draftSupport: "unknown" }), true);
   assert.equal(
-    shouldUseTelegramDraftPreview({ draftSupport: "supported", snapshot: { text: "ok" } }),
+    shouldUseTelegramDraftPreview({ draftSupport: "unknown" }),
+    true,
+  );
+  assert.equal(
+    shouldUseTelegramDraftPreview({
+      draftSupport: "supported",
+      snapshot: { text: "ok" },
+    }),
     true,
   );
 });
@@ -127,11 +134,17 @@ test("Native Markdown draft prefix keeps only structurally closed Markdown", () 
     "Before",
   );
   assert.equal(
-    getSafeTelegramRichMarkdownDraftPrefix("Before\n\n```ts\nconst x = 1\n```", 100),
+    getSafeTelegramRichMarkdownDraftPrefix(
+      "Before\n\n```ts\nconst x = 1\n```",
+      100,
+    ),
     "Before\n\n```ts\nconst x = 1\n```",
   );
   assert.equal(
-    getSafeTelegramRichMarkdownDraftPrefix("[OpenAI](https://openai.com) and [half", 100),
+    getSafeTelegramRichMarkdownDraftPrefix(
+      "[OpenAI](https://openai.com) and [half",
+      100,
+    ),
     "[OpenAI](https://openai.com) and",
   );
   assert.equal(
@@ -139,7 +152,10 @@ test("Native Markdown draft prefix keeps only structurally closed Markdown", () 
     "Block math:",
   );
   assert.equal(
-    getSafeTelegramRichMarkdownDraftPrefix("<!-- telegram_button label=Ok", 100),
+    getSafeTelegramRichMarkdownDraftPrefix(
+      "<!-- telegram_button label=Ok",
+      100,
+    ),
     undefined,
   );
 });
@@ -154,6 +170,61 @@ test("Preview runtime sends only safe native markdown draft prefixes", async () 
   assert.deepEqual(harness.events, ["draft:7:10:**Bold** and"]);
   assert.equal(harness.getState()?.lastSentText, "**Bold** and");
   assert.equal(harness.getDraftSupport(), "supported");
+});
+
+test("Preview runtime sends draft previews into thread target", async () => {
+  const harness = createPreviewRuntimeHarness({
+    mode: "draft",
+    pendingText: "thread draft",
+    lastSentText: "",
+  });
+  const sentOptions: unknown[] = [];
+  harness.deps.sendDraft = async (
+    _chatId: number,
+    _draftId: number,
+    _text?: string,
+    options?: { message_thread_id?: number },
+  ) => {
+    sentOptions.push(options);
+  };
+  await flushTelegramPreview(7, harness.deps, {
+    target: createTelegramThreadTarget(7, 42),
+  });
+  assert.deepEqual(sentOptions, [{ message_thread_id: 42 }]);
+});
+
+test("Preview runtime clears thread drafts in thread target", async () => {
+  const harness = createPreviewRuntimeHarness({
+    mode: "draft",
+    draftId: 10,
+    pendingText: "new draft",
+    lastSentText: "",
+  });
+  const sentOptions: unknown[] = [];
+  harness.deps.sendDraft = async (
+    _chatId: number,
+    _draftId: number,
+    _text?: string,
+    options?: { message_thread_id?: number },
+  ) => {
+    sentOptions.push(options);
+  };
+  await clearTelegramPreview(7, harness.deps, {
+    target: createTelegramThreadTarget(7, 42),
+  });
+  assert.deepEqual(sentOptions, [{ message_thread_id: 42 }]);
+});
+
+test("Preview runtime does not send thinking placeholder for unsafe draft tails", async () => {
+  const harness = createPreviewRuntimeHarness({
+    mode: "draft",
+    pendingText: "<!-- telegram_button label=Ok",
+    lastSentText: "",
+  });
+  await flushTelegramPreview(7, harness.deps);
+  assert.deepEqual(harness.events, []);
+  assert.equal(harness.getState()?.draftId, undefined);
+  assert.equal(harness.getState()?.lastSentText, "");
 });
 
 test("Preview runtime skips unchanged unsafe draft tails", async () => {
@@ -205,10 +276,7 @@ test("Preview runtime serializes overlapping flush requests", async () => {
   const secondFlush = flushTelegramPreview(7, harness.deps);
   releaseDraft?.();
   await Promise.all([firstFlush, secondFlush]);
-  assert.deepEqual(harness.events, [
-    "draft:7:44:first",
-    "draft:7:44:second",
-  ]);
+  assert.deepEqual(harness.events, ["draft:7:44:first", "draft:7:44:second"]);
   assert.equal(harness.getState()?.lastSentText, "second");
 });
 
@@ -256,7 +324,9 @@ test("Native Markdown finalizer waits for active draft flush before final reply"
     clear: (chatId) => clearTelegramPreview(chatId, harness.deps),
     discard: () => harness.deps.setState(undefined),
     sendMarkdownReply: async (chatId, replyToMessageId, markdown) => {
-      harness.events.push(`final:${chatId}:${replyToMessageId ?? "none"}:${markdown}`);
+      harness.events.push(
+        `final:${chatId}:${replyToMessageId ?? "none"}:${markdown}`,
+      );
       return 88;
     },
   });
@@ -292,13 +362,21 @@ test("Assistant preview runtime finalizes previous markdown through native reply
     role: string;
     text?: string;
   }>({
-    getActiveTurn: () => ({ chatId: 7 }),
+    getActiveTurn: () => ({
+      chatId: 7,
+      replyToMessageId: 24,
+      target: createTelegramThreadTarget(7, 42),
+    }),
     isAssistantMessage: (message) => message.role === "assistant",
     getMessageText: (message) => message.text ?? "",
     maxMessageLength: 100,
     sendDraft: async () => {},
-    sendMarkdownReply: async (chatId, replyToMessageId, markdown) => {
-      events.push(`native-final:${chatId}:${replyToMessageId ?? "none"}:${markdown}`);
+    sendMarkdownReply: async (chatId, replyToMessageId, markdown, options) => {
+      events.push(
+        `native-final:${chatId}:${replyToMessageId ?? "none"}:${markdown}:${
+          options?.target?.threadId ?? "private"
+        }`,
+      );
       return 99;
     },
   });
@@ -308,7 +386,7 @@ test("Assistant preview runtime finalizes previous markdown through native reply
     lastSentText: "**previous**",
   });
   await runtime.onMessageStart({ message: { role: "assistant" } });
-  assert.deepEqual(events, ["native-final:7:none:**previous**"]);
+  assert.deepEqual(events, ["native-final:7:24:**previous**:42"]);
   assert.equal(runtime.getState()?.pendingText, "");
 });
 

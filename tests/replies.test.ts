@@ -33,6 +33,7 @@ import {
   TELEGRAM_RICH_MESSAGE_MAX_CHARS,
 } from "../lib/replies.ts";
 import { createDedupAgentStartHook } from "../lib/lifecycle.ts";
+import { createTelegramThreadTarget } from "../lib/target.ts";
 
 test("Reply helpers extract assistant message text and metadata", () => {
   const messages = [
@@ -71,6 +72,65 @@ test("Reply transport forwards send and edit operations through delivery helpers
   assert.equal(await transport.sendRenderedChunks(7, [{ text: "one" }]), 5);
   assert.equal(await transport.editRenderedMessage(7, 9, [{ text: "two" }]), 9);
   assert.deepEqual(events, ["send:7:one", "edit:7:9:two"]);
+});
+
+test("Reply delivery includes thread target on rendered chunks", async () => {
+  const sentBodies: Array<Record<string, unknown>> = [];
+  const ownership: Array<Record<string, unknown>> = [];
+  await sendTelegramRenderedChunks(
+    -1007,
+    [{ text: "one" }, { text: "two" }],
+    {
+      sendMessage: async (body) => {
+        sentBodies.push(body);
+        return { message_id: sentBodies.length };
+      },
+      editMessage: async () => {},
+      recordOwnership: (input) => {
+        ownership.push(input);
+      },
+    },
+    { target: createTelegramThreadTarget(-1007, 42) },
+  );
+  assert.deepEqual(
+    sentBodies.map((body) => body.message_thread_id),
+    [42, 42],
+  );
+  assert.deepEqual(
+    ownership.map((record) => record.messageId),
+    [1, 2],
+  );
+  assert.deepEqual(ownership[0]?.target, createTelegramThreadTarget(-1007, 42));
+});
+
+test("Reply delivery includes thread target on rendered edits and continuation chunks", async () => {
+  const sentBodies: Array<Record<string, unknown>> = [];
+  const editedBodies: Array<Record<string, unknown>> = [];
+  const ownership: Array<Record<string, unknown>> = [];
+  await editTelegramRenderedMessage(
+    -1007,
+    9,
+    [{ text: "one" }, { text: "two" }],
+    {
+      sendMessage: async (body) => {
+        sentBodies.push(body);
+        return { message_id: sentBodies.length };
+      },
+      editMessage: async (body) => {
+        editedBodies.push(body);
+      },
+      recordOwnership: (input) => {
+        ownership.push(input);
+      },
+    },
+    { target: createTelegramThreadTarget(-1007, 42) },
+  );
+  assert.equal(editedBodies[0]?.message_thread_id, 42);
+  assert.equal(sentBodies[0]?.message_thread_id, 42);
+  assert.deepEqual(
+    ownership.map((record) => record.messageId),
+    [9, 1],
+  );
 });
 
 test("Reply delivery sends chunks and applies reply markup only to the last chunk", async () => {
@@ -121,7 +181,9 @@ test("Reply delivery rejects generated buttons above Telegram callback limit", a
         },
         {
           replyMarkup: {
-            inline_keyboard: [[{ text: "Too long", callback_data: "x".repeat(65) }]],
+            inline_keyboard: [
+              [{ text: "Too long", callback_data: "x".repeat(65) }],
+            ],
           },
         },
       ),
@@ -221,9 +283,15 @@ test("Reply runtime bundles text, native markdown, and UI/compat interactive del
   assert.equal(await runtime.sendTextReply(7, 42, "hello"), 1);
   assert.equal(await runtime.sendMarkdownReply(7, 43, "**hello**"), 77);
   assert.equal(
-    await runtime.sendInteractiveMessage(7, "menu", "html", {
-      inline_keyboard: [],
-    }),
+    await runtime.sendInteractiveMessage(
+      7,
+      "menu",
+      "html",
+      {
+        inline_keyboard: [],
+      },
+      { replyToMessageId: 44 },
+    ),
     2,
   );
   await runtime.editInteractiveMessage(7, 9, "menu", "html", {
@@ -249,10 +317,73 @@ test("Reply runtime bundles text, native markdown, and UI/compat interactive del
     allow_sending_without_reply: true,
   });
   assert.deepEqual(sent[1]?.reply_markup, { inline_keyboard: [] });
+  assert.deepEqual(sent[1]?.reply_parameters, {
+    message_id: 44,
+    allow_sending_without_reply: true,
+  });
   assert.deepEqual(
     edited.map((body) => body.text),
     ["html:menu"],
   );
+});
+
+test("Plain reply includes thread target on rendered messages", async () => {
+  const sentBodies: Array<Record<string, unknown>> = [];
+  const runtime = createTelegramRenderedMessageRuntime({
+    renderTelegramMessage: (text) => [{ text }],
+    replyTransport: buildTelegramReplyTransport({
+      sendMessage: async (body) => {
+        sentBodies.push(body);
+        return { message_id: 1 };
+      },
+      editMessage: async () => {},
+    }),
+    sendRichMessage: async () => ({ message_id: 77 }),
+  });
+  await runtime.sendTextReply(-1007, 9, "hello", {
+    target: createTelegramThreadTarget(-1007, 42),
+  });
+  assert.equal(sentBodies[0]?.message_thread_id, 42);
+  assert.deepEqual(sentBodies[0]?.reply_parameters, {
+    message_id: 9,
+    allow_sending_without_reply: true,
+  });
+  assert.equal("reply_to_message_id" in (sentBodies[0] ?? {}), false);
+});
+
+test("Native Markdown reply anchors only the first rich chunk in thread targets", async () => {
+  const sentBodies: Array<Record<string, unknown>> = [];
+  const ownership: Array<Record<string, unknown>> = [];
+  const first = "a".repeat(TELEGRAM_RICH_MESSAGE_MAX_CHARS - 10);
+  const second = "b".repeat(30);
+  const target = createTelegramThreadTarget(-1007, 42);
+  await sendTelegramNativeMarkdownReply(
+    -1007,
+    9,
+    `${first}\n\n${second}`,
+    {
+      recordOwnership: (input) => {
+        ownership.push(input);
+      },
+      sendRichMessage: async (body) => {
+        sentBodies.push(body);
+        return { message_id: sentBodies.length };
+      },
+    },
+    { target },
+  );
+  assert.equal(sentBodies.length, 2);
+  assert.equal(sentBodies[0]?.message_thread_id, 42);
+  assert.equal(sentBodies[1]?.message_thread_id, 42);
+  assert.deepEqual(sentBodies[0]?.reply_parameters, {
+    message_id: 9,
+    allow_sending_without_reply: true,
+  });
+  assert.equal("reply_parameters" in (sentBodies[1] ?? {}), false);
+  assert.deepEqual(ownership, [
+    { chatId: -1007, messageId: 1, target },
+    { chatId: -1007, messageId: 2, target },
+  ]);
 });
 
 test("Reply runtime can send markdown through native rich messages", async () => {
@@ -274,9 +405,14 @@ test("Reply runtime can send markdown through native rich messages", async () =>
       return { message_id: 77 };
     },
   });
-  assert.equal(await runtime.sendMarkdownReply(7, 43, "# hello", {
-    replyMarkup: { inline_keyboard: [[{ text: "ok", callback_data: "noop" }]] },
-  }), 77);
+  assert.equal(
+    await runtime.sendMarkdownReply(7, 43, "# hello", {
+      replyMarkup: {
+        inline_keyboard: [[{ text: "ok", callback_data: "noop" }]],
+      },
+    }),
+    77,
+  );
   assert.deepEqual(richBodies, [
     {
       chat_id: 7,
@@ -291,6 +427,55 @@ test("Reply runtime can send markdown through native rich messages", async () =>
     },
   ]);
   assert.deepEqual(sentBodies, []);
+});
+
+test("Reply runtime uses regular messages for anchored thread markdown replies", async () => {
+  const sentBodies: Array<Record<string, unknown>> = [];
+  const richBodies: Array<Record<string, unknown>> = [];
+  const target = createTelegramThreadTarget(-1007, 42);
+  const runtime = createTelegramRenderedMessageRuntime({
+    renderTelegramMessage: (text, options) => [
+      { text: `${options?.mode ?? "plain"}:${text}`, parseMode: "HTML" },
+    ],
+    replyTransport: buildTelegramReplyTransport({
+      sendMessage: async (body) => {
+        sentBodies.push(body);
+        return { message_id: sentBodies.length };
+      },
+      editMessage: async () => {},
+    }),
+    sendRichMessage: async (body) => {
+      richBodies.push(body);
+      return { message_id: 77 };
+    },
+  });
+
+  assert.equal(
+    await runtime.sendMarkdownReply(-1007, 43, "# hello", {
+      replyMarkup: {
+        inline_keyboard: [[{ text: "ok", callback_data: "noop" }]],
+      },
+      target,
+    }),
+    1,
+  );
+
+  assert.deepEqual(richBodies, []);
+  assert.deepEqual(sentBodies, [
+    {
+      chat_id: -1007,
+      text: "markdown:# hello",
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [[{ text: "ok", callback_data: "noop" }]],
+      },
+      reply_parameters: {
+        message_id: 43,
+        allow_sending_without_reply: true,
+      },
+      message_thread_id: 42,
+    },
+  ]);
 });
 
 test("Reply runtime does not fall back to HTML when native rich message delivery fails", async () => {
@@ -344,7 +529,9 @@ test("Guest replies answer with native Rich Markdown content", async () => {
   const calls: Array<{
     guestQueryId: string;
     text?: string;
-    options?: { richMessage?: { markdown?: string; skip_entity_detection?: boolean } };
+    options?: {
+      richMessage?: { markdown?: string; skip_entity_detection?: boolean };
+    };
   }> = [];
   const sendGuestReply = createGuestMarkdownReplySender({
     answerGuestQuery: async (guestQueryId, text, options) => {
@@ -357,7 +544,10 @@ test("Guest replies answer with native Rich Markdown content", async () => {
       guestQueryId: "guest-1",
       text: undefined,
       options: {
-        richMessage: { markdown: "**hello** /start", skip_entity_detection: true },
+        richMessage: {
+          markdown: "**hello** /start",
+          skip_entity_detection: true,
+        },
       },
     },
   ]);
@@ -431,12 +621,7 @@ test("Native Markdown delivery converts multiline display math to math fences", 
 });
 
 test("Native Markdown delivery ignores math delimiters inside fences when pairing", () => {
-  const markdown = [
-    "$$",
-    "```md",
-    "$$",
-    "```",
-  ].join("\n");
+  const markdown = ["$$", "```md", "$$", "```"].join("\n");
   assert.equal(normalizeTelegramNativeMarkdown(markdown), markdown);
 });
 
@@ -473,9 +658,13 @@ test("Native Markdown delivery sends normalized risky fixture without losing tai
       },
     },
   );
-  const markdown = (bodies[0]?.rich_message as { markdown?: string })?.markdown ?? "";
+  const markdown =
+    (bodies[0]?.rich_message as { markdown?: string })?.markdown ?? "";
   assert.match(markdown, /^\*\*HEAD\*\*/);
-  assert.match(markdown, /\u00A0\u00A0- alpha\/beta gamma-delta with `inline\.code`/);
+  assert.match(
+    markdown,
+    /\u00A0\u00A0- alpha\/beta gamma-delta with `inline\.code`/,
+  );
   assert.match(markdown, /END$/);
 });
 
@@ -508,11 +697,15 @@ test("Native Markdown splitter prefers paragraph boundaries", () => {
   const second = "b".repeat(30);
   const chunks = splitTelegramNativeMarkdown(`${first}\n\n${second}`);
   assert.deepEqual(chunks, [first, second]);
-  assert.ok(chunks.every((chunk) => chunk.length <= TELEGRAM_RICH_MESSAGE_MAX_CHARS));
+  assert.ok(
+    chunks.every((chunk) => chunk.length <= TELEGRAM_RICH_MESSAGE_MAX_CHARS),
+  );
 });
 
 test("Native Markdown splitter falls back to hard limits for long atoms", () => {
-  const chunks = splitTelegramNativeMarkdown("x".repeat(TELEGRAM_RICH_MESSAGE_MAX_CHARS + 5));
+  const chunks = splitTelegramNativeMarkdown(
+    "x".repeat(TELEGRAM_RICH_MESSAGE_MAX_CHARS + 5),
+  );
   assert.equal(chunks.length, 2);
   assert.equal(chunks[0]?.length, TELEGRAM_RICH_MESSAGE_MAX_CHARS);
   assert.equal(chunks[1], "xxxxx");
@@ -521,7 +714,9 @@ test("Native Markdown splitter falls back to hard limits for long atoms", () => 
 test("Native Markdown splitter keeps fenced code blocks together when possible", () => {
   const codeBlock = `\`\`\`ts\n${"x\n\n".repeat(100)}\`\`\``;
   const prefix = "a".repeat(TELEGRAM_RICH_MESSAGE_MAX_CHARS - codeBlock.length);
-  const chunks = splitTelegramNativeMarkdown(`${prefix}\n\n${codeBlock}\n\ntail`);
+  const chunks = splitTelegramNativeMarkdown(
+    `${prefix}\n\n${codeBlock}\n\ntail`,
+  );
   assert.equal(chunks.length, 2);
   assert.equal(chunks[1], `${codeBlock}\n\ntail`);
 });
@@ -531,7 +726,9 @@ test("Native Markdown splitter rewraps oversized fenced code blocks", () => {
     `\`\`\`ts\n${"x".repeat(TELEGRAM_RICH_MESSAGE_MAX_CHARS + 500)}\n\`\`\``,
   );
   assert.ok(chunks.length > 1);
-  assert.ok(chunks.every((chunk) => chunk.length <= TELEGRAM_RICH_MESSAGE_MAX_CHARS));
+  assert.ok(
+    chunks.every((chunk) => chunk.length <= TELEGRAM_RICH_MESSAGE_MAX_CHARS),
+  );
   assert.ok(chunks.every((chunk) => chunk.startsWith("```ts\n")));
   assert.ok(chunks.every((chunk) => chunk.endsWith("\n```")));
   const contentLength = chunks
@@ -545,7 +742,9 @@ test("Native Markdown splitter rewraps oversized display math blocks", () => {
     `$$\n${"x".repeat(TELEGRAM_RICH_MESSAGE_MAX_CHARS + 500)}\n$$`,
   );
   assert.ok(chunks.length > 1);
-  assert.ok(chunks.every((chunk) => chunk.length <= TELEGRAM_RICH_MESSAGE_MAX_CHARS));
+  assert.ok(
+    chunks.every((chunk) => chunk.length <= TELEGRAM_RICH_MESSAGE_MAX_CHARS),
+  );
   assert.ok(chunks.every((chunk) => chunk.startsWith("```math\n")));
   assert.ok(chunks.every((chunk) => chunk.endsWith("\n```")));
 });
@@ -555,11 +754,15 @@ test("Native Markdown splitter rewraps oversized inline formatting blocks", () =
     `**${"x".repeat(TELEGRAM_RICH_MESSAGE_MAX_CHARS + 500)}**`,
   );
   assert.ok(chunks.length > 1);
-  assert.ok(chunks.every((chunk) => chunk.length <= TELEGRAM_RICH_MESSAGE_MAX_CHARS));
+  assert.ok(
+    chunks.every((chunk) => chunk.length <= TELEGRAM_RICH_MESSAGE_MAX_CHARS),
+  );
   assert.ok(chunks.every((chunk) => chunk.startsWith("**")));
   assert.ok(chunks.every((chunk) => chunk.endsWith("**")));
   assert.equal(
-    chunks.map((chunk) => chunk.slice(2, -2).length).reduce((sum, length) => sum + length, 0),
+    chunks
+      .map((chunk) => chunk.slice(2, -2).length)
+      .reduce((sum, length) => sum + length, 0),
     TELEGRAM_RICH_MESSAGE_MAX_CHARS + 500,
   );
 });
@@ -575,7 +778,7 @@ test("Native Markdown splitter respects the rich-message block limit for lists",
   assert.equal(chunks[1]?.split("\n").length, 5);
 });
 
- test("Native Markdown delivery attaches reply metadata first and markup last", async () => {
+test("Native Markdown delivery attaches reply metadata first and markup last", async () => {
   const bodies: Array<Record<string, unknown>> = [];
   const markdown = `${"a".repeat(TELEGRAM_RICH_MESSAGE_MAX_CHARS - 10)}\n\n${"b".repeat(30)}`;
   const lastId = await sendTelegramNativeMarkdownReply(
@@ -588,7 +791,11 @@ test("Native Markdown splitter respects the rich-message block limit for lists",
         return { message_id: bodies.length };
       },
     },
-    { replyMarkup: { inline_keyboard: [[{ text: "ok", callback_data: "noop" }]] } },
+    {
+      replyMarkup: {
+        inline_keyboard: [[{ text: "ok", callback_data: "noop" }]],
+      },
+    },
   );
   assert.equal(lastId, 2);
   assert.equal(bodies.length, 2);
@@ -602,8 +809,14 @@ test("Native Markdown splitter respects the rich-message block limit for lists",
   assert.deepEqual(bodies[1]?.reply_markup, {
     inline_keyboard: [[{ text: "ok", callback_data: "noop" }]],
   });
-  assert.deepEqual((bodies[0]?.rich_message as { markdown?: string })?.markdown, "a".repeat(TELEGRAM_RICH_MESSAGE_MAX_CHARS - 10));
-  assert.deepEqual((bodies[1]?.rich_message as { markdown?: string })?.markdown, "b".repeat(30));
+  assert.deepEqual(
+    (bodies[0]?.rich_message as { markdown?: string })?.markdown,
+    "a".repeat(TELEGRAM_RICH_MESSAGE_MAX_CHARS - 10),
+  );
+  assert.deepEqual(
+    (bodies[1]?.rich_message as { markdown?: string })?.markdown,
+    "b".repeat(30),
+  );
 });
 
 test("Reply runtime sends plain replies using the requested parse mode", async () => {
@@ -625,7 +838,8 @@ test("Reply runtime sends plain replies using the requested parse mode", async (
   assert.deepEqual(sent, ["html"]);
 });
 
-test("Transport reply dedup scopes repeated prompt message ids by chat", () => {
+test("Transport reply dedup scopes repeated prompt message ids by chat and thread", () => {
+  assert.equal(buildTelegramReplyParameters(1, 0), undefined);
   assert.deepEqual(buildTelegramReplyParameters(1, 42), {
     message_id: 42,
     allow_sending_without_reply: true,
@@ -635,6 +849,24 @@ test("Transport reply dedup scopes repeated prompt message ids by chat", () => {
     message_id: 42,
     allow_sending_without_reply: true,
   });
+  assert.deepEqual(
+    buildTelegramReplyParameters(1, 42, { chatId: 1, threadId: 10 }),
+    {
+      message_id: 42,
+      allow_sending_without_reply: true,
+    },
+  );
+  assert.equal(
+    buildTelegramReplyParameters(1, 42, { chatId: 1, threadId: 10 }),
+    undefined,
+  );
+  assert.deepEqual(
+    buildTelegramReplyParameters(1, 42, { chatId: 1, threadId: 11 }),
+    {
+      message_id: 42,
+      allow_sending_without_reply: true,
+    },
+  );
   resetTransportReplyDedup();
   assert.deepEqual(buildTelegramReplyParameters(1, 42), {
     message_id: 42,

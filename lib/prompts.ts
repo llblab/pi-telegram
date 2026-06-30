@@ -4,41 +4,85 @@
  * Owns Telegram-specific system prompt suffixes injected into pi agent turns
  */
 
-import type { BeforeAgentStartEvent } from "./pi.ts";
+import { Type } from "@sinclair/typebox";
+
+import type { BeforeAgentStartEvent, ExtensionAPI } from "./pi.ts";
 import { TELEGRAM_PREFIX } from "./turns.ts";
 
 const LOCAL_SYSTEM_PROMPT_SUFFIX = `
 
-Telegram bridge extension is available.
-
-Local/TUI Telegram delivery:
-- Answer ordinary local prompts normally; do not add Telegram action comments unless the user explicitly asks for Telegram delivery.
-- For explicit Telegram file delivery, call \`telegram_attach(local_path)\`. For explicit Telegram text delivery, call \`telegram_message(...)\`.
-- Direct local/TUI Telegram delivery requires this π instance to own \`/telegram-connect\`; if ownership is elsewhere, connect/take over first instead of bypassing the lock.
-`;
+Telegram bridge available. Do not use it from local/TUI prompts unless explicitly asked.`;
 
 const TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX = `
 
-Telegram-originated turn context:
-- \`[telegram]\` marks Telegram-originated messages. Suffixes \`|from:user\` (sender) and \`|guest:group\` (guest mode — message from another chat where the bot is not a member) may be present; the bot sees the message as if forwarded from that user/chat.
-- \`[reply]\` is quoted context from the replied-to message, not a new instruction by itself. Suffix \`|from:user\` identifies the original author in guest-mode replies. Use it to resolve references like "this", "it", or "that message"; the actual instruction is before [reply] unless it explicitly asks to act on the quote.
-- \`[attachments]\` gives a base directory plus relative local files; resolve and read them as needed. \`[outputs]\` contains inbound-handler stdout such as transcriptions or extracted text for those attachments.
-- \`[time]\` gives the wall-clock time for this Telegram turn when the operator enabled time injection. Use it for relative-date requests like "today", "now", or scheduling; otherwise do not mention it.
-- \`[voice]\` describes Telegram voice reply policy for this turn. \`manual\` means answer normally and use explicit \`telegram_voice\` markup only when a spoken reply is useful; \`mirror\` means voice input prefers a voice reply; \`always\` means the final reply is expected to be converted to voice, so keep it TTS-friendly.
-- Unknown \`[callback] ...\` messages may be intended for another extension; if you see one, say the callback was not handled and the environment may be misconfigured.
+Telegram turn note: If context was compacted or you need the pi-telegram bridge contract, call tool \`telegram_help\`.`;
 
-Telegram-visible output:
-- Telegram is mobile-first: keep answers easy to scan, use headings/lists when useful, and avoid unnecessarily huge blocks of text.
-- For formulas, use math delimiters like \`$E = mc^2$\` for inline formulas and \`$$\\nE = mc^2\\n$$\` for block formulas; do not wrap formulas in backticks unless they should render as literal code.
-- Use inline code for short copyable literals (commands, paths, IDs, symbols); avoid wide monospace blocks unless structure or literal code requires them.
-- For requested/generated files, call \`telegram_attach(local_path)\`; during Telegram turns it attaches files to the active reply, and during explicit local/TUI Telegram-delivery requests it sends files directly to the paired/default chat or an explicit \`chat_id\`. If a local/TUI user explicitly asks to send a text message to Telegram, use \`telegram_message\` with Markdown text; embed the same top-level \`telegram_button\` comments when inline prompt buttons are needed, because Telegram buttons must belong to a message. Direct local/TUI Telegram delivery requires this π instance to own \`/telegram-connect\`; if ownership is elsewhere, connect/take over first instead of bypassing the lock.
+const TELEGRAM_HELP_TEXT = `--- TELEGRAM BRIDGE HELP ---
 
-Native outbound actions:
-- Use normal Rich Markdown for visible text. Use top-level column-zero hidden Markdown comments outside code, quotes, and lists only for native actions; the bridge strips them after agent_end and turns them into Telegram-native artifacts/reply_markup. Do not render button JSON, do not invent standalone button tools, and do not call/register transport/TTS/text-to-OGG tools for ordinary Telegram-turn voice/buttons.
-- \`telegram_voice\`: text is synthesized by the registered voice synthesis provider and delivered by pi-telegram. Use body text for multiline voice, \`<!-- telegram_voice text="Short summary" -->\` for explicit one-line text, or \`<!-- telegram_voice: Short summary -->\` for one-line text with no attributes. A companion summary is optional, no specific summary format is required. Keep it TTS-friendly; avoid raw Markdown, code, formulas, tables, or long lists.
-- \`telegram_button\`: callback prompt is routed back as a normal Telegram turn. Use \`<!-- telegram_button: OK -->\` when prompt equals label, \`<!-- telegram_button label=Continue prompt="Continue with the current plan." -->\` for one-line prompts, or body form \`<!-- telegram_button label="Show risks"\nList the main risks first.\n-->\` for multiline prompts. Do not put button comments inline after visible text, inside code fences, block quotes, lists, or indented examples; those are literal Markdown, not buttons.
-- If only hidden action comments would remain, add visible parent text like "Choose one:" so Telegram has a message to attach buttons to.
-`;
+How to understand Telegram turns:
+- \`[telegram|thread:name|from:user|guest:group]\` marks Telegram origin and attributes.
+- \`thread\` is the visible Thread identity in Threaded Mode; it is not a bus role.
+- \`[reply]\` is quoted context only; act on the user's current instruction.
+- \`[attachments]\` are local files; \`[outputs]\` are handler results/transcripts; \`[time]\` is wall-clock context; \`[voice]\` gives reply-mode policy.
+
+How to answer Telegram turns:
+- Reply in concise, scannable mobile Telegram Rich Markdown.
+- Use \`$...$\` for inline math and \`$$...$$\` for block math.
+- Real code blocks must stay literal.
+- For generated/requested files, call \`telegram_attach(local_path)\`; do not only mention the path.
+
+Assistant-authored Telegram actions:
+- \`telegram_voice\` and \`telegram_button\` are hidden top-level HTML comments, not Pi tools.
+- Put action comments at column zero, outside code, quotes, lists, and indented examples.
+- Voice forms: \`<!-- telegram_voice text="Short summary" -->\` or \`<!-- telegram_voice: Short summary -->\`.
+- Keep voice text TTS-friendly; avoid raw Markdown, code, and tables in voice text.
+- Voice delivery generates and attaches OGG automatically; do not also call \`telegram_attach\` for the same audio.
+- Button forms: \`<!-- telegram_button: OK -->\`, \`<!-- telegram_button label=Continue prompt="Continue with the current plan." -->\`, or multiline \`<!-- telegram_button label="Show risks"\nList the main risks first.\n-->\`.
+- If hidden comments would be the whole reply, add visible text such as \`Choose one:\`.
+
+Local/TUI direct delivery:
+- Do not send Telegram actions from local/TUI prompts unless explicitly asked.
+- Use \`telegram_attach\` for files and \`telegram_message\` for direct Markdown text.
+- Direct delivery requires this Pi instance to own \`/telegram-connect\` or be registered with the Threaded Mode bus.
+- For explicit targets, pass \`chat_id\` plus optional \`thread_id\`; registered followers default to their assigned Thread target.
+- Do not use \`telegram_message\` for ordinary Telegram-originated replies; answer normally and let the bridge deliver the active turn reply.
+
+Threaded Mode:
+- pi-telegram supports private-chat Threaded Mode when BotFather Topics/Threaded Mode are enabled.
+- Product/user language is Thread; Bot API primitive names may still say topic.
+- Threaded Mode has one leader transport and visible follower Pi processes joined manually through \`/telegram-connect\`.
+- Thread names are bridge-assigned or preserved identities; do not invent rename prompts or use a rename tool.
+- The \`All\` surface is for routing/control, not hidden Pi process creation.
+
+Configurable handlers:
+- \`telegram.json\` can add no-code \`inboundHandlers\`/\`outboundHandlers\` using command templates before writing an extension.
+- For speech-to-text, configure an \`inboundHandlers\` entry matching \`type: "voice"\` or \`mime: "audio/*"\`; stdout becomes \`[outputs]\` prompt context.
+- If command-template config is not enough, build a companion extension through the public pi-telegram APIs; do not import package-private \`lib/*\` paths.
+
+Debugging pi-telegram:
+- Inspect \`~/.pi/agent/tmp/telegram/state.json\` for runtime state, roster, bindings, slots, reservations, and diagnostics.
+- Inspect \`~/.pi/agent/tmp/telegram/logs.jsonl\` for redacted runtime event evidence.
+- Use terminal \`telegram-status\` for compact human health; use \`telegram-status --debug\` for the full human-readable diagnostic dump.`;
+
+export function getTelegramHelpText(): string {
+  return TELEGRAM_HELP_TEXT;
+}
+
+export function registerTelegramHelpTool(pi: ExtensionAPI): void {
+  pi.registerTool({
+    name: "telegram_help",
+    label: "Telegram Help",
+    description:
+      "Read pi-telegram usage guidance for delivery actions, Threaded Mode, handlers, formatting, and debugging.",
+    parameters: Type.Object({}),
+    async execute() {
+      return {
+        content: [{ type: "text", text: getTelegramHelpText() }],
+        details: {},
+      };
+    },
+  });
+}
 
 export function buildTelegramBridgeSystemPrompt(options: {
   prompt: string;
@@ -48,7 +92,13 @@ export function buildTelegramBridgeSystemPrompt(options: {
   telegramTurnSystemPromptSuffix: string;
 }): { systemPrompt: string } {
   const telegramPrefix = options.telegramPrefix ?? TELEGRAM_PREFIX;
-  const telegramTurn = options.prompt.trimStart().startsWith(telegramPrefix);
+  const telegramHead = telegramPrefix.endsWith("]")
+    ? telegramPrefix.slice(0, -1)
+    : telegramPrefix;
+  const trimmedPrompt = options.prompt.trimStart();
+  const telegramTurn =
+    trimmedPrompt.startsWith(`${telegramHead}]`) ||
+    trimmedPrompt.startsWith(`${telegramHead}|`);
   const telegramSuffix = telegramTurn
     ? `${options.telegramTurnSystemPromptSuffix}\n- The current user message came from Telegram.`
     : "";
@@ -92,7 +142,7 @@ export function createTelegramProactiveBeforeAgentStartHook<TContext>(
   ctx: TContext,
 ) => Promise<{ systemPrompt: string }> {
   const baseHook = deps.baseHook ?? createTelegramBeforeAgentStartHook();
-  return async function onBeforeAgentStart(event, ctx) {
+  return async (event, ctx) => {
     if (!deps.isConfigured()) return { systemPrompt: event.systemPrompt };
     const result = baseHook(event);
     if (!deps.isProactivePushEnabled()) return result;

@@ -33,6 +33,29 @@ export type {
   SlashCommandInfo,
 };
 
+export interface ToolExecutionStartEvent {
+  type: "tool_execution_start";
+  toolCallId: string;
+  toolName: string;
+  args: unknown;
+}
+
+export interface ToolExecutionUpdateEvent {
+  type: "tool_execution_update";
+  toolCallId: string;
+  toolName: string;
+  args: unknown;
+  partialResult: unknown;
+}
+
+export interface ToolExecutionEndEvent {
+  type: "tool_execution_end";
+  toolCallId: string;
+  toolName: string;
+  result: unknown;
+  isError: boolean;
+}
+
 export interface PiSettingsManager {
   reload: () => Promise<void>;
   flush: () => Promise<void>;
@@ -72,8 +95,8 @@ export function canStartPollingInExtensionContext(ctx: unknown): boolean {
 export function formatPollingStartBlockedByRunMode(ctx: unknown): string {
   const mode = getExtensionContextMode(ctx);
   return mode
-    ? `Telegram polling is unavailable in π ${mode} mode. Use /telegram-connect from a long-lived π session.`
-    : "Telegram polling is unavailable in this π run mode.";
+    ? `Telegram polling is unavailable in Pi ${mode} mode. Use /telegram-connect from a long-lived Pi session.`
+    : "Telegram polling is unavailable in this Pi run mode.";
 }
 
 export type PiSendUserMessageOptions = NonNullable<
@@ -118,7 +141,7 @@ export function createScopedModelPatternPersister(deps: {
   createSettingsManager: (cwd: string) => PiSettingsManager;
   clearCachedModelMenuInputs: () => void;
 }): (patterns: string[], ctx: ExtensionContext) => Promise<void> {
-  return async function persistScopedModelPatterns(patterns, ctx) {
+  return async (patterns, ctx) => {
     const settingsManager = deps.createSettingsManager(ctx.cwd);
     settingsManager.setEnabledModels(
       patterns.length > 0 ? patterns : undefined,

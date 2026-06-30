@@ -1,6 +1,6 @@
 /**
  * Regression tests for Telegram prompt-template bridge helpers
- * Covers π prompt-template discovery filtering and command expansion
+ * Covers Pi prompt-template discovery filtering and command expansion
  */
 
 import assert from "node:assert/strict";

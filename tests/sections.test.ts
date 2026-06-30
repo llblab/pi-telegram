@@ -15,13 +15,7 @@ import {
   handleTelegramSectionSettingsOpen,
   type TelegramSectionRegistration,
   type TelegramSectionCallbackHandlerDeps,
-  type TelegramSectionView,
 } from "../lib/sections.ts";
-
-function noop(): void {}
-function noopAsync(): Promise<void> {
-  return Promise.resolve();
-}
 
 function stubSection(
   id: string,
@@ -186,7 +180,10 @@ test("getTelegramSectionMainMenuRows omits sections with failing labels", () => 
     }),
   );
   const rows = getTelegramSectionMainMenuRows(registry);
-  assert.deepEqual(rows.map((row) => row.text), ["A"]);
+  assert.deepEqual(
+    rows.map((row) => row.text),
+    ["A"],
+  );
   const diagnostics = registry.getDiagnostics();
   assert.equal(diagnostics[1].status, "error");
   assert.equal(diagnostics[1].lastError, "label failed");
@@ -211,7 +208,10 @@ test("getTelegramExtensionSettingsRows omits settings with failing labels", () =
     }),
   );
   const rows = getTelegramExtensionSettingsRows(registry);
-  assert.deepEqual(rows.map((row) => row.label), ["A"]);
+  assert.deepEqual(
+    rows.map((row) => row.label),
+    ["A"],
+  );
   const diagnostics = registry.getDiagnostics();
   assert.equal(diagnostics[1].status, "error");
   assert.equal(diagnostics[1].lastError, "settings label failed");

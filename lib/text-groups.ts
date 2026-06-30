@@ -12,6 +12,7 @@ export interface TelegramTextGroupMessage {
   message_id: number;
   media_group_id?: string;
   chat: { id: number };
+  message_thread_id?: number;
   from?: { id: number; is_bot?: boolean };
   text?: string;
   caption?: string;
@@ -70,7 +71,10 @@ function getTelegramTextGroupKey(
   if (message.media_group_id) return undefined;
   if (!message.from || message.from.is_bot) return undefined;
   if (typeof message.text !== "string") return undefined;
-  return `${message.chat.id}:${message.from.id}`;
+  const threadKey = typeof message.message_thread_id === "number"
+    ? `thread:${message.message_thread_id}`
+    : "private";
+  return `${message.chat.id}:${threadKey}:${message.from.id}`;
 }
 
 function canStartTelegramTextGroup(

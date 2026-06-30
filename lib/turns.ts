@@ -44,12 +44,46 @@ export {
 
 export const TELEGRAM_PREFIX = "[telegram]";
 
+export interface TelegramTurnTarget {
+  chatId: number;
+  threadId?: number;
+}
+
 export interface TelegramTurnMessage {
   message_id: number;
-  chat: { id: number };
+  message_thread_id?: number;
+  chat: { id: number; type?: string };
 }
 
 export type DownloadedTelegramTurnFile = DownloadedTelegramMessageFile;
+
+function getTelegramTurnTarget(message: TelegramTurnMessage): TelegramTurnTarget {
+  return Number.isInteger(message.message_thread_id)
+    ? { chatId: message.chat.id, threadId: message.message_thread_id }
+    : { chatId: message.chat.id };
+}
+
+function formatTelegramPrefixAttributeValue(value: string): string {
+  return value.replace(/[\]\n\r|]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+export function createTelegramTurnPrefix(
+  attributes: Record<string, string | undefined> = {},
+): string {
+  const parts = [TELEGRAM_PREFIX.slice(1, -1)];
+  for (const [key, value] of Object.entries(attributes)) {
+    const normalized = value ? formatTelegramPrefixAttributeValue(value) : "";
+    if (normalized) parts.push(`${key}:${normalized}`);
+  }
+  return `[${parts.join("|")}]`;
+}
+
+export function formatTelegramTurnPrefix(
+  _message: TelegramTurnMessage,
+  basePrefix = TELEGRAM_PREFIX,
+): string {
+  return basePrefix;
+}
 
 import { truncateTelegramQueueSummary } from "./queue.ts";
 export { truncateTelegramQueueSummary };
@@ -363,6 +397,8 @@ export interface TelegramPromptTurnRuntimeBuilderDeps<
   resolveTimeLine?: (chatId: number) => string | null;
   getVoiceReplyMode?: () => TelegramVoiceReplyMode;
   isVoiceReplyModeConfigured?: () => boolean;
+  /** Returns the visible thread label for a message target, used to add thread context to the prompt prefix. */
+  getTelegramThreadLabel?: (message: { chat: { id: number }; message_thread_id?: number }) => string | undefined;
 }
 
 export function createTelegramPromptTurnRuntimeBuilder<
@@ -397,8 +433,13 @@ export function createTelegramPromptTurnRuntimeBuilder<
       deps.resolveTimeLine && chatId !== undefined
         ? deps.resolveTimeLine(chatId)
         : null;
+    const firstMessage = messages[0];
+    const threadLabel = firstMessage
+      ? deps.getTelegramThreadLabel?.(firstMessage)
+      : undefined;
+    const telegramPrefix = createTelegramTurnPrefix({ thread: threadLabel });
     return buildTelegramPromptTurnRuntime({
-      telegramPrefix: TELEGRAM_PREFIX,
+      telegramPrefix,
       messages,
       historyTurns,
       queueOrder: deps.allocateQueueOrder(),
@@ -446,7 +487,10 @@ export async function buildTelegramPromptTurn(
     {
       type: "text",
       text: buildTelegramTurnPrompt({
-        telegramPrefix: options.telegramPrefix,
+        telegramPrefix: formatTelegramTurnPrefix(
+          firstMessage,
+          options.telegramPrefix,
+        ),
         rawText: options.rawText,
         files: options.files,
         promptFiles: options.promptFiles,
@@ -482,6 +526,7 @@ export async function buildTelegramPromptTurn(
   return {
     kind: "prompt",
     chatId: firstMessage.chat.id,
+    target: getTelegramTurnTarget(firstMessage),
     replyToMessageId: firstMessage.message_id,
     sourceMessageIds: collectTelegramMessageIds(options.messages),
     queueOrder: options.queueOrder,

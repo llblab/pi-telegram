@@ -50,7 +50,9 @@ function runNodeScript(
     const timeout = setTimeout(() => {
       child.kill("SIGKILL");
       reject(
-        new Error(`Child process did not exit. stdout=${stdout} stderr=${stderr}`),
+        new Error(
+          `Child process did not exit. stdout=${stdout} stderr=${stderr}`,
+        ),
       );
     }, options.timeoutMs ?? 2000);
     timeout.unref?.();
@@ -107,7 +109,9 @@ function runPiPrint(
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new Error(`pi -p did not exit. stdout=${stdout} stderr=${stderr}`));
+      reject(
+        new Error(`pi -p did not exit. stdout=${stdout} stderr=${stderr}`),
+      );
     }, options.timeoutMs ?? 10_000);
     timeout.unref?.();
     child.on("error", (error) => {
@@ -326,7 +330,9 @@ test("Child process sharing the agent dir does not poll while parent owns Telegr
     parent.on("exit", (code) => resolve({ code }));
   });
   try {
-    await waitForFileText(markerPath, (text) => text.includes("parent:getUpdates"));
+    await waitForFileText(markerPath, (text) =>
+      text.includes("parent:getUpdates"),
+    );
     const childScript = `
       import { appendFileSync } from "node:fs";
       const markerPath = process.env.PI_TELEGRAM_TEST_METHOD_MARKER;
@@ -384,7 +390,9 @@ test("Child process sharing the agent dir does not poll while parent owns Telegr
       });
       const { code } = await Promise.race([parentExit, timeout]);
       if (code !== 0)
-        parentError = new Error(`Parent exited with ${code}. stderr=${parentStderr}`);
+        parentError = new Error(
+          `Parent exited with ${code}. stderr=${parentStderr}`,
+        );
     } catch (error) {
       parentError = error;
     }
@@ -473,11 +481,11 @@ test("Direct Telegram tools refuse delivery from a non-owner process", async () 
     assert.equal(result.code, 0, result.stderr);
     assert.match(
       result.stdout,
-      /telegram_message:Telegram direct delivery requires this π instance to own \/telegram-connect/,
+      /telegram_message:Telegram direct delivery requires this Pi instance to own \/telegram-connect/,
     );
     assert.match(
       result.stdout,
-      /telegram_attach:Telegram direct delivery requires this π instance to own \/telegram-connect/,
+      /telegram_attach:Telegram direct delivery requires this Pi instance to own \/telegram-connect/,
     );
     await assert.rejects(() => readFile(markerPath, "utf8"), {
       code: "ENOENT",

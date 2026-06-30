@@ -15,6 +15,7 @@ import {
   createTelegramPollingControllerState,
   createTelegramPollLoopRunner,
   getLatestTelegramUpdateId,
+  isTelegramGetUpdatesConflictError,
   isTelegramPollingControllerActive,
   runTelegramPollLoop,
   shouldStartTelegramPolling,
@@ -575,6 +576,56 @@ test("Poll loop stops without status reset when aborted during retry sleep", asy
   });
   assert.equal(calls, 1);
   assert.deepEqual(statusMessages, ["error:network down"]);
+});
+
+test("Poll loop suppresses getUpdates conflicts while another long poll drains", async () => {
+  const config = { botToken: "123:abc", lastUpdateId: 1 };
+  const statusMessages: string[] = [];
+  const runtimeEvents: string[] = [];
+  let calls = 0;
+  await runTelegramPollLoop({
+    ctx: TEST_CONTEXT,
+    signal: new AbortController().signal,
+    config,
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      calls += 1;
+      if (calls <= 4) {
+        throw new Error(
+          "Telegram API getUpdates failed: HTTP 409: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running",
+        );
+      }
+      throw new DOMException("stop", "AbortError");
+    },
+    persistConfig: async () => {},
+    handleUpdate: async () => {},
+    onErrorStatus: (message) => {
+      statusMessages.push(`error:${message}`);
+    },
+    onStatusReset: () => {
+      statusMessages.push("reset");
+    },
+    sleep: async (ms) => {
+      statusMessages.push(`sleep:${ms}`);
+    },
+    recordRuntimeEvent: (category, error, details) => {
+      const message = error instanceof Error ? error.message : String(error);
+      runtimeEvents.push(`${category}:${message}:${details?.phase}`);
+    },
+  });
+  assert.equal(
+    isTelegramGetUpdatesConflictError(
+      new Error("HTTP 409: Conflict: terminated by other getUpdates request"),
+    ),
+    true,
+  );
+  assert.deepEqual(statusMessages, [
+    "sleep:1000",
+    "sleep:1000",
+    "sleep:3000",
+    "sleep:3000",
+  ]);
+  assert.equal(runtimeEvents.length, 4);
 });
 
 test("Poll loop reports retryable errors and sleeps before retrying", async () => {

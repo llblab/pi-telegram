@@ -1,11 +1,11 @@
 {
   "name": "@llblab/pi-telegram",
-  "version": "0.17.5",
+  "version": "0.18.0",
   "private": false,
   "publishConfig": {
     "access": "public"
   },
-  "description": "Telegram runtime adapter for π",
+  "description": "Telegram runtime adapter for Pi",
   "keywords": [
     "pi-package",
     "pi",
@@ -70,5 +70,27 @@
   "devDependencies": {
     "@types/node": "latest",
     "typescript": "latest"
+  },
+  "overrides": {
+    "protobufjs": "7.6.4",
+    "undici": "8.5.0",
+    "ws": "8.21.0",
+    "@earendil-works/pi-coding-agent": {
+      "protobufjs": "7.6.4",
+      "undici": "8.5.0",
+      "ws": "8.21.0",
+      "@google/genai": {
+        "protobufjs": "7.6.4",
+        "ws": "8.21.0"
+      },
+      "@earendil-works/pi-ai": {
+        "protobufjs": "7.6.4",
+        "ws": "8.21.0",
+        "@google/genai": {
+          "protobufjs": "7.6.4",
+          "ws": "8.21.0"
+        }
+      }
+    }
   }
 }

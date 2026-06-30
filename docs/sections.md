@@ -8,7 +8,7 @@
 
 ## 1. Philosophy
 
-Telegram Extension Sections let ordinary pi extensions add structured UI surfaces to the `pi-telegram` inline application menu. The platform mirrors π's own extensibility model: small, composable extensions that plug into a shared shell without owning transport, polling, authorization, or menu lifecycle.
+Telegram Extension Sections let ordinary pi extensions add structured UI surfaces to the `pi-telegram` inline application menu. The platform mirrors Pi's own extensibility model: small, composable extensions that plug into a shared shell without owning transport, polling, authorization, or menu lifecycle.
 
 `pi-telegram` stays the single bot operator. Extensions register typed sections; the bridge handles Telegram UI rendering, callback routing, token mapping, navigation hierarchy, and diagnostics. Section views default to explicit Telegram HTML UI markup, while extensions can request Markdown or plain text when that better matches their content. No second polling loop, no new loader — just one `registerTelegramSection()` call.
 
@@ -380,7 +380,7 @@ This applies to section callbacks as well — the state check runs before dispat
 
 ## 11. Pi Extension API Inspiration
 
-The platform inherits from π's own extension model:
+The platform inherits from Pi's own extension model:
 
 - `export default function(pi)` → `registerTelegramSection(section)`
 - `pi.on("shutdown", ...)` → disposer from `registerTelegramSection`

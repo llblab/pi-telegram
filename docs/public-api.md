@@ -1,6 +1,6 @@
 # Public API
 
-`pi-telegram` is both a π extension and a small Telegram platform for companion extensions. This document defines the stable public surface. Everything outside this document is implementation detail unless another focused doc explicitly marks it stable.
+`pi-telegram` is both a Pi extension and a small Telegram platform for companion extensions. This document defines the stable public surface. Everything outside this document is implementation detail unless another focused doc explicitly marks it stable.
 
 ## Stability Levels
 
@@ -27,13 +27,13 @@ import {
 } from "@llblab/pi-telegram/voice";
 ```
 
-`0.12.0` intentionally removes the published `@llblab/pi-telegram/lib/*.ts` compatibility wildcard. Integrations should use the public API domain subpaths above. Package exports point at `/api/*.ts` membranes that re-export only stable companion-extension symbols; implementation modules under `lib/` remain package-private. Telegram command extensions use `/commands` as an explicit opt-in surface instead of automatically exposing arbitrary π slash commands to Telegram. See [Public API Smoke Examples](#public-api-smoke-examples) below for minimal companion-extension patterns that avoid implementation imports.
+`0.12.0` intentionally removes the published `@llblab/pi-telegram/lib/*.ts` compatibility wildcard. Integrations should use the public API domain subpaths above. Package exports point at `/api/*.ts` membranes that re-export only stable companion-extension symbols; implementation modules under `lib/` remain package-private. Telegram command extensions use `/commands` as an explicit opt-in surface instead of automatically exposing arbitrary Pi slash commands to Telegram. See [Public API Smoke Examples](#public-api-smoke-examples) below for minimal companion-extension patterns that avoid implementation imports.
 
 ## User-Facing API
 
-### π commands
+### Pi commands
 
-Stable commands inside π:
+Stable commands inside Pi:
 
 - `/telegram-setup` — configure/update the bot token.
 - `/telegram-connect` — start polling here and acquire external Telegram control ownership. Accepted queue/reply state stays local if ownership later moves elsewhere.
@@ -57,8 +57,9 @@ This command surface is a mobile companion subset, not a raw terminal-command br
 
 ### Tools and assistant-authored actions
 
-- `telegram_attach(paths, chat_id?, caption?)` is the stable artifact delivery tool for generated files. During Telegram turns it queues files for the active reply; outside Telegram turns it sends files directly to the paired/default chat or explicit `chat_id` when this π instance owns `/telegram-connect`.
-- `telegram_message(text, chat_id?)` sends a direct Telegram Markdown message from local/TUI-initiated work when this π instance owns `/telegram-connect`. Top-level `telegram_button` comments inside `text` are parsed with the same planner used for normal replies and attached to that message; buttons are never standalone Telegram messages.
+- `telegram_attach(paths, chat_id?, thread_id?, caption?)` is the stable artifact delivery tool for generated files. During Telegram turns it queues files for the active reply; outside Telegram turns it sends files directly to the paired/default chat, the registered follower's assigned thread, or an explicit `chat_id` plus optional `thread_id` when this Pi instance owns `/telegram-connect` or is registered with the multi-instance bus.
+- `telegram_message(text, chat_id?, thread_id?)` sends a direct Telegram Markdown message from local/TUI-initiated work when this Pi instance owns `/telegram-connect` or is registered with the multi-instance bus. Top-level `telegram_button` comments inside `text` are parsed with the same planner used for normal replies and attached to that message; buttons are never standalone Telegram messages.
+- `telegram_help()` returns detailed agent-facing guidance for pi-telegram delivery actions, Threaded Mode, formatting, and debugging. The regular prompt only points agents at this tool instead of repeating the full guidance on every turn.
 - `telegram_voice` hidden comments request Telegram-native voice delivery.
 - `telegram_button` hidden comments create inline buttons whose taps enqueue prompts. Use top-level column-zero comments outside code, quotes, lists, and indented examples; do not emit JSON button specs or standalone button actions.
 
@@ -97,6 +98,7 @@ interface TelegramConfig {
 Hidden/default semantics are represented by absence:
 
 - Voice Reply `hidden`: no `voice.replyMode` key is persisted.
+- Agent activity status is not configurable in this release. Telegram uses native `sendChatAction(typing)` / product `...active` status as the only automatic in-chat work signal before the final reply.
 - Time Injection `hidden`: no `time.injectionMode` key is persisted; if `time` becomes empty, the whole `time` object may be omitted.
 
 Assistant Markdown delivery is native: final replies are sent as `InputRichMessage.markdown` via `sendRichMessage`, and draft previews use `sendRichMessageDraft` when a structurally closed preview frame is available. Draft-frame failures are recorded and skipped rather than converted into raw plain preview messages, because partial Markdown can be temporarily invalid while the final answer remains valid. Long native replies are split at Telegram Rich Message transport limits, with oversized fenced code, display-math, and fully wrapped inline-formatting blocks rewrapped per chunk so persisted chunks remain structurally valid. Guest replies use `InputRichMessageContent` in `answerGuestQuery` results. Bridge-owned UI surfaces such as menus, status, queue controls, commands, and sections keep explicit Telegram HTML/plain rendering by default because those texts are authored by the bridge or companion extensions for Telegram UI. Companion extension sections may explicitly request `"markdown"`, `"html"`, or `"plain"` per view. There is no `telegram.json` rendering toggle for assistant delivery. The bridge sets `skip_entity_detection: true` for assistant and guest Markdown so technical text such as `/commands`, hashtags, URLs, phone numbers, and card-like numbers does not gain unintended automatic entities; explicit Markdown links still belong in the Markdown source.
@@ -130,7 +132,7 @@ Low-level stable buses:
   - Purpose: observe or consume raw Telegram updates before default routing.
 - `registerTelegramInboundHandler()`
   - Identity: no id.
-  - Purpose: generic Telegram-to-π transforms.
+  - Purpose: generic Telegram-to-Pi transforms.
 - `registerTelegramOutboundHandler()`
   - Identity: no id.
   - Purpose: generic final-reply transforms or voice command fallbacks.
@@ -145,7 +147,7 @@ All registration APIs return a disposer. Companion extensions should call dispos
 
 ## Commands
 
-Import from `@llblab/pi-telegram/commands`. This registers Telegram slash commands only; it does not expose π slash commands and is unrelated to command-template handlers.
+Import from `@llblab/pi-telegram/commands`. This registers Telegram slash commands only; it does not expose Pi slash commands and is unrelated to command-template handlers.
 
 ```ts
 const off = registerTelegramCommand({
@@ -166,7 +168,7 @@ Contract:
 - Duplicate extension command names are rejected. The disposer removes only its own command registration.
 - Routing precedence is built-in bridge commands first, registered extension commands second, and prompt-template aliases after that. This lets an extension intentionally claim a command name; prompt-template owners can resolve collisions by renaming the template alias.
 - `showInMenu` defaults to `false`. When `true`, `emoji` is required and the command appears in `/start` help with that marker; it also joins Bot API command sync only when `description` is provided, because Telegram command-list entries require descriptions. The emoji is prefixed to the Bot API description as well. Workflow/product commands should opt in deliberately instead of expanding the core command row by default.
-- The command context currently provides `name`, `args`, `reply(text)`, and `enqueuePrompt(prompt)`. Use `enqueuePrompt()` when a command should create normal queued π work rather than perform immediate Telegram-side handling.
+- The command context currently provides `name`, `args`, `reply(text)`, and `enqueuePrompt(prompt)`. Use `enqueuePrompt()` when a command should create normal queued Pi work rather than perform immediate Telegram-side handling.
 - Handler failures are isolated: the bridge records a `telegram-command` runtime diagnostic, sends a compact failure reply, and keeps Telegram polling/routing alive.
 
 Core commands stay reserved for bridge lifecycle, transport ownership, queue safety, and essential operator controls. Opinionated workflow commands should live in companion extensions through this registry.
@@ -466,7 +468,7 @@ async function synthesizeDemoOgg(_text: string): Promise<string> {
 
 Owned prefixes are reserved by `pi-telegram`: `compact:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `settings:`, and `section:`.
 
-Companion extensions should use their own short prefix for raw callbacks or use `ctx.callbackData()` inside sections. Unknown unowned callbacks may be forwarded to π as `[callback] <data>` after built-in handlers decline them.
+Companion extensions should use their own short prefix for raw callbacks or use `ctx.callbackData()` inside sections. Unknown unowned callbacks may be forwarded to Pi as `[callback] <data>` after built-in handlers decline them.
 
 Full behavior: [Callback Namespaces](./callback-namespaces.md).
 

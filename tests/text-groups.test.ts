@@ -174,6 +174,53 @@ test("Text group helper ignores commands, bots, media groups, and non-contiguous
   );
 });
 
+test("Text group helper scopes split recovery by thread target", () => {
+  const groups = new Map<
+    string,
+    TextGroups.TelegramTextGroupState<TestMessage, string>
+  >();
+  const timers: Array<() => void> = [];
+  const dispatched: string[] = [];
+  const queue = (message: TestMessage) =>
+    TextGroups.queueTelegramTextGroupMessage({
+      message,
+      context: "ctx",
+      groups,
+      debounceMs: 10,
+      minSplitLength: 8,
+      setTimer: (callback) => {
+        timers.push(callback);
+        return callback as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimer: () => {},
+      dispatchMessages: (messages, ctx) => {
+        dispatched.push(
+          `${ctx}:${messages.map((item) => item.text).join("|")}`,
+        );
+      },
+    });
+
+  assert.equal(
+    queue(createMessage(1, "long-enough", { message_thread_id: 10 })),
+    true,
+  );
+  assert.equal(
+    queue(createMessage(2, "other-thread", { message_thread_id: 11 })),
+    true,
+  );
+  assert.equal(
+    queue(createMessage(3, "tail", { message_thread_id: 10 })),
+    true,
+  );
+  assert.deepEqual(dispatched, []);
+  timers.at(-1)?.();
+  timers.at(-2)?.();
+  assert.deepEqual(dispatched.sort(), [
+    "ctx:long-enough|tail",
+    "ctx:other-thread",
+  ]);
+});
+
 test("Text group helper appends many split tails with wider id gaps", () => {
   const groups = new Map<
     string,

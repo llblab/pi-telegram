@@ -5,13 +5,6 @@
  */
 
 import {
-  handleTelegramSectionCallback,
-  handleTelegramSectionOpen,
-  handleTelegramSectionSettingsOpen,
-  parseTelegramSectionCallback,
-  type TelegramSectionRegistry,
-} from "./sections.ts";
-import {
   createTelegramModelMenuStateBuilder,
   handleTelegramModelMenuCallbackAction,
   openTelegramModelMenu,
@@ -39,6 +32,13 @@ import {
   type ScopedTelegramModel,
   type ThinkingLevel,
 } from "./model.ts";
+import {
+  handleTelegramSectionCallback,
+  handleTelegramSectionOpen,
+  handleTelegramSectionSettingsOpen,
+  parseTelegramSectionCallback,
+  type TelegramSectionRegistry,
+} from "./sections.ts";
 
 export {
   applyTelegramModelPageSelection,
@@ -150,7 +150,11 @@ export interface TelegramMenuCallbackEntryDeps {
 export interface MenuCallbackQuery {
   id: string;
   data?: string;
-  message?: { message_id?: number };
+  message?: {
+    message_id?: number;
+    message_thread_id?: number;
+    chat?: { id?: number };
+  };
 }
 
 export interface StoredTelegramMenuCallbackDeps<
@@ -158,6 +162,7 @@ export interface StoredTelegramMenuCallbackDeps<
 > {
   getStoredModelMenuState: (
     messageId: number | undefined,
+    chatId?: number,
   ) => TelegramModelMenuState<TModel> | undefined;
   handleStatusAction: (
     state: TelegramModelMenuState<TModel>,
@@ -180,6 +185,7 @@ export interface TelegramMenuCallbackRuntimeDeps<
 > {
   getStoredModelMenuState: (
     messageId: number | undefined,
+    chatId?: number,
   ) => TelegramModelMenuState<TModel> | undefined;
   getActiveModel: (ctx: TContext) => TModel | undefined;
   getThinkingLevel: () => ThinkingLevel;
@@ -236,8 +242,13 @@ export interface TelegramMenuCallbackRuntimeDeps<
     text: string,
     mode: "markdown" | "html" | "plain",
     replyMarkup: TelegramReplyMarkup,
+    options?: { target?: { chatId: number; threadId?: number } },
   ) => Promise<number | undefined>;
-  enqueueSectionPrompt?: (prompt: string, ctx: TContext) => Promise<void>;
+  enqueueSectionPrompt?: (
+    prompt: string,
+    ctx: TContext,
+    target?: { chatId: number; threadId?: number },
+  ) => Promise<void>;
   deleteMessage?: (chatId: number, messageId: number) => Promise<void>;
   isVoiceReplyActive?: () => boolean;
 }
@@ -249,6 +260,7 @@ export interface TelegramMenuActionRuntimeDeps<
   getModelMenuState: (
     chatId: number,
     ctx: TContext,
+    threadId?: number,
   ) => Promise<TelegramModelMenuState<TModel>>;
   getActiveModel: (ctx: TContext) => TModel | undefined;
   getThinkingLevel: () => ThinkingLevel;
@@ -261,6 +273,7 @@ export interface TelegramMenuActionRuntimeDeps<
     chatId: number,
     replyToMessageId: number,
     text: string,
+    options?: { target?: { chatId: number; threadId?: number } },
   ) => Promise<unknown>;
   sectionRegistry?: TelegramSectionRegistry;
   isVoiceReplyActive?: () => boolean;
@@ -286,11 +299,13 @@ export interface TelegramMenuActionRuntime<
     chatId: number,
     replyToMessageId: number,
     ctx: TContext,
+    threadId?: number,
   ) => Promise<void>;
   openModelMenu: (
     chatId: number,
     replyToMessageId: number,
     ctx: TContext,
+    threadId?: number,
   ) => Promise<void>;
   openThinkingMenu: (
     chatId: number,
@@ -392,7 +407,10 @@ export async function handleStoredTelegramMenuCallback<
   query: MenuCallbackQuery,
   deps: StoredTelegramMenuCallbackDeps<TModel>,
 ): Promise<void> {
-  const state = deps.getStoredModelMenuState(query.message?.message_id);
+  const state = deps.getStoredModelMenuState(
+    query.message?.message_id,
+    query.message?.chat?.id,
+  );
   await handleTelegramMenuCallbackEntry(query.id, query.data, state, {
     handleStatusAction: async () => {
       if (!state) return false;
@@ -416,6 +434,7 @@ export interface TelegramMenuCallbackRuntimeAdapterDeps<
 > {
   getStoredModelMenuState: (
     messageId: number | undefined,
+    chatId?: number,
   ) => TelegramModelMenuState<TModel> | undefined;
   getActiveModel: (ctx: TContext) => TModel | undefined;
   getThinkingLevel: () => ThinkingLevel;
@@ -472,8 +491,13 @@ export interface TelegramMenuCallbackRuntimeAdapterDeps<
     text: string,
     mode: "markdown" | "html" | "plain",
     replyMarkup: TelegramReplyMarkup,
+    options?: { target?: { chatId: number; threadId?: number } },
   ) => Promise<number | undefined>;
-  enqueueSectionPrompt?: (prompt: string, ctx: TContext) => Promise<void>;
+  enqueueSectionPrompt?: (
+    prompt: string,
+    ctx: TContext,
+    target?: { chatId: number; threadId?: number },
+  ) => Promise<void>;
   deleteMessage?: (chatId: number, messageId: number) => Promise<void>;
 }
 
@@ -532,7 +556,10 @@ export async function handleTelegramMenuCallbackRuntime<
   deps: TelegramMenuCallbackRuntimeDeps<TContext, TModel>,
 ): Promise<void> {
   if (query.data === "menu:back") {
-    const state = deps.getStoredModelMenuState(query.message?.message_id);
+    const state = deps.getStoredModelMenuState(
+      query.message?.message_id,
+      query.message?.chat?.id,
+    );
     if (!state) {
       await deps.answerCallbackQuery(query.id, "Interactive message expired.");
       return;
@@ -545,14 +572,19 @@ export async function handleTelegramMenuCallbackRuntime<
   if (deps.sectionRegistry && query.data?.startsWith("section:")) {
     const parsed = parseTelegramSectionCallback(query.data);
     if (parsed) {
-      const chatId = (query as { message?: { chat?: { id?: number } } }).message
-        ?.chat?.id;
-      const messageId = (query as { message?: { message_id?: number } }).message
-        ?.message_id;
+      const message = query.message;
+      const chatId = message?.chat?.id;
+      const messageId = message?.message_id;
+      const target =
+        typeof chatId === "number"
+          ? typeof message?.message_thread_id === "number"
+            ? { chatId, threadId: message.message_thread_id }
+            : { chatId }
+          : undefined;
       if (typeof chatId === "number" && typeof messageId === "number") {
         const { token, action, payload } = parsed;
         if (action === "open") {
-          const state = deps.getStoredModelMenuState(messageId);
+          const state = deps.getStoredModelMenuState(messageId, chatId);
           if (!state) {
             await deps.answerCallbackQuery(
               query.id,
@@ -568,12 +600,14 @@ export async function handleTelegramMenuCallbackRuntime<
             query.id,
             {
               answerCallbackQuery: deps.answerCallbackQuery,
+              target,
               editInteractiveMessage:
                 deps.editInteractiveMessage ?? (async () => {}),
               sendInteractiveMessage:
                 deps.sendInteractiveMessage ?? (async () => undefined),
               enqueuePrompt: deps.enqueueSectionPrompt
-                ? (prompt: string) => deps.enqueueSectionPrompt!(prompt, ctx)
+                ? (prompt: string) =>
+                    deps.enqueueSectionPrompt!(prompt, ctx, target)
                 : async () => {},
               deleteMessage: deps.deleteMessage ?? (async () => {}),
             },
@@ -589,12 +623,14 @@ export async function handleTelegramMenuCallbackRuntime<
               query.id,
               {
                 answerCallbackQuery: deps.answerCallbackQuery,
+                target,
                 editInteractiveMessage:
                   deps.editInteractiveMessage ?? (async () => {}),
                 sendInteractiveMessage:
                   deps.sendInteractiveMessage ?? (async () => undefined),
                 enqueuePrompt: deps.enqueueSectionPrompt
-                  ? (prompt: string) => deps.enqueueSectionPrompt!(prompt, ctx)
+                  ? (prompt: string) =>
+                      deps.enqueueSectionPrompt!(prompt, ctx, target)
                   : async () => {},
                 deleteMessage: deps.deleteMessage ?? (async () => {}),
               },
@@ -612,12 +648,14 @@ export async function handleTelegramMenuCallbackRuntime<
             query.id,
             {
               answerCallbackQuery: deps.answerCallbackQuery,
+              target,
               editInteractiveMessage:
                 deps.editInteractiveMessage ?? (async () => {}),
               sendInteractiveMessage:
                 deps.sendInteractiveMessage ?? (async () => undefined),
               enqueuePrompt: deps.enqueueSectionPrompt
-                ? (prompt: string) => deps.enqueueSectionPrompt!(prompt, ctx)
+                ? (prompt: string) =>
+                    deps.enqueueSectionPrompt!(prompt, ctx, target)
                 : async () => {},
               deleteMessage: deps.deleteMessage ?? (async () => {}),
             },
@@ -770,17 +808,18 @@ export function createTelegramMenuActionRuntime<
         deps.sectionRegistry,
         deps.isVoiceReplyActive?.(),
       ),
-    sendStatusMessage: (chatId, replyToMessageId, ctx) =>
+    sendStatusMessage: (chatId, replyToMessageId, ctx, threadId) =>
       openTelegramStatusMenu({
         isIdle: () => deps.isIdle(ctx),
         sendBusyMessage: async () => {
           await deps.sendTextReply(
             chatId,
             replyToMessageId,
-            "Cannot open status while π is busy. Send /abort, /next, or /stop.",
+            "Cannot open status while Pi is busy. Send /abort, /next, or /stop.",
+            { target: { chatId, threadId } },
           );
         },
-        getModelMenuState: () => deps.getModelMenuState(chatId, ctx),
+        getModelMenuState: () => deps.getModelMenuState(chatId, ctx, threadId),
         buildStatusHtml: () => deps.buildStatusHtml(ctx),
         getActiveModel: () => deps.getActiveModel(ctx),
         getThinkingLevel: deps.getThinkingLevel,
@@ -804,7 +843,7 @@ export function createTelegramMenuActionRuntime<
           ),
         storeModelMenuState: deps.storeModelMenuState,
       }),
-    openModelMenu: (chatId, replyToMessageId, ctx) =>
+    openModelMenu: (chatId, replyToMessageId, ctx, threadId) =>
       openTelegramModelMenu({
         isIdle: () => deps.isIdle(ctx),
         canOfferInFlightModelSwitch: () =>
@@ -813,7 +852,8 @@ export function createTelegramMenuActionRuntime<
           await deps.sendTextReply(
             chatId,
             replyToMessageId,
-            "Cannot switch model while π is busy. Send /abort, /next, or /stop.",
+            "Cannot switch model while Pi is busy. Send /abort, /next, or /stop.",
+            { target: { chatId, threadId } },
           );
         },
         sendNoModelsMessage: async () => {
@@ -821,9 +861,10 @@ export function createTelegramMenuActionRuntime<
             chatId,
             replyToMessageId,
             "No available models with configured auth.",
+            { target: { chatId, threadId } },
           );
         },
-        getModelMenuState: () => deps.getModelMenuState(chatId, ctx),
+        getModelMenuState: () => deps.getModelMenuState(chatId, ctx, threadId),
         getActiveModel: () => deps.getActiveModel(ctx),
         sendModelMenu: (state, activeModel) =>
           sendTelegramModelMenuMessage(state, activeModel, deps),

@@ -463,31 +463,6 @@ function matchMarkdownHeadingLine(line: string): RegExpMatchArray | null {
   return line.match(/^(\s*)#{1,6}\s+(.+)$/);
 }
 
-function endsWithMarkdownHeadingLine(markdown: string): boolean {
-  const lines = markdown.split("\n");
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index] ?? "";
-    if (line.trim().length === 0) continue;
-    return matchMarkdownHeadingLine(line) !== null;
-  }
-  return false;
-}
-
-function splitLeadingMarkdownBlankLines(markdown: string): {
-  blankLines: number;
-  remainingText: string;
-} {
-  const lines = markdown.split("\n");
-  let start = 0;
-  while (start < lines.length && (lines[start] ?? "").trim().length === 0) {
-    start += 1;
-  }
-  return {
-    blankLines: start,
-    remainingText: lines.slice(start).join("\n"),
-  };
-}
-
 // --- UI Markdown-to-Telegram-HTML Rendering ---
 
 function renderDelimitedInlineStyle(

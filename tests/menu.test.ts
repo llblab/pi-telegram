@@ -66,6 +66,7 @@ import {
 } from "../lib/menu.ts";
 import type { MenuModel } from "../lib/model.ts";
 import type { TelegramQueueItem } from "../lib/queue.ts";
+import { createTelegramExtensionSectionRegistry } from "../lib/sections.ts";
 
 function createMenuState<TModel extends MenuModel = MenuModel>(
   messageId: number,
@@ -120,9 +121,9 @@ test("Menu helpers store, refresh, prune, and bound model menu state", () => {
     maxStoredMenus: 2,
     now: 1030,
   });
-  assert.equal(menus.has(2), false);
-  assert.equal(menus.has(1), true);
-  assert.equal(menus.has(3), true);
+  assert.equal(menus.has("1:2"), false);
+  assert.equal(menus.has("1:1"), true);
+  assert.equal(menus.has("1:3"), true);
   assert.equal(
     getStoredTelegramModelMenuState(menus, 1, {
       maxAgeMs: 10,
@@ -130,6 +131,39 @@ test("Menu helpers store, refresh, prune, and bound model menu state", () => {
       now: 1050,
     }),
     undefined,
+  );
+});
+
+test("Menu helpers scope stored model menu state by chat and message", () => {
+  const menus = new Map();
+  storeTelegramModelMenuState(
+    menus,
+    { ...createMenuState(1), chatId: 10, note: "chat-10" },
+    { maxAgeMs: 100, maxStoredMenus: 5, now: 1000 },
+  );
+  storeTelegramModelMenuState(
+    menus,
+    { ...createMenuState(1), chatId: 20, note: "chat-20" },
+    { maxAgeMs: 100, maxStoredMenus: 5, now: 1000 },
+  );
+
+  assert.equal(
+    getStoredTelegramModelMenuState(
+      menus,
+      1,
+      { maxAgeMs: 100, maxStoredMenus: 5, now: 1010 },
+      20,
+    )?.note,
+    "chat-20",
+  );
+  assert.equal(
+    getStoredTelegramModelMenuState(
+      menus,
+      1,
+      { maxAgeMs: 100, maxStoredMenus: 5, now: 1010 },
+      10,
+    )?.note,
+    "chat-10",
   );
 });
 
@@ -543,7 +577,7 @@ test("Menu helpers build model callback plans for paging, page menu, selection, 
       canRestartBusyRun: false,
       hasActiveToolExecutions: false,
     }),
-    { kind: "answer", text: "π is busy. Send /abort, /next, or /stop." },
+    { kind: "answer", text: "Pi is busy. Send /abort, /next, or /stop." },
   );
 });
 
@@ -2089,13 +2123,82 @@ test("Menu helpers build model, thinking, and status UI payloads", () => {
   assert.equal(noReasoningMarkup.inline_keyboard.length, 3);
 });
 
+test("Section callback actions preserve callback thread target", async () => {
+  const registry = createTelegramExtensionSectionRegistry();
+  const enqueued: Array<unknown> = [];
+  const opened: Array<unknown> = [];
+  registry.register({
+    id: "demo",
+    label: "Demo",
+    render: () => ({ text: "Demo" }),
+    handleCallback: async (ctx) => {
+      await ctx.enqueuePrompt("section prompt");
+      await ctx.open({ text: "Opened" });
+      return "handled" as const;
+    },
+  });
+
+  await handleTelegramMenuCallbackRuntime(
+    {
+      id: "cb-section",
+      data: "section:0:run",
+      message: {
+        message_id: 2,
+        message_thread_id: 55,
+        chat: { id: -1001 },
+      },
+    },
+    {},
+    {
+      getStoredModelMenuState: () => createMenuState(2),
+      getActiveModel: () => undefined,
+      getThinkingLevel: () => "medium",
+      setThinkingLevel: () => {},
+      updateStatus: () => {},
+      updateModelMenuMessage: async () => {},
+      updateThinkingMenuMessage: async () => {},
+      updateStatusMessage: async () => {},
+      answerCallbackQuery: async () => {},
+      isIdle: () => true,
+      hasActiveTelegramTurn: () => false,
+      hasAbortHandler: () => false,
+      hasActiveToolExecutions: () => false,
+      setModel: async () => true,
+      setCurrentModel: () => {},
+      stagePendingModelSwitch: () => {},
+      restartInterruptedTelegramTurn: () => false,
+      sectionRegistry: registry,
+      sendInteractiveMessage: async (
+        _chatId,
+        text,
+        _mode,
+        _markup,
+        options,
+      ) => {
+        opened.push({ text, target: options?.target });
+        return 3;
+      },
+      enqueueSectionPrompt: async (prompt, _ctx, target) => {
+        enqueued.push({ prompt, target });
+      },
+    },
+  );
+
+  assert.deepEqual(enqueued, [
+    { prompt: "section prompt", target: { chatId: -1001, threadId: 55 } },
+  ]);
+  assert.deepEqual(opened, [
+    { text: "Opened", target: { chatId: -1001, threadId: 55 } },
+  ]);
+});
+
 test("Settings menu labels proactive push with state text", () => {
   assert.deepEqual(
     buildTelegramSettingsMenuReplyMarkup(true, "manual", "hidden")
       .inline_keyboard[3],
     [
       {
-        text: "📌 Proactive push: On",
+        text: "📌 Proactive push: on",
         callback_data: "settings:open:proactive",
       },
     ],
@@ -2105,7 +2208,7 @@ test("Settings menu labels proactive push with state text", () => {
       .inline_keyboard[3],
     [
       {
-        text: "📌 Proactive push: Off",
+        text: "📌 Proactive push: off",
         callback_data: "settings:open:proactive",
       },
     ],
@@ -2118,7 +2221,7 @@ test("Settings menu exposes time injection mode selection", () => {
       .inline_keyboard[2],
     [
       {
-        text: "🕒 Time injection: Hidden",
+        text: "🕒 Time injection: hidden",
         callback_data: "settings:open:time-injection",
       },
     ],
@@ -2128,7 +2231,7 @@ test("Settings menu exposes time injection mode selection", () => {
       .inline_keyboard[2],
     [
       {
-        text: "🕒 Time injection: Interval",
+        text: "🕒 Time injection: interval",
         callback_data: "settings:open:time-injection",
       },
     ],
@@ -2172,7 +2275,7 @@ test("Settings menu marks voice mode selection with model-style dot", () => {
     ).inline_keyboard[1],
     [
       {
-        text: "👄 Voice reply: Hidden",
+        text: "👄 Voice reply: hidden",
         callback_data: "settings:open:voice-reply",
       },
     ],
@@ -2182,7 +2285,7 @@ test("Settings menu marks voice mode selection with model-style dot", () => {
       .inline_keyboard[1],
     [
       {
-        text: "👄 Voice reply: Always",
+        text: "👄 Voice reply: always",
         callback_data: "settings:open:voice-reply",
       },
     ],

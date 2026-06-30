@@ -273,7 +273,9 @@ test("Inbound handler failure output is bounded before runtime events", async ()
       killed: false,
     }),
     recordRuntimeEvent: (category, error) => {
-      events.push(`${category}:${error instanceof Error ? error.message : String(error)}`);
+      events.push(
+        `${category}:${error instanceof Error ? error.message : String(error)}`,
+      );
     },
   });
 
