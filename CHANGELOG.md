@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `[Bus Transport]` Introduced an explicit local bus transport boundary for endpoint derivation, socket-vs-pipe detection, operation-aware retry policy, timeout/transient IPC error classification, endpoint reachability probes, request-scoped server/client transport events, and handler-failure ACKs instead of silent client timeouts. Impact: Unix socket behavior remains the common baseline while Windows named-pipe stabilization can evolve at the transport layer instead of leaking into routing.
+- `[Windows IPC]` Leader-side forwarding now tolerates a pruned follower registry entry by using the follower's deterministic receiver endpoint, the default follower prune window is slightly more conservative, and `/telegram-status --debug` prints whether local bus endpoints are pipes or sockets. Impact: a follower thread that already showed `Instance ... connected` is less likely to fall back to `not connected to the Telegram bus yet` during Windows named-pipe heartbeat jitter, and Windows diagnostics identify the active transport contour directly.
+
 ## 0.18.4: Windows Threaded Mode hotfix
 
 - `[Windows IPC]` Follower registration now retries transient local bus connection failures while the leader named pipe/socket is still coming online. Impact: a same-directory Windows follower is less likely to fail `/telegram-connect` with `connect ENOENT \\.\\pipe\\...` during leader reload or hot Threaded Mode activation.

@@ -34,14 +34,19 @@ Context: Threaded Mode uses a local leader/follower IPC bus. Unix-like platforms
 
 Open work:
 
+- [ ] Deep Windows Threaded Mode research pass before further release:
+  - prioritize the Bus Transport boundary first: common bus protocol vs Unix socket transport vs Windows named-pipe transport;
+  - map leader/follower lifecycle from `/telegram-connect` through lock acquire, named-pipe server start, follower receiver start, registration, heartbeat, registry pruning, forwarding, and dispatch;
+  - isolate PowerShell-vs-CMD differences around `PI_CODING_AGENT_DIR`, cwd normalization, process liveness, inherited environment, and named-pipe path derivation;
+  - add diagnostic probes that expose lock path, pipe path, leader epoch, follower receiver path, registry entries, heartbeat age, and dispatch blocked reason without relying on `state.json` as authority;
+  - verify Telegram-originated assistant replies remain visible in the ordinary terminal/TUI transcript; Telegram delivery must be an external control/delivery membrane, not a replacement path that changes local terminal behavior;
+  - produce minimized Windows-relevant regressions before changing higher-level routing again.
 - [ ] Live smoke Threaded Mode on native Windows without WSL.
   - Scope: leader/follower `/telegram-connect`, follower heartbeat, forwarded Bot API calls, restore flows, lifecycle announcements, shutdown cleanup, and reconnect/reload behavior.
   - Observed: a same-directory follower can see a live leader lock but fail registration with `connect ENOENT \\.\\pipe\\...`, leaving the follower disconnected during leader reload/hot activation timing.
   - Observed: Windows/QEMU live polling/dispatch can lag until reload; inbound messages appear to increase the extension queue count, but the next queued item is not dispatched promptly.
+  - Observed: after a follower shows `Instance ... connected`, messages in its thread can still fall back to `not connected to the Telegram bus yet`, consistent with leader-side heartbeat pruning or registry loss while the follower receiver may still be alive.
   - Baseline: deterministic path tests run everywhere, and a Windows-only named-pipe roundtrip regression runs when the suite executes on `win32`. Live Windows smoke remains unavailable in this environment.
-- [x] Add a minimized registration-boundary regression for transient leader endpoint startup races.
-- [x] Add a session-bound queue dispatch watchdog so queued Telegram work can recover if a one-shot wakeup/timer is missed.
-
 Done when: Threaded Mode leader/follower operation works on native Windows with the same safety guarantees as Unix-like systems, and unsupported transport assumptions are covered by tests/docs.
 
 ## P1 — Evidence-Backed Telegram Client Follow-Ups

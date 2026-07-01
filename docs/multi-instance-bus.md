@@ -161,7 +161,7 @@ Implemented transport:
 
 ### Local IPC endpoint under agent temp dir
 
-Leader opens a local Node `net` endpoint: a Unix-domain socket under the agent temp directory on Unix-like platforms, or a deterministic Windows named pipe (`\\.\pipe\pi-telegram-...`) on native Windows. Followers register, heartbeat, and exchange routed events. Follower registration uses a longer registration-specific response timeout than ordinary heartbeat/forwarding calls because the leader may need to provision a Telegram thread before it can return the assigned target; timing out that handshake leaves a visible tab with no follower heartbeat. Keep this handshake to the true critical path: create/reuse the target, persist the live binding, and return it. Connected notices and replaced-thread reconciliation cleanup are non-critical and should run after registration so a follower becomes routable before Telegram client/server UI convergence work finishes.
+Leader opens a local Node `net` endpoint: a Unix-domain socket under the agent temp directory on Unix-like platforms, or a deterministic Windows named pipe (`\\.\pipe\pi-telegram-...`) on native Windows. Followers register, heartbeat, and exchange routed events. The transport boundary owns endpoint derivation, socket-vs-pipe detection, bounded operation-aware retry policy, timeout/transient IPC error classification, endpoint reachability probes, and request-scoped transport events. Follower registration uses a longer registration-specific response timeout than ordinary heartbeat/forwarding calls because the leader may need to provision a Telegram thread before it can return the assigned target; timing out that handshake leaves a visible tab with no follower heartbeat. Keep this handshake to the true critical path: create/reuse the target, persist the live binding, and return it. Connected notices and replaced-thread reconciliation cleanup are non-critical and should run after registration so a follower becomes routable before Telegram client/server UI convergence work finishes.
 
 Pros:
 
@@ -190,7 +190,7 @@ Manual smoke checklist:
 6. Close the follower terminal; verify heartbeat pruning, disconnected notice, and cleanup behavior match Unix-like behavior.
 7. Reload the leader and verify status/debug output does not expose raw pipe internals except in explicit diagnostics.
 
-If any step fails, capture `telegram-status --debug`, `tmp/telegram/state.json`, and `tmp/telegram/logs.jsonl` before retrying.
+If any step fails, capture `telegram-status --debug`, `tmp/telegram/state.json`, and `tmp/telegram/logs.jsonl` before retrying. Debug status prints local leader/follower endpoints with their active transport kind (`pipe` or `socket`), while the runtime log records request-scoped transport failures with envelope kind, request id, retry attempt, endpoint, and classified IPC error.
 
 ### Native Windows Assumption Audit
 

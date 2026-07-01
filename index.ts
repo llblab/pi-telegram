@@ -9,6 +9,7 @@ import * as BusApi from "./lib/bus-api.ts";
 import * as Bus from "./lib/bus.ts";
 import * as BusFollower from "./lib/bus-follower.ts";
 import * as BusLeader from "./lib/bus-leader.ts";
+import * as BusTransport from "./lib/bus-transport.ts";
 import * as CommandTemplates from "./lib/command-templates.ts";
 import * as Commands from "./lib/commands.ts";
 import * as Config from "./lib/config.ts";
@@ -248,6 +249,21 @@ export default function (pi: Pi.ExtensionAPI) {
         followers: telegramBusFollowerRegistry.list(),
         records: threadStore.list(),
       });
+    },
+    getLocalBus() {
+      return {
+        leaderSocketPath: telegramBusSocketPath,
+        leaderTransport:
+          BusTransport.getTelegramBusTransportKind(telegramBusSocketPath),
+        followerSocketPath: telegramBusFollowerSocketPath,
+        followerTransport: BusTransport.getTelegramBusTransportKind(
+          telegramBusFollowerSocketPath,
+        ),
+        followerRegistered: telegramBusFollowerRegistrationState.isRegistered(),
+        followerTarget: telegramBusFollowerRegistrationState.getTarget(),
+        followerSlot: telegramBusFollowerRegistrationState.getSlot(),
+        followerThreadName: telegramBusFollowerRegistrationState.getThreadName(),
+      };
     },
     getTopicTargets() {
       return Threads.listTelegramThreadStatusTargets(threadStore.list());
@@ -647,7 +663,12 @@ export default function (pi: Pi.ExtensionAPI) {
     },
     getMessageOwnership: messageOwnershipStore.get,
     getTargetOwnership(target) {
-      return telegramBusFollowerRegistry.getByTarget(target);
+      return Bus.getTelegramFollowerTargetOwnership({
+        target,
+        followers: telegramBusFollowerRegistry.list(),
+        activeThreadRecords: threadStore.list(),
+        currentInstanceId: telegramInstanceId,
+      });
     },
     getLiveThreadTargets() {
       return Bus.listTelegramBusLiveThreadTargets({

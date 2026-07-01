@@ -805,6 +805,42 @@ test("Bridge status lines include bus follower diagnostics when present", () => 
   ]);
 });
 
+test("Bridge status lines include local bus diagnostics", () => {
+  const lines = buildTelegramBridgeStatusLines(
+    {
+      botUsername: "demo_bot",
+      allowedUserId: 42,
+      pollingActive: false,
+      pendingDispatch: false,
+      compactionInProgress: false,
+      activeToolExecutions: 0,
+      pendingModelSwitch: false,
+      queuedItems: [],
+      localBus: {
+        leaderSocketPath: "\\\\.\\pipe\\pi-telegram-demo-bus",
+        leaderTransport: "pipe",
+        followerSocketPath: "\\\\.\\pipe\\pi-telegram-demo-follower",
+        followerTransport: "pipe",
+        followerRegistered: true,
+        followerTarget: { chatId: 42, threadId: 9 },
+        followerThreadName: "Boreal",
+      },
+      recentRuntimeEvents: [],
+    },
+    { verbose: true },
+  );
+  assert.ok(lines.includes("local bus:"));
+  assert.ok(lines.includes("- follower registered: yes Boreal target 42:9"));
+  assert.ok(
+    lines.includes("- leader endpoint [pipe]: \\\\.\\pipe\\pi-telegram-demo-bus"),
+  );
+  assert.ok(
+    lines.includes(
+      "- follower endpoint [pipe]: \\\\.\\pipe\\pi-telegram-demo-follower",
+    ),
+  );
+});
+
 test("Bridge status lines include queue lanes and recent runtime events", () => {
   const lines = buildTelegramBridgeStatusLines(
     {
