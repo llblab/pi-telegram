@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.18.5: Windows Threaded Mode stabilization hotfix
+
+- `[Bus Transport]` Introduced an explicit local bus transport boundary for endpoint derivation, socket-vs-pipe detection, operation-aware retry policy, timeout/transient IPC error classification, endpoint reachability probes, request-scoped server/client transport events, and handler-failure ACKs instead of silent client timeouts. Impact: Unix socket behavior remains the stable baseline while Windows named-pipe readiness and retry behavior are contained in the transport layer instead of leaking into routing.
+- `[Windows IPC]` Leader-side forwarding now tolerates a pruned follower registry entry by using the follower's deterministic receiver endpoint, the default follower prune window is more conservative, and `/telegram-status --debug` identifies local bus endpoints as pipes or sockets. Impact: follower threads that already connected are less likely to fall back to `not connected to the Telegram bus yet` during Windows named-pipe heartbeat jitter, and diagnostics expose the active transport contour directly.
+- `[Capability Switching]` Live Threaded Mode downgrade now blocks follower takeover while active thread bindings prove the bot is degrading from a live leader/follower organism, confirms disabled thread capability after two 2.5-second monitor probes, retries classic polling restore after transient failures, and clears the in-memory follower registry when bus leadership stops. Impact: when BotFather disables private-chat threads, the current bus leader keeps the classic singleton polling role and followers disconnect instead of stealing ownership or lingering as a live bus roster.
+- `[Diagnostics]` Runtime JSONL reset now preserves the previous session log as `logs.previous.jsonl` and records that path in the new reset line. Impact: `/reload` no longer destroys the best evidence for long-running `/start`, menu, polling, queue, or bus stalls immediately before restart.
+- `[Previews]` Native rich Markdown previews no longer send syntax-only prefixes such as a bare opening `**`, while keeping the native draft/final lifecycle otherwise unchanged and removing unused throttle/manual-clear branches. Impact: Telegram avoids malformed early preview fragments without extra delivery policy that can create duplicate, stalled, or placeholder draft artifacts.
+- `[Validation]` Native Windows smoke passed for classic mode, classic ownership handoff, hot upgrade to Threaded Mode, leader/follower registration and delivery, and hot downgrade back to classic with follower disconnect. Impact: the named-pipe and capability-switching fixes have live evidence across both directions, with classic restore/status convergence inside the intended 5–15 second fallback window.
 
 ## 0.18.4: Windows Threaded Mode hotfix
 
@@ -15,7 +22,7 @@
 - `[Status]` Leader target assignment now carries the live thread name into status fallback state. Impact: the status bar is less likely to flicker from `Dune Leader/Active` to generic `Telegram Leader` when the current active turn or thread-store lookup changes.
 - `[Model Menu]` The Telegram model menu now hides one-page pagination controls and keeps scope tabs hidden unless scoped models exist. Impact: the minimal model menu shows only main-menu navigation and the available models.
 
-## 0.18.2: setup pairing start hotfix
+## 0.18.2: Setup pairing start hotfix
 
 - `[Setup]` `/telegram-setup` now updates the live in-memory config immediately after persisting the validated bot token and before starting polling. Impact: first-time setup no longer shows `Send /start...` followed by `Telegram bot is not configured`, and `/start` can be received without restarting Pi.
 

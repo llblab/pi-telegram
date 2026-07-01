@@ -12,7 +12,6 @@ import {
 } from "./target.ts";
 import { shouldSuppressPreviewForVoice } from "./voice.ts";
 
-const TELEGRAM_PREVIEW_THROTTLE_MS = 0;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_DRAFT_PREVIEW_MAX_CHARS = 4096;
 
@@ -26,7 +25,6 @@ export interface TelegramPreviewState {
 }
 
 export interface TelegramPreviewRuntimeState extends TelegramPreviewState {
-  flushTimer?: ReturnType<typeof setTimeout>;
   flushPromise?: Promise<void>;
   flushRequested?: boolean;
 }
@@ -36,7 +34,6 @@ export type TelegramPreviewReplyMarkup = unknown;
 export interface TelegramPreviewRuntimeDeps {
   getState: () => TelegramPreviewRuntimeState | undefined;
   setState: (state: TelegramPreviewRuntimeState | undefined) => void;
-  clearScheduledFlush: (state: TelegramPreviewRuntimeState) => void;
   maxMessageLength: number;
   getDraftSupport: () => TelegramDraftSupport;
   setDraftSupport: (support: TelegramDraftSupport) => void;
@@ -132,13 +129,7 @@ export interface TelegramPreviewControllerDeps {
     },
   ) => Promise<unknown>;
   canSend?: () => boolean;
-  throttleMs?: number;
   maxDraftId?: number;
-  setTimer?: (
-    callback: () => void,
-    ms: number,
-  ) => ReturnType<typeof setTimeout>;
-  clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
   recordRuntimeEvent?: (
     category: string,
     error: unknown,
@@ -154,7 +145,7 @@ export interface TelegramPreviewController {
   resetState: () => void;
   clear: (
     chatId: number,
-    options?: { target?: TelegramTarget },
+    options?: { awaitFlush?: boolean; target?: TelegramTarget },
   ) => Promise<void>;
   flush: (
     chatId: number,
@@ -171,7 +162,8 @@ export interface TelegramPreviewController {
   ) => Promise<boolean>;
 }
 
-export type TelegramPreviewControllerRuntimeDeps = TelegramPreviewControllerDeps;
+export type TelegramPreviewControllerRuntimeDeps =
+  TelegramPreviewControllerDeps;
 
 export function createTelegramPreviewControllerRuntime(
   deps: TelegramPreviewControllerRuntimeDeps,
@@ -181,10 +173,7 @@ export function createTelegramPreviewControllerRuntime(
     maxMessageLength: deps.maxMessageLength,
     initialDraftSupport: deps.initialDraftSupport,
     sendDraft: deps.sendDraft,
-    throttleMs: deps.throttleMs,
     maxDraftId: deps.maxDraftId,
-    setTimer: deps.setTimer,
-    clearTimer: deps.clearTimer,
     recordRuntimeEvent: deps.recordRuntimeEvent,
   });
 }
@@ -223,7 +212,7 @@ export function createTelegramNativeMarkdownPreviewFinalizer<
   getState: () => TelegramPreviewRuntimeState | undefined;
   clear: (
     chatId: number,
-    options?: { target?: TelegramTarget },
+    options?: { awaitFlush?: boolean; target?: TelegramTarget },
   ) => Promise<void>;
   discard?: () => void;
   sendMarkdownReply: (
@@ -283,12 +272,6 @@ export function createTelegramPreviewController(
   deps: TelegramPreviewControllerDeps,
 ): TelegramPreviewController {
   let state: TelegramPreviewRuntimeState | undefined;
-  const clearTimer = deps.clearTimer ?? clearTimeout;
-  const setTimer =
-    deps.setTimer ??
-    ((callback: () => void, ms: number): ReturnType<typeof setTimeout> =>
-      setTimeout(callback, ms));
-  const throttleMs = deps.throttleMs ?? TELEGRAM_PREVIEW_THROTTLE_MS;
   const maxDraftId = deps.maxDraftId ?? TELEGRAM_DRAFT_ID_MAX;
   const maxMessageLength =
     deps.maxMessageLength ?? TELEGRAM_DRAFT_PREVIEW_MAX_CHARS;
@@ -298,11 +281,6 @@ export function createTelegramPreviewController(
     getState: () => state,
     setState: (nextState) => {
       state = nextState;
-    },
-    clearScheduledFlush: (nextState) => {
-      if (!nextState.flushTimer) return;
-      clearTimer(nextState.flushTimer);
-      nextState.flushTimer = undefined;
     },
     maxMessageLength,
     getDraftSupport: () => draftSupport,
@@ -334,15 +312,8 @@ export function createTelegramPreviewController(
     flush: (chatId, options) =>
       flushTelegramPreview(chatId, getRuntimeDeps(), options),
     scheduleFlush: (chatId, options) => {
-      if (!state || state.flushTimer) return;
-      if (throttleMs <= 0) {
-        void flushTelegramPreview(chatId, getRuntimeDeps(), options);
-        return;
-      }
-      state.flushTimer = setTimer(() => {
-        void flushTelegramPreview(chatId, getRuntimeDeps(), options);
-      }, throttleMs);
-      state.flushTimer.unref?.();
+      if (!state) return;
+      void flushTelegramPreview(chatId, getRuntimeDeps(), options);
     },
     finalize: (chatId, _replyToMessageId, options) =>
       finalizeTelegramPreview(chatId, getRuntimeDeps(), options),
@@ -464,7 +435,6 @@ export async function clearTelegramPreview(
 ): Promise<void> {
   const state = deps.getState();
   if (!state) return;
-  deps.clearScheduledFlush(state);
   if (state.flushPromise && options.awaitFlush !== false) {
     state.flushRequested = false;
     await state.flushPromise.catch(() => {});
@@ -699,6 +669,10 @@ function findSafeTelegramRichMarkdownDraftEnd(markdown: string): number {
   return safeEnd;
 }
 
+function hasTelegramPreviewVisibleContent(markdown: string): boolean {
+  return /[\p{L}\p{N}]/u.test(markdown);
+}
+
 export function getSafeTelegramRichMarkdownDraftPrefix(
   markdown: string,
   maxMessageLength: number,
@@ -710,13 +684,21 @@ export function getSafeTelegramRichMarkdownDraftPrefix(
       ? source.slice(0, maxMessageLength)
       : source;
   const safeEnd = findSafeTelegramRichMarkdownDraftEnd(limited);
-  if (safeEnd > 0) return limited.slice(0, safeEnd).trimEnd() || undefined;
+  if (safeEnd > 0) {
+    const safePrefix = limited.slice(0, safeEnd).trimEnd();
+    return hasTelegramPreviewVisibleContent(safePrefix)
+      ? safePrefix
+      : undefined;
+  }
   let candidateEnd = limited.length;
   while (candidateEnd > 0) {
     candidateEnd = limited.lastIndexOf(" ", candidateEnd - 1);
     if (candidateEnd <= 0) return undefined;
     const candidate = limited.slice(0, candidateEnd).trimEnd();
-    if (findSafeTelegramRichMarkdownDraftEnd(candidate) === candidate.length) {
+    if (
+      hasTelegramPreviewVisibleContent(candidate) &&
+      findSafeTelegramRichMarkdownDraftEnd(candidate) === candidate.length
+    ) {
       return candidate || undefined;
     }
   }
@@ -795,7 +777,6 @@ export async function flushTelegramPreview(
     await state.flushPromise;
     return;
   }
-  state.flushTimer = undefined;
   state.flushPromise = (async () => {
     do {
       state.flushRequested = false;

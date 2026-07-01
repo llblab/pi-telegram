@@ -25,8 +25,10 @@ test("Runtime JSONL log resets and appends session events", async () => {
   try {
     let nowMs = 1000;
     const path = join(dir, "logs.jsonl");
+    const previousPath = join(dir, "logs.previous.jsonl");
     const log = createTelegramRuntimeJsonlLog({
       path,
+      previousPath,
       getNowMs: () => nowMs,
     });
 
@@ -45,6 +47,7 @@ test("Runtime JSONL log resets and appends session events", async () => {
         kind: "reset",
         reason: "extension-start",
         scope: { role: "leader" },
+        previousPath,
       },
       {
         at: 1001,
@@ -65,6 +68,23 @@ test("Runtime JSONL log resets and appends session events", async () => {
         kind: "reset",
         reason: "status-scope-change",
         scope: { role: "follower" },
+        previousPath,
+      },
+    ]);
+    assert.deepEqual(await readJsonl(previousPath), [
+      {
+        at: 1000,
+        kind: "reset",
+        reason: "extension-start",
+        scope: { role: "leader" },
+        previousPath,
+      },
+      {
+        at: 1001,
+        kind: "event",
+        category: "bus",
+        message: "started",
+        details: { phase: "leader-start" },
       },
     ]);
   } finally {

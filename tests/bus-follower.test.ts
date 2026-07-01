@@ -439,7 +439,7 @@ test("Bus follower registration runtime retries while leader endpoint is startin
     assert.equal(state.isRegistered(), true);
     assert.deepEqual(state.getTarget(), { chatId: -1007, threadId: 42 });
     assert.equal(
-      events.some((event) => event?.phase === "follower-register-retry"),
+      events.some((event) => event?.phase === "follower-register-client-retry"),
       true,
     );
   } finally {

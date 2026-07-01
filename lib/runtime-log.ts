@@ -4,7 +4,14 @@
  * Owns session-local append-only runtime evidence for debugging without becoming routing state
  */
 
-import { existsSync, mkdirSync, statSync, writeFileSync, appendFile } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  statSync,
+  writeFileSync,
+  appendFile,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -17,6 +24,7 @@ export interface TelegramRuntimeJsonlEvent {
 
 export interface TelegramRuntimeJsonlLogOptions {
   path?: string;
+  previousPath?: string;
   maxBytes?: number;
   getNowMs?: () => number;
 }
@@ -57,6 +65,8 @@ export function createTelegramRuntimeJsonlLog(
   options: TelegramRuntimeJsonlLogOptions = {},
 ): TelegramRuntimeJsonlLog {
   const path = options.path ?? getTelegramRuntimeLogPath();
+  const previousPath =
+    options.previousPath ?? path.replace(/\.jsonl$/u, ".previous.jsonl");
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_LOG_BYTES;
   const getNowMs = options.getNowMs ?? Date.now;
   let scopeKey: string | undefined;
@@ -66,8 +76,15 @@ export function createTelegramRuntimeJsonlLog(
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   };
 
+  const preserveCurrentLog = () => {
+    if (!existsSync(path)) return;
+    mkdirSync(dirname(previousPath), { recursive: true, mode: 0o700 });
+    copyFileSync(path, previousPath);
+  };
+
   const writeReset = (reason: string, scope?: Record<string, unknown>) => {
     ensureParent();
+    preserveCurrentLog();
     writeFileSync(
       path,
       safeJsonLine({
@@ -75,6 +92,7 @@ export function createTelegramRuntimeJsonlLog(
         kind: "reset",
         reason,
         scope,
+        previousPath,
       }) + "\n",
       { mode: 0o600 },
     );

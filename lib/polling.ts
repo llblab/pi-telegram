@@ -20,7 +20,7 @@ const TELEGRAM_INITIAL_SYNC_LIMIT = 1;
 const TELEGRAM_INITIAL_SYNC_TIMEOUT_SECONDS = 0;
 const TELEGRAM_LONG_POLL_LIMIT = 10;
 const TELEGRAM_LONG_POLL_TIMEOUT_SECONDS = 30;
-const TELEGRAM_THREAD_CAPABILITY_MONITOR_INTERVAL_MS = 5_000;
+const TELEGRAM_THREAD_CAPABILITY_MONITOR_INTERVAL_MS = 2_500;
 const TELEGRAM_THREAD_CAPABILITY_DISABLED_CONFIRMATION_PROBES = 2;
 const TELEGRAM_POLLING_DEFAULT_MAX_UPDATE_FAILURES = 3;
 const TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT = 3;
@@ -426,6 +426,12 @@ export async function probeTelegramStartupThreadCapability(
   return threadModeEnabled;
 }
 
+function hasTelegramClassicRestoreFailure(
+  state: TelegramThreadCapabilityState,
+): boolean {
+  return state.lastReconcileAction?.endsWith("-classic-restore-failed") ?? false;
+}
+
 function hasTelegramThreadCapabilityBindings(
   store: TelegramThreadCapabilityStore,
 ): boolean {
@@ -451,6 +457,7 @@ export async function applyTelegramThreadCapability<TContext>(
   await deps.topicTargetStore.load();
   if (!deps.isBusConfigured()) return;
   const nowMs = (deps.getNowMs ?? Date.now)();
+  const previousBotState = deps.topicTargetStore.getBotState();
   if (!threadModeEnabled) {
     if (
       hasTelegramThreadCapabilityBindings(deps.topicTargetStore) &&
@@ -470,11 +477,26 @@ export async function applyTelegramThreadCapability<TContext>(
     await deps.topicTargetStore.persist();
     deps.setTopicModeUnavailable(true);
     deps.stopFollowerRegistration();
-    if (deps.getPollingStartedWithTelegramBus()) {
+    if (
+      deps.getPollingStartedWithTelegramBus() ||
+      hasTelegramClassicRestoreFailure(previousBotState)
+    ) {
       deps.stopLeaderHealth();
       await deps.stopBusPolling();
       deps.setPollingStartedWithTelegramBus(false);
-      await deps.startClassicPolling(ctx);
+      try {
+        await deps.startClassicPolling(ctx);
+      } catch (classicError) {
+        deps.topicTargetStore.setBotState({
+          threadMode: "disabled",
+          updatedAtMs: (deps.getNowMs ?? Date.now)(),
+          lastReconcileAction: `${phase}-classic-restore-failed`,
+        });
+        await deps.topicTargetStore.persist();
+        deps.recordEvent("bus", classicError, {
+          phase: `${phase}-classic-restore`,
+        });
+      }
     }
     deps.updateStatus(ctx);
     return;
@@ -509,6 +531,12 @@ export async function applyTelegramThreadCapability<TContext>(
       try {
         await deps.startClassicPolling(ctx);
       } catch (classicError) {
+        deps.topicTargetStore.setBotState({
+          threadMode: "disabled",
+          updatedAtMs: (deps.getNowMs ?? Date.now)(),
+          lastReconcileAction: `${phase}-classic-restore-failed`,
+        });
+        await deps.topicTargetStore.persist();
         deps.recordEvent("bus", classicError, {
           phase: `${phase}-classic-restore`,
         });
@@ -583,6 +611,19 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
   ): Promise<boolean | undefined> => {
     await deps.topicTargetStore.load();
     if (deps.topicTargetStore.getBotState().threadMode !== "enabled") {
+      if (hasTelegramThreadCapabilityBindings(deps.topicTargetStore)) {
+        deps.recordEvent(
+          "bus",
+          "Telegram Threaded Mode disabled; follower takeover blocked",
+          {
+            phase: "follower-register-thread-mode-disabled",
+            reason: "active-thread-bindings-present",
+          },
+        );
+        throw new Error(
+          "Telegram Threaded Mode is disabled; the current leader remains the classic polling owner.",
+        );
+      }
       return undefined;
     }
     if (!deps.isBusRuntimeEnabled()) return undefined;
@@ -653,9 +694,21 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
           return;
         }
         if (threadModeEnabled) consecutiveDisabledProbes = 0;
-        const current = deps.topicTargetStore.getBotState().threadMode;
+        const botState = deps.topicTargetStore.getBotState();
+        const current = botState.threadMode;
         if (threadModeEnabled && current === "enabled") return;
-        if (!threadModeEnabled && current === "disabled") return;
+        if (!threadModeEnabled && current === "disabled") {
+          if (!deps.ownsLock(ctx) || !hasTelegramClassicRestoreFailure(botState)) {
+            return;
+          }
+          await applyTelegramThreadCapability(
+            ctx,
+            false,
+            "capability-monitor-disabled-confirmed",
+            deps,
+          );
+          return;
+        }
         if (
           !threadModeEnabled &&
           hasTelegramThreadCapabilityBindings(deps.topicTargetStore)

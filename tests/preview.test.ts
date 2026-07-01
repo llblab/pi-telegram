@@ -36,12 +36,6 @@ function createPreviewRuntimeHarness(state?: TelegramPreviewRuntimeState) {
       setState: (nextState: TelegramPreviewRuntimeState | undefined) => {
         previewState = nextState;
       },
-      clearScheduledFlush: (nextState: TelegramPreviewRuntimeState) => {
-        if (!nextState.flushTimer) return;
-        clearTimeout(nextState.flushTimer);
-        nextState.flushTimer = undefined;
-        events.push("clear-timer");
-      },
       maxMessageLength: 100,
       getDraftSupport: () => draftSupport,
       setDraftSupport: (support: "unknown" | "supported") => {
@@ -130,6 +124,10 @@ test("Native Markdown draft prefix keeps only structurally closed Markdown", () 
     "**Bold** and",
   );
   assert.equal(
+    getSafeTelegramRichMarkdownDraftPrefix("**Heading still streaming", 100),
+    undefined,
+  );
+  assert.equal(
     getSafeTelegramRichMarkdownDraftPrefix("Before\n\n```ts\nconst x = 1", 100),
     "Before",
   );
@@ -163,6 +161,7 @@ test("Native Markdown draft prefix keeps only structurally closed Markdown", () 
 test("Preview runtime sends only safe native markdown draft prefixes", async () => {
   const harness = createPreviewRuntimeHarness({
     mode: "draft",
+    draftId: 10,
     pendingText: "**Bold** and *ita",
     lastSentText: "",
   });
@@ -175,6 +174,7 @@ test("Preview runtime sends only safe native markdown draft prefixes", async () 
 test("Preview runtime sends draft previews into thread target", async () => {
   const harness = createPreviewRuntimeHarness({
     mode: "draft",
+    draftId: 10,
     pendingText: "thread draft",
     lastSentText: "",
   });
@@ -240,6 +240,7 @@ test("Preview runtime skips unchanged unsafe draft tails", async () => {
 test("Preview runtime records draft failures without plain fallback", async () => {
   const harness = createPreviewRuntimeHarness({
     mode: "draft",
+    draftId: 10,
     pendingText: "abcdef",
     lastSentText: "",
   });
@@ -348,6 +349,7 @@ test("Native Markdown finalizer waits for active draft flush before final reply"
 test("Plain preview finalization does not send fallback messages", async () => {
   const harness = createPreviewRuntimeHarness({
     mode: "draft",
+    draftId: 10,
     pendingText: "final body",
     lastSentText: "final",
   });
@@ -424,7 +426,7 @@ test("Preview controller runtime binds Bot API draft transport", async () => {
     maxDraftId: 10,
   });
   runtime.resetState();
-  runtime.setPendingText("hello");
+  runtime.setPendingText("hello".repeat(60));
   await runtime.flush(7);
-  assert.deepEqual(events, ["draft:7:1:hello"]);
+  assert.deepEqual(events, [`draft:7:1:${"hello".repeat(60)}`]);
 });

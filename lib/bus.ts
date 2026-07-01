@@ -5,7 +5,7 @@
  * cross-instance forwarding helpers, and the live follower registry model.
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import {
   createConnection,
@@ -16,6 +16,19 @@ import {
 import { homedir, platform as getPlatform } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
+import {
+  classifyTelegramBusTransportError,
+  createTelegramBusTransportTimeoutError,
+  delayTelegramBusTransportRetry,
+  getTelegramBusEndpointDiagnostics,
+  getTelegramBusFollowerEndpoint,
+  getTelegramBusLeaderEndpoint,
+  getTelegramBusTransportRetryPolicy,
+  isTelegramBusPipePath,
+  isRetryableTelegramBusTransportError,
+  type TelegramBusTransportEventRecorder,
+  type TelegramBusTransportRetryPolicy,
+} from "./bus-transport.ts";
 import type { TelegramTarget } from "./target.ts";
 
 export type TelegramBusRole = "leader" | "follower";
@@ -30,30 +43,11 @@ export function createTelegramBusAuthSecret(): string {
   return randomBytes(32).toString("base64url");
 }
 
-function getTelegramBusPipePath(input: {
-  agentDir: string;
-  scope: string;
-}): string {
-  const digest = createHash("sha256")
-    .update(resolve(input.agentDir))
-    .digest("base64url")
-    .slice(0, 16);
-  const scope = input.scope.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 80);
-  return `\\\\.\\pipe\\pi-telegram-${digest}-${scope}`;
-}
-
-function isWindowsPipePath(socketPath: string): boolean {
-  return /^\\\\[.?]\\pipe\\/i.test(socketPath);
-}
-
 export function getTelegramBusSocketPath(
   agentDir = getAgentDir(),
   platform = getPlatform(),
 ): string {
-  if (platform === "win32") {
-    return getTelegramBusPipePath({ agentDir, scope: "bus" });
-  }
-  return join(agentDir, "tmp", "telegram", "bus.sock");
+  return getTelegramBusLeaderEndpoint({ agentDir, platform });
 }
 
 export function getTelegramBusFollowerSocketPath(
@@ -61,19 +55,7 @@ export function getTelegramBusFollowerSocketPath(
   agentDir = getAgentDir(),
   platform = getPlatform(),
 ): string {
-  if (platform === "win32") {
-    return getTelegramBusPipePath({
-      agentDir,
-      scope: `follower-${instanceId}`,
-    });
-  }
-  return join(
-    agentDir,
-    "tmp",
-    "telegram",
-    "followers",
-    `${instanceId.replace(/[^a-zA-Z0-9_.-]/g, "_")}.sock`,
-  );
+  return getTelegramBusFollowerEndpoint({ agentDir, platform, instanceId });
 }
 
 export interface TelegramBusInstanceRegistration {
@@ -89,6 +71,35 @@ export interface TelegramBusInstanceRegistration {
 
 export interface TelegramBusFollowerView extends TelegramBusInstanceRegistration {
   lastHeartbeatMs: number;
+}
+
+export function getTelegramFollowerTargetOwnership(input: {
+  target: TelegramTarget;
+  followers: TelegramBusFollowerView[];
+  activeThreadRecords?: Array<{
+    status?: string;
+    instanceId?: string;
+    target: TelegramTarget;
+  }>;
+  currentInstanceId?: string;
+}): { instanceId: string } | undefined {
+  const liveFollower = input.followers.find((follower) => {
+    return (
+      follower.target?.chatId === input.target.chatId &&
+      follower.target.threadId === input.target.threadId
+    );
+  });
+  if (liveFollower) return { instanceId: liveFollower.instanceId };
+  const record = input.activeThreadRecords?.find((candidate) => {
+    return (
+      candidate.status === "active" &&
+      candidate.instanceId &&
+      candidate.instanceId !== input.currentInstanceId &&
+      candidate.target.chatId === input.target.chatId &&
+      candidate.target.threadId === input.target.threadId
+    );
+  });
+  return record?.instanceId ? { instanceId: record.instanceId } : undefined;
 }
 
 export function isTelegramFollowerApiCallAllowed(input: {
@@ -310,12 +321,15 @@ export interface TelegramBusLocalServerDeps {
     | Promise<TelegramBusEnvelope | undefined>
     | TelegramBusEnvelope
     | undefined;
+  recordTransportEvent?: TelegramBusTransportEventRecorder;
 }
 
 export interface TelegramBusLocalClientOptions {
   socketPath: string;
   envelope: TelegramBusEnvelope;
   timeoutMs?: number;
+  retry?: TelegramBusTransportRetryPolicy;
+  recordTransportEvent?: TelegramBusTransportEventRecorder;
 }
 
 export interface TelegramBusForeignOwnedForwarderDeps {
@@ -362,6 +376,10 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
       socketPath: deps.socketPath,
       envelope,
       timeoutMs: deps.timeoutMs,
+      retry: getTelegramBusTransportRetryPolicy({
+        endpoint: deps.socketPath,
+        operation: "operation",
+      }),
     });
     return response?.kind === "bus.ack" && response.ok;
   };
@@ -449,6 +467,10 @@ export function createTelegramBusFollowerTargetController(
         socketPath: follower.busSocketPath,
         envelope,
         timeoutMs: deps.timeoutMs,
+        retry: getTelegramBusTransportRetryPolicy({
+          endpoint: follower.busSocketPath,
+          operation: "operation",
+        }),
       });
       return response?.kind === "bus.ack" && response.ok;
     },
@@ -517,7 +539,11 @@ export function createTelegramBusLocalServer(
   return {
     start: async () => {
       if (server) return;
-      const usesWindowsPipe = isWindowsPipePath(deps.socketPath);
+      const usesWindowsPipe = isTelegramBusPipePath(deps.socketPath);
+      deps.recordTransportEvent?.(
+        "server-start",
+        getTelegramBusEndpointDiagnostics(deps.socketPath),
+      );
       if (!usesWindowsPipe) {
         const socketDir = dirname(deps.socketPath);
         mkdirSync(socketDir, { recursive: true, mode: 0o700 });
@@ -533,16 +559,40 @@ export function createTelegramBusLocalServer(
           const lines = buffer.split("\n");
           buffer = lines.pop() ?? "";
           for (const line of lines) {
-            void handleTelegramBusSocketLine(line, socket, deps.handleEnvelope);
+            void handleTelegramBusSocketLine(
+              line,
+              socket,
+              deps.handleEnvelope,
+              deps.recordTransportEvent,
+              deps.socketPath,
+            );
           }
         });
         socket.on("close", () => sockets.delete(socket));
-        socket.on("error", () => closeSocket(socket));
+        socket.on("error", (error) => {
+          deps.recordTransportEvent?.("server-socket-error", {
+            ...getTelegramBusEndpointDiagnostics(deps.socketPath),
+            ...classifyTelegramBusTransportError(error),
+          });
+          closeSocket(socket);
+        });
       });
-      await new Promise<void>((resolve, reject) => {
-        server?.once("error", reject);
-        server?.listen(deps.socketPath, resolve);
-      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server?.once("error", reject);
+          server?.listen(deps.socketPath, resolve);
+        });
+        deps.recordTransportEvent?.(
+          "server-started",
+          getTelegramBusEndpointDiagnostics(deps.socketPath),
+        );
+      } catch (error) {
+        deps.recordTransportEvent?.("server-start-failed", {
+          ...getTelegramBusEndpointDiagnostics(deps.socketPath),
+          ...classifyTelegramBusTransportError(error),
+        });
+        throw error;
+      }
       if (!usesWindowsPipe) chmodSync(deps.socketPath, 0o600);
     },
     stop: async () => {
@@ -554,14 +604,27 @@ export function createTelegramBusLocalServer(
           activeServer.close(() => resolve()),
         );
       }
-      if (!isWindowsPipePath(deps.socketPath) && existsSync(deps.socketPath)) {
+      if (!isTelegramBusPipePath(deps.socketPath) && existsSync(deps.socketPath)) {
         unlinkSync(deps.socketPath);
       }
+      deps.recordTransportEvent?.(
+        "server-stopped",
+        getTelegramBusEndpointDiagnostics(deps.socketPath),
+      );
     },
   };
 }
 
-export function sendTelegramBusLocalEnvelope(
+function getTelegramBusEnvelopeDiagnostics(
+  envelope: TelegramBusEnvelope,
+): Record<string, unknown> {
+  return {
+    envelopeKind: envelope.kind,
+    requestId: envelope.requestId,
+  };
+}
+
+function sendTelegramBusLocalEnvelopeOnce(
   options: TelegramBusLocalClientOptions,
 ): Promise<TelegramBusEnvelope | undefined> {
   const timeoutMs = options.timeoutMs ?? 1000;
@@ -578,7 +641,11 @@ export function sendTelegramBusLocalEnvelope(
     };
     const timeout = setTimeout(() => {
       settle(() =>
-        reject(new Error("Timed out waiting for Telegram bus response")),
+        reject(
+          createTelegramBusTransportTimeoutError(
+            "Timed out waiting for Telegram bus response",
+          ),
+        ),
       );
     }, timeoutMs);
     timeout.unref?.();
@@ -598,6 +665,39 @@ export function sendTelegramBusLocalEnvelope(
   });
 }
 
+export async function sendTelegramBusLocalEnvelope(
+  options: TelegramBusLocalClientOptions,
+): Promise<TelegramBusEnvelope | undefined> {
+  const attempts = Math.max(1, options.retry?.attempts ?? 1);
+  const delayMs = Math.max(0, options.retry?.delayMs ?? 0);
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await sendTelegramBusLocalEnvelopeOnce(options);
+    } catch (error) {
+      const info = classifyTelegramBusTransportError(error);
+      options.recordTransportEvent?.("client-failed", {
+        ...getTelegramBusEndpointDiagnostics(options.socketPath),
+        ...getTelegramBusEnvelopeDiagnostics(options.envelope),
+        attempt,
+        attempts,
+        ...info,
+      });
+      if (attempt >= attempts || !isRetryableTelegramBusTransportError(error)) {
+        throw error;
+      }
+      options.recordTransportEvent?.("client-retry", {
+        ...getTelegramBusEndpointDiagnostics(options.socketPath),
+        ...getTelegramBusEnvelopeDiagnostics(options.envelope),
+        attempt,
+        attempts,
+        delayMs,
+        ...info,
+      });
+      await delayTelegramBusTransportRetry(delayMs);
+    }
+  }
+}
+
 export interface TelegramBusFollowerRegistry {
   register: (
     registration: TelegramBusInstanceRegistration,
@@ -610,6 +710,7 @@ export interface TelegramBusFollowerRegistry {
   getByTarget: (target: TelegramTarget) => TelegramBusFollowerView | undefined;
   list: () => TelegramBusFollowerView[];
   remove: (instanceId: string) => boolean;
+  clear: () => void;
   pruneStale: (
     nowMs: number,
     staleAfterMs: number,
@@ -660,6 +761,7 @@ export function createTelegramBusFollowerRegistry(): TelegramBusFollowerRegistry
     },
     list: () => [...followers.values()].map(clone),
     remove: (instanceId) => followers.delete(instanceId),
+    clear: () => followers.clear(),
     pruneStale: (nowMs, staleAfterMs) => {
       const removed: TelegramBusFollowerView[] = [];
       for (const [instanceId, follower] of followers.entries()) {
@@ -676,9 +778,15 @@ async function handleTelegramBusSocketLine(
   line: string,
   socket: Socket,
   handleEnvelope: TelegramBusLocalServerDeps["handleEnvelope"],
+  recordTransportEvent: TelegramBusTransportEventRecorder | undefined,
+  socketPath: string,
 ): Promise<void> {
   const envelope = parseTelegramBusEnvelope(line);
   if (!envelope) {
+    recordTransportEvent?.("server-invalid-envelope", {
+      ...getTelegramBusEndpointDiagnostics(socketPath),
+      byteLength: Buffer.byteLength(line),
+    });
     socket.write(
       encodeTelegramBusEnvelope({
         kind: "bus.ack",
@@ -689,8 +797,24 @@ async function handleTelegramBusSocketLine(
     );
     return;
   }
-  const response = await handleEnvelope(envelope);
-  if (response) socket.write(encodeTelegramBusEnvelope(response));
+  try {
+    const response = await handleEnvelope(envelope);
+    if (response) socket.write(encodeTelegramBusEnvelope(response));
+  } catch (error) {
+    recordTransportEvent?.("server-handler-failed", {
+      ...getTelegramBusEndpointDiagnostics(socketPath),
+      ...getTelegramBusEnvelopeDiagnostics(envelope),
+      ...classifyTelegramBusTransportError(error),
+    });
+    socket.write(
+      encodeTelegramBusEnvelope({
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: false,
+        message: "Telegram bus handler failed.",
+      }),
+    );
+  }
 }
 
 function parseRegisterEnvelope(

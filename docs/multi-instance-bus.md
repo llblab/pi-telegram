@@ -161,7 +161,7 @@ Implemented transport:
 
 ### Local IPC endpoint under agent temp dir
 
-Leader opens a local Node `net` endpoint: a Unix-domain socket under the agent temp directory on Unix-like platforms, or a deterministic Windows named pipe (`\\.\pipe\pi-telegram-...`) on native Windows. Followers register, heartbeat, and exchange routed events. Follower registration uses a longer registration-specific response timeout than ordinary heartbeat/forwarding calls because the leader may need to provision a Telegram thread before it can return the assigned target; timing out that handshake leaves a visible tab with no follower heartbeat. Keep this handshake to the true critical path: create/reuse the target, persist the live binding, and return it. Connected notices and replaced-thread reconciliation cleanup are non-critical and should run after registration so a follower becomes routable before Telegram client/server UI convergence work finishes.
+Leader opens a local Node `net` endpoint: a Unix-domain socket under the agent temp directory on Unix-like platforms, or a deterministic Windows named pipe (`\\.\pipe\pi-telegram-...`) on native Windows. Followers register, heartbeat, and exchange routed events. The transport boundary owns endpoint derivation, socket-vs-pipe detection, bounded operation-aware retry policy, timeout/transient IPC error classification, endpoint reachability probes, and request-scoped transport events. Follower registration uses a longer registration-specific response timeout than ordinary heartbeat/forwarding calls because the leader may need to provision a Telegram thread before it can return the assigned target; timing out that handshake leaves a visible tab with no follower heartbeat. Keep this handshake to the true critical path: create/reuse the target, persist the live binding, and return it. Connected notices and replaced-thread reconciliation cleanup are non-critical and should run after registration so a follower becomes routable before Telegram client/server UI convergence work finishes.
 
 Pros:
 
@@ -190,7 +190,7 @@ Manual smoke checklist:
 6. Close the follower terminal; verify heartbeat pruning, disconnected notice, and cleanup behavior match Unix-like behavior.
 7. Reload the leader and verify status/debug output does not expose raw pipe internals except in explicit diagnostics.
 
-If any step fails, capture `telegram-status --debug`, `tmp/telegram/state.json`, and `tmp/telegram/logs.jsonl` before retrying.
+If any step fails, capture `telegram-status --debug`, `tmp/telegram/state.json`, `tmp/telegram/logs.jsonl`, and, after a reload, `tmp/telegram/logs.previous.jsonl`. Debug status prints local leader/follower endpoints with their active transport kind (`pipe` or `socket`), while the runtime log records request-scoped transport failures with envelope kind, request id, retry attempt, endpoint, and classified IPC error. Reloads preserve the prior JSONL log as `logs.previous.jsonl` so the evidence that caused the reload is not immediately overwritten.
 
 ### Native Windows Assumption Audit
 
@@ -311,7 +311,7 @@ Typical config remains just bot identity and authorization:
 
 Rules:
 
-- Classic mode is selected by Telegram capability: when private-chat threads are unavailable or disabled, the polling owner uses ordinary single-DM behavior and blocked instances do not register as followers.
+- Classic mode is selected by Telegram capability: when private-chat threads are unavailable or disabled, the polling owner uses ordinary single-DM behavior and blocked instances do not register as followers. During a live downgrade from Threaded Mode, the current bus leader becomes the classic polling owner after two 2.5-second capability-monitor probes and followers disconnect; if classic polling restore fails transiently, later monitor ticks retry the restore instead of allowing a follower takeover. Followers must not turn the downgrade into a takeover while active thread bindings prove the singleton owner was already established by the bus leader.
 - Telegram private-chat Threaded Mode enables local leader/follower behavior automatically. The leader owns `getUpdates`; registered followers route Telegram API work through the leader. `/telegram-connect` registers as follower when a live leader exists and does not offer manual takeover in that state. The TUI status bar reports `telegram leader` or `telegram follower` so transport role is visible without opening diagnostics.
 - The thread chat is the owner's private bot DM (`allowedUserId`); no `topics.chatId` config is needed. Thread names are assigned by the bridge from a baked compact per-slot palette. There is no agent-facing `telegram_rename_thread` tool and no separate user-facing slash command for manual thread renames.
 - Thread reuse is extension-owned through current live binding identity; there is no separate `topics` config surface in the active private-chat thread model. Manual followers use instance-scoped internal keys by default so multiple terminal processes in the same cwd can receive separate threads.

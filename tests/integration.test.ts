@@ -479,7 +479,7 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
       },
       ctx,
     );
-    mock.timers.tick(850);
+    mock.timers.tick(1000);
     await flushMicrotasks(50);
     await handlers.get("agent_end")?.(
       {

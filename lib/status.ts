@@ -113,6 +113,17 @@ export interface TelegramBridgeStatusBusFollower {
   status?: string;
 }
 
+export interface TelegramBridgeStatusLocalBus {
+  leaderSocketPath?: string;
+  leaderTransport?: "pipe" | "socket";
+  followerSocketPath?: string;
+  followerTransport?: "pipe" | "socket";
+  followerRegistered?: boolean;
+  followerTarget?: { chatId: number; threadId?: number };
+  followerSlot?: string;
+  followerThreadName?: string;
+}
+
 export interface TelegramBridgeStatusTopicTarget {
   instanceId?: string;
   status?: string;
@@ -187,6 +198,7 @@ export interface TelegramBridgeStatusLineState {
   pendingModelSwitch: boolean;
   queuedItems: Array<{ queueLane: TelegramStatusQueueLane }>;
   busFollowers?: TelegramBridgeStatusBusFollower[];
+  localBus?: TelegramBridgeStatusLocalBus;
   topicTargets?: TelegramBridgeStatusTopicTarget[];
   threadReservations?: TelegramBridgeStatusThreadReservation[];
   topicSyncObservations?: TelegramBridgeStatusSyncObservation[];
@@ -266,6 +278,7 @@ export interface TelegramBridgeStatusRuntimeDeps<
       }
     | undefined;
   getBusFollowers?: () => TelegramBridgeStatusBusFollower[];
+  getLocalBus?: () => TelegramBridgeStatusLocalBus | undefined;
   getTopicTargets?: () => TelegramBridgeStatusTopicTarget[];
   getThreadReservations?: () => TelegramBridgeStatusThreadReservation[];
   getTopicSyncObservations?: () => TelegramBridgeStatusSyncObservation[];
@@ -626,6 +639,7 @@ export function createTelegramBridgeStatusRuntime<
         pendingModelSwitch: deps.hasPendingModelSwitch(),
         queuedItems: deps.getQueuedItems(),
         busFollowers: deps.getBusFollowers?.(),
+        localBus: deps.getLocalBus?.(),
         topicTargets: deps.getTopicTargets?.(),
         threadReservations: deps.getThreadReservations?.(),
         topicSyncObservations: deps.getTopicSyncObservations?.(),
@@ -682,6 +696,7 @@ export function createTelegramStatusSnapshot(
     },
     liveRoster: {
       busFollowers: state.busFollowers ?? [],
+      ...(state.localBus ? { localBus: state.localBus } : {}),
       topicTargets: state.topicTargets ?? [],
       reservations: state.threadReservations ?? [],
       syncObservations: state.topicSyncObservations ?? [],
@@ -822,6 +837,38 @@ function buildTelegramBusFollowerLines(
       return `- ${follower.instanceId}:${labelSuffix} heartbeat ${ageSeconds}s ago${statusLabel}${target}${cwd}`;
     }),
   ];
+}
+
+function buildTelegramLocalBusLines(
+  state: Pick<TelegramBridgeStatusLineState, "localBus">,
+  options: { verbose?: boolean } = {},
+): string[] {
+  const localBus = state.localBus;
+  if (!localBus) return [];
+  const target = formatTelegramStatusTarget(localBus.followerTarget);
+  const label = formatTelegramThreadStatusLabel({
+    slot: localBus.followerSlot,
+    threadName: localBus.followerThreadName,
+  });
+  const followerLine = `- follower registered: ${localBus.followerRegistered ? "yes" : "no"}${label ? ` ${label}` : ""}${target}`;
+  const lines = ["", "local bus:", followerLine];
+  if (options.verbose) {
+    if (localBus.leaderSocketPath) {
+      const transport = localBus.leaderTransport
+        ? ` [${localBus.leaderTransport}]`
+        : "";
+      lines.push(`- leader endpoint${transport}: ${localBus.leaderSocketPath}`);
+    }
+    if (localBus.followerSocketPath) {
+      const transport = localBus.followerTransport
+        ? ` [${localBus.followerTransport}]`
+        : "";
+      lines.push(
+        `- follower endpoint${transport}: ${localBus.followerSocketPath}`,
+      );
+    }
+  }
+  return lines;
 }
 
 function buildTelegramSyncSliceLines(
@@ -1038,6 +1085,8 @@ function buildTelegramBridgeCompactStatusLines(
       : []),
     ...(state.pendingModelSwitch ? ["- pending model switch: yes"] : []),
     ...buildTelegramBridgeCompactThreadLines(state),
+    ...buildTelegramBusFollowerLines(state),
+    ...buildTelegramLocalBusLines(state),
     ...buildTelegramThreadReconciliationLines(state),
     "",
     "diagnostics:",
@@ -1100,6 +1149,7 @@ export function buildTelegramBridgeDiagnosticStatusLines(
     `- queued turns: ${state.queuedItems.length}`,
     `- lanes: control=${controlQueueCount}, priority=${priorityQueueCount}, default=${defaultQueueCount}`,
     ...buildTelegramBusFollowerLines(state),
+    ...buildTelegramLocalBusLines(state, { verbose: true }),
     ...buildTelegramTopicTargetDiagnosticLines(state),
     ...buildTelegramThreadReconciliationLines(state),
     ...buildTelegramSyncSliceLines(state),

@@ -513,9 +513,8 @@ test("Bus leader stamps follower liveness after slow target provisioning", async
   assert.deepEqual(registry.pruneStale(21001, 15000), []);
 });
 
-test("Bus leader envelope handler rejects unknown followers and unroutable forwards", async () => {
+test("Bus leader envelope handler rejects unknown follower heartbeats", async () => {
   const registry = createTelegramBusFollowerRegistry();
-  registry.register({ instanceId: "inst-b", connectedAtMs: 1000 });
   const handleEnvelope = createTelegramBusLeaderEnvelopeHandler({
     followerRegistry: registry,
   });
@@ -532,21 +531,6 @@ test("Bus leader envelope handler rejects unknown followers and unroutable forwa
       requestId: "missing:1",
       ok: false,
       message: "Unknown Telegram bus follower instance.",
-    },
-  );
-  assert.deepEqual(
-    await handleEnvelope({
-      kind: "leader.forwardCallback",
-      requestId: "leader:1",
-      recipientInstanceId: "inst-b",
-      query: {},
-      sentAtMs: 1000,
-    }),
-    {
-      kind: "bus.ack",
-      requestId: "leader:1",
-      ok: false,
-      message: "Telegram bus follower does not expose a receiver socket.",
     },
   );
 });
@@ -860,9 +844,12 @@ test("Bus leader runtime prunes stale followers while polling", async () => {
     await runtime.startPolling("ctx");
     await waitForCondition(() => registry.get("stale") === undefined);
     assert.equal(registry.get("fresh")?.instanceId, "fresh");
-    assert.deepEqual(runtimeEvents, [
-      "bus:follower-prune:stale:Telegram bus follower timed out",
-    ]);
+    assert.equal(
+      runtimeEvents.includes(
+        "bus:follower-prune:stale:Telegram bus follower timed out",
+      ),
+      true,
+    );
   } finally {
     await runtime.stopPolling();
     rmSync(dir, { recursive: true, force: true });
@@ -910,7 +897,7 @@ test("Bus leader runtime reports pruned followers to offline hook", async () => 
   }
 });
 
-test("Bus leader runtime stops stale follower pruning on stop", async () => {
+test("Bus leader runtime stops stale follower pruning and clears registry on stop", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-prune-stop-"));
   const socketPath = join(dir, "bus.sock");
   const registry = createTelegramBusFollowerRegistry();
@@ -930,7 +917,7 @@ test("Bus leader runtime stops stale follower pruning on stop", async () => {
     await runtime.stopPolling();
     nowMs = 2000;
     await new Promise((resolve) => setTimeout(resolve, 70));
-    assert.equal(registry.get("stale")?.instanceId, "stale");
+    assert.deepEqual(registry.list(), []);
   } finally {
     await runtime.stopPolling();
     rmSync(dir, { recursive: true, force: true });

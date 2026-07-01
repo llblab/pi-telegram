@@ -1,6 +1,6 @@
 # Project Backlog
 
-_Current deterministic status: Threaded Mode implementation, native typing/activity status, regression coverage, docs/context reconciliation, typecheck, full tests, pack check, audit, Domain DAG validation, context validation, and core live Threaded Mode smoke are green. This backlog intentionally tracks only release-relevant remaining work: native Windows smoke, evidence-gated Telegram client follow-ups, and upstream Pi API blockers._
+_Current deterministic status: Threaded Mode implementation, native typing/activity status, regression coverage, docs/context reconciliation, typecheck, full tests, pack check, audit, Domain DAG validation, context validation, core live Threaded Mode smoke, and native Windows classic↔Threaded Mode upgrade/downgrade smoke are green. This backlog intentionally tracks only release-relevant remaining work: evidence-gated Telegram client/runtime follow-ups and upstream Pi API blockers._
 
 ## P0 — Live Threaded Mode Regression Sweep
 
@@ -8,19 +8,8 @@ Context: live Linux testing exposed regressions around prompt dispatch readiness
 
 Open work:
 
-- [x] Hide minimal model-menu one-page pagination and keep scope tabs progressive.
-- [x] Add immediate-plus-deferred inbound prompt dispatch so queued prompts do not wait for a later `/reload` or command.
-- [x] Stop automatic leader reclaim/reconciliation paths from visibly calling `editForumTopic` for internal identity restoration.
-- [x] Prevent leader auto-claim of an unknown unbound thread while another live thread target exists, covering same-directory leader/follower smear risk.
-- [x] Prefer local live leader/follower target labels over stale shared thread-store records when building prompt prefixes.
-- [x] Permit follower-safe bot identity reads and own-chat native activity through the leader API proxy without granting cross-thread message/file/topic writes.
-- [x] Preserve leader thread-name fallback in live status state to reduce `Dune`/generic `Telegram` flicker.
 - [ ] Live smoke on Linux with one leader and one follower:
-  - [x] clean-state pass after removing `tmp/telegram` so stale diagnostic snapshots do not obscure live behavior;
   - [ ] dirty-state pass with old `state.json`/`logs.jsonl` present to prove live locks, bus registration, target ownership, and reconciliation override stale diagnostics;
-  - [x] follower thread receives raw voice/message updates through the leader bus;
-  - [x] follower-local handlers from that instance's `telegram.json` process voice independently;
-  - [x] same-directory leader/follower sessions keep distinct thread bindings;
   - [ ] leader reload recovers without duplicate visible thread renames;
   - [ ] prompts dispatch without a second command;
   - [ ] status remains stable around thread name and role while active turns start/end.
@@ -28,21 +17,16 @@ Open work:
 
 Done when: local Linux live Threaded Mode smoke is stable for leader reload, follower connect, prompt dispatch, voice forwarding, and status naming without visible rename noise.
 
-## P0 — Native Windows Threaded Mode Support
+## P1 — Native Windows Threaded Mode Follow-Ups
 
-Context: Threaded Mode uses a local leader/follower IPC bus. Unix-like platforms use Node `net` over Unix sockets; native Windows uses Node `net` named-pipe paths. The product expectation is identical behavior across both transports: leader/follower registration, heartbeats, forwarded Telegram API calls, thread target preservation, lifecycle cleanup, and shutdown semantics should not depend on socket-vs-pipe transport. This remains after the local Linux regression sweep is green.
+Context: Native Windows smoke on the WIP `dev` build now passes for classic mode, classic ownership handoff, hot upgrade to Threaded Mode, leader/follower registration and delivery, and hot downgrade back to classic with follower disconnect. The observed downgrade status convergence can take around 10 seconds, which is acceptable for the current retry-based safety model but should remain evidence-gated if it becomes user-visible friction.
 
 Open work:
 
-- [ ] Live smoke Threaded Mode on native Windows without WSL.
-  - Scope: leader/follower `/telegram-connect`, follower heartbeat, forwarded Bot API calls, restore flows, lifecycle announcements, shutdown cleanup, and reconnect/reload behavior.
-  - Observed: a same-directory follower can see a live leader lock but fail registration with `connect ENOENT \\.\\pipe\\...`, leaving the follower disconnected during leader reload/hot activation timing.
-  - Observed: Windows/QEMU live polling/dispatch can lag until reload; inbound messages appear to increase the extension queue count, but the next queued item is not dispatched promptly.
-  - Baseline: deterministic path tests run everywhere, and a Windows-only named-pipe roundtrip regression runs when the suite executes on `win32`. Live Windows smoke remains unavailable in this environment.
-- [x] Add a minimized registration-boundary regression for transient leader endpoint startup races.
-- [x] Add a session-bound queue dispatch watchdog so queued Telegram work can recover if a one-shot wakeup/timer is missed.
+- [ ] Capture text diagnostics if Windows classic restore/status convergence repeatedly exceeds the intended 5–15 second fallback window.
+- [ ] Add a focused regression or transport/status adjustment only if new Windows evidence shows a repeatable named-pipe, lock, heartbeat, queue, or status-convergence issue.
 
-Done when: Threaded Mode leader/follower operation works on native Windows with the same safety guarantees as Unix-like systems, and unsupported transport assumptions are covered by tests/docs.
+Done when: new Windows-specific runtime issues are either fixed with targeted coverage or left out of the backlog because the native smoke remains green.
 
 ## P1 — Evidence-Backed Telegram Client Follow-Ups
 

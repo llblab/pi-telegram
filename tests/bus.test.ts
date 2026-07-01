@@ -10,6 +10,14 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  classifyTelegramBusTransportError,
+  getTelegramBusFollowerEndpoint,
+  getTelegramBusLeaderEndpoint,
+  getTelegramBusTransportKind,
+  getTelegramBusTransportRetryPolicy,
+  probeTelegramBusEndpoint,
+} from "../lib/bus-transport.ts";
+import {
   createTelegramBusFollowerRegistry,
   createTelegramBusForeignOwnedUpdateForwarder,
   createTelegramBusLocalServer,
@@ -17,10 +25,95 @@ import {
   encodeTelegramBusEnvelope,
   getTelegramBusFollowerSocketPath,
   getTelegramBusSocketPath,
+  getTelegramFollowerTargetOwnership,
   isTelegramFollowerApiCallAllowed,
   parseTelegramBusEnvelope,
   sendTelegramBusLocalEnvelope,
 } from "../lib/bus.ts";
+test("Bus transport boundary derives socket and pipe endpoints", () => {
+  assert.equal(
+    getTelegramBusLeaderEndpoint({ agentDir: "/agent", platform: "linux" }),
+    join("/agent", "tmp", "telegram", "bus.sock"),
+  );
+  assert.equal(
+    getTelegramBusFollowerEndpoint({
+      agentDir: "/agent",
+      platform: "linux",
+      instanceId: "pid:123",
+    }),
+    join("/agent", "tmp", "telegram", "followers", "pid_123.sock"),
+  );
+  const pipe = getTelegramBusLeaderEndpoint({
+    agentDir: "C:\\Users\\Admin\\.pi\\agent",
+    platform: "win32",
+  });
+  assert.match(pipe, /^\\\\\.\\pipe\\pi-telegram-.+-bus$/);
+  assert.equal(getTelegramBusTransportKind(pipe), "pipe");
+  assert.equal(getTelegramBusTransportKind("/tmp/bus.sock"), "socket");
+});
+
+test("Bus transport retry policy is operation-aware", () => {
+  const pipe = getTelegramBusLeaderEndpoint({
+    agentDir: "C:\\Users\\Admin\\.pi\\agent",
+    platform: "win32",
+  });
+  assert.deepEqual(
+    getTelegramBusTransportRetryPolicy({
+      endpoint: pipe,
+      operation: "operation",
+    }),
+    { attempts: 3, delayMs: 100 },
+  );
+  assert.deepEqual(
+    getTelegramBusTransportRetryPolicy({
+      endpoint: "/tmp/bus.sock",
+      operation: "registration",
+    }),
+    { attempts: 10, delayMs: 150 },
+  );
+  assert.deepEqual(
+    getTelegramBusTransportRetryPolicy({
+      endpoint: "/tmp/bus.sock",
+      operation: "registration",
+      overrides: { attempts: 2, delayMs: 5 },
+    }),
+    { attempts: 2, delayMs: 5 },
+  );
+  assert.equal(
+    getTelegramBusTransportRetryPolicy({
+      endpoint: "/tmp/bus.sock",
+      operation: "operation",
+    }),
+    undefined,
+  );
+});
+
+test("Bus transport error classifier marks transient IPC failures retryable", () => {
+  const error = Object.assign(new Error("connect ENOENT"), {
+    code: "ENOENT",
+    syscall: "connect",
+  });
+  assert.deepEqual(classifyTelegramBusTransportError(error), {
+    message: "connect ENOENT",
+    code: "ENOENT",
+    syscall: "connect",
+    kind: "connect",
+    retryable: true,
+  });
+  assert.deepEqual(
+    classifyTelegramBusTransportError(
+      Object.assign(new Error("operation expired"), { code: "ETIMEDOUT" }),
+    ),
+    {
+      message: "operation expired",
+      code: "ETIMEDOUT",
+      syscall: undefined,
+      kind: "timeout",
+      retryable: true,
+    },
+  );
+});
+
 test("Bus socket path is scoped under the agent temp directory", () => {
   assert.equal(
     getTelegramBusSocketPath("/agent"),
@@ -268,6 +361,8 @@ test("Bus follower registry registers, heartbeats, and prunes live instances", (
     ["inst-a"],
   );
   assert.equal(registry.remove("inst-a"), true);
+  registry.register({ instanceId: "inst-c", connectedAtMs: 4000 });
+  registry.clear();
   assert.deepEqual(registry.list(), []);
 });
 
@@ -410,6 +505,137 @@ test("Bus follower API allowlist permits scoped own-topic cleanup only", () => {
       }),
       false,
     );
+  }
+});
+
+test("Bus transport probe reports reachable and unreachable endpoints", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-probe-"));
+  const socketPath = join(dir, "bus.sock");
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: () => ({ kind: "bus.ack", requestId: "probe", ok: true }),
+  });
+  try {
+    const missing = await probeTelegramBusEndpoint({
+      endpoint: socketPath,
+      timeoutMs: 50,
+    });
+    assert.equal(missing.reachable, false);
+    assert.equal(missing.transport, "socket");
+    await server.start();
+    const reachable = await probeTelegramBusEndpoint({
+      endpoint: socketPath,
+      timeoutMs: 50,
+    });
+    assert.deepEqual(reachable, {
+      endpoint: socketPath,
+      transport: "socket",
+      reachable: true,
+    });
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus local client transport events include request diagnostics", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-client-events-"));
+  const socketPath = join(dir, "missing.sock");
+  const events: Array<{ phase: string; details: Record<string, unknown> }> = [];
+  try {
+    await assert.rejects(
+      sendTelegramBusLocalEnvelope({
+        socketPath,
+        envelope: {
+          kind: "follower.heartbeat",
+          requestId: "inst-a:events",
+          instanceId: "inst-a",
+          sentAtMs: 2000,
+        },
+        recordTransportEvent: (phase, details) => events.push({ phase, details }),
+      }),
+    );
+    assert.equal(events.length, 1);
+    assert.equal(events[0].phase, "client-failed");
+    assert.equal(events[0].details.envelopeKind, "follower.heartbeat");
+    assert.equal(events[0].details.requestId, "inst-a:events");
+    assert.equal(events[0].details.transport, "socket");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus local client classifies response timeouts as transport timeouts", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-client-timeout-"));
+  const socketPath = join(dir, "bus.sock");
+  const events: Array<{ phase: string; details: Record<string, unknown> }> = [];
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: () => undefined,
+  });
+  try {
+    await server.start();
+    await assert.rejects(
+      sendTelegramBusLocalEnvelope({
+        socketPath,
+        timeoutMs: 5,
+        envelope: {
+          kind: "follower.heartbeat",
+          requestId: "inst-a:timeout",
+          instanceId: "inst-a",
+          sentAtMs: 2000,
+        },
+        recordTransportEvent: (phase, details) => events.push({ phase, details }),
+      }),
+    );
+    assert.equal(events[0].phase, "client-failed");
+    assert.equal(events[0].details.code, "ETIMEDOUT");
+    assert.equal(events[0].details.kind, "timeout");
+    assert.equal(events[0].details.retryable, true);
+    assert.equal(events[0].details.requestId, "inst-a:timeout");
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus local IPC server reports handler failures as protocol acks", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-handler-failure-"));
+  const socketPath = join(dir, "bus.sock");
+  const events: Array<{ phase: string; details: Record<string, unknown> }> = [];
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: () => {
+      throw new Error("boom");
+    },
+    recordTransportEvent: (phase, details) => events.push({ phase, details }),
+  });
+  try {
+    await server.start();
+    const response = await sendTelegramBusLocalEnvelope({
+      socketPath,
+      envelope: {
+        kind: "follower.heartbeat",
+        requestId: "inst-a:failed-handler",
+        instanceId: "inst-a",
+        sentAtMs: 2000,
+      },
+    });
+    assert.deepEqual(response, {
+      kind: "bus.ack",
+      requestId: "inst-a:failed-handler",
+      ok: false,
+      message: "Telegram bus handler failed.",
+    });
+    const failure = events.find(
+      (event) => event.phase === "server-handler-failed",
+    );
+    assert.equal(failure?.details.envelopeKind, "follower.heartbeat");
+    assert.equal(failure?.details.requestId, "inst-a:failed-handler");
+    assert.equal(failure?.details.transport, "socket");
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -627,6 +853,39 @@ test("Bus follower registry resolves followers by target", () => {
     "thread",
   );
   assert.equal(registry.getByTarget({ chatId: 1, threadId: 3 }), undefined);
+});
+
+test("Bus follower target ownership falls back to active thread records", () => {
+  assert.deepEqual(
+    getTelegramFollowerTargetOwnership({
+      target: { chatId: 1, threadId: 2 },
+      followers: [],
+      currentInstanceId: "leader",
+      activeThreadRecords: [
+        {
+          status: "active",
+          instanceId: "follower-a",
+          target: { chatId: 1, threadId: 2 },
+        },
+      ],
+    }),
+    { instanceId: "follower-a" },
+  );
+  assert.equal(
+    getTelegramFollowerTargetOwnership({
+      target: { chatId: 1, threadId: 2 },
+      followers: [],
+      currentInstanceId: "leader",
+      activeThreadRecords: [
+        {
+          status: "offline",
+          instanceId: "follower-a",
+          target: { chatId: 1, threadId: 2 },
+        },
+      ],
+    }),
+    undefined,
+  );
 });
 
 test("Bus follower registry returns defensive copies", () => {

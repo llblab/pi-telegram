@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  applyTelegramThreadCapability,
   buildTelegramInitialSyncRequest,
   buildTelegramLongPollRequest,
   createTelegramPollingActivityReader,
@@ -14,6 +15,7 @@ import {
   createTelegramPollingControllerRuntime,
   createTelegramPollingControllerState,
   createTelegramPollLoopRunner,
+  createTelegramThreadAwarePollingPorts,
   getLatestTelegramUpdateId,
   isTelegramGetUpdatesConflictError,
   isTelegramPollingControllerActive,
@@ -56,6 +58,191 @@ test("Polling helpers extract the latest update id", () => {
   assert.equal(
     getLatestTelegramUpdateId([{ update_id: 1 }, { update_id: 7 }]),
     7,
+  );
+});
+
+test("Thread-aware polling blocks follower takeover during Threaded Mode downgrade", async () => {
+  const events: Array<{ category: string; details?: Record<string, unknown> }> = [];
+  const callApi = async <TResponse,>(): Promise<TResponse> => ({}) as TResponse;
+  const store = {
+    async load() {},
+    async persist() {},
+    getBotState() {
+      return { threadMode: "disabled" as const };
+    },
+    setBotState() {},
+    list() {
+      return [
+        {
+          status: "active",
+          target: { chatId: 42, threadId: 7 },
+        },
+      ];
+    },
+  };
+  const ports = createTelegramThreadAwarePollingPorts({
+    getAllowedUserId: () => 42,
+    callApi,
+    topicTargetStore: store,
+    isBusConfigured: () => true,
+    isBusRuntimeEnabled: () => false,
+    isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false,
+    setPollingStartedWithTelegramBus() {},
+    setForceFreshLeaderThreadOnNextStart() {},
+    setTopicModeUnavailable() {},
+    startClassicPolling() {},
+    async stopClassicPolling() {},
+    async startBusLeaderPolling() {},
+    async stopBusLeaderPolling() {},
+    startLeaderHealth() {},
+    stopLeaderHealth() {},
+    registerFollowerWithLeader: async () => true,
+    stopFollowerRegistration() {},
+    recordEvent(category, _error, details) {
+      events.push({ category, details });
+    },
+  });
+
+  await assert.rejects(
+    ports.registerFollowerWithOwner?.(TEST_CONTEXT, { pid: 1 }),
+    /current leader remains the classic polling owner/u,
+  );
+  assert.deepEqual(events, [
+    {
+      category: "bus",
+      details: {
+        phase: "follower-register-thread-mode-disabled",
+        reason: "active-thread-bindings-present",
+      },
+    },
+  ]);
+});
+
+test("Thread capability downgrade retries classic restore after failure", async () => {
+  let state: {
+    threadMode?: "enabled" | "disabled" | "unknown";
+    updatedAtMs?: number;
+    lastReconcileAction?: string;
+  } = {
+    threadMode: "enabled",
+    lastReconcileAction: "capability-monitor-enabled",
+  };
+  let pollingStartedWithBus = true;
+  let classicStarts = 0;
+  let persisted = 0;
+  const events: Array<{ category: string; details?: Record<string, unknown> }> = [];
+  const store = {
+    async load() {},
+    async persist() {
+      persisted += 1;
+    },
+    getBotState() {
+      return state;
+    },
+    setBotState(next: typeof state) {
+      state = { ...state, ...next };
+    },
+    list() {
+      return [
+        {
+          status: "active",
+          target: { chatId: 42, threadId: 7 },
+        },
+      ];
+    },
+  };
+  const deps = {
+    getAllowedUserId: () => 42,
+    callApi: async <TResponse,>(): Promise<TResponse> => ({}) as TResponse,
+    topicTargetStore: store,
+    isBusConfigured: () => true,
+    ownsLock: () => true,
+    getPollingStartedWithTelegramBus: () => pollingStartedWithBus,
+    setPollingStartedWithTelegramBus(started: boolean) {
+      pollingStartedWithBus = started;
+    },
+    setTopicModeUnavailable() {},
+    stopFollowerRegistration() {},
+    startClassicPolling() {
+      classicStarts += 1;
+      if (classicStarts === 1) throw new Error("classic unavailable");
+    },
+    async stopClassicPolling() {},
+    async startBusPolling() {},
+    async stopBusPolling() {},
+    startLeaderHealth() {},
+    stopLeaderHealth() {},
+    isTopicModeUnavailableError: () => false,
+    updateStatus() {},
+    recordEvent(category: string, _error: unknown, details?: Record<string, unknown>) {
+      events.push({ category, details });
+    },
+  };
+
+  await applyTelegramThreadCapability(
+    TEST_CONTEXT,
+    false,
+    "capability-monitor-disabled-confirmed",
+    deps,
+  );
+  assert.equal(classicStarts, 1);
+  assert.equal(
+    state.lastReconcileAction,
+    "capability-monitor-disabled-confirmed-classic-restore-failed",
+  );
+  assert.equal(pollingStartedWithBus, false);
+
+  await applyTelegramThreadCapability(
+    TEST_CONTEXT,
+    false,
+    "capability-monitor-disabled-confirmed",
+    deps,
+  );
+  assert.equal(classicStarts, 2);
+  assert.equal(state.lastReconcileAction, "capability-monitor-disabled-confirmed");
+  assert.equal(persisted >= 3, true);
+  assert.equal(events[0].details?.phase, "capability-monitor-disabled-confirmed-classic-restore");
+});
+
+test("Thread-aware polling still allows classic takeover path without thread bindings", async () => {
+  const callApi = async <TResponse,>(): Promise<TResponse> => ({}) as TResponse;
+  const store = {
+    async load() {},
+    async persist() {},
+    getBotState() {
+      return { threadMode: "disabled" as const };
+    },
+    setBotState() {},
+    list() {
+      return [];
+    },
+  };
+  const ports = createTelegramThreadAwarePollingPorts({
+    getAllowedUserId: () => 42,
+    callApi,
+    topicTargetStore: store,
+    isBusConfigured: () => true,
+    isBusRuntimeEnabled: () => false,
+    isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false,
+    setPollingStartedWithTelegramBus() {},
+    setForceFreshLeaderThreadOnNextStart() {},
+    setTopicModeUnavailable() {},
+    startClassicPolling() {},
+    async stopClassicPolling() {},
+    async startBusLeaderPolling() {},
+    async stopBusLeaderPolling() {},
+    startLeaderHealth() {},
+    stopLeaderHealth() {},
+    registerFollowerWithLeader: async () => true,
+    stopFollowerRegistration() {},
+    recordEvent() {},
+  });
+
+  assert.equal(
+    await ports.registerFollowerWithOwner?.(TEST_CONTEXT, { pid: 1 }),
+    undefined,
   );
 });
 

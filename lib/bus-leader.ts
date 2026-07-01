@@ -21,6 +21,7 @@ import {
   type TelegramBusFollowerView,
   type TelegramBusInstanceRegistration,
 } from "./bus.ts";
+import { getTelegramBusTransportRetryPolicy } from "./bus-transport.ts";
 
 export interface TelegramBusLeaderRuntime<TContext> {
   startPolling: (ctx: TContext) => Promise<void>;
@@ -598,31 +599,22 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
     >,
   ): Promise<TelegramBusEnvelope> => {
     const follower = deps.followerRegistry.get(envelope.recipientInstanceId);
-    if (!follower) {
-      return {
-        kind: "bus.ack",
-        requestId: envelope.requestId,
-        ok: false,
-        message: "Unknown Telegram bus follower instance.",
-      };
-    }
-    if (!follower.busSocketPath) {
-      return {
-        kind: "bus.ack",
-        requestId: envelope.requestId,
-        ok: false,
-        message: "Telegram bus follower does not expose a receiver socket.",
-      };
-    }
-    deps.followerRegistry.heartbeat(follower.instanceId, getNowMs());
+    const followerSocketPath =
+      follower?.busSocketPath ??
+      getTelegramBusFollowerSocketPath(envelope.recipientInstanceId);
+    if (follower) deps.followerRegistry.heartbeat(follower.instanceId, getNowMs());
     try {
       const response = await sendTelegramBusLocalEnvelope({
-        socketPath: follower.busSocketPath,
+        socketPath: followerSocketPath,
         envelope,
         timeoutMs: deps.timeoutMs,
+        retry: getTelegramBusTransportRetryPolicy({
+          endpoint: followerSocketPath,
+          operation: "operation",
+        }),
       });
       if (response?.kind === "bus.ack" && response.ok) {
-        deps.followerRegistry.heartbeat(follower.instanceId, getNowMs());
+        if (follower) deps.followerRegistry.heartbeat(follower.instanceId, getNowMs());
         return { kind: "bus.ack", requestId: envelope.requestId, ok: true };
       }
       const message =
@@ -842,7 +834,7 @@ export function createTelegramBusLeaderRuntime<TContext>(
 ): TelegramBusLeaderRuntime<TContext> {
   const getNowMs = deps.getNowMs ?? Date.now;
   const followerPruneIntervalMs = deps.followerPruneIntervalMs ?? 1000;
-  const followerStaleAfterMs = deps.followerStaleAfterMs ?? 2000;
+  const followerStaleAfterMs = deps.followerStaleAfterMs ?? 5000;
   let pruneInterval: ReturnType<typeof setInterval> | undefined;
   const stopPruning = () => {
     if (!pruneInterval) return;
@@ -878,6 +870,12 @@ export function createTelegramBusLeaderRuntime<TContext>(
   };
   const localServer = createTelegramBusLocalServer({
     socketPath: deps.socketPath,
+    recordTransportEvent(phase, details) {
+      deps.recordRuntimeEvent?.("bus", `Telegram bus ${phase}`, {
+        phase: `leader-${phase}`,
+        ...details,
+      });
+    },
     handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
       followerRegistry: deps.followerRegistry,
       authSecret: deps.authSecret,
@@ -917,6 +915,7 @@ export function createTelegramBusLeaderRuntime<TContext>(
           .catch((error) =>
             deps.recordRuntimeEvent?.("bus", error, { phase: "stop" }),
           );
+        deps.followerRegistry.clear();
       }
     },
   };

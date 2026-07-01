@@ -225,7 +225,7 @@ The agent writes intent; providers or voice handlers own TTS and format conversi
 
 ### Voice reply policies
 
-The bridge can automatically convert agent text replies into Telegram voice messages without requiring explicit `<!-- telegram_voice -->` markup in every response. Configure this from Settings → `👄 Voice reply` or by setting `voice.replyMode` in `telegram.json`:
+The bridge can automatically convert agent text replies into Telegram voice messages without requiring explicit `<!-- telegram_voice -->` markup in every response. Configure this from Settings → `Voice reply` or by setting `voice.replyMode` in `telegram.json`:
 
 - `hidden` (default): no `voice.replyMode` is stored. Behavior is manual, but prompt context stays silent.
 - `manual`: agent-authored `<!-- telegram_voice -->` markup is required for voice replies; no automatic conversion. Unlike `hidden`, this explicit mode adds `[voice] reply mode: manual` context.
