@@ -1,6 +1,6 @@
 {
   "name": "@llblab/pi-telegram",
-  "version": "0.19.2",
+  "version": "0.19.3",
   "private": false,
   "publishConfig": {
     "access": "public"
@@ -59,7 +59,7 @@
     "extensions": [
       "./index.ts"
     ],
-    "image": "https://github.com/llblab/pi-telegram/raw/main/screenshot.png"
+    "image": "https://github.com/llblab/pi-telegram/raw/main/banner.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

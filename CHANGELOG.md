@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.3: Extension Catalogue Image Hotfix
+
+- `[Package]` Updated the Pi extension catalogue image URL from the missing `screenshot.png` to the packaged `banner.png`. Impact: Pi extension catalogue listings can render the working banner image for `pi-telegram`.
+
 ## 0.19.2: Draft And Rendering Isolation Hotfix
 
 - `[Config]` Grouped assistant answer output under `assistant: { rendering, draftPreviews }`, while still reading and cleaning up legacy `assistantRendering`, `draftPreviews`, and `richDraftPreviews`. Impact: config vocabulary now matches the feature boundary; draft visibility and final rendering live together without implying that previews are inherently Rich Markdown.
