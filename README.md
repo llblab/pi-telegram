@@ -93,8 +93,8 @@ The first Telegram user to message the bot becomes the allowed owner. Other user
 | Prompt templates | Run Pi prompt templates as Telegram-safe commands such as `/fix_tests`. | Reusable local workflows become phone-accessible without exposing arbitrary terminal commands. |
 | Model and thinking | Switch model or reasoning level from Telegram through safe continuation flows. | Mobile control can adjust execution strategy without tearing down the current session. |
 | Compaction | Confirm `/compact`, show native active status during compaction, and preserve Telegram-owned turn semantics. | Context maintenance is visible and safe from the phone. |
-| Streaming previews | Show native active status and, when enabled, Rich Markdown drafts while the agent is still working. | The operator can see progress without making draft rendering the baseline. |
-| Final Rich Markdown | Deliver complete assistant/guest model replies through Telegram Rich Message APIs with safe splitting. | Meaningful model answers stay readable on narrow mobile screens without forcing generic HTML conversion. |
+| Draft previews | Show native active status by default, or enable Telegram Rich Draft previews while the agent is still working. | The operator can hide/show in-progress text independently from final rendering. |
+| Assistant rendering | Choose Native Rich Markdown or legacy Markdown-to-HTML for final assistant replies. | Renderer compatibility is explicit instead of being conflated with draft previews. |
 | Bridge UI rendering | Render tool rows, reasoning/technical steps, menus, queue controls, status, settings, diagnostics, and sections through explicit Telegram HTML/plain UI. | Harness-owned surfaces remain operationally predictable and visually distinct from model-authored answers. |
 | Inbound files | Download inbound files to the Pi agent temp directory with size limits. | Screenshots, PDFs, datasets, and artifacts enter Pi as inspectable local files. |
 | Outbound artifacts | Return generated files through `telegram_attach` during active turns or explicit direct delivery. | Agents send real artifacts as files, not pasted blobs. |
@@ -160,7 +160,7 @@ Messages sent while Pi is busy become queued turns. Priority lanes support contr
 
 ### Native Rich Markdown
 
-Rich Markdown is the model-answer membrane. Complete assistant and guest model replies use Telegram's native Rich Message APIs, while tool-call rows, reasoning/thinking blocks, menus, status rows, queue controls, settings, diagnostics, and other harness-owned surfaces use explicit Telegram HTML/plain rendering. This keeps meaningful model-authored answers visually distinct from bridge-owned operational UI. Streaming previews may use rich-message drafts when enabled; final replies persist through `sendRichMessage`.
+Rich Markdown is the default model-answer membrane. Complete assistant and guest model replies use Telegram's native Rich Message APIs, while tool-call rows, reasoning/thinking blocks, menus, status rows, queue controls, settings, diagnostics, and other harness-owned surfaces use explicit Telegram HTML/plain rendering. This keeps meaningful model-authored answers visually distinct from bridge-owned operational UI. Two Settings controls keep the layers separate: `Draft previews` toggles live `sendRichMessageDraft` frames, while `Assistant rendering` chooses final-answer delivery (`rich` Native Rich Markdown or `html` legacy Markdown-to-HTML).
 
 ### Files And Artifacts
 
@@ -202,7 +202,7 @@ Most controls live in Pi commands or the Telegram menu. Environment variables re
 | Inbound file limit | `PI_TELEGRAM_INBOUND_FILE_MAX_BYTES`, `TELEGRAM_MAX_FILE_SIZE_BYTES` |
 | Outbound attachment limit | `PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES`, `TELEGRAM_MAX_ATTACHMENT_SIZE_BYTES` |
 
-Defaults are chosen for ordinary private-bot use: saved config in `~/.pi/agent`, inbound temp files in `~/.pi/agent/tmp/telegram`, native Rich Markdown replies, and native Telegram active status for long-running turns.
+Defaults are chosen for ordinary private-bot use: saved config in `~/.pi/agent`, inbound temp files in `~/.pi/agent/tmp/telegram`, `assistantRendering: "rich"` for final replies, `richDraftPreviews: false` for no live draft text by default, and native Telegram active status for long-running turns.
 
 ## Extension Platform
 

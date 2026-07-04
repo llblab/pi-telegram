@@ -9,8 +9,10 @@ import test from "node:test";
 import {
   buildProactivePushSettingsReplyMarkup,
   buildProactivePushSettingsText,
-  buildRichDraftPreviewsSettingsReplyMarkup,
-  buildRichDraftPreviewsSettingsText,
+  buildAssistantRenderingSettingsReplyMarkup,
+  buildAssistantRenderingSettingsText,
+  buildDraftPreviewsSettingsReplyMarkup,
+  buildDraftPreviewsSettingsText,
   buildTelegramSettingsMenuReplyMarkup,
   buildTelegramSettingsMenuText,
   buildTimeInjectionModeSettingsReplyMarkup,
@@ -37,7 +39,8 @@ test("Settings menu text and reply markup expose built-in controls", () => {
       "menu:back",
       "settings:open:voice-reply",
       "settings:open:time-injection",
-      "settings:open:rich-drafts",
+        "settings:open:draft-previews",
+      "settings:open:assistant-rendering",
       "settings:open:proactive",
     ],
   );
@@ -46,16 +49,23 @@ test("Settings menu text and reply markup expose built-in controls", () => {
     markup.inline_keyboard[2]?.[0]?.text,
     "🕒 Time injection: hidden",
   );
-  assert.equal(markup.inline_keyboard[3]?.[0]?.text, "📝 Rich drafts: off");
-  assert.equal(markup.inline_keyboard[4]?.[0]?.text, "📌 Proactive push: on");
+  assert.equal(markup.inline_keyboard[3]?.[0]?.text, "📝 Draft previews: off");
+  assert.equal(markup.inline_keyboard[4]?.[0]?.text, "🧾 Rendering: rich");
+  assert.equal(markup.inline_keyboard[5]?.[0]?.text, "📌 Proactive push: on");
 });
 
 test("Settings detail markups show active values", () => {
   assert.match(buildProactivePushSettingsText(true), /<code>on<\/code>/);
-  assert.match(buildRichDraftPreviewsSettingsText(false), /<code>off<\/code>/);
+  assert.match(buildDraftPreviewsSettingsText(false), /<code>off<\/code>/);
   assert.equal(
-    buildRichDraftPreviewsSettingsReplyMarkup(true).inline_keyboard[1]?.[0]?.text,
+    buildDraftPreviewsSettingsReplyMarkup(true).inline_keyboard[1]?.[0]?.text,
     "🟢 On",
+  );
+  assert.match(buildAssistantRenderingSettingsText("html"), /<code>html<\/code>/);
+  assert.equal(
+    buildAssistantRenderingSettingsReplyMarkup("rich").inline_keyboard[1]?.[0]
+      ?.text,
+    "🟢 rich",
   );
   assert.equal(
     buildProactivePushSettingsReplyMarkup(false).inline_keyboard[1]?.[1]?.text,
@@ -86,11 +96,15 @@ test("Settings callback action mutates voice, time, and proactive settings", asy
     isVoiceReplyModeConfigured: () => true,
     getTimeInjectionMode: () => "hidden" as const,
     areRichDraftPreviewsEnabled: () => false,
+    getAssistantRenderingMode: () => "rich" as const,
     setProactivePushEnabled: async (enabled: boolean) => {
       calls.push(`proactive:${enabled}`);
     },
     setRichDraftPreviewsEnabled: async (enabled: boolean) => {
-      calls.push(`rich-drafts:${enabled}`);
+      calls.push(`draft-previews:${enabled}`);
+    },
+    setAssistantRenderingMode: async (mode: "rich" | "html") => {
+      calls.push(`rendering:${mode}`);
     },
     setVoiceReplyMode: async (
       mode: "manual" | "mirror" | "always" | undefined,
@@ -127,7 +141,7 @@ test("Settings callback action mutates voice, time, and proactive settings", asy
   assert.equal(
     await handleTelegramSettingsMenuCallbackAction(
       "q3",
-      "settings:set:rich-drafts:on",
+      "settings:set:draft-previews:on",
       deps,
     ),
     true,
@@ -135,13 +149,21 @@ test("Settings callback action mutates voice, time, and proactive settings", asy
   assert.equal(
     await handleTelegramSettingsMenuCallbackAction(
       "q4",
+      "settings:set:assistant-rendering:html",
+      deps,
+    ),
+    true,
+  );
+  assert.equal(
+    await handleTelegramSettingsMenuCallbackAction(
+      "q5",
       "settings:set:proactive:on",
       deps,
     ),
     true,
   );
   assert.equal(
-    await handleTelegramSettingsMenuCallbackAction("q5", "other", deps),
+    await handleTelegramSettingsMenuCallbackAction("q6", "other", deps),
     false,
   );
 
@@ -152,9 +174,12 @@ test("Settings callback action mutates voice, time, and proactive settings", asy
     "time:hidden",
     "update:<b>🕒 Time injection mode:</b> <code>hidden</code>",
     "answer:Time injection: hidden",
-    "rich-drafts:true",
-    "update:<b>📝 Rich draft previews:</b> <code>off</code>",
-    "answer:Rich draft previews enabled",
+    "draft-previews:true",
+    "update:<b>📝 Draft previews:</b> <code>off</code>",
+    "answer:Draft previews enabled",
+    "rendering:html",
+    "update:<b>🧾 Assistant rendering:</b> <code>rich</code>",
+    "answer:Rendering: html",
     "proactive:true",
     "update:<b>📌 Proactive push:</b> <code>off</code>",
     "answer:Proactive push enabled",
@@ -178,11 +203,15 @@ test("Settings runtime opens menus and applies stale-message fallback toggles", 
     isVoiceReplyModeConfigured: () => true,
     getTimeInjectionMode: () => "hidden",
     areRichDraftPreviewsEnabled: () => false,
+    getAssistantRenderingMode: () => "rich",
     setProactivePushEnabled: async (enabled) => {
       calls.push(`proactive:${enabled}`);
     },
     setRichDraftPreviewsEnabled: async (enabled) => {
-      calls.push(`rich-drafts:${enabled}`);
+      calls.push(`draft-previews:${enabled}`);
+    },
+    setAssistantRenderingMode: async (mode) => {
+      calls.push(`rendering:${mode}`);
     },
     setVoiceReplyMode: async (mode) => {
       calls.push(`voice:${mode ?? "hidden"}`);

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.1: Settings Layer Hotfix
+
+- `[Settings]` Split the overloaded Rich Draft setting into two independent controls: `Draft previews` for live `sendRichMessageDraft` streaming and `Assistant rendering` for final-answer delivery mode. Impact: operators can hide/show in-progress drafts without changing how final Markdown is rendered.
+- `[Rendering]` Added persisted `assistantRendering: "rich" | "html"`, defaulting to Native Rich Markdown and allowing legacy Markdown-to-HTML final assistant replies when selected. Impact: renderer compatibility is explicit instead of being conflated with preview visibility.
+- `[Preview]` Kept `richDraftPreviews` as the stored draft-preview flag for compatibility, but renamed the Settings UI to `Draft previews`. Impact: existing configs keep working while the product vocabulary matches the Bot API layer.
+- `[Validation]` Updated menu/settings/reply regressions for the two-axis configuration model.
+
 ## 0.19.0: Telegram Companion Hub
 
 - `[Context]` Defined Rich Markdown as the model-answer membrane: complete assistant/guest model replies use native Rich Message delivery, while tool rows, reasoning/thinking blocks, menus, status, queue controls, settings, diagnostics, and other harness-owned surfaces stay on explicit Telegram HTML/plain rendering.

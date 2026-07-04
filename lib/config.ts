@@ -47,6 +47,8 @@ export interface ResolvedTelegramTimeConfig {
   timezone: string;
 }
 
+export type TelegramAssistantRenderingMode = "rich" | "html";
+
 export interface TelegramConfig {
   botToken?: string;
   botUsername?: string;
@@ -58,6 +60,7 @@ export interface TelegramConfig {
   outboundHandlers?: TelegramOutboundHandlerConfig[];
   proactivePush?: boolean;
   richDraftPreviews?: boolean;
+  assistantRendering?: TelegramAssistantRenderingMode;
   voice?: {
     replyMode?: "manual" | "mirror" | "always";
     /** Whether to attach the provider's transcriptText as caption on voice messages */
@@ -277,6 +280,26 @@ export function createTelegramRichDraftPreviewsSetter(
   };
 }
 
+export function createTelegramAssistantRenderingModeGetter(
+  configStore: Pick<TelegramConfigStore, "get">,
+): () => TelegramAssistantRenderingMode {
+  return () => {
+    const mode = configStore.get().assistantRendering;
+    return mode === "html" ? "html" : "rich";
+  };
+}
+
+export function createTelegramAssistantRenderingModeSetter(
+  configStore: TelegramMutableConfigStore,
+): (mode: TelegramAssistantRenderingMode) => Promise<void> {
+  return async (mode) => {
+    await loadLatestTelegramConfig(configStore);
+    const config = { ...configStore.get(), assistantRendering: mode };
+    configStore.set(config);
+    await configStore.persist(config);
+  };
+}
+
 export function createTelegramVoiceReplyModeGetter(
   configStore: Pick<TelegramConfigStore, "get">,
 ): () => "manual" | "mirror" | "always" {
@@ -416,6 +439,10 @@ export function createTelegramConfigControls(
       createTelegramRichDraftPreviewsChecker(configStore),
     setRichDraftPreviewsEnabled:
       createTelegramRichDraftPreviewsSetter(configStore),
+    getAssistantRenderingMode:
+      createTelegramAssistantRenderingModeGetter(configStore),
+    setAssistantRenderingMode:
+      createTelegramAssistantRenderingModeSetter(configStore),
     getVoiceReplyMode: createTelegramVoiceReplyModeGetter(configStore),
     isVoiceReplyModeConfigured:
       createTelegramVoiceReplyModeConfiguredChecker(configStore),

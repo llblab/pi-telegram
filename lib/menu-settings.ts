@@ -8,7 +8,10 @@ import {
   getTelegramExtensionSettingsRows,
   type TelegramSectionRegistry,
 } from "./sections.ts";
-import type { TelegramTimeMode } from "./config.ts";
+import type {
+  TelegramAssistantRenderingMode,
+  TelegramTimeMode,
+} from "./config.ts";
 import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
 import type { TelegramModelMenuState } from "./menu-model.ts";
 import type { MenuModel } from "./model.ts";
@@ -19,6 +22,7 @@ export type TelegramSettingsMenuReplyMarkup = TelegramInlineKeyboardMarkup;
 export interface TelegramSettingsStateDeps {
   isProactivePushEnabled: () => boolean;
   areRichDraftPreviewsEnabled: () => boolean;
+  getAssistantRenderingMode: () => TelegramAssistantRenderingMode;
   getTimeInjectionMode: () => TelegramTimeMode;
   getVoiceReplyMode: () => TelegramVoiceReplyMode;
   isVoiceReplyModeConfigured: () => boolean;
@@ -27,6 +31,9 @@ export interface TelegramSettingsStateDeps {
 export interface TelegramSettingsMutationDeps extends TelegramSettingsStateDeps {
   setProactivePushEnabled: (enabled: boolean) => Promise<void>;
   setRichDraftPreviewsEnabled: (enabled: boolean) => Promise<void>;
+  setAssistantRenderingMode: (
+    mode: TelegramAssistantRenderingMode,
+  ) => Promise<void>;
   setVoiceReplyMode: (
     mode: TelegramVoiceReplyMode | undefined,
   ) => Promise<void>;
@@ -118,8 +125,9 @@ export interface TelegramSettingsMenuRuntimeDeps<
 
 export const SETTINGS_MENU_TITLE = "<b>⚙️ Settings:</b>";
 export const PROACTIVE_PUSH_SETTINGS_TITLE = "<b>📌 Proactive push:</b>";
-export const RICH_DRAFT_PREVIEWS_SETTINGS_TITLE =
-  "<b>📝 Rich draft previews:</b>";
+export const DRAFT_PREVIEWS_SETTINGS_TITLE = "<b>📝 Draft previews:</b>";
+export const ASSISTANT_RENDERING_SETTINGS_TITLE =
+  "<b>🧾 Assistant rendering:</b>";
 export const TIME_INJECTION_MODE_SETTINGS_TITLE =
   "<b>🕒 Time injection mode:</b>";
 export const VOICE_REPLY_MODE_SETTINGS_TITLE = "<b>👄 Voice reply mode:</b>";
@@ -155,14 +163,27 @@ export function buildProactivePushSettingsText(
   ].join("\n");
 }
 
-export function buildRichDraftPreviewsSettingsText(enabled: boolean): string {
+export function buildDraftPreviewsSettingsText(enabled: boolean): string {
   return [
-    `${RICH_DRAFT_PREVIEWS_SETTINGS_TITLE} <code>${enabled ? "on" : "off"}</code>`,
+    `${DRAFT_PREVIEWS_SETTINGS_TITLE} <code>${enabled ? "on" : "off"}</code>`,
     "",
-    "Show progressive Rich Markdown draft previews while the model is answering.",
+    "Show live answer drafts while the model is answering.",
     "",
-    "<code>-</code> <code>off</code> (default): show native active status, then send the final Rich Markdown answer.",
-    "<code>-</code> <code>on</code>: also stream safe Rich Markdown draft previews before the final answer.",
+    "<code>-</code> <code>off</code> (default): show native active status, then send one final answer.",
+    "<code>-</code> <code>on</code>: stream safe Telegram Rich Draft frames before the final answer.",
+  ].join("\n");
+}
+
+export function buildAssistantRenderingSettingsText(
+  mode: TelegramAssistantRenderingMode,
+): string {
+  return [
+    `${ASSISTANT_RENDERING_SETTINGS_TITLE} <code>${mode}</code>`,
+    "",
+    "Choose how final assistant Markdown answers are delivered.",
+    "",
+    "<code>-</code> <code>rich</code> (default): use Telegram Native Rich Markdown.",
+    "<code>-</code> <code>html</code>: use the legacy Markdown-to-HTML renderer.",
   ].join("\n");
 }
 
@@ -200,12 +221,35 @@ export function buildTimeInjectionModeSettingsText(
 
 export function buildTelegramSettingsMenuReplyMarkup(
   proactivePushEnabled: boolean,
-  richDraftPreviewsEnabled: boolean,
-  voiceReplyMode: TelegramVoiceReplyMode,
-  timeInjectionMode: TelegramTimeMode,
-  sectionRegistry?: TelegramSectionRegistry,
+  draftPreviewsEnabled: boolean,
+  assistantRenderingModeOrVoiceReplyMode: TelegramAssistantRenderingMode | TelegramVoiceReplyMode,
+  voiceReplyModeOrTimeInjectionMode: TelegramVoiceReplyMode | TelegramTimeMode,
+  timeInjectionModeOrSectionRegistry?: TelegramTimeMode | TelegramSectionRegistry,
+  sectionRegistryOrVoiceReplyModeConfigured?: TelegramSectionRegistry | boolean,
   voiceReplyModeConfigured = true,
 ): TelegramSettingsMenuReplyMarkup {
+  const hasRenderingMode =
+    assistantRenderingModeOrVoiceReplyMode === "rich" ||
+    assistantRenderingModeOrVoiceReplyMode === "html";
+  const assistantRenderingMode: TelegramAssistantRenderingMode = hasRenderingMode
+    ? assistantRenderingModeOrVoiceReplyMode
+    : "rich";
+  const voiceReplyMode = hasRenderingMode
+    ? (voiceReplyModeOrTimeInjectionMode as TelegramVoiceReplyMode)
+    : (assistantRenderingModeOrVoiceReplyMode as TelegramVoiceReplyMode);
+  const timeInjectionMode = hasRenderingMode
+    ? (timeInjectionModeOrSectionRegistry as TelegramTimeMode)
+    : (voiceReplyModeOrTimeInjectionMode as TelegramTimeMode);
+  const sectionRegistry = hasRenderingMode
+    ? (sectionRegistryOrVoiceReplyModeConfigured as
+        | TelegramSectionRegistry
+        | undefined)
+    : (timeInjectionModeOrSectionRegistry as TelegramSectionRegistry | undefined);
+  const effectiveVoiceReplyModeConfigured = hasRenderingMode
+    ? voiceReplyModeConfigured
+    : typeof sectionRegistryOrVoiceReplyModeConfigured === "boolean"
+      ? sectionRegistryOrVoiceReplyModeConfigured
+      : true;
   const rows: Array<Array<{ text: string; callback_data: string }>> = [
     [{ text: "⬆️ Main menu", callback_data: "menu:back" }],
   ];
@@ -221,7 +265,7 @@ export function buildTelegramSettingsMenuReplyMarkup(
       {
         text: `👄 Voice reply: ${getTelegramSettingsStateValueLabel(
           getVoiceReplyModeLabel(
-            getVoiceReplyModeSetting(voiceReplyMode, voiceReplyModeConfigured),
+            getVoiceReplyModeSetting(voiceReplyMode, effectiveVoiceReplyModeConfigured),
           ),
         )}`,
         callback_data: "settings:open:voice-reply",
@@ -235,8 +279,14 @@ export function buildTelegramSettingsMenuReplyMarkup(
     ],
     [
       {
-        text: `📝 Rich drafts: ${richDraftPreviewsEnabled ? "on" : "off"}`,
-        callback_data: "settings:open:rich-drafts",
+        text: `📝 Draft previews: ${draftPreviewsEnabled ? "on" : "off"}`,
+        callback_data: "settings:open:draft-previews",
+      },
+    ],
+    [
+      {
+        text: `🧾 Rendering: ${assistantRenderingMode}`,
+        callback_data: "settings:open:assistant-rendering",
       },
     ],
     [
@@ -262,6 +312,7 @@ export async function openTelegramSettingsMenu<
     buildTelegramSettingsMenuReplyMarkup(
       deps.isProactivePushEnabled(),
       deps.areRichDraftPreviewsEnabled(),
+      deps.getAssistantRenderingMode(),
       deps.getVoiceReplyMode(),
       deps.getTimeInjectionMode(),
       sectionRegistry,
@@ -294,7 +345,7 @@ export function buildProactivePushSettingsReplyMarkup(
   };
 }
 
-export function buildRichDraftPreviewsSettingsReplyMarkup(
+export function buildDraftPreviewsSettingsReplyMarkup(
   enabled: boolean,
 ): TelegramSettingsMenuReplyMarkup {
   return {
@@ -303,13 +354,30 @@ export function buildRichDraftPreviewsSettingsReplyMarkup(
       [
         {
           text: enabled ? "🟢 On" : "⚫️ On",
-          callback_data: "settings:set:rich-drafts:on",
+          callback_data: "settings:set:draft-previews:on",
         },
         {
           text: enabled ? "⚫️ Off" : "🟡 Off",
-          callback_data: "settings:set:rich-drafts:off",
+          callback_data: "settings:set:draft-previews:off"
         },
       ],
+    ],
+  };
+}
+
+export function buildAssistantRenderingSettingsReplyMarkup(
+  mode: TelegramAssistantRenderingMode,
+): TelegramSettingsMenuReplyMarkup {
+  const modes: TelegramAssistantRenderingMode[] = ["rich", "html"];
+  return {
+    inline_keyboard: [
+      [{ text: "⬆️ Back", callback_data: "settings:list" }],
+      ...modes.map((value) => [
+        {
+          text: `${value === mode ? "🟢 " : ""}${value}`,
+          callback_data: `settings:set:assistant-rendering:${value}`,
+        },
+      ]),
     ],
   };
 }
@@ -364,6 +432,7 @@ export async function updateTelegramSettingsMenuMessage(
     buildTelegramSettingsMenuReplyMarkup(
       deps.isProactivePushEnabled(),
       deps.areRichDraftPreviewsEnabled(),
+      deps.getAssistantRenderingMode(),
       deps.getVoiceReplyMode(),
       deps.getTimeInjectionMode(),
       sectionRegistry,
@@ -382,13 +451,23 @@ export async function updateProactivePushSettingsMessage(
   );
 }
 
-export async function updateRichDraftPreviewsSettingsMessage(
+export async function updateDraftPreviewsSettingsMessage(
   deps: TelegramSettingsMenuCallbackDeps,
 ): Promise<void> {
   const enabled = deps.areRichDraftPreviewsEnabled();
   await deps.updateSettingsMessage(
-    buildRichDraftPreviewsSettingsText(enabled),
-    buildRichDraftPreviewsSettingsReplyMarkup(enabled),
+    buildDraftPreviewsSettingsText(enabled),
+    buildDraftPreviewsSettingsReplyMarkup(enabled),
+  );
+}
+
+export async function updateAssistantRenderingSettingsMessage(
+  deps: TelegramSettingsMenuCallbackDeps,
+): Promise<void> {
+  const mode = deps.getAssistantRenderingMode();
+  await deps.updateSettingsMessage(
+    buildAssistantRenderingSettingsText(mode),
+    buildAssistantRenderingSettingsReplyMarkup(mode),
   );
 }
 
@@ -429,8 +508,13 @@ export async function handleTelegramSettingsMenuCallbackAction(
     await deps.answerCallbackQuery(callbackQueryId);
     return true;
   }
-  if (data === "settings:open:rich-drafts") {
-    await updateRichDraftPreviewsSettingsMessage(deps);
+  if (data === "settings:open:draft-previews" || data === "settings:open:rich-drafts") {
+    await updateDraftPreviewsSettingsMessage(deps);
+    await deps.answerCallbackQuery(callbackQueryId);
+    return true;
+  }
+  if (data === "settings:open:assistant-rendering") {
+    await updateAssistantRenderingSettingsMessage(deps);
     await deps.answerCallbackQuery(callbackQueryId);
     return true;
   }
@@ -487,17 +571,28 @@ export async function handleTelegramSettingsMenuCallbackAction(
     }
   }
   if (
+    data === "settings:set:draft-previews:on" ||
+    data === "settings:set:draft-previews:off" ||
     data === "settings:set:rich-drafts:on" ||
     data === "settings:set:rich-drafts:off"
   ) {
     const enabled = data.endsWith(":on");
     await deps.setRichDraftPreviewsEnabled(enabled);
-    await updateRichDraftPreviewsSettingsMessage(deps);
+    await updateDraftPreviewsSettingsMessage(deps);
     await deps.answerCallbackQuery(
       callbackQueryId,
-      `Rich draft previews ${enabled ? "enabled" : "disabled"}`,
+      `Draft previews ${enabled ? "enabled" : "disabled"}`,
     );
     return true;
+  }
+  if (data.startsWith("settings:set:assistant-rendering:")) {
+    const mode = data.slice("settings:set:assistant-rendering:".length);
+    if (mode === "rich" || mode === "html") {
+      await deps.setAssistantRenderingMode(mode);
+      await updateAssistantRenderingSettingsMessage(deps);
+      await deps.answerCallbackQuery(callbackQueryId, `Rendering: ${mode}`);
+      return true;
+    }
   }
   if (
     data === "settings:set:proactive:on" ||
@@ -530,6 +625,7 @@ export function createTelegramSettingsMenuRuntime<
           getModelMenuState: () => deps.getModelMenuState(chatId, ctx),
           isProactivePushEnabled: deps.isProactivePushEnabled,
           areRichDraftPreviewsEnabled: deps.areRichDraftPreviewsEnabled,
+          getAssistantRenderingMode: deps.getAssistantRenderingMode,
           getVoiceReplyMode: deps.getVoiceReplyMode,
           isVoiceReplyModeConfigured: deps.isVoiceReplyModeConfigured,
           getTimeInjectionMode: deps.getTimeInjectionMode,
@@ -549,6 +645,7 @@ export function createTelegramSettingsMenuRuntime<
         {
           isProactivePushEnabled: deps.isProactivePushEnabled,
           areRichDraftPreviewsEnabled: deps.areRichDraftPreviewsEnabled,
+          getAssistantRenderingMode: deps.getAssistantRenderingMode,
           getVoiceReplyMode: deps.getVoiceReplyMode,
           isVoiceReplyModeConfigured: deps.isVoiceReplyModeConfigured,
           getTimeInjectionMode: deps.getTimeInjectionMode,
@@ -588,6 +685,8 @@ export function createTelegramSettingsMenuRuntime<
           return true;
         }
         if (
+          query.data === "settings:set:draft-previews:on" ||
+          query.data === "settings:set:draft-previews:off" ||
           query.data === "settings:set:rich-drafts:on" ||
           query.data === "settings:set:rich-drafts:off"
         ) {
@@ -595,9 +694,17 @@ export function createTelegramSettingsMenuRuntime<
           await deps.setRichDraftPreviewsEnabled(enabled);
           await deps.answerCallbackQuery(
             query.id,
-            `Rich draft previews ${enabled ? "enabled" : "disabled"}`,
+            `Draft previews ${enabled ? "enabled" : "disabled"}`,
           );
           return true;
+        }
+        if (query.data.startsWith("settings:set:assistant-rendering:")) {
+          const mode = query.data.slice("settings:set:assistant-rendering:".length);
+          if (mode === "rich" || mode === "html") {
+            await deps.setAssistantRenderingMode(mode);
+            await deps.answerCallbackQuery(query.id, `Rendering: ${mode}`);
+            return true;
+          }
         }
         const hasTimeInjectionPrefix = query.data.startsWith(
           "settings:set:time-injection:",
@@ -630,11 +737,13 @@ export function createTelegramSettingsMenuRuntime<
       return handleTelegramSettingsMenuCallbackAction(query.id, query.data, {
         isProactivePushEnabled: deps.isProactivePushEnabled,
         areRichDraftPreviewsEnabled: deps.areRichDraftPreviewsEnabled,
+        getAssistantRenderingMode: deps.getAssistantRenderingMode,
         getVoiceReplyMode: deps.getVoiceReplyMode,
         isVoiceReplyModeConfigured: deps.isVoiceReplyModeConfigured,
         getTimeInjectionMode: deps.getTimeInjectionMode,
         setProactivePushEnabled: deps.setProactivePushEnabled,
         setRichDraftPreviewsEnabled: deps.setRichDraftPreviewsEnabled,
+        setAssistantRenderingMode: deps.setAssistantRenderingMode,
         setVoiceReplyMode: deps.setVoiceReplyMode,
         setTimeInjectionMode: deps.setTimeInjectionMode,
         updateSettingsMessage: (text, replyMarkup) =>

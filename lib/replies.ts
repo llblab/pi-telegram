@@ -678,6 +678,8 @@ export async function sendTelegramNativeMarkdownReply<TReplyMarkup = unknown>(
 // UI/compat regular-message runtime for bridge-owned text and interactive
 // surfaces. Assistant and guest Markdown delivery bypass this path and use
 // native Rich Message helpers above.
+export type TelegramAssistantRenderingMode = "rich" | "html";
+
 export interface TelegramRenderedMessageRuntimeDeps<TReplyMarkup> {
   renderTelegramMessage: (
     text: string,
@@ -685,6 +687,7 @@ export interface TelegramRenderedMessageRuntimeDeps<TReplyMarkup> {
   ) => TelegramRenderedChunk[];
   replyTransport: TelegramReplyTransport<TReplyMarkup>;
   recordOwnership?: TelegramReplyOwnershipRecorder["record"];
+  getAssistantRenderingMode?: () => TelegramAssistantRenderingMode;
   sendRichMessage: (
     body: TelegramSendRichMessageBody,
   ) => Promise<TelegramSentMessage>;
@@ -732,6 +735,7 @@ export interface TelegramRenderedMessageDeliveryRuntimeDeps<
     text: string,
     options?: { mode?: TelegramRenderMode },
   ) => TelegramRenderedChunk[];
+  getAssistantRenderingMode?: () => TelegramAssistantRenderingMode;
   sendRichMessage: (
     body: TelegramSendRichMessageBody,
   ) => Promise<TelegramSentMessage>;
@@ -752,6 +756,7 @@ export function createTelegramRenderedMessageDeliveryRuntime<TReplyMarkup>(
         deps.renderTelegramMessage ?? renderTelegramMessage,
       replyTransport,
       recordOwnership: deps.recordOwnership,
+      getAssistantRenderingMode: deps.getAssistantRenderingMode,
       sendRichMessage: deps.sendRichMessage,
     }),
   };
@@ -777,13 +782,19 @@ export function createTelegramRenderedMessageRuntime<TReplyMarkup>(
       );
     },
     sendMarkdownReply: async (chatId, replyToMessageId, markdown, options) => {
-      if (typeof options?.target?.threadId === "number" && replyToMessageId && replyToMessageId > 0) {
+      const renderingMode = deps.getAssistantRenderingMode?.() ?? "rich";
+      if (
+        renderingMode === "html" ||
+        (typeof options?.target?.threadId === "number" &&
+          replyToMessageId !== undefined &&
+          replyToMessageId > 0)
+      ) {
         return deps.replyTransport.sendRenderedChunks(
           chatId,
           deps.renderTelegramMessage(markdown, { mode: "markdown" }),
           {
-            replyMarkup: options.replyMarkup,
-            target: options.target,
+            replyMarkup: options?.replyMarkup,
+            target: options?.target,
             replyToMessageId,
           },
         );

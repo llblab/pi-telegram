@@ -443,6 +443,7 @@ export default function (pi: Pi.ExtensionAPI) {
     },
     sendMessage,
     sendRichMessage,
+    getAssistantRenderingMode: configControls.getAssistantRenderingMode,
     editMessage: editTelegramMessageText,
   });
   const { replyTransport, editInteractiveMessage, sendInteractiveMessage } =

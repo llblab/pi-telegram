@@ -180,13 +180,16 @@ test("Telegram settings setters reload before scoped writes to preserve shared c
   await setVoiceMode("mirror");
   await controls.setProactivePushEnabled(true);
   await controls.setRichDraftPreviewsEnabled(true);
+  await controls.setAssistantRenderingMode("html");
 
   assert.deepEqual(await readTelegramConfig(configPath), {
     botToken: "123:abc",
     proactivePush: true,
     richDraftPreviews: true,
+    assistantRendering: "html",
     voice: { replyMode: "mirror" },
   });
+  assert.equal(controls.getAssistantRenderingMode(), "html");
   assert.deepEqual(secondStore.get().voice, { replyMode: "mirror" });
 });
 
