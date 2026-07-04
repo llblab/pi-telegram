@@ -664,6 +664,7 @@ test("buildTelegramSettingsMenuReplyMarkup injects extension settings rows", asy
   // Built-in rows follow extension settings
   assert.ok(rows[2][0].text.includes("Voice reply"));
   assert.ok(rows[3][0].text.includes("Time"));
-  assert.ok(rows[4][0].text.includes("Rich drafts"));
-  assert.ok(rows[5][0].text.includes("Proactive push"));
+  assert.ok(rows[4][0].text.includes("Draft previews"));
+  assert.ok(rows[5][0].text.includes("Rendering"));
+  assert.ok(rows[6][0].text.includes("Proactive push"));
 });

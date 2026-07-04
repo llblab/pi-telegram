@@ -2206,7 +2206,7 @@ test("Section callback actions preserve callback thread target", async () => {
 test("Settings menu labels proactive push with state text", () => {
   assert.deepEqual(
     buildTelegramSettingsMenuReplyMarkup(true, false, "manual", "hidden")
-      .inline_keyboard[4],
+      .inline_keyboard[5],
     [
       {
         text: "📌 Proactive push: on",
@@ -2216,7 +2216,7 @@ test("Settings menu labels proactive push with state text", () => {
   );
   assert.deepEqual(
     buildTelegramSettingsMenuReplyMarkup(false, false, "manual", "hidden")
-      .inline_keyboard[4],
+      .inline_keyboard[5],
     [
       {
         text: "📌 Proactive push: off",
@@ -2327,11 +2327,13 @@ test("Settings menu persists voice mode even when the menu message state expired
     },
     isProactivePushEnabled: () => false,
     areRichDraftPreviewsEnabled: () => false,
+    getAssistantRenderingMode: () => "rich" as const,
     getTimeInjectionMode: () => "hidden",
     getVoiceReplyMode: () => mode ?? "manual",
     isVoiceReplyModeConfigured: () => configured,
     setProactivePushEnabled: async () => {},
     setRichDraftPreviewsEnabled: async () => {},
+    setAssistantRenderingMode: async () => {},
     setVoiceReplyMode: async (nextMode) => {
       mode = nextMode;
       configured = nextMode !== undefined;
