@@ -764,7 +764,7 @@ test("Update runtime denies guest messages before pairing", async () => {
     },
     "ctx",
   );
-  assert.deepEqual(events, ["guest-deny:gq-unpaired:Access denied."]);
+  assert.deepEqual(events, ["guest-deny:gq-unpaired:🚫 Access denied."]);
 });
 
 test("Update runtime answers guest query with access denied for unauthorized users", async () => {
@@ -798,7 +798,7 @@ test("Update runtime answers guest query with access denied for unauthorized use
     },
     "ctx",
   );
-  assert.deepEqual(events, ["guest-deny:gq-deny:Access denied."]);
+  assert.deepEqual(events, ["guest-deny:gq-deny:🚫 Access denied."]);
 });
 
 test("Update runtime handles authorized reaction priority and removal effects", async () => {

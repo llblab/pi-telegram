@@ -1110,7 +1110,7 @@ export async function executeTelegramUpdatePlan<
       if (plan.shouldDeny) {
         await deps.answerGuestQuery(
           plan.guestMessage.guest_query_id,
-          "Access denied.",
+          "🚫 Access denied.",
         );
         return;
       }

@@ -223,7 +223,7 @@ During active Telegram-owned turns, assistant message start/update hooks re-arm 
 
 ### Rendering And Delivery
 
-Assistant replies use Telegram-native Rich Markdown. Final Markdown is sent directly as `InputRichMessage.markdown` through `sendRichMessage`, and streaming previews use `sendRichMessageDraft` when draft delivery succeeds. Guest replies also use native Rich Markdown through `InputRichMessageContent` in `answerGuestQuery` results. The bridge still strips top-level assistant action comments before delivery and may split output only for Telegram transport limits.
+Rich Markdown is the model-answer membrane. Complete assistant replies send final Markdown directly as `InputRichMessage.markdown` through `sendRichMessage`, and guest replies use native Rich Markdown through `InputRichMessageContent` in `answerGuestQuery` results. Tool-call rows, reasoning/thinking blocks, menus, status rows, queue controls, settings, diagnostics, and other harness-owned surfaces stay on explicit Telegram HTML/plain rendering. Streaming previews may use `sendRichMessageDraft` when enabled and when draft delivery succeeds. The bridge still strips top-level assistant action comments before delivery and may split output only for Telegram transport limits.
 
 Assistant delivery guarantees:
 
@@ -231,12 +231,12 @@ Assistant delivery guarantees:
 - Before native Rich Markdown delivery, the bridge normalizes known Bot-API-fragile source forms without changing visible meaning, including space-after-marker blockquotes and dollar-prefixed ticker atoms that Telegram may otherwise treat as unterminated math.
 - Quoted rich replies use Telegram `rich_message` blocks as the prompt-context source when available, so `[reply]` context receives rendered plain text instead of raw `InputRichMessage.markdown` fallback text.
 - Long native Markdown replies are split only at Telegram Rich Message transport limits; oversized fenced code, display-math, and fully wrapped inline-formatting blocks are rewrapped per chunk so persisted Rich Markdown chunks remain structurally valid.
-- Streaming previews pass structurally closed assistant Markdown prefixes through to `sendRichMessageDraft` with ownership checks, voice suppression, and serialized flushes. Unclosed inline spans, links, fenced code, comments, and display-math blocks are held back until a safe boundary exists. Draft failures are recorded and the failing frame is skipped instead of degrading to raw plain-message previews, because partial Markdown can be invalid while the final message remains valid.
+- When enabled, streaming previews pass structurally closed assistant Markdown prefixes through to `sendRichMessageDraft` with ownership checks, voice suppression, and serialized flushes. Unclosed inline spans, links, fenced code, comments, and display-math blocks are held back until a safe boundary exists. Draft failures are recorded and the failing frame is skipped instead of degrading to raw plain-message previews, because partial Markdown can be invalid while the final message remains valid.
 - Preview flushes are serialized so older edits cannot race newer drafts; final delivery waits for active draft flushes and does not perform a post-final draft-clear call.
 
 UI/compat rendering guarantees:
 
-- Bridge-owned UI surfaces such as commands, menus, status messages, queue controls, and interactive sections use Telegram HTML/plain rendering helpers by default. These texts are authored for Telegram UI rather than model output, so explicit HTML markup remains clearer and easier to maintain.
+- Bridge-owned UI surfaces such as tool rows, reasoning/thinking blocks, commands, menus, status messages, queue controls, diagnostics, settings, and interactive sections use Telegram HTML/plain rendering helpers by default. These texts are authored for operational UI rather than model output, so explicit HTML/plain markup remains clearer, safer, and easier to maintain.
 - In those UI/compat surfaces, real code blocks stay literal and escaped, supported absolute links stay clickable, unsupported links degrade safely, tables use compact monospace rendering with grapheme/display-width accounting, and list/quote/heading spacing stays Telegram-safe.
 
 Final delivery attaches reply metadata only where requested. Reply parameters apply only to the first chunk of split messages; continuation chunks are adjacent normal messages. Media-group turns reply to the representative message id.
