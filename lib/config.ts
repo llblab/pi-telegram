@@ -57,6 +57,7 @@ export interface TelegramConfig {
   attachmentHandlers?: TelegramInboundHandlerConfig[];
   outboundHandlers?: TelegramOutboundHandlerConfig[];
   proactivePush?: boolean;
+  richDraftPreviews?: boolean;
   voice?: {
     replyMode?: "manual" | "mirror" | "always";
     /** Whether to attach the provider's transcriptText as caption on voice messages */
@@ -259,6 +260,23 @@ export function createTelegramProactivePushSetter(
   };
 }
 
+export function createTelegramRichDraftPreviewsChecker(
+  configStore: Pick<TelegramConfigStore, "get">,
+): () => boolean {
+  return () => configStore.get().richDraftPreviews ?? false;
+}
+
+export function createTelegramRichDraftPreviewsSetter(
+  configStore: TelegramMutableConfigStore,
+): (enabled: boolean) => Promise<void> {
+  return async (enabled) => {
+    await loadLatestTelegramConfig(configStore);
+    const config = { ...configStore.get(), richDraftPreviews: enabled };
+    configStore.set(config);
+    await configStore.persist(config);
+  };
+}
+
 export function createTelegramVoiceReplyModeGetter(
   configStore: Pick<TelegramConfigStore, "get">,
 ): () => "manual" | "mirror" | "always" {
@@ -394,6 +412,10 @@ export function createTelegramConfigControls(
   return {
     isProactivePushEnabled: createTelegramProactivePushChecker(configStore),
     setProactivePushEnabled: createTelegramProactivePushSetter(configStore),
+    areRichDraftPreviewsEnabled:
+      createTelegramRichDraftPreviewsChecker(configStore),
+    setRichDraftPreviewsEnabled:
+      createTelegramRichDraftPreviewsSetter(configStore),
     getVoiceReplyMode: createTelegramVoiceReplyModeGetter(configStore),
     isVoiceReplyModeConfigured:
       createTelegramVoiceReplyModeConfiguredChecker(configStore),

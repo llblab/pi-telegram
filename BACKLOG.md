@@ -1,6 +1,6 @@
 # Project Backlog
 
-_Current deterministic status: Threaded Mode implementation, native typing/activity status, regression coverage, docs/context reconciliation, typecheck, full tests, pack check, audit, Domain DAG validation, context validation, native Windows classic↔Threaded Mode upgrade/downgrade smoke, and live post-reload leader/follower prompt routing, follower Active parity, and unbound reroute/restore smoke are green. This backlog intentionally tracks only release-relevant remaining work: evidence-gated Telegram client/runtime follow-ups and upstream Pi API blockers._
+_Current deterministic status: Threaded Mode implementation, native typing/activity status, regression coverage, docs/context reconciliation, typecheck, full tests, pack check, audit, Domain DAG validation, context validation, native Windows classic↔Threaded Mode upgrade/downgrade smoke, and live post-reload leader/follower prompt routing, follower Active parity, and unbound reroute/restore smoke are green. This backlog intentionally tracks only release-relevant remaining work: 0.19.0 release preparation, evidence-gated Telegram client/runtime follow-ups, and upstream Pi API blockers._
 
 ## P0 — Promoted Follower Reload Smoke
 
