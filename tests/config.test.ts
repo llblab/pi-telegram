@@ -175,15 +175,16 @@ test("Telegram settings setters reload before scoped writes to preserve shared c
   await secondStore.load();
 
   const setVoiceMode = createTelegramVoiceReplyModeSetter(firstStore);
-  const setProactivePush =
-    createTelegramConfigControls(secondStore).setProactivePushEnabled;
+  const controls = createTelegramConfigControls(secondStore);
 
   await setVoiceMode("mirror");
-  await setProactivePush(true);
+  await controls.setProactivePushEnabled(true);
+  await controls.setRichDraftPreviewsEnabled(true);
 
   assert.deepEqual(await readTelegramConfig(configPath), {
     botToken: "123:abc",
     proactivePush: true,
+    richDraftPreviews: true,
     voice: { replyMode: "mirror" },
   });
   assert.deepEqual(secondStore.get().voice, { replyMode: "mirror" });
@@ -241,8 +242,20 @@ test("Telegram settings menu callbacks persist voice and time settings to telegr
     ),
     true,
   );
+  assert.equal(
+    await runtime.handleCallbackQuery(
+      {
+        id: "drafts",
+        data: "settings:set:rich-drafts:on",
+        message: { message_id: state.messageId },
+      },
+      {},
+    ),
+    true,
+  );
   assert.deepEqual(await readTelegramConfig(configPath), {
     botToken: "123:abc",
+    richDraftPreviews: true,
     voice: { replyMode: "mirror" },
     time: { injectionMode: "always" },
   });

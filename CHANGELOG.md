@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.19.0: Telegram Companion Hub
+
+- `[Context]` Defined Rich Markdown as the model-answer membrane: complete assistant/guest model replies use native Rich Message delivery, while tool rows, reasoning/thinking blocks, menus, status, queue controls, settings, diagnostics, and other harness-owned surfaces stay on explicit Telegram HTML/plain rendering.
+- `[Settings]` Added an opt-in `richDraftPreviews` setting, exposed it in Telegram Settings, and gated `sendRichMessageDraft` preview frames behind it while preserving final native Rich Markdown replies. Impact: fresh installs default to final-only Rich Markdown plus native active status, and operators can explicitly enable progressive draft drawing when desired.
+- `[Backlog]` Opened 0.19.0 release preparation and closed the rich draft preview setting task, making final-only Rich Markdown replies the intended baseline and draft previews an opt-in progressive enhancement.
+- `[Context]` Clarified the README standard: keep the root entrypoint balanced between product positioning and a compact practical feature showcase, avoiding both over-abstract marketing copy and duplicated implementation docs. Impact: future README changes preserve the feature-catalogue value while keeping the surface coherent.
+- `[Docs]` Reworked the root README as a product-oriented RhythmE entrypoint with clearer hero positioning, install/connect flow, operating model, expanded feature showcase, classic-vs-Threaded Mode comparison, safety boundaries, extension platform summary, and documentation map. Impact: the public entrypoint now explains `pi-telegram` as a Telegram companion console while preserving a practical catalogue of user-facing capabilities.
+- `[Guest Mode]` Unauthorized guest-query replies now include the standard denied-action emoji. Impact: the compact `Access denied` message is easier to recognize in Telegram.
 
 ## 0.18.6: Threaded Mode parity hotfix
 

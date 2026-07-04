@@ -487,6 +487,7 @@ export default function (pi: Pi.ExtensionAPI) {
     getMessageText: Replies.getAgentMessageText,
     getDefaultReplyToMessageId: activeTurnRuntime.getReplyToMessageId,
     sendDraft: nativeMarkdownDraftSender,
+    canSend: configControls.areRichDraftPreviewsEnabled,
     sendMarkdownReply,
     recordRuntimeEvent,
     ...replyTransport,

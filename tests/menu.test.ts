@@ -2205,8 +2205,8 @@ test("Section callback actions preserve callback thread target", async () => {
 
 test("Settings menu labels proactive push with state text", () => {
   assert.deepEqual(
-    buildTelegramSettingsMenuReplyMarkup(true, "manual", "hidden")
-      .inline_keyboard[3],
+    buildTelegramSettingsMenuReplyMarkup(true, false, "manual", "hidden")
+      .inline_keyboard[4],
     [
       {
         text: "📌 Proactive push: on",
@@ -2215,8 +2215,8 @@ test("Settings menu labels proactive push with state text", () => {
     ],
   );
   assert.deepEqual(
-    buildTelegramSettingsMenuReplyMarkup(false, "manual", "hidden")
-      .inline_keyboard[3],
+    buildTelegramSettingsMenuReplyMarkup(false, false, "manual", "hidden")
+      .inline_keyboard[4],
     [
       {
         text: "📌 Proactive push: off",
@@ -2228,7 +2228,7 @@ test("Settings menu labels proactive push with state text", () => {
 
 test("Settings menu exposes time injection mode selection", () => {
   assert.deepEqual(
-    buildTelegramSettingsMenuReplyMarkup(false, "manual", "hidden")
+    buildTelegramSettingsMenuReplyMarkup(false, false, "manual", "hidden")
       .inline_keyboard[2],
     [
       {
@@ -2238,7 +2238,7 @@ test("Settings menu exposes time injection mode selection", () => {
     ],
   );
   assert.deepEqual(
-    buildTelegramSettingsMenuReplyMarkup(false, "manual", "interval")
+    buildTelegramSettingsMenuReplyMarkup(false, false, "manual", "interval")
       .inline_keyboard[2],
     [
       {
@@ -2279,6 +2279,7 @@ test("Settings menu marks voice mode selection with model-style dot", () => {
   assert.deepEqual(
     buildTelegramSettingsMenuReplyMarkup(
       false,
+      false,
       "manual",
       "hidden",
       undefined,
@@ -2292,7 +2293,7 @@ test("Settings menu marks voice mode selection with model-style dot", () => {
     ],
   );
   assert.deepEqual(
-    buildTelegramSettingsMenuReplyMarkup(false, "always", "hidden")
+    buildTelegramSettingsMenuReplyMarkup(false, false, "always", "hidden")
       .inline_keyboard[1],
     [
       {
@@ -2325,10 +2326,12 @@ test("Settings menu persists voice mode even when the menu message state expired
       answers.push(text ?? "");
     },
     isProactivePushEnabled: () => false,
+    areRichDraftPreviewsEnabled: () => false,
     getTimeInjectionMode: () => "hidden",
     getVoiceReplyMode: () => mode ?? "manual",
     isVoiceReplyModeConfigured: () => configured,
     setProactivePushEnabled: async () => {},
+    setRichDraftPreviewsEnabled: async () => {},
     setVoiceReplyMode: async (nextMode) => {
       mode = nextMode;
       configured = nextMode !== undefined;
