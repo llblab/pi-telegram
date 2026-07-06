@@ -116,11 +116,21 @@ export function getTelegramPromptTemplateCommands(
     if (!telegramCommand) continue;
     if (reservedNames.has(telegramCommand)) continue;
     if (seen.has(telegramCommand)) continue;
+    // REVIEWER (iteration 7): guard against missing sourceInfo. This was the
+    // ONLY log-confirmed crash (updates 541414917/918: "undefined is not an
+    // object (evaluating 'command.sourceInfo.path')"). An unguarded throw here
+    // rejects handleUpdate, the poll loop retries the same update up to
+    // maxUpdateFailures, and the message never dispatches — matching the
+    // "handleUpdate never completes / stuck typing" symptom. `path` is a
+    // required field used as a reader key, so skip commands that lack it rather
+    // than push a broken entry into the Telegram command menu. See history §12.7.
+    const sourcePath = command.sourceInfo?.path;
+    if (!sourcePath) continue;
     seen.add(telegramCommand);
     promptCommands.push({
       command: telegramCommand,
       description: command.description,
-      path: command.sourceInfo.path,
+      path: sourcePath,
     });
   }
   return promptCommands.sort((a, b) => a.command.localeCompare(b.command));

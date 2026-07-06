@@ -1,28 +1,43 @@
 /**
- * Telegram bridge config and pairing helpers
+ * Telegram bridge config and pairing helpers — MULTI-INSTANCE PATCHED
+ * Changes:
+ *  - Agent dir auto-detection (Pi vs OMP) — no env var required
+ *  - Multi-bot profile registry (telegram-bots.json) for /telegram-setup & /telegram-connect
  * Zones: telegram config, pairing, filesystem
  * Owns persisted bot/session pairing state, local config storage, live config controls, authorization policy, and first-user pairing side effects
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import type { TelegramInboundHandlerConfig } from "./inbound.ts";
 import type { CommandTemplateObjectConfig } from "./command-templates.ts";
+import { telegramDebugLog } from "./debug-log.ts";
 
 const CONFIG_RUNTIME_KEY = "__piTelegramConfigRuntime__";
 
 function getAgentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR
-    ? resolve(process.env.PI_CODING_AGENT_DIR)
-    : join(homedir(), ".pi", "agent");
+  // MULTI-INSTANCE: honor explicit override, otherwise detect Pi vs OMP
+  if (process.env.PI_CODING_AGENT_DIR) {
+    return resolve(process.env.PI_CODING_AGENT_DIR);
+  }
+  const home = homedir();
+  const execBasename =
+    (process.execPath || "").toLowerCase().split("/").pop() ?? "";
+  const argv1Last =
+    (process.argv[1] ?? "").toLowerCase().split("/").pop() ?? "";
+  if (execBasename.startsWith("omp") || argv1Last.startsWith("omp")) {
+    return join(home, ".omp", "agent");
+  }
+  return join(home, ".pi", "agent");
 }
 
 function getConfigPath(): string {
   return join(getAgentDir(), "telegram.json");
 }
+
 
 export type TelegramOutboundCommandTemplateConfig =
   | string
@@ -250,6 +265,16 @@ export function createTelegramConfigStore(
     },
     persist: async (nextConfig = config) => {
       await writeTelegramConfig(agentDir, configPath, nextConfig);
+      try {
+        await syncActiveTelegramBotProfileFromConfig(
+          nextConfig,
+          join(agentDir, "telegram-bots.json"),
+        );
+      } catch (error) {
+        options.recordRuntimeEvent?.("config", error, {
+          phase: "sync-active-bot-registry",
+        });
+      }
     },
   };
 }
@@ -509,11 +534,14 @@ export function getTelegramAuthorizationState(
   allowedUserId?: number,
 ): TelegramAuthorizationState {
   if (allowedUserId === undefined) {
+    telegramDebugLog("authz", "pair", { userId, allowedUserId: undefined });
     return { kind: "pair", userId };
   }
   if (userId === allowedUserId) {
+    telegramDebugLog("authz", "allow", { userId, allowedUserId });
     return { kind: "allow" };
   }
+  telegramDebugLog("authz", "deny", { userId, allowedUserId });
   return { kind: "deny" };
 }
 
@@ -529,17 +557,31 @@ export async function pairTelegramUserIfNeeded<TContext>(
   userId: number,
   deps: TelegramUserPairingDeps<TContext>,
 ): Promise<boolean> {
+  telegramDebugLog("pairing", "pairIfNeeded enter", {
+    userId,
+    allowedUserId: deps.allowedUserId,
+  });
   const authorization = getTelegramAuthorizationState(
     userId,
     deps.allowedUserId,
   );
-  if (authorization.kind !== "pair") return false;
+  if (authorization.kind !== "pair") {
+    telegramDebugLog("pairing", "not pair kind, skipping", {
+      kind: authorization.kind,
+      userId,
+    });
+    return false;
+  }
   deps.setAllowedUserId(authorization.userId);
   await deps.persistConfig();
+  telegramDebugLog("pairing", "set allowedUserId + persisted", { userId });
   try {
     deps.updateStatus(deps.ctx);
   } catch (error) {
     if (!isTelegramStaleContextError(error)) throw error;
+    telegramDebugLog("pairing", "stale ctx (ignored)", {
+      error: String(error),
+    });
   }
   return true;
 }
@@ -557,4 +599,170 @@ export function createTelegramUserPairingRuntime<TContext>(
         updateStatus: deps.updateStatus,
       }),
   };
+}
+
+// --- MULTI-INSTANCE: Multi-bot profile registry ---
+
+export interface TelegramBotProfile {
+  id: string;
+  name?: string;
+  botToken: string;
+  botId?: number;
+  botUsername?: string;
+  allowedUserId?: number;
+  lastUpdateId?: number;
+}
+
+export interface TelegramBotRegistry {
+  version: 1;
+  bots: TelegramBotProfile[];
+  activeBotId?: string;
+}
+
+export function getTelegramBotRegistryPath(): string {
+  return join(getAgentDir(), "telegram-bots.json");
+}
+
+function emptyTelegramBotRegistry(): TelegramBotRegistry {
+  return { version: 1, bots: [] };
+}
+
+function isValidTelegramBotProfile(
+  value: unknown,
+): value is TelegramBotProfile {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.id === "string" && typeof v.botToken === "string";
+}
+
+export function readTelegramBotRegistry(
+  path: string = getTelegramBotRegistryPath(),
+): TelegramBotRegistry {
+  if (!existsSync(path)) return emptyTelegramBotRegistry();
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8"));
+    if (!raw || typeof raw !== "object" || !Array.isArray(raw.bots)) {
+      return emptyTelegramBotRegistry();
+    }
+    return {
+      version: 1,
+      bots: raw.bots.filter(isValidTelegramBotProfile),
+      activeBotId:
+        typeof raw.activeBotId === "string" ? raw.activeBotId : undefined,
+    };
+  } catch {
+    return emptyTelegramBotRegistry();
+  }
+}
+
+export async function writeTelegramBotRegistry(
+  registry: TelegramBotRegistry,
+  path: string = getTelegramBotRegistryPath(),
+): Promise<void> {
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  await writeFile(tmp, JSON.stringify(registry, null, "\t") + "\n", {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await chmod(tmp, 0o600);
+  await rename(tmp, path);
+  await chmod(path, 0o600);
+}
+
+export function findTelegramBotProfile(
+  registry: TelegramBotRegistry,
+  id: string,
+): TelegramBotProfile | undefined {
+  return registry.bots.find((b) => b.id === id);
+}
+
+export function upsertTelegramBotProfile(
+  registry: TelegramBotRegistry,
+  profile: TelegramBotProfile,
+): TelegramBotRegistry {
+  const idx = registry.bots.findIndex((b) => b.id === profile.id);
+  const next = [...registry.bots];
+  if (idx >= 0) next[idx] = profile;
+  else next.push(profile);
+  return { ...registry, bots: next };
+}
+
+export function removeTelegramBotProfile(
+  registry: TelegramBotRegistry,
+  id: string,
+): TelegramBotRegistry {
+  const next = registry.bots.filter((b) => b.id !== id);
+  const activeBotId =
+    registry.activeBotId === id ? undefined : registry.activeBotId;
+  return { ...registry, bots: next, activeBotId };
+}
+
+export function getActiveTelegramBotProfile(
+  registry: TelegramBotRegistry,
+): TelegramBotProfile | undefined {
+  if (!registry.activeBotId) return undefined;
+  return findTelegramBotProfile(registry, registry.activeBotId);
+}
+
+export function setActiveTelegramBotProfile(
+  registry: TelegramBotRegistry,
+  id: string,
+): TelegramBotRegistry {
+  return { ...registry, activeBotId: id };
+}
+
+export function telegramBotProfileToConfig(
+  profile: TelegramBotProfile,
+): TelegramConfig {
+  return {
+    botToken: profile.botToken,
+    botId: profile.botId,
+    botUsername: profile.botUsername,
+    allowedUserId: profile.allowedUserId,
+    lastUpdateId: profile.lastUpdateId,
+  };
+}
+
+export function telegramConfigToBotProfile(
+  config: TelegramConfig,
+  id?: string,
+): TelegramBotProfile | undefined {
+  const token = config.botToken?.trim();
+  if (!token) return undefined;
+  const profileId = id ?? (config.botId ? String(config.botId) : undefined);
+  if (!profileId) return undefined;
+  return {
+    id: profileId,
+    botToken: token,
+    botId: config.botId,
+    botUsername: config.botUsername,
+    allowedUserId: config.allowedUserId,
+    lastUpdateId: config.lastUpdateId,
+  };
+}
+
+async function syncActiveTelegramBotProfileFromConfig(
+  config: TelegramConfig,
+  registryPath: string,
+): Promise<void> {
+  const registry = readTelegramBotRegistry(registryPath);
+  const profile = telegramConfigToBotProfile(config);
+  if (!profile) {
+    if (registry.activeBotId) {
+      await writeTelegramBotRegistry(
+        { ...registry, activeBotId: undefined },
+        registryPath,
+      );
+    }
+    return;
+  }
+  const activeBotId = registry.activeBotId ?? profile.id;
+  if (activeBotId !== profile.id) return;
+  const next = setActiveTelegramBotProfile(
+    upsertTelegramBotProfile(registry, profile),
+    profile.id,
+  );
+  await writeTelegramBotRegistry(next, registryPath);
 }

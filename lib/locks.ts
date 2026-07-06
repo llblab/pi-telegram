@@ -1,8 +1,13 @@
 /**
- * Telegram singleton lock helpers
+ * Telegram singleton lock helpers — MULTI-INSTANCE PATCHED
+ * Changes:
+ *  - Agent dir auto-detection (Pi vs OMP) — locks.json lives in the right agent dir
+ *  - Lazy key resolution (key may be a string OR a function) for per-bot lock isolation
  * Zones: shared singleton, filesystem, telegram runtime ownership
  * Owns shared locks.json access and Telegram bridge ownership semantics
  */
+
+import { telegramDebugLog } from "./debug-log.ts";
 
 import {
   existsSync,
@@ -19,14 +24,25 @@ export const TELEGRAM_LOCK_KEY = "@llblab/pi-telegram";
 export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 5_000;
 
 function getAgentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR
-    ? resolve(process.env.PI_CODING_AGENT_DIR)
-    : join(homedir(), ".pi", "agent");
+  // MULTI-INSTANCE: honor explicit override, otherwise detect Pi vs OMP
+  if (process.env.PI_CODING_AGENT_DIR) {
+    return resolve(process.env.PI_CODING_AGENT_DIR);
+  }
+  const home = homedir();
+  const execBasename =
+    (process.execPath || "").toLowerCase().split("/").pop() ?? "";
+  const argv1Last =
+    (process.argv[1] ?? "").toLowerCase().split("/").pop() ?? "";
+  if (execBasename.startsWith("omp") || argv1Last.startsWith("omp")) {
+    return join(home, ".omp", "agent");
+  }
+  return join(home, ".pi", "agent");
 }
 
 function getLocksPath(): string {
   return join(getAgentDir(), "locks.json");
 }
+
 
 export interface TelegramLockEntry {
   pid: number;
@@ -81,7 +97,8 @@ export interface TelegramLockContextStore<
 }
 
 export interface TelegramLockRuntimeOptions {
-  key?: string;
+  /** Static key string OR a function that returns the key (resolved lazily on each access) */
+  key?: string | (() => string | undefined);
   locksPath?: string;
   pid?: number;
   isProcessAlive?: (pid: number) => boolean;
@@ -190,6 +207,12 @@ function ownsLockContext(
   if (!lock || lock.pid !== pid) return false;
   return !lock.cwd || !ctx || lock.cwd === ctx.cwd;
 }
+function resolveLockKey(
+  key: string | (() => string | undefined) | undefined,
+): string {
+  if (typeof key === "function") return key() ?? TELEGRAM_LOCK_KEY;
+  return key ?? TELEGRAM_LOCK_KEY;
+}
 
 function createLockEntry(
   pid: number,
@@ -229,7 +252,6 @@ function formatLockState(state: TelegramLockState): string {
 export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
   options: TelegramLockRuntimeOptions = {},
 ): TelegramLockRuntime<TContext> {
-  const key = options.key ?? TELEGRAM_LOCK_KEY;
   const locksPath = options.locksPath ?? getLocksPath();
   const pid = options.pid ?? process.pid;
   const isAlive = options.isProcessAlive ?? isProcessAlive;
@@ -238,17 +260,52 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
     nowMs: getNowMs(),
     staleHeartbeatMs: options.staleHeartbeatMs,
   });
-  const readLock = () => parseTelegramLockEntry(readLocks(locksPath)[key]);
+  const readLock = () => {
+    const currentKey = resolveLockKey(options.key);
+    return parseTelegramLockEntry(readLocks(locksPath)[currentKey]);
+  };
   const writeLock = (lock: TelegramLockEntry) => {
+    const currentKey = resolveLockKey(options.key);
     const locks = readLocks(locksPath);
-    locks[key] = lock;
+    // Clean up old default key if migrating to a scoped key
+    if (currentKey !== TELEGRAM_LOCK_KEY) {
+      delete locks[TELEGRAM_LOCK_KEY];
+    }
+    // Bug 9: clean up previous scoped keys held by this pid.
+    // On bot switch (bot1 → bot2) the old scoped lock entry leaks in
+    // locks.json because release() resolves the NEW key (after
+    // configStore switch). Scan and drop any scoped entry owned by us.
+    for (const key of Object.keys(locks)) {
+      if (key === currentKey || key === TELEGRAM_LOCK_KEY) continue;
+      const entry = locks[key];
+      if (entry && typeof entry === "object" && entry.pid === pid) {
+        delete locks[key];
+        telegramDebugLog("lock", "scoped cleanup removed stale", {
+          removedKey: key,
+          pid,
+        });
+      }
+    }
+    locks[currentKey] = lock;
     writeLocks(locksPath, locks);
   };
   return {
     acquire: (ctx, acquireOptions = {}) => {
       const state = getLockState(readLock(), pid, isAlive, stateOptions());
-      if (state.kind === "active-elsewhere" && !acquireOptions.force)
+      telegramDebugLog("lock", "acquire enter", {
+        key: resolveLockKey(options.key),
+        pid,
+        stateKind: state.kind,
+        force: !!acquireOptions.force,
+      });
+      if (state.kind === "active-elsewhere" && !acquireOptions.force) {
+        telegramDebugLog("lock", "acquire denied — active elsewhere", {
+          key: resolveLockKey(options.key),
+          pid,
+          ownerPid: state.lock.pid,
+        });
         return { ok: false, lock: state.lock };
+      }
       const lock = createLockEntry(pid, ctx, {
         instanceId: options.instanceId,
         busSocketPath: options.busSocketPath,
@@ -256,15 +313,25 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
         getNowMs,
       });
       writeLock(lock);
+      telegramDebugLog("lock", "acquired", {
+        key: resolveLockKey(options.key),
+        pid,
+        replacedStale: state.kind === "stale",
+      });
       return { ok: true, lock, replacedStale: state.kind === "stale" };
     },
     release: () => {
       const state = getLockState(readLock(), pid, isAlive, stateOptions());
       if (state.kind === "active-here" || state.kind === "stale") {
+        const currentKey = resolveLockKey(options.key);
         const locks = readLocks(locksPath);
-        delete locks[key];
+        delete locks[currentKey];
         writeLocks(locksPath, locks);
       }
+      telegramDebugLog("lock", "released", {
+        key: resolveLockKey(options.key),
+        pid,
+      });
       return state;
     },
     getState: () => getLockState(readLock(), pid, isAlive, stateOptions()),
@@ -275,7 +342,9 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
       const lock = readLock();
       if (!lock || !ownsLockContext(lock, pid, ctx)) return false;
       if (!options.instanceId) return true;
-      writeLock({
+      const currentKey = resolveLockKey(options.key);
+      const locks = readLocks(locksPath);
+      locks[currentKey] = {
         pid: lock.pid,
         ...(lock.cwd ? { cwd: lock.cwd } : {}),
         instanceId: options.instanceId,
@@ -285,7 +354,8 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
           ? { busSocketPath: options.busSocketPath }
           : {}),
         busSecret: options.busSecret ?? lock.busSecret,
-      });
+      };
+      writeLocks(locksPath, locks);
       return true;
     },
   };
@@ -423,13 +493,24 @@ export function createTelegramLockedPollingRuntime<
     "Telegram polling is unavailable in this Pi run mode.";
   return {
     start: async (ctx, options = {}) => {
+      telegramDebugLog("lock", "lockedPollingRuntime.start enter", {
+        hasBotToken: deps.hasBotToken(),
+        canStart: canStartPolling(ctx),
+        force: !!options.force,
+      });
       if (!deps.hasBotToken()) {
+        telegramDebugLog("lock", "start blocked: no botToken");
         return { ok: false, message: "Telegram bot is not configured." };
       }
       if (!canStartPolling(ctx)) {
+        telegramDebugLog("lock", "start blocked: canStartPolling false");
         return { ok: false, message: formatStartBlockedMessage(ctx) };
       }
       const acquired = deps.lock.acquire(ctx, options);
+      telegramDebugLog("lock", "acquire result", {
+        ok: acquired.ok,
+        replacedStale: acquired.ok ? acquired.replacedStale : undefined,
+      });
       if (!acquired.ok) {
         if (deps.registerFollowerWithOwner) {
           let failureMessage: string | undefined;
@@ -468,6 +549,10 @@ export function createTelegramLockedPollingRuntime<
           message: `Telegram bridge is active in another Pi instance (${owner}).`,
         };
       }
+      telegramDebugLog("lock", "lockedPollingRuntime.start → calling deps.startPolling", {
+        pid: process.pid,
+        replacedStale: acquired.replacedStale,
+      });
       await deps.startPolling(ctx, options);
       startOwnershipWatcher(ctx);
       deps.updateStatus(ctx);

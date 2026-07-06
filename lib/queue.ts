@@ -5,6 +5,10 @@
  */
 
 import { isVoiceTurn } from "./voice.ts";
+import { telegramDebugLog, telegramEmitBootStamp } from "./debug-log.ts";
+
+// REVIEWER (iteration 7): prove the loaded build in live tests. See history.md §12.6.
+telegramEmitBootStamp("queue.ts");
 
 // --- Queue Items ---
 
@@ -1996,6 +2000,11 @@ export interface TelegramPromptDeliveryOptions {
   deliverAs: "followUp";
 }
 
+type TelegramPromptDispatchItem<TContext = unknown> = Extract<
+  TelegramQueueDispatchAction<TContext>,
+  { kind: "prompt" }
+>["item"];
+
 export const TELEGRAM_PROMPT_FOLLOW_UP_DELIVERY = {
   deliverAs: "followUp",
 } as const satisfies TelegramPromptDeliveryOptions;
@@ -2014,7 +2023,7 @@ export interface TelegramDispatchRuntimeDeps<TContext = unknown> {
       { kind: "prompt" }
     >["item"]["content"],
     options?: TelegramPromptDeliveryOptions,
-  ) => void;
+  ) => void | PromiseLike<void>;
   onPromptDispatchFailure: (message: string) => void;
   onIdle: () => void;
 }
@@ -2026,9 +2035,16 @@ export interface TelegramQueueDispatchControllerDeps<
   setQueuedItems: (items: TelegramQueueItem<TContext>[]) => void;
   canDispatch: (ctx: TContext) => boolean;
   hasDispatchContext?: () => boolean;
+  hasActiveTurn?: () => boolean;
+  hasDispatchPending?: () => boolean;
+  dispatchStallTimeoutMs?: number;
   updateStatus: (ctx: TContext, error?: string) => void;
   sendTextReply: TelegramControlRuntimeDeps<TContext>["sendTextReply"];
   onPromptDispatchStart: (ctx: TContext, chatId: number) => void;
+  preflightPromptDispatch?: (
+    ctx: TContext,
+    item: TelegramPromptDispatchItem<TContext>,
+  ) => string | undefined;
   sendUserMessage: TelegramDispatchRuntimeDeps<TContext>["sendUserMessage"];
   onPromptDispatchFailure: (ctx: TContext, message: string) => void;
 }
@@ -2037,23 +2053,69 @@ export interface TelegramQueueDispatchController<TContext = unknown> {
   dispatchNext: (ctx: TContext) => void;
 }
 
+function isPromiseLike<T>(value: unknown): value is PromiseLike<T> {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    "then" in value &&
+    typeof value.then === "function"
+  );
+}
+
 export function executeTelegramQueueDispatchPlan<TContext = unknown>(
   plan: TelegramQueueDispatchAction<TContext>,
   deps: TelegramDispatchRuntimeDeps<TContext>,
 ): void {
   if (plan.kind === "none") {
+    telegramDebugLog("dispatch", "plan=none → onIdle");
     deps.onIdle();
     return;
   }
   if (plan.kind === "control") {
+    telegramDebugLog("dispatch", "plan=control");
     deps.executeControlItem(plan.item);
     return;
   }
+  telegramDebugLog("dispatch", "plan=prompt → onPromptDispatchStart", {
+    chatId: plan.item.chatId,
+    contentType: plan.item.content?.type,
+  });
   deps.onPromptDispatchStart(plan.item.chatId);
   try {
-    deps.sendUserMessage(plan.item.content, TELEGRAM_PROMPT_FOLLOW_UP_DELIVERY);
+    telegramDebugLog("dispatch", "sendUserMessage call", {
+      chatId: plan.item.chatId,
+    });
+    // DISPATCH-FOLLOWUP-FIX: do NOT use { deliverAs: "followUp" } here.
+    // canDispatch already confirmed isIdle=true (agent is not streaming).
+    // Using followUp when the agent is idle causes Pi core to queue the
+    // prompt internally and wait for agent_end — which never comes because
+    // there's no active work. Result: agent_start never fires, dispatch
+    // stalls forever (watchdog cleans up after 45s, but the prompt is lost).
+    // See history.md §13 and the live log for PID 78359.
+    const result = deps.sendUserMessage(plan.item.content);
+    telegramDebugLog("dispatch", "sendUserMessage returned", {
+      chatId: plan.item.chatId,
+      resultType: typeof result,
+      isPromise: isPromiseLike(result),
+    });
+    // DISPATCH-STALL-FIX: observe async rejection so typing stops if the
+    // prompt never reaches agent_start.
+    if (isPromiseLike(result)) {
+      result.catch((error: unknown) => {
+        const message = getTelegramQueueErrorMessage(error);
+        telegramDebugLog("dispatch", "sendUserMessage ASYNC REJECT", {
+          chatId: plan.item.chatId,
+          error: message,
+        });
+        deps.onPromptDispatchFailure(message);
+      });
+    }
   } catch (error) {
     const message = getTelegramQueueErrorMessage(error);
+    telegramDebugLog("dispatch", "sendUserMessage SYNC THROW", {
+      chatId: plan.item.chatId,
+      error: message,
+    });
     deps.onPromptDispatchFailure(message);
   }
 }
@@ -2078,9 +2140,13 @@ export function createTelegramQueueDispatchRuntime<TContext = unknown>(
       hasPendingMessages: deps.hasPendingMessages,
     }),
     hasDispatchContext: deps.hasDispatchContext,
+    hasActiveTurn: deps.hasActiveTurn,
+    hasDispatchPending: deps.hasDispatchPending,
+    dispatchStallTimeoutMs: deps.dispatchStallTimeoutMs,
     updateStatus: deps.updateStatus,
     sendTextReply: deps.sendTextReply,
     onPromptDispatchStart: deps.onPromptDispatchStart,
+    preflightPromptDispatch: deps.preflightPromptDispatch,
     sendUserMessage: deps.sendUserMessage,
     onPromptDispatchFailure: deps.onPromptDispatchFailure,
     recordRuntimeEvent: deps.recordRuntimeEvent,
@@ -2091,6 +2157,10 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
   deps: TelegramQueueDispatchControllerDeps<TContext>,
 ): TelegramQueueDispatchController<TContext> {
   let controlDispatchPending = false;
+  // DISPATCH-STATE: guards against double-resolution. Set true when either
+  // watchdog fires or agent_start consumes the dispatched item.
+  let dispatchSettled = false;
+
   const controller: TelegramQueueDispatchController<TContext> = {
     dispatchNext: (ctx) => {
       if (deps.hasDispatchContext && !deps.hasDispatchContext()) return;
@@ -2098,10 +2168,57 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
         deps.updateStatus(ctx);
         return;
       }
+      const queuedItems = deps.getQueuedItems();
+      const canDispatch = deps.canDispatch(ctx);
+      // REVIEWER (iteration 7): log the decision inputs, but ONLY when the queue
+      // is non-empty — logging every idle tick floods debug.jsonl (see history
+      // §12.6 lock-heartbeat spam). This makes the next live test diagnostic:
+      // if items are queued but canDispatch=false, the agent is genuinely busy
+      // (followUp is correct); if canDispatch=true but nothing starts, the stall
+      // is real.
+      if (queuedItems.length > 0) {
+        telegramDebugLog("dispatch", "canDispatch", {
+          canDispatch,
+          queueLen: queuedItems.length,
+          hasActiveTurn: deps.hasActiveTurn?.(),
+          hasDispatchPending: deps.hasDispatchPending?.(),
+        });
+      }
       const dispatchPlan = planNextTelegramQueueAction(
-        deps.getQueuedItems(),
-        deps.canDispatch(ctx),
+        queuedItems,
+        canDispatch,
       );
+      if (dispatchPlan.kind === "prompt") {
+        const preflightError = deps.preflightPromptDispatch?.(
+          ctx,
+          dispatchPlan.item,
+        );
+        if (preflightError) {
+          telegramDebugLog("dispatch", "prompt preflight failed", {
+            chatId: dispatchPlan.item.chatId,
+            error: preflightError,
+          });
+          deps.setQueuedItems(
+            deps.getQueuedItems().filter((item) => item !== dispatchPlan.item),
+          );
+          deps.onPromptDispatchFailure(ctx, preflightError);
+          void deps
+            .sendTextReply(
+              dispatchPlan.item.chatId,
+              dispatchPlan.item.replyToMessageId,
+              `Telegram prompt was not sent to Pi: ${preflightError}`,
+              { target: dispatchPlan.item.target },
+            )
+            .catch((error) => {
+              deps.recordRuntimeEvent?.("dispatch", error, {
+                phase: "prompt-preflight-reply",
+                chatId: dispatchPlan.item.chatId,
+                replyToMessageId: dispatchPlan.item.replyToMessageId,
+              });
+            });
+          return;
+        }
+      }
       if (dispatchPlan.kind !== "none") {
         deps.setQueuedItems(dispatchPlan.remainingItems);
       }
@@ -2122,6 +2239,8 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
           });
         },
         onPromptDispatchStart: (chatId) => {
+          // Reset settled flag for this dispatch — a new prompt is being dispatched
+          dispatchSettled = false;
           deps.onPromptDispatchStart(ctx, chatId);
         },
         sendUserMessage: deps.sendUserMessage,
@@ -2132,6 +2251,68 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
           deps.updateStatus(ctx);
         },
       });
+      if (dispatchPlan.kind === "prompt") {
+        const dispatchItem = dispatchPlan.item;
+        // REVIEWER (iteration 7): the 2s "followUp fallback" timer was REMOVED.
+        // It targeted a phantom root cause (a "title-generator" that does not
+        // exist in the codebase — see history.md §12.2/§12.4) and it left the
+        // dispatched item in the queue while clearing pendingDispatch, which
+        // caused DUPLICATE execution once the agent went idle. During real
+        // streaming, canDispatch already gates on isIdle+hasPendingMessages, so
+        // a prompt cannot be dispatched into a busy agent in the first place.
+        //
+        // One watchdog remains as a pure safety net. Raised 12s -> 45s: real
+        // preflight (cold-start model, before_agent_start hooks, compaction) can
+        // legitimately exceed 15s, and a false timeout drops a valid prompt.
+        const timeoutMs = deps.dispatchStallTimeoutMs ?? 45000;
+
+        const watchdogTimer = setTimeout(() => {
+          if (dispatchSettled) {
+            telegramDebugLog("dispatch", "prompt watchdog skipped — already settled", {
+              chatId: dispatchItem.chatId,
+            });
+            return;
+          }
+          if (!deps.hasDispatchPending?.() || deps.hasActiveTurn?.()) {
+            dispatchSettled = true;
+            return;
+          }
+          const message =
+            "Pi did not accept the Telegram prompt after dispatch. The prompt was removed from the Telegram queue so later messages can continue.";
+          telegramDebugLog("dispatch", "prompt dispatch stalled", {
+            chatId: dispatchItem.chatId,
+            timeoutMs,
+          });
+          dispatchSettled = true;
+          deps.setQueuedItems(
+            deps.getQueuedItems().filter((item) => item !== dispatchItem),
+          );
+          deps.onPromptDispatchFailure(ctx, message);
+          void deps
+            .sendTextReply(
+              dispatchItem.chatId,
+              dispatchItem.replyToMessageId,
+              `Telegram prompt was not accepted by Pi: ${message}`,
+              { target: dispatchItem.target },
+            )
+            .catch((error) => {
+              deps.recordRuntimeEvent?.("dispatch", error, {
+                phase: "prompt-stall-reply",
+                chatId: dispatchItem.chatId,
+                replyToMessageId: dispatchItem.replyToMessageId,
+              });
+            })
+            .finally(() => {
+              if (deps.hasDispatchContext && !deps.hasDispatchContext()) return;
+              controller.dispatchNext(ctx);
+            });
+        }, timeoutMs);
+        // REVIEWER (iteration 7): call .unref() as a STATEMENT, not as the value
+        // assigned to watchdogTimer. Previously `setTimeout(...).unref?.()` stored
+        // the RETURN of unref() (undefined under some runtimes / bun), which made
+        // clearTimeout a silent no-op. See history.md §12.5.
+        watchdogTimer.unref?.();
+      }
     },
   };
   return controller;

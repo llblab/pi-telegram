@@ -5,6 +5,7 @@
  */
 
 import * as Bindings from "./lib/bindings.ts";
+import { telegramDebugLog } from "./lib/debug-log.ts";
 import * as BusApi from "./lib/bus-api.ts";
 import * as Bus from "./lib/bus.ts";
 import * as BusFollower from "./lib/bus-follower.ts";
@@ -114,7 +115,17 @@ export default function (pi: Pi.ExtensionAPI) {
   const threadStore = Threads.createTelegramTopicTargetStore({
     path: Threads.getTelegramTopicTargetsPath(),
   });
+  // MULTI-INSTANCE: per-bot lock key — no env var needed.
+  // locks.json lives in the agent dir (Pi: ~/.pi/agent, OMP: ~/.omp/agent),
+  // so different agents never collide. Different bots within one agent get
+  // different keys via botId, letting multiple instances coexist.
+  const resolveTelegramLockKey = function (): string | undefined {
+    const botId = configStore.get()?.botId;
+    if (botId) return `@llblab/pi-telegram:${botId}`;
+    return undefined; // fallback to TELEGRAM_LOCK_KEY until a bot is configured
+  };
   const lockRuntime = Locks.createTelegramLockRuntime<Pi.ExtensionContext>({
+    key: resolveTelegramLockKey,
     instanceId: telegramInstanceId,
     busSecret: telegramBusAuthSecret,
     staleHeartbeatMs: Locks.TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
@@ -197,8 +208,14 @@ export default function (pi: Pi.ExtensionAPI) {
       action,
     );
   };
-  const persistTelegramConfigWithSync = async function () {
-    await configStore.persist();
+  // MULTI-BOT FIX (Bug 1): accept optional nextConfig so callers (setup/picker
+  // wrappers) can persist the NEW config they just built, not the OLD in-memory.
+  // Previously this was `() => Promise<void>` and ignored the arg passed by
+  // setup.ts wrappers → telegram.json & registry got PRE-change state.
+  const persistTelegramConfigWithSync = async function (
+    nextConfig?: Config.TelegramConfig,
+  ) {
+    await configStore.persist(nextConfig);
     markTelegramConfigSyncChange("config-persist");
   };
   const getCurrentThreadRecord = function ():
@@ -468,6 +485,16 @@ export default function (pi: Pi.ExtensionAPI) {
       updateStatus,
       sendTextReply,
       recordRuntimeEvent,
+      preflightPromptDispatch(ctx) {
+        const model = ctx.model;
+        if (!model) {
+          return "No model selected in Pi. Select a model before sending Telegram prompts.";
+        }
+        if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
+          return `Model ${model.provider}/${model.id} is not authenticated or configured. Fix Pi model credentials and retry from Telegram.`;
+        }
+        return undefined;
+      },
       ...promptDispatchRuntime,
       sendUserMessage,
     }).dispatchNext;

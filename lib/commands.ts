@@ -7,6 +7,7 @@
 import { pairTelegramUserIfNeeded } from "./config.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
 import type { TelegramBridgeStatusLineOptions } from "./status.ts";
+import { telegramDebugLog } from "./debug-log.ts";
 import {
   createTelegramControlItemBuilder,
   createTelegramControlQueueController,
@@ -296,6 +297,7 @@ export interface TelegramBridgeCommandStartPollingResult {
 
 export interface TelegramBridgeCommandRegistrationDeps {
   promptForConfig: (ctx: ExtensionCommandContext) => Promise<void>;
+  selectBotForConnect: (ctx: ExtensionCommandContext) => Promise<boolean>;
   getStatusLines: (options?: TelegramBridgeStatusLineOptions) => string[];
   reloadConfig: () => Promise<void>;
   hasBotToken: () => boolean;
@@ -331,8 +333,9 @@ export function registerTelegramBridgeCommands(
   deps: TelegramBridgeCommandRegistrationDeps,
 ): void {
   pi.registerCommand("telegram-setup", {
-    description: "Configure Telegram bot token",
+    description: "Configure Telegram bots (multi-bot registry)",
     handler: async (_args, ctx) => {
+      telegramDebugLog("cmd", "/telegram-setup invoked");
       await deps.promptForConfig(ctx);
     },
   });
@@ -348,13 +351,52 @@ export function registerTelegramBridgeCommands(
   pi.registerCommand("telegram-connect", {
     description: "Start the Telegram bridge in this Pi session",
     handler: async (_args, ctx) => {
-      await deps.reloadConfig();
+      telegramDebugLog("cmd", "/telegram-connect invoked");
+      // Bug 11: check picker return value — if user cancelled or registry
+      // empty, don't proceed to startPolling on a stale/disabled config.
+      const picked = await deps.selectBotForConnect(ctx);
+      if (picked) {
+        // Bug 4: picker already set in-memory + persisted to telegram.json;
+        // skip reloadConfig which would overwrite the picker's setConfig
+        // with disk state (harmless now that persist is correct, but was
+        // actively destructive before Bug 1 fix — and still a redundant
+        // disk round-trip that adds nothing).
+      } else {
+        // Picker didn't run (0 bots) or was cancelled — reload from disk
+        // so in-memory matches telegram.json before we check hasBotToken.
+        await deps.reloadConfig();
+      }
+      telegramDebugLog("cmd", "/telegram-connect after picker", {
+        hasBotToken: deps.hasBotToken(),
+        picked,
+      });
       if (!deps.hasBotToken()) {
         await deps.promptForConfig(ctx);
         return;
       }
+      // Bug 9 (cont): stop any previous polling + release old bot's lock
+      // before acquiring the new bot's lock. Without this, switching bots
+      // via /telegram-connect leaves the old getUpdates loop running and
+      // the old scoped lock entry leaks in locks.json.
+      try {
+        const stopMsg = await deps.stopPolling();
+        if (stopMsg) {
+          telegramDebugLog("cmd", "/telegram-connect stopped previous", {
+            stopMsg,
+          });
+        }
+      } catch (error) {
+        telegramDebugLog("cmd", "/telegram-connect stop failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       let result = await deps.startPolling(ctx, {
         forceFreshLeaderThread: true,
+      });
+      telegramDebugLog("cmd", "/telegram-connect startPolling result", {
+        ok: result?.ok,
+        canTakeover: result?.canTakeover,
+        message: result?.message,
       });
       if (result && !result.ok && result.canTakeover) {
         const confirmed = await ctx.ui.confirm(

@@ -3,6 +3,7 @@
  * Zones: telegram transport, polling runtime
  * Owns polling request builders, stop conditions, and the long-poll loop runtime for Telegram updates
  */
+import { telegramDebugLog } from "./debug-log.ts";
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -239,12 +240,16 @@ export function startTelegramPollingRuntime<TContext>(
   ctx: TContext,
   deps: TelegramPollingRuntimeDeps<TContext>,
 ): void {
-  if (
-    !shouldStartTelegramPolling({
-      hasBotToken: deps.hasBotToken(),
-      hasPollingPromise: !!deps.getPollingPromise(),
-    })
-  ) {
+  const shouldStart = shouldStartTelegramPolling({
+    hasBotToken: deps.hasBotToken(),
+    hasPollingPromise: !!deps.getPollingPromise(),
+  });
+  telegramDebugLog("poll", "startTelegramPollingRuntime", {
+    shouldStart,
+    hasBotToken: deps.hasBotToken(),
+    hasPollingPromise: !!deps.getPollingPromise(),
+  });
+  if (!shouldStart) {
     return;
   }
   const controller = deps.createAbortController?.() ?? new AbortController();
@@ -867,10 +872,19 @@ export async function runTelegramPollLoop<
   TUpdate extends TelegramUpdate,
   TContext = unknown,
 >(deps: TelegramPollLoopDeps<TUpdate, TContext>): Promise<void> {
-  if (!deps.config.botToken) return;
+  if (!deps.config.botToken) {
+    telegramDebugLog("poll", "loop start skipped: no botToken");
+    return;
+  }
+  telegramDebugLog("poll", "loop start", {
+    lastUpdateId: deps.config.lastUpdateId,
+    botTokenTail: deps.config.botToken?.slice(-6),
+  });
   try {
     await deps.deleteWebhook(deps.signal);
-  } catch {
+    telegramDebugLog("poll", "deleteWebhook ok");
+  } catch (e) {
+    telegramDebugLog("poll", "deleteWebhook failed", { error: String(e) });
     // ignore
   }
   if (deps.config.lastUpdateId === undefined) {
@@ -884,6 +898,10 @@ export async function runTelegramPollLoop<
         deps.config.lastUpdateId = lastUpdateId;
         await deps.persistConfig();
       }
+      telegramDebugLog("poll", "initial sync", {
+        updateCount: updates.length,
+        lastUpdateId: getLatestTelegramUpdateId(updates),
+      });
     } catch {
       // ignore
     }
@@ -902,9 +920,20 @@ export async function runTelegramPollLoop<
         deps.signal,
       );
       consecutiveGetUpdatesConflicts = 0;
+      if (updates.length > 0) {
+        telegramDebugLog("poll", "getUpdates", {
+          count: updates.length,
+          lastUpdateId: deps.config.lastUpdateId,
+          firstUpdateId: updates[0]?.update_id,
+        });
+      }
       for (const update of updates) {
         try {
           await deps.handleUpdate(update, deps.ctx);
+        telegramDebugLog("poll", "handleUpdate", {
+          updateId: update.update_id,
+          hasMessage: !!(update as Record<string, unknown>).message,
+        });
           deps.config.lastUpdateId = update.update_id;
           updateFailures.delete(update.update_id);
           await deps.persistConfig();
@@ -915,6 +944,11 @@ export async function runTelegramPollLoop<
             phase: "handleUpdate",
             updateId: update.update_id,
             failureCount,
+          });
+          telegramDebugLog("poll", "handleUpdate failed", {
+            updateId: update.update_id,
+            failureCount,
+            error: String(error),
           });
           if (failureCount < maxUpdateFailures) {
             handledUpdateFailureRethrown = true;
@@ -935,6 +969,7 @@ export async function runTelegramPollLoop<
         handledUpdateFailureRethrown = false;
       } else {
         deps.recordRuntimeEvent?.("polling", error, { phase: "loop" });
+        telegramDebugLog("poll", "loop error", { error: String(error) });
       }
       if (isTelegramGetUpdatesConflictError(error)) {
         consecutiveGetUpdatesConflicts += 1;
@@ -954,4 +989,5 @@ export async function runTelegramPollLoop<
       deps.onStatusReset();
     }
   }
+  telegramDebugLog("poll", "loop exit");
 }

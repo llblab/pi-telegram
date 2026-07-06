@@ -37,7 +37,7 @@ type TelegramBridgeStatusUpdater =
 interface TelegramCommandsAndToolsBindingDeps {
   pi: Pi.ExtensionAPI;
   configStore: Config.TelegramConfigStore;
-  persistConfig: () => Promise<void>;
+  persistConfig: (config?: Config.TelegramConfig) => Promise<void>;
   setup: Setup.TelegramSetupGuard;
   activeTurnRuntime: Queue.TelegramActiveTurnStore<Queue.PendingTelegramTurn>;
   lockedPollingRuntime: Locks.TelegramLockedPollingRuntime<Pi.ExtensionContext>;
@@ -96,7 +96,7 @@ export function registerTelegramCommandsAndTools({
   });
   Prompts.registerTelegramHelpTool(pi);
   Commands.registerTelegramBridgeCommands(pi, {
-    promptForConfig: Setup.createTelegramSetupPromptRuntime({
+    promptForConfig: Setup.createTelegramMultiBotSetupPromptRuntime({
       getConfig: configStore.get,
       setConfig: configStore.set,
       setupGuard: setup,
@@ -104,6 +104,12 @@ export function registerTelegramCommandsAndTools({
       persistConfig,
       startPolling: lockedPollingRuntime.start,
       updateStatus,
+      recordRuntimeEvent,
+    }),
+    selectBotForConnect: Setup.createTelegramBotPickerPromptRuntime({
+      getConfig: configStore.get,
+      setConfig: configStore.set,
+      persistConfig,
       recordRuntimeEvent,
     }),
     getStatusLines,
