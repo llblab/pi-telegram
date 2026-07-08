@@ -127,7 +127,7 @@ test("Thread names can include the assigned slot", () => {
   assert.match(name, /Follower/);
 });
 
-test("Thread state path is transient", () => {
+test("Thread state path is transient and profile-aware", () => {
   assert.equal(
     getTelegramTopicTargetsPath("/agent"),
     join("/agent", "tmp", "telegram", "state.json"),
@@ -135,6 +135,14 @@ test("Thread state path is transient", () => {
   assert.equal(
     getTelegramStatePath("/agent"),
     getTelegramTopicTargetsPath("/agent"),
+  );
+  assert.equal(
+    getTelegramTopicTargetsPath("/agent", "omp"),
+    join("/agent", "tmp", "telegram", "state.omp.json"),
+  );
+  assert.equal(
+    getTelegramStatePath("/agent", "omp"),
+    getTelegramTopicTargetsPath("/agent", "omp"),
   );
 });
 

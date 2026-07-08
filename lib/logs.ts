@@ -1,7 +1,7 @@
 /**
- * Telegram runtime JSONL diagnostics log
+ * Telegram diagnostics logs
  * Zones: telegram diagnostics, filesystem, session observability
- * Owns session-local append-only runtime evidence for debugging without becoming routing state
+ * Owns bounded JSONL runtime evidence files, previous-log preservation, and profile-aware log paths without becoming routing state
  */
 
 import {
@@ -12,8 +12,13 @@ import {
   writeFileSync,
   appendFile,
 } from "node:fs";
-import { dirname, join } from "node:path";
-import { resolveAgentDir } from "./paths.ts";
+import { dirname } from "node:path";
+import {
+  resolveAgentDir,
+  resolveTelegramProfileTempFilePath,
+} from "./paths.ts";
+
+export type TelegramLogPathInput = string | (() => string);
 
 export interface TelegramRuntimeJsonlEvent {
   at: number;
@@ -23,14 +28,14 @@ export interface TelegramRuntimeJsonlEvent {
 }
 
 export interface TelegramRuntimeJsonlLogOptions {
-  path?: string;
-  previousPath?: string;
+  path?: TelegramLogPathInput;
+  previousPath?: TelegramLogPathInput;
   maxBytes?: number;
   getNowMs?: () => number;
 }
 
 export interface TelegramRuntimeJsonlLog {
-  path: string;
+  getPath: () => string;
   reset: (reason: string, scope?: Record<string, unknown>) => void;
   resetIfScopeChanged: (
     scopeKey: string,
@@ -44,8 +49,26 @@ const DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024;
 
 export function getTelegramRuntimeLogPath(
   agentDir = resolveAgentDir(),
+  profileName?: string,
 ): string {
-  return join(agentDir, "tmp", "telegram", "logs.jsonl");
+  return resolveTelegramProfileTempFilePath(
+    "logs",
+    "jsonl",
+    agentDir,
+    profileName,
+  );
+}
+
+export function getTelegramPreviousRuntimeLogPath(
+  agentDir = resolveAgentDir(),
+  profileName?: string,
+): string {
+  return resolveTelegramProfileTempFilePath(
+    "logs",
+    "previous.jsonl",
+    agentDir,
+    profileName,
+  );
 }
 
 function safeJsonLine(value: unknown): string {
@@ -61,27 +84,35 @@ function safeJsonLine(value: unknown): string {
 export function createTelegramRuntimeJsonlLog(
   options: TelegramRuntimeJsonlLogOptions = {},
 ): TelegramRuntimeJsonlLog {
-  const path = options.path ?? getTelegramRuntimeLogPath();
-  const previousPath =
-    options.previousPath ?? path.replace(/\.jsonl$/u, ".previous.jsonl");
+  const resolvePath = () =>
+    typeof options.path === "function"
+      ? options.path()
+      : (options.path ?? getTelegramRuntimeLogPath());
+  const resolvePreviousPath = () => {
+    if (typeof options.previousPath === "function") return options.previousPath();
+    if (options.previousPath) return options.previousPath;
+    return resolvePath().replace(/\.jsonl$/u, ".previous.jsonl");
+  };
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_LOG_BYTES;
   const getNowMs = options.getNowMs ?? Date.now;
-  let scopeKey: string | undefined;
+  const scopeKeys = new Map<string, string | undefined>();
   let pending: Promise<void> = Promise.resolve();
 
-  const ensureParent = () => {
+  const ensureParent = (path: string) => {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   };
 
-  const preserveCurrentLog = () => {
+  const preserveCurrentLog = (path: string, previousPath: string) => {
     if (!existsSync(path)) return;
     mkdirSync(dirname(previousPath), { recursive: true, mode: 0o700 });
     copyFileSync(path, previousPath);
   };
 
   const writeReset = (reason: string, scope?: Record<string, unknown>) => {
-    ensureParent();
-    preserveCurrentLog();
+    const path = resolvePath();
+    const previousPath = resolvePreviousPath();
+    ensureParent(path);
+    preserveCurrentLog(path, previousPath);
     writeFileSync(
       path,
       safeJsonLine({
@@ -99,7 +130,8 @@ export function createTelegramRuntimeJsonlLog(
     pending = pending
       .catch(() => undefined)
       .then(async () => {
-        ensureParent();
+        const path = resolvePath();
+        ensureParent(path);
         if (existsSync(path) && statSync(path).size > maxBytes) {
           writeReset("max-bytes", { maxBytes });
         }
@@ -113,9 +145,10 @@ export function createTelegramRuntimeJsonlLog(
   };
 
   return {
-    path,
+    getPath: resolvePath,
     reset(reason, scope) {
-      scopeKey = scope ? safeJsonLine(scope) : undefined;
+      const path = resolvePath();
+      scopeKeys.set(path, scope ? safeJsonLine(scope) : undefined);
       try {
         writeReset(reason, scope);
       } catch {
@@ -123,8 +156,9 @@ export function createTelegramRuntimeJsonlLog(
       }
     },
     resetIfScopeChanged(nextScopeKey, reason, scope) {
-      if (scopeKey === nextScopeKey) return;
-      scopeKey = nextScopeKey;
+      const path = resolvePath();
+      if (scopeKeys.get(path) === nextScopeKey) return;
+      scopeKeys.set(path, nextScopeKey);
       try {
         writeReset(reason, scope);
       } catch {

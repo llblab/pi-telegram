@@ -32,7 +32,7 @@ import * as Queue from "./lib/queue.ts";
 import * as Replies from "./lib/replies.ts";
 import * as Routing from "./lib/routing.ts";
 import * as Runtime from "./lib/runtime.ts";
-import * as RuntimeLog from "./lib/runtime-log.ts";
+import * as Logs from "./lib/logs.ts";
 import * as Sections from "./lib/sections.ts";
 import * as Status from "./lib/status.ts";
 import * as Sync from "./lib/sync.ts";
@@ -94,7 +94,23 @@ export default function (pi: Pi.ExtensionAPI) {
       return configStoreForRedaction?.getBotToken();
     },
   });
-  const runtimeJsonlLog = RuntimeLog.createTelegramRuntimeJsonlLog();
+  let getRuntimeLogProfileName = function (): string | undefined {
+    return undefined;
+  };
+  const runtimeJsonlLog = Logs.createTelegramRuntimeJsonlLog({
+    path: function () {
+      return Logs.getTelegramRuntimeLogPath(
+        undefined,
+        getRuntimeLogProfileName(),
+      );
+    },
+    previousPath: function () {
+      return Logs.getTelegramPreviousRuntimeLogPath(
+        undefined,
+        getRuntimeLogProfileName(),
+      );
+    },
+  });
   runtimeJsonlLog.reset("extension-start", {
     instanceId: telegramInstanceId,
     pid: process.pid,
@@ -112,6 +128,7 @@ export default function (pi: Pi.ExtensionAPI) {
   };
   const configStore = Config.createTelegramConfigStore({ recordRuntimeEvent });
   configStoreForRedaction = configStore;
+  getRuntimeLogProfileName = configStore.getActiveProfileName;
   const isTelegramBusConfigured = function (): boolean {
     return true;
   };
@@ -121,7 +138,12 @@ export default function (pi: Pi.ExtensionAPI) {
   Config.bindGlobalTelegramConfigRuntime(configStore);
   const configControls = Config.createTelegramConfigControls(configStore);
   const threadStore = Threads.createTelegramTopicTargetStore({
-    path: Threads.getTelegramTopicTargetsPath(),
+    path: function () {
+      return Threads.getTelegramTopicTargetsPath(
+        undefined,
+        configStore.getActiveProfileName(),
+      );
+    },
   });
   const lockRuntime = Locks.createTelegramLockRuntime<Pi.ExtensionContext>({
     key: Locks.createTelegramLockKeyResolver(configStore),
@@ -313,15 +335,12 @@ export default function (pi: Pi.ExtensionAPI) {
     },
   });
   const { updateStatus: updateStatusLine } = statusRuntime;
-  let lastRuntimeLogScopeKey: string | undefined;
   const updateRuntimeLogScope = function (reason: string) {
     const scope = Status.createTelegramRuntimeLogScope({
       state: statusRuntime.getStatusState(),
       instanceId: telegramInstanceId,
     });
     const scopeKey = JSON.stringify(scope);
-    if (scopeKey === lastRuntimeLogScopeKey) return;
-    lastRuntimeLogScopeKey = scopeKey;
     runtimeJsonlLog.resetIfScopeChanged(scopeKey, reason, scope);
   };
   const updateStatus = function (ctx: Pi.ExtensionContext) {

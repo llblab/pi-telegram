@@ -51,11 +51,27 @@ export function resolveTelegramLocksPath(): string {
 }
 
 /** Telegram bridge temporary directory (<agentDir>/tmp/telegram). */
-export function resolveTelegramTempDir(): string {
-  return join(resolveAgentDir(), "tmp", "telegram");
+export function resolveTelegramTempDir(agentDir = resolveAgentDir()): string {
+  return join(agentDir, "tmp", "telegram");
+}
+
+export function getTelegramProfilePathSuffix(profileName?: string): string {
+  return profileName ? `.${profileName.replace(/[^a-zA-Z0-9._-]+/g, "_")}` : "";
+}
+
+export function resolveTelegramProfileTempFilePath(
+  baseName: string,
+  extension: string,
+  agentDir = resolveAgentDir(),
+  profileName?: string,
+): string {
+  return join(
+    resolveTelegramTempDir(agentDir),
+    `${baseName}${getTelegramProfilePathSuffix(profileName)}.${extension}`,
+  );
 }
 
 /** Runtime event log (<agentDir>/tmp/telegram/logs.jsonl). */
 export function resolveTelegramRuntimeLogPath(): string {
-  return join(resolveAgentDir(), "tmp", "telegram", "logs.jsonl");
+  return resolveTelegramProfileTempFilePath("logs", "jsonl");
 }

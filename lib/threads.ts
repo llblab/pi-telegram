@@ -7,11 +7,14 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 
 import type { TelegramTarget } from "./target.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
-import { resolveAgentDir } from "./paths.ts";
+import {
+  resolveAgentDir,
+  resolveTelegramProfileTempFilePath,
+} from "./paths.ts";
 
 export interface TelegramThreadNameInput {
   seed: string;
@@ -219,7 +222,7 @@ export interface TelegramTopicTargetStore {
 }
 
 export interface TelegramTopicTargetStoreOptions {
-  path: string;
+  path: string | (() => string);
   getNowMs?: () => number;
 }
 
@@ -328,14 +331,23 @@ export function createTelegramThreadName(
   );
 }
 
-export function getTelegramStatePath(agentDir = resolveAgentDir()): string {
-  return join(agentDir, "tmp", "telegram", "state.json");
+export function getTelegramStatePath(
+  agentDir = resolveAgentDir(),
+  profileName?: string,
+): string {
+  return resolveTelegramProfileTempFilePath(
+    "state",
+    "json",
+    agentDir,
+    profileName,
+  );
 }
 
 export function getTelegramTopicTargetsPath(
   agentDir = resolveAgentDir(),
+  profileName?: string,
 ): string {
-  return getTelegramStatePath(agentDir);
+  return getTelegramStatePath(agentDir, profileName);
 }
 
 export function getTelegramThreadOwnerKey(owner: TelegramThreadOwner): string {
@@ -844,6 +856,7 @@ export function createTelegramTopicTargetStore(
   let pendingProvisions: TelegramThreadPendingProvision[] = [];
   let syncObservations: TelegramTopicSyncObservation[] = [];
   let loaded = false;
+  let loadedPath: string | undefined;
   let dirty = false;
   let statusSnapshot: {
     runtime?: Record<string, unknown>;
@@ -869,8 +882,26 @@ export function createTelegramTopicTargetStore(
     });
   };
 
+  const getPath = () =>
+    typeof options.path === "function" ? options.path() : options.path;
+  const resetForPath = (path: string) => {
+    if (loadedPath === path) return;
+    botState = { threadMode: "unknown" };
+    records = new Map();
+    identities = new Map();
+    reservations = [];
+    pendingProvisions = [];
+    syncObservations = [];
+    statusSnapshot = {};
+    loaded = false;
+    dirty = false;
+    loadedPath = path;
+  };
+
   const loadFromDisk = async () => {
-    if (!existsSync(options.path)) {
+    const path = getPath();
+    resetForPath(path);
+    if (!existsSync(path)) {
       botState = { threadMode: "unknown" };
       records = new Map();
       identities = new Map();
@@ -880,7 +911,7 @@ export function createTelegramTopicTargetStore(
       loaded = true;
       return;
     }
-    const content = await readFile(options.path, "utf8");
+    const content = await readFile(path, "utf8");
     const file = parseTopicTargetFile(JSON.parse(content));
     botState = file.bot;
     records = new Map(
@@ -923,9 +954,11 @@ export function createTelegramTopicTargetStore(
       await loadFromDisk();
     },
     async persist() {
+      const path = getPath();
+      if (loadedPath !== path && !dirty) resetForPath(path);
       if (!loaded && !dirty) await loadFromDisk();
-      await mkdir(dirname(options.path), { recursive: true });
-      const tempPath = `${options.path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+      await mkdir(dirname(path), { recursive: true });
+      const tempPath = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
       const nowMs = getNowMs();
       reservations = reservations.filter(
         (reservation) =>
@@ -970,8 +1003,8 @@ export function createTelegramTopicTargetStore(
         mode: 0o600,
       });
       await chmod(tempPath, 0o600);
-      await rename(tempPath, options.path);
-      await chmod(options.path, 0o600);
+      await rename(tempPath, path);
+      await chmod(path, 0o600);
       loaded = true;
       dirty = false;
     },
@@ -1063,6 +1096,7 @@ export function createTelegramTopicTargetStore(
       dirty = true;
     },
     setStatusSnapshot(snapshot) {
+      if (!loadedPath) loadedPath = getPath();
       statusSnapshot = { ...snapshot };
     },
     getByProfileKey(profileKey) {
