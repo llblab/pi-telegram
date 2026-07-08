@@ -2921,7 +2921,7 @@ test("Dispatch runtime idles on none and executes control items directly", () =>
   assert.deepEqual(events, ["idle", "control"]);
 });
 
-test("Dispatch runtime sends prompt turns as Pi follow-up messages", () => {
+test("Dispatch runtime sends prompt turns as normal user messages", () => {
   const events: string[] = [];
   executeTelegramQueueDispatchPlan(
     {
@@ -2959,7 +2959,7 @@ test("Dispatch runtime sends prompt turns as Pi follow-up messages", () => {
       },
     },
   );
-  assert.deepEqual(events, ["start:2", "send:followUp"]);
+  assert.deepEqual(events, ["start:2", "send:default"]);
 });
 
 test("Dispatch runtime reports prompt dispatch failures after starting", () => {
