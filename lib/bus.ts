@@ -30,21 +30,17 @@ import {
   type TelegramBusTransportRetryPolicy,
 } from "./bus-transport.ts";
 import type { TelegramTarget } from "./target.ts";
+import { resolveAgentDir } from "./paths.ts";
 
 export type TelegramBusRole = "leader" | "follower";
 
-function getAgentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR
-    ? resolve(process.env.PI_CODING_AGENT_DIR)
-    : join(homedir(), ".pi", "agent");
-}
 
 export function createTelegramBusAuthSecret(): string {
   return randomBytes(32).toString("base64url");
 }
 
 export function getTelegramBusSocketPath(
-  agentDir = getAgentDir(),
+  agentDir = resolveAgentDir(),
   platform = getPlatform(),
 ): string {
   return getTelegramBusLeaderEndpoint({ agentDir, platform });
@@ -52,7 +48,7 @@ export function getTelegramBusSocketPath(
 
 export function getTelegramBusFollowerSocketPath(
   instanceId: string,
-  agentDir = getAgentDir(),
+  agentDir = resolveAgentDir(),
   platform = getPlatform(),
 ): string {
   return getTelegramBusFollowerEndpoint({ agentDir, platform, instanceId });
