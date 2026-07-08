@@ -56,6 +56,7 @@ interface TelegramCommandsAndToolsBindingDeps {
   canSendDirect: () => boolean;
   updateStatus: TelegramBridgeStatusUpdater;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
+  activeProfileRef?: { current: string | undefined };
 }
 
 export function registerTelegramCommandsAndTools({
@@ -73,8 +74,9 @@ export function registerTelegramCommandsAndTools({
   getDefaultChatId,
   getDefaultTarget,
   canSendDirect,
-  updateStatus,
   recordRuntimeEvent,
+  updateStatus,
+  activeProfileRef,
 }: TelegramCommandsAndToolsBindingDeps): void {
   OutboundAttachments.registerTelegramOutboundAttachmentTool(pi, {
     getActiveTurn: activeTurnRuntime.get,
@@ -96,22 +98,74 @@ export function registerTelegramCommandsAndTools({
   });
   Prompts.registerTelegramHelpTool(pi);
   Commands.registerTelegramBridgeCommands(pi, {
-    promptForConfig: Setup.createTelegramSetupPromptRuntime({
-      getConfig: configStore.get,
-      setConfig: configStore.set,
-      setupGuard: setup,
-      getMe: TelegramApi.fetchTelegramBotIdentity,
-      persistConfig,
-      startPolling: lockedPollingRuntime.start,
-      updateStatus,
-      recordRuntimeEvent,
-    }),
+    promptForConfig: (ctx, profileName) => {
+      const runSetup = Setup.createTelegramSetupPromptRuntime({
+        getConfig: configStore.get,
+        setConfig: configStore.set,
+        setupGuard: setup,
+        getMe: TelegramApi.fetchTelegramBotIdentity,
+        persistConfig,
+        startPolling: lockedPollingRuntime.start,
+        updateStatus,
+        recordRuntimeEvent,
+      });
+      if (!profileName) return runSetup(ctx);
+      // Profile-aware: save top-level before setup, restore after
+      const savedTopLevel = {
+        botToken: configStore.get().botToken,
+        botUsername: configStore.get().botUsername,
+        botId: configStore.get().botId,
+        allowedUserId: configStore.get().allowedUserId,
+        lastUpdateId: configStore.get().lastUpdateId,
+      };
+      return runSetup(ctx).then(async () => {
+        const config = configStore.get();
+        const profile = {
+          botToken: config.botToken,
+          botUsername: config.botUsername,
+          botId: config.botId,
+          allowedUserId: config.allowedUserId,
+          lastUpdateId: config.lastUpdateId,
+        };
+        // Restore original top-level, save new bot to profile
+        const next = {
+          ...config,
+          botToken: savedTopLevel.botToken,
+          botUsername: savedTopLevel.botUsername,
+          botId: savedTopLevel.botId,
+          allowedUserId: savedTopLevel.allowedUserId,
+          lastUpdateId: savedTopLevel.lastUpdateId,
+          profiles: { ...(config.profiles ?? {}), [profileName]: profile },
+        };
+        configStore.set(next);
+        await persistConfig(next);
+        ctx.ui.notify(`Profile "${profileName}" saved. Run /telegram-connect ${profileName} to connect.`);
+      });
+    },
     getStatusLines,
     reloadConfig: configStore.load,
     hasBotToken: configStore.hasBotToken,
     startPolling: lockedPollingRuntime.start,
     stopPolling: stopPolling ?? lockedPollingRuntime.stop,
     updateStatus,
+    activateProfileConfig: async (_ctx, profileName) => {
+      await configStore.load();
+      const config = configStore.get();
+      const profile = config.profiles?.[profileName];
+      if (!profile) return false;
+      // Activate profile in-memory only — do NOT persist to the shared
+      // telegram.json file which other OMP sessions also read.
+      configStore.set({
+        ...config,
+        botToken: profile.botToken,
+        botUsername: profile.botUsername,
+        botId: profile.botId,
+        allowedUserId: profile.allowedUserId,
+        lastUpdateId: profile.lastUpdateId,
+      });
+      activeProfileRef.current = profileName;
+      return true;
+    },
   });
 }
 
