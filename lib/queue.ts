@@ -2051,7 +2051,7 @@ export function executeTelegramQueueDispatchPlan<TContext = unknown>(
   }
   deps.onPromptDispatchStart(plan.item.chatId);
   try {
-    deps.sendUserMessage(plan.item.content, TELEGRAM_PROMPT_FOLLOW_UP_DELIVERY);
+    deps.sendUserMessage(plan.item.content);
   } catch (error) {
     const message = getTelegramQueueErrorMessage(error);
     deps.onPromptDispatchFailure(message);
