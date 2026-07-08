@@ -98,8 +98,33 @@ export function registerTelegramCommandsAndTools({
   });
   Prompts.registerTelegramHelpTool(pi);
   Commands.registerTelegramBridgeCommands(pi, {
-    promptForConfig: (ctx, profileName) => {
-      const previousProfileName = configStore.getActiveProfileName();
+    promptForConfig: async (ctx, profileName) => {
+      const nextProfileName = profileName ?? undefined;
+      if (profileName && !Config.isValidTelegramProfileName(profileName)) {
+        ctx.ui.notify(`Invalid Telegram profile name: ${profileName}`, "error");
+        return;
+      }
+      const previousProfileName = activeProfileRef?.current;
+      if (previousProfileName !== nextProfileName) {
+        await (stopPolling ?? lockedPollingRuntime.stop)();
+      }
+      if (!profileName) {
+        configStore.activateProfile(undefined);
+        if (activeProfileRef) activeProfileRef.current = undefined;
+      } else {
+        const storedConfig = configStore.getStoredConfig();
+        if (!storedConfig.profiles?.[profileName]) {
+          configStore.set({
+            ...storedConfig,
+            profiles: {
+              ...(storedConfig.profiles ?? {}),
+              [profileName]: { botToken: "" },
+            },
+          });
+        }
+        configStore.activateProfile(profileName);
+        if (activeProfileRef) activeProfileRef.current = profileName;
+      }
       const runSetup = Setup.createTelegramSetupPromptRuntime({
         getConfig: configStore.get,
         setConfig: configStore.set,
@@ -110,31 +135,10 @@ export function registerTelegramCommandsAndTools({
         updateStatus,
         recordRuntimeEvent,
       });
-      if (!profileName) {
-        configStore.activateProfile(undefined);
-        return runSetup(ctx).finally(() => {
-          configStore.activateProfile(previousProfileName);
-        });
+      await runSetup(ctx);
+      if (profileName) {
+        ctx.ui.notify(`Profile "${profileName}" saved and connected.`, "info");
       }
-      if (!Config.isValidTelegramProfileName(profileName)) {
-        ctx.ui.notify(`Invalid Telegram profile name: ${profileName}`, "error");
-        return Promise.resolve();
-      }
-      const storedConfig = configStore.getStoredConfig();
-      if (!storedConfig.profiles?.[profileName]) {
-        configStore.set({
-          ...storedConfig,
-          profiles: {
-            ...(storedConfig.profiles ?? {}),
-            [profileName]: { botToken: "" },
-          },
-        });
-      }
-      configStore.activateProfile(profileName);
-      return runSetup(ctx).finally(() => {
-        configStore.activateProfile(previousProfileName);
-        ctx.ui.notify(`Profile "${profileName}" saved. Run /telegram-connect ${profileName} to connect.`, "info");
-      });
     },
     getStatusLines,
     reloadConfig: configStore.load,
@@ -144,6 +148,15 @@ export function registerTelegramCommandsAndTools({
     updateStatus,
     getProfileNames: () =>
       Config.getTelegramProfileNames(configStore.getStoredConfig()),
+    activateDefaultProfileConfig: async () => {
+      await configStore.load();
+      const previousProfileName = activeProfileRef?.current;
+      if (previousProfileName) {
+        await (stopPolling ?? lockedPollingRuntime.stop)();
+      }
+      configStore.activateProfile(undefined);
+      if (activeProfileRef) activeProfileRef.current = undefined;
+    },
     activateProfileConfig: async (_ctx, profileName) => {
       await configStore.load();
       if (!Config.isValidTelegramProfileName(profileName)) return false;

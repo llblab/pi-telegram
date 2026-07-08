@@ -309,6 +309,7 @@ export interface TelegramBridgeCommandRegistrationDeps {
   stopPolling: () => Promise<void | string>;
   updateStatus: (ctx: ExtensionCommandContext) => void;
   getProfileNames?: () => string[];
+  activateDefaultProfileConfig?: (ctx: ExtensionCommandContext) => Promise<void>;
   activateProfileConfig?: (
     ctx: ExtensionCommandContext,
     profileName: string,
@@ -370,7 +371,7 @@ export function registerTelegramBridgeCommands(
         }
         ctx.ui.notify(`Activated profile "${profileName}".`, "info");
       } else {
-        await deps.reloadConfig();
+        await (deps.activateDefaultProfileConfig?.(ctx) ?? deps.reloadConfig());
       }
       if (!deps.hasBotToken()) {
         const profileNames = deps.getProfileNames?.() ?? [];
