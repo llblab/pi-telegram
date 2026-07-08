@@ -11,6 +11,7 @@ import {
   createTelegramOutboundReplyPlanner,
 } from "../lib/outbound.ts";
 import {
+  appendTelegramPromptTurnOnce,
   appendTelegramQueueItem,
   assertTelegramQueueItemAdmissionValid,
   buildPendingTelegramControlItem,
@@ -288,6 +289,33 @@ test("Queue planning rejects invalid queue admission", () => {
         "Invalid Telegram queue admission: control item cannot use default lane",
     },
   );
+});
+
+test("Queue prompt append-once deduplicates repeated callback prompts", () => {
+  const callbackTurn = createQueueTestPromptTurn({
+    queueLane: "priority",
+    laneOrder: 0,
+    content: [{ type: "text", text: "[callback] approve" }],
+    historyText: "approve",
+  });
+  const first = appendTelegramPromptTurnOnce([], callbackTurn);
+  assert.equal(first.appended, true);
+
+  const duplicate = appendTelegramPromptTurnOnce(first.items, {
+    ...callbackTurn,
+    queueOrder: 99,
+    laneOrder: 99,
+  });
+  assert.equal(duplicate.appended, false);
+  assert.equal(duplicate.items.length, 1);
+
+  const distinct = appendTelegramPromptTurnOnce(first.items, {
+    ...callbackTurn,
+    content: [{ type: "text", text: "[callback] reject" }],
+    historyText: "reject",
+  });
+  assert.equal(distinct.appended, true);
+  assert.equal(distinct.items.length, 2);
 });
 
 test("Control-lane items sort before priority and default prompt items", () => {

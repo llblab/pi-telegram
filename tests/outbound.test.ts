@@ -739,7 +739,7 @@ test("Button prompt turns use Telegram prompt content", () => {
       replyToMessageId: 22,
       sourceMessageIds: [22],
       queueOrder: 3,
-      queueLane: "default",
+      queueLane: "priority",
       laneOrder: 3,
       queuedAttachments: [],
       content: [{ type: "text", text: "[telegram] Continue now" }],

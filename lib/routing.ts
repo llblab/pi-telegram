@@ -1248,22 +1248,25 @@ export function createTelegramInboundRouteRuntime<
             if (typeof chatId !== "number" || typeof messageId !== "number")
               return;
             const queueOrder = deps.bridgeRuntime.queue.allocateItemOrder();
-            deps.queueMutationRuntime.append(
-              OutboundHandlers.createTelegramButtonPromptTurn({
-                chatId,
-                target:
-                  typeof buttonQuery.message?.message_thread_id === "number"
-                    ? {
-                        chatId,
-                        threadId: buttonQuery.message.message_thread_id,
-                      }
-                    : { chatId },
-                replyToMessageId: messageId,
-                queueOrder,
-                action,
-              }),
-              context,
+            const turn = OutboundHandlers.createTelegramButtonPromptTurn({
+              chatId,
+              target:
+                typeof buttonQuery.message?.message_thread_id === "number"
+                  ? {
+                      chatId,
+                      threadId: buttonQuery.message.message_thread_id,
+                    }
+                  : { chatId },
+              replyToMessageId: messageId,
+              queueOrder,
+              action,
+            });
+            const result = Queue.appendTelegramPromptTurnOnce(
+              deps.telegramQueueStore.getQueuedItems(),
+              turn,
             );
+            if (!result.appended) return;
+            deps.telegramQueueStore.setQueuedItems(result.items);
             deps.updateStatus(context);
             requestDispatchNextQueuedTelegramTurn(context);
           },
@@ -1323,15 +1326,39 @@ export function createTelegramInboundRouteRuntime<
     );
     if (handledBySettings) return;
     const callbackData = query.data;
-    if (
-      deps.sendUserMessage &&
-      callbackData &&
-      !isTelegramOwnedCallbackData(callbackData)
-    ) {
-      deps.sendUserMessage(
-        `[callback] ${callbackData}`,
-        Queue.TELEGRAM_PROMPT_FOLLOW_UP_DELIVERY,
-      );
+    if (callbackData && !isTelegramOwnedCallbackData(callbackData)) {
+      const chatId = query.message?.chat?.id;
+      const messageId = query.message?.message_id;
+      if (typeof chatId === "number" && typeof messageId === "number") {
+        const queueOrder = deps.bridgeRuntime.queue.allocateItemOrder();
+        const target =
+          typeof query.message?.message_thread_id === "number"
+            ? { chatId, threadId: query.message.message_thread_id }
+            : { chatId };
+        const turn: Queue.PendingTelegramTurn = {
+          kind: "prompt",
+          chatId,
+          target,
+          replyToMessageId: messageId,
+          sourceMessageIds: [messageId],
+          queueOrder,
+          queueLane: "priority",
+          laneOrder: queueOrder,
+          queuedAttachments: [],
+          content: [{ type: "text", text: `[callback] ${callbackData}` }],
+          historyText: callbackData,
+          statusSummary: callbackData,
+        };
+        const result = Queue.appendTelegramPromptTurnOnce(
+          deps.telegramQueueStore.getQueuedItems(),
+          turn,
+        );
+        if (result.appended) {
+          deps.telegramQueueStore.setQueuedItems(result.items);
+          deps.updateStatus(ctx);
+          requestDispatchNextQueuedTelegramTurn(ctx);
+        }
+      }
       await deps.answerCallbackQuery(query.id);
       return;
     }

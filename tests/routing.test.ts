@@ -306,9 +306,14 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
       { cwd: "/repo" },
     );
   }
-  assert.equal(
-    events.includes("user:[callback] vividfish:approve:123:followUp"),
-    true,
+  const callbackTurn = telegramQueueStore
+    .getQueuedItems()
+    .find((item) => item.statusSummary === "vividfish:approve:123");
+  assert.equal(callbackTurn?.kind, "prompt");
+  assert.equal(callbackTurn?.queueLane, "priority");
+  assert.deepEqual(
+    callbackTurn?.kind === "prompt" ? callbackTurn.content : undefined,
+    [{ type: "text", text: "[callback] vividfish:approve:123" }],
   );
   assert.equal(events.includes("answer:cb-custom"), true);
   for (const data of ownedCallbackData) {

@@ -32,15 +32,15 @@ export function resolveTelegramLockKey(activeProfile?: string): string {
   return TELEGRAM_LOCK_KEY;
 }
 
-export interface TelegramActiveProfileRef {
-  current: string | undefined;
+export interface TelegramActiveProfileGetter {
+  getActiveProfileName: () => string | undefined;
 }
 
 export function createTelegramLockKeyResolver(
-  activeProfileRef: TelegramActiveProfileRef,
+  activeProfile: TelegramActiveProfileGetter,
 ): () => string {
   return function getTelegramLockKey() {
-    return resolveTelegramLockKey(activeProfileRef.current);
+    return resolveTelegramLockKey(activeProfile.getActiveProfileName());
   };
 }
 

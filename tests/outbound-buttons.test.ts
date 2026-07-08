@@ -72,7 +72,7 @@ test("Button prompt turn preserves prompt text and queue metadata", () => {
   assert.equal(turn.chatId, 10);
   assert.deepEqual(turn.target, { chatId: 10, threadId: 40 });
   assert.equal(turn.replyToMessageId, 20);
-  assert.equal(turn.queueLane, "default");
+  assert.equal(turn.queueLane, "priority");
   assert.deepEqual(turn.sourceMessageIds, [20]);
   assert.deepEqual(turn.content, [
     { type: "text", text: "[telegram] Run this now." },

@@ -11,8 +11,10 @@ import test from "node:test";
 
 import {
   createTelegramLockedPollingRuntime,
+  createTelegramLockKeyResolver,
   createTelegramLockRuntime,
   readLocks,
+  resolveTelegramLockKey,
   TELEGRAM_LOCK_KEY,
   writeLocks,
 } from "../lib/locks.ts";
@@ -52,6 +54,51 @@ test("Lock runtime acquires, refreshes, and releases its own key", () => {
     });
     assert.equal(lock.release().kind, "active-here");
     assert.deepEqual(readLocks(temp.path), {});
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Lock key resolver preserves default compatibility and scopes named profiles", () => {
+  let activeProfileName: string | undefined;
+  const resolveKey = createTelegramLockKeyResolver({
+    getActiveProfileName: () => activeProfileName,
+  });
+
+  assert.equal(resolveTelegramLockKey(), TELEGRAM_LOCK_KEY);
+  assert.equal(resolveKey(), TELEGRAM_LOCK_KEY);
+  activeProfileName = "omp";
+  assert.equal(resolveKey(), `${TELEGRAM_LOCK_KEY}:omp`);
+});
+
+test("Lock runtime releases only the active profile key", () => {
+  const temp = createTempLockPath();
+  try {
+    let activeProfileName: string | undefined = "work";
+    const lock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      key: createTelegramLockKeyResolver({
+        getActiveProfileName: () => activeProfileName,
+      }),
+    });
+    assert.equal(lock.acquire({ cwd: "/repo" }).ok, true);
+    activeProfileName = "omp";
+    const other = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      key: createTelegramLockKeyResolver({
+        getActiveProfileName: () => activeProfileName,
+      }),
+    });
+    assert.equal(other.acquire({ cwd: "/repo" }).ok, true);
+
+    assert.equal(other.release().kind, "active-here");
+    assert.deepEqual(readLocks(temp.path)[`${TELEGRAM_LOCK_KEY}:work`], {
+      pid: 10,
+      cwd: "/repo",
+    });
+    assert.equal(readLocks(temp.path)[`${TELEGRAM_LOCK_KEY}:omp`], undefined);
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }

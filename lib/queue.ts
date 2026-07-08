@@ -273,6 +273,37 @@ export function appendTelegramQueueItem<
   return [...items, item];
 }
 
+function getTelegramPromptTextSignature(item: PendingTelegramTurn): string {
+  return item.content
+    .filter((entry): entry is TelegramPromptTextContent => entry.type === "text")
+    .map((entry) => entry.text)
+    .join("\n");
+}
+
+function isDuplicateTelegramPromptTurn(
+  left: PendingTelegramTurn,
+  right: PendingTelegramTurn,
+): boolean {
+  return (
+    left.chatId === right.chatId &&
+    left.target?.threadId === right.target?.threadId &&
+    left.replyToMessageId === right.replyToMessageId &&
+    getTelegramPromptTextSignature(left) === getTelegramPromptTextSignature(right)
+  );
+}
+
+export function appendTelegramPromptTurnOnce<TContext = unknown>(
+  items: TelegramQueueItem<TContext>[],
+  turn: PendingTelegramTurn,
+): { items: TelegramQueueItem<TContext>[]; appended: boolean } {
+  assertTelegramQueueItemAdmissionValid(turn);
+  const duplicate = items.some(
+    (item) => isPendingTelegramTurn(item) && isDuplicateTelegramPromptTurn(item, turn),
+  );
+  if (duplicate) return { items, appended: false };
+  return { items: [...items, turn], appended: true };
+}
+
 export function compareTelegramQueueItems<TContext = unknown>(
   left: TelegramQueueItem<TContext>,
   right: TelegramQueueItem<TContext>,

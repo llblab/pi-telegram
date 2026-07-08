@@ -192,7 +192,7 @@ export function createTelegramButtonPromptTurn(options: {
     replyToMessageId: options.replyToMessageId,
     sourceMessageIds: [options.replyToMessageId],
     queueOrder: options.queueOrder,
-    queueLane: "default",
+    queueLane: "priority",
     laneOrder: options.queueOrder,
     queuedAttachments: [],
     content: [{ type: "text", text: prompt }],

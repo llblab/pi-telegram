@@ -48,12 +48,6 @@ type ActivePiModel = NonNullable<Pi.ExtensionContext["model"]>;
 // --- Extension Runtime ---
 
 export default function (pi: Pi.ExtensionAPI) {
-  // Per-session active profile name — NOT persisted to telegram.json.
-  // Must stay in-memory only because multiple OMP sessions share the
-  // same agent dir and the same config file. If persisted, one session
-  // activating a profile would change the lock key for ALL sessions.
-  const activeProfileRef = { current: undefined as string | undefined };
-
   const piRuntime = Pi.createExtensionApiRuntimePorts(pi);
   const {
     getCommands,
@@ -121,7 +115,7 @@ export default function (pi: Pi.ExtensionAPI) {
     path: Threads.getTelegramTopicTargetsPath(),
   });
   const lockRuntime = Locks.createTelegramLockRuntime<Pi.ExtensionContext>({
-    key: Locks.createTelegramLockKeyResolver(activeProfileRef),
+    key: Locks.createTelegramLockKeyResolver(configStore),
     instanceId: telegramInstanceId,
     busSecret: telegramBusAuthSecret,
     staleHeartbeatMs: Locks.TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
@@ -1290,7 +1284,6 @@ export default function (pi: Pi.ExtensionAPI) {
     },
     updateStatus,
     recordRuntimeEvent,
-    activeProfileRef,
   });
 
   // --- Lifecycle Hooks ---
