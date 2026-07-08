@@ -56,6 +56,7 @@ interface TelegramCommandsAndToolsBindingDeps {
   canSendDirect: () => boolean;
   updateStatus: TelegramBridgeStatusUpdater;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
+  activeProfileRef?: { current: string | undefined };
 }
 
 export function registerTelegramCommandsAndTools({
@@ -73,8 +74,9 @@ export function registerTelegramCommandsAndTools({
   getDefaultChatId,
   getDefaultTarget,
   canSendDirect,
-  updateStatus,
   recordRuntimeEvent,
+  updateStatus,
+  activeProfileRef,
 }: TelegramCommandsAndToolsBindingDeps): void {
   OutboundAttachments.registerTelegramOutboundAttachmentTool(pi, {
     getActiveTurn: activeTurnRuntime.get,
@@ -96,22 +98,58 @@ export function registerTelegramCommandsAndTools({
   });
   Prompts.registerTelegramHelpTool(pi);
   Commands.registerTelegramBridgeCommands(pi, {
-    promptForConfig: Setup.createTelegramSetupPromptRuntime({
-      getConfig: configStore.get,
-      setConfig: configStore.set,
-      setupGuard: setup,
-      getMe: TelegramApi.fetchTelegramBotIdentity,
-      persistConfig,
-      startPolling: lockedPollingRuntime.start,
-      updateStatus,
-      recordRuntimeEvent,
-    }),
+    promptForConfig: (ctx, profileName) => {
+      const previousProfileName = configStore.getActiveProfileName();
+      const runSetup = Setup.createTelegramSetupPromptRuntime({
+        getConfig: configStore.get,
+        setConfig: configStore.set,
+        setupGuard: setup,
+        getMe: TelegramApi.fetchTelegramBotIdentity,
+        persistConfig,
+        startPolling: lockedPollingRuntime.start,
+        updateStatus,
+        recordRuntimeEvent,
+      });
+      if (!profileName) {
+        configStore.activateProfile(undefined);
+        return runSetup(ctx).finally(() => {
+          configStore.activateProfile(previousProfileName);
+        });
+      }
+      if (!Config.isValidTelegramProfileName(profileName)) {
+        ctx.ui.notify(`Invalid Telegram profile name: ${profileName}`, "error");
+        return Promise.resolve();
+      }
+      const storedConfig = configStore.getStoredConfig();
+      if (!storedConfig.profiles?.[profileName]) {
+        configStore.set({
+          ...storedConfig,
+          profiles: {
+            ...(storedConfig.profiles ?? {}),
+            [profileName]: { botToken: "" },
+          },
+        });
+      }
+      configStore.activateProfile(profileName);
+      return runSetup(ctx).finally(() => {
+        configStore.activateProfile(previousProfileName);
+        ctx.ui.notify(`Profile "${profileName}" saved. Run /telegram-connect ${profileName} to connect.`, "info");
+      });
+    },
     getStatusLines,
     reloadConfig: configStore.load,
     hasBotToken: configStore.hasBotToken,
     startPolling: lockedPollingRuntime.start,
     stopPolling: stopPolling ?? lockedPollingRuntime.stop,
     updateStatus,
+    getProfileNames: () => Config.getTelegramProfileNames(configStore.getStoredConfig()),
+    activateProfileConfig: async (_ctx, profileName) => {
+      await configStore.load();
+      if (!Config.isValidTelegramProfileName(profileName)) return false;
+      if (!configStore.activateProfile(profileName)) return false;
+      if (activeProfileRef) activeProfileRef.current = profileName;
+      return true;
+    },
   });
 }
 

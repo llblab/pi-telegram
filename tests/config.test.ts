@@ -86,6 +86,60 @@ test("Telegram config helpers persist and reload config", async () => {
   );
 });
 
+test("Telegram config store persists active named profile session fields without overwriting default", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-profile-config-"));
+  const configPath = join(agentDir, "telegram.json");
+  const store = createTelegramConfigStore({
+    agentDir,
+    configPath,
+    initialConfig: {
+      botToken: "default-token",
+      botUsername: "default_bot",
+      allowedUserId: 1,
+      voice: { replyMode: "mirror" },
+      profiles: {
+        omp: {
+          botToken: "omp-token",
+          botUsername: "omp_bot",
+          allowedUserId: 2,
+          lastUpdateId: 10,
+        },
+      },
+    },
+  });
+
+  assert.equal(store.activateProfile("omp"), true);
+  assert.equal(store.getBotToken(), "omp-token");
+  assert.equal(store.getAllowedUserId(), 2);
+  store.setAllowedUserId(3);
+  await store.persist({ ...store.get(), lastUpdateId: 99 });
+
+  assert.deepEqual(await readTelegramConfig(configPath), {
+    botToken: "default-token",
+    botUsername: "default_bot",
+    allowedUserId: 1,
+    voice: { replyMode: "mirror" },
+    profiles: {
+      omp: {
+        botToken: "omp-token",
+        botUsername: "omp_bot",
+        allowedUserId: 3,
+        lastUpdateId: 99,
+      },
+    },
+  });
+});
+
+test("Telegram config store rejects missing named profile activation", () => {
+  const store = createTelegramConfigStore({
+    initialConfig: { profiles: { work: { botToken: "work-token" } } },
+  });
+
+  assert.equal(store.activateProfile("missing"), false);
+  assert.equal(store.getActiveProfileName(), undefined);
+  assert.equal(store.getBotToken(), undefined);
+});
+
 test("Telegram config load recovers invalid JSON and records a diagnostic", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-invalid-config-"));
   const configPath = join(agentDir, "telegram.json");

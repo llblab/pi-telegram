@@ -295,7 +295,7 @@ export interface TelegramBridgeCommandStartPollingResult {
 }
 
 export interface TelegramBridgeCommandRegistrationDeps {
-  promptForConfig: (ctx: ExtensionCommandContext) => Promise<void>;
+  promptForConfig: (ctx: ExtensionCommandContext, profileName?: string) => Promise<void>;
   getStatusLines: (options?: TelegramBridgeStatusLineOptions) => string[];
   reloadConfig: () => Promise<void>;
   hasBotToken: () => boolean;
@@ -308,6 +308,18 @@ export interface TelegramBridgeCommandRegistrationDeps {
     | TelegramBridgeCommandStartPollingResult;
   stopPolling: () => Promise<void | string>;
   updateStatus: (ctx: ExtensionCommandContext) => void;
+  getProfileNames?: () => string[];
+  activateProfileConfig?: (
+    ctx: ExtensionCommandContext,
+    profileName: string,
+  ) => Promise<boolean>;
+}
+
+function parseTelegramProfileArg(args: string): string | undefined {
+  const word = args.trim().split(/\s+/)[0];
+  if (!word || word.length === 0) return undefined;
+  if (word.startsWith("-")) return undefined;
+  return word;
 }
 
 function formatTelegramTakeoverTitle(ctx: ExtensionCommandContext): string {
@@ -331,9 +343,9 @@ export function registerTelegramBridgeCommands(
   deps: TelegramBridgeCommandRegistrationDeps,
 ): void {
   pi.registerCommand("telegram-setup", {
-    description: "Configure Telegram bot token",
-    handler: async (_args, ctx) => {
-      await deps.promptForConfig(ctx);
+    description: "Configure Telegram bot token. Use /telegram-setup <name> for named profiles.",
+    handler: async (args, ctx) => {
+      await deps.promptForConfig(ctx, parseTelegramProfileArg(args));
     },
   });
   pi.registerCommand("telegram-status", {
@@ -346,11 +358,31 @@ export function registerTelegramBridgeCommands(
     },
   });
   pi.registerCommand("telegram-connect", {
-    description: "Start the Telegram bridge in this Pi session",
-    handler: async (_args, ctx) => {
-      await deps.reloadConfig();
+    description: "Start the Telegram bridge. Use /telegram-connect <name> for named profiles.",
+    handler: async (args, ctx) => {
+      const profileName = parseTelegramProfileArg(args);
+      if (profileName && deps.activateProfileConfig) {
+        const ok = await deps.activateProfileConfig(ctx, profileName);
+        if (!ok) {
+          ctx.ui.notify(`Profile "${profileName}" not found.`, "error");
+          deps.updateStatus(ctx);
+          return;
+        }
+        ctx.ui.notify(`Activated profile "${profileName}".`, "info");
+      } else {
+        await deps.reloadConfig();
+      }
       if (!deps.hasBotToken()) {
-        await deps.promptForConfig(ctx);
+        const profileNames = deps.getProfileNames?.() ?? [];
+        if (!profileName && profileNames.length > 0) {
+          ctx.ui.notify(
+            `No default Telegram profile configured. Available profiles: ${profileNames.join(", ")}. Use /telegram-connect <profileName> or /telegram-setup to create a default profile.`,
+            "info",
+          );
+          deps.updateStatus(ctx);
+          return;
+        }
+        await deps.promptForConfig(ctx, profileName);
         return;
       }
       let result = await deps.startPolling(ctx, {
