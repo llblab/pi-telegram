@@ -8,20 +8,15 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { resolveAgentDir, resolveTelegramConfigPath } from "./paths.ts";
 
 import type { TelegramInboundHandlerConfig } from "./inbound.ts";
 import type { CommandTemplateObjectConfig } from "./command-templates.ts";
 
 const CONFIG_RUNTIME_KEY = "__piTelegramConfigRuntime__";
 
-function getAgentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR
-    ? resolve(process.env.PI_CODING_AGENT_DIR)
-    : join(homedir(), ".pi", "agent");
-}
-
 function getConfigPath(): string {
-  return join(getAgentDir(), "telegram.json");
+  return resolveTelegramConfigPath();
 }
 
 export type TelegramOutboundCommandTemplateConfig =
@@ -75,6 +70,81 @@ export interface TelegramConfig {
     sendTranscript?: boolean;
   };
   time?: TelegramTimeConfig;
+  /** Named bot/session profiles (e.g. "work", "omp"). */
+  profiles?: Record<string, TelegramBotProfile>;
+  /** Currently active profile name (set by /telegram-connect <name>). */
+  activeProfile?: string;
+}
+
+/**
+ * Per-profile bot/session identity fields.
+ * Stored under `profiles.<name>` in telegram.json.
+ * Shared bridge settings (inboundHandlers, outboundHandlers, voice, time,
+ * assistant, proactivePush) stay at the top level.
+ */
+export interface TelegramBotProfile {
+  botToken: string;
+  botUsername?: string;
+  botId?: number;
+  allowedUserId?: number;
+  lastUpdateId?: number;
+}
+
+/** Profile names must be lowercase letters, digits, hyphens, underscores; max 32 chars. */
+const TELEGRAM_PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const TELEGRAM_RESERVED_PROFILE_NAMES: ReadonlySet<string> = new Set([
+  "default",
+  "main",
+  "active",
+]);
+
+export function isValidTelegramProfileName(name: string): boolean {
+  return (
+    TELEGRAM_PROFILE_NAME_PATTERN.test(name) &&
+    !TELEGRAM_RESERVED_PROFILE_NAMES.has(name)
+  );
+}
+
+/**
+ * Resolve the effective config for a named (or default) profile.
+ * Returns bot/session fields from the named profile, falling back to
+ * top-level fields for the default profile. Shared bridge settings
+ * always come from the top level.
+ */
+export function resolveTelegramActiveProfile(
+  config: TelegramConfig,
+  profileName?: string,
+): {
+  botToken?: string;
+  botUsername?: string;
+  botId?: number;
+  allowedUserId?: number;
+  lastUpdateId?: number;
+} {
+  if (!profileName || !config.profiles?.[profileName]) {
+    return {
+      botToken: config.botToken,
+      botUsername: config.botUsername,
+      botId: config.botId,
+      allowedUserId: config.allowedUserId,
+      lastUpdateId: config.lastUpdateId,
+    };
+  }
+  const profile = config.profiles[profileName];
+  return {
+    botToken: profile.botToken,
+    botUsername: profile.botUsername,
+    botId: profile.botId,
+    allowedUserId: profile.allowedUserId,
+    lastUpdateId: profile.lastUpdateId,
+  };
+}
+
+/** List defined profile names. */
+export function getTelegramProfileNames(
+  config: TelegramConfig,
+): string[] {
+  return Object.keys(config.profiles ?? {}).sort();
 }
 
 export interface TelegramConfigStore {
@@ -215,7 +285,7 @@ export function createTelegramConfigStore(
   options: TelegramConfigStoreOptions = {},
 ): TelegramConfigStore {
   let config: TelegramConfig = options.initialConfig ?? {};
-  const agentDir = options.agentDir ?? getAgentDir();
+  const agentDir = options.agentDir ?? resolveAgentDir();
   const configPath = options.configPath ?? getConfigPath();
   return {
     get: () => config,

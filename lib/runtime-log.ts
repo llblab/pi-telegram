@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { resolveAgentDir } from "./paths.ts";
 
 export interface TelegramRuntimeJsonlEvent {
   at: number;
@@ -42,13 +43,8 @@ export interface TelegramRuntimeJsonlLog {
 
 const DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024;
 
-function getAgentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR
-    ? resolve(process.env.PI_CODING_AGENT_DIR)
-    : join(homedir(), ".pi", "agent");
-}
 
-export function getTelegramRuntimeLogPath(agentDir = getAgentDir()): string {
+export function getTelegramRuntimeLogPath(agentDir = resolveAgentDir()): string {
   return join(agentDir, "tmp", "telegram", "logs.jsonl");
 }
 

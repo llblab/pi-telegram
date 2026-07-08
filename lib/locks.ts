@@ -14,18 +14,24 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { resolveAgentDir, resolveTelegramLocksPath } from "./paths.ts";
 
 export const TELEGRAM_LOCK_KEY = "@llblab/pi-telegram";
 export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 5_000;
 
-function getAgentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR
-    ? resolve(process.env.PI_CODING_AGENT_DIR)
-    : join(homedir(), ".pi", "agent");
-}
 
 function getLocksPath(): string {
-  return join(getAgentDir(), "locks.json");
+  return resolveTelegramLocksPath();
+}
+
+/**
+ * Resolve the scoped lock key for the active Telegram profile.
+ * Default profile → @llblab/pi-telegram
+ * Named profile → @llblab/pi-telegram:<name>
+ */
+export function resolveTelegramLockKey(activeProfile?: string): string {
+  if (activeProfile) return `${TELEGRAM_LOCK_KEY}:${activeProfile}`;
+  return TELEGRAM_LOCK_KEY;
 }
 
 export interface TelegramLockEntry {
@@ -238,10 +244,18 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
     nowMs: getNowMs(),
     staleHeartbeatMs: options.staleHeartbeatMs,
   });
-  const readLock = () => parseTelegramLockEntry(readLocks(locksPath)[key]);
+  const resolveEffectiveKey = (): string => {
+    if (typeof key === "function") return key() || TELEGRAM_LOCK_KEY;
+    return key;
+  };
+  const readLock = () => {
+    const effectiveKey = resolveEffectiveKey();
+    return parseTelegramLockEntry(readLocks(locksPath)[effectiveKey]);
+  };
   const writeLock = (lock: TelegramLockEntry) => {
+    const effectiveKey = resolveEffectiveKey();
     const locks = readLocks(locksPath);
-    locks[key] = lock;
+    locks[effectiveKey] = lock;
     writeLocks(locksPath, locks);
   };
   return {
@@ -262,7 +276,7 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
       const state = getLockState(readLock(), pid, isAlive, stateOptions());
       if (state.kind === "active-here" || state.kind === "stale") {
         const locks = readLocks(locksPath);
-        delete locks[key];
+        delete locks[resolveEffectiveKey()];
         writeLocks(locksPath, locks);
       }
       return state;

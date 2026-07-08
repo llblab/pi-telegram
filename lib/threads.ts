@@ -12,6 +12,7 @@ import { dirname, join, resolve } from "node:path";
 
 import type { TelegramTarget } from "./target.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
+import { resolveAgentDir } from "./paths.ts";
 
 export interface TelegramThreadNameInput {
   seed: string;
@@ -288,11 +289,6 @@ interface TelegramTopicResult {
   message_thread_id?: number;
 }
 
-function getAgentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR
-    ? resolve(process.env.PI_CODING_AGENT_DIR)
-    : join(homedir(), ".pi", "agent");
-}
 
 function hashString(value: string): number {
   let hash = 2166136261;
@@ -339,11 +335,11 @@ export function createTelegramThreadName(
   );
 }
 
-export function getTelegramStatePath(agentDir = getAgentDir()): string {
+export function getTelegramStatePath(agentDir = resolveAgentDir()): string {
   return join(agentDir, "tmp", "telegram", "state.json");
 }
 
-export function getTelegramTopicTargetsPath(agentDir = getAgentDir()): string {
+export function getTelegramTopicTargetsPath(agentDir = resolveAgentDir()): string {
   return getTelegramStatePath(agentDir);
 }
 
