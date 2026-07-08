@@ -42,7 +42,7 @@
     "BACKLOG.md",
     "CHANGELOG.md",
     "docs/",
-    "banner.png"
+    "screenshot.png"
   ],
   "exports": {
     ".": "./index.ts",
@@ -59,7 +59,7 @@
     "extensions": [
       "./index.ts"
     ],
-    "image": "https://github.com/llblab/pi-telegram/raw/main/banner.png"
+    "image": "https://github.com/llblab/pi-telegram/raw/main/screenshot.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
