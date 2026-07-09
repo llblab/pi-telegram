@@ -63,13 +63,13 @@ Implementations may expand `~` in command position and may resolve relative comm
 
 Supported forms:
 
-| Form             | Meaning                                          |
-| ---------------- | ------------------------------------------------ |
-| `{name}`         | Required value from runtime values or `defaults` |
-| `{name=default}` | Inline default when no value is provided         |
-| `{items[index]}` | Array item selected by literal or repeat index   |
-| `{value??fallback}` | Fallback when the value is absent or falsy    |
-| `{flag?yes:no}`  | Conditional text selected by flag truthiness     |
+| Form | Meaning |
+| --- | --- |
+| `{name}` | Required value from runtime values or `defaults` |
+| `{name=default}` | Inline default when no value is provided |
+| `{items[index]}` | Array item selected by literal or repeat index |
+| `{value??fallback}` | Fallback when the value is absent or falsy |
+| `{flag?yes:no}` | Conditional text selected by flag truthiness |
 
 Resolution order is runtime values → `defaults` → inline default → error. Default values that are themselves a single placeholder, such as `{prompt}` resolving to `{prompts[index]}`, are resolved recursively with a small depth guard. A repeat node may set `repeat` to `{items.length}` when an array arg should determine fanout width.
 

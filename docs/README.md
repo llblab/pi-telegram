@@ -6,7 +6,7 @@ Living index of project documentation in `/docs`.
 
 ## Documents
 
-- [architecture.md](./architecture.md) — Overview of the Telegram bridge runtime, queueing model, native Rich Markdown delivery, UI/compat rendering, and interactive controls
+- [architecture.md](./architecture.md) — Overview of the Telegram bridge runtime, optional profile isolation, queueing model, native Rich Markdown delivery, UI/compat rendering, and interactive controls
 - [public-api.md](./public-api.md) — Stable public API map: package entrypoints, commands, config, assistant markup, extension APIs, smoke examples, and compatibility boundaries
 - [../.agents/skills/telegram-bot/SKILL.md](../.agents/skills/telegram-bot/SKILL.md) — Agent-facing Telegram Bot API lookup skill backed by a local full Bot API reference
 - [../.agents/skills/domain-dag/SKILL.md](../.agents/skills/domain-dag/SKILL.md) — Project-local Domain DAG architecture skill and validator guidance
@@ -15,7 +15,7 @@ Living index of project documentation in `/docs`.
 - [outbound.md](./outbound.md) — Local `pi-telegram` outbound-handler config, text/voice/button behavior, voice synthesis provider fallback priority, artifact outputs, and callback routing
 - [callback-namespaces.md](./callback-namespaces.md) — Shared Telegram `callback_data` namespace standard for layered extensions
 - [updates.md](./updates.md) — Update classification and runtime handler registry that lets layered extensions observe and consume Telegram updates without owning their own polling connection
-- [multi-instance-bus.md](./multi-instance-bus.md) — Optional multi-instance Telegram bus architecture: leader/follower routing, thread targets, instance slots, manual follower registration, and recovery semantics
+- [multi-instance-bus.md](./multi-instance-bus.md) — Optional multi-instance Telegram bus architecture: profile-scoped transport, leader/follower routing, thread targets, instance slots, manual follower registration, and recovery semantics
 - [sections.md](./sections.md) — Telegram Extension Sections Standard: registration contract, context ports, callback routing, navigation hierarchy, and demo reference for pi extensions that want Telegram UI surfaces
 - [voice.md](./voice.md) — Voice integration guide: detection, reply policy, STT/TTS provider registration, provider-owned conversion, and transparent interception
 - [locks.md](./locks.md) — Shared `locks.json` standard for singleton extension ownership

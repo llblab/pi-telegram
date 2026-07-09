@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.1: Profile IPC Isolation Hotfix
+
+- `[Runtime Isolation]` Profile-scoped Threaded Mode leader and follower IPC endpoints on Unix and Windows while preserving the default profile's legacy socket and named-pipe paths. Impact: parallel named-profile runtimes no longer contend for, unlink, or connect to another bot profile's local bus transport.
+- `[Profile Switching]` Resolved leader and follower endpoints from the active profile when servers start, follower calls are sent, diagnostics render, and follower registration publishes its receiver address. Impact: changing profiles after process start cannot retain stale IPC identity from the previously active profile.
+- `[Validation]` Added Unix and Windows endpoint-isolation regressions plus runtime restart coverage, and documented global, profile-scoped, and session-local runtime surfaces. Impact: profile reality boundaries are explicit and deterministic without making scratch attachments or extension registries routing authority.
+
 ## 0.20.0: Pi-Compatible Multi-Profile Runtime
 
 - `[Profiles]` Added named Telegram bot/session profiles under `telegram.json` `profiles` while preserving the top-level default profile and legacy default paths. Profile activation is session-local, bot/session fields are profile-scoped, shared bridge settings remain global, and setup/connect accept explicit profile names. Impact: separate bots can run from the same agent directory without `telegram-bots.json`, persisted active-profile drift, or default-profile migration risk.

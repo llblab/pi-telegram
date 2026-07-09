@@ -16,8 +16,10 @@ import {
   createTelegramBusLocalServer,
   createUnauthorizedBusAck,
   getTelegramBusSocketPath,
+  resolveTelegramBusSocketPath,
   sendTelegramBusLocalEnvelope,
   type TelegramBusEnvelope,
+  type TelegramBusSocketPathSource,
 } from "./bus.ts";
 import {
   getTelegramBusTransportRetryPolicy,
@@ -133,7 +135,7 @@ export interface TelegramBusForwardedUpdateReceiverRuntime {
 }
 
 export interface TelegramBusFollowerApiCallerDeps {
-  socketPath: string;
+  socketPath: TelegramBusSocketPathSource;
   instanceId: string;
   createRequestId: () => string;
   getAuthSecret?: () => string | undefined;
@@ -149,6 +151,7 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<
   getLeaderAuthSecret?: (leader: { busSecret?: string }) => string | undefined;
   setActiveAuthSecret?: (secret: string | undefined) => void;
   followerBusSocketPath?: string;
+  getFollowerBusSocketPath?: () => string;
   getLeaderSocketPath?: () => string;
   startReceiving?: () => Promise<void>;
   stopReceiving?: () => Promise<void> | void;
@@ -238,7 +241,7 @@ export interface TelegramBusForwardedUpdateReceiverRuntimeDeps<
   TCallbackQuery,
   TMessage = unknown,
 > {
-  socketPath: string;
+  socketPath: TelegramBusSocketPathSource;
   instanceId: string;
   getAuthSecret?: () => string | undefined;
   getContext: () => TContext | undefined;
@@ -354,11 +357,12 @@ export function createTelegramBusFollowerApiCaller(
   const getNowMs = deps.getNowMs ?? Date.now;
   const timeoutMs = deps.timeoutMs ?? 30000;
   return async (method, args) => {
+    const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
     const response = await sendTelegramBusLocalEnvelope({
-      socketPath: deps.socketPath,
+      socketPath,
       timeoutMs,
       retry: getTelegramBusTransportRetryPolicy({
-        endpoint: deps.socketPath,
+        endpoint: socketPath,
         operation: "operation",
       }),
       envelope: {
@@ -725,7 +729,8 @@ export function createTelegramBusFollowerRegistrationRuntime<
             (ctx.cwd ? basename(ctx.cwd) : undefined),
           cwd: ctx.cwd,
           pid: getPid(),
-          busSocketPath: deps.followerBusSocketPath,
+          busSocketPath:
+            deps.getFollowerBusSocketPath?.() ?? deps.followerBusSocketPath,
           connectedAtMs: getNowMs(),
         },
       });

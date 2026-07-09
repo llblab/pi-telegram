@@ -20,6 +20,7 @@ import {
   type TelegramBusFollowerRegistry,
   type TelegramBusFollowerView,
   type TelegramBusInstanceRegistration,
+  type TelegramBusSocketPathSource,
 } from "./bus.ts";
 import { getTelegramBusTransportRetryPolicy } from "./bus-transport.ts";
 
@@ -176,7 +177,7 @@ export type TelegramBusFollowerMessageOwnershipRecorder = (
 ) => void;
 
 export interface TelegramBusLeaderRuntimeDeps<TContext> {
-  socketPath: string;
+  socketPath: TelegramBusSocketPathSource;
   followerRegistry: TelegramBusFollowerRegistry;
   authSecret?: string;
   startPolling: (ctx: TContext) => void | Promise<void>;

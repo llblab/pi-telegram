@@ -41,16 +41,23 @@ export function createTelegramBusAuthSecret(): string {
 export function getTelegramBusSocketPath(
   agentDir = resolveAgentDir(),
   platform = getPlatform(),
+  profileName?: string,
 ): string {
-  return getTelegramBusLeaderEndpoint({ agentDir, platform });
+  return getTelegramBusLeaderEndpoint({ agentDir, platform, profileName });
 }
 
 export function getTelegramBusFollowerSocketPath(
   instanceId: string,
   agentDir = resolveAgentDir(),
   platform = getPlatform(),
+  profileName?: string,
 ): string {
-  return getTelegramBusFollowerEndpoint({ agentDir, platform, instanceId });
+  return getTelegramBusFollowerEndpoint({
+    agentDir,
+    platform,
+    instanceId,
+    profileName,
+  });
 }
 
 export interface TelegramBusInstanceRegistration {
@@ -344,8 +351,16 @@ export interface TelegramBusLocalServer {
   stop: () => Promise<void>;
 }
 
+export type TelegramBusSocketPathSource = string | (() => string);
+
+export function resolveTelegramBusSocketPath(
+  source: TelegramBusSocketPathSource,
+): string {
+  return typeof source === "function" ? source() : source;
+}
+
 export interface TelegramBusLocalServerDeps {
-  socketPath: string;
+  socketPath: TelegramBusSocketPathSource;
   handleEnvelope: (
     envelope: TelegramBusEnvelope,
   ) =>
@@ -362,7 +377,7 @@ export interface TelegramBusLocalClientOptions {
 }
 
 export interface TelegramBusForeignOwnedForwarderDeps {
-  socketPath: string;
+  socketPath: TelegramBusSocketPathSource;
   createRequestId: () => string;
   getNowMs?: () => number;
   timeoutMs?: number;
@@ -401,12 +416,13 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
   const getNowMs = deps.getNowMs ?? Date.now;
   const send = async (envelope: TelegramBusEnvelope): Promise<boolean> => {
     if (deps.getAuthSecret) envelope.auth = deps.getAuthSecret();
+    const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
     const response = await sendTelegramBusLocalEnvelope({
-      socketPath: deps.socketPath,
+      socketPath,
       envelope,
       timeoutMs: deps.timeoutMs,
       retry: getTelegramBusTransportRetryPolicy({
-        endpoint: deps.socketPath,
+        endpoint: socketPath,
         operation: "operation",
       }),
     });
@@ -558,6 +574,7 @@ export function createTelegramBusLocalServer(
   deps: TelegramBusLocalServerDeps,
 ): TelegramBusLocalServer {
   let server: Server | undefined;
+  let activeSocketPath: string | undefined;
   const sockets = new Set<Socket>();
   const closeSocket = (socket: Socket) => {
     sockets.delete(socket);
@@ -566,16 +583,18 @@ export function createTelegramBusLocalServer(
   return {
     start: async () => {
       if (server) return;
-      const usesWindowsPipe = isTelegramBusPipePath(deps.socketPath);
+      const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
+      activeSocketPath = socketPath;
+      const usesWindowsPipe = isTelegramBusPipePath(socketPath);
       deps.recordTransportEvent?.(
         "server-start",
-        getTelegramBusEndpointDiagnostics(deps.socketPath),
+        getTelegramBusEndpointDiagnostics(socketPath),
       );
       if (!usesWindowsPipe) {
-        const socketDir = dirname(deps.socketPath);
+        const socketDir = dirname(socketPath);
         mkdirSync(socketDir, { recursive: true, mode: 0o700 });
         chmodSync(socketDir, 0o700);
-        if (existsSync(deps.socketPath)) unlinkSync(deps.socketPath);
+        if (existsSync(socketPath)) unlinkSync(socketPath);
       }
       server = createServer((socket) => {
         sockets.add(socket);
@@ -591,14 +610,14 @@ export function createTelegramBusLocalServer(
               socket,
               deps.handleEnvelope,
               deps.recordTransportEvent,
-              deps.socketPath,
+              socketPath,
             );
           }
         });
         socket.on("close", () => sockets.delete(socket));
         socket.on("error", (error) => {
           deps.recordTransportEvent?.("server-socket-error", {
-            ...getTelegramBusEndpointDiagnostics(deps.socketPath),
+            ...getTelegramBusEndpointDiagnostics(socketPath),
             ...classifyTelegramBusTransportError(error),
           });
           closeSocket(socket);
@@ -607,24 +626,28 @@ export function createTelegramBusLocalServer(
       try {
         await new Promise<void>((resolve, reject) => {
           server?.once("error", reject);
-          server?.listen(deps.socketPath, resolve);
+          server?.listen(socketPath, resolve);
         });
         deps.recordTransportEvent?.(
           "server-started",
-          getTelegramBusEndpointDiagnostics(deps.socketPath),
+          getTelegramBusEndpointDiagnostics(socketPath),
         );
       } catch (error) {
+        server = undefined;
+        activeSocketPath = undefined;
         deps.recordTransportEvent?.("server-start-failed", {
-          ...getTelegramBusEndpointDiagnostics(deps.socketPath),
+          ...getTelegramBusEndpointDiagnostics(socketPath),
           ...classifyTelegramBusTransportError(error),
         });
         throw error;
       }
-      if (!usesWindowsPipe) chmodSync(deps.socketPath, 0o600);
+      if (!usesWindowsPipe) chmodSync(socketPath, 0o600);
     },
     stop: async () => {
       const activeServer = server;
+      const socketPath = activeSocketPath;
       server = undefined;
+      activeSocketPath = undefined;
       for (const socket of sockets) closeSocket(socket);
       if (activeServer) {
         await new Promise<void>((resolve) =>
@@ -632,15 +655,18 @@ export function createTelegramBusLocalServer(
         );
       }
       if (
-        !isTelegramBusPipePath(deps.socketPath) &&
-        existsSync(deps.socketPath)
+        socketPath &&
+        !isTelegramBusPipePath(socketPath) &&
+        existsSync(socketPath)
       ) {
-        unlinkSync(deps.socketPath);
+        unlinkSync(socketPath);
       }
-      deps.recordTransportEvent?.(
-        "server-stopped",
-        getTelegramBusEndpointDiagnostics(deps.socketPath),
-      );
+      if (socketPath) {
+        deps.recordTransportEvent?.(
+          "server-stopped",
+          getTelegramBusEndpointDiagnostics(socketPath),
+        );
+      }
     },
   };
 }

@@ -99,31 +99,55 @@ export function getTelegramBusTransportRetryPolicy(input: {
   };
 }
 
+function normalizeTelegramBusEndpointScope(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 80);
+}
+
 export function getTelegramBusLeaderEndpoint(input: {
   agentDir: string;
   platform: NodeJS.Platform | string;
+  profileName?: string;
 }): string {
+  const profileScope = input.profileName
+    ? normalizeTelegramBusEndpointScope(input.profileName)
+    : undefined;
   return input.platform === "win32"
-    ? getTelegramBusPipePath({ agentDir: input.agentDir, scope: "bus" })
-    : join(input.agentDir, "tmp", "telegram", "bus.sock");
+    ? getTelegramBusPipePath({
+        agentDir: input.agentDir,
+        scope: profileScope ? `bus-${profileScope}` : "bus",
+      })
+    : join(
+        input.agentDir,
+        "tmp",
+        "telegram",
+        profileScope ? `bus.${profileScope}.sock` : "bus.sock",
+      );
 }
 
 export function getTelegramBusFollowerEndpoint(input: {
   agentDir: string;
   platform: NodeJS.Platform | string;
   instanceId: string;
+  profileName?: string;
 }): string {
+  const instanceScope = normalizeTelegramBusEndpointScope(input.instanceId);
+  const profileScope = input.profileName
+    ? normalizeTelegramBusEndpointScope(input.profileName)
+    : undefined;
   return input.platform === "win32"
     ? getTelegramBusPipePath({
         agentDir: input.agentDir,
-        scope: `follower-${input.instanceId}`,
+        scope: profileScope
+          ? `follower-${profileScope}-${instanceScope}`
+          : `follower-${instanceScope}`,
       })
     : join(
         input.agentDir,
         "tmp",
         "telegram",
         "followers",
-        `${input.instanceId.replace(/[^a-zA-Z0-9_.-]/g, "_")}.sock`,
+        ...(profileScope ? [profileScope] : []),
+        `${instanceScope}.sock`,
       );
 }
 

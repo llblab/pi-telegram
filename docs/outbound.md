@@ -10,11 +10,11 @@ Text handlers use the portable [Command Template Standard](./command-templates.m
 
 An outbound handler is selected by `type`. Text replies and assistant markup map to handler types:
 
-| Source            | Handler                       | Action                  |
-| ----------------- | ----------------------------- | ----------------------- |
-| Final text        | `outboundHandlers[type=text]` | Transform before render |
-| `telegram_voice`  | Voice pipeline                | OGG/Opus `sendVoice`    |
-| `telegram_button` | Built-in                      | Attach inline button    |
+| Source | Handler | Action |
+| --- | --- | --- |
+| Final text | `outboundHandlers[type=text]` | Transform before render |
+| `telegram_voice` | Voice pipeline | OGG/Opus `sendVoice` |
+| `telegram_button` | Built-in | Attach inline button |
 
 The voice pipeline is detailed below: configured `type: "voice"` handlers first, then programmatic handlers, then registered synthesis providers.
 

@@ -77,9 +77,21 @@ export default function (pi: Pi.ExtensionAPI) {
   let telegramBusLifecycleOverridePhase:
     | Status.TelegramBridgeBusLifecyclePhase
     | undefined;
-  const telegramBusSocketPath = Bus.getTelegramBusSocketPath();
-  const telegramBusFollowerSocketPath =
-    Bus.getTelegramBusFollowerSocketPath(telegramInstanceId);
+  const getTelegramBusSocketPath = function (): string {
+    return Bus.getTelegramBusSocketPath(
+      undefined,
+      undefined,
+      getActiveTelegramThreadProfile(),
+    );
+  };
+  const getTelegramBusFollowerSocketPath = function (): string {
+    return Bus.getTelegramBusFollowerSocketPath(
+      telegramInstanceId,
+      undefined,
+      undefined,
+      getActiveTelegramThreadProfile(),
+    );
+  };
   let telegramBusRequestSequence = 0;
   const telegramBusFollowerRegistry = Bus.createTelegramBusFollowerRegistry();
   const telegramBusFollowerRegistrationState =
@@ -300,12 +312,13 @@ export default function (pi: Pi.ExtensionAPI) {
     },
     getLocalBus() {
       return {
-        leaderSocketPath: telegramBusSocketPath,
-        leaderTransport:
-          BusTransport.getTelegramBusTransportKind(telegramBusSocketPath),
-        followerSocketPath: telegramBusFollowerSocketPath,
+        leaderSocketPath: getTelegramBusSocketPath(),
+        leaderTransport: BusTransport.getTelegramBusTransportKind(
+          getTelegramBusSocketPath(),
+        ),
+        followerSocketPath: getTelegramBusFollowerSocketPath(),
         followerTransport: BusTransport.getTelegramBusTransportKind(
-          telegramBusFollowerSocketPath,
+          getTelegramBusFollowerSocketPath(),
         ),
         followerRegistered: telegramBusFollowerRegistrationState.isRegistered(),
         followerTarget: telegramBusFollowerRegistrationState.getTarget(),
@@ -412,7 +425,7 @@ export default function (pi: Pi.ExtensionAPI) {
     },
     getDefaultTarget: proactivePushTargetGetter,
     callFollowerApi: BusFollower.createTelegramBusFollowerApiCaller({
-      socketPath: telegramBusSocketPath,
+      socketPath: getTelegramBusSocketPath,
       instanceId: telegramInstanceId,
       createRequestId() {
         telegramBusRequestSequence += 1;
@@ -641,7 +654,7 @@ export default function (pi: Pi.ExtensionAPI) {
       Routing.TelegramRoutedCallbackQuery,
       Routing.TelegramRoutedMessage
     >({
-      socketPath: telegramBusSocketPath,
+      socketPath: getTelegramBusSocketPath,
       createRequestId() {
         telegramBusRequestSequence += 1;
         return Bus.createTelegramBusRequestId({
@@ -656,7 +669,7 @@ export default function (pi: Pi.ExtensionAPI) {
     });
   const followerTargetController =
     Bus.createTelegramBusFollowerTargetController({
-      socketPath: telegramBusSocketPath,
+      socketPath: getTelegramBusSocketPath,
       createRequestId() {
         telegramBusRequestSequence += 1;
         return Bus.createTelegramBusRequestId({
@@ -811,7 +824,7 @@ export default function (pi: Pi.ExtensionAPI) {
       Routing.TelegramRoutedCallbackQuery,
       Routing.TelegramRoutedMessage
     >({
-      socketPath: telegramBusFollowerSocketPath,
+      socketPath: getTelegramBusFollowerSocketPath,
       instanceId: telegramInstanceId,
       getContext() {
         return telegramSessionContextStore.get();
@@ -910,7 +923,8 @@ export default function (pi: Pi.ExtensionAPI) {
     BusFollower.createTelegramBusFollowerRegistrationRuntime<Pi.ExtensionContext>(
       {
         instanceId: telegramInstanceId,
-        followerBusSocketPath: telegramBusFollowerSocketPath,
+        getFollowerBusSocketPath: getTelegramBusFollowerSocketPath,
+        getLeaderSocketPath: getTelegramBusSocketPath,
         startReceiving: telegramBusForwardedUpdateReceiver.start,
         stopReceiving: telegramBusForwardedUpdateReceiver.stop,
         registrationState: telegramBusFollowerRegistrationState,
@@ -967,7 +981,7 @@ export default function (pi: Pi.ExtensionAPI) {
     });
   };
   const telegramBusLeaderRuntime = BusLeader.createTelegramBusLeaderRuntime({
-    socketPath: telegramBusSocketPath,
+    socketPath: getTelegramBusSocketPath,
     followerRegistry: telegramBusFollowerRegistry,
     authSecret: telegramBusAuthSecret,
     startPolling: pollingRuntime.start,

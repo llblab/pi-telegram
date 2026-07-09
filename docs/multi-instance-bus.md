@@ -8,6 +8,8 @@ This document uses **thread** as the canonical product term because Telegram cli
 
 This document supersedes the narrower API-topic framing. Telegram threads are a UI/routing substrate, but the deeper design problem is multi-instance coordination: one bot token has one Telegram API update bus, while multiple live Pi agent instances may want to expose their own Telegram workspace through that bus.
 
+Named bot profiles are optional and orthogonal to this design. The ordinary unnamed profile keeps the existing setup, connect, lock, state, log, Unix socket, and Windows named-pipe paths. When operators configure additional profiles, each profile is an independent bot runtime with its own lock key, observable state, thread ownership, and leader/follower IPC endpoints; leader election and follower routing never cross profile boundaries.
+
 ## Problem
 
 Classic `pi-telegram` mode binds one private Telegram DM to one live Pi instance through one bot token and one singleton polling owner. The lock currently answers: "which Pi instance owns Telegram control/polling?"

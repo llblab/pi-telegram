@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -125,7 +125,29 @@ test("Bus socket path is scoped under the agent temp directory", () => {
   );
 });
 
-test("Bus socket path uses Windows named pipes on win32", () => {
+test("Bus socket paths isolate named profiles and preserve default Unix paths", () => {
+  assert.equal(
+    getTelegramBusSocketPath("/agent", "linux", "work"),
+    join("/agent", "tmp", "telegram", "bus.work.sock"),
+  );
+  assert.equal(
+    getTelegramBusFollowerSocketPath("pid:123", "/agent", "linux", "work"),
+    join(
+      "/agent",
+      "tmp",
+      "telegram",
+      "followers",
+      "work",
+      "pid_123.sock",
+    ),
+  );
+  assert.notEqual(
+    getTelegramBusSocketPath("/agent", "linux", "work"),
+    getTelegramBusSocketPath("/agent", "linux", "personal"),
+  );
+});
+
+test("Bus socket path uses profile-scoped Windows named pipes on win32", () => {
   assert.match(
     getTelegramBusSocketPath("C:\\Users\\me\\.pi\\agent", "win32"),
     /^\\\\\.\\pipe\\pi-telegram-[A-Za-z0-9_-]{16}-bus$/,
@@ -137,6 +159,23 @@ test("Bus socket path uses Windows named pipes on win32", () => {
       "win32",
     ),
     /^\\\\\.\\pipe\\pi-telegram-[A-Za-z0-9_-]{16}-follower-pid_123_unsafe$/,
+  );
+  assert.match(
+    getTelegramBusSocketPath(
+      "C:\\Users\\me\\.pi\\agent",
+      "win32",
+      "work",
+    ),
+    /^\\\\\.\\pipe\\pi-telegram-[A-Za-z0-9_-]{16}-bus-work$/,
+  );
+  assert.match(
+    getTelegramBusFollowerSocketPath(
+      "pid:123/unsafe",
+      "C:\\Users\\me\\.pi\\agent",
+      "win32",
+      "work",
+    ),
+    /^\\\\\.\\pipe\\pi-telegram-[A-Za-z0-9_-]{16}-follower-work-pid_123_unsafe$/,
   );
 });
 
@@ -601,6 +640,34 @@ test("Bus transport probe reports reachable and unreachable endpoints", async ()
       transport: "socket",
       reachable: true,
     });
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus local server resolves the active profile endpoint on each start", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-profile-switch-"));
+  let profileName = "work";
+  const getSocketPath = () =>
+    getTelegramBusSocketPath(dir, "linux", profileName);
+  const server = createTelegramBusLocalServer({
+    socketPath: getSocketPath,
+    handleEnvelope: () => ({ kind: "bus.ack", requestId: "profile", ok: true }),
+  });
+  const workSocketPath = getSocketPath();
+  try {
+    await server.start();
+    assert.equal(existsSync(workSocketPath), true);
+    await server.stop();
+    assert.equal(existsSync(workSocketPath), false);
+
+    profileName = "personal";
+    const personalSocketPath = getSocketPath();
+    await server.start();
+    assert.notEqual(personalSocketPath, workSocketPath);
+    assert.equal(existsSync(personalSocketPath), true);
+    assert.equal(existsSync(workSocketPath), false);
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });

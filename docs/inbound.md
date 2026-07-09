@@ -59,11 +59,11 @@ Handlers match by optional `type`, `mime`, or `match`. `mime` and `type` are ind
 
 Built-in placeholders for text handlers:
 
-| Placeholder | Value        |
-| ----------- | ------------ |
-| `{text}`    | Current text |
-| `{mime}`    | `text/plain` |
-| `{type}`    | `text`       |
+| Placeholder | Value |
+| --- | --- |
+| `{text}` | Current text |
+| `{mime}` | `text/plain` |
+| `{type}` | `text` |
 
 ## Media/File Handlers
 
@@ -71,12 +71,12 @@ Media/file handlers keep the legacy attachment-handler behavior: downloaded file
 
 Built-in placeholders for media/file handlers:
 
-| Placeholder | Value                                          |
-| ----------- | ---------------------------------------------- |
-| `{file}`    | Downloaded file path                           |
-| `{mime}`    | MIME type if known                             |
-| `{type}`    | Kind: `voice`, `audio`, `document`, or `photo` |
-| `{text}`    | Empty string                                   |
+| Placeholder | Value |
+| --- | --- |
+| `{file}` | Downloaded file path |
+| `{mime}` | MIME type if known |
+| `{type}` | Kind: `voice`, `audio`, `document`, or `photo` |
+| `{text}` | Empty string |
 
 If a top-level one-step media handler template has no `{file}` placeholder, the downloaded file path is appended as the last command arg as a one-step handler convenience. Composition steps are plain command templates and do not receive implicit file-path args; include `{file}` explicitly where needed.
 

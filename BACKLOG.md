@@ -1,28 +1,16 @@
 # Project Backlog
 
-_This backlog tracks only open release-relevant work: 0.20.0 profile isolation, evidence-gated Telegram client/runtime follow-ups, and upstream Pi API blockers. Completed validation evidence belongs in `CHANGELOG.md`, not in this queue._
+_This backlog tracks only open release-relevant work: live promoted-follower verification, evidence-gated Telegram client/runtime follow-ups, and upstream Pi API blockers. Completed validation evidence belongs in `CHANGELOG.md`, not in this queue._
 
-## P0 — Profile Reality Isolation Audit
+## P1 — Promoted Follower Reload Evidence
 
-Context: 0.20.0 profiles are parallel bot/runtime realities, not just alternate credentials. Any persistent or observable runtime surface that cannot safely mix bot identities must be explicitly global or profile-scoped. Logs and Threaded Mode state are now profile-aware; the remaining audit lens should check surfaces beyond the validated setup/connect smoke path: bus endpoints, temp artifacts, in-memory registries, queues, ownership caches, and status diagnostics.
-
-Open work:
-
-- [ ] Audit remaining non-setup filesystem/runtime observability surfaces and classify each as global shared config, session-local memory, or profile-scoped reality.
-- [ ] Profile-scope bus leader/follower IPC endpoints if parallel named profiles can run in the same agent dir concurrently.
-- [ ] Add regression coverage for any newly profile-scoped surface, preserving default-profile legacy paths where applicable.
-
-Done when: parallel named-profile runtimes have no shared logs/state/IPC/diagnostic surfaces except intentionally top-level shared bridge configuration.
-
-## P0 — Promoted Follower Reload Smoke
-
-Context: deterministic coverage protects promoted follower thread preservation, and the latest live Linux smoke closed the reload routing, follower Active, and reroute/restore regressions. Keep one explicit live check for promoted-follower reload identity unless that exact path is covered in the release smoke pass.
+Context: deterministic coverage protects promoted follower thread preservation, and the latest live Linux smoke closed reload routing, follower Active, and reroute/restore regressions. The exact promoted-leader reload path is deliberately outside the 0.20.1 profile IPC hotfix because it is unrelated to profile transport isolation; keep it as an evidence-gated follow-up rather than blocking that release.
 
 Open work:
 
-- [ ] Close leader → follower promotes → `/reload` promoted leader preserves the same Telegram thread identity.
+- [ ] Capture live evidence that leader → follower promotes → `/reload` preserves the promoted leader's Telegram thread identity.
 
-Done when: promoted-follower reload identity has live Telegram evidence or is deliberately deferred out of the hotfix scope.
+Done when: promoted-follower reload identity has direct live Telegram evidence.
 
 ## P1 — Native Windows Threaded Mode Follow-Ups
 
