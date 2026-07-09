@@ -601,6 +601,24 @@ test("Bridge status runtime builds status state from live ports", () => {
   ]);
 });
 
+test("Bridge status lines render named-profile diagnostic paths", () => {
+  const lines = buildTelegramBridgeStatusLines({
+    activeProfileName: "work",
+    botUsername: "work_bot",
+    pollingActive: false,
+    pendingDispatch: false,
+    compactionInProgress: false,
+    activeToolExecutions: 0,
+    pendingModelSwitch: false,
+    queuedItems: [],
+    recentRuntimeEvents: [],
+  });
+  assert.ok(
+    lines.includes("- state: ~/.pi/agent/tmp/telegram/state.work.json"),
+  );
+  assert.ok(lines.includes("- logs: ~/.pi/agent/tmp/telegram/logs.work.jsonl"));
+});
+
 test("Bridge status lines distinguish unknown bot identity from missing config", () => {
   const base = {
     allowedUserId: 42,
@@ -847,7 +865,9 @@ test("Bridge status lines include local bus diagnostics", () => {
   assert.ok(lines.includes("local bus:"));
   assert.ok(lines.includes("- follower registered: yes Boreal target 42:9"));
   assert.ok(
-    lines.includes("- leader endpoint [pipe]: \\\\.\\pipe\\pi-telegram-demo-bus"),
+    lines.includes(
+      "- leader endpoint [pipe]: \\\\.\\pipe\\pi-telegram-demo-bus",
+    ),
   );
   assert.ok(
     lines.includes(

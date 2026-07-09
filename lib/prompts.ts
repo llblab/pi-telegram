@@ -6,6 +6,7 @@
 
 import { Type } from "@sinclair/typebox";
 
+import { getTelegramDiagnosticsDisplayPaths } from "./paths.ts";
 import type { BeforeAgentStartEvent, ExtensionAPI } from "./pi.ts";
 import { TELEGRAM_PREFIX } from "./turns.ts";
 
@@ -17,7 +18,9 @@ const TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX = `
 
 Telegram turn note: If context was compacted or you need the pi-telegram bridge contract, call tool \`telegram_help\`; hidden comments are valid only for explicit \`telegram_voice\` or \`telegram_button\` actions with payload.`;
 
-const TELEGRAM_HELP_TEXT = `--- TELEGRAM BRIDGE HELP ---
+function buildTelegramHelpText(profileName?: string): string {
+  const diagnosticsPaths = getTelegramDiagnosticsDisplayPaths(profileName);
+  return `--- TELEGRAM BRIDGE HELP ---
 
 How to understand Telegram turns:
 - \`[telegram|thread:name|from:user|guest:group]\` marks Telegram origin and attributes.
@@ -60,15 +63,19 @@ Configurable handlers:
 - If command-template config is not enough, build a companion extension through the public pi-telegram APIs; do not import package-private \`lib/*\` paths.
 
 Debugging pi-telegram:
-- Inspect \`~/.pi/agent/tmp/telegram/state.json\` for runtime state, roster, bindings, slots, reservations, and diagnostics.
-- Inspect \`~/.pi/agent/tmp/telegram/logs.jsonl\` for redacted runtime event evidence.
+- Inspect \`${diagnosticsPaths.state}\` for runtime state, roster, bindings, slots, reservations, and diagnostics.
+- Inspect \`${diagnosticsPaths.logs}\` for redacted runtime event evidence.
 - Use terminal \`telegram-status\` for compact human health; use \`telegram-status --debug\` for the full human-readable diagnostic dump.`;
-
-export function getTelegramHelpText(): string {
-  return TELEGRAM_HELP_TEXT;
 }
 
-export function registerTelegramHelpTool(pi: ExtensionAPI): void {
+export function getTelegramHelpText(profileName?: string): string {
+  return buildTelegramHelpText(profileName);
+}
+
+export function registerTelegramHelpTool(
+  pi: ExtensionAPI,
+  options: { getActiveProfileName?: () => string | undefined } = {},
+): void {
   pi.registerTool({
     name: "telegram_help",
     label: "Telegram Help",
@@ -77,7 +84,12 @@ export function registerTelegramHelpTool(pi: ExtensionAPI): void {
     parameters: Type.Object({}),
     async execute() {
       return {
-        content: [{ type: "text", text: getTelegramHelpText() }],
+        content: [
+          {
+            type: "text",
+            text: getTelegramHelpText(options.getActiveProfileName?.()),
+          },
+        ],
         details: {},
       };
     },

@@ -630,10 +630,13 @@ test("Setup runtime prompts, validates token, persists config, and starts pollin
     },
   });
   assert.deepEqual(nextConfig, {
-    allowedUserId: 7,
-    botToken: "new-token",
-    botId: 42,
-    botUsername: "demo_bot",
+    status: "success",
+    config: {
+      allowedUserId: 7,
+      botToken: "new-token",
+      botId: 42,
+      botUsername: "demo_bot",
+    },
   });
   assert.deepEqual(events, [
     "editor:Telegram bot token:env-token",
@@ -668,7 +671,7 @@ test("Setup runtime reports invalid tokens without persisting", async () => {
       events.push("status");
     },
   });
-  assert.equal(nextConfig, undefined);
+  assert.deepEqual(nextConfig, { status: "validation-failed" });
   assert.deepEqual(events, ["notify:error:nope"]);
 });
 

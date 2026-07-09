@@ -155,7 +155,7 @@ Leader election is heartbeat-gated and lock-backed:
 4. If the leader heartbeat is stale, attempt an atomic leadership takeover; ordinary `/telegram-connect` on a follower is not a leadership move while the leader is live.
 5. If several followers detect stale leadership, atomic compare/write lock acquisition ensures only one becomes leader.
 
-Followers first try to re-register after leader reload or unknown-heartbeat responses, then promote only after the grace window expires. This preserves thread bindings through transient reload gaps without allowing competing pollers.
+Followers first try to re-register after leader reload or unknown-heartbeat responses, carrying their last known target so the new leader can reuse the same binding, then promote only after the grace window expires. The leader does not restore persisted followers into the live registry speculatively: after a bounded re-registration grace window it removes follower records that still lack a live bus owner from current `state.json`, without deleting Telegram tabs. This preserves real thread bindings through transient reload gaps without allowing historical records or competing pollers to masquerade as live state.
 
 ## Leader/Follower Communication
 
@@ -224,7 +224,7 @@ In Telegram private-chat Threaded Mode:
 - The private bot DM becomes the operator's multi-instance dashboard.
 - Each live bound instance gets one visible thread.
 - Each instance has a durable single-letter slot (`A`-`Z`) assigned by the extension and a bridge-authored `threadName`.
-- New slots advance monotonically through the alphabet and wrap after `Z` only to a free slot; closed earlier slots are not backfilled out of order. This preserves sequence feel and intentionally caps concurrent visible instances to the alphabet without duplicating occupied letters. The compact `bot.lastSlot` cursor persists across reloads and live-test history, so after `Z` the next truly new thread can be `A` again when `A` is currently free.
+- New slots advance through the alphabet and wrap after `Z` only to a free slot, intentionally capping concurrent visible instances to the alphabet without duplicating occupied letters. The compact `bot.lastSlot` cursor persists while its binding remains live/recovering, including true `Z → A` wraparound. When post-grace follower compaction removes the cursor's binding, that same reconciliation pass realigns it to the newest-created remaining live binding; pending provisions and reservations still block collisions. Other explicit thread deletion paths may preserve the cursor to continue ring sequence.
 - A follower that later becomes leader keeps its existing slot and thread name; leadership changes are transport role changes, not identity resets.
 - Instance-thread names are short and recognizable. Default provisioning chooses one baked 4-6 letter single-word Latin thread name from the assigned slot's five-name palette using provisioning timestamp entropy and creates the Telegram thread with that title immediately. The slot remains internal ordering metadata and is not redundantly included in the thread name. Bare slot titles are fallback/legacy state only; do not prompt agents to self-name and do not expose a rename tool. Existing human-named threads are preserved across reloads and leadership changes when they remain the current live binding. If reload creates a new runtime instance while the previous leader thread is still alive, the new leader should take the next free slot instead of reusing the old slot immediately.
 - A thread-local `/start` opens that instance's menu.
@@ -370,9 +370,10 @@ All files containing routing, chat ids, thread ids, or process details use priva
 
 ### Follower heartbeat is missed
 
-- Leader prunes the follower from the live registry after missed heartbeats, but heartbeat pruning is only liveness bookkeeping.
+- Leader prunes the follower from the live registry after missed heartbeats, but heartbeat pruning is only immediate liveness bookkeeping.
 - A missed heartbeat does not delete, close, mark offline, or send a disconnected notice for the follower's Telegram thread binding because the common cause may be leader reload, IPC handoff, or transient reconnect rather than a dead follower.
-- Followers treat rejected/missing heartbeat acknowledgements as registration loss: clear local registered truth, try to re-register with the current leader, wait a short leader-reload grace window, retry, and then promote themselves if the leader still cannot route them.
+- Followers treat rejected/missing heartbeat acknowledgements as registration loss: retain the last known target locally, clear registered truth, try to re-register with the current leader, wait a short leader-reload grace window, retry, and then promote themselves if the leader still cannot route them.
+- After leader reload grace expires, persisted manual-follower records without a matching live registry owner leave current `state.json`; this compaction is non-destructive and does not close/delete the Telegram thread.
 - Every successful follower registration/re-registration sends a compact connected notice in the assigned thread so recovery and reconnection are visible during live testing without confusing heartbeat suspicion with real disconnect.
 - Successful forwarded updates and follower-originated API calls refresh liveness, so active followers are not pruned only because the interval heartbeat tick lagged.
 - Destructive follower thread teardown belongs to explicit `/telegram-disconnect` or confirmed reconciliation actions, not generic heartbeat pruning.

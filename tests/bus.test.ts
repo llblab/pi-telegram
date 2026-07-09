@@ -21,6 +21,7 @@ import {
   createTelegramBusFollowerRegistry,
   createTelegramBusForeignOwnedUpdateForwarder,
   createTelegramBusLocalServer,
+  createTelegramBusProcessRuntime,
   createTelegramBusRequestId,
   encodeTelegramBusEnvelope,
   getTelegramBusFollowerSocketPath,
@@ -30,6 +31,36 @@ import {
   parseTelegramBusEnvelope,
   sendTelegramBusLocalEnvelope,
 } from "../lib/bus.ts";
+
+test("Bus process runtime resolves live profile endpoints", () => {
+  let profileName: string | undefined;
+  const runtime = createTelegramBusProcessRuntime({
+    getActiveProfileName: () => profileName,
+    pid: 42,
+    parentPid: 7,
+    createdAtMs: 1000,
+  });
+  assert.equal(runtime.instanceId, "42:1000");
+  assert.equal(runtime.manualFollowerOwnerId, "7");
+  const defaultLeaderPath = runtime.getLeaderSocketPath();
+  const defaultFollowerPath = runtime.getFollowerSocketPath();
+  profileName = "work";
+  assert.notEqual(runtime.getLeaderSocketPath(), defaultLeaderPath);
+  assert.notEqual(runtime.getFollowerSocketPath(), defaultFollowerPath);
+  assert.match(runtime.getLeaderSocketPath(), /work/);
+  assert.match(runtime.getFollowerSocketPath(), /work/);
+});
+
+test("Bus process runtime falls back to pid without a parent pid", () => {
+  const runtime = createTelegramBusProcessRuntime({
+    getActiveProfileName: () => undefined,
+    pid: 42,
+    parentPid: 0,
+    createdAtMs: 1000,
+  });
+  assert.equal(runtime.manualFollowerOwnerId, "42");
+});
+
 test("Bus transport boundary derives socket and pipe endpoints", () => {
   assert.equal(
     getTelegramBusLeaderEndpoint({ agentDir: "/agent", platform: "linux" }),
@@ -132,14 +163,7 @@ test("Bus socket paths isolate named profiles and preserve default Unix paths", 
   );
   assert.equal(
     getTelegramBusFollowerSocketPath("pid:123", "/agent", "linux", "work"),
-    join(
-      "/agent",
-      "tmp",
-      "telegram",
-      "followers",
-      "work",
-      "pid_123.sock",
-    ),
+    join("/agent", "tmp", "telegram", "followers", "work", "pid_123.sock"),
   );
   assert.notEqual(
     getTelegramBusSocketPath("/agent", "linux", "work"),
@@ -161,11 +185,7 @@ test("Bus socket path uses profile-scoped Windows named pipes on win32", () => {
     /^\\\\\.\\pipe\\pi-telegram-[A-Za-z0-9_-]{16}-follower-pid_123_unsafe$/,
   );
   assert.match(
-    getTelegramBusSocketPath(
-      "C:\\Users\\me\\.pi\\agent",
-      "win32",
-      "work",
-    ),
+    getTelegramBusSocketPath("C:\\Users\\me\\.pi\\agent", "win32", "work"),
     /^\\\\\.\\pipe\\pi-telegram-[A-Za-z0-9_-]{16}-bus-work$/,
   );
   assert.match(
@@ -688,7 +708,8 @@ test("Bus local client transport events include request diagnostics", async () =
           instanceId: "inst-a",
           sentAtMs: 2000,
         },
-        recordTransportEvent: (phase, details) => events.push({ phase, details }),
+        recordTransportEvent: (phase, details) =>
+          events.push({ phase, details }),
       }),
     );
     assert.equal(events.length, 1);
@@ -721,7 +742,8 @@ test("Bus local client classifies response timeouts as transport timeouts", asyn
           instanceId: "inst-a",
           sentAtMs: 2000,
         },
-        recordTransportEvent: (phase, details) => events.push({ phase, details }),
+        recordTransportEvent: (phase, details) =>
+          events.push({ phase, details }),
       }),
     );
     assert.equal(events[0].phase, "client-failed");

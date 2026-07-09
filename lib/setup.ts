@@ -27,6 +27,11 @@ export interface TelegramPollingStartResult {
   message?: string;
 }
 
+export type TelegramSetupCompletion =
+  | { status: "success"; config: TelegramSetupConfig }
+  | { status: "cancelled" | "unavailable" | "busy" | "validation-failed" }
+  | { status: "polling-failed"; config: TelegramSetupConfig };
+
 export interface TelegramSetupDeps {
   hasUI: boolean;
   env: NodeJS.ProcessEnv;
@@ -120,8 +125,8 @@ export function getTelegramBotTokenPromptSpec(
 
 export async function runTelegramSetup(
   deps: TelegramSetupDeps,
-): Promise<TelegramSetupConfig | undefined> {
-  if (!deps.hasUI) return undefined;
+): Promise<TelegramSetupCompletion> {
+  if (!deps.hasUI) return { status: "unavailable" };
   const tokenPrompt = getTelegramBotTokenPromptSpec(
     deps.env,
     deps.config.botToken,
@@ -130,7 +135,7 @@ export async function runTelegramSetup(
     tokenPrompt.method === "editor"
       ? await deps.promptEditor("Telegram bot token", tokenPrompt.value)
       : await deps.promptInput("Telegram bot token", tokenPrompt.value);
-  if (!token) return undefined;
+  if (!token) return { status: "cancelled" };
   const nextConfig: TelegramSetupConfig = {
     ...deps.config,
     botToken: token.trim(),
@@ -141,11 +146,11 @@ export async function runTelegramSetup(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     deps.notify(`Telegram API check failed: ${message}`, "error");
-    return undefined;
+    return { status: "validation-failed" };
   }
   if (!data.ok || !data.result) {
     deps.notify(data.description || "Invalid Telegram bot token", "error");
-    return undefined;
+    return { status: "validation-failed" };
   }
   nextConfig.botId = data.result.id;
   nextConfig.botUsername = data.result.username;
@@ -158,21 +163,33 @@ export async function runTelegramSetup(
     "Send /start to your bot in Telegram to pair this extension with your account.",
     "info",
   );
-  const startResult = await deps.startPolling();
+  let startResult: unknown;
+  try {
+    startResult = await deps.startPolling();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    deps.notify(`Telegram polling failed: ${message}`, "error");
+    deps.updateStatus();
+    return { status: "polling-failed", config: nextConfig };
+  }
   if (isTelegramPollingStartResult(startResult) && startResult.message) {
     deps.notify(startResult.message, startResult.ok ? "info" : "error");
   }
   deps.updateStatus();
-  return nextConfig;
+  if (isTelegramPollingStartResult(startResult) && !startResult.ok) {
+    return { status: "polling-failed", config: nextConfig };
+  }
+  return { status: "success", config: nextConfig };
 }
 
 export function createTelegramSetupPromptRuntime<
   TContext extends TelegramSetupPromptContext,
 >(deps: TelegramSetupPromptRuntimeDeps<TContext>) {
-  return async (ctx: TContext): Promise<void> => {
-    if (!ctx.hasUI || !deps.setupGuard.start()) return;
+  return async (ctx: TContext): Promise<TelegramSetupCompletion> => {
+    if (!ctx.hasUI) return { status: "unavailable" };
+    if (!deps.setupGuard.start()) return { status: "busy" };
     try {
-      await runTelegramSetup({
+      return await runTelegramSetup({
         hasUI: ctx.hasUI,
         env: deps.env ?? process.env,
         config: deps.getConfig(),

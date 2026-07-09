@@ -173,6 +173,63 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<
   onHeartbeatFailure?: (error: unknown, ctx: TContext) => Promise<void> | void;
 }
 
+export function createTelegramManualFollowerProfileKeyResolver(input: {
+  getActiveProfileName: () => string | undefined;
+  manualFollowerOwnerId: string;
+}): () => string {
+  return () =>
+    Threads.getTelegramThreadOwnerKey({
+      kind: "manual-follower",
+      instanceId: input.manualFollowerOwnerId,
+      telegramProfile: input.getActiveProfileName(),
+    });
+}
+
+export type TelegramBusFollowerPromotionHandler<TContext> = (
+  ctx: TContext,
+  binding: TelegramBusFollowerPromotedBinding,
+) => Promise<void>;
+
+export function createTelegramBusFollowerPromotionHandler<
+  TContext extends { cwd: string },
+>(input: {
+  topicTargetStore: Threads.TelegramTopicTargetStore;
+  instanceId: string;
+  getActiveProfileName: () => string | undefined;
+  startLeader: (ctx: TContext) => Promise<unknown> | unknown;
+  recordRuntimeEvent: (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
+}): TelegramBusFollowerPromotionHandler<TContext> {
+  return async (ctx, binding) => {
+    const promotedRecord = await Threads.promoteTelegramFollowerBindingToLeader({
+      store: input.topicTargetStore,
+      instanceId: input.instanceId,
+      cwd: ctx.cwd,
+      telegramProfile: input.getActiveProfileName(),
+      target: binding.target,
+      slot: binding.slot,
+      threadName: binding.threadName,
+    });
+    if (promotedRecord) {
+      input.recordRuntimeEvent(
+        "bus",
+        "Follower thread binding promoted to leader",
+        {
+          phase: "follower-promoted-binding",
+          chatId: promotedRecord.target.chatId,
+          threadId: promotedRecord.target.threadId,
+          slot: promotedRecord.slot,
+          threadName: promotedRecord.threadName,
+        },
+      );
+    }
+    await input.startLeader(ctx);
+  };
+}
+
 export interface TelegramBusFollowerTargetReplacementHandlerDeps<TContext> {
   topicTargetStore: Pick<
     Threads.TelegramTopicTargetStore,
@@ -183,7 +240,7 @@ export interface TelegramBusFollowerTargetReplacementHandlerDeps<TContext> {
     "getTarget" | "setRegistered"
   >;
   instanceId: string;
-  manualFollowerProfileKey: string;
+  getManualFollowerProfileKey: () => string;
   manualFollowerOwnerId: string;
   getSyncState: () => Sync.TelegramSyncState;
   setSyncState: (state: Sync.TelegramSyncState) => void;
@@ -276,6 +333,71 @@ export interface TelegramBusForwardedUpdateReceiverRuntimeDeps<
   ) => void;
 }
 
+export interface TelegramBusFollowerRuntimeAssemblyDeps<
+  TContext extends { cwd?: string },
+  TReactionUpdate,
+  TCallbackQuery,
+  TMessage = unknown,
+> {
+  receiver: Omit<
+    TelegramBusForwardedUpdateReceiverRuntimeDeps<
+      TContext,
+      TReactionUpdate,
+      TCallbackQuery,
+      TMessage
+    >,
+    "handleReplaceTarget"
+  >;
+  targetReplacement: TelegramBusFollowerTargetReplacementHandlerDeps<TContext>;
+  recovery: Omit<
+    TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext>,
+    "getRegistrationRuntime"
+  >;
+  registration: Omit<
+    TelegramBusFollowerRegistrationRuntimeDeps<TContext>,
+    "startReceiving" | "stopReceiving" | "onHeartbeatFailure"
+  >;
+}
+
+export interface TelegramBusFollowerRuntimeAssembly<TContext> {
+  receiver: TelegramBusForwardedUpdateReceiverRuntime;
+  registration: TelegramBusFollowerRegistrationRuntime<TContext>;
+}
+
+export function createTelegramBusFollowerRuntimeAssembly<
+  TContext extends { cwd?: string },
+  TReactionUpdate,
+  TCallbackQuery,
+  TMessage = unknown,
+>(
+  deps: TelegramBusFollowerRuntimeAssemblyDeps<
+    TContext,
+    TReactionUpdate,
+    TCallbackQuery,
+    TMessage
+  >,
+): TelegramBusFollowerRuntimeAssembly<TContext> {
+  const receiver = createTelegramBusForwardedUpdateReceiverRuntime({
+    ...deps.receiver,
+    handleReplaceTarget:
+      createTelegramBusFollowerTargetReplacementHandler(
+        deps.targetReplacement,
+      ),
+  });
+  let registration: TelegramBusFollowerRegistrationRuntime<TContext>;
+  const recovery = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    ...deps.recovery,
+    getRegistrationRuntime: () => registration,
+  });
+  registration = createTelegramBusFollowerRegistrationRuntime({
+    ...deps.registration,
+    startReceiving: receiver.start,
+    stopReceiving: receiver.stop,
+    onHeartbeatFailure: recovery,
+  });
+  return { receiver, registration };
+}
+
 export function createTelegramBusFollowerTargetReplacementHandler<TContext>(
   deps: TelegramBusFollowerTargetReplacementHandlerDeps<TContext>,
 ): NonNullable<
@@ -308,7 +430,7 @@ export function createTelegramBusFollowerTargetReplacementHandler<TContext>(
       );
     }
     const profileKey =
-      currentRecord?.profileKey ?? deps.manualFollowerProfileKey;
+      currentRecord?.profileKey ?? deps.getManualFollowerProfileKey();
     deps.topicTargetStore.upsert({
       profileKey,
       owner: {
@@ -654,6 +776,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
   let activeLeaderSocketPath: string | undefined;
   let activeAuthSecret: string | undefined;
   let activeContext: TContext | undefined;
+  let lastKnownTarget: TelegramTarget | undefined;
   const stopHeartbeat = () => {
     if (!heartbeatInterval) return;
     clearInterval(heartbeatInterval);
@@ -664,6 +787,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
     activeAuthSecret = undefined;
     deps.setActiveAuthSecret?.(undefined);
     deps.registrationState?.setRegistered(false);
+    lastKnownTarget = undefined;
     activeContext = undefined;
     void deps.stopReceiving?.();
   };
@@ -729,6 +853,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
             (ctx.cwd ? basename(ctx.cwd) : undefined),
           cwd: ctx.cwd,
           pid: getPid(),
+          target: deps.registrationState?.getTarget() ?? lastKnownTarget,
           busSocketPath:
             deps.getFollowerBusSocketPath?.() ?? deps.followerBusSocketPath,
           connectedAtMs: getNowMs(),
@@ -783,6 +908,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
           registrationResult.target,
           registrationResult,
         );
+        lastKnownTarget = registrationResult.target;
         activeLeaderSocketPath = leaderSocketPath;
         activeContext = ctx;
         await sendHeartbeat();

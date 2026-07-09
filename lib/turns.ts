@@ -8,8 +8,6 @@ import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import {
-  appendTelegramForwardContext,
-  appendTelegramReplyContext,
   buildTelegramReplyContextBlock,
   collectTelegramMessageIds,
   downloadTelegramMessageFiles,

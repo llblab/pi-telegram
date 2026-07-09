@@ -150,18 +150,23 @@ test("Prompt helpers expose detailed Telegram guidance through agent help tool",
   assert.match(help, /speech-to-text/);
   assert.match(help, /state\.json/);
   assert.match(help, /logs\.jsonl/);
+  const namedHelp = getTelegramHelpText("work");
+  assert.match(namedHelp, /state\.work\.json/);
+  assert.match(namedHelp, /logs\.work\.jsonl/);
 
   let tool:
-    | { name?: string; execute: () => Promise<unknown> | unknown }
-    | undefined;
-  registerTelegramHelpTool({
-    registerTool: (definition: { name?: string; execute: () => unknown }) => {
-      tool = definition;
-    },
-  } as never);
+    { name?: string; execute: () => Promise<unknown> | unknown } | undefined;
+  registerTelegramHelpTool(
+    {
+      registerTool: (definition: { name?: string; execute: () => unknown }) => {
+        tool = definition;
+      },
+    } as never,
+    { getActiveProfileName: () => "work" },
+  );
   assert.equal(tool?.name, "telegram_help");
   assert.deepEqual(await tool?.execute(), {
-    content: [{ type: "text", text: help }],
+    content: [{ type: "text", text: namedHelp }],
     details: {},
   });
 });

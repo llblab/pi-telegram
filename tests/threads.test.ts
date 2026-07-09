@@ -22,6 +22,7 @@ import {
   getTelegramStatePath,
   getTelegramTopicTargetsPath,
   provisionOwnBusTopic,
+  reconcileTelegramFreshAllocationCursor,
   resolveTelegramInstanceThreadTarget,
   listTelegramThreadStatusFollowers,
   listTelegramThreadStatusTargets,
@@ -37,7 +38,11 @@ import {
 
 test("Thread owner keys isolate named Telegram profiles without changing default keys", () => {
   assert.equal(
-    getTelegramThreadOwnerKey({ kind: "leader", cwd: "/repo", instanceId: "a" }),
+    getTelegramThreadOwnerKey({
+      kind: "leader",
+      cwd: "/repo",
+      instanceId: "a",
+    }),
     "cwd:/repo",
   );
   assert.equal(
@@ -494,6 +499,36 @@ test("Thread store returns defensive copies and prunes offline/stale observation
   );
 });
 
+test("Thread cursor reconciliation preserves a live cursor and collision guards", () => {
+  const store = createTelegramTopicTargetStore({
+    path: "/tmp/unused-telegram-cursor-reconcile.json",
+    getNowMs: () => 1000,
+  });
+  store.upsert({
+    profileKey: "leader:/repo",
+    owner: { kind: "leader", cwd: "/repo", instanceId: "leader" },
+    target: { chatId: 7, threadId: 40 },
+    status: "active",
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    instanceId: "leader",
+    slot: "D",
+  });
+  store.reserveThread({
+    target: { chatId: 7, threadId: 41 },
+    slot: "E",
+    reason: "leader-reload",
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    expiresAtMs: 2000,
+  });
+  store.setBotState({ lastSlot: "D" });
+
+  assert.equal(reconcileTelegramFreshAllocationCursor(store, 1000), false);
+  assert.equal(store.getBotState().lastSlot, "D");
+  assert.equal(store.allocateSlot("manual:new"), "F");
+});
+
 test("Thread slot allocator preserves existing slots on reuse", () => {
   const store = createTelegramTopicTargetStore({
     path: "/tmp/unused-telegram-targets.json",
@@ -518,12 +553,12 @@ test("Thread slot allocator preserves existing slots on reuse", () => {
     threadName: "b",
     slot: "A",
   });
-  assert.equal(store.allocateSlot("cwd:/new"), "D");
+  assert.equal(store.allocateSlot("cwd:/new"), "B");
   store.markStaleByTarget({ chatId: -1001, threadId: 1 });
-  assert.equal(store.allocateSlot("cwd:/existing-stale"), "D");
+  assert.equal(store.allocateSlot("cwd:/existing-stale"), "B");
 });
 
-test("Thread slot allocator continues from durable cursor when lower live slots exist", () => {
+test("Thread slot allocator follows the latest fresh slot around the ring", () => {
   const store = createTelegramTopicTargetStore({
     path: "/tmp/unused-telegram-targets.json",
   });
@@ -544,7 +579,25 @@ test("Thread slot allocator continues from durable cursor when lower live slots 
     updatedAtMs: 1,
     slot: "U",
   });
-  assert.equal(store.allocateSlot("cwd:/new"), "X");
+  assert.equal(store.allocateSlot("cwd:/new"), "V");
+});
+
+test("Thread slot allocator starts from the cursor instead of higher live slots", () => {
+  const store = createTelegramTopicTargetStore({
+    path: "/tmp/unused-telegram-targets.json",
+  });
+  store.setBotState({ lastSlot: "D" });
+  store.upsert({
+    profileKey: "manual:historical-i",
+    target: { chatId: -1001, threadId: 9 },
+    status: "active",
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    slot: "I",
+  });
+  store.setBotState({ lastSlot: "D" });
+
+  assert.equal(store.allocateSlot("manual:new"), "E");
 });
 
 test("Thread slot allocator treats unexpired reservations as occupied", () => {
@@ -713,9 +766,29 @@ test("Thread slot allocator continues after persisted last slot when no threads 
       slot: "I",
     });
     store.markStaleByTarget({ chatId: 7, threadId: 9 });
+    store.upsert({
+      profileKey: "manual:wrap-z",
+      target: { chatId: 7, threadId: 26 },
+      status: "active",
+      createdAtMs: 2100,
+      updatedAtMs: 2100,
+      slot: "Z",
+    });
+    store.markStaleByTarget({ chatId: 7, threadId: 26 });
+    assert.equal(store.allocateSlot("manual:wrap-a"), "A");
+    store.upsert({
+      profileKey: "manual:wrap-a",
+      target: { chatId: 7, threadId: 27 },
+      status: "active",
+      createdAtMs: 2200,
+      updatedAtMs: 2200,
+      slot: "A",
+    });
+    store.markStaleByTarget({ chatId: 7, threadId: 27 });
+    assert.equal(store.allocateSlot("manual:wrap-b"), "B");
     await store.persist();
     const file = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(file.bot.lastSlot, "I");
+    assert.equal(file.bot.lastSlot, "A");
     assert.deepEqual(file.threads, []);
   } finally {
     await rm(dir, { force: true, recursive: true });
@@ -1333,7 +1406,10 @@ test("Thread provisioner creates forum topics without retrying non-idempotent re
     },
   });
 
-  await provision({ instanceId: "instance-a", profileKey: "manual:instance-a" });
+  await provision({
+    instanceId: "instance-a",
+    profileKey: "manual:instance-a",
+  });
 
   assert.deepEqual(calls, [
     {

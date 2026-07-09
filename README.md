@@ -41,7 +41,7 @@ Run this inside Pi:
 /telegram-setup
 ```
 
-Paste the bot token. If `~/.pi/agent/telegram.json` already contains a saved token, setup offers it as the default. If no saved token exists, setup can prefill from `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_KEY`, `TELEGRAM_TOKEN`, or `TELEGRAM_KEY`. Named profiles are optional; the ordinary `/telegram-setup` and `/telegram-connect` flow keeps using the default profile. Use `/telegram-setup <name>` only when you want an additional bot profile.
+Paste the bot token. If `~/.pi/agent/telegram.json` already contains a saved token, setup offers it as the default. If no saved token exists, setup can prefill from `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_KEY`, `TELEGRAM_TOKEN`, or `TELEGRAM_KEY`. Named profiles are optional; the ordinary `/telegram-setup` and `/telegram-connect` flow keeps using the default profile. Use `/telegram-setup <name>` only when you want an additional bot profile. Cancelling or failing named-profile token validation leaves the currently active profile and polling runtime unchanged; setup reports the profile as saved and connected only after polling startup succeeds.
 
 ### 3. Connect this Pi session
 

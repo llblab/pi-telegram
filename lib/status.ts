@@ -1065,6 +1065,13 @@ function buildTelegramBridgeCompactStatusLines(
       : state.activeSourceMessageIds?.length
         ? "active"
         : "idle";
+  const profileSuffix = state.activeProfileName
+    ? `.${state.activeProfileName.replace(/[^a-zA-Z0-9._-]+/g, "_")}`
+    : "";
+  const diagnosticsPaths = {
+    state: `~/.pi/agent/tmp/telegram/state${profileSuffix}.json`,
+    logs: `~/.pi/agent/tmp/telegram/logs${profileSuffix}.jsonl`,
+  };
   return [
     "connection:",
     `- bot: ${formatTelegramBridgeBotStatus(state)}`,
@@ -1094,8 +1101,8 @@ function buildTelegramBridgeCompactStatusLines(
     ...buildTelegramThreadReconciliationLines(state),
     "",
     "diagnostics:",
-    "- state: ~/.pi/agent/tmp/telegram/state.json",
-    "- logs: ~/.pi/agent/tmp/telegram/logs.jsonl",
+    `- state: ${diagnosticsPaths.state}`,
+    `- logs: ${diagnosticsPaths.logs}`,
     "- full dump: /telegram-status --debug",
   ];
 }

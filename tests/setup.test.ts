@@ -71,12 +71,15 @@ test("Setup runner validates token, persists config, starts polling, and updates
   });
 
   assert.deepEqual(nextConfig, {
-    allowedUserId: 42,
-    botToken: "token",
-    botId: 7,
-    botUsername: "demo_bot",
+    status: "success",
+    config: {
+      allowedUserId: 42,
+      botToken: "token",
+      botId: 7,
+      botUsername: "demo_bot",
+    },
   });
-  assert.deepEqual(persisted, nextConfig);
+  assert.deepEqual(persisted, nextConfig.config);
   assert.deepEqual(calls, [
     `input:${TELEGRAM_BOT_TOKEN_INPUT_PLACEHOLDER}`,
     "getMe:token",
@@ -105,8 +108,51 @@ test("Setup runner reports invalid tokens without persisting or starting polling
     updateStatus: () => calls.push("status"),
   });
 
-  assert.equal(nextConfig, undefined);
+  assert.deepEqual(nextConfig, { status: "validation-failed" });
   assert.deepEqual(calls, ["error:Unauthorized"]);
+});
+
+test("Setup runner distinguishes cancellation and polling startup failure", async () => {
+  const baseDeps = {
+    hasUI: true,
+    env: {},
+    config: {},
+    promptEditor: async () => undefined,
+    getMe: async () => ({
+      ok: true,
+      result: { id: 7, username: "demo_bot" },
+    }),
+    persistConfig: async () => undefined,
+    notify: () => undefined,
+    updateStatus: () => undefined,
+  };
+  assert.deepEqual(
+    await runTelegramSetup({
+      ...baseDeps,
+      hasUI: false,
+      promptInput: async () => "token",
+      startPolling: () => ({ ok: true }),
+    }),
+    { status: "unavailable" },
+  );
+  assert.deepEqual(
+    await runTelegramSetup({
+      ...baseDeps,
+      promptInput: async () => undefined,
+      startPolling: () => ({ ok: true }),
+    }),
+    { status: "cancelled" },
+  );
+  const failed = await runTelegramSetup({
+    ...baseDeps,
+    promptInput: async () => "token",
+    startPolling: () => ({ ok: false, message: "Polling unavailable" }),
+  });
+  assert.equal(failed.status, "polling-failed");
+  assert.equal(
+    failed.status === "polling-failed" && failed.config.botToken,
+    "token",
+  );
 });
 
 test("Setup prompt runtime stores config before starting polling", async () => {

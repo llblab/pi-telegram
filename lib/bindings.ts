@@ -94,7 +94,9 @@ export function registerTelegramCommandsAndTools({
       sendMarkdownReply(chatId, undefined, markdown, options),
     recordRuntimeEvent,
   });
-  Prompts.registerTelegramHelpTool(pi);
+  Prompts.registerTelegramHelpTool(pi, {
+    getActiveProfileName: configStore.getActiveProfileName,
+  });
   Commands.registerTelegramBridgeCommands(pi, {
     promptForConfig: async (ctx, profileName) => {
       const nextProfileName = profileName ?? undefined;
@@ -103,36 +105,58 @@ export function registerTelegramCommandsAndTools({
         return;
       }
       const previousProfileName = configStore.getActiveProfileName();
-      if (previousProfileName !== nextProfileName) {
-        await (stopPolling ?? lockedPollingRuntime.stop)();
-      }
+      let setupConfigStore = configStore;
+      let persistSetupConfig = persistConfig;
       if (!profileName) {
+        if (previousProfileName !== nextProfileName) {
+          await (stopPolling ?? lockedPollingRuntime.stop)();
+        }
         configStore.activateProfile(undefined);
       } else {
         const storedConfig = configStore.getStoredConfig();
-        if (!storedConfig.profiles?.[profileName]) {
+        setupConfigStore = Config.createTelegramConfigStore({
+          initialConfig: {
+            ...storedConfig,
+            profiles: {
+              ...(storedConfig.profiles ?? {}),
+              [profileName]: storedConfig.profiles?.[profileName] ?? {
+                botToken: "",
+              },
+            },
+          },
+        });
+        setupConfigStore.activateProfile(profileName);
+        persistSetupConfig = async () => {
+          if (previousProfileName !== profileName) {
+            await (stopPolling ?? lockedPollingRuntime.stop)();
+          }
+          configStore.activateProfile(undefined);
           configStore.set({
             ...storedConfig,
             profiles: {
               ...(storedConfig.profiles ?? {}),
-              [profileName]: { botToken: "" },
+              [profileName]: storedConfig.profiles?.[profileName] ?? {
+                botToken: "",
+              },
             },
           });
-        }
-        configStore.activateProfile(profileName);
+          configStore.activateProfile(profileName);
+          configStore.set(setupConfigStore.get());
+          await persistConfig();
+        };
       }
       const runSetup = Setup.createTelegramSetupPromptRuntime({
-        getConfig: configStore.get,
-        setConfig: configStore.set,
+        getConfig: setupConfigStore.get,
+        setConfig: setupConfigStore.set,
         setupGuard: setup,
         getMe: TelegramApi.fetchTelegramBotIdentity,
-        persistConfig,
+        persistConfig: persistSetupConfig,
         startPolling: lockedPollingRuntime.start,
         updateStatus,
         recordRuntimeEvent,
       });
-      await runSetup(ctx);
-      if (profileName) {
+      const completion = await runSetup(ctx);
+      if (profileName && completion.status === "success") {
         ctx.ui.notify(`Profile "${profileName}" saved and connected.`, "info");
       }
     },
@@ -155,6 +179,8 @@ export function registerTelegramCommandsAndTools({
     activateProfileConfig: async (_ctx, profileName) => {
       await configStore.load();
       if (!Config.isValidTelegramProfileName(profileName)) return false;
+      const storedConfig = configStore.getStoredConfig();
+      if (!storedConfig.profiles?.[profileName]) return false;
       const previousProfileName = configStore.getActiveProfileName();
       if (previousProfileName !== profileName) {
         await (stopPolling ?? lockedPollingRuntime.stop)();

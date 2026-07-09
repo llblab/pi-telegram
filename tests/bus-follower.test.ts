@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,10 +13,13 @@ import {
   createTelegramBusFollowerApiCaller,
   createTelegramBusFollowerHeartbeatRecoveryHandler,
   createTelegramBusFollowerRegistrationRuntime,
+  createTelegramBusFollowerPromotionHandler,
   createTelegramBusFollowerRegistrationState,
+  createTelegramBusFollowerRuntimeAssembly,
   createTelegramBusFollowerSessionReplacementSuspender,
   createTelegramBusFollowerTargetReplacementHandler,
   createTelegramBusForwardedUpdateReceiverRuntime,
+  createTelegramManualFollowerProfileKeyResolver,
   getTelegramFollowerSessionHandoff,
   setTelegramFollowerSessionHandoff,
 } from "../lib/bus-follower.ts";
@@ -27,6 +30,7 @@ import {
   sendTelegramBusLocalEnvelope,
 } from "../lib/bus.ts";
 import { createTelegramBusLeaderEnvelopeHandler } from "../lib/bus-leader.ts";
+import { createTelegramTopicTargetStore } from "../lib/threads.ts";
 
 async function waitForCondition(
   predicate: () => boolean,
@@ -39,6 +43,60 @@ async function waitForCondition(
   }
   assert.fail("Timed out waiting for condition");
 }
+
+test("Bus follower profile key resolver follows the active profile", () => {
+  let profileName: string | undefined;
+  const resolveProfileKey = createTelegramManualFollowerProfileKeyResolver({
+    getActiveProfileName: () => profileName,
+    manualFollowerOwnerId: "7",
+  });
+  assert.equal(resolveProfileKey(), "manual:7");
+  profileName = "work";
+  assert.equal(resolveProfileKey(), "profile:work:manual:7");
+});
+
+test("Bus follower promotion handler transfers binding before starting leader", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-promotion-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+  const events: unknown[] = [];
+  const promote = createTelegramBusFollowerPromotionHandler({
+    topicTargetStore: store,
+    instanceId: "inst-a",
+    getActiveProfileName: () => "work",
+    startLeader: (ctx: { cwd: string }) => {
+      events.push(`start:${ctx.cwd}`);
+    },
+    recordRuntimeEvent: (category, message, details) => {
+      events.push({ category, message, details });
+    },
+  });
+  try {
+    await promote(
+      { cwd: "/repo" },
+      {
+        target: { chatId: 42, threadId: 11 },
+        slot: "E",
+        threadName: "Ember",
+      },
+    );
+    assert.equal(store.list()[0]?.profileKey, "profile:work:cwd:/repo");
+    assert.equal(store.list()[0]?.owner?.kind, "leader");
+    assert.equal(events.at(-1), "start:/repo");
+    assert.deepEqual(events[0], {
+      category: "bus",
+      message: "Follower thread binding promoted to leader",
+      details: {
+        phase: "follower-promoted-binding",
+        chatId: 42,
+        threadId: 11,
+        slot: "E",
+        threadName: "Ember",
+      },
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("Bus follower receiver handles leader-forwarded updates and target replacement", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-forward-"));
@@ -205,10 +263,14 @@ test("Bus follower heartbeat recovery passes current binding into promotion", as
   const promoted: unknown[] = [];
   let leaderStateCalls = 0;
   const registrationState = createTelegramBusFollowerRegistrationState();
-  registrationState.setRegistered(true, { chatId: 42, threadId: 10 }, {
-    slot: "F",
-    threadName: "Fjord",
-  });
+  registrationState.setRegistered(
+    true,
+    { chatId: 42, threadId: 10 },
+    {
+      slot: "F",
+      threadName: "Fjord",
+    },
+  );
   const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
     registrationState,
     getRegistrationRuntime: () => ({
@@ -323,7 +385,7 @@ test("Bus follower target replacement handler persists restored target", async (
     },
     registrationState,
     instanceId: "inst-a",
-    manualFollowerProfileKey: "manual:new",
+    getManualFollowerProfileKey: () => "manual:new",
     manualFollowerOwnerId: "new",
     getSyncState: () => syncState,
     setSyncState: (state) => {
@@ -387,6 +449,121 @@ test("Bus follower target replacement handler persists restored target", async (
   ]);
 });
 
+test("Bus follower target replacement resolves named-profile fallback at call time", async () => {
+  let activeProfileKey = "manual:default";
+  const upserts: Array<{ profileKey: string }> = [];
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  const handler = createTelegramBusFollowerTargetReplacementHandler({
+    topicTargetStore: {
+      load: async () => undefined,
+      list: () => [],
+      markStaleByTarget: () => false,
+      upsert: (record) => {
+        upserts.push(record);
+        return record;
+      },
+      persist: async () => undefined,
+    },
+    registrationState,
+    instanceId: "inst-a",
+    getManualFollowerProfileKey: () => activeProfileKey,
+    manualFollowerOwnerId: "owner-a",
+    getSyncState: () => ({}),
+    setSyncState: () => undefined,
+    getNowMs: () => 2000,
+    updateStatus: () => undefined,
+  });
+  activeProfileKey = "profile:work:manual-follower:owner-a";
+  await handler(
+    {
+      target: { chatId: 42, threadId: 11 },
+      reason: "thread-restore",
+    },
+    "ctx",
+  );
+  assert.equal(upserts[0]?.profileKey, "profile:work:manual-follower:owner-a");
+});
+
+test("Bus follower assembly wires receiver, recovery, and registration", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-assembly-"));
+  const leaderSocketPath = join(dir, "leader.sock");
+  const followerSocketPath = join(dir, "follower.sock");
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  const leader = createTelegramBusLocalServer({
+    socketPath: leaderSocketPath,
+    handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
+      followerRegistry: createTelegramBusFollowerRegistry(),
+      provisionFollowerTarget: () => ({ chatId: 7, threadId: 42 }),
+    }),
+  });
+  const assembly = createTelegramBusFollowerRuntimeAssembly<
+    { cwd: string },
+    unknown,
+    unknown
+  >({
+    receiver: {
+      socketPath: followerSocketPath,
+      instanceId: "inst-a",
+      getContext: () => ({ cwd: "/repo" }),
+      handleForwardedCallback: () => undefined,
+      handleForwardedReaction: () => undefined,
+    },
+    targetReplacement: {
+      topicTargetStore: {
+        load: async () => undefined,
+        list: () => [],
+        markStaleByTarget: () => false,
+        upsert: (record) => record,
+        persist: async () => undefined,
+      },
+      registrationState,
+      instanceId: "inst-a",
+      getManualFollowerProfileKey: () => "manual:a",
+      manualFollowerOwnerId: "a",
+      getSyncState: () => ({}),
+      setSyncState: () => undefined,
+      updateStatus: () => undefined,
+    },
+    recovery: {
+      registrationState,
+      getLeaderState: () => ({ kind: "inactive" }),
+      setLifecyclePhase: () => undefined,
+      updateStatus: () => undefined,
+      promoteToLeader: () => undefined,
+      sleep: async () => undefined,
+      promotionGraceMs: 1,
+      recordRuntimeEvent: () => undefined,
+    },
+    registration: {
+      instanceId: "inst-a",
+      getFollowerBusSocketPath: () => followerSocketPath,
+      getLeaderSocketPath: () => leaderSocketPath,
+      registrationState,
+      createRequestId: () => "inst-a:1",
+    },
+  });
+  try {
+    await leader.start();
+    assert.equal(
+      await assembly.registration.registerWithLeader(
+        { cwd: "/repo" },
+        { busSocketPath: leaderSocketPath },
+      ),
+      true,
+    );
+    assert.equal(existsSync(followerSocketPath), true);
+    assert.deepEqual(registrationState.getTarget(), {
+      chatId: 7,
+      threadId: 42,
+    });
+  } finally {
+    assembly.registration.stop();
+    await assembly.receiver.stop();
+    await leader.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Bus follower registration state tracks successful registration and stop", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-follower-state-"));
   const socketPath = join(dir, "bus.sock");
@@ -432,6 +609,56 @@ test("Bus follower registration state tracks successful registration and stop", 
     assert.equal(state.getTarget(), undefined);
     assert.equal(state.getSlot(), undefined);
     assert.equal(state.getThreadName(), undefined);
+  } finally {
+    follower.stop();
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus follower re-registration carries its last known target", async () => {
+  const dir = mkdtempSync(
+    join(tmpdir(), "pi-telegram-follower-reload-target-"),
+  );
+  const socketPath = join(dir, "bus.sock");
+  const state = createTelegramBusFollowerRegistrationState();
+  const registrationTargets: unknown[] = [];
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
+      followerRegistry: createTelegramBusFollowerRegistry(),
+      provisionFollowerTarget(registration) {
+        registrationTargets.push(registration.target);
+        return { chatId: 7, threadId: 42 };
+      },
+    }),
+  });
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    instanceId: "inst-a",
+    createRequestId: () => "inst-a:reload",
+    registrationState: state,
+  });
+  try {
+    await server.start();
+    assert.equal(
+      await follower.registerWithLeader(
+        { cwd: "/repo" },
+        { busSocketPath: socketPath },
+      ),
+      true,
+    );
+    state.setRegistered(false);
+    assert.equal(
+      await follower.registerWithLeader(
+        { cwd: "/repo" },
+        { busSocketPath: socketPath },
+      ),
+      true,
+    );
+    assert.deepEqual(registrationTargets, [
+      undefined,
+      { chatId: 7, threadId: 42 },
+    ]);
   } finally {
     follower.stop();
     await server.stop();

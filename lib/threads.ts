@@ -133,30 +133,32 @@ function getNextMonotonicSlot(
   nowMs: number,
   lastSlot?: string,
 ): string | undefined {
-  let maxCode = "A".charCodeAt(0) - 1;
-  for (const record of records.values()) {
-    if (!record.slot || !isCurrentThreadRecord(record)) continue;
-    maxCode = Math.max(maxCode, record.slot.charCodeAt(0));
-  }
-  for (const reservation of reservations) {
-    if (
-      reservation.expiresAtMs !== undefined &&
-      reservation.expiresAtMs <= nowMs
-    )
-      continue;
-    if (!reservation.slot) continue;
-    maxCode = Math.max(maxCode, reservation.slot.charCodeAt(0));
-  }
-  for (const provision of pendingProvisions) {
-    if (provision.expiresAtMs !== undefined && provision.expiresAtMs <= nowMs)
-      continue;
-    if (!provision.slot) continue;
-    maxCode = Math.max(maxCode, provision.slot.charCodeAt(0));
-  }
+  let cursorCode: number | undefined;
   if (lastSlot && /^[A-Z]$/.test(lastSlot)) {
-    maxCode = Math.max(maxCode, lastSlot.charCodeAt(0));
+    cursorCode = lastSlot.charCodeAt(0);
+  } else {
+    cursorCode = "A".charCodeAt(0) - 1;
+    for (const record of records.values()) {
+      if (!record.slot || !isCurrentThreadRecord(record)) continue;
+      cursorCode = Math.max(cursorCode, record.slot.charCodeAt(0));
+    }
+    for (const reservation of reservations) {
+      if (
+        reservation.expiresAtMs !== undefined &&
+        reservation.expiresAtMs <= nowMs
+      )
+        continue;
+      if (!reservation.slot) continue;
+      cursorCode = Math.max(cursorCode, reservation.slot.charCodeAt(0));
+    }
+    for (const provision of pendingProvisions) {
+      if (provision.expiresAtMs !== undefined && provision.expiresAtMs <= nowMs)
+        continue;
+      if (!provision.slot) continue;
+      cursorCode = Math.max(cursorCode, provision.slot.charCodeAt(0));
+    }
   }
-  let code = maxCode + 1;
+  let code = cursorCode + 1;
   if (code > "Z".charCodeAt(0)) code = "A".charCodeAt(0);
   for (let attempt = 0; attempt < 26; attempt++) {
     const candidate = String.fromCharCode(code);
@@ -226,6 +228,39 @@ export interface TelegramTopicTargetStore {
     instanceId: string,
     threadName?: string,
   ) => TelegramTopicTargetRecord | undefined;
+}
+
+export function reconcileTelegramFreshAllocationCursor(
+  store: Pick<
+    TelegramTopicTargetStore,
+    "getBotState" | "list" | "setBotState"
+  >,
+  nowMs = Date.now(),
+): boolean {
+  const currentCursor = store.getBotState().lastSlot;
+  const slottedRecords = store
+    .list()
+    .filter((record) => !!record.slot && /^[A-Z]$/.test(record.slot));
+  if (slottedRecords.some((record) => record.slot === currentCursor)) {
+    return false;
+  }
+  const latestLiveRecord = slottedRecords.reduce<
+    TelegramTopicTargetRecord | undefined
+  >((latest, record) => {
+    if (!latest) return record;
+    if (record.createdAtMs !== latest.createdAtMs) {
+      return record.createdAtMs > latest.createdAtMs ? record : latest;
+    }
+    return record.updatedAtMs > latest.updatedAtMs ? record : latest;
+  }, undefined);
+  const nextCursor = latestLiveRecord?.slot;
+  if (nextCursor === currentCursor) return false;
+  store.setBotState({
+    lastSlot: nextCursor,
+    updatedAtMs: nowMs,
+    lastReconcileAction: "live-cursor-realignment",
+  });
+  return true;
 }
 
 export interface TelegramTopicTargetStoreOptions {
@@ -881,9 +916,6 @@ export function createTelegramTopicTargetStore(
 
   const rememberSlot = (slot: string | undefined, nowMs = getNowMs()) => {
     if (!slot || !/^[A-Z]$/.test(slot)) return;
-    const currentCode =
-      botState.lastSlot?.charCodeAt(0) ?? "A".charCodeAt(0) - 1;
-    if (slot.charCodeAt(0) < currentCode) return;
     botState = { ...botState, lastSlot: slot, updatedAtMs: nowMs };
   };
   const rememberIdentity = (record: TelegramTopicTargetRecord) => {
@@ -1151,6 +1183,7 @@ export function createTelegramTopicTargetStore(
     upsert(record) {
       const next = cloneRecord(record);
       const nextOwnerKey = getRecordOwnerKey(next);
+      const previousRecord = records.get(nextOwnerKey);
       if (isCurrentThreadRecord(next)) {
         for (const existing of Array.from(records.values())) {
           const existingOwnerKey = getRecordOwnerKey(existing);
@@ -1180,7 +1213,12 @@ export function createTelegramTopicTargetStore(
         return cloneRecord(next);
       }
       records.set(nextOwnerKey, next);
-      rememberSlot(next.slot, next.updatedAtMs);
+      if (
+        !previousRecord ||
+        !targetMatches(previousRecord.target, next.target)
+      ) {
+        rememberSlot(next.slot, next.updatedAtMs);
+      }
       rememberIdentity(next);
       loaded = true;
       dirty = true;

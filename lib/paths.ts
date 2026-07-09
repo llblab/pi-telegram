@@ -71,6 +71,17 @@ export function resolveTelegramProfileTempFilePath(
   );
 }
 
+export function getTelegramDiagnosticsDisplayPaths(profileName?: string): {
+  state: string;
+  logs: string;
+} {
+  const suffix = getTelegramProfilePathSuffix(profileName);
+  return {
+    state: `~/.pi/agent/tmp/telegram/state${suffix}.json`,
+    logs: `~/.pi/agent/tmp/telegram/logs${suffix}.jsonl`,
+  };
+}
+
 /** Runtime event log (<agentDir>/tmp/telegram/logs.jsonl). */
 export function resolveTelegramRuntimeLogPath(): string {
   return resolveTelegramProfileTempFilePath("logs", "jsonl");

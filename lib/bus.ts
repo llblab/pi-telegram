@@ -34,6 +34,40 @@ import { resolveAgentDir } from "./paths.ts";
 
 export type TelegramBusRole = "leader" | "follower";
 
+export interface TelegramBusProcessRuntime {
+  instanceId: string;
+  manualFollowerOwnerId: string;
+  getLeaderSocketPath: () => string;
+  getFollowerSocketPath: () => string;
+}
+
+export function createTelegramBusProcessRuntime(input: {
+  getActiveProfileName: () => string | undefined;
+  pid: number;
+  parentPid: number;
+  createdAtMs: number;
+}): TelegramBusProcessRuntime {
+  const instanceId = `${input.pid}:${input.createdAtMs}`;
+  const manualFollowerOwnerId = String(input.parentPid || input.pid);
+  return {
+    instanceId,
+    manualFollowerOwnerId,
+    getLeaderSocketPath: () =>
+      getTelegramBusSocketPath(
+        undefined,
+        undefined,
+        input.getActiveProfileName(),
+      ),
+    getFollowerSocketPath: () =>
+      getTelegramBusFollowerSocketPath(
+        instanceId,
+        undefined,
+        undefined,
+        input.getActiveProfileName(),
+      ),
+  };
+}
+
 export function createTelegramBusAuthSecret(): string {
   return randomBytes(32).toString("base64url");
 }
