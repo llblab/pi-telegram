@@ -16,7 +16,7 @@ Telegram bridge available. Do not use it from local/TUI prompts unless explicitl
 
 const TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX = `
 
-Telegram turn note: If context was compacted or you need the pi-telegram bridge contract, call tool \`telegram_help\`; hidden comments are valid only for explicit \`telegram_voice\` or \`telegram_button\` actions with payload.`;
+Telegram turn note: If context was compacted or you need the pi-telegram bridge contract, call tool \`telegram_help\`; hidden comments are valid only for explicit \`telegram_voice\` or \`telegram_button\` actions with payload. For voice use a top-level HTML action: \`<!-- telegram_voice: Speak this. -->\`, multiline \`<!-- telegram_voice lang=ru\nSpeak this.\n-->\`, or paired \`<!-- telegram_voice lang=ru -->\nSpeak this.\n<!-- /telegram_voice -->\`.`;
 
 function buildTelegramHelpText(profileName?: string): string {
   const diagnosticsPaths = getTelegramDiagnosticsDisplayPaths(profileName);
@@ -37,7 +37,8 @@ How to answer Telegram turns:
 Assistant-authored Telegram actions:
 - \`telegram_voice\` and \`telegram_button\` are hidden top-level HTML comments, not Pi tools.
 - Put action comments at column zero, outside code, quotes, lists, and indented examples.
-- Voice forms: \`<!-- telegram_voice text="Short summary" -->\` or \`<!-- telegram_voice: Short summary -->\`.
+- Voice forms: \`<!-- telegram_voice text="Short summary" -->\`, \`<!-- telegram_voice: Short summary -->\`, multiline \`<!-- telegram_voice lang=ru\nShort summary.\n-->\`, or paired \`<!-- telegram_voice lang=ru -->\nShort summary.\n<!-- /telegram_voice -->\`.
+- Keep the complete action at top level and include a non-empty voice payload.
 - Keep voice text TTS-friendly; avoid raw Markdown, code, and tables in voice text.
 - Voice delivery generates and attaches OGG automatically; do not also call \`telegram_attach\` for the same audio.
 - Button forms: \`<!-- telegram_button: OK -->\`, \`<!-- telegram_button label=Continue prompt="Continue with the current plan." -->\`, or multiline \`<!-- telegram_button label="Show risks"\nList the main risks first.\n-->\`.

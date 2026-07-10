@@ -64,6 +64,36 @@ function isTopLevelClosingFence(
   );
 }
 
+function collectPairedTelegramVoiceActionBody(
+  markdown: string,
+  bodyStart: number,
+  commentContent: string,
+): { content: string; end: number } | undefined {
+  const normalizedContent = commentContent.trim();
+  if (
+    !normalizedContent.startsWith("telegram_voice") ||
+    !isTelegramActionCommentContent(commentContent)
+  ) {
+    return undefined;
+  }
+  let offset = bodyStart;
+  while (offset < markdown.length) {
+    const lineEnd = getMarkdownLineEnd(markdown, offset);
+    const line = getMarkdownLineText(markdown, offset, lineEnd);
+    if (line === "<!-- /telegram_voice -->") {
+      const body = markdown.slice(bodyStart, offset).trim();
+      if (!body) return undefined;
+      return {
+        content: `${commentContent.trimEnd()}\n${body}`,
+        end: lineEnd,
+      };
+    }
+    if (line.startsWith("<!--")) return undefined;
+    offset = lineEnd;
+  }
+  return undefined;
+}
+
 function collectInlineClosedTelegramActionBody(
   markdown: string,
   bodyStart: number,
@@ -117,14 +147,19 @@ export function collectTopLevelHtmlComments(markdown: string): {
       const closesOnOpeningLine = closeIndex < lineEnd;
       const hasOnlyWhitespaceAfterClose =
         line.slice(closeColumn + 3).trim() === "";
-      const inlineBody =
+      const pairedVoiceBody =
         closesOnOpeningLine && hasOnlyWhitespaceAfterClose
+          ? collectPairedTelegramVoiceActionBody(markdown, lineEnd, content)
+          : undefined;
+      const inlineBody =
+        !pairedVoiceBody && closesOnOpeningLine && hasOnlyWhitespaceAfterClose
           ? collectInlineClosedTelegramActionBody(markdown, lineEnd, content)
           : undefined;
-      if (inlineBody) {
-        end = inlineBody.end;
+      const recoveredBody = pairedVoiceBody ?? inlineBody;
+      if (recoveredBody) {
+        end = recoveredBody.end;
         raw = markdown.slice(offset, end);
-        content = inlineBody.content;
+        content = recoveredBody.content;
       }
       comments.push({ raw, content, start: offset, end });
       offset = getMarkdownLineEnd(markdown, end);

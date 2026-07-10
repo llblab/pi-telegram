@@ -226,6 +226,28 @@ test("Voice reply planner extracts multiline telegram_voice comments", () => {
   });
 });
 
+test("Voice reply planner supports paired voice comments", () => {
+  const plan = planTelegramVoiceReply(
+    [
+      "Visible answer.",
+      "",
+      "<!-- telegram_voice lang=ru rate=+5% -->",
+      "Первая строка.",
+      "Вторая строка.",
+      "<!-- /telegram_voice -->",
+    ].join("\n"),
+  );
+  assert.deepEqual(plan, {
+    markdown: "Visible answer.",
+    voiceText: "Первая строка.\nВторая строка.",
+    voiceReplies: [
+      { text: "Первая строка.\nВторая строка.", lang: "ru", rate: "+5%" },
+    ],
+    lang: "ru",
+    rate: "+5%",
+  });
+});
+
 test("Voice reply planner supports compact inline comments", () => {
   const plan = planTelegramVoiceReply(
     "Text before.\n\n<!-- telegram_voice: Inline summary. -->",

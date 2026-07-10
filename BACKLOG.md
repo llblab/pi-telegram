@@ -2,38 +2,18 @@
 
 _This backlog tracks only open release-relevant work: live promoted-follower verification, evidence-gated Telegram client/runtime follow-ups, and upstream Pi API blockers. Completed validation evidence belongs in `CHANGELOG.md`, not in this queue._
 
-## P0 — Private Guest DM Peer Attribution
+## P1 — Guest Media Live Follow-Ups
 
-Evidence: live private Guest Mode produced `[telegram|guest:<owner>]` for an owner-authored DM turn even though `guest` must identify the remote conversation peer. Code inspection confirms that private guest routing falls back to `fromPeer` whenever an owner-authored message has no usable `reply_to_message`; because `from.id` then equals the configured `allowedUserId`, the owner is mislabeled as the guest. Existing coverage protects incoming guest messages and owner replies with explicit replied-guest metadata, but does not cover owner-authored private guest messages without reply context.
+Context: 0.20.5 shipped deterministic Guest Mode file/audio delivery coverage. Post-release private-DM smoke confirmed that one local document reaches the remote conversation through `answerGuestQuery`; remaining checks validate Telegram client behavior rather than gate the implemented transport.
 
-Planned work:
+Open work:
 
-- [ ] Capture or minimize the raw private `guest_message` shape for owner-authored turns without reply context and identify the stable remote-peer fields supplied by Telegram (`chat` identity, username/name/id, or another explicit peer field) before choosing a resolver.
-- [ ] Centralize Guest Mode peer attribution: group turns use the group title; private non-owner turns use the sender; private owner turns use the replied guest when present and otherwise the remote private-chat peer.
-- [ ] Compare ownership by Telegram user id (`allowedUserId`), not display name or username. Never emit the configured owner as `guest`; if Telegram omits a username, fall back to the remote peer's stable name/id rather than the owner.
-- [ ] Keep `[reply|from:...]` and `[attachments|from:...]` source attribution aligned with the same resolved peer without changing the current-turn/source-context distinction.
-- [ ] Add regressions for incoming private guests, owner replies, owner-authored no-reply turns, missing usernames, username changes, and named-profile pairing identities.
-- [ ] Update the prompt-context contract/docs only after the minimized Telegram fixture establishes the actual private Guest Mode field semantics.
+- [x] Confirm one local document in a private Guest Mode DM after extension reload.
+- [x] Confirm one synthesized paired-comment voice result in a private Guest Mode DM; Telegram delivered it to the correctly attributed remote peer without visible fallback text.
+- [ ] Confirm one local document and one synthesized voice/audio result in group Guest Mode.
+- [ ] Record a focused client/API caveat only if live behavior contradicts the one-result and staging contracts.
 
-Done when: `[telegram|guest:...]` always identifies the remote peer or group for private/group Guest Mode, never the paired owner, and reply/attachment provenance remains source-correct.
-
-## P0 — Guest Reply File And Audio Delivery
-
-Evidence: live Guest Mode accepted `telegram_attach` during an active guest turn and reported the file as queued, but delivered nothing. Code inspection confirms that guest turns use sentinel `chatId: 0`; the tool appends files to `queuedAttachments`, then the agent-end guest branch sends only `answerGuestQuery` text and returns before queued attachments or voice artifacts run. Telegram's `answerGuestQuery` accepts one `InlineQueryResult`, not ordinary `sendDocument`/`sendVoice` multipart delivery, so local artifacts require a guest-specific result plan rather than reuse of chat/thread attachment transport.
-
-Planned work:
-
-- [x] Fail closed immediately for unsupported guest attachments until guest delivery is available; never return `Queued` when the guest agent-end path cannot consume the artifact.
-- [x] Map the current Bot API `InlineQueryResult` capabilities for document, photo, audio, and voice replies, including URL versus cached `file_id`, caption limits, supported formats, and the one-result-per-guest-query constraint. `answerGuestQuery` accepts exactly one result; local multipart uploads are not accepted there. URL results require public HTTP content (documents only PDF/ZIP, audio MP3, voice OGG/OPUS, photos JPEG up to 5 MB), while cached result variants accept Telegram `document_file_id`, `photo_file_id`, `audio_file_id`, or `voice_file_id`; media captions remain limited to 0–1024 characters after entity parsing.
-- [x] Design one guest reply planner that chooses exactly one result: text article, one cached local file/media with answer text reduced to a caption, or one cached synthesized voice/audio result. Guest tool admission rejects a second attachment before mutation. A failure before the one-shot answer may degrade to one text article; an ambiguous/failing `answerGuestQuery` call must not issue a second answer that could duplicate delivery.
-- [x] Determine an evidence-backed local-file staging path. Local media must upload through the existing leader-owned multipart transport to the paired owner's bot chat, extract the returned Telegram `file_id`, answer the guest query with the matching cached result, and delete the staging message in `finally`. The staging message can briefly appear or notify the owner; this unavoidable Bot API limitation must be documented, no external hosting is introduced, and cleanup failure must be diagnosed rather than hidden.
-- [x] Extend `answerGuestQuery` and bus forwarding from hard-coded article input to the minimal typed result union required by confirmed file/audio/voice cases.
-- [x] Route `telegram_attach`, queued outbound artifacts, and `telegram_voice` through the guest planner before the guest branch returns; never call ordinary multipart methods with sentinel `chatId: 0`.
-- [x] Preserve follower operation by routing staging and `answerGuestQuery` through the transport leader without duplicate answers or leaked staging messages.
-- [x] Add regressions for unsupported fail-closed behavior, document/image/audio/voice result construction, caption fallback, staging cleanup/failure, multiple-file rejection, guest query one-shot semantics, and text fallback after media failure.
-- [ ] Capture live private and group Guest Mode evidence for one local document and one synthesized voice/audio reply before claiming support.
-
-Done when: guest turns never silently lose queued artifacts, one supported local file or audio/voice result can be delivered through `answerGuestQuery` with clear constraints, and unsupported/multi-file cases fail visibly without sending to an unrelated thread.
+Done when: private and group Guest Mode each have direct document and voice/audio delivery evidence, or a confirmed Telegram limitation is documented.
 
 ## P1 — Compaction Status Ownership And Native Activity
 

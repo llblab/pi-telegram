@@ -113,10 +113,8 @@ test("Prompt helpers add full Telegram-turn guidance for Telegram prompts", () =
   );
   assert.doesNotMatch(defaultSystemPrompt, /telegram_attach/);
   assert.doesNotMatch(defaultSystemPrompt, /telegram_message/);
-  assert.doesNotMatch(
-    defaultSystemPrompt,
-    /telegram_voice text="Short summary"/,
-  );
+  assert.match(defaultSystemPrompt, /telegram_voice: Speak this/);
+  assert.match(defaultSystemPrompt, /\/telegram_voice/);
   assert.doesNotMatch(defaultSystemPrompt, /telegram_button: OK/);
   assert.doesNotMatch(defaultSystemPrompt, /state\.json/);
   assert.doesNotMatch(defaultSystemPrompt, /logs\.jsonl/);

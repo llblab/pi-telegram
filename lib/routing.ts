@@ -21,10 +21,67 @@ import * as TextGroups from "./text-groups.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import * as Turns from "./turns.ts";
 
-function formatTelegramPromptPeer(user: { id?: unknown; username?: unknown } | undefined): string | undefined {
-  if (!user) return undefined;
-  if (typeof user.username === "string" && user.username.length > 0) return user.username;
-  return typeof user.id === "number" ? String(user.id) : undefined;
+interface TelegramPromptPeerView {
+  id?: unknown;
+  username?: unknown;
+  first_name?: unknown;
+  last_name?: unknown;
+  title?: unknown;
+}
+
+function formatTelegramPromptPeer(
+  peer: TelegramPromptPeerView | undefined,
+): string | undefined {
+  if (!peer) return undefined;
+  if (typeof peer.username === "string" && peer.username.length > 0) {
+    return peer.username;
+  }
+  const displayName = [peer.first_name, peer.last_name]
+    .filter(
+      (part): part is string =>
+        typeof part === "string" && part.length > 0,
+    )
+    .join(" ");
+  if (displayName) return displayName;
+  if (typeof peer.title === "string" && peer.title.length > 0) {
+    return peer.title;
+  }
+  return typeof peer.id === "number" ? String(peer.id) : undefined;
+}
+
+function isTelegramPromptOwnerPeer(
+  peer: TelegramPromptPeerView | undefined,
+  ownerUserId: number | undefined,
+): boolean {
+  return ownerUserId !== undefined && peer?.id === ownerUserId;
+}
+
+export function resolveTelegramGuestPromptPeer(input: {
+  chatType?: string;
+  chat?: TelegramPromptPeerView;
+  from?: TelegramPromptPeerView;
+  replyFrom?: TelegramPromptPeerView;
+  guestBotCallerUser?: TelegramPromptPeerView;
+  guestBotCallerChat?: TelegramPromptPeerView;
+  ownerUserId?: number;
+}): string | undefined {
+  if (input.chatType !== "private") {
+    return formatTelegramPromptPeer(input.chat);
+  }
+  if (!isTelegramPromptOwnerPeer(input.from, input.ownerUserId)) {
+    return formatTelegramPromptPeer(input.from);
+  }
+  for (const candidate of [
+    input.replyFrom,
+    input.chat,
+    input.guestBotCallerUser,
+    input.guestBotCallerChat,
+  ]) {
+    if (isTelegramPromptOwnerPeer(candidate, input.ownerUserId)) continue;
+    const peer = formatTelegramPromptPeer(candidate);
+    if (peer) return peer;
+  }
+  return undefined;
 }
 
 function appendTelegramSourceAttachmentSection(
@@ -1812,22 +1869,43 @@ export function createTelegramInboundRouteRuntime<
     const gm = guestMessage as unknown as Record<string, unknown>;
     // Build telegram prefix with guest context
     const chatRaw = gm.chat as Record<string, unknown>;
-    const chatTitle = chatRaw?.title as string | undefined;
     const chatType = chatRaw?.type as string;
     const fromRaw = gm.from as Record<string, unknown> | undefined;
     const replyMsg = gm.reply_to_message as Record<string, unknown> | undefined;
     const replyFromRaw = replyMsg?.from as Record<string, unknown> | undefined;
-    const fromPeer = formatTelegramPromptPeer(fromRaw);
+    const guestBotCallerUser = gm.guest_bot_caller_user as
+      | Record<string, unknown>
+      | undefined;
+    const guestBotCallerChat = gm.guest_bot_caller_chat as
+      | Record<string, unknown>
+      | undefined;
+    const ownerUserId = deps.configStore.getAllowedUserId();
     const replyPeer = formatTelegramPromptPeer(replyFromRaw);
-    const fromIsOwner = fromRaw?.id === deps.configStore.getAllowedUserId();
-    const guestPeer = chatType === "private" && fromIsOwner && replyPeer
-      ? replyPeer
-      : fromPeer;
+    const guestPeer = resolveTelegramGuestPromptPeer({
+      chatType,
+      chat: chatRaw,
+      from: fromRaw,
+      replyFrom: replyFromRaw,
+      guestBotCallerUser,
+      guestBotCallerChat,
+      ownerUserId,
+    });
     const prefixParts = ["telegram"];
-    if (chatType !== "private" && chatTitle) {
-      prefixParts.push(`guest:${chatTitle}`);
-    } else if (chatType === "private" && guestPeer) {
+    if (guestPeer) {
       prefixParts.push(`guest:${guestPeer}`);
+    } else if (chatType === "private") {
+      deps.recordRuntimeEvent?.(
+        "guest",
+        new Error("Private Guest Mode remote peer could not be resolved"),
+        {
+          phase: "peer-attribution",
+          chatId: typeof chatRaw?.id === "number" ? chatRaw.id : undefined,
+          fromId: typeof fromRaw?.id === "number" ? fromRaw.id : undefined,
+          hasReplyFrom: !!replyFromRaw,
+          hasCallerUser: !!guestBotCallerUser,
+          hasCallerChat: !!guestBotCallerChat,
+        },
+      );
     }
     const telegramPrefix = `[${prefixParts.join("|")}]`;
     // Extract reply context

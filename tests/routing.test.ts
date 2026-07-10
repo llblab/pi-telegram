@@ -1001,8 +1001,8 @@ test("Routing runtime labels private guest-mode prompts with dm metadata", async
     {
       guest_message: {
         guest_query_id: "guest-dm-1",
-        chat: { type: "private" },
-        from: { id: 7, is_bot: false, username: "guest" } as TestUser & {
+        chat: { id: 99, type: "private", username: "guest" } as never,
+        from: { id: 7, is_bot: false, username: "llblab" } as TestUser & {
           username: string;
         },
         text: "private guest question",
@@ -1017,6 +1017,84 @@ test("Routing runtime labels private guest-mode prompts with dm metadata", async
       ? queued.content[0].text
       : "",
     "[telegram|guest:guest] private guest question",
+  );
+});
+
+test("Routing runtime labels owner-authored private guest turns with the remote chat peer", async () => {
+  const { routeRuntime, telegramQueueStore } = createRouteHarness({});
+
+  await routeRuntime.handleUpdate(
+    {
+      guest_message: {
+        guest_query_id: "guest-dm-owner-1",
+        chat: {
+          id: 99,
+          type: "private",
+          username: "sister",
+          first_name: "Maria",
+        } as never,
+        from: { id: 7, is_bot: false, username: "llblab" } as TestUser & {
+          username: string;
+        },
+        text: "@k1awbot attach something",
+      },
+    },
+    { cwd: "/repo" },
+  );
+
+  const queued = telegramQueueStore.getQueuedItems()[0];
+  assert.equal(
+    queued?.kind === "prompt" && queued.content[0]?.type === "text"
+      ? queued.content[0].text
+      : "",
+    "[telegram|guest:sister] @k1awbot attach something",
+  );
+});
+
+test("Guest peer resolver never labels the paired owner and uses stable fallbacks", () => {
+  assert.equal(
+    Routing.resolveTelegramGuestPromptPeer({
+      chatType: "private",
+      from: { id: 99, username: "remote" },
+      ownerUserId: 7,
+    }),
+    "remote",
+  );
+  assert.equal(
+    Routing.resolveTelegramGuestPromptPeer({
+      chatType: "private",
+      chat: { id: 99, username: "renamedremote" },
+      from: { id: 840585, username: "profileowner" },
+      ownerUserId: 840585,
+    }),
+    "renamedremote",
+  );
+  assert.equal(
+    Routing.resolveTelegramGuestPromptPeer({
+      chatType: "private",
+      chat: { id: 99, first_name: "Maria", last_name: "Example" },
+      from: { id: 7, username: "llblab" },
+      ownerUserId: 7,
+    }),
+    "Maria Example",
+  );
+  assert.equal(
+    Routing.resolveTelegramGuestPromptPeer({
+      chatType: "private",
+      chat: { id: 99 },
+      from: { id: 7, username: "llblab" },
+      ownerUserId: 7,
+    }),
+    "99",
+  );
+  assert.equal(
+    Routing.resolveTelegramGuestPromptPeer({
+      chatType: "private",
+      chat: { id: 7, username: "llblab" },
+      from: { id: 7, username: "llblab" },
+      ownerUserId: 7,
+    }),
+    undefined,
   );
 });
 
