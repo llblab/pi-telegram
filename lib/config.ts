@@ -85,8 +85,8 @@ export interface TelegramBotProfile {
   lastUpdateId?: number;
 }
 
-/** Profile names must be lowercase letters, digits, hyphens, underscores; max 32 chars. */
-const TELEGRAM_PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+/** Profile names must contain only lowercase ASCII letters and digits; max 32 chars. */
+const TELEGRAM_PROFILE_NAME_PATTERN = /^[a-z0-9]{1,32}$/;
 const TELEGRAM_RESERVED_PROFILE_NAMES: ReadonlySet<string> = new Set([
   "default",
   "main",

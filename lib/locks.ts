@@ -203,6 +203,17 @@ export function formatTelegramLockEntry(lock: TelegramLockEntry): string {
   return lock.cwd ? `pid ${lock.pid}, cwd ${lock.cwd}` : `pid ${lock.pid}`;
 }
 
+function formatTelegramFollowerRegistrationFailure(message: string): string {
+  if (/\b(?:ENOENT|ECONNREFUSED|ETIMEDOUT)\b/u.test(message)) {
+    return (
+      `live owner / unreachable bus endpoint after bounded retries (${message}); ` +
+      "wait briefly for owner recovery, then retry /telegram-connect. " +
+      "Do not force takeover while the owner remains live"
+    );
+  }
+  return message;
+}
+
 function getLockState(
   lock: TelegramLockEntry | undefined,
   pid: number,
@@ -509,7 +520,7 @@ export function createTelegramLockedPollingRuntime<
               ok: false,
               canTakeover: false,
               owner,
-              message: `Telegram bridge is active in another Pi instance (${owner}); follower registration failed: ${failureMessage}.`,
+              message: `Telegram bridge is active in another Pi instance (${owner}); follower registration failed: ${formatTelegramFollowerRegistrationFailure(failureMessage)}.`,
             };
           }
         }

@@ -11,6 +11,7 @@ import test from "node:test";
 
 import {
   createTelegramQueuedOutboundAttachmentSender,
+  deliverTelegramGuestCachedAttachment,
   getTelegramOutboundAttachmentByteLimitFromEnv,
   queueTelegramOutboundAttachments,
   registerTelegramOutboundAttachmentTool,
@@ -379,6 +380,205 @@ test("Outbound attachment queueing adds files to the active Telegram turn", asyn
   ]);
   assert.deepEqual(result.details.paths, ["/tmp/demo.txt"]);
   assert.equal(result.content[0]?.text, "\nQueued 1 Telegram attachment(s).");
+});
+
+test("Outbound attachment queueing admits exactly one Guest Mode file", async () => {
+  const activeTurn = {
+    ...createAttachmentQueueTarget(),
+    guestQueryId: "guest-query",
+  };
+  await queueTelegramOutboundAttachments({
+    activeTurn,
+    paths: ["/tmp/demo.txt"],
+    maxAttachmentsPerTurn: 2,
+    statPath: async () => ({ isFile: () => true }),
+  });
+  assert.deepEqual(activeTurn.queuedAttachments, [
+    { path: "/tmp/demo.txt", fileName: "demo.txt" },
+  ]);
+
+  let statCalled = false;
+  await assert.rejects(
+    () =>
+      queueTelegramOutboundAttachments({
+        activeTurn,
+        paths: ["/tmp/second.txt"],
+        maxAttachmentsPerTurn: 2,
+        statPath: async () => {
+          statCalled = true;
+          return { isFile: () => true };
+        },
+      }),
+    {
+      message:
+        "Telegram Guest Mode supports one attachment per reply; no attachment was queued",
+    },
+  );
+  assert.equal(statCalled, false);
+  assert.equal(activeTurn.queuedAttachments.length, 1);
+});
+
+test("Guest attachment staging builds cached media results and always deletes staging messages", async () => {
+  const cases = [
+    {
+      path: "/tmp/report.txt",
+      response: { message_id: 11, document: { file_id: "doc-id" } },
+      expectedMethod: "sendDocument",
+      expectedResult: {
+        type: "document",
+        id: "attachment-1",
+        title: "report.txt",
+        document_file_id: "doc-id",
+        caption: "caption",
+      },
+    },
+    {
+      path: "/tmp/photo.jpg",
+      response: {
+        message_id: 12,
+        photo: [
+          { file_id: "small", file_size: 10 },
+          { file_id: "large", file_size: 20 },
+        ],
+      },
+      expectedMethod: "sendPhoto",
+      expectedResult: {
+        type: "photo",
+        id: "attachment-1",
+        photo_file_id: "large",
+        caption: "caption",
+      },
+    },
+    {
+      path: "/tmp/audio.mp3",
+      response: { message_id: 13, audio: { file_id: "audio-id" } },
+      expectedMethod: "sendAudio",
+      expectedResult: {
+        type: "audio",
+        id: "attachment-1",
+        audio_file_id: "audio-id",
+        caption: "caption",
+      },
+    },
+    {
+      path: "/tmp/voice.ogg",
+      response: { message_id: 14, voice: { file_id: "voice-id" } },
+      expectedMethod: "sendVoice",
+      expectedResult: {
+        type: "voice",
+        id: "attachment-1",
+        voice_file_id: "voice-id",
+        title: "voice.ogg",
+        caption: "caption",
+      },
+    },
+  ] as const;
+
+  for (const item of cases) {
+    const events: unknown[] = [];
+    await deliverTelegramGuestCachedAttachment({
+      guestQueryId: "guest-1",
+      stagingChatId: 42,
+      attachment: { path: item.path, fileName: item.path.split("/").at(-1)! },
+      caption: "caption",
+      sendMultipart: async (method, fields, fileField) => {
+        events.push(["upload", method, fields, fileField]);
+        return item.response;
+      },
+      answerGuestQuery: async (guestQueryId, result) => {
+        events.push(["answer", guestQueryId, result]);
+      },
+      deleteMessage: async (chatId, messageId) => {
+        events.push(["delete", chatId, messageId]);
+      },
+    });
+    assert.deepEqual(events, [
+      [
+        "upload",
+        item.expectedMethod,
+        { chat_id: "42" },
+        item.expectedMethod.replace("send", "").toLowerCase(),
+      ],
+      ["answer", "guest-1", item.expectedResult],
+      ["delete", 42, item.response.message_id],
+    ]);
+  }
+});
+
+test("Guest attachment staging cleans up extraction and answer failures", async () => {
+  for (const phase of ["extract", "answer"] as const) {
+    const events: string[] = [];
+    await assert.rejects(
+      () =>
+        deliverTelegramGuestCachedAttachment({
+          guestQueryId: "guest-1",
+          stagingChatId: 42,
+          attachment: { path: "/tmp/report.txt", fileName: "report.txt" },
+          sendMultipart: async () => ({
+            message_id: 20,
+            ...(phase === "answer" ? { document: { file_id: "doc-id" } } : {}),
+          }),
+          answerGuestQuery: async () => {
+            events.push("answer");
+            throw new Error("answer failed");
+          },
+          deleteMessage: async () => {
+            events.push("delete");
+          },
+        }),
+      phase === "extract" ? /no document file_id/ : /answer failed/,
+    );
+    assert.deepEqual(events, phase === "extract" ? ["delete"] : ["answer", "delete"]);
+  }
+});
+
+test("Guest attachment staging falls back to one text answer before media answer", async () => {
+  const events: string[] = [];
+  await deliverTelegramGuestCachedAttachment({
+    guestQueryId: "guest-1",
+    stagingChatId: 42,
+    attachment: { path: "/tmp/report.txt", fileName: "report.txt" },
+    fallbackText: "fallback",
+    sendMultipart: async () => ({ message_id: 20 }),
+    answerGuestQuery: async () => {
+      events.push("unexpected:media");
+    },
+    answerGuestText: async (guestQueryId, text) => {
+      events.push(`text:${guestQueryId}:${text}`);
+    },
+    deleteMessage: async () => {
+      events.push("delete");
+    },
+  });
+  assert.deepEqual(events, ["text:guest-1:fallback", "delete"]);
+});
+
+test("Guest attachment staging records cleanup failure without retrying the answer", async () => {
+  const events: string[] = [];
+  await deliverTelegramGuestCachedAttachment({
+    guestQueryId: "guest-1",
+    stagingChatId: 42,
+    attachment: { path: "/tmp/report.txt", fileName: "report.txt" },
+    sendMultipart: async () => ({
+      message_id: 20,
+      document: { file_id: "doc-id" },
+    }),
+    answerGuestQuery: async () => {
+      events.push("answer");
+    },
+    deleteMessage: async () => {
+      events.push("delete");
+      throw new Error("cleanup failed");
+    },
+    recordRuntimeEvent: (category, error, details) => {
+      events.push(`${category}:${(error as Error).message}:${details?.phase}`);
+    },
+  });
+  assert.deepEqual(events, [
+    "answer",
+    "delete",
+    "attachment:cleanup failed:guest-staging-cleanup",
+  ]);
 });
 
 test("Outbound attachment queueing uses the domain stat fallback", async () => {

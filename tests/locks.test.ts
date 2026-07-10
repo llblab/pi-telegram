@@ -454,6 +454,43 @@ test("Locked polling runtime records follower registration failures without bloc
   }
 });
 
+test("Locked polling runtime diagnoses a live owner with unreachable bus endpoint", async () => {
+  const temp = createTempLockPath();
+  try {
+    writeFileSync(
+      temp.path,
+      JSON.stringify({ [TELEGRAM_LOCK_KEY]: { pid: 99, cwd: "/old" } }),
+    );
+    const lock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      isProcessAlive: (pid) => pid === 99,
+    });
+    const runtime = createTelegramLockedPollingRuntime({
+      lock,
+      hasBotToken: () => true,
+      registerFollowerWithOwner: async () => {
+        throw new Error("connect ENOENT /agent/tmp/telegram/bus.sock");
+      },
+      startPolling: async () => undefined,
+      stopPolling: async () => undefined,
+      updateStatus: () => undefined,
+    });
+
+    const blocked = await runtime.start({ cwd: "/repo" });
+    assert.equal(blocked.ok, false);
+    assert.equal(blocked.canTakeover, false);
+    assert.match(
+      blocked.message,
+      /live owner \/ unreachable bus endpoint after bounded retries/,
+    );
+    assert.match(blocked.message, /retry \/telegram-connect/);
+    assert.match(blocked.message, /Do not force takeover/);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
 test("Locked polling runtime stops follower heartbeat on stop", async () => {
   const temp = createTempLockPath();
   try {

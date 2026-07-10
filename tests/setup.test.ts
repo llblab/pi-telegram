@@ -4,14 +4,19 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
+import { createTelegramConfigStore } from "../lib/config.ts";
 import {
   TELEGRAM_BOT_TOKEN_INPUT_PLACEHOLDER,
   createTelegramSetupPromptRuntime,
   getTelegramBotTokenInputDefault,
   getTelegramBotTokenPromptSpec,
   runTelegramSetup,
+  type TelegramSetupConfig,
 } from "../lib/setup.ts";
 
 test("Setup token defaults prefer config, then env aliases, then placeholder", () => {
@@ -187,14 +192,160 @@ test("Setup prompt runtime stores config before starting polling", async () => {
   });
 
   assert.deepEqual(calls, [
-    "persist:token",
     "set:token",
+    "persist:token",
     "notify:Telegram bot connected: @demo_bot",
     "notify:Send /start to your bot in Telegram to pair this extension with your account.",
     "start:token",
     "status",
     "finish",
   ]);
+});
+
+test("Setup prompt runtime rolls memory back when persistence fails", async () => {
+  const calls: string[] = [];
+  let config: TelegramSetupConfig = { botToken: "previous" };
+  const runtime = createTelegramSetupPromptRuntime({
+    env: {},
+    getConfig: () => config,
+    setConfig: (next) => {
+      config = { ...next };
+      calls.push(`set:${next.botToken}`);
+    },
+    setupGuard: {
+      start: () => true,
+      finish: () => calls.push("finish"),
+    },
+    getMe: async () => ({ ok: true, result: { id: 7, username: "demo_bot" } }),
+    persistConfig: async () => {
+      calls.push("persist");
+      throw new Error("disk full");
+    },
+    startPolling: () => calls.push("unexpected:start"),
+    updateStatus: () => calls.push("unexpected:status"),
+    recordRuntimeEvent: () => calls.push("record"),
+  });
+
+  await assert.rejects(
+    runtime({
+      hasUI: true,
+      ui: {
+        input: async () => "token",
+        editor: async () => "token",
+        notify: () => calls.push("unexpected:notify"),
+      },
+    }),
+    /disk full/,
+  );
+  assert.deepEqual(config, { botToken: "previous" });
+  assert.deepEqual(calls, [
+    "set:token",
+    "persist",
+    "set:previous",
+    "record",
+    "finish",
+  ]);
+});
+
+test("Setup prompt runtime persists the first validated config to missing or empty files", async () => {
+  for (const initialFile of [undefined, "{}\n"]) {
+    const dir = await mkdtemp(join(tmpdir(), "pi-telegram-setup-first-run-"));
+    const configPath = join(dir, "telegram.json");
+    try {
+      if (initialFile !== undefined) await writeFile(configPath, initialFile);
+      const store = createTelegramConfigStore({ agentDir: dir, configPath });
+      await store.load();
+      const runtime = createTelegramSetupPromptRuntime({
+        env: { TELEGRAM_BOT_TOKEN: "env-token" },
+        getConfig: store.get,
+        setConfig: store.set,
+        setupGuard: { start: () => true, finish: () => {} },
+        getMe: async () => ({
+          ok: true,
+          result: { id: 77, username: "first_run_bot" },
+        }),
+        persistConfig: async () => store.persist(),
+        startPolling: () => ({ ok: true }),
+        updateStatus: () => {},
+      });
+
+      const result = await runtime({
+        hasUI: true,
+        ui: {
+          input: async () => "env-token",
+          editor: async () => "env-token",
+          notify: () => {},
+        },
+      });
+
+      assert.equal(result.status, "success");
+      assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), {
+        botToken: "env-token",
+        botUsername: "first_run_bot",
+        botId: 77,
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Setup prompt runtime persists a first named profile without changing siblings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-setup-profile-"));
+  const configPath = join(dir, "telegram.json");
+  try {
+    const store = createTelegramConfigStore({
+      agentDir: dir,
+      configPath,
+      initialConfig: {
+        botToken: "default-token",
+        botId: 1,
+        profiles: {
+          existing: { botToken: "existing-token", botId: 2 },
+          fresh: { botToken: "" },
+        },
+      },
+    });
+    assert.equal(store.activateProfile("fresh"), true);
+    const runtime = createTelegramSetupPromptRuntime({
+      env: { TELEGRAM_BOT_TOKEN: "fresh-token" },
+      getConfig: store.get,
+      setConfig: store.set,
+      setupGuard: { start: () => true, finish: () => {} },
+      getMe: async () => ({
+        ok: true,
+        result: { id: 3, username: "fresh_bot" },
+      }),
+      persistConfig: async () => store.persist(),
+      startPolling: () => ({ ok: true }),
+      updateStatus: () => {},
+    });
+
+    const result = await runtime({
+      hasUI: true,
+      ui: {
+        input: async () => "fresh-token",
+        editor: async () => "fresh-token",
+        notify: () => {},
+      },
+    });
+
+    assert.equal(result.status, "success");
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), {
+      botToken: "default-token",
+      botId: 1,
+      profiles: {
+        existing: { botToken: "existing-token", botId: 2 },
+        fresh: {
+          botToken: "fresh-token",
+          botUsername: "fresh_bot",
+          botId: 3,
+        },
+      },
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("Setup prompt runtime reports token check errors and always finishes", async () => {

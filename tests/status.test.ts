@@ -170,7 +170,19 @@ test("Status bar text renders bridge connection and queue states", () => {
       processing: false,
       queuedStatus: "",
     }),
-    "<accent>telegram</accent> <warning>compacting</warning>",
+    "<accent>telegram</accent> <success>connected</success>",
+  );
+  assert.equal(
+    buildTelegramStatusBarText(theme, {
+      hasBotToken: true,
+      pollingActive: true,
+      paired: true,
+      compactionInProgress: true,
+      processing: true,
+      processingStatus: "active",
+      queuedStatus: "",
+    }),
+    "<accent>telegram</accent> <warning>active</warning>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -616,7 +628,9 @@ test("Bridge status lines render named-profile diagnostic paths", () => {
   assert.ok(
     lines.includes("- state: ~/.pi/agent/tmp/telegram/state.work.json"),
   );
-  assert.ok(lines.includes("- logs: ~/.pi/agent/tmp/telegram/logs.work.jsonl"));
+  assert.ok(
+    lines.includes("- logs: ~/.pi/agent/tmp/telegram/logs.work.jsonl"),
+  );
 });
 
 test("Bridge status lines distinguish unknown bot identity from missing config", () => {
@@ -1002,7 +1016,7 @@ test("Status HTML builder includes companion status lines", () => {
   }
 });
 
-test("Status HTML builder shows compacting while compact is running", () => {
+test("Status HTML builder leaves compaction lifecycle to Pi", () => {
   const buildStatusHtml = createTelegramStatusHtmlBuilder({
     getActiveModel: () => undefined,
     isCompactionInProgress: () => true,
@@ -1013,7 +1027,8 @@ test("Status HTML builder shows compacting while compact is running", () => {
     isIdle: () => true,
     modelRegistry: { isUsingOAuth: () => false },
   });
-  assert.match(html, /Status.*compacting/s);
+  assert.match(html, /Status.*idle/s);
+  assert.doesNotMatch(html, /compacting/);
 });
 
 test("Runtime event lines render the recent-event ring newest first", () => {

@@ -21,6 +21,7 @@ import {
   createTelegramVoiceReplyModeGetter,
   createTelegramVoiceReplyModeSetter,
   getTelegramAuthorizationState,
+  isValidTelegramProfileName,
   pairTelegramUserIfNeeded,
   readTelegramConfig,
   setGlobalTelegramConfigRuntime,
@@ -34,6 +35,25 @@ import {
   getTelegramBotTokenPromptSpec,
   runTelegramSetup,
 } from "../lib/setup.ts";
+
+test("Telegram profile names allow only lowercase letters and digits", () => {
+  assert.equal(isValidTelegramProfileName("work2"), true);
+  assert.equal(isValidTelegramProfileName("previous"), true);
+  assert.equal(isValidTelegramProfileName("prev"), true);
+  for (const name of [
+    "default",
+    "main",
+    "active",
+    "Work",
+    "work-one",
+    "work_one",
+    "work.one",
+    "work one",
+    "",
+  ]) {
+    assert.equal(isValidTelegramProfileName(name), false, name);
+  }
+});
 
 test("Telegram config helper returns empty config when file is absent", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-missing-config-"));
@@ -752,8 +772,8 @@ test("Setup prompt runtime guards concurrent setup and stores successful config"
     "start",
     "editor:env-token",
     "getMe:new-token",
-    "persist:new-token",
     "set:demo_bot",
+    "persist:new-token",
     "notify:info:Telegram bot connected: @demo_bot",
     "notify:info:Send /start to your bot in Telegram to pair this extension with your account.",
     "poll",

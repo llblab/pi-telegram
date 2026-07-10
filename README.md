@@ -151,6 +151,8 @@ Run these inside Pi.
 | `/telegram-disconnect` | Stop polling and release ownership |
 | `/telegram-status` | Inspect connection, mode, queue, transport, and recent diagnostics |
 
+Named profile identifiers contain only lowercase ASCII letters and digits (maximum 32 characters); `default`, `main`, and `active` remain reserved.
+
 ## Main Surfaces
 
 ### Operator Menu

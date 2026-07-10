@@ -192,7 +192,7 @@ Manual smoke checklist:
 6. Close the follower terminal; verify heartbeat pruning, disconnected notice, and cleanup behavior match Unix-like behavior.
 7. Reload the leader and verify status/debug output does not expose raw pipe internals except in explicit diagnostics.
 
-If any step fails, capture `telegram-status --debug`, `tmp/telegram/state.json`, `tmp/telegram/logs.jsonl`, and, after a reload, `tmp/telegram/logs.previous.jsonl`. Debug status prints local leader/follower endpoints with their active transport kind (`pipe` or `socket`), while the runtime log records request-scoped transport failures with envelope kind, request id, retry attempt, endpoint, and classified IPC error. Reloads preserve the prior JSONL log as `logs.previous.jsonl` so the evidence that caused the reload is not immediately overwritten.
+If any step fails, capture `telegram-status --debug`, `tmp/telegram/state.json`, `tmp/telegram/logs.jsonl`, and, after a reload, `tmp/telegram/logs._prev.jsonl`. Debug status prints local leader/follower endpoints with their active transport kind (`pipe` or `socket`), while the runtime log records request-scoped transport failures with envelope kind, request id, retry attempt, endpoint, and classified IPC error. Reloads preserve the prior JSONL log as `logs._prev.jsonl` so the evidence that caused the reload is not immediately overwritten.
 
 ### Native Windows Assumption Audit
 

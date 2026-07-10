@@ -1199,6 +1199,13 @@ export function createTelegramBusLeaderRuntime<TContext>(
     followerRealityTimer.unref?.();
   };
   const pruneFollowers = async () => {
+    try {
+      await localServer.ensureEndpoint();
+    } catch (error) {
+      deps.recordRuntimeEvent?.("bus", error, {
+        phase: "leader-endpoint-recovery",
+      });
+    }
     const removed = deps.followerRegistry.pruneStale(
       getNowMs(),
       followerStaleAfterMs,

@@ -65,7 +65,7 @@ export function getTelegramPreviousRuntimeLogPath(
 ): string {
   return resolveTelegramProfileTempFilePath(
     "logs",
-    "previous.jsonl",
+    "_prev.jsonl",
     agentDir,
     profileName,
   );
@@ -91,7 +91,7 @@ export function createTelegramRuntimeJsonlLog(
   const resolvePreviousPath = () => {
     if (typeof options.previousPath === "function") return options.previousPath();
     if (options.previousPath) return options.previousPath;
-    return resolvePath().replace(/\.jsonl$/u, ".previous.jsonl");
+    return resolvePath().replace(/\.jsonl$/u, "._prev.jsonl");
   };
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_LOG_BYTES;
   const getNowMs = options.getNowMs ?? Date.now;

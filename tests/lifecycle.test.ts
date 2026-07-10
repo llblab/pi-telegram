@@ -13,6 +13,10 @@ import {
   registerTelegramLifecycleHooks,
 } from "../lib/lifecycle.ts";
 import type { ExtensionAPI, ExtensionContext } from "../lib/pi.ts";
+import {
+  createTelegramBridgeRuntime,
+  createTelegramTypingLoopStarter,
+} from "../lib/runtime.ts";
 
 type RegisteredLifecycleHandler = (
   event: unknown,
@@ -123,7 +127,7 @@ test("Compaction observer mirrors active work with native typing", () => {
   ]);
 });
 
-test("Compaction observer can suppress native typing for non-turn compaction", () => {
+test("Compaction observer keeps native typing for non-turn compaction", () => {
   const events: string[] = [];
   let timerCallback: (() => void) | undefined;
   const observer = createTelegramCompactionObserverRuntime({
@@ -139,7 +143,6 @@ test("Compaction observer can suppress native typing for non-turn compaction", (
     stopTypingLoop() {
       events.push("typing:stop");
     },
-    shouldStartTypingLoop: () => false,
     requestDeferredDispatchNextQueuedTelegramTurn(dispatch) {
       events.push("dispatch:request");
       dispatch(createLifecycleContext());
@@ -162,18 +165,56 @@ test("Compaction observer can suppress native typing for non-turn compaction", (
   observer.onSessionShutdown();
   assert.deepEqual(events, [
     "compact:true",
+    "typing:start",
     "status",
     "compact:false",
+    "typing:stop",
     "status",
     "dispatch:request",
     "dispatch",
     "compact:true",
+    "typing:start",
     "status",
     "compact:false",
+    "typing:stop",
     "status",
     "dispatch:request",
     "dispatch",
   ]);
+});
+
+test("Compaction observer sends native typing to the resolved thread and All", async () => {
+  const runtime = createTelegramBridgeRuntime();
+  const actions: Array<string> = [];
+  const startTyping = createTelegramTypingLoopStarter({
+    typing: runtime.typing,
+    getDefaultChatId: () => 77,
+    sendTypingAction: async (chatId, options) => {
+      actions.push(`thread:${chatId}:${options?.message_thread_id ?? "all"}`);
+    },
+    sendAggregateTypingAction: async (chatId) => {
+      actions.push(`aggregate:${chatId}`);
+    },
+    updateStatus: () => {},
+    intervalMs: 60_000,
+  });
+  const observer = createTelegramCompactionObserverRuntime({
+    setCompactionInProgress: runtime.lifecycle.setCompactionInProgress,
+    updateStatus: () => {},
+    startTypingLoop: (ctx) =>
+      startTyping(ctx, 77, { target: { chatId: 77, threadId: 12 } }),
+    stopTypingLoop: runtime.typing.stop,
+    requestDeferredDispatchNextQueuedTelegramTurn: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+  });
+
+  observer.onSessionBeforeCompact({} as never, createLifecycleContext());
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  observer.onSessionCompact({} as never, createLifecycleContext());
+  await runtime.typing.waitForIdle();
+
+  assert.deepEqual(actions, ["thread:77:12", "aggregate:77"]);
+  assert.equal(runtime.lifecycle.isCompactionInProgress(), false);
 });
 
 test("Compaction observer unrefs fallback timers when supported", () => {

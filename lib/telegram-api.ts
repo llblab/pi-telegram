@@ -287,6 +287,44 @@ export interface TelegramFileDownloadOptions {
   maxFileSizeBytes?: number;
 }
 
+export type TelegramGuestCachedMediaResult =
+  | {
+      type: "document";
+      id: string;
+      title: string;
+      document_file_id: string;
+      caption?: string;
+      parse_mode?: string;
+    }
+  | {
+      type: "photo";
+      id: string;
+      photo_file_id: string;
+      caption?: string;
+      parse_mode?: string;
+    }
+  | {
+      type: "audio";
+      id: string;
+      audio_file_id: string;
+      caption?: string;
+      parse_mode?: string;
+    }
+  | {
+      type: "voice";
+      id: string;
+      voice_file_id: string;
+      title: string;
+      caption?: string;
+      parse_mode?: string;
+    };
+
+export interface TelegramAnswerGuestQueryOptions {
+  parseMode?: string;
+  richMessage?: TelegramInputRichMessage;
+  result?: TelegramGuestCachedMediaResult;
+}
+
 export interface TelegramAnswerCallbackQueryOptions {
   recordRuntimeEvent?: (
     kind: "api",
@@ -322,7 +360,7 @@ export interface TelegramApiClient {
   answerGuestQuery?: (
     guestQueryId: string,
     text?: string,
-    options?: { parseMode?: string; richMessage?: TelegramInputRichMessage },
+    options?: TelegramAnswerGuestQueryOptions,
   ) => Promise<void>;
 }
 
@@ -401,7 +439,7 @@ export interface TelegramBridgeApiRuntime {
   answerGuestQuery: (
     guestQueryId: string,
     text?: string,
-    options?: { parseMode?: string; richMessage?: TelegramInputRichMessage },
+    options?: TelegramAnswerGuestQueryOptions,
   ) => Promise<void>;
   deleteMessage: (chatId: number, messageId: number) => Promise<void>;
   prepareTempDir: () => Promise<number>;
@@ -1312,12 +1350,12 @@ export function createTelegramBridgeApiRuntime(
     answerGuestQuery: (
       guestQueryId: string,
       text: string | undefined,
-      options:
-        | { parseMode?: string; richMessage?: TelegramInputRichMessage }
-        | undefined,
+      options: TelegramAnswerGuestQueryOptions | undefined,
     ) => {
       const body: Record<string, unknown> = { guest_query_id: guestQueryId };
-      if (text !== undefined || options?.richMessage) {
+      if (options?.result) {
+        body.result = options.result;
+      } else if (text !== undefined || options?.richMessage) {
         const inputContent: Record<string, unknown> = options?.richMessage
           ? { rich_message: options.richMessage }
           : { message_text: text };

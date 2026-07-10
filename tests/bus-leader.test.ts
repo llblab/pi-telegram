@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1286,6 +1286,7 @@ test("Bus leader runtime starts the local server around polling", async () => {
   const runtime = createTelegramBusLeaderRuntime({
     socketPath,
     followerRegistry: registry,
+    followerPruneIntervalMs: 10,
     startPolling: () => {
       events.push("poll:start");
     },
@@ -1309,6 +1310,9 @@ test("Bus leader runtime starts the local server around polling", async () => {
       "bus.ack",
     );
     assert.equal(registry.get("inst-a")?.instanceId, "inst-a");
+    unlinkSync(socketPath);
+    await waitForCondition(() => existsSync(socketPath));
+    assert.deepEqual(events, ["poll:start"]);
     await runtime.stopPolling();
     assert.deepEqual(events, ["poll:start", "poll:stop"]);
     await assert.rejects(
