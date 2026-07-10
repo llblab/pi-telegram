@@ -909,6 +909,15 @@ test("Telegram bridge API runtime exposes typed Bot API helpers", async () => {
   await runtime.answerGuestQuery("guest-rich", undefined, {
     richMessage: { markdown: "**hello**", skip_entity_detection: true },
   });
+  await runtime.answerGuestQuery("guest-voice", undefined, {
+    result: {
+      type: "voice",
+      id: "voice-1",
+      voice_file_id: "cached-voice",
+      title: "Response",
+      caption: "hello",
+    },
+  });
   await runtime.answerGuestQuery("guest-2");
   assert.equal(await runtime.sendMessageDraft(1, 2, "draft"), true);
   assert.equal(await runtime.sendMessageDraft(1, 2, ""), true);
@@ -973,6 +982,19 @@ test("Telegram bridge API runtime exposes typed Bot API helpers", async () => {
               skip_entity_detection: true,
             },
           },
+        },
+      },
+    },
+    {
+      method: "answerGuestQuery",
+      body: {
+        guest_query_id: "guest-voice",
+        result: {
+          type: "voice",
+          id: "voice-1",
+          voice_file_id: "cached-voice",
+          title: "Response",
+          caption: "hello",
         },
       },
     },

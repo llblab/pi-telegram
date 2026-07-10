@@ -197,8 +197,14 @@ export function createTelegramSetupPromptRuntime<
         promptEditor: (label, value) => ctx.ui.editor(label, value),
         getMe: deps.getMe,
         persistConfig: async (config) => {
-          await deps.persistConfig(config);
+          const previousConfig = deps.getConfig();
           deps.setConfig(config);
+          try {
+            await deps.persistConfig(config);
+          } catch (error) {
+            deps.setConfig(previousConfig);
+            throw error;
+          }
         },
         notify: (message, level) => ctx.ui.notify(message, level),
         startPolling: () => deps.startPolling(ctx),

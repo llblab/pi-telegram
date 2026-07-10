@@ -899,6 +899,16 @@ export interface TelegramAgentEndRuntimeDeps<
     options?: { parseMode?: string },
   ) => Promise<void>;
   sendGuestReply?: (guestQueryId: string, markdown: string) => Promise<void>;
+  sendGuestAttachment?: (
+    turn: TTurn,
+    attachment: QueuedAttachment,
+    caption?: string,
+  ) => Promise<void>;
+  sendGuestVoiceReply?: (
+    turn: TTurn,
+    plan: TelegramAgentEndOutboundReplyPlan<TReplyMarkup>,
+    caption?: string,
+  ) => Promise<void>;
   planOutboundReply?: (
     markdown: string,
   ) => TelegramAgentEndOutboundReplyPlan<TReplyMarkup>;
@@ -958,6 +968,8 @@ export interface TelegramAgentEndHookRuntimeDeps<
   sendQueuedAttachments: (turn: TTurn) => Promise<void>;
   answerGuestQuery?: TelegramAgentEndRuntimeDeps<TTurn>["answerGuestQuery"];
   sendGuestReply?: TelegramAgentEndRuntimeDeps<TTurn>["sendGuestReply"];
+  sendGuestAttachment?: TelegramAgentEndRuntimeDeps<TTurn>["sendGuestAttachment"];
+  sendGuestVoiceReply?: TelegramAgentEndRuntimeDeps<TTurn>["sendGuestVoiceReply"];
   planOutboundReply?: TelegramAgentEndRuntimeDeps<
     TTurn,
     TReplyMarkup
@@ -1083,6 +1095,8 @@ export function createTelegramAgentEndHook<
       sendQueuedAttachments: deps.sendQueuedAttachments,
       answerGuestQuery: deps.answerGuestQuery,
       sendGuestReply: deps.sendGuestReply,
+      sendGuestAttachment: deps.sendGuestAttachment,
+      sendGuestVoiceReply: deps.sendGuestVoiceReply,
       planOutboundReply: deps.planOutboundReply,
       sendOutboundReplyArtifacts: deps.sendOutboundReplyArtifacts,
       getDefaultChatId: deps.getDefaultChatId,
@@ -1181,7 +1195,38 @@ export async function handleTelegramAgentEndRuntime<
       if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
       return;
     }
-    if (finalText) {
+    const [guestAttachment] = turn.queuedAttachments;
+    if (guestAttachment && deps.sendGuestAttachment) {
+      try {
+        await deps.sendGuestAttachment(
+          turn,
+          guestAttachment,
+          finalText || undefined,
+        );
+      } catch (error) {
+        deps.recordRuntimeEvent?.("delivery", error, {
+          phase: "guest-attachment",
+          guestQueryId: turn.guestQueryId,
+        });
+      }
+    } else if (
+      outboundReply &&
+      (outboundReply.voiceText || outboundReply.voiceReplies?.length) &&
+      deps.sendGuestVoiceReply
+    ) {
+      try {
+        await deps.sendGuestVoiceReply(
+          turn,
+          outboundReply,
+          finalText || undefined,
+        );
+      } catch (error) {
+        deps.recordRuntimeEvent?.("delivery", error, {
+          phase: "guest-voice",
+          guestQueryId: turn.guestQueryId,
+        });
+      }
+    } else if (finalText) {
       if (deps.sendGuestReply) {
         await deps.sendGuestReply(turn.guestQueryId, finalText);
       } else {

@@ -165,6 +165,7 @@ export function isTelegramFollowerApiCallAllowed(input: {
     "sendRichMessageDraft",
   ]);
   const allowedMultipartMethods = new Set([
+    "sendAudio",
     "sendDocument",
     "sendMediaGroup",
     "sendPhoto",
@@ -384,6 +385,7 @@ export function parseTelegramBusEnvelope(
 export interface TelegramBusLocalServer {
   start: () => Promise<void>;
   stop: () => Promise<void>;
+  ensureEndpoint: () => Promise<boolean>;
 }
 
 export type TelegramBusSocketPathSource = string | (() => string);
@@ -610,12 +612,14 @@ export function createTelegramBusLocalServer(
 ): TelegramBusLocalServer {
   let server: Server | undefined;
   let activeSocketPath: string | undefined;
+  let endpointRecovery: Promise<boolean> | undefined;
+  let stopGeneration = 0;
   const sockets = new Set<Socket>();
   const closeSocket = (socket: Socket) => {
     sockets.delete(socket);
     socket.destroy();
   };
-  return {
+  const runtime: TelegramBusLocalServer = {
     start: async () => {
       if (server) return;
       const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
@@ -679,6 +683,7 @@ export function createTelegramBusLocalServer(
       if (!usesWindowsPipe) chmodSync(socketPath, 0o600);
     },
     stop: async () => {
+      stopGeneration += 1;
       const activeServer = server;
       const socketPath = activeSocketPath;
       server = undefined;
@@ -703,7 +708,44 @@ export function createTelegramBusLocalServer(
         );
       }
     },
+    ensureEndpoint: async () => {
+      const socketPath = activeSocketPath;
+      if (
+        !server ||
+        !socketPath ||
+        isTelegramBusPipePath(socketPath) ||
+        existsSync(socketPath)
+      ) {
+        return false;
+      }
+      if (endpointRecovery) return endpointRecovery;
+      endpointRecovery = (async () => {
+        deps.recordTransportEvent?.(
+          "server-endpoint-missing",
+          getTelegramBusEndpointDiagnostics(socketPath),
+        );
+        const recoveryStopGeneration = stopGeneration + 1;
+        await runtime.stop();
+        if (stopGeneration !== recoveryStopGeneration) return false;
+        await runtime.start();
+        if (stopGeneration !== recoveryStopGeneration) {
+          await runtime.stop();
+          return false;
+        }
+        deps.recordTransportEvent?.(
+          "server-endpoint-recovered",
+          getTelegramBusEndpointDiagnostics(socketPath),
+        );
+        return true;
+      })();
+      try {
+        return await endpointRecovery;
+      } finally {
+        endpointRecovery = undefined;
+      }
+    },
   };
+  return runtime;
 }
 
 function getTelegramBusEnvelopeDiagnostics(

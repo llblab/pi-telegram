@@ -24,6 +24,7 @@ import * as Menu from "./lib/menu.ts";
 import * as Model from "./lib/model.ts";
 import * as Outbound from "./lib/outbound.ts";
 import * as Ownership from "./lib/ownership.ts";
+import * as Paths from "./lib/paths.ts";
 import * as Pi from "./lib/pi.ts";
 import * as Polling from "./lib/polling.ts";
 import * as Preview from "./lib/preview.ts";
@@ -309,6 +310,7 @@ export default function (pi: Pi.ExtensionAPI) {
   >({
     getConfig: configStore.get,
     getActiveProfileName: configStore.getActiveProfileName,
+    getDiagnosticPaths: Paths.getTelegramDiagnosticsDisplayPaths,
     isPollingActive: Polling.createTelegramPollingActivityReader(
       pollingControllerState,
     ),
@@ -1318,6 +1320,7 @@ export default function (pi: Pi.ExtensionAPI) {
     sendTextReply,
     dispatchNextQueuedTelegramTurn,
     answerGuestQuery,
+    deleteMessage: deleteTelegramMessage,
     sendGuestReply,
     finalizeMarkdownPreview,
     proactivePushChatIdGetter,

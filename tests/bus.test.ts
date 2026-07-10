@@ -4,7 +4,13 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -466,6 +472,20 @@ test("Bus follower API allowlist permits scoped own-thread voice uploads", () =>
       follower,
       method: "callMultipart",
       args: [
+        "sendAudio",
+        { chat_id: 10, message_thread_id: 42 },
+        "audio",
+        "/tmp/audio.mp3",
+        "audio.mp3",
+      ],
+    }),
+    true,
+  );
+  assert.equal(
+    isTelegramFollowerApiCallAllowed({
+      follower,
+      method: "callMultipart",
+      args: [
         "sendVoice",
         { chat_id: 10 },
         "voice",
@@ -689,6 +709,42 @@ test("Bus local server resolves the active profile endpoint on each start", asyn
     assert.notEqual(personalSocketPath, workSocketPath);
     assert.equal(existsSync(personalSocketPath), true);
     assert.equal(existsSync(workSocketPath), false);
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus local server rebinds an externally unlinked Unix endpoint", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-rebind-"));
+  const socketPath = join(dir, "bus.sock");
+  const phases: string[] = [];
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: () => ({ kind: "bus.ack", requestId: "rebind", ok: true }),
+    recordTransportEvent: (phase) => phases.push(phase),
+  });
+  try {
+    await server.start();
+    unlinkSync(socketPath);
+    assert.equal(existsSync(socketPath), false);
+
+    assert.equal(await server.ensureEndpoint(), true);
+    assert.equal(existsSync(socketPath), true);
+    assert.equal(await server.ensureEndpoint(), false);
+    assert.deepEqual(
+      phases.filter((phase) => phase.includes("endpoint")),
+      ["server-endpoint-missing", "server-endpoint-recovered"],
+    );
+    assert.equal(
+      (
+        await probeTelegramBusEndpoint({
+          endpoint: socketPath,
+          timeoutMs: 50,
+        })
+      ).reachable,
+      true,
+    );
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });

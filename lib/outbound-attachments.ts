@@ -88,12 +88,49 @@ export interface TelegramQueuedOutboundAttachmentView {
 
 export interface TelegramOutboundAttachmentQueueTargetView {
   queuedAttachments: TelegramQueuedOutboundAttachmentView[];
+  guestQueryId?: string;
 }
 
 export interface TelegramQueuedOutboundAttachmentTurnView extends TelegramOutboundAttachmentQueueTargetView {
   chatId: number;
   replyToMessageId: number;
   target?: TelegramTarget;
+}
+
+export type TelegramGuestCachedAttachmentResult =
+  | {
+      type: "document";
+      id: string;
+      title: string;
+      document_file_id: string;
+      caption?: string;
+    }
+  | {
+      type: "photo";
+      id: string;
+      photo_file_id: string;
+      caption?: string;
+    }
+  | {
+      type: "audio";
+      id: string;
+      audio_file_id: string;
+      caption?: string;
+    }
+  | {
+      type: "voice";
+      id: string;
+      voice_file_id: string;
+      title: string;
+      caption?: string;
+    };
+
+interface TelegramGuestStagingMessage {
+  message_id?: number;
+  document?: { file_id?: string };
+  photo?: Array<{ file_id?: string; file_size?: number }>;
+  audio?: { file_id?: string };
+  voice?: { file_id?: string };
 }
 
 function isTelegramOutboundPhotoAttachmentPath(path: string): boolean {
@@ -105,6 +142,27 @@ function isTelegramOutboundPhotoAttachmentPath(path: string): boolean {
     normalized.endsWith(".webp") ||
     normalized.endsWith(".gif")
   );
+}
+
+function getTelegramGuestAttachmentTransport(path: string): {
+  method: "sendDocument" | "sendPhoto" | "sendAudio" | "sendVoice";
+  fileField: "document" | "photo" | "audio" | "voice";
+} {
+  const normalized = path.toLowerCase();
+  if (
+    normalized.endsWith(".jpg") ||
+    normalized.endsWith(".jpeg") ||
+    normalized.endsWith(".png")
+  ) {
+    return { method: "sendPhoto", fileField: "photo" };
+  }
+  if (normalized.endsWith(".ogg") || normalized.endsWith(".opus")) {
+    return { method: "sendVoice", fileField: "voice" };
+  }
+  if (normalized.endsWith(".mp3")) {
+    return { method: "sendAudio", fileField: "audio" };
+  }
+  return { method: "sendDocument", fileField: "document" };
 }
 
 function formatTelegramOutboundAttachmentSizeLimitError(
@@ -389,6 +447,14 @@ export async function queueTelegramOutboundAttachments(options: {
     });
   }
   if (
+    options.activeTurn.guestQueryId &&
+    options.activeTurn.queuedAttachments.length + options.paths.length > 1
+  ) {
+    throw new Error(
+      "Telegram Guest Mode supports one attachment per reply; no attachment was queued",
+    );
+  }
+  if (
     options.activeTurn.queuedAttachments.length + options.paths.length >
     options.maxAttachmentsPerTurn
   ) {
@@ -412,6 +478,110 @@ export async function queueTelegramOutboundAttachments(options: {
     ],
     details: { paths: added },
   };
+}
+
+export async function deliverTelegramGuestCachedAttachment(options: {
+  guestQueryId: string;
+  stagingChatId: number;
+  stagingTarget?: TelegramTarget;
+  attachment: TelegramQueuedOutboundAttachmentView;
+  caption?: string;
+  sendMultipart: TelegramQueuedOutboundAttachmentDeliveryDeps["sendMultipart"];
+  answerGuestQuery: (
+    guestQueryId: string,
+    result: TelegramGuestCachedAttachmentResult,
+  ) => Promise<void>;
+  answerGuestText?: (guestQueryId: string, text: string) => Promise<void>;
+  fallbackText?: string;
+  deleteMessage: (chatId: number, messageId: number) => Promise<void>;
+  recordRuntimeEvent?: TelegramOutboundAttachmentRuntimeEventRecorderPort["recordRuntimeEvent"];
+}): Promise<void> {
+  const transport = getTelegramGuestAttachmentTransport(options.attachment.path);
+  let stagingMessageId: number | undefined;
+  let answerAttempted = false;
+  try {
+    const message = (await options.sendMultipart(
+      transport.method,
+      {
+        chat_id: String(options.stagingChatId),
+        ...getTelegramMultipartTargetFields(options.stagingTarget),
+      },
+      transport.fileField,
+      options.attachment.path,
+      options.attachment.fileName,
+    )) as TelegramGuestStagingMessage;
+    stagingMessageId = message.message_id;
+    const caption = options.caption
+      ? Array.from(options.caption).slice(0, 1024).join("")
+      : undefined;
+    let result: TelegramGuestCachedAttachmentResult;
+    if (transport.fileField === "photo") {
+      const photo = [...(message.photo ?? [])]
+        .sort((left, right) => (left.file_size ?? 0) - (right.file_size ?? 0))
+        .at(-1);
+      if (!photo?.file_id) throw new Error("Guest staging upload returned no photo file_id");
+      result = {
+        type: "photo",
+        id: "attachment-1",
+        photo_file_id: photo.file_id,
+        ...(caption ? { caption } : {}),
+      };
+    } else if (transport.fileField === "audio") {
+      if (!message.audio?.file_id)
+        throw new Error("Guest staging upload returned no audio file_id");
+      result = {
+        type: "audio",
+        id: "attachment-1",
+        audio_file_id: message.audio.file_id,
+        ...(caption ? { caption } : {}),
+      };
+    } else if (transport.fileField === "voice") {
+      if (!message.voice?.file_id)
+        throw new Error("Guest staging upload returned no voice file_id");
+      result = {
+        type: "voice",
+        id: "attachment-1",
+        voice_file_id: message.voice.file_id,
+        title: options.attachment.fileName,
+        ...(caption ? { caption } : {}),
+      };
+    } else {
+      if (!message.document?.file_id)
+        throw new Error("Guest staging upload returned no document file_id");
+      result = {
+        type: "document",
+        id: "attachment-1",
+        title: options.attachment.fileName,
+        document_file_id: message.document.file_id,
+        ...(caption ? { caption } : {}),
+      };
+    }
+    answerAttempted = true;
+    await options.answerGuestQuery(options.guestQueryId, result);
+  } catch (error) {
+    if (
+      !answerAttempted &&
+      options.answerGuestText &&
+      options.fallbackText
+    ) {
+      answerAttempted = true;
+      await options.answerGuestText(options.guestQueryId, options.fallbackText);
+    } else {
+      throw error;
+    }
+  } finally {
+    if (stagingMessageId !== undefined) {
+      try {
+        await options.deleteMessage(options.stagingChatId, stagingMessageId);
+      } catch (error) {
+        options.recordRuntimeEvent?.("attachment", error, {
+          phase: "guest-staging-cleanup",
+          chatId: options.stagingChatId,
+          messageId: stagingMessageId,
+        });
+      }
+    }
+  }
 }
 
 export async function sendTelegramOutboundMessage(options: {

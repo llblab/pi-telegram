@@ -76,9 +76,10 @@ export function getTelegramDiagnosticsDisplayPaths(profileName?: string): {
   logs: string;
 } {
   const suffix = getTelegramProfilePathSuffix(profileName);
+  const profileSlug = suffix.slice(1);
   return {
     state: `~/.pi/agent/tmp/telegram/state${suffix}.json`,
-    logs: `~/.pi/agent/tmp/telegram/logs${suffix}.jsonl`,
+    logs: `~/.pi/agent/tmp/telegram/logs${profileSlug ? `.${profileSlug}` : ""}.jsonl`,
   };
 }
 

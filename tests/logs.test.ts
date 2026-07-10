@@ -31,7 +31,7 @@ test("Runtime log paths preserve default compatibility and isolate named profile
   );
   assert.equal(
     getTelegramPreviousRuntimeLogPath("/agent"),
-    "/agent/tmp/telegram/logs.previous.jsonl",
+    "/agent/tmp/telegram/logs._prev.jsonl",
   );
   assert.equal(
     getTelegramRuntimeLogPath("/agent", "omp"),
@@ -39,7 +39,35 @@ test("Runtime log paths preserve default compatibility and isolate named profile
   );
   assert.equal(
     getTelegramPreviousRuntimeLogPath("/agent", "omp"),
-    "/agent/tmp/telegram/logs.omp.previous.jsonl",
+    "/agent/tmp/telegram/logs.omp._prev.jsonl",
+  );
+});
+
+test("Runtime JSONL paths do not collide across profile lifecycle names", () => {
+  const profiles = [
+    "prev",
+    "previous",
+    "current",
+    "work",
+    "workone",
+    "worktwo",
+  ];
+  const paths = new Set([
+    getTelegramRuntimeLogPath("/agent"),
+    getTelegramPreviousRuntimeLogPath("/agent"),
+  ]);
+  for (const profile of profiles) {
+    paths.add(getTelegramRuntimeLogPath("/agent", profile));
+    paths.add(getTelegramPreviousRuntimeLogPath("/agent", profile));
+  }
+  assert.equal(paths.size, 2 + profiles.length * 2);
+  assert.equal(
+    getTelegramRuntimeLogPath("/agent", "previous"),
+    "/agent/tmp/telegram/logs.previous.jsonl",
+  );
+  assert.equal(
+    getTelegramPreviousRuntimeLogPath("/agent", "previous"),
+    "/agent/tmp/telegram/logs.previous._prev.jsonl",
   );
 });
 
@@ -48,7 +76,7 @@ test("Runtime JSONL log resets and appends session events", async () => {
   try {
     let nowMs = 1000;
     const path = join(dir, "logs.jsonl");
-    const previousPath = join(dir, "logs.previous.jsonl");
+    const previousPath = join(dir, "logs._prev.jsonl");
     const log = createTelegramRuntimeJsonlLog({
       path,
       previousPath,

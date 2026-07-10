@@ -153,9 +153,8 @@ function unrefTelegramLifecycleTimer(timer: TelegramLifecycleTimer): void {
 export interface TelegramCompactionObserverRuntimeDeps<TContext> {
   setCompactionInProgress: (inProgress: boolean) => void;
   updateStatus: (ctx: TContext) => void;
-  startTypingLoop?: (ctx: TContext) => void;
+  startTypingLoop?: (ctx: TContext) => boolean | void;
   stopTypingLoop?: () => void;
-  shouldStartTypingLoop?: () => boolean;
   requestDeferredDispatchNextQueuedTelegramTurn: (
     dispatch: (ctx: TContext) => void,
   ) => void;
@@ -196,8 +195,9 @@ export function createTelegramCompactionObserverRuntime<TContext>(
   return {
     onSessionBeforeCompact: (_event, ctx) => {
       deps.setCompactionInProgress(true);
-      typingStartedByObserver = deps.shouldStartTypingLoop?.() ?? true;
-      if (typingStartedByObserver) deps.startTypingLoop?.(ctx);
+      const typingStartResult = deps.startTypingLoop?.(ctx);
+      typingStartedByObserver =
+        !!deps.startTypingLoop && typingStartResult !== false;
       deps.updateStatus(ctx);
       clearFallbackTimer();
       fallbackTimer = setTimer(() => {

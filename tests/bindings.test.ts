@@ -211,7 +211,7 @@ test("Named profile setup cancellation preserves the active runtime", async () =
     handler: (args: string, ctx: ExtensionContext) => Promise<void>;
   };
   const notifications: string[] = [];
-  await setupCommand.handler("new-profile", {
+  await setupCommand.handler("newprofile", {
     cwd: "/repo",
     hasUI: true,
     ui: {
@@ -302,6 +302,7 @@ test("Lifecycle binding delegates shutdown to composed session runtime", async (
     finalizeMarkdownPreview: async () => undefined,
     proactivePushChatIdGetter: () => undefined,
     isProactivePushEnabled: () => false,
+    canSendAgentActivity: () => false,
     updateStatus: () => {},
     recordRuntimeEvent: () => {},
   } as unknown as Parameters<typeof registerTelegramLifecycleRuntimeHooks>[0];
@@ -432,6 +433,15 @@ test("Lifecycle binding uses native typing and assistant previews without activi
     { type: "session_before_compact" },
     {} as ExtensionContext,
   );
+  await getRequiredBindingHandler(harness.handlers, "session_compact")(
+    { type: "session_compact" },
+    {} as ExtensionContext,
+  );
+  activeTurn = false;
+  await getRequiredBindingHandler(harness.handlers, "session_before_compact")(
+    { type: "session_before_compact" },
+    {} as ExtensionContext,
+  );
 
   assert.deepEqual(events, [
     "typing:42:8",
@@ -442,5 +452,6 @@ test("Lifecycle binding uses native typing and assistant previews without activi
     "preview:update",
     "typing:42:9",
     "typing:42:9",
+    "typing:42:8",
   ]);
 });

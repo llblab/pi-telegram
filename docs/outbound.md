@@ -18,6 +18,12 @@ An outbound handler is selected by `type`. Text replies and assistant markup map
 
 The voice pipeline is detailed below: configured `type: "voice"` handlers first, then programmatic handlers, then registered synthesis providers.
 
+### Guest Mode media boundary
+
+A Guest Mode reply is one `answerGuestQuery` call carrying exactly one `InlineQueryResult`; it is not a normal chat target and cannot receive `sendDocument`/`sendVoice` multipart uploads through sentinel `chatId: 0`. `telegram_attach` therefore admits at most one file during a guest turn and rejects additional files before queue mutation.
+
+Telegram accepts public URLs or existing Telegram `file_id` values for inline media results, but pi-telegram does not publish local artifacts to external hosting. A local guest document, photo, MP3 audio, or OGG/OPUS voice therefore uses a temporary upload to the paired owner's bot chat, extraction of the returned `file_id`, one cached-media guest answer, and best-effort deletion of the staging message. That message can briefly appear or notify the owner. One guest query can carry only one media item, and its answer text must fit the media caption limit rather than a separate full Rich Markdown message.
+
 Configured text handlers provide `template`. A string is one command; an array is ordered composition. Top-level `args` and `defaults` apply to all composed steps unless a step defines private values. The command-template default timeout applies automatically. Use `template: [...]` for composition; the old local `pipe` alias is removed in 0.13.0.
 
 ## Text Handler Config

@@ -938,6 +938,135 @@ test("Agent end runtime resets state, finalizes replies, sends attachments, and 
   ]);
 });
 
+test("Agent end runtime delivers one Guest Mode attachment instead of a text article", async () => {
+  const events: unknown[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    chatId: 0,
+    replyToMessageId: 0,
+    guestQueryId: "guest-1",
+    queuedAttachments: [{ path: "/tmp/demo.txt", fileName: "demo.txt" }],
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "final caption" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => events.push("reset"),
+    updateStatus: () => events.push("status"),
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {
+      events.push("unexpected:ordinary");
+    },
+    sendGuestReply: async () => {
+      events.push("unexpected:text");
+    },
+    sendGuestAttachment: async (nextTurn, attachment, caption) => {
+      events.push([
+        "guest-attachment",
+        nextTurn.guestQueryId,
+        attachment.path,
+        caption,
+      ]);
+    },
+  });
+  assert.deepEqual(events, [
+    "reset",
+    "status",
+    ["guest-attachment", "guest-1", "/tmp/demo.txt", "final caption"],
+    "dispatch",
+  ]);
+});
+
+test("Agent end runtime routes Guest Mode voice markup through one media result", async () => {
+  const events: unknown[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    chatId: 0,
+    replyToMessageId: 0,
+    guestQueryId: "guest-1",
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "voice markup" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {
+      events.push("unexpected:attachment");
+    },
+    sendGuestReply: async () => {
+      events.push("unexpected:text");
+    },
+    planOutboundReply: () => ({
+      markdown: "visible caption",
+      voiceText: "spoken result",
+    }),
+    sendGuestVoiceReply: async (nextTurn, plan, caption) => {
+      events.push([
+        "guest-voice",
+        nextTurn.guestQueryId,
+        plan.voiceText,
+        caption,
+      ]);
+    },
+  });
+  assert.deepEqual(events, [
+    ["guest-voice", "guest-1", "spoken result", "visible caption"],
+    "dispatch",
+  ]);
+});
+
+test("Agent end runtime records Guest Mode attachment failure without a second answer", async () => {
+  const events: string[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    chatId: 0,
+    replyToMessageId: 0,
+    guestQueryId: "guest-1",
+    queuedAttachments: [{ path: "/tmp/demo.txt", fileName: "demo.txt" }],
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "final caption" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    answerGuestQuery: async () => {
+      events.push("unexpected:fallback");
+    },
+    sendGuestReply: async () => {
+      events.push("unexpected:text");
+    },
+    sendGuestAttachment: async () => {
+      events.push("attachment");
+      throw new Error("ambiguous answer failure");
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(`record:${details?.phase}`);
+    },
+  });
+  assert.deepEqual(events, [
+    "attachment",
+    "record:guest-attachment",
+    "dispatch",
+  ]);
+});
+
 test("Agent end runtime can schedule active-turn final delivery without blocking", async () => {
   const events: string[] = [];
   let scheduledTask: (() => Promise<void>) | undefined;

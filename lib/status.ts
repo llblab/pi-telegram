@@ -181,6 +181,7 @@ export interface TelegramBridgeStatusLineState {
   hasBotToken?: boolean;
   botUsername?: string;
   activeProfileName?: string;
+  diagnosticPaths?: { state: string; logs: string };
   allowedUserId?: number;
   botThreadMode?: "unknown" | "enabled" | "disabled";
   botThreadModeUpdatedAtMs?: number;
@@ -259,6 +260,9 @@ export interface TelegramBridgeStatusRuntimeDeps<
   statusKey?: string;
   getConfig: () => TelegramBridgeStatusConfig;
   getActiveProfileName?: () => string | undefined;
+  getDiagnosticPaths?: (
+    profileName?: string,
+  ) => { state: string; logs: string };
   isPollingActive: () => boolean;
   getActiveSourceMessageIds: () => number[] | undefined;
   hasActiveTurn: () => boolean;
@@ -620,10 +624,12 @@ export function createTelegramBridgeStatusRuntime<
     getBridgeStatusLineState: () => {
       const config = deps.getConfig();
       const botThreadMode = deps.getBotThreadMode?.();
+      const activeProfileName = deps.getActiveProfileName?.();
       return {
         hasBotToken: Boolean(config.botToken),
         botUsername: config.botUsername,
-        activeProfileName: deps.getActiveProfileName?.(),
+        activeProfileName,
+        diagnosticPaths: deps.getDiagnosticPaths?.(activeProfileName),
         allowedUserId: config.allowedUserId,
         botThreadMode: botThreadMode?.threadMode,
         botThreadModeUpdatedAtMs: botThreadMode?.updatedAtMs,
@@ -774,9 +780,6 @@ export function buildTelegramStatusBarText(
     return `${label} ${theme.fg("warning", "electing")}${queued}`;
   if (!state.pollingActive && state.busRole !== "follower")
     return `${theme.fg("accent", "telegram")} ${theme.fg("muted", "disconnected")}${queued}`;
-  if (state.compactionInProgress) {
-    return `${label} ${theme.fg("warning", "compacting")}${queued}`;
-  }
   if (state.processing) {
     const processingStatus = state.queuedStatus
       ? "active"
@@ -1058,19 +1061,18 @@ function buildTelegramBridgeCompactStatusLines(
       ? ` (control=${controlQueueCount}, priority=${priorityQueueCount}, default=${defaultQueueCount})`
       : ""
   }`;
-  const executionState = state.compactionInProgress
-    ? "compacting"
-    : state.pendingDispatch
-      ? "pending dispatch"
-      : state.activeSourceMessageIds?.length
-        ? "active"
-        : "idle";
+  const executionState = state.pendingDispatch
+    ? "pending dispatch"
+    : state.activeSourceMessageIds?.length
+      ? "active"
+      : "idle";
   const profileSuffix = state.activeProfileName
     ? `.${state.activeProfileName.replace(/[^a-zA-Z0-9._-]+/g, "_")}`
     : "";
-  const diagnosticsPaths = {
+  const profileSlug = profileSuffix.slice(1);
+  const diagnosticsPaths = state.diagnosticPaths ?? {
     state: `~/.pi/agent/tmp/telegram/state${profileSuffix}.json`,
-    logs: `~/.pi/agent/tmp/telegram/logs${profileSuffix}.jsonl`,
+    logs: `~/.pi/agent/tmp/telegram/logs${profileSlug ? `.${profileSlug}` : ""}.jsonl`,
   };
   return [
     "connection:",
@@ -1251,7 +1253,6 @@ function buildContextSummary(
 }
 
 function buildStatusSummary(ctx: TelegramStatusContext): string {
-  if (ctx.isCompactionInProgress?.()) return "compacting";
   if (ctx.hasPendingMessages?.()) return "pending";
   if (ctx.isIdle?.() === false) return "active";
   if (ctx.isIdle?.() === true) return "idle";

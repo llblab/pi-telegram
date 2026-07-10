@@ -5,10 +5,10 @@
  */
 
 import type {
+  TelegramAnswerGuestQueryOptions,
   TelegramApiCallOptions,
   TelegramBridgeApiRuntime,
   TelegramEditMessageTextBody,
-  TelegramInputRichMessage,
   TelegramSendMessageBody,
   TelegramSendMessageDraftBody,
   TelegramSendRichMessageBody,
@@ -273,14 +273,16 @@ export function createTelegramBusAwareApiRuntime(
     async answerGuestQuery(
       guestQueryId: string,
       text?: string,
-      options?: { parseMode?: string; richMessage?: TelegramInputRichMessage },
+      options?: TelegramAnswerGuestQueryOptions,
     ): Promise<void> {
       if (deps.ownsDirect()) {
         await deps.directRuntime.answerGuestQuery(guestQueryId, text, options);
         return;
       }
       const body: Record<string, unknown> = { guest_query_id: guestQueryId };
-      if (text !== undefined || options?.richMessage) {
+      if (options?.result) {
+        body.result = options.result;
+      } else if (text !== undefined || options?.richMessage) {
         const inputContent: Record<string, unknown> = options?.richMessage
           ? { rich_message: options.richMessage }
           : { message_text: text };

@@ -152,6 +152,14 @@ test("Bus-aware API runtime routes follower outbound calls through the leader", 
   await runtime.deleteMessage(1, 9);
   await runtime.answerCallbackQuery("cb1", "Done");
   await runtime.answerGuestQuery("guest1", "Hello", { parseMode: "Markdown" });
+  await runtime.answerGuestQuery("guest2", undefined, {
+    result: {
+      type: "photo",
+      id: "photo-1",
+      photo_file_id: "cached-photo",
+      caption: "Result",
+    },
+  });
   assert.equal(
     await runtime.downloadFile("file1", "photo.png"),
     "/tmp/leader-photo.png",
@@ -206,6 +214,21 @@ test("Bus-aware API runtime routes follower outbound calls through the leader", 
               message_text: "Hello",
               parse_mode: "Markdown",
             },
+          },
+        },
+      ],
+    },
+    {
+      method: "call",
+      args: [
+        "answerGuestQuery",
+        {
+          guest_query_id: "guest2",
+          result: {
+            type: "photo",
+            id: "photo-1",
+            photo_file_id: "cached-photo",
+            caption: "Result",
           },
         },
       ],

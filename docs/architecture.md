@@ -120,7 +120,7 @@ Deleting `locks.json` resets runtime ownership without deleting Telegram configu
 
 Telegram private-chat Threaded Mode is the public switch for multi-instance Telegram operation. Classic single-DM polling is the base mode. When Telegram private-chat threads are available for the bot, the bridge enables the local leader/follower bus automatically; when threads are unavailable or later disabled, the bridge returns to classic single-DM polling as a first-class mode.
 
-Named Telegram profiles are orthogonal to Threaded Mode. The selected profile chooses the bot/session slice (`botToken`, `botId`, `botUsername`, `allowedUserId`, `lastUpdateId`) and scopes singleton locks, diagnostics logs, state files, thread/bus owner keys, and leader/follower IPC endpoints; it must not change the Threaded Mode rules. Within one selected profile, leader/follower election, bus transport, thread provisioning, routing, ownership forwarding, cleanup, and runtime diagnostics behave exactly as they do for the default profile. A different selected profile is a parallel bot runtime: its locks, `tmp/telegram/state.<profile>.json`, `tmp/telegram/logs.<profile>.jsonl`, previous log, thread bindings, Unix sockets, and Windows named pipes are isolated from the default profile and from other named profiles while shared bridge settings remain top-level/global. The default profile preserves legacy state, log, socket, and named-pipe paths for compatibility.
+Named Telegram profiles are orthogonal to Threaded Mode. The selected profile chooses the bot/session slice (`botToken`, `botId`, `botUsername`, `allowedUserId`, `lastUpdateId`) and scopes singleton locks, diagnostics logs, state files, thread/bus owner keys, and leader/follower IPC endpoints; it must not change the Threaded Mode rules. Within one selected profile, leader/follower election, bus transport, thread provisioning, routing, ownership forwarding, cleanup, and runtime diagnostics behave exactly as they do for the default profile. A different selected profile is a parallel bot runtime: its locks, `tmp/telegram/state.<profile>.json`, `tmp/telegram/logs.<profile>.jsonl`, `tmp/telegram/logs.<profile>._prev.jsonl`, thread bindings, Unix sockets, and Windows named pipes are isolated from the default profile and from other named profiles while shared bridge settings remain top-level/global. The default profile preserves legacy state, log, socket, and named-pipe paths for compatibility.
 
 Profile reality follows three explicit storage classes. `telegram.json` shared settings and extension registries are process-global platform configuration; profile bot/session fields and observable transport/routing authority are profile-scoped; queues, active turns, ownership caches, menu state, and runtime controllers are session-local memory. Downloaded attachments use UUID-prefixed names in the shared Telegram scratch directory and are session artifacts rather than identity or routing authority, so cross-profile cleanup is limited to stale scratch files and cannot redirect live traffic.
 
@@ -214,14 +214,14 @@ Queue and menu mutations are reachable through Telegram updates handled by the c
 
 ### Compaction And Typing Status
 
-Manual `/compact` requires inline confirmation because accidental taps are disruptive. Confirmed manual compaction and auto-compaction both set the bridge compaction flag, block queued prompt dispatch, update status to `compacting`, and clear that state on compact completion, timeout fallback, or session shutdown.
+Manual `/compact` requires inline confirmation because accidental taps are disruptive. Confirmed manual compaction and auto-compaction both set the bridge compaction flag, block queued prompt dispatch, retain that flag in explicit diagnostics, and clear it on compact completion, timeout fallback, or session shutdown. Pi owns its terminal compaction lifecycle; pi-telegram keeps `Active` scoped to Telegram-owned work and otherwise preserves the stable connected/leader/follower role.
 
-Native typing during compaction is deliberately narrower than the compaction flag:
+Native typing during compaction follows connected-instance activity rather than terminal status:
 
-- Confirmed manual `/compact` always starts a native `typing` keepalive in the command target and stops it on completion/failure.
-- Automatic/session compaction starts native `typing` only when there is an active Telegram-owned turn; it must reuse that active turn's target.
-- Startup, reload, connect/reconnect, restore, leader/follower recovery, and idle/background compaction without an active Telegram turn must not send visible typing.
-- Thread-targeted typing is sent to the concrete thread and mirrored to `All` as the aggregate activity surface.
+- Confirmed manual `/compact` starts a native `typing` keepalive in the command target and stops it on completion/failure.
+- Automatic/session compaction with an active Telegram turn reuses that turn's target.
+- Automatic/session compaction without an active Telegram turn uses the connected instance's assigned target; an unconnected instance sends nothing.
+- Thread-targeted typing is sent to the concrete thread and mirrored to `All` as the aggregate activity surface; completion, timeout, and shutdown stop the keyed loop.
 
 At every connected instance `agent_start`, the lifecycle binding starts Telegram's native `…typing` indicator in that instance's assigned target, whether the run came from Telegram, the local TUI, or an autonomous continuation such as Grow Loop. Terminal `Active` remains Telegram-turn-specific; the native indicator answers the separate question of whether the instance is doing agent work. Assistant message start/update hooks still re-arm it during Telegram-owned turns so transient provider/model errors do not leave a continuing run without activity feedback, and agent/session completion stops it.
 
