@@ -4,7 +4,16 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import {
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -148,6 +157,133 @@ test("Telegram config store persists active named profile session fields without
       },
     },
   });
+});
+
+test("Telegram config transactions merge concurrent profile offsets and global fields", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-config-race-"));
+  const configPath = join(dir, "telegram.json");
+  const startPath = join(dir, "start");
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      botToken: "default-token",
+      profiles: {
+        work: { botToken: "work-token", lastUpdateId: 1 },
+        personal: { botToken: "personal-token", lastUpdateId: 2 },
+      },
+    }),
+  );
+  const moduleUrl = new URL("../lib/config.ts", import.meta.url).href;
+  const children = [
+    { profile: "work", offset: "11", field: "proactive" },
+    { profile: "personal", offset: "22", field: "voice" },
+  ].map(({ profile, offset, field }) => {
+    const readyPath = join(dir, `ready-${profile}`);
+    const source = `
+      import { existsSync, writeFileSync } from "node:fs";
+      import { createTelegramConfigStore } from ${JSON.stringify(moduleUrl)};
+      const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+      const store = createTelegramConfigStore({
+        agentDir: process.env.AGENT_DIR,
+        configPath: process.env.CONFIG_PATH,
+      });
+      await store.load();
+      if (!store.activateProfile(process.env.PROFILE)) throw new Error("profile missing");
+      writeFileSync(process.env.READY_PATH, "ready");
+      while (!existsSync(process.env.START_PATH)) sleep(2);
+      store.update((config) => {
+        config.lastUpdateId = Number(process.env.OFFSET);
+        if (process.env.FIELD === "proactive") config.proactivePush = true;
+        else config.voice = { ...(config.voice ?? {}), replyMode: "mirror" };
+      });
+      await store.persist();
+    `;
+    const child = spawn(
+      process.execPath,
+      ["--experimental-strip-types", "--input-type=module", "--eval", source],
+      {
+        env: {
+          ...process.env,
+          AGENT_DIR: dir,
+          CONFIG_PATH: configPath,
+          PROFILE: profile,
+          OFFSET: offset,
+          FIELD: field,
+          READY_PATH: readyPath,
+          START_PATH: startPath,
+        },
+        stdio: ["ignore", "ignore", "pipe"],
+      },
+    );
+    const done = new Promise<void>((resolve, reject) => {
+      let stderr = "";
+      child.stderr.on("data", (chunk) => (stderr += String(chunk)));
+      child.on("error", reject);
+      child.on("exit", (code) =>
+        code === 0
+          ? resolve()
+          : reject(new Error(`config child exited ${code}: ${stderr}`)),
+      );
+    });
+    return { readyPath, done };
+  });
+  try {
+    const deadline = Date.now() + 3000;
+    while (
+      !children.every((child) => existsSync(child.readyPath)) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(children.every((child) => existsSync(child.readyPath)), true);
+    await writeFile(startPath, "start");
+    await Promise.all(children.map((child) => child.done));
+
+    assert.deepEqual(await readTelegramConfig(configPath), {
+      botToken: "default-token",
+      proactivePush: true,
+      voice: { replyMode: "mirror" },
+      profiles: {
+        work: { botToken: "work-token", lastUpdateId: 11 },
+        personal: { botToken: "personal-token", lastUpdateId: 22 },
+      },
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Telegram config keeps same-profile polling offsets monotonic", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-config-offset-"));
+  const configPath = join(dir, "telegram.json");
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      profiles: { work: { botToken: "work-token", lastUpdateId: 10 } },
+    }),
+  );
+  try {
+    const stale = createTelegramConfigStore({ agentDir: dir, configPath });
+    const replacement = createTelegramConfigStore({ agentDir: dir, configPath });
+    await stale.load();
+    await replacement.load();
+    assert.equal(stale.activateProfile("work"), true);
+    assert.equal(replacement.activateProfile("work"), true);
+    const stalePollingConfig = stale.get();
+    stalePollingConfig.lastUpdateId = 12;
+    const replacementPollingConfig = replacement.get();
+    replacementPollingConfig.lastUpdateId = 20;
+
+    await replacement.persist(replacementPollingConfig);
+    await stale.persist(stalePollingConfig);
+
+    assert.equal(
+      (await readTelegramConfig(configPath)).profiles?.work.lastUpdateId,
+      20,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("Telegram config store rejects missing named profile activation", () => {

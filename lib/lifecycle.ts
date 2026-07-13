@@ -4,6 +4,8 @@
  * Binds prepared Telegram lifecycle runtimes to pi extension lifecycle events
  */
 
+import * as BusFollower from "./bus-follower.ts";
+import * as Queue from "./queue.ts";
 import type {
   AgentEndEvent,
   AgentSettledEvent,
@@ -50,6 +52,7 @@ type TelegramLifecycleModel = ExtensionContext["model"];
 type TelegramLifecycleMessage = AgentEndEvent["messages"][number];
 
 export interface TelegramLifecycleRegistrationDeps {
+  isSessionActive?: (ctx: ExtensionContext) => boolean;
   onInput?: (event: InputEvent, ctx: ExtensionContext) => Promise<void> | void;
   onSessionStart: (
     event: SessionStartEvent,
@@ -122,21 +125,73 @@ export interface TelegramSessionLifecycleHooks {
 
 export interface TelegramSessionContextStore<TContext> {
   get: () => TContext | undefined;
-  set: (ctx: TContext) => void;
-  clear: () => void;
+  getGeneration: () => number;
+  isCurrent: (ctx: TContext, generation?: number) => boolean;
+  set: (ctx: TContext) => number;
+  clear: (ctx?: TContext) => boolean;
 }
 
-export function createTelegramSessionContextStore<
-  TContext,
->(): TelegramSessionContextStore<TContext> {
+export function createTelegramSessionContextStore<TContext>(
+  options: {
+    getIdentity?: (ctx: TContext) => unknown;
+  } = {},
+): TelegramSessionContextStore<TContext> {
   let currentContext: TContext | undefined;
+  let currentIdentity: unknown;
+  let generation = 0;
+  const objectIdentityGenerations = new WeakMap<object, number>();
+  const primitiveIdentityGenerations = new Map<unknown, number>();
+  const resolveIdentity = (ctx: TContext): unknown =>
+    options.getIdentity?.(ctx) ?? ctx;
+  const getIdentityGeneration = (identity: unknown): number | undefined =>
+    (typeof identity === "object" && identity !== null) ||
+    typeof identity === "function"
+      ? objectIdentityGenerations.get(identity as object)
+      : primitiveIdentityGenerations.get(identity);
+  const setIdentityGeneration = (identity: unknown, value: number): void => {
+    if (
+      (typeof identity === "object" && identity !== null) ||
+      typeof identity === "function"
+    ) {
+      objectIdentityGenerations.set(identity as object, value);
+    } else {
+      primitiveIdentityGenerations.set(identity, value);
+    }
+  };
   return {
     get: () => currentContext,
+    getGeneration: () => generation,
+    isCurrent: (ctx, expectedGeneration) => {
+      if (currentContext === undefined) return false;
+      const identity = resolveIdentity(ctx);
+      return (
+        identity === currentIdentity &&
+        getIdentityGeneration(identity) === generation &&
+        (expectedGeneration === undefined || generation === expectedGeneration)
+      );
+    },
     set: (ctx) => {
       currentContext = ctx;
+      currentIdentity = resolveIdentity(ctx);
+      generation += 1;
+      setIdentityGeneration(currentIdentity, generation);
+      return generation;
     },
-    clear: () => {
+    clear: (ctx) => {
+      if (ctx !== undefined) {
+        const identity = resolveIdentity(ctx);
+        if (
+          identity !== currentIdentity ||
+          getIdentityGeneration(identity) !== generation
+        ) {
+          return false;
+        }
+      }
+      if (currentContext === undefined) return false;
       currentContext = undefined;
+      currentIdentity = undefined;
+      generation += 1;
+      return true;
     },
   };
 }
@@ -148,10 +203,125 @@ export function createTelegramSessionContextTracker(
     onSessionStart: async (_event, ctx) => {
       store.set(ctx);
     },
-    onSessionShutdown: async () => {
-      store.clear();
+    onSessionShutdown: async (_event, ctx) => {
+      store.clear(ctx);
     },
   };
+}
+
+export function createTelegramSessionGenerationFence(
+  store: TelegramSessionContextStore<ExtensionContext>,
+  hooks: TelegramSessionLifecycleHooks,
+): TelegramSessionLifecycleHooks {
+  return {
+    async onSessionStart(event, ctx) {
+      const generation = store.set(ctx);
+      await hooks.onSessionStart(event, ctx);
+      if (!store.isCurrent(ctx, generation)) return;
+    },
+    async onSessionShutdown(event, ctx) {
+      const generation = store.getGeneration();
+      if (!store.isCurrent(ctx, generation)) return;
+      await hooks.onSessionShutdown(event, ctx);
+      store.clear(ctx);
+    },
+  };
+}
+
+export interface TelegramBridgeSessionServiceRuntime {
+  resumeGroupedInput(ctx: ExtensionContext): void;
+  suspendGroupedInput(): void;
+  delivery: {
+    onSessionStart(): Promise<void>;
+    onSessionShutdown(): Promise<void>;
+  };
+  polling: {
+    onSessionStart(
+      event: SessionStartEvent,
+      ctx: ExtensionContext,
+    ): Promise<void>;
+  };
+  capabilityMonitor: { start(ctx: ExtensionContext): void; stop(): void };
+  queueWatchdog: { start(ctx: ExtensionContext): void; stop(): void };
+}
+
+export interface TelegramBridgeSessionLifecycleAssemblyDeps<
+  TQueueItem,
+  TModel = unknown,
+> {
+  contextStore: TelegramSessionContextStore<ExtensionContext>;
+  queue: Omit<
+    Queue.TelegramSessionLifecycleRuntimeDeps<
+      ExtensionContext,
+      TQueueItem,
+      TModel
+    >,
+    "isSessionActive" | "stopPolling" | "clearPendingMediaGroups"
+  >;
+  follower: Omit<
+    BusFollower.TelegramBusFollowerSessionRefreshHookDeps<ExtensionContext>,
+    "isSessionActive"
+  > &
+    BusFollower.TelegramBusFollowerSessionReplacementSuspenderDeps;
+  services: TelegramBridgeSessionServiceRuntime;
+}
+
+export function createTelegramBridgeSessionLifecycleAssembly<
+  TQueueItem,
+  TModel = unknown,
+>(
+  deps: TelegramBridgeSessionLifecycleAssemblyDeps<TQueueItem, TModel>,
+): TelegramSessionLifecycleHooks {
+  const isSessionActive = deps.contextStore.isCurrent;
+  const suspendForReplacement =
+    BusFollower.createTelegramBusFollowerSessionReplacementSuspender({
+      registrationState: deps.follower.registrationState,
+      instanceId: deps.follower.instanceId,
+      suspendPolling: deps.follower.suspendPolling,
+      recordRuntimeEvent: deps.follower.recordRuntimeEvent,
+    });
+  const queueLifecycle = Queue.createTelegramSessionLifecycleRuntime({
+    ...deps.queue,
+    isSessionActive,
+    stopPolling: suspendForReplacement,
+    clearPendingMediaGroups: deps.services.suspendGroupedInput,
+  });
+  const servicesLifecycle = appendTelegramLifecycleHooks(
+    queueLifecycle,
+    {
+      async onSessionStart(event, ctx) {
+        deps.services.resumeGroupedInput(ctx);
+        await deps.services.delivery.onSessionStart();
+        await deps.services.polling.onSessionStart(event, ctx);
+        deps.services.capabilityMonitor.start(ctx);
+        deps.services.queueWatchdog.start(ctx);
+      },
+      async onSessionShutdown() {
+        await deps.services.delivery.onSessionShutdown();
+        deps.services.queueWatchdog.stop();
+        deps.services.capabilityMonitor.stop();
+      },
+    },
+    isSessionActive,
+  );
+  const followerLifecycle = appendTelegramLifecycleHooks(
+    servicesLifecycle,
+    {
+      onSessionStart: BusFollower.createTelegramBusFollowerSessionRefreshHook({
+        registrationState: deps.follower.registrationState,
+        registrationRuntime: deps.follower.registrationRuntime,
+        getLeaderState: deps.follower.getLeaderState,
+        isSessionActive,
+        updateStatus: deps.follower.updateStatus,
+        recordRuntimeEvent: deps.follower.recordRuntimeEvent,
+      }),
+    },
+    isSessionActive,
+  );
+  return createTelegramSessionGenerationFence(
+    deps.contextStore,
+    followerLifecycle,
+  );
 }
 
 type TelegramLifecycleTimer = number | ReturnType<typeof setTimeout>;
@@ -162,6 +332,7 @@ function unrefTelegramLifecycleTimer(timer: TelegramLifecycleTimer): void {
 }
 
 export interface TelegramCompactionObserverRuntimeDeps<TContext> {
+  isContextActive?: (ctx: TContext) => boolean;
   setCompactionInProgress: (inProgress: boolean) => void;
   updateStatus: (ctx: TContext) => void;
   startTypingLoop?: (ctx: TContext) => boolean | void;
@@ -206,6 +377,7 @@ export function createTelegramCompactionObserverRuntime<TContext>(
   };
   return {
     onSessionBeforeCompact: (_event, ctx) => {
+      if (deps.isContextActive && !deps.isContextActive(ctx)) return;
       deps.setCompactionInProgress(true);
       const typingStartResult = deps.startTypingLoop?.(ctx);
       typingStartedByObserver =
@@ -214,6 +386,7 @@ export function createTelegramCompactionObserverRuntime<TContext>(
       clearFallbackTimer();
       fallbackTimer = setTimer(() => {
         fallbackTimer = undefined;
+        if (deps.isContextActive && !deps.isContextActive(ctx)) return;
         deps.setCompactionInProgress(false);
         if (typingStartedByObserver) deps.stopTypingLoop?.();
         typingStartedByObserver = false;
@@ -229,6 +402,7 @@ export function createTelegramCompactionObserverRuntime<TContext>(
     },
     onSessionCompact: (_event, ctx) => {
       clearFallbackTimer();
+      if (deps.isContextActive && !deps.isContextActive(ctx)) return;
       deps.setCompactionInProgress(false);
       if (typingStartedByObserver) deps.stopTypingLoop?.();
       typingStartedByObserver = false;
@@ -314,14 +488,17 @@ export interface TelegramExtraLifecycleHooks {
 export function appendTelegramLifecycleHooks(
   base: TelegramSessionLifecycleHooks,
   extra: TelegramExtraLifecycleHooks,
+  isSessionActive?: (ctx: ExtensionContext) => boolean,
 ): TelegramSessionLifecycleHooks {
   return {
     onSessionStart: async (event, ctx) => {
       await base.onSessionStart(event, ctx);
+      if (isSessionActive?.(ctx) === false) return;
       await extra.onSessionStart?.(event, ctx);
     },
     onSessionShutdown: async (event, ctx) => {
       await base.onSessionShutdown(event, ctx);
+      if (isSessionActive?.(ctx) === false) return;
       await extra.onSessionShutdown?.(event, ctx);
     },
   };
@@ -331,7 +508,10 @@ export function registerTelegramLifecycleHooks(
   pi: ExtensionAPI,
   deps: TelegramLifecycleRegistrationDeps,
 ): void {
+  const isActive = (ctx: ExtensionContext): boolean =>
+    deps.isSessionActive?.(ctx) !== false;
   pi.on("input", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onInput?.(event, ctx);
   });
   pi.on("session_start", async (event, ctx) => {
@@ -341,39 +521,50 @@ export function registerTelegramLifecycleHooks(
     await deps.onSessionShutdown(event, ctx);
   });
   pi.on("session_before_compact", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onSessionBeforeCompact?.(event, ctx);
   });
   pi.on("session_compact", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onSessionCompact?.(event, ctx);
   });
   pi.on("before_agent_start", async (event, ctx) => {
     return deps.onBeforeAgentStart(event, ctx);
   });
   pi.on("model_select", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onModelSelect(event, ctx);
   });
   pi.on("agent_start", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onAgentStart(event, ctx);
   });
   pi.on("tool_execution_start", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onToolExecutionStart(event, ctx);
   });
   pi.on("tool_execution_update", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onToolExecutionUpdate?.(event, ctx);
   });
   pi.on("tool_execution_end", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onToolExecutionEnd(event, ctx);
   });
   pi.on("message_start", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onMessageStart(event, ctx);
   });
   pi.on("message_update", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onMessageUpdate(event, ctx);
   });
   pi.on("agent_end", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onAgentEnd(event, ctx);
   });
   pi.on("agent_settled", async (event, ctx) => {
+    if (!isActive(ctx)) return;
     await deps.onAgentSettled?.(event, ctx);
   });
 }

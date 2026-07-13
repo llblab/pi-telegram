@@ -16,6 +16,8 @@ import {
   createTelegramPollingControllerState,
   createTelegramPollLoopRunner,
   createTelegramThreadAwarePollingPorts,
+  createTelegramThreadCapabilityStateRuntime,
+  createTelegramThreadTargetObservationBinding,
   getLatestTelegramUpdateId,
   isTelegramGetUpdatesConflictError,
   isTelegramPollingControllerActive,
@@ -59,6 +61,35 @@ test("Polling helpers extract the latest update id", () => {
     getLatestTelegramUpdateId([{ update_id: 1 }, { update_id: 7 }]),
     7,
   );
+});
+
+test("Thread target observation binding supports late runtime composition", async () => {
+  const events: string[] = [];
+  const binding = createTelegramThreadTargetObservationBinding<string>();
+
+  await binding.handle("before");
+  binding.set(async (ctx) => {
+    events.push(ctx);
+  });
+  await binding.handle("after");
+
+  assert.deepEqual(events, ["after"]);
+});
+
+test("Thread capability state runtime owns transition flags", () => {
+  const state = createTelegramThreadCapabilityStateRuntime();
+
+  assert.equal(state.isBusPollingStarted(), false);
+  assert.equal(state.isTopicModeUnavailable(), false);
+  assert.equal(state.shouldForceFreshLeaderThread(), false);
+
+  state.setBusPollingStarted(true);
+  state.setTopicModeUnavailable(true);
+  state.setForceFreshLeaderThread(true);
+
+  assert.equal(state.isBusPollingStarted(), true);
+  assert.equal(state.isTopicModeUnavailable(), true);
+  assert.equal(state.shouldForceFreshLeaderThread(), true);
 });
 
 test("Thread-aware polling blocks follower takeover during Threaded Mode downgrade", async () => {
@@ -673,6 +704,38 @@ test("Poll loop persists long-poll offsets only after handling updates", async (
   assert.deepEqual(handled, [6]);
   assert.equal(config.lastUpdateId, 5);
   assert.deepEqual(persisted, []);
+});
+
+test("Poll loop does not readmit an update after offset persistence fails", async () => {
+  const config = { botToken: "123:abc", lastUpdateId: 5 };
+  const handled: number[] = [];
+  let getUpdatesCalls = 0;
+  let persistCalls = 0;
+  await runTelegramPollLoop({
+    ctx: TEST_CONTEXT,
+    signal: new AbortController().signal,
+    config,
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      getUpdatesCalls += 1;
+      if (getUpdatesCalls <= 2) return [{ update_id: 6 }];
+      throw new DOMException("stop", "AbortError");
+    },
+    persistConfig: async () => {
+      persistCalls += 1;
+      if (persistCalls === 1) throw new Error("config commit failed");
+    },
+    handleUpdate: async (update) => {
+      handled.push(update.update_id);
+    },
+    onErrorStatus: () => {},
+    onStatusReset: () => {},
+    sleep: async () => {},
+  });
+
+  assert.deepEqual(handled, [6]);
+  assert.equal(persistCalls, 2);
+  assert.equal(config.lastUpdateId, 6);
 });
 
 test("Poll loop skips repeatedly failing updates after the configured threshold", async () => {

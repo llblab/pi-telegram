@@ -12,6 +12,9 @@ import test from "node:test";
 
 import {
   chooseTelegramThreadName,
+  createTelegramCurrentInstanceThreadRuntime,
+  createTelegramLeaderThreadStateRuntime,
+  createTelegramThreadStatusProjectionRuntime,
   createTelegramTopicTargetProvisioner,
   createTelegramThreadName,
   createTelegramTopicTargetRenamer,
@@ -36,6 +39,11 @@ import {
   isTelegramTopicModeUnavailableError,
   isTelegramTopicTargetStaleError,
 } from "../lib/threads.ts";
+import { createTelegramLockRuntime } from "../lib/locks.ts";
+import {
+  isTelegramApiCommitUnknownError,
+  TelegramApiCommitUnknownError,
+} from "../lib/telegram-api.ts";
 
 test("Thread owner keys isolate named Telegram profiles without changing default keys", () => {
   assert.equal(
@@ -418,6 +426,69 @@ test("Thread store denies follower writes until transport ownership promotes", a
   }
 });
 
+test("Thread store snapshot commit is fenced by exact lock ownership", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-state-fence-"));
+  const path = join(dir, "state.json");
+  const locksPath = join(dir, "locks.json");
+  try {
+    const owner = createTelegramLockRuntime({
+      locksPath,
+      instanceId: "leader:first",
+    });
+    const acquired = owner.acquire({ cwd: "/repo" });
+    assert.equal(acquired.ok, true);
+    const store = createTelegramTopicTargetStore({
+      path,
+      canPersist: () => true,
+      commitPersist: (commit) => owner.commitIfOwned(commit),
+    });
+    store.upsert({
+      profileKey: "cwd:/repo",
+      target: { chatId: 7, threadId: 42 },
+      status: "active",
+      createdAtMs: 1000,
+      updatedAtMs: 1000,
+      instanceId: "leader:first",
+      slot: "A",
+    });
+    await store.persist();
+
+    store.upsert({
+      profileKey: "manual:follower-b",
+      target: { chatId: 7, threadId: 43 },
+      status: "active",
+      createdAtMs: 1100,
+      updatedAtMs: 1100,
+      instanceId: "follower-b",
+      slot: "B",
+    });
+    const replacement = createTelegramLockRuntime({
+      locksPath,
+      instanceId: "leader:replacement",
+    });
+    const replaced = replacement.acquire(
+      { cwd: "/repo" },
+      {
+        force: true,
+        expectedOwner: acquired.ok ? acquired.lock : undefined,
+      },
+    );
+    assert.equal(replaced.ok, true);
+    await assert.rejects(
+      store.persist(),
+      /lost exact transport ownership before commit/,
+    );
+
+    const reloaded = createTelegramTopicTargetStore({ path });
+    await reloaded.load();
+    assert.equal(reloaded.getByProfileKey("cwd:/repo")?.target.threadId, 42);
+    assert.equal(reloaded.getByProfileKey("manual:follower-b"), undefined);
+    assert.equal(store.getByProfileKey("manual:follower-b"), undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("Thread store load does not clobber unpersisted thread mutations", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-state-"));
   const path = join(dir, "state.json");
@@ -482,6 +553,62 @@ test("Thread store concurrent persists use unique temp files", async () => {
     const file = JSON.parse(await readFile(path, "utf8"));
     assert.equal(file.threads.length, 1);
     assert.equal(file.threads[0].target.threadId, 42);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Thread store retains mutations that arrive during snapshot commit", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-state-revision-"));
+  const path = join(dir, "state.json");
+  try {
+    let injectMutation = true;
+    let store: ReturnType<typeof createTelegramTopicTargetStore>;
+    store = createTelegramTopicTargetStore({
+      path,
+      commitPersist(commit) {
+        if (injectMutation) {
+          injectMutation = false;
+          store.upsert({
+            profileKey: "manual:follower-b",
+            target: { chatId: -1001, threadId: 43 },
+            status: "active",
+            createdAtMs: 1100,
+            updatedAtMs: 1100,
+            slot: "B",
+          });
+        }
+        commit();
+        return true;
+      },
+    });
+    store.upsert({
+      profileKey: "cwd:/repo",
+      target: { chatId: -1001, threadId: 42 },
+      status: "active",
+      createdAtMs: 1000,
+      updatedAtMs: 1000,
+      slot: "A",
+    });
+
+    await store.persist();
+    let file = JSON.parse(await readFile(path, "utf8"));
+    assert.deepEqual(
+      file.threads.map((record: { target: { threadId: number } }) =>
+        record.target.threadId
+      ),
+      [42],
+    );
+    assert.equal(store.getByProfileKey("manual:follower-b")?.target.threadId, 43);
+
+    await store.persist();
+    file = JSON.parse(await readFile(path, "utf8"));
+    assert.deepEqual(
+      file.threads
+        .map((record: { target: { threadId: number } }) => record.target.threadId)
+        .sort(),
+      [42, 43],
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1414,9 +1541,10 @@ test("Thread provisioner persists pending provision while creating a fresh topic
             id: "provision:inst-a:A:2000",
             owner: "manual-follower",
             instanceId: "inst-a",
+            profileKey: "manual:inst-a",
+            threadName: "Atlas",
             slot: "A",
             startedAtMs: 2000,
-            expiresAtMs: 902000,
             leaderEpoch: 2000,
           },
         ]);
@@ -1437,6 +1565,196 @@ test("Thread provisioner persists pending provision while creating a fresh topic
     const file = JSON.parse(await readFile(path, "utf8"));
     assert.deepEqual(file.pendingProvisions, []);
     assert.equal(file.threads?.[0]?.target.threadId, 77);
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("Thread provisioner preserves ambiguous creation intent and blocks successor duplication", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-provision-ambiguous-"));
+  const path = join(dir, "state.json");
+  let nowMs = 2000;
+  try {
+    const store = createTelegramTopicTargetStore({
+      path,
+      getNowMs: () => nowMs,
+    });
+    let apiCalls = 0;
+    const provision = createTelegramTopicTargetProvisioner({
+      topicChatId: -1001,
+      store,
+      getNowMs: () => nowMs,
+      async callApi() {
+        apiCalls += 1;
+        throw new TelegramApiCommitUnknownError(
+          "createForumTopic",
+          new Error("response lost"),
+        );
+      },
+    });
+
+    await assert.rejects(
+      () => provision({ instanceId: "inst-a", profileKey: "manual:inst-a" }),
+      isTelegramApiCommitUnknownError,
+    );
+    assert.deepEqual(store.listPendingProvisions(), [
+      {
+        id: "provision:inst-a:A:2000",
+        owner: "manual-follower",
+        instanceId: "inst-a",
+        profileKey: "manual:inst-a",
+        status: "ambiguous",
+        threadName: "Atlas",
+        slot: "A",
+        startedAtMs: 2000,
+      },
+    ]);
+
+    nowMs = 902001;
+    const successor = createTelegramTopicTargetProvisioner({
+      topicChatId: -1001,
+      store,
+      getNowMs: () => nowMs,
+      async callApi<TResponse>() {
+        apiCalls += 1;
+        return { message_thread_id: 99 } as TResponse;
+      },
+    });
+    await assert.rejects(
+      () =>
+        successor({
+          instanceId: "replacement-inst",
+          profileKey: "manual:inst-a",
+        }),
+      /remains ambiguous/,
+    );
+    assert.equal(apiCalls, 1);
+    const file = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(file.pendingProvisions?.[0]?.status, "ambiguous");
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("Thread provisioner treats a malformed successful create as commit-unknown", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-provision-malformed-"));
+  try {
+    const store = createTelegramTopicTargetStore({
+      path: join(dir, "state.json"),
+      getNowMs: () => 2000,
+    });
+    const provision = createTelegramTopicTargetProvisioner({
+      topicChatId: -1001,
+      store,
+      getNowMs: () => 2000,
+      async callApi<TResponse>() {
+        return {} as TResponse;
+      },
+    });
+
+    await assert.rejects(
+      () => provision({ instanceId: "inst-a", profileKey: "manual:inst-a" }),
+      isTelegramApiCommitUnknownError,
+    );
+    assert.equal(store.listPendingProvisions()[0]?.status, "ambiguous");
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("Thread provisioner fails closed before mutation without leader ownership", async () => {
+  const store = createTelegramTopicTargetStore({
+    path: "/tmp/unused-telegram-targets-no-owner.json",
+    getNowMs: () => 2000,
+  });
+  let apiCalls = 0;
+  const provision = createTelegramTopicTargetProvisioner({
+    topicChatId: -1001,
+    store,
+    getCurrentLeaderEpoch: () => undefined,
+    async callApi<TResponse>() {
+      apiCalls += 1;
+      return { message_thread_id: 77 } as TResponse;
+    },
+  });
+
+  await assert.rejects(
+    provision({ instanceId: "inst-a", profileKey: "manual:inst-a" }),
+    /lost leader ownership \(start\)/,
+  );
+  assert.equal(apiCalls, 0);
+  assert.deepEqual(store.listPendingProvisions(), []);
+});
+
+test("Thread provisioner preserves its intent and stops binding after create loses ownership", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-provision-epoch-loss-"));
+  const path = join(dir, "state.json");
+  let currentEpoch: number | undefined = 1;
+  try {
+    const store = createTelegramTopicTargetStore({
+      path,
+      getNowMs: () => 2000,
+    });
+    const provision = createTelegramTopicTargetProvisioner({
+      topicChatId: -1001,
+      store,
+      getNowMs: () => 2000,
+      getCurrentLeaderEpoch: () => currentEpoch,
+      async callApi<TResponse>() {
+        currentEpoch = undefined;
+        return { message_thread_id: 77 } as TResponse;
+      },
+    });
+
+    await assert.rejects(
+      provision({ instanceId: "inst-a", profileKey: "manual:inst-a" }),
+      /lost leader ownership/,
+    );
+
+    assert.deepEqual(store.list(), []);
+    assert.deepEqual(store.listPendingProvisions(), [
+      {
+        id: "provision:inst-a:A:2000",
+        owner: "manual-follower",
+        instanceId: "inst-a",
+        profileKey: "manual:inst-a",
+        status: "ambiguous",
+        threadName: "Atlas",
+        slot: "A",
+        target: { chatId: -1001, threadId: 77 },
+        startedAtMs: 2000,
+        leaderEpoch: 1,
+      },
+    ]);
+    const file = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(file.pendingProvisions?.[0]?.leaderEpoch, 1);
+    assert.deepEqual(file.threads, []);
+
+    currentEpoch = 2;
+    const successorStore = createTelegramTopicTargetStore({
+      path,
+      getNowMs: () => 3000,
+    });
+    await successorStore.load();
+    let successorApiCalls = 0;
+    const successor = createTelegramTopicTargetProvisioner({
+      topicChatId: -1001,
+      store: successorStore,
+      getNowMs: () => 3000,
+      getCurrentLeaderEpoch: () => currentEpoch,
+      async callApi<TResponse>() {
+        successorApiCalls += 1;
+        return { message_thread_id: 99 } as TResponse;
+      },
+    });
+    const recovered = await successor({
+      instanceId: "replacement-inst",
+      profileKey: "manual:inst-a",
+    });
+    assert.equal(recovered.reused, true);
+    assert.deepEqual(recovered.target, { chatId: -1001, threadId: 77 });
+    assert.equal(successorApiCalls, 0);
+    assert.deepEqual(successorStore.listPendingProvisions(), []);
   } finally {
     await rm(dir, { force: true, recursive: true });
   }
@@ -1484,10 +1802,11 @@ test("Thread provisioner keeps targeted pending provision after post-create bind
         id: "provision:inst-a:A:2000",
         owner: "manual-follower",
         instanceId: "inst-a",
+        profileKey: "manual:inst-a",
+        threadName: "Atlas",
         slot: "A",
         target: { chatId: -1001, threadId: 88 },
         startedAtMs: 2000,
-        expiresAtMs: 902000,
       },
     ]);
     const file = JSON.parse(await readFile(path, "utf8"));
@@ -1993,6 +2312,95 @@ test("Thread helpers prefer follower and current store targets when resolving an
     { chatId: 7, threadId: 10 },
   );
   assert.equal(resolveTelegramInstanceThreadTarget({}), undefined);
+});
+
+test("Leader thread state runtime owns target identity transitions", () => {
+  const state = createTelegramLeaderThreadStateRuntime();
+  assert.equal(state.getTarget(), undefined);
+  state.set({
+    target: { chatId: 7, threadId: 11 },
+    slot: "C",
+    threadName: "Cedar",
+  });
+  assert.deepEqual(state.getIdentity(), {
+    target: { chatId: 7, threadId: 11 },
+    slot: "C",
+    threadName: "Cedar",
+  });
+  state.clear();
+  assert.equal(state.getIdentity(), undefined);
+});
+
+test("Current-instance thread runtime owns record and live identity selection", () => {
+  const records = [
+    {
+      profileKey: "manual:follower",
+      owner: { kind: "manual-follower" as const, instanceId: "current" },
+      target: { chatId: 7, threadId: 11 },
+      status: "active" as const,
+      createdAtMs: 1,
+      updatedAtMs: 1,
+      instanceId: "current",
+      slot: "B",
+      threadName: "Beacon",
+    },
+  ];
+  let registered = false;
+  const runtime = createTelegramCurrentInstanceThreadRuntime({
+    instanceId: "current",
+    listRecords: () => records,
+    getPreferredTarget: () => ({ chatId: 7, threadId: 11 }),
+    getFollower: () => ({
+      registered,
+      target: { chatId: 7, threadId: 11 },
+      slot: "C",
+      threadName: "Cedar",
+    }),
+    getLeader: () => undefined,
+  });
+
+  assert.equal(runtime.findRecord()?.threadName, "Beacon");
+  assert.equal(runtime.getRecord(), undefined);
+  registered = true;
+  assert.equal(runtime.getRecord()?.threadName, "Beacon");
+  assert.deepEqual(runtime.getIdentity(), {
+    target: { chatId: 7, threadId: 11 },
+    slot: "C",
+    threadName: "Cedar",
+  });
+});
+
+test("Thread status runtime owns bus and identity projections", () => {
+  const runtime = createTelegramThreadStatusProjectionRuntime({
+    getThreadMode: () => "enabled",
+    isBusPollingStarted: () => false,
+    isFollowerRegistered: () => true,
+    listFollowers: () => [],
+    listRecords: () => [],
+    listReservations: () => [],
+    listSyncObservations: () => [],
+    getLeaderSocketPath: () => "/tmp/leader.sock",
+    getFollowerSocketPath: () => "/tmp/follower.sock",
+    getTransportKind: () => "socket",
+    getFollowerTarget: () => ({ chatId: 7, threadId: 11 }),
+    getFollowerSlot: () => "C",
+    getFollowerThreadName: () => "Cedar",
+    getCurrentIdentity: () => ({ slot: "C", threadName: "Cedar" }),
+  });
+
+  assert.equal(runtime.getBusRole(), "follower");
+  assert.equal(runtime.getInstanceSlot(), "C");
+  assert.equal(runtime.getInstanceThreadName(), "Cedar");
+  assert.deepEqual(runtime.getLocalBus(), {
+    leaderSocketPath: "/tmp/leader.sock",
+    leaderTransport: "socket",
+    followerSocketPath: "/tmp/follower.sock",
+    followerTransport: "socket",
+    followerRegistered: true,
+    followerTarget: { chatId: 7, threadId: 11 },
+    followerSlot: "C",
+    followerThreadName: "Cedar",
+  });
 });
 
 test("Thread helpers project thread state for status without entrypoint mapping", () => {

@@ -4,12 +4,22 @@
  * Owns persisted bot/session pairing state, local config storage, live config controls, authorization policy, and first-user pairing side effects
  */
 
-import { existsSync } from "node:fs";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { resolveAgentDir, resolveTelegramConfigPath } from "./paths.ts";
 
 import type { TelegramInboundHandlerConfig } from "./inbound.ts";
 import type { CommandTemplateObjectConfig } from "./command-templates.ts";
+import { withTelegramFileTransaction } from "./locks.ts";
 
 const CONFIG_RUNTIME_KEY = "__piTelegramConfigRuntime__";
 
@@ -136,9 +146,7 @@ export function resolveTelegramActiveProfile(
 }
 
 /** List defined profile names. */
-export function getTelegramProfileNames(
-  config: TelegramConfig,
-): string[] {
+export function getTelegramProfileNames(config: TelegramConfig): string[] {
   return Object.keys(config.profiles ?? {}).sort();
 }
 
@@ -251,16 +259,31 @@ export async function readTelegramConfig(
     onInvalidConfig?: (recovery: TelegramInvalidConfigRecovery) => void;
   } = {},
 ): Promise<TelegramConfig> {
-  if (!existsSync(configPath)) return {};
-  const content = await readFile(configPath, "utf8");
-  try {
-    return JSON.parse(content) as TelegramConfig;
-  } catch (error) {
-    const recoveryPath = getInvalidTelegramConfigRecoveryPath(configPath);
-    await rename(configPath, recoveryPath);
-    options.onInvalidConfig?.({ configPath, recoveryPath, error });
-    return {};
-  }
+  return withTelegramFileTransaction(`${configPath}.transaction`, () => {
+    if (!existsSync(configPath)) return {};
+    const identity = statSync(configPath);
+    const content = readFileSync(configPath, "utf8");
+    try {
+      return JSON.parse(content) as TelegramConfig;
+    } catch (error) {
+      const currentIdentity = statSync(configPath);
+      if (
+        currentIdentity.dev !== identity.dev ||
+        currentIdentity.ino !== identity.ino ||
+        currentIdentity.size !== identity.size ||
+        currentIdentity.mtimeMs !== identity.mtimeMs
+      ) {
+        throw new Error(
+          `Telegram config changed while validating invalid content: ${configPath}`,
+          { cause: error },
+        );
+      }
+      const recoveryPath = getInvalidTelegramConfigRecoveryPath(configPath);
+      renameSync(configPath, recoveryPath);
+      options.onInvalidConfig?.({ configPath, recoveryPath, error });
+      return {};
+    }
+  });
 }
 
 export async function writeTelegramConfig(
@@ -279,7 +302,88 @@ export async function writeTelegramConfig(
   await chmod(configPath, 0o600);
 }
 
-function getTelegramProfileFields(config: TelegramConfig): TelegramBotProfile | undefined {
+function isPlainConfigRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function cloneTelegramConfig<T>(value: T): T {
+  return structuredClone(value);
+}
+
+function configValuesEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function mergeTelegramConfigDelta(
+  base: Record<string, unknown>,
+  desired: Record<string, unknown>,
+  latest: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = cloneTelegramConfig(latest);
+  for (const key of new Set([...Object.keys(base), ...Object.keys(desired)])) {
+    const baseHas = Object.hasOwn(base, key);
+    const desiredHas = Object.hasOwn(desired, key);
+    const baseValue = base[key];
+    const desiredValue = desired[key];
+    if (baseHas === desiredHas && configValuesEqual(baseValue, desiredValue)) {
+      continue;
+    }
+    if (!desiredHas) {
+      if (key !== "lastUpdateId") delete merged[key];
+      continue;
+    }
+    if (
+      key === "lastUpdateId" &&
+      typeof desiredValue === "number" &&
+      typeof merged[key] === "number"
+    ) {
+      merged[key] = Math.max(desiredValue, merged[key] as number);
+      continue;
+    }
+    if (
+      isPlainConfigRecord(desiredValue) &&
+      (!baseHas || isPlainConfigRecord(baseValue))
+    ) {
+      merged[key] = mergeTelegramConfigDelta(
+        isPlainConfigRecord(baseValue) ? baseValue : {},
+        desiredValue,
+        isPlainConfigRecord(merged[key]) ? merged[key] : {},
+      );
+      continue;
+    }
+    merged[key] = cloneTelegramConfig(desiredValue);
+  }
+  return merged;
+}
+
+function readTelegramConfigForTransaction(configPath: string): TelegramConfig {
+  if (!existsSync(configPath)) return {};
+  const parsed: unknown = JSON.parse(readFileSync(configPath, "utf8"));
+  if (!isPlainConfigRecord(parsed)) {
+    throw new Error(`Invalid Telegram config object: ${configPath}`);
+  }
+  return parsed as TelegramConfig;
+}
+
+function writeTelegramConfigInTransaction(
+  agentDir: string,
+  configPath: string,
+  config: TelegramConfig,
+): void {
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  const tempConfigPath = `${configPath}.tmp-${process.pid}-${randomUUID()}`;
+  writeFileSync(tempConfigPath, `${JSON.stringify(config, null, "\t")}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  chmodSync(tempConfigPath, 0o600);
+  renameSync(tempConfigPath, configPath);
+  chmodSync(configPath, 0o600);
+}
+
+export function getTelegramProfileFields(
+  config: TelegramConfig,
+): TelegramBotProfile | undefined {
   const token = config.botToken?.trim();
   if (!token) return undefined;
   return {
@@ -332,13 +436,22 @@ function storeTelegramEffectiveConfig(
 export function createTelegramConfigStore(
   options: TelegramConfigStoreOptions = {},
 ): TelegramConfigStore {
-  let config: TelegramConfig = options.initialConfig ?? {};
+  let config: TelegramConfig = cloneTelegramConfig(options.initialConfig ?? {});
+  let persistedConfig: TelegramConfig = {};
+  let mutationVersion = 0;
+  let persistQueue: Promise<void> = Promise.resolve();
   let activeProfileName: string | undefined;
   const agentDir = options.agentDir ?? resolveAgentDir();
   const configPath = options.configPath ?? getConfigPath();
-  const getEffectiveConfig = () => applyTelegramProfile(config, activeProfileName);
+  const getEffectiveConfig = () =>
+    applyTelegramProfile(config, activeProfileName);
   const setEffectiveConfig = (nextConfig: TelegramConfig) => {
-    config = storeTelegramEffectiveConfig(config, nextConfig, activeProfileName);
+    config = storeTelegramEffectiveConfig(
+      config,
+      nextConfig,
+      activeProfileName,
+    );
+    mutationVersion += 1;
   };
   return {
     get: getEffectiveConfig,
@@ -379,18 +492,45 @@ export function createTelegramConfigStore(
           });
         },
       });
-      if (activeProfileName && !config.profiles?.[activeProfileName]) {
-        activeProfileName = undefined;
-      }
+      persistedConfig = cloneTelegramConfig(config);
+      mutationVersion += 1;
     },
-    persist: async (nextConfig = getEffectiveConfig()) => {
-      const storedConfig = storeTelegramEffectiveConfig(
+    persist: (nextConfig = getEffectiveConfig()) => {
+      const profileName = activeProfileName;
+      const desiredConfig = storeTelegramEffectiveConfig(
         config,
-        nextConfig,
-        activeProfileName,
+        cloneTelegramConfig(nextConfig),
+        profileName,
       );
-      config = storedConfig;
-      await writeTelegramConfig(agentDir, configPath, storedConfig);
+      const baseConfig = cloneTelegramConfig(persistedConfig);
+      const capturedMutationVersion = mutationVersion;
+      const persist = persistQueue.then(() => {
+        const mergedConfig = withTelegramFileTransaction(
+          `${configPath}.transaction`,
+          () => {
+            const latestConfig = readTelegramConfigForTransaction(configPath);
+            const merged = mergeTelegramConfigDelta(
+              baseConfig as Record<string, unknown>,
+              desiredConfig as Record<string, unknown>,
+              latestConfig as Record<string, unknown>,
+            ) as TelegramConfig;
+            writeTelegramConfigInTransaction(agentDir, configPath, merged);
+            return merged;
+          },
+        );
+        persistedConfig = cloneTelegramConfig(mergedConfig);
+        if (mutationVersion === capturedMutationVersion) {
+          config = cloneTelegramConfig(mergedConfig);
+        } else {
+          config = mergeTelegramConfigDelta(
+            baseConfig as Record<string, unknown>,
+            config as Record<string, unknown>,
+            mergedConfig as Record<string, unknown>,
+          ) as TelegramConfig;
+        }
+      });
+      persistQueue = persist.catch(() => undefined);
+      return persist;
     },
   };
 }

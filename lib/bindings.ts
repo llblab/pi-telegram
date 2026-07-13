@@ -38,12 +38,15 @@ type TelegramBridgeStatusUpdater =
 interface TelegramCommandsAndToolsBindingDeps {
   pi: Pi.ExtensionAPI;
   configStore: Config.TelegramConfigStore;
-  persistConfig: () => Promise<void>;
+  persistConfig: (config?: Config.TelegramConfig) => Promise<void>;
   setup: Setup.TelegramSetupGuard;
   activeTurnRuntime: Queue.TelegramActiveTurnStore<Queue.PendingTelegramTurn>;
   lockedPollingRuntime: Locks.TelegramLockedPollingRuntime<Pi.ExtensionContext>;
   stopPolling?: () => Promise<void | string>;
-  getStatusLines: (options?: Status.TelegramBridgeStatusLineOptions) => string[];
+  onTransportChanged?: () => Promise<void> | void;
+  getStatusLines: (
+    options?: Status.TelegramBridgeStatusLineOptions,
+  ) => string[];
   buttonActionStore: OutboundHandlers.TelegramButtonActionStore;
   sendMarkdownReply: (
     chatId: number,
@@ -67,6 +70,7 @@ export function registerTelegramCommandsAndTools({
   activeTurnRuntime,
   lockedPollingRuntime,
   stopPolling,
+  onTransportChanged,
   getStatusLines,
   buttonActionStore,
   sendMarkdownReply,
@@ -113,6 +117,7 @@ export function registerTelegramCommandsAndTools({
           await (stopPolling ?? lockedPollingRuntime.stop)();
         }
         configStore.activateProfile(undefined);
+        await onTransportChanged?.();
       } else {
         const storedConfig = configStore.getStoredConfig();
         setupConfigStore = Config.createTelegramConfigStore({
@@ -129,27 +134,35 @@ export function registerTelegramCommandsAndTools({
         setupConfigStore.activateProfile(profileName);
         persistSetupConfig = async () => {
           try {
+            if (previousProfileName !== profileName) {
+              await (stopPolling ?? lockedPollingRuntime.stop)();
+            }
+            const profile = Config.getTelegramProfileFields(
+              setupConfigStore.get(),
+            );
+            if (!profile) {
+              throw new Error(
+                `Telegram profile "${profileName}" has no token.`,
+              );
+            }
+            await configStore.load();
+            const latestConfig = configStore.getStoredConfig();
             configStore.activateProfile(undefined);
             configStore.set({
-              ...storedConfig,
+              ...latestConfig,
               profiles: {
-                ...(storedConfig.profiles ?? {}),
-                [profileName]: storedConfig.profiles?.[profileName] ?? {
-                  botToken: "",
-                },
+                ...(latestConfig.profiles ?? {}),
+                [profileName]: profile,
               },
             });
             configStore.activateProfile(profileName);
-            configStore.set(setupConfigStore.get());
-            await persistConfig();
+            await onTransportChanged?.();
+            await persistConfig(configStore.get());
           } catch (error) {
-            configStore.activateProfile(undefined);
-            configStore.set(storedConfig);
+            await configStore.load().catch(() => undefined);
             configStore.activateProfile(previousProfileName);
+            await onTransportChanged?.();
             throw error;
-          }
-          if (previousProfileName !== profileName) {
-            await (stopPolling ?? lockedPollingRuntime.stop)();
           }
         };
       }
@@ -177,23 +190,25 @@ export function registerTelegramCommandsAndTools({
     getProfileNames: () =>
       Config.getTelegramProfileNames(configStore.getStoredConfig()),
     activateDefaultProfileConfig: async () => {
-      await configStore.load();
       const previousProfileName = configStore.getActiveProfileName();
+      await configStore.load();
       if (previousProfileName) {
         await (stopPolling ?? lockedPollingRuntime.stop)();
       }
       configStore.activateProfile(undefined);
+      await onTransportChanged?.();
     },
     activateProfileConfig: async (_ctx, profileName) => {
+      const previousProfileName = configStore.getActiveProfileName();
       await configStore.load();
       if (!Config.isValidTelegramProfileName(profileName)) return false;
       const storedConfig = configStore.getStoredConfig();
       if (!storedConfig.profiles?.[profileName]) return false;
-      const previousProfileName = configStore.getActiveProfileName();
       if (previousProfileName !== profileName) {
         await (stopPolling ?? lockedPollingRuntime.stop)();
       }
       if (!configStore.activateProfile(profileName)) return false;
+      await onTransportChanged?.();
       return true;
     },
   });
@@ -272,6 +287,8 @@ interface TelegramLifecycleBindingDeps {
   isProactivePushEnabled: () => boolean;
   canSendProactivePush: (ctx: Pi.ExtensionContext) => boolean;
   canSendAgentActivity: (ctx: Pi.ExtensionContext) => boolean;
+  isSessionContextActive: (ctx: Pi.ExtensionContext) => boolean;
+  isTurnTransportActive?: (turn: Queue.PendingTelegramTurn) => boolean;
   updateStatus: TelegramBridgeStatusUpdater;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }
@@ -307,6 +324,8 @@ export function registerTelegramLifecycleRuntimeHooks({
   isProactivePushEnabled,
   canSendProactivePush,
   canSendAgentActivity,
+  isSessionContextActive = () => true,
+  isTurnTransportActive,
   updateStatus,
   recordRuntimeEvent,
 }: TelegramLifecycleBindingDeps): void {
@@ -332,7 +351,9 @@ export function registerTelegramLifecycleRuntimeHooks({
     const stagingTarget = proactivePushTargetGetter();
     const stagingChatId = stagingTarget?.chatId ?? proactivePushChatIdGetter();
     if (stagingChatId === undefined) {
-      throw new Error("Guest attachment staging requires a paired Telegram chat");
+      throw new Error(
+        "Guest attachment staging requires a paired Telegram chat",
+      );
     }
     await OutboundAttachments.deliverTelegramGuestCachedAttachment({
       guestQueryId: turn.guestQueryId!,
@@ -346,7 +367,8 @@ export function registerTelegramLifecycleRuntimeHooks({
       answerGuestText: (guestQueryId, text) =>
         answerGuestQuery(guestQueryId, text),
       fallbackText:
-        caption || "Telegram bridge could not deliver the requested attachment.",
+        caption ||
+        "Telegram bridge could not deliver the requested attachment.",
       deleteMessage,
       recordRuntimeEvent,
     });
@@ -455,6 +477,8 @@ export function registerTelegramLifecycleRuntimeHooks({
     getFoldQueuedPromptsIntoHistory:
       lifecycle.shouldFoldQueuedPromptsIntoHistory,
     resetRuntimeState: agentEndResetter,
+    isSessionActive: isSessionContextActive,
+    isTurnTransportActive,
     waitForTypingIdle: typing.waitForIdle,
     dispatchNextQueuedTelegramTurn,
     requestDeferredDispatchNextQueuedTelegramTurn:
@@ -512,6 +536,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     });
   };
   const compactionObserver = Lifecycle.createTelegramCompactionObserverRuntime({
+    isContextActive: isSessionContextActive,
     setCompactionInProgress: lifecycle.setCompactionInProgress,
     updateStatus,
     startTypingLoop: startAgentActivityTypingLoop,
@@ -532,34 +557,41 @@ export function registerTelegramLifecycleRuntimeHooks({
     });
   const messageActivityHooks = messageActivityTypingHooks;
   Lifecycle.registerTelegramLifecycleHooks(pi, {
+    isSessionActive: isSessionContextActive,
     ...sessionLifecycleRuntime,
     ...agentLifecycleHooks,
     onInput(event) {
       activityRuntime.recordInputSource(event.source ?? "unknown");
     },
     async onSessionStart(event, ctx) {
+      previewRuntime.invalidate();
       activityRuntime.onSessionStart?.();
       await sessionLifecycleRuntime.onSessionStart(event, ctx);
     },
     async onSessionShutdown(event, ctx) {
+      if (!isSessionContextActive(ctx)) return;
       activityRuntime.onSessionShutdown();
       compactionObserver.onSessionShutdown();
       await sessionLifecycleRuntime.onSessionShutdown(event, ctx);
     },
     onSessionBeforeCompact(event, ctx) {
+      if (!isSessionContextActive(ctx)) return;
       activityRuntime.onCompactionStart(Pi.getSessionCompactionReason(event));
       compactionObserver.onSessionBeforeCompact(event, ctx);
     },
     onSessionCompact(event, ctx) {
+      if (!isSessionContextActive(ctx)) return;
       activityRuntime.onCompactionEnd(Pi.getSessionCompactionReason(event));
       compactionObserver.onSessionCompact(event, ctx);
     },
     async onAgentStart(event, ctx) {
+      if (!isSessionContextActive(ctx)) return;
       await agentStartWithDedupReset(event, ctx);
       activityRuntime.onAgentStart(activeTurnRuntime.get()?.target);
       startAgentActivityTypingLoop(ctx);
     },
-    async onToolExecutionStart(event, _ctx) {
+    async onToolExecutionStart(event, ctx) {
+      if (!isSessionContextActive(ctx)) return;
       agentLifecycleHooks.onToolExecutionStart();
       activityRuntime.onToolStart({
         toolCallId: event.toolCallId,
@@ -567,7 +599,8 @@ export function registerTelegramLifecycleRuntimeHooks({
         args: event.args,
       });
     },
-    onToolExecutionUpdate(event) {
+    onToolExecutionUpdate(event, ctx) {
+      if (!isSessionContextActive(ctx)) return;
       activityRuntime.onToolUpdate({
         toolCallId: event.toolCallId,
         toolName: event.toolName,
@@ -575,6 +608,7 @@ export function registerTelegramLifecycleRuntimeHooks({
       });
     },
     async onToolExecutionEnd(event, ctx) {
+      if (!isSessionContextActive(ctx)) return;
       activityRuntime.onToolEnd({
         toolCallId: event.toolCallId,
         toolName: event.toolName,
@@ -584,9 +618,11 @@ export function registerTelegramLifecycleRuntimeHooks({
       agentLifecycleHooks.onToolExecutionEnd(event, ctx);
     },
     async onMessageStart(event, ctx) {
+      if (!isSessionContextActive(ctx)) return;
       await messageActivityHooks.onMessageStart(event, ctx);
     },
     async onMessageUpdate(event, ctx) {
+      if (!isSessionContextActive(ctx)) return;
       if (event.assistantMessageEvent) {
         activityRuntime.onAssistantEvent(
           event.assistantMessageEvent as Activity.TelegramAssistantStreamEvent,
@@ -595,10 +631,12 @@ export function registerTelegramLifecycleRuntimeHooks({
       await messageActivityHooks.onMessageUpdate(event, ctx);
     },
     async onAgentEnd(event, ctx) {
+      if (!isSessionContextActive(ctx)) return;
       activityRuntime.onAgentEnd();
       await agentLifecycleHooks.onAgentEnd(event, ctx);
     },
-    onAgentSettled() {
+    onAgentSettled(_event, ctx) {
+      if (!isSessionContextActive(ctx)) return;
       activityRuntime.onAgentSettled();
     },
     onBeforeAgentStart: Prompts.createTelegramProactiveBeforeAgentStartHook({

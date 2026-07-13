@@ -30,8 +30,7 @@ export interface TelegramLeaderThreadSyncDeps {
   getRandom?: () => number;
   getCurrentLeaderEpoch?: () => number | string | undefined;
   getThreadReconciliationMachineState?: () =>
-    | ThreadReconciler.ThreadReconciliationMachineState
-    | undefined;
+    ThreadReconciler.ThreadReconciliationMachineState | undefined;
   recordThreadReconciliationPlan?: (
     plan: ThreadReconciler.ThreadReconciliationPlan,
   ) => void;
@@ -67,8 +66,7 @@ export interface TelegramTopicLifecycleSyncDeps {
   isTopicProvisioningActive?: () => boolean;
   getCurrentLeaderEpoch?: () => number | string | undefined;
   getThreadReconciliationMachineState?: () =>
-    | ThreadReconciler.ThreadReconciliationMachineState
-    | undefined;
+    ThreadReconciler.ThreadReconciliationMachineState | undefined;
   recordThreadReconciliationPlan?: (
     plan: ThreadReconciler.ThreadReconciliationPlan,
   ) => void;
@@ -83,8 +81,9 @@ export type TelegramTopicLifecycleSyncHandler<TMessage = unknown> = (
   lifecycle: TelegramTopicLifecycleSyncUpdate<TMessage>,
 ) => Promise<void>;
 
-export interface TelegramObservedTopicLifecycleSyncDeps<TSyncState>
-  extends TelegramTopicLifecycleSyncDeps {
+export interface TelegramObservedTopicLifecycleSyncDeps<
+  TSyncState,
+> extends TelegramTopicLifecycleSyncDeps {
   getSyncState: () => TSyncState;
   setSyncState: (state: TSyncState) => void;
   getNowMs?: () => number;
@@ -122,6 +121,7 @@ export interface TelegramManualThreadDisconnectDeps<TSyncState> {
     body: Record<string, unknown>,
   ) => Promise<TResponse>;
   getLeaderTarget: () => TelegramTarget | undefined;
+  getCurrentLeaderEpoch?: () => number | string | undefined;
   clearLeaderTarget: () => void;
   getSyncState: () => TSyncState;
   setSyncState: (state: TSyncState) => void;
@@ -134,11 +134,9 @@ export interface TelegramManualThreadDisconnectDeps<TSyncState> {
   getNowMs?: () => number;
 }
 
-export function markTelegramConfigSyncChange<TSyncState extends TelegramSyncState>(
-  state: TSyncState,
-  action: string,
-  options?: { nowMs?: number },
-): TSyncState {
+export function markTelegramConfigSyncChange<
+  TSyncState extends TelegramSyncState,
+>(state: TSyncState, action: string, options?: { nowMs?: number }): TSyncState {
   const nowMs = options?.nowMs ?? Date.now();
   let nextState = markTelegramSyncSliceFresh(state, "pairing", {
     nowMs,
@@ -163,10 +161,18 @@ export function createTelegramManualThreadDisconnectHandler<
     if (currentRecord?.target.threadId) {
       const isManualFollower = currentRecord.owner?.kind === "manual-follower";
       if (!isManualFollower) {
+        const leaderEpoch = deps.getCurrentLeaderEpoch?.();
+        const stillOwnsLeaderEpoch = () =>
+          !deps.getCurrentLeaderEpoch ||
+          (leaderEpoch !== undefined &&
+            deps.getCurrentLeaderEpoch() === leaderEpoch);
         await ThreadReconciler.applyThreadReconciliationPlan(
           ThreadReconciler.planDisconnectedInstanceThreadCleanup({
-            target: currentRecord.target as TelegramTarget & { threadId: number },
+            target: currentRecord.target as TelegramTarget & {
+              threadId: number;
+            },
             instanceId: deps.instanceId,
+            leaderEpoch,
           }),
           {
             callApi(method, body) {
@@ -175,11 +181,17 @@ export function createTelegramManualThreadDisconnectHandler<
             persist() {
               return deps.topicTargetStore.persist();
             },
+            getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
             recordRuntimeEvent: deps.recordRuntimeEvent,
           },
         );
-        if (deps.topicTargetStore.markOfflineByInstanceId(deps.instanceId) > 0) {
+        if (!stillOwnsLeaderEpoch()) return deps.stopPolling();
+        const offlineChanged =
+          deps.topicTargetStore.markOfflineByInstanceId(deps.instanceId) > 0;
+        if (!stillOwnsLeaderEpoch()) return deps.stopPolling();
+        if (offlineChanged) {
           await deps.topicTargetStore.persist();
+          if (!stillOwnsLeaderEpoch()) return deps.stopPolling();
         }
       }
       const leaderTarget = deps.getLeaderTarget();
@@ -305,15 +317,27 @@ export async function recoverStaleTelegramTopicApiError<
 export async function ensureTelegramLeaderThreadBinding(
   deps: TelegramLeaderThreadSyncDeps,
 ): Promise<TelegramOwnTopicProvisionResult | undefined> {
-  await deps.topicTargetStore.load();
-  const priorTargets = deps.topicTargetStore
-    .list()
-    .filter((record) => {
-      return (
-        record.instanceId === deps.instanceId &&
-        (record.status === "active" || record.status === "starting")
+  const leaderEpoch = deps.getCurrentLeaderEpoch?.();
+  const assertLeaderEpoch = (phase: string): void => {
+    if (
+      deps.getCurrentLeaderEpoch &&
+      (leaderEpoch === undefined ||
+        deps.getCurrentLeaderEpoch() !== leaderEpoch)
+    ) {
+      throw new Error(
+        `Telegram leader thread binding lost ownership (${phase}).`,
       );
-    });
+    }
+  };
+  assertLeaderEpoch("start");
+  await deps.topicTargetStore.load();
+  assertLeaderEpoch("after-load");
+  const priorTargets = deps.topicTargetStore.list().filter((record) => {
+    return (
+      record.instanceId === deps.instanceId &&
+      (record.status === "active" || record.status === "starting")
+    );
+  });
   // Short-circuit: when the instance already has an active thread and we are not
   // force-freshing, reuse it without re-provisioning. A thread belongs to the
   // live instance binding, not to one transient Pi session lifecycle.
@@ -330,6 +354,7 @@ export async function ensureTelegramLeaderThreadBinding(
         slot: record.slot,
       },
     );
+    assertLeaderEpoch("before-reuse");
     return {
       target: record.target,
       slot: record.slot ?? "A",
@@ -360,6 +385,7 @@ export async function ensureTelegramLeaderThreadBinding(
     }
     if (forcedUnnamedStale) await deps.topicTargetStore.persist();
   }
+  assertLeaderEpoch("before-provision");
   const ownTarget = await provisionOwnBusTopic({
     getAllowedUserId: deps.getAllowedUserId,
     instanceId: deps.instanceId,
@@ -375,6 +401,7 @@ export async function ensureTelegramLeaderThreadBinding(
     getRandom: deps.getRandom,
     recordEvent: deps.recordEvent,
   });
+  assertLeaderEpoch("after-provision");
   if (!ownTarget) return undefined;
   const replacementPlan = ThreadReconciler.planThreadReconciliation({
     nowMs: Date.now(),
@@ -404,7 +431,9 @@ export async function ensureTelegramLeaderThreadBinding(
     getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
     recordRuntimeEvent: deps.recordEvent,
   });
+  assertLeaderEpoch("before-final-persist");
   await deps.topicTargetStore.persist();
+  assertLeaderEpoch("after-final-persist");
   return ownTarget;
 }
 
@@ -452,6 +481,53 @@ export function createUnknownTelegramSyncState(): TelegramSyncState {
   return Object.fromEntries(
     TELEGRAM_SYNC_SLICES.map((slice) => [slice, { status: "unknown" }]),
   ) as TelegramSyncState;
+}
+
+export interface TelegramSyncStateRuntime {
+  getState(): TelegramSyncState;
+  setState(state: TelegramSyncState): void;
+  markConfigChange(action: string): void;
+  markSliceFresh(
+    slice: TelegramSyncSlice,
+    options: { nowMs: number; action: string },
+  ): void;
+}
+
+export function createTelegramSyncStateRuntime(
+  initialState = createUnknownTelegramSyncState(),
+): TelegramSyncStateRuntime {
+  let state = initialState;
+  return {
+    getState: () => state,
+    setState(nextState) {
+      state = nextState;
+    },
+    markConfigChange(action) {
+      state = markTelegramConfigSyncChange(state, action);
+    },
+    markSliceFresh(slice, options) {
+      state = markTelegramSyncSliceFresh(state, slice, options);
+    },
+  };
+}
+
+export interface TelegramProvisioningActivityRuntime {
+  isActive(): boolean;
+  start(): void;
+  end(): void;
+}
+
+export function createTelegramProvisioningActivityRuntime(): TelegramProvisioningActivityRuntime {
+  let activeCount = 0;
+  return {
+    isActive: () => activeCount > 0,
+    start() {
+      activeCount += 1;
+    },
+    end() {
+      activeCount = Math.max(0, activeCount - 1);
+    },
+  };
 }
 
 const RECONCILE_TRIGGERS = new Set<TelegramSyncTrigger>([
@@ -518,9 +594,8 @@ export function createTelegramObservedTopicLifecycleSyncHandler<
 >(
   deps: TelegramObservedTopicLifecycleSyncDeps<TSyncState>,
 ): TelegramTopicLifecycleSyncHandler<TMessage> {
-  const syncTopicLifecycle = createTelegramTopicLifecycleSyncHandler<TMessage>(
-    deps,
-  );
+  const syncTopicLifecycle =
+    createTelegramTopicLifecycleSyncHandler<TMessage>(deps);
   return async (lifecycle) => {
     const nowMs = deps.getNowMs ?? Date.now;
     deps.setSyncState(
@@ -580,14 +655,12 @@ export function createTelegramTopicLifecycleSyncHandler<TMessage = unknown>(
     const changed = result.changed;
     if (lifecycle.kind === "created" && deps.isBusEnabled()) {
       const target = lifecycle.target;
-      const isKnownInRecords = deps.topicTargetStore
-        .list()
-        .some((record) => {
-          return (
-            record.target.chatId === target.chatId &&
-            record.target.threadId === target.threadId
-          );
-        });
+      const isKnownInRecords = deps.topicTargetStore.list().some((record) => {
+        return (
+          record.target.chatId === target.chatId &&
+          record.target.threadId === target.threadId
+        );
+      });
       const isKnownInReservations = deps.topicTargetStore
         .listReservations()
         .some((reservation) => {

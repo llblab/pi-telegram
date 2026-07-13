@@ -100,6 +100,9 @@ export interface TelegramMediaGroupState<TMessage, TContext = unknown> {
   messages: TMessage[];
   context?: TContext;
   flushTimer?: ReturnType<typeof setTimeout>;
+  dispatching?: boolean;
+  suspended?: boolean;
+  reschedule?: () => void;
 }
 
 export interface TelegramMediaGroupController<
@@ -109,9 +112,14 @@ export interface TelegramMediaGroupController<
   queueMessage: (options: {
     message: TMessage;
     context?: TContext;
-    dispatchMessages: (messages: TMessage[], ctx?: TContext) => void;
+    dispatchMessages: (
+      messages: TMessage[],
+      ctx?: TContext,
+    ) => unknown | Promise<unknown>;
   }) => boolean;
   removeMessages: (messageIds: number[]) => number;
+  suspend: () => void;
+  resume: (context: TContext) => void;
   clear: () => void;
 }
 
@@ -140,13 +148,7 @@ export interface TelegramMediaGroupControllerOptions {
 }
 
 export type TelegramAttachmentKind =
-  | "photo"
-  | "document"
-  | "video"
-  | "audio"
-  | "voice"
-  | "animation"
-  | "sticker";
+  "photo" | "document" | "video" | "audio" | "voice" | "animation" | "sticker";
 
 export interface TelegramFileInfo {
   file_id: string;
@@ -306,11 +308,16 @@ function truncateTelegramReplyContextText(text: string): string {
   return `${text.slice(0, TELEGRAM_REPLY_CONTEXT_MAX_LENGTH).trimEnd()}…`;
 }
 
-function formatTelegramUser(user: TelegramMessageUser | undefined): string | undefined {
+function formatTelegramUser(
+  user: TelegramMessageUser | undefined,
+): string | undefined {
   if (!user) return undefined;
   if (user.username) return user.username;
   if (typeof user.id === "number") return String(user.id);
-  const name = [user.first_name, user.last_name].filter(Boolean).join(" ").trim();
+  const name = [user.first_name, user.last_name]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
   return name || undefined;
 }
 
@@ -331,7 +338,8 @@ export function extractTelegramForwardContextText(
   message: TelegramMediaMessage,
   allowedUserId?: number,
 ): string {
-  const originUser = message.forward_origin?.sender_user ?? message.forward_from;
+  const originUser =
+    message.forward_origin?.sender_user ?? message.forward_from;
   const isOwnerOrigin =
     typeof allowedUserId === "number" && originUser?.id === allowedUserId;
   const origin = formatTelegramForwardOriginIdentifier(message);
@@ -497,21 +505,55 @@ export function queueTelegramMediaGroupMessage<
   debounceMs: number;
   setTimer: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
-  dispatchMessages: (messages: TMessage[], ctx?: TContext) => void;
+  dispatchMessages: (
+    messages: TMessage[],
+    ctx?: TContext,
+  ) => unknown | Promise<unknown>;
 }): boolean {
   const key = getTelegramMediaGroupKey(options.message);
   if (!key) return false;
   const existing = options.groups.get(key) ?? { messages: [] };
   existing.messages.push(options.message);
   existing.context = options.context;
+  const scheduleDispatch = (): void => {
+    if (existing.suspended) return;
+    existing.flushTimer = options.setTimer(() => {
+      existing.flushTimer = undefined;
+      const state = options.groups.get(key);
+      if (!state) return;
+      if (state.dispatching) {
+        scheduleDispatch();
+        return;
+      }
+      const dispatchedMessages = [...state.messages];
+      const dispatchedIds = new Set(
+        dispatchedMessages.map((message) => message.message_id),
+      );
+      state.dispatching = true;
+      void Promise.resolve(
+        options.dispatchMessages(dispatchedMessages, state.context),
+      ).then(
+        () => {
+          if (options.groups.get(key) !== state) return;
+          state.messages = state.messages.filter(
+            (message) => !dispatchedIds.has(message.message_id),
+          );
+          state.dispatching = false;
+          if (state.messages.length === 0) options.groups.delete(key);
+          else if (!state.flushTimer) scheduleDispatch();
+        },
+        () => {
+          if (options.groups.get(key) !== state) return;
+          state.dispatching = false;
+          if (!state.flushTimer) scheduleDispatch();
+        },
+      );
+    }, options.debounceMs);
+    existing.flushTimer.unref?.();
+  };
+  existing.reschedule = scheduleDispatch;
   if (existing.flushTimer) options.clearTimer(existing.flushTimer);
-  existing.flushTimer = options.setTimer(() => {
-    const state = options.groups.get(key);
-    options.groups.delete(key);
-    if (!state) return;
-    options.dispatchMessages(state.messages, state.context);
-  }, options.debounceMs);
-  existing.flushTimer.unref?.();
+  scheduleDispatch();
   options.groups.set(key, existing);
   return true;
 }
@@ -542,6 +584,20 @@ export function createTelegramMediaGroupController<
       }),
     removeMessages: (messageIds) =>
       removePendingTelegramMediaGroupMessages(groups, messageIds, clearTimer),
+    suspend: () => {
+      for (const state of groups.values()) {
+        state.suspended = true;
+        if (state.flushTimer) clearTimer(state.flushTimer);
+        state.flushTimer = undefined;
+      }
+    },
+    resume: (context) => {
+      for (const state of groups.values()) {
+        state.context = context;
+        state.suspended = false;
+        if (!state.dispatching && !state.flushTimer) state.reschedule?.();
+      }
+    },
     clear: () => {
       for (const state of groups.values()) {
         if (state.flushTimer) clearTimer(state.flushTimer);
@@ -562,11 +618,10 @@ export function createTelegramMediaGroupDispatchRuntime<
       const queuedMediaGroup = deps.mediaGroups.queueMessage({
         message,
         context: ctx,
-        dispatchMessages: (messages, queuedCtx) => {
-          if (queuedCtx !== undefined) {
-            void deps.dispatchMessages(messages, queuedCtx);
-          }
-        },
+        dispatchMessages: (messages, queuedCtx) =>
+          queuedCtx === undefined
+            ? Promise.resolve()
+            : deps.dispatchMessages(messages, queuedCtx),
       });
       if (queuedMediaGroup) return;
       await deps.dispatchMessages([message], ctx);

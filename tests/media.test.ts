@@ -219,7 +219,7 @@ test("Media helpers key messages by chat and media group", () => {
   );
 });
 
-test("Media helpers replace debounce timers and dispatch grouped messages", () => {
+test("Media helpers replace debounce timers and dispatch grouped messages", async () => {
   const groups = new Map<
     string,
     TelegramMediaGroupState<{
@@ -262,7 +262,46 @@ test("Media helpers replace debounce timers and dispatch grouped messages", () =
   });
   assert.deepEqual(cleared, [1]);
   callbacks.at(-1)?.();
+  await Promise.resolve();
   assert.deepEqual(dispatched, [[1, 2]]);
+  assert.equal(groups.size, 0);
+});
+
+test("Media group keeps messages until asynchronous dispatch succeeds", async () => {
+  const groups = new Map<
+    string,
+    TelegramMediaGroupState<{
+      message_id: number;
+      chat: { id: number };
+      media_group_id?: string;
+    }>
+  >();
+  const callbacks: Array<() => void> = [];
+  let attempts = 0;
+  queueTelegramMediaGroupMessage({
+    message: { message_id: 1, chat: { id: 7 }, media_group_id: "album" },
+    groups,
+    debounceMs: 10,
+    setTimer: (callback) => {
+      callbacks.push(callback);
+      return createTestTimer(callbacks.length);
+    },
+    clearTimer: () => {},
+    dispatchMessages: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("queue admission failed");
+    },
+  });
+
+  callbacks[0]?.();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(groups.size, 1);
+  assert.equal(callbacks.length, 2);
+  callbacks[1]?.();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(attempts, 2);
   assert.equal(groups.size, 0);
 });
 
@@ -310,6 +349,41 @@ test("Media group controller owns timers, removal, and cleanup", () => {
   });
   controller.clear();
   assert.deepEqual(cleared, [1, 2, 3]);
+});
+
+test("Media group suspension preserves admitted messages for replacement context", async () => {
+  const callbacks: Array<() => void> = [];
+  const cleared: number[] = [];
+  const dispatched: Array<{ ids: number[]; ctx?: string }> = [];
+  let nextTimer = 1;
+  const controller = createTelegramMediaGroupController<
+    { message_id: number; chat: { id: number }; media_group_id?: string },
+    string
+  >({
+    debounceMs: 100,
+    setTimer: (callback) => {
+      callbacks.push(callback);
+      return createTestTimer(nextTimer++);
+    },
+    clearTimer: (timer) => cleared.push(getTestTimerId(timer)),
+  });
+  controller.queueMessage({
+    message: { message_id: 1, chat: { id: 7 }, media_group_id: "album" },
+    context: "old-session",
+    dispatchMessages: (messages, ctx) =>
+      dispatched.push({
+        ids: messages.map((message) => message.message_id),
+        ctx,
+      }),
+  });
+
+  controller.suspend();
+  controller.resume("new-session");
+  callbacks[1]?.();
+  await Promise.resolve();
+
+  assert.deepEqual(cleared, [1]);
+  assert.deepEqual(dispatched, [{ ids: [1], ctx: "new-session" }]);
 });
 
 test("Media group dispatch runtime handles immediate and grouped messages", async () => {

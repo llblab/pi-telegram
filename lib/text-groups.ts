@@ -22,14 +22,22 @@ export interface TelegramTextGroupState<TMessage, TContext = unknown> {
   messages: TMessage[];
   context?: TContext;
   flushTimer?: ReturnType<typeof setTimeout>;
+  dispatching?: boolean;
+  suspended?: boolean;
+  reschedule?: () => void;
 }
 
 export interface TelegramTextGroupController<TMessage, TContext = unknown> {
   queueMessage: (options: {
     message: TMessage;
     context: TContext;
-    dispatchMessages: (messages: TMessage[], ctx: TContext) => void;
+    dispatchMessages: (
+      messages: TMessage[],
+      ctx: TContext,
+    ) => unknown | Promise<unknown>;
   }) => boolean;
+  suspend: () => void;
+  resume: (context: TContext) => void;
   clear: () => void;
 }
 
@@ -71,9 +79,10 @@ function getTelegramTextGroupKey(
   if (message.media_group_id) return undefined;
   if (!message.from || message.from.is_bot) return undefined;
   if (typeof message.text !== "string") return undefined;
-  const threadKey = typeof message.message_thread_id === "number"
-    ? `thread:${message.message_thread_id}`
-    : "private";
+  const threadKey =
+    typeof message.message_thread_id === "number"
+      ? `thread:${message.message_thread_id}`
+      : "private";
   return `${message.chat.id}:${threadKey}:${message.from.id}`;
 }
 
@@ -114,7 +123,10 @@ export function queueTelegramTextGroupMessage<
   minSplitLength: number;
   setTimer: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
-  dispatchMessages: (messages: TMessage[], ctx: TContext) => void;
+  dispatchMessages: (
+    messages: TMessage[],
+    ctx: TContext,
+  ) => unknown | Promise<unknown>;
 }): boolean {
   const key = getTelegramTextGroupKey(options.message);
   if (!key) return false;
@@ -129,14 +141,45 @@ export function queueTelegramTextGroupMessage<
   const state = existing ?? { messages: [] };
   state.messages.push(options.message);
   state.context = options.context;
+  const scheduleDispatch = (): void => {
+    if (state.suspended) return;
+    state.flushTimer = options.setTimer(() => {
+      state.flushTimer = undefined;
+      const queued = options.groups.get(key);
+      if (!queued || queued.context === undefined) return;
+      if (queued.dispatching) {
+        scheduleDispatch();
+        return;
+      }
+      const dispatchedMessages = [...queued.messages];
+      const dispatchedIds = new Set(
+        dispatchedMessages.map((message) => message.message_id),
+      );
+      queued.dispatching = true;
+      void Promise.resolve(
+        options.dispatchMessages(dispatchedMessages, queued.context),
+      ).then(
+        () => {
+          if (options.groups.get(key) !== queued) return;
+          queued.messages = queued.messages.filter(
+            (message) => !dispatchedIds.has(message.message_id),
+          );
+          queued.dispatching = false;
+          if (queued.messages.length === 0) options.groups.delete(key);
+          else if (!queued.flushTimer) scheduleDispatch();
+        },
+        () => {
+          if (options.groups.get(key) !== queued) return;
+          queued.dispatching = false;
+          if (!queued.flushTimer) scheduleDispatch();
+        },
+      );
+    }, options.debounceMs);
+    state.flushTimer.unref?.();
+  };
+  state.reschedule = scheduleDispatch;
   if (state.flushTimer) options.clearTimer(state.flushTimer);
-  state.flushTimer = options.setTimer(() => {
-    const queued = options.groups.get(key);
-    options.groups.delete(key);
-    if (!queued || queued.context === undefined) return;
-    options.dispatchMessages(queued.messages, queued.context);
-  }, options.debounceMs);
-  state.flushTimer.unref?.();
+  scheduleDispatch();
   options.groups.set(key, state);
   return true;
 }
@@ -168,6 +211,20 @@ export function createTelegramTextGroupController<
         clearTimer,
         dispatchMessages,
       }),
+    suspend: () => {
+      for (const state of groups.values()) {
+        state.suspended = true;
+        if (state.flushTimer) clearTimer(state.flushTimer);
+        state.flushTimer = undefined;
+      }
+    },
+    resume: (context) => {
+      for (const state of groups.values()) {
+        state.context = context;
+        state.suspended = false;
+        if (!state.dispatching && !state.flushTimer) state.reschedule?.();
+      }
+    },
     clear: () => {
       for (const state of groups.values()) {
         if (state.flushTimer) clearTimer(state.flushTimer);
@@ -190,9 +247,8 @@ export function createTelegramTextGroupDispatchRuntime<
       const queuedTextGroup = deps.textGroups.queueMessage({
         message,
         context: ctx,
-        dispatchMessages: (messages, queuedCtx) => {
-          void deps.dispatchMessages(messages, queuedCtx);
-        },
+        dispatchMessages: (messages, queuedCtx) =>
+          deps.dispatchMessages(messages, queuedCtx),
       });
       if (queuedTextGroup) return;
       await deps.dispatchSingleMessage(message, ctx);

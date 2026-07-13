@@ -31,6 +31,7 @@ import {
   downloadTelegramFile,
   fetchTelegramBotIdentity,
   getTelegramInboundFileByteLimitFromEnv,
+  isTelegramApiCommitUnknownError,
   isTelegramMessageNotModifiedError,
   setTelegramApiHttpsFetchForTesting,
   prepareTelegramTempDir,
@@ -371,7 +372,7 @@ test("Telegram API helpers include HTTP status details for failed responses", as
   }
 });
 
-test("Telegram API helpers retry 429 and 5xx responses", async () => {
+test("Non-idempotent Telegram API calls retry explicit 429 but report 5xx commit unknown", async () => {
   const sleeps: number[] = [];
   let calls = 0;
   const restoreFetch = setApiTestFetch(async () => {
@@ -389,26 +390,50 @@ test("Telegram API helpers retry 429 and 5xx responses", async () => {
     return createApiJsonResponse("sent");
   });
   try {
-    const result = await callTelegram<string>(
-      "123:abc",
-      "sendMessage",
-      {},
-      {
-        retryBaseDelayMs: 10,
-        sleep: async (ms) => {
-          sleeps.push(ms);
-        },
-      },
+    await assert.rejects(
+      () =>
+        callTelegram<string>("123:abc", "sendMessage", {}, {
+          retryBaseDelayMs: 10,
+          sleep: async (ms) => {
+            sleeps.push(ms);
+          },
+        }),
+      (error) =>
+        isTelegramApiCommitUnknownError(error) &&
+        error.method === "sendMessage",
     );
-    assert.equal(result, "sent");
-    assert.equal(calls, 3);
-    assert.deepEqual(sleeps, [2000, 20]);
+    assert.equal(calls, 2);
+    assert.deepEqual(sleeps, [2000]);
   } finally {
     restoreFetch();
   }
 });
 
-test("Telegram API transport falls back to IPv4 once for fetch failures", async () => {
+test("Retry-safe Telegram API methods replay 5xx responses", async () => {
+  let calls = 0;
+  const restoreFetch = setApiTestFetch(async () => {
+    calls += 1;
+    return calls === 1
+      ? createApiErrorResponse(502, "Bad Gateway")
+      : createApiJsonResponse("edited");
+  });
+  try {
+    assert.equal(
+      await callTelegram<string>(
+        "123:abc",
+        "editMessageText",
+        {},
+        { retryBaseDelayMs: 0, sleep: async () => {} },
+      ),
+      "edited",
+    );
+    assert.equal(calls, 2);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("Retry-safe Telegram API transport falls back to IPv4 once", async () => {
   const familySeen: boolean[] = [];
   let calls = 0;
   const restoreEnv = setApiTestNetworkFamily("ipv4-fallback");
@@ -428,7 +453,7 @@ test("Telegram API transport falls back to IPv4 once for fetch failures", async 
     assert.equal(
       await callTelegram<string>(
         "123:abc",
-        "sendMessage",
+        "editMessageText",
         {},
         {
           maxAttempts: 1,
@@ -466,7 +491,7 @@ test("Telegram API transport does not IPv4-fallback retry HTTP 400", async () =>
   }
 });
 
-test("Telegram multipart API rebuilds forms for transport fallback", async () => {
+test("Telegram multipart transport failure reports commit unknown without fallback", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-upload-fallback-"));
   const filePath = join(tempDir, "demo.txt");
   await writeFile(filePath, "hello", "utf8");
@@ -495,20 +520,22 @@ test("Telegram multipart API rebuilds forms for transport fallback", async () =>
     },
   );
   try {
-    assert.equal(
-      await callTelegramMultipart<boolean>(
-        "123:abc",
-        "sendDocument",
-        { chat_id: "1" },
-        "document",
-        filePath,
-        "demo.txt",
-        { maxAttempts: 1 },
-      ),
-      true,
+    await assert.rejects(
+      () =>
+        callTelegramMultipart<boolean>(
+          "123:abc",
+          "sendDocument",
+          { chat_id: "1" },
+          "document",
+          filePath,
+          "demo.txt",
+          { maxAttempts: 1 },
+        ),
+      (error) => isTelegramApiCommitUnknownError(error),
     );
-    assert.deepEqual(formStates, ["auto:blob", "ipv4:buffer"]);
+    assert.deepEqual(formStates, ["auto:blob"]);
     assert.equal(forms.size, 1);
+    assert.equal(calls, 1);
   } finally {
     restoreHttpsFetch();
     restoreFetch();
@@ -597,7 +624,7 @@ test("Telegram transport diagnostics serialize nested fetch causes", async () =>
   ]);
 });
 
-test("Telegram multipart API rebuilds forms for retryable responses", async () => {
+test("Telegram multipart 5xx reports commit unknown without replay", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-upload-"));
   const filePath = join(tempDir, "demo.txt");
   await writeFile(filePath, "hello", "utf8");
@@ -616,20 +643,21 @@ test("Telegram multipart API rebuilds forms for retryable responses", async () =
     return createApiJsonResponse(true);
   });
   try {
-    assert.equal(
-      await callTelegramMultipart<boolean>(
-        "123:abc",
-        "sendDocument",
-        { chat_id: "1" },
-        "document",
-        filePath,
-        "demo.txt",
-        { retryBaseDelayMs: 0, sleep: async () => {} },
-      ),
-      true,
+    await assert.rejects(
+      () =>
+        callTelegramMultipart<boolean>(
+          "123:abc",
+          "sendDocument",
+          { chat_id: "1" },
+          "document",
+          filePath,
+          "demo.txt",
+          { retryBaseDelayMs: 0, sleep: async () => {} },
+        ),
+      (error) => isTelegramApiCommitUnknownError(error),
     );
-    assert.equal(calls, 2);
-    assert.deepEqual(contentTypes, ["blob", "blob"]);
+    assert.equal(calls, 1);
+    assert.deepEqual(contentTypes, ["blob"]);
   } finally {
     restoreFetch();
   }
@@ -719,6 +747,23 @@ test("Telegram API helpers reject malformed successful responses", async () => {
     await assert.rejects(() => callTelegram("123:abc", "getMe", {}), {
       message: "Telegram API getMe returned invalid JSON",
     });
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("Non-idempotent malformed success becomes commit-unknown", async () => {
+  const restoreFetch = setApiTestFetch(async () =>
+    createMalformedApiTextResponse("not json"),
+  );
+  try {
+    await assert.rejects(
+      () =>
+        callTelegram("123:abc", "createForumTopic", {}, {
+          maxAttempts: 1,
+        }),
+      isTelegramApiCommitUnknownError,
+    );
   } finally {
     restoreFetch();
   }

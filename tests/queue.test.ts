@@ -38,6 +38,8 @@ import {
   createTelegramQueueDispatchWatchdogRuntime,
   createTelegramQueueMutationController,
   createTelegramQueueStore,
+  createTelegramTransportStampedQueueStore,
+  createTelegramTransportStampRuntime,
   createTelegramSessionLifecycleHooks,
   createTelegramSessionLifecycleRuntime,
   createTelegramSessionStateApplier,
@@ -125,6 +127,60 @@ test("Queue store owns queued item state helpers", () => {
   store.setQueuedItems([]);
   assert.deepEqual(store.getQueuedItems(), []);
   assert.equal(store.hasQueuedItems(), false);
+});
+
+test("Transport stamp runtime owns profile and token generations", () => {
+  let profile: string | undefined;
+  let botToken: string | undefined = "token-a";
+  const runtime = createTelegramTransportStampRuntime({
+    getProfileName: () => profile,
+    getBotToken: () => botToken,
+  });
+
+  const initial = runtime.getStamp();
+  assert.deepEqual(initial, { profile: "default", generation: "1" });
+  assert.equal(runtime.isActive(initial), true);
+  assert.equal(runtime.isActive(undefined), false);
+
+  profile = "work";
+  const afterProfileChange = runtime.getStamp();
+  assert.deepEqual(afterProfileChange, { profile: "work", generation: "2" });
+  assert.equal(runtime.isActive(initial), false);
+
+  botToken = "token-b";
+  const afterTokenChange = runtime.getStamp();
+  assert.deepEqual(afterTokenChange, { profile: "work", generation: "3" });
+  assert.equal(runtime.isActive(afterProfileChange), false);
+  assert.equal(runtime.isActive(afterTokenChange), true);
+});
+
+test("Transport-stamped queue store preserves admitted generations", () => {
+  const runtime = createTelegramTransportStampRuntime({
+    getProfileName: () => "work",
+    getBotToken: () => "token",
+  });
+  const rawStore = createTelegramQueueStore<string>();
+  const store = createTelegramTransportStampedQueueStore(
+    rawStore,
+    runtime.getStamp,
+  );
+  const unstamped = createQueueTestPromptTurn({ queueOrder: 1, laneOrder: 1 });
+  const preserved = createQueueTestPromptTurn({
+    queueOrder: 2,
+    laneOrder: 2,
+    transportStamp: { profile: "old", generation: "9" },
+  });
+
+  store.setQueuedItems([unstamped, preserved]);
+
+  assert.deepEqual(store.getQueuedItems()[0]?.transportStamp, {
+    profile: "work",
+    generation: "1",
+  });
+  assert.deepEqual(store.getQueuedItems()[1]?.transportStamp, {
+    profile: "old",
+    generation: "9",
+  });
 });
 
 test("Active turn store owns active turn state helpers", () => {
@@ -1122,6 +1178,73 @@ test("Agent end runtime can schedule active-turn final delivery without blocking
     "attachments:1",
     "dispatch",
   ]);
+});
+
+test("Agent end scheduled delivery stops after session generation loss", async () => {
+  const events: string[] = [];
+  let active = true;
+  let scheduledTask: (() => Promise<void>) | undefined;
+  await handleTelegramAgentEndRuntime({
+    turn: createQueueTestPromptTurn(),
+    assistant: { text: "stale final" },
+    foldQueuedPromptsIntoHistory: false,
+    isSessionActive: () => active,
+    resetRuntimeState: () => events.push("reset"),
+    updateStatus: () => events.push("status"),
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    scheduleActiveTurnDelivery: (task) => {
+      scheduledTask = task;
+    },
+    clearPreview: async () => {
+      events.push("clear");
+    },
+    setPreviewPendingText: () => events.push("preview"),
+    finalizeMarkdownPreview: async () => {
+      events.push("finalize");
+      return true;
+    },
+    sendMarkdownReply: async () => events.push("send"),
+    sendTextReply: async () => events.push("text"),
+    sendQueuedAttachments: async () => {
+      events.push("attachments");
+    },
+  });
+  active = false;
+  await scheduledTask?.();
+
+  assert.deepEqual(events, ["reset", "status"]);
+});
+
+test("Agent end stops old-profile delivery after preview finalization yields", async () => {
+  const events: string[] = [];
+  let transportActive = true;
+  const turn = createQueueTestPromptTurn();
+  turn.transportStamp = { profile: "a", generation: "epoch-a" };
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "old profile final" },
+    foldQueuedPromptsIntoHistory: false,
+    isTurnTransportActive: () => transportActive,
+    resetRuntimeState: () => events.push("reset"),
+    updateStatus: () => events.push("status"),
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {
+      events.push("clear");
+    },
+    setPreviewPendingText: () => events.push("preview"),
+    finalizeMarkdownPreview: async () => {
+      events.push("finalize");
+      transportActive = false;
+      return false;
+    },
+    sendMarkdownReply: async () => events.push("send"),
+    sendTextReply: async () => events.push("text"),
+    sendQueuedAttachments: async () => {
+      events.push("attachments");
+    },
+  });
+
+  assert.deepEqual(events, ["reset", "status", "preview", "finalize"]);
 });
 
 test("Agent end runtime keeps plain notices in the active turn target", async () => {
@@ -2659,6 +2782,56 @@ test("Session runtime helper runs shutdown side effects in order", async () => {
   ]);
 });
 
+test("Session shutdown does not clear replacement state after polling await", async () => {
+  const events: string[] = [];
+  let active = true;
+  await shutdownTelegramSessionRuntime<string>({
+    isSessionActive: () => active,
+    unbindDeferredDispatchContext: () => events.push("unbind"),
+    applyState: () => events.push("state"),
+    clearPendingMediaGroups: () => events.push("media"),
+    clearModelMenuState: () => events.push("menus"),
+    getActiveTurnChatId: () => 42,
+    clearPreview: async () => {
+      events.push("preview");
+    },
+    clearActiveTurn: () => events.push("turn"),
+    clearAbort: () => events.push("abort"),
+    stopPolling: async () => {
+      events.push("polling");
+      active = false;
+    },
+  });
+
+  assert.deepEqual(events, ["unbind", "polling"]);
+});
+
+test("Session shutdown bounds a stuck preview clear", async () => {
+  const events: string[] = [];
+  await shutdownTelegramSessionRuntime<string>({
+    applyState: () => events.push("state"),
+    clearPendingMediaGroups: () => events.push("media"),
+    clearModelMenuState: () => events.push("menus"),
+    getActiveTurnChatId: () => 42,
+    clearPreview: () => new Promise<void>(() => {}),
+    previewShutdownTimeoutMs: 5,
+    clearActiveTurn: () => events.push("turn"),
+    clearAbort: () => events.push("abort"),
+    stopPolling: async () => {
+      events.push("polling");
+    },
+  });
+
+  assert.deepEqual(events, [
+    "polling",
+    "state",
+    "media",
+    "menus",
+    "turn",
+    "abort",
+  ]);
+});
+
 test("Control queue controller appends and dispatches control items", () => {
   const events: string[] = [];
   const execute = async (): Promise<void> => {};
@@ -3017,6 +3190,35 @@ test("Dispatch controller skips inactive stale contexts before readiness checks"
   });
   controller.dispatchNext("stale");
   assert.deepEqual(events, []);
+});
+
+test("Dispatch controller drops stale transport work before sending the next prompt", () => {
+  const stale = createQueueTestPromptTurn({ chatId: 1, replyToMessageId: 11 });
+  stale.transportStamp = { profile: "a", generation: "epoch-a" };
+  const current = createQueueTestPromptTurn({ chatId: 2, replyToMessageId: 22 });
+  current.transportStamp = { profile: "b", generation: "epoch-b" };
+  let items: TelegramQueueItem<string>[] = [stale, current];
+  const sent: number[] = [];
+  const controller = createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => items,
+    setQueuedItems: (next) => {
+      items = next;
+    },
+    canDispatch: () => true,
+    isQueueItemTransportActive: (item) =>
+      item.transportStamp?.profile === "b" &&
+      item.transportStamp.generation === "epoch-b",
+    updateStatus: () => {},
+    sendTextReply: async () => undefined,
+    onPromptDispatchStart: (_ctx, chatId) => sent.push(chatId),
+    sendUserMessage: () => {},
+    onPromptDispatchFailure: () => {},
+  });
+
+  controller.dispatchNext("ctx");
+
+  assert.deepEqual(sent, [2]);
+  assert.deepEqual(items, [current]);
 });
 
 test("Dispatch runtime idles on none and executes control items directly", () => {

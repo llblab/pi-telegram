@@ -10,12 +10,7 @@ import type { TelegramTarget } from "./target.ts";
 type ThreadTarget = TelegramTarget & { threadId: number };
 
 type ThreadRecordStatus =
-  | "active"
-  | "offline"
-  | "stale"
-  | "pending"
-  | "starting"
-  | "failed";
+  "active" | "offline" | "stale" | "pending" | "starting" | "failed";
 
 export interface ThreadReconciliationRecord {
   target: ThreadTarget;
@@ -157,16 +152,10 @@ export type ThreadReconciliationAction =
     };
 
 export type ThreadReconciliationPhase =
-  | "stable"
-  | "provisioning"
-  | "sync-required"
-  | "cleanup-required";
+  "stable" | "provisioning" | "sync-required" | "cleanup-required";
 
 export type ThreadReconciliationEvent =
-  | "settled"
-  | "pending-provision"
-  | "sync-required"
-  | "cleanup-required";
+  "settled" | "pending-provision" | "sync-required" | "cleanup-required";
 
 export interface ThreadReconciliationMachineState {
   phase: ThreadReconciliationPhase;
@@ -410,20 +399,19 @@ function shouldSkipForStaleLeaderEpoch(
   const actionLeaderEpoch = getActionLeaderEpoch(action);
   const currentLeaderEpoch = ports.getCurrentLeaderEpoch?.();
   if (actionLeaderEpoch === undefined) {
-    if (currentLeaderEpoch !== undefined) {
-      ports.recordRuntimeEvent?.(
-        "telegram",
-        "Thread reconciliation destructive action has no leader epoch",
-        {
-          phase: "thread-reconciler-missing-leader-epoch",
-          action: action.kind,
-          currentLeaderEpoch,
-          chatId: action.target.chatId,
-          threadId: action.target.threadId,
-        },
-      );
-    }
-    return false;
+    if (!ports.getCurrentLeaderEpoch) return false;
+    ports.recordRuntimeEvent?.(
+      "telegram",
+      "Thread reconciliation destructive action has no leader epoch",
+      {
+        phase: "thread-reconciler-missing-leader-epoch",
+        currentLeaderEpoch,
+        action: action.kind,
+        chatId: action.target.chatId,
+        threadId: action.target.threadId,
+      },
+    );
+    return true;
   }
   if (currentLeaderEpoch === actionLeaderEpoch) return false;
   ports.recordRuntimeEvent?.(
@@ -492,6 +480,7 @@ export function createThreadReconciliationRuntime(deps: {
 export function planDisconnectedInstanceThreadCleanup(input: {
   target: TelegramTarget & { threadId: number };
   instanceId?: string;
+  leaderEpoch?: number | string;
 }): ThreadReconciliationPlan {
   return {
     actions: [
@@ -500,6 +489,9 @@ export function planDisconnectedInstanceThreadCleanup(input: {
         target: input.target,
         reason: "manual-disconnect",
         instanceId: input.instanceId,
+        ...(input.leaderEpoch !== undefined
+          ? { leaderEpoch: input.leaderEpoch }
+          : {}),
       },
     ],
   };
@@ -510,6 +502,7 @@ export async function applyThreadReconciliationPlan(
   ports: ThreadReconciliationApplyPorts,
 ): Promise<ThreadReconciliationApplyResult> {
   let shouldPersist = false;
+  const persistFences: ThreadReconciliationAction[] = [];
   for (const action of plan.actions) {
     if (action.kind === "remove-reservation") {
       shouldPersist =
@@ -543,12 +536,17 @@ export async function applyThreadReconciliationPlan(
         continue;
       }
       try {
+        if (shouldSkipForStaleLeaderEpoch(action, ports)) continue;
         await ports.callApi("closeForumTopic", {
           chat_id: action.target.chatId,
           message_thread_id: action.target.threadId,
         });
-        shouldPersist =
-          ports.markStaleByTarget?.(action.target, "closed") || shouldPersist;
+        if (!shouldSkipForStaleLeaderEpoch(action, ports)) {
+          const changed =
+            ports.markStaleByTarget?.(action.target, "closed") ?? false;
+          if (changed) persistFences.push(action);
+          shouldPersist = changed || shouldPersist;
+        }
       } catch (error) {
         ports.recordRuntimeEvent?.("telegram", error, {
           phase: `thread-reconciler-${action.reason}-closeForumTopic`,
@@ -584,6 +582,7 @@ export async function applyThreadReconciliationPlan(
       }
       let deleteConfirmed = false;
       for (const method of ["closeForumTopic", "deleteForumTopic"]) {
+        if (shouldSkipForStaleLeaderEpoch(action, ports)) break;
         try {
           await ports.callApi(method, {
             chat_id: action.target.chatId,
@@ -602,6 +601,7 @@ export async function applyThreadReconciliationPlan(
           }
         }
       }
+      if (shouldSkipForStaleLeaderEpoch(action, ports)) continue;
       if (!deleteConfirmed) {
         ports.recordRuntimeEvent?.(
           "telegram",
@@ -617,6 +617,7 @@ export async function applyThreadReconciliationPlan(
         );
         continue;
       }
+      if (shouldSkipForStaleLeaderEpoch(action, ports)) continue;
       if (
         action.kind !== "close-delete-previous-leader-topic" &&
         action.kind !== "close-delete-pruned-follower-topic" &&
@@ -624,8 +625,10 @@ export async function applyThreadReconciliationPlan(
         action.kind !== "close-delete-disconnected-instance-topic" &&
         action.kind !== "close-delete-expired-pending-provision-topic"
       ) {
-        shouldPersist =
-          ports.markStaleByTarget?.(action.target, "deleted") || shouldPersist;
+        const changed =
+          ports.markStaleByTarget?.(action.target, "deleted") ?? false;
+        if (changed) persistFences.push(action);
+        shouldPersist = changed || shouldPersist;
       }
       ports.recordRuntimeEvent?.(
         "telegram",
@@ -667,13 +670,23 @@ export async function applyThreadReconciliationPlan(
         action.kind === "close-delete-expired-pending-provision-topic" &&
         deleteConfirmed
       ) {
-        shouldPersist =
-          ports.removePendingProvisionById?.(action.pendingProvisionId) ||
-          shouldPersist;
+        if (shouldSkipForStaleLeaderEpoch(action, ports)) continue;
+        const changed =
+          ports.removePendingProvisionById?.(action.pendingProvisionId) ??
+          false;
+        if (changed) persistFences.push(action);
+        shouldPersist = changed || shouldPersist;
       }
     }
   }
-  if (shouldPersist) await ports.persist?.();
+  if (shouldPersist) {
+    for (const action of persistFences) {
+      if (shouldSkipForStaleLeaderEpoch(action, ports)) {
+        return { changed: true };
+      }
+    }
+    await ports.persist?.();
+  }
   return { changed: shouldPersist };
 }
 

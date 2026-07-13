@@ -5,12 +5,30 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import {
+  chmodSync,
+  existsSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
+import {
+  chmod,
+  mkdir,
+  readFile,
+  rename,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { dirname } from "node:path";
 
-import type { TelegramApiCallOptions } from "./telegram-api.ts";
+import {
+  isTelegramApiCommitUnknownError,
+  TelegramApiCommitUnknownError,
+  type TelegramApiCallOptions,
+} from "./telegram-api.ts";
 import type { TelegramTarget } from "./target.ts";
+import { withTelegramFileTransaction } from "./locks.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import {
   resolveAgentDir,
@@ -58,12 +76,25 @@ export interface TelegramThreadPendingProvision {
   id: string;
   owner: "leader" | "manual-follower";
   instanceId: string;
+  profileKey?: string;
+  status?: "in-flight" | "ambiguous";
+  threadName?: string;
   slot?: string;
   target?: TelegramTarget & { threadId: number };
   startedAtMs: number;
   expiresAtMs?: number;
   leaderEpoch?: number | string;
 }
+
+type TelegramProvisionRecoveryFile = Record<
+  string,
+  {
+    instanceId: string;
+    profileKey?: string;
+    leaderEpoch?: number | string;
+    target: TelegramTarget & { threadId: number };
+  }
+>;
 
 export interface TelegramTopicSyncObservation {
   target: TelegramTarget & { threadId: number };
@@ -152,7 +183,11 @@ function getNextMonotonicSlot(
       cursorCode = Math.max(cursorCode, reservation.slot.charCodeAt(0));
     }
     for (const provision of pendingProvisions) {
-      if (provision.expiresAtMs !== undefined && provision.expiresAtMs <= nowMs)
+      if (
+        provision.status !== "ambiguous" &&
+        provision.expiresAtMs !== undefined &&
+        provision.expiresAtMs <= nowMs
+      )
         continue;
       if (!provision.slot) continue;
       cursorCode = Math.max(cursorCode, provision.slot.charCodeAt(0));
@@ -191,6 +226,10 @@ export interface TelegramTopicTargetStore {
   listSyncObservations: () => TelegramTopicSyncObservation[];
   reserveThread: (reservation: TelegramThreadReservation) => void;
   upsertPendingProvision: (provision: TelegramThreadPendingProvision) => void;
+  recordPendingProvisionTargetRecovery: (
+    provision: TelegramThreadPendingProvision,
+    target: TelegramTarget & { threadId: number },
+  ) => Promise<boolean>;
   removePendingProvision: (id: string) => boolean;
   removeReservationByTarget: (target: TelegramTarget) => boolean;
   getBotState: () => TelegramBotStateSnapshot;
@@ -234,10 +273,7 @@ export interface TelegramTopicTargetStore {
 }
 
 export function reconcileTelegramFreshAllocationCursor(
-  store: Pick<
-    TelegramTopicTargetStore,
-    "getBotState" | "list" | "setBotState"
-  >,
+  store: Pick<TelegramTopicTargetStore, "getBotState" | "list" | "setBotState">,
   nowMs = Date.now(),
 ): boolean {
   const currentCursor = store.getBotState().lastSlot;
@@ -270,6 +306,7 @@ export interface TelegramTopicTargetStoreOptions {
   path: string | (() => string);
   getNowMs?: () => number;
   canPersist?: () => boolean;
+  commitPersist?: (commit: () => void) => boolean;
 }
 
 export interface TelegramTopicTargetProvisionerDeps {
@@ -285,7 +322,9 @@ export interface TelegramTopicTargetProvisionerDeps {
     | "markStaleByTarget"
     | "allocateSlot"
     | "claimReusableTarget"
+    | "listPendingProvisions"
     | "upsertPendingProvision"
+    | "recordPendingProvisionTargetRecovery"
     | "removePendingProvision"
     | "persist"
   >;
@@ -753,6 +792,15 @@ function normalizePendingProvision(
     id: record.id,
     owner,
     instanceId: record.instanceId,
+    ...(typeof record.profileKey === "string"
+      ? { profileKey: record.profileKey }
+      : {}),
+    ...(record.status === "in-flight" || record.status === "ambiguous"
+      ? { status: record.status }
+      : {}),
+    ...(typeof record.threadName === "string"
+      ? { threadName: record.threadName }
+      : {}),
     ...(typeof record.slot === "string" ? { slot: record.slot } : {}),
     ...(target ? { target } : {}),
     startedAtMs: record.startedAtMs,
@@ -883,7 +931,11 @@ function parseFollowerRecoveryHints(
   const hints = new Map<string, { slot?: string; threadName?: string }>();
   if (!value || typeof value !== "object" || Array.isArray(value)) return hints;
   const liveRoster = (value as Record<string, unknown>).liveRoster;
-  if (!liveRoster || typeof liveRoster !== "object" || Array.isArray(liveRoster))
+  if (
+    !liveRoster ||
+    typeof liveRoster !== "object" ||
+    Array.isArray(liveRoster)
+  )
     return hints;
   const followers = (liveRoster as Record<string, unknown>).busFollowers;
   if (!Array.isArray(followers)) return hints;
@@ -892,7 +944,8 @@ function parseFollowerRecoveryHints(
       continue;
     const record = follower as Record<string, unknown>;
     const target = record.target;
-    if (!target || typeof target !== "object" || Array.isArray(target)) continue;
+    if (!target || typeof target !== "object" || Array.isArray(target))
+      continue;
     const targetRecord = target as Record<string, unknown>;
     if (typeof targetRecord.chatId !== "number") continue;
     const normalizedTarget: TelegramTarget = {
@@ -941,6 +994,7 @@ function isPendingProvisionLiveOrTargeted(
   provision: TelegramThreadPendingProvision,
   nowMs: number,
 ): boolean {
+  if (provision.status === "ambiguous") return true;
   if (provision.expiresAtMs === undefined || provision.expiresAtMs > nowMs) {
     return true;
   }
@@ -964,6 +1018,8 @@ export function createTelegramTopicTargetStore(
   let loaded = false;
   let loadedPath: string | undefined;
   let dirty = false;
+  let mutationRevision = 0;
+  let persistQueue: Promise<void> = Promise.resolve();
   let statusSnapshot: {
     runtime?: Record<string, unknown>;
     liveRoster?: Record<string, unknown>;
@@ -987,6 +1043,21 @@ export function createTelegramTopicTargetStore(
 
   const getPath = () =>
     typeof options.path === "function" ? options.path() : options.path;
+  const getRecoveryPath = (path: string) => `${path}.provision-recovery.json`;
+  const readProvisionRecoveries = (
+    path: string,
+  ): TelegramProvisionRecoveryFile => {
+    const recoveryPath = getRecoveryPath(path);
+    if (!existsSync(recoveryPath)) return {};
+    try {
+      const value = JSON.parse(readFileSync(recoveryPath, "utf8")) as unknown;
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? (value as TelegramProvisionRecoveryFile)
+        : {};
+    } catch {
+      return {};
+    }
+  };
   const resetForPath = (path: string) => {
     if (loadedPath === path) return;
     botState = { threadMode: "unknown" };
@@ -1042,12 +1113,25 @@ export function createTelegramTopicTargetStore(
           reservation.expiresAtMs > nowMs,
       )
       .map((reservation) => ({ ...reservation }));
+    const recoveries = readProvisionRecoveries(path);
     pendingProvisions = (file.pendingProvisions ?? [])
       .filter((provision) => isPendingProvisionLiveOrTargeted(provision, nowMs))
-      .map((provision) => ({
-        ...provision,
-        ...(provision.target ? { target: { ...provision.target } } : {}),
-      }));
+      .map((provision) => {
+        const recovery = recoveries[provision.id];
+        const recoveryMatches =
+          recovery?.instanceId === provision.instanceId &&
+          recovery.profileKey === provision.profileKey &&
+          recovery.leaderEpoch === provision.leaderEpoch &&
+          Number.isInteger(recovery.target?.threadId);
+        return {
+          ...provision,
+          ...(recoveryMatches
+            ? { target: { ...recovery.target }, status: "ambiguous" as const }
+            : provision.target
+              ? { target: { ...provision.target } }
+              : {}),
+        };
+      });
     syncObservations = (file.syncObservations ?? []).map((observation) => ({
       ...observation,
       target: { ...observation.target },
@@ -1056,69 +1140,98 @@ export function createTelegramTopicTargetStore(
     dirty = false;
   };
 
+  const markDirty = (): void => {
+    loaded = true;
+    dirty = true;
+    mutationRevision += 1;
+  };
+
   return {
     async load() {
       if (dirty) return;
       await loadFromDisk();
     },
-    async persist() {
-      const path = getPath();
-      if (loadedPath !== path && !dirty) resetForPath(path);
-      if (options.canPersist && !options.canPersist()) {
-        await loadFromDisk();
-        return;
-      }
-      if (!dirty || !loaded) await loadFromDisk();
-      await mkdir(dirname(path), { recursive: true });
-      const tempPath = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
-      const nowMs = getNowMs();
-      reservations = reservations.filter(
-        (reservation) =>
-          reservation.expiresAtMs === undefined ||
-          reservation.expiresAtMs > nowMs,
-      );
-      pendingProvisions = pendingProvisions.filter((provision) =>
-        isPendingProvisionLiveOrTargeted(provision, nowMs),
-      );
-      const currentRecords = Array.from(records.values())
-        .filter(isCurrentThreadRecord)
-        .map(cloneRecord);
-      records = new Map(
-        currentRecords.map((record) => [
-          getRecordOwnerKey(record),
-          cloneRecord(record),
-        ]),
-      );
-      const file = {
-        version: 1,
-        source: "snapshot",
-        writtenAtMs: nowMs,
-        bot: botState,
-        ...statusSnapshot,
-        identities: Array.from(identities.values()).map(cloneIdentityRecord),
-        reservations: reservations.map((reservation) => ({ ...reservation })),
-        pendingProvisions: pendingProvisions.map((provision) => ({
-          ...provision,
-          ...(provision.target ? { target: { ...provision.target } } : {}),
-        })),
-        syncObservations: syncObservations.map((observation) => ({
-          ...observation,
-          target: { ...observation.target },
-        })),
-        threads: currentRecords.map((record) => {
-          const { profileKey: _profileKey, ...serialized } = record;
-          return serialized;
-        }),
-      };
-      await writeFile(tempPath, `${JSON.stringify(file, null, 2)}\n`, {
-        encoding: "utf8",
-        mode: 0o600,
+    persist() {
+      const persist = persistQueue.then(async () => {
+        const path = getPath();
+        if (loadedPath !== path && !dirty) resetForPath(path);
+        if (options.canPersist && !options.canPersist()) {
+          await loadFromDisk();
+          return;
+        }
+        if (!dirty || !loaded) await loadFromDisk();
+        await mkdir(dirname(path), { recursive: true });
+        const tempPath = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+        const nowMs = getNowMs();
+        reservations = reservations.filter(
+          (reservation) =>
+            reservation.expiresAtMs === undefined ||
+            reservation.expiresAtMs > nowMs,
+        );
+        pendingProvisions = pendingProvisions.filter((provision) =>
+          isPendingProvisionLiveOrTargeted(provision, nowMs),
+        );
+        const currentRecords = Array.from(records.values())
+          .filter(isCurrentThreadRecord)
+          .map(cloneRecord);
+        records = new Map(
+          currentRecords.map((record) => [
+            getRecordOwnerKey(record),
+            cloneRecord(record),
+          ]),
+        );
+        const persistedRevision = mutationRevision;
+        const file = {
+          version: 1,
+          source: "snapshot",
+          writtenAtMs: nowMs,
+          bot: botState,
+          ...statusSnapshot,
+          identities: Array.from(identities.values()).map(cloneIdentityRecord),
+          reservations: reservations.map((reservation) => ({ ...reservation })),
+          pendingProvisions: pendingProvisions.map((provision) => ({
+            ...provision,
+            ...(provision.target ? { target: { ...provision.target } } : {}),
+          })),
+          syncObservations: syncObservations.map((observation) => ({
+            ...observation,
+            target: { ...observation.target },
+          })),
+          threads: currentRecords.map((record) => {
+            const { profileKey: _profileKey, ...serialized } = record;
+            return serialized;
+          }),
+        };
+        await writeFile(tempPath, `${JSON.stringify(file, null, 2)}\n`, {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+        await chmod(tempPath, 0o600);
+        try {
+          if (options.commitPersist) {
+            const committed = options.commitPersist(() => {
+              renameSync(tempPath, path);
+              chmodSync(path, 0o600);
+            });
+            if (!committed) {
+              await loadFromDisk();
+              throw new Error(
+                "Telegram thread snapshot lost exact transport ownership before commit.",
+              );
+            }
+          } else {
+            await rename(tempPath, path);
+            await chmod(path, 0o600);
+          }
+        } catch (error) {
+          await unlink(tempPath).catch(() => undefined);
+          throw error;
+        }
+        loaded = true;
+        if (mutationRevision === persistedRevision) dirty = false;
       });
-      await chmod(tempPath, 0o600);
-      await rename(tempPath, path);
-      await chmod(path, 0o600);
-      loaded = true;
-      dirty = false;
+      persistQueue = persist.catch(() => undefined);
+      return persist;
     },
     list() {
       return Array.from(records.values()).map(cloneRecord);
@@ -1162,8 +1275,7 @@ export function createTelegramTopicTargetStore(
           !targetMatches(existing.target, next.target),
       );
       reservations.push(next);
-      loaded = true;
-      dirty = true;
+      markDirty();
     },
     upsertPendingProvision(provision) {
       const next = {
@@ -1174,8 +1286,41 @@ export function createTelegramTopicTargetStore(
         (existing) => existing.id !== next.id,
       );
       pendingProvisions.push(next);
-      loaded = true;
-      dirty = true;
+      markDirty();
+    },
+    async recordPendingProvisionTargetRecovery(provision, target) {
+      const path = getPath();
+      const recoveryPath = getRecoveryPath(path);
+      await mkdir(dirname(recoveryPath), { recursive: true });
+      withTelegramFileTransaction(`${recoveryPath}.transaction`, () => {
+        const recoveries = readProvisionRecoveries(path);
+        recoveries[provision.id] = {
+          instanceId: provision.instanceId,
+          ...(provision.profileKey ? { profileKey: provision.profileKey } : {}),
+          ...(provision.leaderEpoch !== undefined
+            ? { leaderEpoch: provision.leaderEpoch }
+            : {}),
+          target: { ...target },
+        };
+        const tempPath = `${recoveryPath}.${process.pid}.${randomUUID()}.tmp`;
+        writeFileSync(tempPath, `${JSON.stringify(recoveries, null, 2)}\n`, {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+        renameSync(tempPath, recoveryPath);
+        chmodSync(recoveryPath, 0o600);
+      });
+      const current = pendingProvisions.find(
+        (entry) =>
+          entry.id === provision.id &&
+          entry.instanceId === provision.instanceId &&
+          entry.profileKey === provision.profileKey &&
+          entry.leaderEpoch === provision.leaderEpoch,
+      );
+      if (!current) return false;
+      current.target = { ...target };
+      current.status = "ambiguous";
+      return true;
     },
     removePendingProvision(id) {
       const before = pendingProvisions.length;
@@ -1183,10 +1328,7 @@ export function createTelegramTopicTargetStore(
         (provision) => provision.id !== id,
       );
       const changed = pendingProvisions.length !== before;
-      if (changed) {
-        loaded = true;
-        dirty = true;
-      }
+      if (changed) markDirty();
       return changed;
     },
     removeReservationByTarget(target) {
@@ -1195,10 +1337,7 @@ export function createTelegramTopicTargetStore(
         (reservation) => !targetMatches(reservation.target, target),
       );
       const changed = reservations.length !== before;
-      if (changed) {
-        loaded = true;
-        dirty = true;
-      }
+      if (changed) markDirty();
       return changed;
     },
     getBotState() {
@@ -1208,8 +1347,7 @@ export function createTelegramTopicTargetStore(
     },
     setBotState(state) {
       botState = { ...botState, ...state };
-      loaded = true;
-      dirty = true;
+      markDirty();
     },
     setStatusSnapshot(snapshot) {
       if (!loadedPath) loadedPath = getPath();
@@ -1245,8 +1383,7 @@ export function createTelegramTopicTargetStore(
       const removedOwner = identities.delete(ownerKey);
       const removedProfile = identities.delete(profileKey);
       if (!removedOwner && !removedProfile) return false;
-      loaded = true;
-      dirty = true;
+      markDirty();
       return true;
     },
     upsert(record) {
@@ -1277,8 +1414,7 @@ export function createTelegramTopicTargetStore(
       if (!isCurrentThreadRecord(next)) {
         rememberIdentity(next);
         records.delete(nextOwnerKey);
-        loaded = true;
-        dirty = true;
+        markDirty();
         return cloneRecord(next);
       }
       records.set(nextOwnerKey, next);
@@ -1289,8 +1425,7 @@ export function createTelegramTopicTargetStore(
         rememberSlot(next.slot, next.updatedAtMs);
       }
       rememberIdentity(next);
-      loaded = true;
-      dirty = true;
+      markDirty();
       return cloneRecord(next);
     },
     markOfflineByInstanceId(instanceId) {
@@ -1304,10 +1439,7 @@ export function createTelegramTopicTargetStore(
         records.delete(getRecordOwnerKey(record));
         count += 1;
       }
-      if (count > 0) {
-        loaded = true;
-        dirty = true;
-      }
+      if (count > 0) markDirty();
       return count;
     },
     markStaleByTarget(target, syncStatus = "unknown", lastSyncError) {
@@ -1328,8 +1460,7 @@ export function createTelegramTopicTargetStore(
         });
         rememberIdentity(record);
         records.delete(getRecordOwnerKey(record));
-        loaded = true;
-        dirty = true;
+        markDirty();
         return true;
       }
       return false;
@@ -1345,8 +1476,7 @@ export function createTelegramTopicTargetStore(
         record.lastReconcileAction = "mark-active";
         delete record.lastError;
         delete record.lastSyncError;
-        loaded = true;
-        dirty = true;
+        markDirty();
         return true;
       }
       return false;
@@ -1361,8 +1491,7 @@ export function createTelegramTopicTargetStore(
         record.threadName = normalizedThreadName;
         record.updatedAtMs = nowMs;
         rememberIdentity(record);
-        loaded = true;
-        dirty = true;
+        markDirty();
         return cloneRecord(record);
       }
       return undefined;
@@ -1401,8 +1530,7 @@ export function createTelegramTopicTargetStore(
         record.threadName = threadName;
       delete record.lastError;
       rememberIdentity(record);
-      loaded = true;
-      dirty = true;
+      markDirty();
       return cloneRecord(record);
     },
     allocateSlot(profileKey, preferredSlot) {
@@ -1456,7 +1584,11 @@ function isTelegramTopicTargetSlotOccupied(
     if (reservation.slot === slot) return true;
   }
   for (const provision of pendingProvisions) {
-    if (provision.expiresAtMs !== undefined && provision.expiresAtMs <= nowMs)
+    if (
+      provision.status !== "ambiguous" &&
+      provision.expiresAtMs !== undefined &&
+      provision.expiresAtMs <= nowMs
+    )
       continue;
     if (provision.slot === slot) return true;
   }
@@ -1945,6 +2077,26 @@ export async function provisionOwnBusTopic(
       threadId: record.target.threadId,
       slot: record.slot,
     });
+    if (
+      deps.getCurrentLeaderEpoch &&
+      (action.leaderEpoch === undefined ||
+        deps.getCurrentLeaderEpoch() !== action.leaderEpoch)
+    ) {
+      deps.recordEvent(
+        "bus",
+        "Skipped previous-topic local cleanup after leader epoch loss",
+        {
+          phase: "leader-topic-previous-cleanup-stale-epoch-skip",
+          actionLeaderEpoch: action.leaderEpoch,
+          currentLeaderEpoch: deps.getCurrentLeaderEpoch(),
+          chatId: record.target.chatId,
+          threadId: record.target.threadId,
+        },
+      );
+      throw new Error(
+        "Telegram leader ownership changed during topic reconciliation.",
+      );
+    }
     deps.store.markStaleByTarget(record.target);
     deps.store.reserveThread({
       target: record.target,
@@ -2048,7 +2200,9 @@ export function resolveTelegramInstanceThreadIdentity(options: {
   ) => {
     if (!candidate) return false;
     if (!options.target) return true;
-    return !!candidate.target && targetMatches(candidate.target, options.target);
+    return (
+      !!candidate.target && targetMatches(candidate.target, options.target)
+    );
   };
   const local = targetMatchesCandidate(options.follower)
     ? options.follower
@@ -2061,15 +2215,92 @@ export function resolveTelegramInstanceThreadIdentity(options: {
       ? options.record
       : undefined;
   return {
-    ...(local?.target ?? record?.target
+    ...((local?.target ?? record?.target)
       ? { target: local?.target ?? record?.target }
       : {}),
-    ...(local?.slot ?? record?.slot
+    ...((local?.slot ?? record?.slot)
       ? { slot: local?.slot ?? record?.slot }
       : {}),
-    ...(local?.threadName ?? record?.threadName
+    ...((local?.threadName ?? record?.threadName)
       ? { threadName: local?.threadName ?? record?.threadName }
       : {}),
+  };
+}
+
+export interface TelegramLeaderThreadStateRuntime {
+  getTarget(): TelegramTarget | undefined;
+  getIdentity(): TelegramInstanceThreadIdentityCandidate | undefined;
+  set(
+    input: TelegramInstanceThreadIdentityCandidate & { target: TelegramTarget },
+  ): void;
+  clear(): void;
+}
+
+export function createTelegramLeaderThreadStateRuntime(): TelegramLeaderThreadStateRuntime {
+  let identity:
+    | (TelegramInstanceThreadIdentityCandidate & { target: TelegramTarget })
+    | undefined;
+  return {
+    getTarget: () => identity?.target,
+    getIdentity: () => identity,
+    set(input) {
+      identity = { ...input, target: { ...input.target } };
+    },
+    clear() {
+      identity = undefined;
+    },
+  };
+}
+
+export interface TelegramCurrentInstanceThreadRuntime {
+  findRecord(): TelegramTopicTargetRecord | undefined;
+  getRecord(): TelegramTopicTargetRecord | undefined;
+  getIdentity(target?: TelegramTarget): TelegramInstanceThreadIdentityCandidate;
+}
+
+export function createTelegramCurrentInstanceThreadRuntime(deps: {
+  instanceId: string;
+  listRecords(): readonly TelegramTopicTargetRecord[];
+  getPreferredTarget(): TelegramTarget | undefined;
+  getFollower():
+    | (TelegramInstanceThreadIdentityCandidate & { registered: boolean })
+    | undefined;
+  getLeader(): TelegramInstanceThreadIdentityCandidate | undefined;
+}): TelegramCurrentInstanceThreadRuntime {
+  const findRecord = function (): TelegramTopicTargetRecord | undefined {
+    return findCurrentTelegramInstanceThreadRecord({
+      records: deps.listRecords(),
+      instanceId: deps.instanceId,
+      preferredTarget: deps.getPreferredTarget(),
+    });
+  };
+  const getRecord = function (): TelegramTopicTargetRecord | undefined {
+    const record = findRecord();
+    const follower = deps.getFollower();
+    if (record?.owner?.kind === "manual-follower" && !follower?.registered) {
+      return undefined;
+    }
+    return record;
+  };
+  return {
+    findRecord,
+    getRecord,
+    getIdentity(target) {
+      const follower = deps.getFollower();
+      const record = target
+        ? findCurrentTelegramInstanceThreadRecord({
+            records: deps.listRecords(),
+            instanceId: deps.instanceId,
+            preferredTarget: target,
+          })
+        : getRecord();
+      return resolveTelegramInstanceThreadIdentity({
+        target,
+        follower: follower?.registered ? follower : undefined,
+        leader: deps.getLeader(),
+        record,
+      });
+    },
   };
 }
 
@@ -2109,6 +2340,88 @@ export function resolveTelegramInstanceThreadTarget(options: {
     typeof raw.threadId === "number"
     ? { chatId: raw.chatId, threadId: raw.threadId }
     : undefined;
+}
+
+export interface TelegramThreadStatusProjectionRuntime {
+  getBusRole(): "leader" | "follower" | undefined;
+  getBusFollowers(): ReturnType<typeof listTelegramThreadStatusFollowers>;
+  getLocalBus(): {
+    leaderSocketPath: string;
+    leaderTransport: "socket" | "pipe";
+    followerSocketPath: string;
+    followerTransport: "socket" | "pipe";
+    followerRegistered: boolean;
+    followerTarget?: TelegramTarget;
+    followerSlot?: string;
+    followerThreadName?: string;
+  };
+  getTopicTargets(): ReturnType<typeof listTelegramThreadStatusTargets>;
+  getThreadReservations(): ReturnType<
+    typeof listTelegramThreadStatusReservations
+  >;
+  getTopicSyncObservations(): ReturnType<
+    typeof listTelegramThreadStatusObservations
+  >;
+  getInstanceSlot(): string | undefined;
+  getInstanceThreadName(): string | undefined;
+}
+
+export function createTelegramThreadStatusProjectionRuntime(deps: {
+  getThreadMode(): "unknown" | "enabled" | "disabled";
+  isBusPollingStarted(): boolean;
+  isFollowerRegistered(): boolean;
+  listFollowers(): readonly TelegramThreadStatusFollowerView[];
+  listRecords(): readonly TelegramTopicTargetRecord[];
+  listReservations(): readonly TelegramThreadReservation[];
+  listSyncObservations(): readonly TelegramTopicSyncObservation[];
+  getLeaderSocketPath(): string;
+  getFollowerSocketPath(): string;
+  getTransportKind(path: string): "socket" | "pipe";
+  getFollowerTarget(): TelegramTarget | undefined;
+  getFollowerSlot(): string | undefined;
+  getFollowerThreadName(): string | undefined;
+  getCurrentIdentity(): TelegramInstanceThreadIdentityCandidate;
+}): TelegramThreadStatusProjectionRuntime {
+  return {
+    getBusRole() {
+      if (deps.getThreadMode() === "disabled") return undefined;
+      if (deps.isBusPollingStarted()) return "leader";
+      return deps.isFollowerRegistered() ? "follower" : undefined;
+    },
+    getBusFollowers() {
+      return listTelegramThreadStatusFollowers({
+        followers: deps.listFollowers(),
+        records: deps.listRecords(),
+      });
+    },
+    getLocalBus() {
+      const leaderSocketPath = deps.getLeaderSocketPath();
+      const followerSocketPath = deps.getFollowerSocketPath();
+      return {
+        leaderSocketPath,
+        leaderTransport: deps.getTransportKind(leaderSocketPath),
+        followerSocketPath,
+        followerTransport: deps.getTransportKind(followerSocketPath),
+        followerRegistered: deps.isFollowerRegistered(),
+        followerTarget: deps.getFollowerTarget(),
+        followerSlot: deps.getFollowerSlot(),
+        followerThreadName: deps.getFollowerThreadName(),
+      };
+    },
+    getTopicTargets: () => listTelegramThreadStatusTargets(deps.listRecords()),
+    getThreadReservations: () =>
+      listTelegramThreadStatusReservations(deps.listReservations()),
+    getTopicSyncObservations: () =>
+      listTelegramThreadStatusObservations(deps.listSyncObservations()),
+    getInstanceSlot() {
+      if (deps.getThreadMode() === "disabled") return undefined;
+      return deps.getCurrentIdentity().slot;
+    },
+    getInstanceThreadName() {
+      if (deps.getThreadMode() === "disabled") return undefined;
+      return deps.getCurrentIdentity().threadName;
+    },
+  };
 }
 
 export interface TelegramThreadStatusFollowerView {
@@ -2330,10 +2643,27 @@ export function createTelegramTopicTargetProvisioner(
   const getNowMs = deps.getNowMs ?? (() => 0);
   const getRandom = deps.getRandom;
   return async (request) => {
+    const leaderEpoch = deps.getCurrentLeaderEpoch?.();
+    const assertLeaderEpoch = (phase: string): void => {
+      if (
+        deps.getCurrentLeaderEpoch &&
+        (leaderEpoch === undefined ||
+          deps.getCurrentLeaderEpoch() !== leaderEpoch)
+      ) {
+        throw new Error(
+          `Telegram topic provisioning lost leader ownership (${phase}).`,
+        );
+      }
+    };
+    assertLeaderEpoch("start");
     normalizeCurrentThreadNameSlots(deps.store);
     let existing = deps.store.getByProfileKey(request.profileKey);
     const isManualFollowerRequest = request.owner?.kind === "manual-follower";
-    if (isManualFollowerRequest && existing && isCurrentThreadRecord(existing)) {
+    if (
+      isManualFollowerRequest &&
+      existing &&
+      isCurrentThreadRecord(existing)
+    ) {
       deps.store.markStaleByTarget(
         existing.target,
         "unknown",
@@ -2342,9 +2672,10 @@ export function createTelegramTopicTargetProvisioner(
       deps.store.forgetIdentityByProfileKey(request.profileKey);
       existing = undefined;
     }
-    const identity = isManualFollowerRequest && !existing
-      ? undefined
-      : deps.store.getIdentityByProfileKey(request.profileKey);
+    const identity =
+      isManualFollowerRequest && !existing
+        ? undefined
+        : deps.store.getIdentityByProfileKey(request.profileKey);
     const nowMs = getNowMs();
     if (existing && isCurrentThreadRecord(existing)) {
       const slot = existing.slot ?? deps.store.allocateSlot(request.profileKey);
@@ -2370,6 +2701,35 @@ export function createTelegramTopicTargetProvisioner(
         lastError: undefined,
       });
       return { target: record.target, reused: true, record };
+    }
+    const pendingForRequest = deps.store
+      .listPendingProvisions()
+      .find(
+        (pending) =>
+          pending.profileKey === request.profileKey ||
+          pending.instanceId === request.instanceId,
+      );
+    if (pendingForRequest?.target) {
+      const record = deps.store.upsert({
+        profileKey: request.profileKey,
+        owner: request.owner,
+        target: pendingForRequest.target,
+        status: "active",
+        createdAtMs: pendingForRequest.startedAtMs,
+        updatedAtMs: nowMs,
+        threadName: pendingForRequest.threadName,
+        instanceId: request.instanceId,
+        slot: pendingForRequest.slot,
+      });
+      deps.store.removePendingProvision(pendingForRequest.id);
+      await deps.store.persist();
+      assertLeaderEpoch("after-recovered-binding");
+      return { target: record.target, reused: true, record };
+    }
+    if (pendingForRequest) {
+      throw new Error(
+        `Telegram topic provisioning remains ${pendingForRequest.status ?? "in-flight"} for this instance.`,
+      );
     }
     const activeForInstance = deps.store.getActiveByInstanceId(
       request.instanceId,
@@ -2403,7 +2763,7 @@ export function createTelegramTopicTargetProvisioner(
         request.profileKey,
         isManualFollowerRequest
           ? request.preferredSlot
-          : request.preferredSlot ?? preferredNameSlot,
+          : (request.preferredSlot ?? preferredNameSlot),
       );
     const requestThreadName =
       candidateThreadName &&
@@ -2413,20 +2773,23 @@ export function createTelegramTopicTargetProvisioner(
     const pendingId = `provision:${request.instanceId}:${slot}:${nowMs}`;
     const pendingOwner =
       request.owner?.kind === "leader" ? "leader" : "manual-follower";
-    const leaderEpoch = deps.getCurrentLeaderEpoch?.();
+    assertLeaderEpoch("before-pending-intent");
     const pendingBase: TelegramThreadPendingProvision = {
       id: pendingId,
       owner: pendingOwner,
       instanceId: request.instanceId,
+      profileKey: request.profileKey,
+      threadName: requestThreadName,
       slot,
       startedAtMs: nowMs,
-      expiresAtMs: nowMs + TELEGRAM_THREAD_RESERVATION_TTL_MS,
       ...(leaderEpoch !== undefined ? { leaderEpoch } : {}),
     };
     deps.store.upsertPendingProvision(pendingBase);
     await deps.store.persist();
+    assertLeaderEpoch("after-pending-intent");
     let threadId: number | undefined;
     try {
+      assertLeaderEpoch("before-createForumTopic");
       const topic = await deps.callApi<TelegramTopicResult>(
         "createForumTopic",
         {
@@ -2445,13 +2808,16 @@ export function createTelegramTopicTargetProvisioner(
       );
       threadId = topic.message_thread_id;
       if (typeof threadId !== "number" || !Number.isInteger(threadId)) {
-        throw new Error(
-          "Telegram createForumTopic returned no message_thread_id.",
+        throw new TelegramApiCommitUnknownError(
+          "createForumTopic",
+          new Error("Telegram createForumTopic returned no message_thread_id."),
         );
       }
+      assertLeaderEpoch("after-createForumTopic");
       const target = { chatId: deps.topicChatId, threadId };
       deps.store.upsertPendingProvision({ ...pendingBase, target });
       await deps.store.persist();
+      assertLeaderEpoch("after-pending-target");
       deps.store.upsert({
         profileKey: request.profileKey,
         owner: request.owner,
@@ -2464,6 +2830,7 @@ export function createTelegramTopicTargetProvisioner(
         slot,
       });
       await deps.store.persist();
+      assertLeaderEpoch("after-starting-binding");
       const record = deps.store.upsert({
         profileKey: request.profileKey,
         owner: request.owner,
@@ -2477,10 +2844,30 @@ export function createTelegramTopicTargetProvisioner(
       });
       deps.store.removePendingProvision(pendingId);
       await deps.store.persist();
+      assertLeaderEpoch("after-active-binding");
       return { target: record.target, reused: false, record };
     } catch (error) {
+      if (
+        threadId !== undefined &&
+        deps.getCurrentLeaderEpoch &&
+        deps.getCurrentLeaderEpoch() !== leaderEpoch
+      ) {
+        await deps.store.recordPendingProvisionTargetRecovery(pendingBase, {
+          chatId: deps.topicChatId,
+          threadId,
+        });
+        throw error;
+      }
+      assertLeaderEpoch("failure-cleanup");
       if (threadId === undefined) {
-        deps.store.removePendingProvision(pendingId);
+        if (isTelegramApiCommitUnknownError(error)) {
+          deps.store.upsertPendingProvision({
+            ...pendingBase,
+            status: "ambiguous",
+          });
+        } else {
+          deps.store.removePendingProvision(pendingId);
+        }
         await deps.store.persist();
       } else {
         try {

@@ -55,6 +55,12 @@ function withDefaultThreadTarget(
     : body;
 }
 
+function rejectTelegramDirectOwnership(method: string): Promise<never> {
+  return Promise.reject(
+    new Error(`Telegram ${method} requires direct transport ownership.`),
+  );
+}
+
 export function createTelegramAggregateTypingActionSender(
   runtime: Pick<TelegramBridgeApiRuntime, "call">,
 ): (chatId: number) => Promise<unknown> {
@@ -114,13 +120,17 @@ export function createTelegramBusAwareApiRuntime(
           ]) as Promise<string>);
     },
     deleteWebhook(signal?: AbortSignal): Promise<boolean> {
-      return deps.directRuntime.deleteWebhook(signal);
+      return deps.ownsDirect()
+        ? deps.directRuntime.deleteWebhook(signal)
+        : rejectTelegramDirectOwnership("deleteWebhook");
     },
     getUpdates(
       body: Record<string, unknown>,
       signal?: AbortSignal,
     ): Promise<TelegramUpdate[]> {
-      return deps.directRuntime.getUpdates(body, signal);
+      return deps.ownsDirect()
+        ? deps.directRuntime.getUpdates(body, signal)
+        : rejectTelegramDirectOwnership("getUpdates");
     },
     setMyCommands(commands): Promise<boolean> {
       return deps.ownsDirect()

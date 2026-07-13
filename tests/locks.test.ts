@@ -4,7 +4,15 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,6 +25,7 @@ import {
   resolveTelegramLockKey,
   TELEGRAM_LOCK_KEY,
   writeLocks,
+  type TelegramLockEntry,
 } from "../lib/locks.ts";
 
 function createTempLockPath(): { dir: string; path: string } {
@@ -35,6 +44,115 @@ async function waitForCondition(
   }
   assert.fail("Timed out waiting for condition");
 }
+
+interface LockRaceChild {
+  result: Promise<{ ok: boolean; pid?: number }>;
+}
+
+function spawnLockRaceChild(input: {
+  locksPath: string;
+  key: string;
+  readyPath: string;
+  startPath: string;
+}): LockRaceChild {
+  const moduleUrl = new URL("../lib/locks.ts", import.meta.url).href;
+  const source = `
+    import { existsSync, writeFileSync } from "node:fs";
+    import { createTelegramLockRuntime } from ${JSON.stringify(moduleUrl)};
+    const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    writeFileSync(process.env.READY_PATH, "ready");
+    while (!existsSync(process.env.START_PATH)) sleep(2);
+    const lock = createTelegramLockRuntime({
+      locksPath: process.env.LOCKS_PATH,
+      key: process.env.LOCK_KEY,
+    });
+    const acquired = lock.acquire({ cwd: "/race" });
+    process.stdout.write(JSON.stringify({ ok: acquired.ok, pid: acquired.ok ? acquired.lock.pid : undefined }));
+    if (acquired.ok) sleep(300);
+  `;
+  const child = spawn(
+    process.execPath,
+    ["--experimental-strip-types", "--input-type=module", "--eval", source],
+    {
+      env: {
+        ...process.env,
+        LOCKS_PATH: input.locksPath,
+        LOCK_KEY: input.key,
+        READY_PATH: input.readyPath,
+        START_PATH: input.startPath,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const result = new Promise<{ ok: boolean; pid?: number }>(
+    (resolve, reject) => {
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        if (code !== 0) {
+          reject(new Error(`Lock race child exited ${code}: ${stderr}`));
+          return;
+        }
+        resolve(JSON.parse(stdout) as { ok: boolean; pid?: number });
+      });
+    },
+  );
+  return { result };
+}
+
+test("Lock runtime commits side effects only under its exact transaction owner", () => {
+  const temp = createTempLockPath();
+  try {
+    const first = createTelegramLockRuntime({
+      locksPath: temp.path,
+      instanceId: "runtime:first",
+    });
+    const acquired = first.acquire({ cwd: "/repo" });
+    assert.equal(acquired.ok, true);
+    let commits = 0;
+    assert.equal(
+      first.commitIfOwned(() => {
+        commits += 1;
+      }),
+      true,
+    );
+
+    const replacement = createTelegramLockRuntime({
+      locksPath: temp.path,
+      instanceId: "runtime:replacement",
+    });
+    const replaced = replacement.acquire(
+      { cwd: "/repo" },
+      {
+        force: true,
+        expectedOwner: acquired.ok ? acquired.lock : undefined,
+      },
+    );
+    assert.equal(replaced.ok, true);
+    assert.equal(
+      first.commitIfOwned(() => {
+        commits += 1;
+      }),
+      false,
+    );
+    assert.equal(
+      replacement.commitIfOwned(() => {
+        commits += 1;
+      }),
+      true,
+    );
+    assert.equal(commits, 2);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
 
 test("Lock runtime acquires, refreshes, and releases its own key", () => {
   const temp = createTempLockPath();
@@ -114,6 +232,147 @@ test("writeLocks writes private lock files", () => {
   }
 });
 
+test("Lock transaction recovers a guard left by a dead process", () => {
+  const temp = createTempLockPath();
+  try {
+    writeFileSync(
+      `${temp.path}.transaction`,
+      JSON.stringify({
+        pid: 2_147_483_647,
+        acquiredAtMs: Date.now(),
+        generation: "dead-guard",
+      }),
+    );
+    const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
+    assert.equal(lock.acquire({ cwd: "/repo" }).ok, true);
+    assert.equal(existsSync(`${temp.path}.transaction`), false);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Lock transaction fails closed on an unverified guard", () => {
+  const temp = createTempLockPath();
+  try {
+    writeFileSync(`${temp.path}.transaction`, "");
+    const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
+    assert.throws(
+      () => lock.acquire({ cwd: "/repo" }),
+      /Timed out acquiring Telegram lock transaction/,
+    );
+    assert.equal(readFileSync(`${temp.path}.transaction`, "utf8"), "");
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Lock transaction fails closed on malformed registry content", () => {
+  const temp = createTempLockPath();
+  try {
+    const malformed = "{not-json";
+    writeFileSync(temp.path, malformed);
+    const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
+    assert.throws(() => lock.acquire({ cwd: "/repo" }), SyntaxError);
+    assert.equal(readFileSync(temp.path, "utf8"), malformed);
+    assert.equal(existsSync(`${temp.path}.transaction`), false);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Lock transaction elects exactly one concurrent child process", async () => {
+  const temp = createTempLockPath();
+  const startPath = join(temp.dir, "start");
+  const readyPaths = [join(temp.dir, "ready-a"), join(temp.dir, "ready-b")];
+  try {
+    const children = readyPaths.map((readyPath) =>
+      spawnLockRaceChild({
+        locksPath: temp.path,
+        key: TELEGRAM_LOCK_KEY,
+        readyPath,
+        startPath,
+      }),
+    );
+    await waitForCondition(
+      () => readyPaths.every((readyPath) => existsSync(readyPath)),
+      2_000,
+    );
+    writeFileSync(startPath, "start");
+    const results = await Promise.all(children.map((child) => child.result));
+    assert.equal(results.filter((result) => result.ok).length, 1);
+    const persisted = readLocks(temp.path)[TELEGRAM_LOCK_KEY] as { pid: number };
+    assert.equal(
+      persisted.pid,
+      results.find((result) => result.ok)?.pid,
+    );
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Concurrent stale-guard recovery elects exactly one child process", async () => {
+  const temp = createTempLockPath();
+  const startPath = join(temp.dir, "start");
+  const readyPaths = [join(temp.dir, "ready-a"), join(temp.dir, "ready-b")];
+  try {
+    writeFileSync(
+      `${temp.path}.transaction`,
+      JSON.stringify({
+        pid: 2_147_483_647,
+        acquiredAtMs: Date.now(),
+        generation: "dead-race-guard",
+      }),
+    );
+    const children = readyPaths.map((readyPath) =>
+      spawnLockRaceChild({
+        locksPath: temp.path,
+        key: TELEGRAM_LOCK_KEY,
+        readyPath,
+        startPath,
+      }),
+    );
+    await waitForCondition(
+      () => readyPaths.every((readyPath) => existsSync(readyPath)),
+      2_000,
+    );
+    writeFileSync(startPath, "start");
+    const results = await Promise.all(children.map((child) => child.result));
+    assert.equal(results.filter((result) => result.ok).length, 1);
+    assert.equal(existsSync(`${temp.path}.transaction`), false);
+    assert.equal(existsSync(`${temp.path}.transaction.recovery`), false);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Lock transaction preserves keys acquired by concurrent profiles", async () => {
+  const temp = createTempLockPath();
+  const startPath = join(temp.dir, "start");
+  const readyPaths = [join(temp.dir, "ready-a"), join(temp.dir, "ready-b")];
+  const keys = [TELEGRAM_LOCK_KEY, `${TELEGRAM_LOCK_KEY}:work`];
+  try {
+    const children = keys.map((key, index) =>
+      spawnLockRaceChild({
+        locksPath: temp.path,
+        key,
+        readyPath: readyPaths[index]!,
+        startPath,
+      }),
+    );
+    await waitForCondition(
+      () => readyPaths.every((readyPath) => existsSync(readyPath)),
+      2_000,
+    );
+    writeFileSync(startPath, "start");
+    const results = await Promise.all(children.map((child) => child.result));
+    assert.equal(results.every((result) => result.ok), true);
+    const persisted = readLocks(temp.path);
+    assert.deepEqual(Object.keys(persisted).sort(), [...keys].sort());
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
 test("Lock runtime preserves other extension keys and refuses live polling owners", () => {
   const temp = createTempLockPath();
   try {
@@ -151,14 +410,18 @@ test("Lock runtime records bus leader metadata and refreshes heartbeat", () => {
       pid: 10,
       instanceId: "inst-a",
       getNowMs: () => nowMs,
+      mintLeaderEpoch: () => 1000,
+      runtimeGeneration: 1,
     });
     assert.equal(lock.acquire({ cwd: "/repo" }).ok, true);
+    assert.equal(lock.getOwnedLeaderEpoch(), 1000);
     assert.deepEqual(readLocks(temp.path)[TELEGRAM_LOCK_KEY], {
       pid: 10,
       cwd: "/repo",
       instanceId: "inst-a",
       heartbeatMs: 1000,
       leaderEpoch: 1000,
+      runtimeGeneration: 1,
     });
     nowMs = 1500;
     assert.equal(lock.refresh({ cwd: "/repo" }), true);
@@ -168,6 +431,211 @@ test("Lock runtime records bus leader metadata and refreshes heartbeat", () => {
       instanceId: "inst-a",
       heartbeatMs: 1500,
       leaderEpoch: 1000,
+      runtimeGeneration: 1,
+    });
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Lock runtime fences refresh and release to the acquired owner epoch", () => {
+  const temp = createTempLockPath();
+  try {
+    const first = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "inst-a",
+      getNowMs: () => 1000,
+      mintLeaderEpoch: () => "epoch-a",
+      runtimeGeneration: 1,
+    });
+    const second = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 11,
+      instanceId: "inst-b",
+      getNowMs: () => 2000,
+      mintLeaderEpoch: () => "epoch-b",
+      runtimeGeneration: 2,
+      isProcessAlive: () => true,
+    });
+    const acquiredFirst = first.acquire({ cwd: "/repo" });
+    assert.equal(acquiredFirst.ok, true);
+    assert.equal(second.acquire({ cwd: "/repo" }).ok, false);
+    assert.equal(
+      second.acquire(
+        { cwd: "/repo" },
+        {
+          force: true,
+          expectedOwner: {
+            pid: 10,
+            cwd: "/repo",
+            instanceId: "wrong-owner",
+            leaderEpoch: "epoch-a",
+          },
+        },
+      ).ok,
+      false,
+    );
+    assert.equal(
+      second.acquire(
+        { cwd: "/repo" },
+        {
+          force: true,
+          expectedOwner: acquiredFirst.ok ? acquiredFirst.lock : undefined,
+        },
+      ).ok,
+      true,
+    );
+
+    assert.equal(first.getOwnedLeaderEpoch(), undefined);
+    assert.equal(second.getOwnedLeaderEpoch(), "epoch-b");
+    assert.equal(first.refresh({ cwd: "/repo" }), false);
+    first.release();
+    assert.deepEqual(readLocks(temp.path)[TELEGRAM_LOCK_KEY], {
+      pid: 11,
+      cwd: "/repo",
+      instanceId: "inst-b",
+      heartbeatMs: 2000,
+      leaderEpoch: "epoch-b",
+      runtimeGeneration: 2,
+    });
+    assert.equal(second.owns({ cwd: "/repo" }), true);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Lock election cannot replace an observed stale owner after its lease refreshes", () => {
+  const temp = createTempLockPath();
+  try {
+    let nowMs = 1000;
+    const leader = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "leader",
+      runtimeGeneration: 1,
+      getNowMs: () => nowMs,
+      mintLeaderEpoch: () => "leader-epoch",
+      staleHeartbeatMs: 500,
+    });
+    assert.equal(leader.acquire({ cwd: "/repo" }).ok, true);
+    const follower = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 11,
+      instanceId: "follower",
+      runtimeGeneration: 2,
+      getNowMs: () => nowMs,
+      staleHeartbeatMs: 500,
+      isProcessAlive: () => true,
+    });
+    nowMs = 2000;
+    const observed = follower.getState();
+    assert.equal(observed.kind, "stale");
+    nowMs = 2001;
+    assert.equal(leader.refresh({ cwd: "/repo" }), true);
+    const result = follower.acquire(
+      { cwd: "/repo" },
+      {
+        election: true,
+        expectedOwner:
+          observed.kind === "stale" ? observed.lock : undefined,
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(leader.owns({ cwd: "/repo" }), true);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Lock election cannot replace an owner that appeared after inactive observation", () => {
+  const temp = createTempLockPath();
+  try {
+    const leader = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "leader",
+      runtimeGeneration: 1,
+    });
+    const follower = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 11,
+      instanceId: "follower",
+      runtimeGeneration: 2,
+      isProcessAlive: () => true,
+    });
+    assert.equal(follower.getState().kind, "inactive");
+    assert.equal(leader.acquire({ cwd: "/repo" }).ok, true);
+    assert.equal(
+      follower.acquire(
+        { cwd: "/repo" },
+        { election: true, expectedOwner: undefined },
+      ).ok,
+      false,
+    );
+    assert.equal(leader.owns({ cwd: "/repo" }), true);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Lock runtime mints collision-resistant epochs independently of heartbeat time", () => {
+  const temp = createTempLockPath();
+  try {
+    const first = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "inst-a",
+      getNowMs: () => 1000,
+    });
+    const firstResult = first.acquire({ cwd: "/repo" });
+    assert.equal(firstResult.ok, true);
+    first.release();
+    const second = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 11,
+      instanceId: "inst-b",
+      getNowMs: () => 1000,
+    });
+    const secondResult = second.acquire({ cwd: "/repo" });
+    assert.equal(secondResult.ok, true);
+    assert.equal(typeof (firstResult.ok && firstResult.lock.leaderEpoch), "string");
+    assert.notEqual(
+      firstResult.ok ? firstResult.lock.leaderEpoch : undefined,
+      secondResult.ok ? secondResult.lock.leaderEpoch : undefined,
+    );
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Lock runtime upgrades adopted legacy ownership during refresh", () => {
+  const temp = createTempLockPath();
+  try {
+    writeFileSync(
+      temp.path,
+      JSON.stringify({
+        [TELEGRAM_LOCK_KEY]: { pid: 10, cwd: "/repo" },
+      }),
+    );
+    const lock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "leader",
+      runtimeGeneration: 7,
+      getNowMs: () => 2000,
+      mintLeaderEpoch: () => "epoch",
+    });
+    assert.equal(lock.owns({ cwd: "/repo" }), true);
+    assert.equal(lock.refresh({ cwd: "/repo" }), true);
+    assert.equal(lock.owns({ cwd: "/repo" }), true);
+    assert.deepEqual(readLocks(temp.path)[TELEGRAM_LOCK_KEY], {
+      pid: 10,
+      cwd: "/repo",
+      instanceId: "leader",
+      heartbeatMs: 2000,
+      leaderEpoch: "epoch",
+      runtimeGeneration: 7,
     });
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
@@ -186,6 +654,7 @@ test("Lock runtime prunes legacy bus socket path on heartbeat refresh", () => {
           instanceId: "inst-a",
           heartbeatMs: 1000,
           leaderEpoch: 1000,
+          runtimeGeneration: 1,
           busSocketPath: join(temp.dir, "bus.sock"),
         },
       }),
@@ -194,6 +663,7 @@ test("Lock runtime prunes legacy bus socket path on heartbeat refresh", () => {
       locksPath: temp.path,
       pid: 10,
       instanceId: "inst-a",
+      runtimeGeneration: 1,
       getNowMs: () => 1500,
     });
     assert.equal(lock.refresh({ cwd: "/repo" }), true);
@@ -203,6 +673,7 @@ test("Lock runtime prunes legacy bus socket path on heartbeat refresh", () => {
       instanceId: "inst-a",
       heartbeatMs: 1500,
       leaderEpoch: 1000,
+      runtimeGeneration: 1,
     });
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
@@ -228,6 +699,8 @@ test("Lock runtime treats stale bus heartbeats as replaceable even when pid is a
       pid: 10,
       instanceId: "inst-a",
       getNowMs: () => 3000,
+      mintLeaderEpoch: () => 3000,
+      runtimeGeneration: 1,
       staleHeartbeatMs: 500,
       isProcessAlive: (pid) => pid === 99,
     });
@@ -241,6 +714,7 @@ test("Lock runtime treats stale bus heartbeats as replaceable even when pid is a
       instanceId: "inst-a",
       heartbeatMs: 3000,
       leaderEpoch: 3000,
+      runtimeGeneration: 1,
     });
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
@@ -570,6 +1044,214 @@ test("Locked polling runtime can force takeover of live polling owners", async (
   }
 });
 
+test("Locked polling runtime hands same-process ownership to a replacement instance", async () => {
+  const temp = createTempLockPath();
+  try {
+    const previousLock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "old-instance",
+      mintLeaderEpoch: () => "old-epoch",
+    });
+    assert.equal(previousLock.acquire({ cwd: "/repo" }).ok, true);
+    const replacementLock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "new-instance",
+      mintLeaderEpoch: () => "new-epoch",
+    });
+    const events: string[] = [];
+    const runtime = createTelegramLockedPollingRuntime({
+      lock: replacementLock,
+      hasBotToken: () => true,
+      startPolling: async () => {
+        events.push("start");
+      },
+      stopPolling: async () => {
+        events.push("stop");
+      },
+      updateStatus: () => {
+        events.push("status");
+      },
+    });
+
+    assert.deepEqual(await runtime.start({ cwd: "/repo" }), {
+      ok: true,
+      message: "Telegram bridge connected.",
+    });
+    assert.equal(previousLock.refresh({ cwd: "/repo" }), false);
+    previousLock.release();
+    const persisted = readLocks(temp.path)[TELEGRAM_LOCK_KEY] as Record<
+      string,
+      unknown
+    >;
+    assert.equal(persisted.pid, 10);
+    assert.equal(persisted.cwd, "/repo");
+    assert.equal(persisted.instanceId, "new-instance");
+    assert.equal(typeof persisted.heartbeatMs, "number");
+    assert.equal(persisted.leaderEpoch, "new-epoch");
+    assert.deepEqual(events, ["start", "status"]);
+    await runtime.stop();
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Default runtime generation supersedes a pre-reload same-process counter", () => {
+  const temp = createTempLockPath();
+  try {
+    writeLocks(
+      temp.path,
+      {
+        [TELEGRAM_LOCK_KEY]: {
+          pid: 10,
+          cwd: "/repo",
+          instanceId: "10:old-reload",
+          heartbeatMs: Date.now(),
+          leaderEpoch: "old-epoch",
+          runtimeGeneration: 2,
+        },
+      },
+    );
+    const replacement = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "10:new-reload",
+      mintLeaderEpoch: () => "new-epoch",
+    });
+
+    const expectedOwner = readLocks(temp.path)[
+      TELEGRAM_LOCK_KEY
+    ] as TelegramLockEntry;
+    const acquired = replacement.acquire(
+      { cwd: "/repo" },
+      { force: true, expectedOwner },
+    );
+
+    assert.equal(acquired.ok, true);
+    if (!acquired.ok) return;
+    assert.equal(acquired.lock.instanceId, "10:new-reload");
+    assert.ok((acquired.lock.runtimeGeneration ?? 0) > 2);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Older same-process runtime cannot reverse a replacement handoff", async () => {
+  const temp = createTempLockPath();
+  try {
+    const oldLock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "old-instance",
+      runtimeGeneration: 1,
+      mintLeaderEpoch: () => "old-epoch",
+    });
+    const newLock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "new-instance",
+      runtimeGeneration: 2,
+      mintLeaderEpoch: () => "new-epoch",
+    });
+    assert.equal(oldLock.acquire({ cwd: "/repo" }).ok, true);
+    const newRuntime = createTelegramLockedPollingRuntime({
+      lock: newLock,
+      hasBotToken: () => true,
+      startPolling: async () => undefined,
+      stopPolling: async () => undefined,
+      updateStatus: () => undefined,
+    });
+    assert.equal((await newRuntime.start({ cwd: "/repo" })).ok, true);
+    const oldRuntime = createTelegramLockedPollingRuntime({
+      lock: oldLock,
+      hasBotToken: () => true,
+      startPolling: async () => assert.fail("Old runtime must not restart"),
+      stopPolling: async () => undefined,
+      updateStatus: () => undefined,
+    });
+
+    assert.equal((await oldRuntime.start({ cwd: "/repo" })).ok, false);
+    await oldRuntime.onSessionStart({}, { cwd: "/repo" });
+    const persisted = readLocks(temp.path)[TELEGRAM_LOCK_KEY] as Record<
+      string,
+      unknown
+    >;
+    assert.equal(persisted.pid, 10);
+    assert.equal(persisted.cwd, "/repo");
+    assert.equal(persisted.instanceId, "new-instance");
+    assert.equal(typeof persisted.heartbeatMs, "number");
+    assert.equal(persisted.leaderEpoch, "new-epoch");
+    assert.equal(persisted.runtimeGeneration, 2);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Same instance id cannot bypass same-process generation handoff", () => {
+  const temp = createTempLockPath();
+  try {
+    const first = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "10:1000",
+      runtimeGeneration: 1,
+      mintLeaderEpoch: () => "first-epoch",
+    });
+    const second = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "10:1000",
+      runtimeGeneration: 2,
+      mintLeaderEpoch: () => "second-epoch",
+    });
+    const acquiredFirst = first.acquire({ cwd: "/repo" });
+    assert.equal(acquiredFirst.ok, true);
+    assert.equal(second.owns({ cwd: "/repo" }), false);
+    assert.equal(
+      second.acquire(
+        { cwd: "/repo" },
+        {
+          force: true,
+          expectedOwner: acquiredFirst.ok ? acquiredFirst.lock : undefined,
+        },
+      ).ok,
+      true,
+    );
+    assert.equal(first.owns({ cwd: "/repo" }), false);
+    assert.equal(second.owns({ cwd: "/repo" }), true);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Retained lock ownership cannot cross a dynamic profile key", () => {
+  const temp = createTempLockPath();
+  try {
+    let activeProfileName: string | undefined;
+    const lock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      key: () => resolveTelegramLockKey(activeProfileName),
+    });
+    assert.equal(lock.acquire({ cwd: "/repo" }).ok, true);
+    const locks = readLocks(temp.path);
+    locks[`${TELEGRAM_LOCK_KEY}:work`] = { pid: 10, cwd: "/repo" };
+    writeLocks(temp.path, locks);
+
+    activeProfileName = "work";
+    assert.equal(lock.owns({ cwd: "/repo" }), false);
+    assert.equal(lock.refresh({ cwd: "/repo" }), false);
+    lock.release();
+    assert.deepEqual(readLocks(temp.path), {
+      [TELEGRAM_LOCK_KEY]: { pid: 10, cwd: "/repo" },
+      [`${TELEGRAM_LOCK_KEY}:work`]: { pid: 10, cwd: "/repo" },
+    });
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
 test("Locked polling runtime releases ownership when setup is missing", async () => {
   const temp = createTempLockPath();
   try {
@@ -621,6 +1303,167 @@ test("Locked polling runtime refuses start when run mode disallows polling", asy
     });
     assert.deepEqual(events, []);
     assert.deepEqual(readLocks(temp.path), {});
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Locked polling runtime refreshes ownership during slow startup", async () => {
+  const temp = createTempLockPath();
+  try {
+    let nowMs = 1000;
+    let releaseStart: (() => void) | undefined;
+    const startGate = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    const lock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "leader",
+      getNowMs: () => nowMs,
+      mintLeaderEpoch: () => "epoch",
+    });
+    const runtime = createTelegramLockedPollingRuntime({
+      lock,
+      hasBotToken: () => true,
+      startPolling: async () => {
+        await startGate;
+      },
+      stopPolling: async () => undefined,
+      updateStatus: () => undefined,
+      ownershipCheckMs: 5,
+    });
+
+    const started = runtime.start({ cwd: "/repo" });
+    nowMs = 2000;
+    await waitForCondition(
+      () =>
+        (readLocks(temp.path)[TELEGRAM_LOCK_KEY] as { heartbeatMs?: number })
+          ?.heartbeatMs === 2000,
+    );
+    releaseStart?.();
+    assert.equal((await started).ok, true);
+    await runtime.stop();
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Locked polling runtime fails startup closed after ownership loss", async () => {
+  const temp = createTempLockPath();
+  try {
+    let releaseStart: (() => void) | undefined;
+    const startGate = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    const events: string[] = [];
+    let pollingActive = false;
+    const lock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "leader",
+    });
+    const runtime = createTelegramLockedPollingRuntime({
+      lock,
+      hasBotToken: () => true,
+      startPolling: async () => {
+        events.push("start");
+        await startGate;
+        pollingActive = true;
+      },
+      stopPolling: async () => {
+        events.push("stop");
+        pollingActive = false;
+      },
+      updateStatus: () => undefined,
+      ownershipCheckMs: 5,
+    });
+
+    const started = runtime.start({ cwd: "/repo" });
+    await waitForCondition(() => events.includes("start"));
+    writeLocks(temp.path, {
+      [TELEGRAM_LOCK_KEY]: {
+        pid: 99,
+        cwd: "/other",
+        instanceId: "replacement",
+        leaderEpoch: "replacement-epoch",
+      },
+    });
+    await waitForCondition(() => events.includes("stop"));
+    releaseStart?.();
+    const result = await started;
+    assert.equal(result.ok, false);
+    assert.equal(pollingActive, false);
+    assert.deepEqual(events, ["start", "stop", "stop"]);
+    assert.equal(
+      (readLocks(temp.path)[TELEGRAM_LOCK_KEY] as { instanceId?: string })
+        .instanceId,
+      "replacement",
+    );
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Locked polling runtime rolls back ownership when startup fails", async () => {
+  const temp = createTempLockPath();
+  try {
+    const events: string[] = [];
+    const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
+    const runtime = createTelegramLockedPollingRuntime({
+      lock,
+      hasBotToken: () => true,
+      startPolling: async () => {
+        throw new Error("startup failed");
+      },
+      stopPolling: async () => {
+        events.push("stop");
+      },
+      updateStatus: () => undefined,
+    });
+
+    await assert.rejects(runtime.start({ cwd: "/repo" }), /startup failed/);
+    assert.deepEqual(readLocks(temp.path), {});
+    assert.deepEqual(events, ["stop"]);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Locked polling runtime refreshes retained heartbeat before auto-start", async () => {
+  const temp = createTempLockPath();
+  try {
+    let nowMs = 1000;
+    const observedHeartbeats: Array<number | undefined> = [];
+    const lock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "leader",
+      getNowMs: () => nowMs,
+      mintLeaderEpoch: () => "epoch",
+    });
+    assert.equal(lock.acquire({ cwd: "/repo" }).ok, true);
+    nowMs = 6000;
+    const runtime = createTelegramLockedPollingRuntime({
+      lock,
+      hasBotToken: () => true,
+      startPolling: async () => {
+        observedHeartbeats.push(
+          (
+            readLocks(temp.path)[TELEGRAM_LOCK_KEY] as {
+              heartbeatMs?: number;
+            }
+          ).heartbeatMs,
+        );
+      },
+      stopPolling: async () => undefined,
+      updateStatus: () => undefined,
+    });
+
+    await runtime.onSessionStart({}, { cwd: "/repo" });
+    await waitForCondition(() => observedHeartbeats.length === 1);
+    assert.deepEqual(observedHeartbeats, [6000]);
+    await runtime.stop();
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
@@ -858,13 +1701,21 @@ test("Locked polling runtime records refresh write failures instead of throwing 
     phase: unknown;
     message: string;
   }[] = [];
+  let refreshCalls = 0;
   const lock = {
     acquire: () => ({ ok: true, lock: { pid: 10, cwd: "/repo" }, replacedStale: false as const }),
     release: () => ({ kind: "inactive" as const }),
     getState: () => ({ kind: "active-here" as const, lock: { pid: 10, cwd: "/repo" } }),
     getStatusLabel: () => "active here",
+    getOwnedLeaderEpoch: () => undefined,
     owns: () => true,
+    commitIfOwned: (commit: () => void) => {
+      commit();
+      return true;
+    },
     refresh: () => {
+      refreshCalls += 1;
+      if (refreshCalls === 1) return true;
       throw new Error("EPERM: operation not permitted, rename locks tmp");
     },
   };

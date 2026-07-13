@@ -145,6 +145,7 @@ export interface TelegramPreviewController {
   setPendingText: (text: string) => void;
   createState: () => TelegramPreviewRuntimeState;
   resetState: () => void;
+  invalidate: () => void;
   clear: (
     chatId: number,
     options?: { awaitFlush?: boolean; target?: TelegramTarget },
@@ -175,6 +176,7 @@ export function createTelegramPreviewControllerRuntime(
     maxMessageLength: deps.maxMessageLength,
     initialDraftSupport: deps.initialDraftSupport,
     sendDraft: deps.sendDraft,
+    canSend: deps.canSend,
     maxDraftId: deps.maxDraftId,
     recordRuntimeEvent: deps.recordRuntimeEvent,
   });
@@ -233,9 +235,10 @@ export function createTelegramNativeMarkdownPreviewFinalizer<
     const state = deps.getState();
     if (state?.flushPromise) {
       await state.flushPromise.catch(() => {});
+      if (deps.getState() !== state) return false;
     }
     await deps.sendMarkdownReply(chatId, replyToMessageId, markdown, options);
-    deps.discard?.();
+    if (deps.getState() === state) deps.discard?.();
     return true;
   };
 }
@@ -275,12 +278,15 @@ export function createTelegramPreviewController(
   deps: TelegramPreviewControllerDeps,
 ): TelegramPreviewController {
   let state: TelegramPreviewRuntimeState | undefined;
+  let generation = 0;
   const maxDraftId = deps.maxDraftId ?? TELEGRAM_DRAFT_ID_MAX;
   const maxMessageLength =
     deps.maxMessageLength ?? TELEGRAM_DRAFT_PREVIEW_MAX_CHARS;
   let draftSupport = deps.initialDraftSupport ?? "unknown";
   let nextDraftId = 0;
-  const getRuntimeDeps = (): TelegramPreviewRuntimeDeps => ({
+  const getRuntimeDeps = (
+    operationGeneration = generation,
+  ): TelegramPreviewRuntimeDeps => ({
     getState: () => state,
     setState: (nextState) => {
       state = nextState;
@@ -295,7 +301,8 @@ export function createTelegramPreviewController(
       return nextDraftId;
     },
     sendDraft: deps.sendDraft,
-    canSend: deps.canSend,
+    canSend: () =>
+      operationGeneration === generation && (deps.canSend?.() ?? true),
     recordRuntimeEvent: deps.recordRuntimeEvent,
   });
   return {
@@ -308,7 +315,12 @@ export function createTelegramPreviewController(
     },
     createState: () => createTelegramPreviewRuntimeState(),
     resetState: () => {
+      generation += 1;
       state = createTelegramPreviewRuntimeState();
+    },
+    invalidate: () => {
+      generation += 1;
+      state = undefined;
     },
     clear: (chatId, options) =>
       clearTelegramPreview(chatId, getRuntimeDeps(), options),

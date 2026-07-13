@@ -13,6 +13,8 @@ import {
   TELEGRAM_SYNC_SLICES,
   createTelegramLeaderHealthRuntime,
   createTelegramManualThreadDisconnectHandler,
+  createTelegramProvisioningActivityRuntime,
+  createTelegramSyncStateRuntime,
   createTelegramTopicLifecycleSyncHandler,
   createUnknownTelegramSyncState,
   ensureTelegramLeaderThreadBinding,
@@ -22,6 +24,30 @@ import {
   shouldReconcileTelegramSync,
 } from "../lib/sync.ts";
 import { createTelegramTopicTargetStore } from "../lib/threads.ts";
+
+test("Telegram sync state runtime owns transitions and nested provisioning activity", () => {
+  const syncState = createTelegramSyncStateRuntime();
+  syncState.markConfigChange("profile-change");
+  assert.equal(syncState.getState()["bot-identity"]?.status, "fresh");
+  syncState.markSliceFresh("target-bindings", {
+    nowMs: 10,
+    action: "binding-restored",
+  });
+  assert.deepEqual(syncState.getState()["target-bindings"], {
+    status: "fresh",
+    updatedAtMs: 10,
+    lastReconcileAction: "binding-restored",
+  });
+
+  const provisioning = createTelegramProvisioningActivityRuntime();
+  provisioning.start();
+  provisioning.start();
+  provisioning.end();
+  assert.equal(provisioning.isActive(), true);
+  provisioning.end();
+  provisioning.end();
+  assert.equal(provisioning.isActive(), false);
+});
 
 test("Telegram sync reconciliation is demand-driven, not per ordinary action", () => {
   for (const trigger of [
@@ -371,6 +397,51 @@ test("Leader thread sync reuses same-profile topic across reload", async () => {
   }
 });
 
+test("Leader thread sync rejects reused binding after load loses epoch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-leader-reuse-epoch-"));
+  const store = createTelegramTopicTargetStore({
+    path: join(dir, "state.json"),
+    getNowMs: () => 2000,
+  });
+  let leaderEpoch: number | undefined = 1;
+  try {
+    store.upsert({
+      profileKey: "cwd:/repo",
+      target: { chatId: 7, threadId: 10 },
+      status: "active",
+      createdAtMs: 1000,
+      updatedAtMs: 1000,
+      instanceId: "leader-a",
+      slot: "A",
+    });
+    await store.persist();
+    const epochLosingStore = {
+      ...store,
+      async load() {
+        await store.load();
+        leaderEpoch = undefined;
+      },
+    };
+
+    await assert.rejects(
+      ensureTelegramLeaderThreadBinding({
+        getAllowedUserId: () => 7,
+        instanceId: "leader-a",
+        cwd: "/repo",
+        getCurrentLeaderEpoch: () => leaderEpoch,
+        topicTargetStore: epochLosingStore,
+        async callApi<TResponse>() {
+          return {} as TResponse;
+        },
+        recordEvent() {},
+      }),
+      /lost ownership \(after-load\)/,
+    );
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
 test("Leader thread sync reuses same-process legacy leader topic across reload", async () => {
   const dir = await mkdtemp(
     join(tmpdir(), "pi-telegram-leader-sync-same-pid-"),
@@ -622,6 +693,53 @@ test("Leader thread sync cleans previous leader records regardless of profile ke
       reservation?.reason,
       "previous-process-cleaned-without-visible-probe",
     );
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("Leader thread sync aborts local previous-leader cleanup after ownership loss", async () => {
+  const dir = await mkdtemp(
+    join(tmpdir(), "pi-telegram-leader-cleanup-epoch-loss-"),
+  );
+  const store = createTelegramTopicTargetStore({
+    path: join(dir, "state.json"),
+    getNowMs: () => 2000,
+  });
+  let currentEpoch: number | undefined = 1;
+  const calls: string[] = [];
+  try {
+    store.upsert({
+      profileKey: "leader:previous-id",
+      target: { chatId: 7, threadId: 10 },
+      status: "active",
+      createdAtMs: 1000,
+      updatedAtMs: 1000,
+      instanceId: "previous-instance",
+      slot: "B",
+    });
+    await store.persist();
+
+    await assert.rejects(
+      ensureTelegramLeaderThreadBinding({
+        getAllowedUserId: () => 7,
+        instanceId: "leader-a",
+        cwd: "/repo",
+        topicTargetStore: store,
+        getCurrentLeaderEpoch: () => currentEpoch,
+        async callApi<TResponse>(method: string) {
+          calls.push(method);
+          currentEpoch = undefined;
+          return {} as TResponse;
+        },
+        recordEvent() {},
+      }),
+      /ownership changed during topic reconciliation/,
+    );
+
+    assert.deepEqual(calls, ["closeForumTopic"]);
+    assert.equal(store.getByProfileKey("leader:previous-id")?.status, "active");
+    assert.deepEqual(store.listReservations(), []);
   } finally {
     await rm(dir, { force: true, recursive: true });
   }
@@ -984,4 +1102,107 @@ test("Manual follower disconnect preserves its Telegram thread binding", async (
   assert.deepEqual(calls, []);
   assert.equal(offlineCalls, 0);
   assert.equal(persisted, 0);
+});
+
+test("Manual leader disconnect stops local teardown after epoch loss", async () => {
+  const trace: string[] = [];
+  let currentEpoch: number | undefined = 1;
+  let syncState = createUnknownTelegramSyncState();
+  const disconnect = createTelegramManualThreadDisconnectHandler({
+    instanceId: "leader-runtime:1",
+    getCurrentThreadRecord: () => ({
+      owner: { kind: "leader" },
+      instanceId: "leader-runtime:1",
+      target: { chatId: 7, threadId: 42 },
+    }),
+    topicTargetStore: {
+      markOfflineByInstanceId: () => {
+        trace.push("mark-offline");
+        return 1;
+      },
+      persist: async () => {
+        trace.push("persist");
+      },
+    },
+    callApi: async <TResponse>(method: string) => {
+      trace.push(method);
+      currentEpoch = undefined;
+      return { ok: true } as TResponse;
+    },
+    getCurrentLeaderEpoch: () => currentEpoch,
+    getLeaderTarget: () => {
+      trace.push("get-leader-target");
+      return { chatId: 7, threadId: 42 };
+    },
+    clearLeaderTarget: () => {
+      trace.push("clear-leader-target");
+    },
+    getSyncState: () => syncState,
+    setSyncState: (state) => {
+      trace.push("set-sync-state");
+      syncState = state;
+    },
+    stopPolling: async () => {
+      trace.push("stop-polling");
+      return "stopped";
+    },
+    recordRuntimeEvent: () => undefined,
+  });
+
+  assert.equal(await disconnect(), "stopped");
+  assert.deepEqual(trace, ["closeForumTopic", "stop-polling"]);
+});
+
+test("Manual leader disconnect rechecks epoch after zero-change offline mutation", async () => {
+  const trace: string[] = [];
+  let currentEpoch: number | undefined = 1;
+  let syncState = createUnknownTelegramSyncState();
+  const disconnect = createTelegramManualThreadDisconnectHandler({
+    instanceId: "leader-runtime:1",
+    getCurrentThreadRecord: () => ({
+      owner: { kind: "leader" },
+      instanceId: "leader-runtime:1",
+      target: { chatId: 7, threadId: 42 },
+    }),
+    topicTargetStore: {
+      markOfflineByInstanceId: () => {
+        trace.push("mark-offline");
+        currentEpoch = undefined;
+        return 0;
+      },
+      persist: async () => {
+        trace.push("persist");
+      },
+    },
+    callApi: async <TResponse>(method: string) => {
+      trace.push(method);
+      return { ok: true } as TResponse;
+    },
+    getCurrentLeaderEpoch: () => currentEpoch,
+    getLeaderTarget: () => {
+      trace.push("get-leader-target");
+      return { chatId: 7, threadId: 42 };
+    },
+    clearLeaderTarget: () => {
+      trace.push("clear-leader-target");
+    },
+    getSyncState: () => syncState,
+    setSyncState: (state) => {
+      trace.push("set-sync-state");
+      syncState = state;
+    },
+    stopPolling: async () => {
+      trace.push("stop-polling");
+      return "stopped";
+    },
+    recordRuntimeEvent: () => undefined,
+  });
+
+  assert.equal(await disconnect(), "stopped");
+  assert.deepEqual(trace, [
+    "closeForumTopic",
+    "deleteForumTopic",
+    "mark-offline",
+    "stop-polling",
+  ]);
 });

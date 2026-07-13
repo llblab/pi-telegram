@@ -393,8 +393,9 @@ test("Model-switch continuation turn stays control-lane and resume-oriented", ()
   });
   assert.equal(builtTurn.queueOrder, 5);
   assert.equal(builtTurn.laneOrder, 6);
+  const sourceTarget = { chatId: 1, threadId: 42 };
   const turn = buildTelegramModelSwitchContinuationTurn({
-    turn: { chatId: 1, replyToMessageId: 2 },
+    turn: { chatId: 1, replyToMessageId: 2, target: sourceTarget },
     selection: createModelTestSelection(createModelTestModel(), "high"),
     telegramPrefix: "[telegram]",
     queueOrder: 3,
@@ -406,6 +407,8 @@ test("Model-switch continuation turn stays control-lane and resume-oriented", ()
   assert.equal(turn.laneOrder, 4);
   assert.equal(turn.chatId, 1);
   assert.equal(turn.replyToMessageId, 2);
+  assert.deepEqual(turn.target, { chatId: 1, threadId: 42 });
+  assert.notEqual(turn.target, sourceTarget);
   assert.deepEqual(turn.sourceMessageIds, []);
   assert.equal(
     turn.historyText,

@@ -109,6 +109,7 @@ export type TelegramDeliveryFailureReason =
   | "target-unauthorized"
   | "stale-handle"
   | "invalid-view"
+  | "commit-unknown"
   | "transport-failed";
 
 export type TelegramDeliveryResult<T> =
@@ -121,7 +122,7 @@ export type TelegramDeliveryResult<T> =
     };
 ```
 
-Expected availability, authorization, and lifecycle outcomes return failures rather than throwing. Programmer errors may still throw for malformed objects that cannot satisfy the TypeScript contract. Transport failures are redacted before reaching callers and are also recorded in bridge runtime diagnostics.
+Expected availability, authorization, lifecycle, and ambiguous mutation outcomes return failures rather than throwing. `commit-unknown` means a non-idempotent Bot API mutation may have committed before its response was lost; callers must not blindly replay it. When earlier chunks remain known, `partial` still carries their recoverable logical handle. Programmer errors may still throw for malformed objects that cannot satisfy the TypeScript contract. Transport failures are redacted before reaching callers and are also recorded in bridge runtime diagnostics.
 
 When a multi-chunk `send` or growing `edit` fails after materializing part of the logical view, `partial` contains a valid handle for every message still visible from that operation. Callers may pass it to `editTelegramView` to reconcile the view or to `deleteTelegramView` for cleanup. A failure before any message exists omits `partial`; callers must never infer message ids or construct a handle.
 

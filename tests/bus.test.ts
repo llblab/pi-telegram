@@ -26,9 +26,11 @@ import {
 import {
   createTelegramBusFollowerRegistry,
   createTelegramBusForeignOwnedUpdateForwarder,
+  createTelegramFollowerApiCallAuthorizer,
   createTelegramBusLocalServer,
   createTelegramBusProcessRuntime,
   createTelegramBusRequestId,
+  createTelegramBusRequestIdFactory,
   encodeTelegramBusEnvelope,
   getTelegramBusFollowerSocketPath,
   getTelegramBusSocketPath,
@@ -46,10 +48,11 @@ test("Bus process runtime resolves live profile endpoints", () => {
     getActiveProfileName: () => profileName,
     pid: 42,
     parentPid: 7,
+    parentProcessIdentity: "7:start:test",
     createdAtMs: 1000,
   });
   assert.equal(runtime.instanceId, "42:1000");
-  assert.equal(runtime.manualFollowerOwnerId, "7");
+  assert.equal(runtime.manualFollowerOwnerId, "7:start:test");
   const defaultLeaderPath = runtime.getLeaderSocketPath();
   const defaultFollowerPath = runtime.getFollowerSocketPath();
   profileName = "work";
@@ -64,9 +67,10 @@ test("Bus process runtime falls back to pid without a parent pid", () => {
     getActiveProfileName: () => undefined,
     pid: 42,
     parentPid: 0,
+    parentProcessIdentity: "42:start:test",
     createdAtMs: 1000,
   });
-  assert.equal(runtime.manualFollowerOwnerId, "42");
+  assert.equal(runtime.manualFollowerOwnerId, "42:start:test");
 });
 
 test("Bus transport boundary derives socket and pipe endpoints", () => {
@@ -205,6 +209,14 @@ test("Bus socket path uses profile-scoped Windows named pipes on win32", () => {
     ),
     /^\\\\\.\\pipe\\pi-telegram-[A-Za-z0-9_-]{16}-follower-work-pid_123_unsafe$/,
   );
+});
+
+test("Bus request id factory owns one monotonic instance sequence", () => {
+  const createRequestId = createTelegramBusRequestIdFactory("inst-a");
+
+  assert.equal(createRequestId(), "inst-a:1");
+  assert.equal(createRequestId(), "inst-a:2");
+  assert.equal(createRequestId(), "inst-a:3");
 });
 
 test("Bus contract encodes and parses follower registration envelopes", () => {
@@ -434,6 +446,35 @@ test("Bus follower registry registers, heartbeats, and prunes live instances", (
   assert.deepEqual(registry.list(), []);
 });
 
+test("Bus follower API authorizer delegates message ownership with follower identity", () => {
+  const calls: string[] = [];
+  const follower = {
+    instanceId: "follower-a",
+    connectedAtMs: 1,
+    lastHeartbeatMs: 2,
+    target: { chatId: 7, threadId: 11 },
+  };
+  const authorize = createTelegramFollowerApiCallAuthorizer({
+    isMessageOwned({ chatId, messageId, follower: owner }) {
+      calls.push(`${owner.instanceId}:${chatId}:${messageId}`);
+      return true;
+    },
+  });
+
+  assert.equal(
+    authorize({
+      follower,
+      method: "call",
+      args: [
+        "editMessageText",
+        { chat_id: 7, message_thread_id: 11, message_id: 9 },
+      ],
+    }),
+    true,
+  );
+  assert.deepEqual(calls, ["follower-a:7:9"]);
+});
+
 test("Bus follower API allowlist permits scoped own-thread voice uploads", () => {
   const follower = {
     instanceId: "inst-a",
@@ -511,6 +552,7 @@ test("Bus follower API allowlist permits chat message edit/delete operations", (
       follower,
       method: "call",
       args: ["editMessageText", { chat_id: 100, message_id: 9, text: "Next" }],
+      isMessageOwned: (chatId, messageId) => chatId === 100 && messageId === 9,
     }),
     true,
   );
@@ -519,6 +561,7 @@ test("Bus follower API allowlist permits chat message edit/delete operations", (
       follower,
       method: "call",
       args: ["deleteMessage", { chat_id: "100", message_id: "9" }],
+      isMessageOwned: (chatId, messageId) => chatId === 100 && messageId === 9,
     }),
     true,
   );
@@ -526,7 +569,17 @@ test("Bus follower API allowlist permits chat message edit/delete operations", (
     isTelegramFollowerApiCallAllowed({
       follower,
       method: "call",
+      args: ["deleteMessage", { chat_id: 100, message_id: 10 }],
+      isMessageOwned: () => false,
+    }),
+    false,
+  );
+  assert.equal(
+    isTelegramFollowerApiCallAllowed({
+      follower,
+      method: "call",
       args: ["deleteMessage", { chat_id: 101, message_id: 9 }],
+      isMessageOwned: () => true,
     }),
     false,
   );
@@ -761,6 +814,122 @@ test("Bus local server resolves the active profile endpoint on each start", asyn
   }
 });
 
+test("Old bus server stop cannot invalidate a replacement endpoint generation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-generation-"));
+  const socketPath = join(dir, "bus.sock");
+  const first = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: (envelope) => ({
+      kind: "bus.ack",
+      requestId: envelope.requestId,
+      ok: false,
+      message: "first",
+    }),
+  });
+  const replacement = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: (envelope) => ({
+      kind: "bus.ack",
+      requestId: envelope.requestId,
+      ok: true,
+      message: "replacement",
+    }),
+  });
+  try {
+    await first.start();
+    await replacement.start();
+    await first.stop();
+
+    assert.equal(
+      (
+        await probeTelegramBusEndpoint({
+          endpoint: socketPath,
+          timeoutMs: 50,
+        })
+      ).reachable,
+      true,
+    );
+    const response = await sendTelegramBusLocalEnvelope({
+      socketPath,
+      envelope: {
+        kind: "follower.heartbeat",
+        requestId: "replacement-generation",
+        instanceId: "follower-a",
+        sentAtMs: 2000,
+      },
+    });
+    assert.deepEqual(response, {
+      kind: "bus.ack",
+      requestId: "replacement-generation",
+      ok: true,
+      message: "replacement",
+    });
+  } finally {
+    await first.stop();
+    await replacement.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Stale bus server cannot publish over a replacement endpoint generation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-publish-fence-"));
+  const socketPath = join(dir, "bus.sock");
+  let releasePublication: (() => void) | undefined;
+  let signalPublicationReady: (() => void) | undefined;
+  const publicationReady = new Promise<void>((resolve) => {
+    signalPublicationReady = resolve;
+  });
+  const publicationRelease = new Promise<void>((resolve) => {
+    releasePublication = resolve;
+  });
+  const stale = createTelegramBusLocalServer({
+    socketPath,
+    beforeEndpointPublication: async () => {
+      signalPublicationReady?.();
+      await publicationRelease;
+    },
+    commitEndpointPublication: () => false,
+    handleEnvelope: () => undefined,
+  });
+  const replacement = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: (envelope) => ({
+      kind: "bus.ack",
+      requestId: envelope.requestId,
+      ok: true,
+      message: "replacement",
+    }),
+  });
+  try {
+    const staleStart = stale.start();
+    await publicationReady;
+    await replacement.start();
+    releasePublication?.();
+    await assert.rejects(staleStart, /lost transport ownership/);
+
+    const response = await sendTelegramBusLocalEnvelope({
+      socketPath,
+      envelope: {
+        kind: "follower.heartbeat",
+        requestId: "replacement-after-stale-publication",
+        instanceId: "follower-a",
+        sentAtMs: 2000,
+      },
+    });
+    assert.deepEqual(response, {
+      kind: "bus.ack",
+      requestId: "replacement-after-stale-publication",
+      ok: true,
+      message: "replacement",
+    });
+  } finally {
+    releasePublication?.();
+    await stale.stop();
+    await replacement.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Bus local server rebinds an externally unlinked Unix endpoint", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-rebind-"));
   const socketPath = join(dir, "bus.sock");
@@ -854,6 +1023,148 @@ test("Bus local client classifies response timeouts as transport timeouts", asyn
     assert.equal(events[0].details.kind, "timeout");
     assert.equal(events[0].details.retryable, true);
     assert.equal(events[0].details.requestId, "inst-a:timeout");
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus local server memoizes completed and in-flight request results", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-ledger-"));
+  const socketPath = join(dir, "bus.sock");
+  let executions = 0;
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    async handleEnvelope(envelope) {
+      executions += 1;
+      await gate;
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: true,
+        result: { executions },
+      };
+    },
+  });
+  try {
+    await server.start();
+    const envelope = {
+      kind: "follower.heartbeat" as const,
+      requestId: "follower-a:ledger:1",
+      instanceId: "follower-a",
+      sentAtMs: 1000,
+    };
+    const first = sendTelegramBusLocalEnvelope({ socketPath, envelope });
+    const duplicate = sendTelegramBusLocalEnvelope({ socketPath, envelope });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(executions, 1);
+    release?.();
+    const [firstResult, duplicateResult] = await Promise.all([first, duplicate]);
+    const replayResult = await sendTelegramBusLocalEnvelope({
+      socketPath,
+      envelope,
+    });
+    assert.deepEqual(firstResult, duplicateResult);
+    assert.deepEqual(replayResult, firstResult);
+    assert.equal(executions, 1);
+  } finally {
+    release?.();
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus retry returns the memoized result after the first acknowledgement is lost", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-ledger-ack-loss-"));
+  const socketPath = join(dir, "bus.sock");
+  let executions = 0;
+  let dropped = false;
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope(envelope) {
+      executions += 1;
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: true,
+        result: { message_id: 77 },
+      };
+    },
+    shouldDropResponse() {
+      if (dropped) return false;
+      dropped = true;
+      return true;
+    },
+  });
+  try {
+    await server.start();
+    const response = await sendTelegramBusLocalEnvelope({
+      socketPath,
+      timeoutMs: 10,
+      retry: { attempts: 2, delayMs: 0 },
+      envelope: {
+        kind: "follower.callApi",
+        requestId: "follower-a:send:1",
+        instanceId: "follower-a",
+        method: "call",
+        args: ["sendMessage", { chat_id: 1, text: "hello" }],
+        sentAtMs: 1000,
+      },
+    });
+    assert.deepEqual(response, {
+      kind: "bus.ack",
+      requestId: "follower-a:send:1",
+      ok: true,
+      message: undefined,
+      result: { message_id: 77 },
+    });
+    assert.equal(executions, 1);
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus local server rejects request-id reuse with a changed payload", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-ledger-collision-"));
+  const socketPath = join(dir, "bus.sock");
+  let executions = 0;
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope(envelope) {
+      executions += 1;
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: true,
+      };
+    },
+  });
+  try {
+    await server.start();
+    const first = {
+      kind: "follower.heartbeat" as const,
+      requestId: "follower-a:collision:1",
+      instanceId: "follower-a",
+      sentAtMs: 1000,
+    };
+    await sendTelegramBusLocalEnvelope({ socketPath, envelope: first });
+    const collision = await sendTelegramBusLocalEnvelope({
+      socketPath,
+      envelope: { ...first, sentAtMs: 1001 },
+    });
+    assert.equal(executions, 1);
+    assert.deepEqual(collision, {
+      kind: "bus.ack",
+      requestId: first.requestId,
+      ok: false,
+      message: "Telegram bus request id was reused with a different payload.",
+      error: { code: "request-id-collision" },
+    });
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });

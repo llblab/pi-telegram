@@ -273,6 +273,7 @@ interface TelegramApiResponse<T> {
 export interface TelegramApiCallOptions {
   signal?: AbortSignal;
   maxAttempts?: number;
+  retrySafety?: "safe" | "non-idempotent";
   retryBaseDelayMs?: number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -449,6 +450,32 @@ function sanitizeFileName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
 
+class TelegramApiMalformedSuccessError extends Error {
+  constructor(method: string, detail: string) {
+    super(`Telegram API ${method} ${detail}`);
+    this.name = "TelegramApiMalformedSuccessError";
+  }
+}
+
+export class TelegramApiCommitUnknownError extends Error {
+  readonly kind = "commit-unknown" as const;
+  readonly method: string;
+  override readonly cause: unknown;
+
+  constructor(method: string, cause: unknown) {
+    super(`Telegram API ${method} may have committed before transport failed.`);
+    this.name = "TelegramApiCommitUnknownError";
+    this.method = method;
+    this.cause = cause;
+  }
+}
+
+export function isTelegramApiCommitUnknownError(
+  error: unknown,
+): error is TelegramApiCommitUnknownError {
+  return error instanceof TelegramApiCommitUnknownError;
+}
+
 class TelegramApiHttpError extends Error {
   readonly status: number | undefined;
   readonly retryAfterSeconds: number | undefined;
@@ -467,6 +494,30 @@ export function isTelegramMessageNotModifiedError(error: unknown): boolean {
   return (
     error instanceof Error && error.message.includes("message is not modified")
   );
+}
+
+const TELEGRAM_RETRY_SAFE_METHODS = new Set([
+  "answerCallbackQuery",
+  "closeForumTopic",
+  "deleteForumTopic",
+  "deleteMessage",
+  "deleteWebhook",
+  "editForumTopic",
+  "editMessageCaption",
+  "editMessageReplyMarkup",
+  "editMessageText",
+  "getChat",
+  "getFile",
+  "getMe",
+  "getUpdates",
+  "sendChatAction",
+  "sendMessageDraft",
+  "sendRichMessageDraft",
+  "setMyCommands",
+]);
+
+export function isTelegramApiMethodRetrySafe(method: string): boolean {
+  return TELEGRAM_RETRY_SAFE_METHODS.has(method);
 }
 
 function isRetryableTelegramApiError(error: unknown): boolean {
@@ -579,22 +630,23 @@ async function parseTelegramApiResponse<TResponse>(
       Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
     );
   }
-  return (
-    data ?? {
-      ok: false,
-      description: `Telegram API ${method} returned invalid JSON`,
-    }
-  );
+  if (!data) {
+    throw new TelegramApiMalformedSuccessError(method, "returned invalid JSON");
+  }
+  return data;
 }
 
 function unwrapTelegramApiResult<TResponse>(
   method: string,
   data: TelegramApiResponse<TResponse>,
 ): TResponse {
-  if (!data.ok || data.result === undefined) {
+  if (data.ok && data.result === undefined) {
+    throw new TelegramApiMalformedSuccessError(method, "returned no result");
+  }
+  if (!data.ok) {
     throw new Error(data.description || `Telegram API ${method} failed`);
   }
-  return data.result;
+  return data.result as TResponse;
 }
 
 function getTelegramNetworkFamilyPolicy(
@@ -754,11 +806,13 @@ async function telegramFetch(
 
 async function callTelegramTransportRequest(
   request: (family?: TelegramNetworkFamily) => Promise<Response>,
+  allowFallback = true,
 ): Promise<Response> {
   const policy = getTelegramNetworkFamilyPolicy();
   if (policy === "auto") return request();
   const family = getTelegramNetworkFamily(policy);
   if (family) return request(family);
+  if (!allowFallback) return request();
   try {
     return await request();
   } catch (error) {
@@ -864,6 +918,10 @@ async function callTelegramWithRetry<TResponse>(
   request: (family?: TelegramNetworkFamily) => Promise<Response>,
   options: TelegramApiCallOptions | undefined,
 ): Promise<TResponse> {
+  const retrySafe =
+    options?.retrySafety === "safe" ||
+    (options?.retrySafety !== "non-idempotent" &&
+      isTelegramApiMethodRetrySafe(method));
   const maxAttempts = Math.max(1, options?.maxAttempts ?? 3);
   const retryBaseDelayMs = options?.retryBaseDelayMs ?? 500;
   const sleep = options?.sleep ?? sleepTelegramRetry;
@@ -872,14 +930,32 @@ async function callTelegramWithRetry<TResponse>(
       return unwrapTelegramApiResult(
         method,
         await parseTelegramApiResponse<TResponse>(
-          await callTelegramTransportRequest(request),
+          await callTelegramTransportRequest(request, retrySafe),
           method,
         ),
       );
     } catch (error) {
-      if (attempt >= maxAttempts - 1 || !isRetryableTelegramApiError(error)) {
+      const retryable = isRetryableTelegramApiError(error);
+      if (!retrySafe) {
+        if (error instanceof TelegramApiHttpError && error.status === 429) {
+          if (attempt >= maxAttempts - 1) throw error;
+          await sleep(
+            getTelegramRetryDelayMs(error, attempt, retryBaseDelayMs),
+          );
+          continue;
+        }
+        if (
+          error instanceof TelegramApiMalformedSuccessError ||
+          isTelegramTransportFailure(error) ||
+          (error instanceof TelegramApiHttpError &&
+            error.status !== undefined &&
+            error.status >= 500)
+        ) {
+          throw new TelegramApiCommitUnknownError(method, error);
+        }
         throw error;
       }
+      if (attempt >= maxAttempts - 1 || !retryable) throw error;
       await sleep(getTelegramRetryDelayMs(error, attempt, retryBaseDelayMs));
     }
   }

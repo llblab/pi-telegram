@@ -6,6 +6,7 @@
 
 import { readFile } from "node:fs/promises";
 import { basename, dirname } from "node:path";
+import * as Bus from "./bus.ts";
 import * as Commands from "./commands.ts";
 import type { TelegramConfigStore } from "./config.ts";
 import type { TelegramSectionRegistry } from "./sections.ts";
@@ -18,6 +19,10 @@ import * as PromptTemplates from "./prompt-templates.ts";
 import * as Queue from "./queue.ts";
 import type { TelegramBridgeRuntime } from "./runtime.ts";
 import * as TextGroups from "./text-groups.ts";
+import type {
+  TelegramInstanceThreadIdentityCandidate,
+  TelegramTopicTargetRecord,
+} from "./threads.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import * as Turns from "./turns.ts";
 
@@ -39,8 +44,7 @@ function formatTelegramPromptPeer(
   }
   const displayName = [peer.first_name, peer.last_name]
     .filter(
-      (part): part is string =>
-        typeof part === "string" && part.length > 0,
+      (part): part is string => typeof part === "string" && part.length > 0,
     )
     .join(" ");
   if (displayName) return displayName;
@@ -425,8 +429,7 @@ async function deleteReservedTelegramTopicThroughReconciler(
     >;
     getCurrentLeaderEpoch?: () => number | string | undefined;
     getThreadReconciliationMachineState?: () =>
-      | ThreadReconciler.ThreadReconciliationMachineState
-      | undefined;
+      ThreadReconciler.ThreadReconciliationMachineState | undefined;
     recordThreadReconciliationPlan?: (
       plan: ThreadReconciler.ThreadReconciliationPlan,
     ) => void;
@@ -487,6 +490,56 @@ export type TelegramRoutedMessage = Updates.TelegramUpdateMessage &
 export type TelegramRoutedCallbackQuery = Updates.TelegramCallbackQuery &
   Menu.MenuCallbackQuery;
 
+export interface TelegramInboundBusProjectionRuntime {
+  getTargetOwnership: Updates.TelegramTargetOwnershipLookup;
+  getLiveThreadTargets(): Queue.TelegramQueueTarget[];
+  getLocalThreadLabelForTarget(
+    target: Queue.TelegramQueueTarget,
+  ): string | undefined;
+}
+
+export function createTelegramInboundBusProjectionRuntime(deps: {
+  instanceId: string;
+  listFollowers(): readonly Bus.TelegramBusFollowerView[];
+  listThreadRecords(): readonly TelegramTopicTargetRecord[];
+  getLeaderTarget(): Queue.TelegramQueueTarget | undefined;
+  isFollowerRegistered(): boolean;
+  getFollowerTarget(): Queue.TelegramQueueTarget | undefined;
+  getCurrentIdentity(
+    target?: Queue.TelegramQueueTarget,
+  ): TelegramInstanceThreadIdentityCandidate;
+}): TelegramInboundBusProjectionRuntime {
+  return {
+    getTargetOwnership(target) {
+      return Bus.getTelegramFollowerTargetOwnership({
+        target,
+        followers: deps.listFollowers(),
+        activeThreadRecords: deps.listThreadRecords(),
+        currentInstanceId: deps.instanceId,
+      });
+    },
+    getLiveThreadTargets() {
+      return Bus.listTelegramBusLiveThreadTargets({
+        leaderTarget: deps.getLeaderTarget(),
+        followers: deps.listFollowers(),
+      });
+    },
+    getLocalThreadLabelForTarget(target) {
+      const followerTarget = deps.getFollowerTarget();
+      const leaderTarget = deps.getLeaderTarget();
+      const isLocalFollowerTarget =
+        deps.isFollowerRegistered() &&
+        followerTarget?.chatId === target.chatId &&
+        followerTarget.threadId === target.threadId;
+      const isLocalLeaderTarget =
+        leaderTarget?.chatId === target.chatId &&
+        leaderTarget.threadId === target.threadId;
+      if (!isLocalFollowerTarget && !isLocalLeaderTarget) return undefined;
+      return deps.getCurrentIdentity(target).threadName;
+    },
+  };
+}
+
 export interface TelegramInboundRouteRuntimeDeps<
   TMessage extends TelegramRoutedMessage,
   TCallbackQuery extends TelegramRoutedCallbackQuery,
@@ -511,8 +564,7 @@ export interface TelegramInboundRouteRuntimeDeps<
   ) => string | undefined;
   getCurrentLeaderEpoch?: () => number | string | undefined;
   getThreadReconciliationMachineState?: () =>
-    | ThreadReconciler.ThreadReconciliationMachineState
-    | undefined;
+    ThreadReconciler.ThreadReconciliationMachineState | undefined;
   recordThreadReconciliationPlan?: (
     plan: ThreadReconciler.ThreadReconciliationPlan,
   ) => void;
@@ -1494,7 +1546,11 @@ export function createTelegramInboundRouteRuntime<
       for (const r of records) {
         if (r.target.chatId !== chatId || r.target.threadId !== threadId)
           continue;
-        if (currentInstanceId && r.instanceId && r.instanceId !== currentInstanceId)
+        if (
+          currentInstanceId &&
+          r.instanceId &&
+          r.instanceId !== currentInstanceId
+        )
           continue;
         return r.threadName &&
           Threads.isTelegramTopicThreadNameValidForSlot(r.threadName, r.slot)
@@ -1889,11 +1945,9 @@ export function createTelegramInboundRouteRuntime<
     const replyMsg = gm.reply_to_message as Record<string, unknown> | undefined;
     const replyFromRaw = replyMsg?.from as Record<string, unknown> | undefined;
     const guestBotCallerUser = gm.guest_bot_caller_user as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
     const guestBotCallerChat = gm.guest_bot_caller_chat as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
     const ownerUserId = deps.configStore.getAllowedUserId();
     const replyPeer = formatTelegramPromptPeer(replyFromRaw);
     const guestPeer = resolveTelegramGuestPromptPeer({
@@ -1947,7 +2001,9 @@ export function createTelegramInboundRouteRuntime<
     let sourceContext = "";
     if (replyMsg) {
       const replyHeader = replyPeer ? `[reply|from:${replyPeer}]` : "[reply]";
-      const replyBlock = replyText ? `${replyHeader} ${replyText}` : replyHeader;
+      const replyBlock = replyText
+        ? `${replyHeader} ${replyText}`
+        : replyHeader;
       sourceContext = appendTelegramSourceAttachmentSection(
         replyBlock,
         replyPeer,

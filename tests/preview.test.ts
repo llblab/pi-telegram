@@ -346,6 +346,46 @@ test("Native Markdown finalizer waits for active draft flush before final reply"
   assert.equal(harness.getState(), undefined);
 });
 
+test("Native Markdown finalizer stops when preview generation changes during flush", async () => {
+  const harness = createPreviewRuntimeHarness({
+    mode: "draft",
+    draftId: 10,
+    pendingText: "old draft",
+    lastSentText: "",
+  });
+  let release: (() => void) | undefined;
+  harness.deps.sendDraft = async () =>
+    new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  let finalSends = 0;
+  const finalizeMarkdown = createTelegramNativeMarkdownPreviewFinalizer({
+    getState: harness.deps.getState,
+    clear: (chatId) => clearTelegramPreview(chatId, harness.deps),
+    discard: () => harness.deps.setState(undefined),
+    sendMarkdownReply: async () => {
+      finalSends += 1;
+      return 88;
+    },
+  });
+  const flush = flushTelegramPreview(7, harness.deps);
+  await Promise.resolve();
+  const finalize = finalizeMarkdown(7, "old final", 55);
+  await Promise.resolve();
+  harness.deps.setState({
+    mode: "draft",
+    draftId: 11,
+    pendingText: "new draft",
+    lastSentText: "",
+  });
+  release?.();
+
+  assert.equal(await finalize, false);
+  await flush;
+  assert.equal(finalSends, 0);
+  assert.equal(harness.getState()?.draftId, 11);
+});
+
 test("Plain preview finalization does not send fallback messages", async () => {
   const harness = createPreviewRuntimeHarness({
     mode: "draft",

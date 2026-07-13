@@ -575,6 +575,117 @@ test("Thread reconciler apply skips destructive actions from stale leader epochs
   ]);
 });
 
+test("Thread reconciler rechecks leader epoch between close and delete", async () => {
+  const calls: string[] = [];
+  const staleTargets: unknown[] = [];
+  let currentEpoch = 1;
+  let persisted = false;
+  await applyThreadReconciliationPlan(
+    {
+      actions: [
+        {
+          kind: "close-delete-unbound-topic",
+          target: { chatId: 7, threadId: 92 },
+          observedAtMs: nowMs,
+          reason: "unbound-user-message",
+          leaderEpoch: 1,
+        },
+      ],
+    },
+    {
+      getCurrentLeaderEpoch: () => currentEpoch,
+      async callApi<TResponse>(method: string) {
+        calls.push(method);
+        currentEpoch = 2;
+        return {} as TResponse;
+      },
+      markStaleByTarget(target, syncStatus) {
+        staleTargets.push({ target, syncStatus });
+        return true;
+      },
+      async persist() {
+        persisted = true;
+      },
+      recordRuntimeEvent() {},
+    },
+  );
+
+  assert.deepEqual(calls, ["closeForumTopic"]);
+  assert.deepEqual(staleTargets, []);
+  assert.equal(persisted, false);
+});
+
+test("Thread reconciler rechecks leader epoch before cleanup persistence", async () => {
+  let currentEpoch = 1;
+  let persisted = false;
+  const staleTargets: unknown[] = [];
+  await applyThreadReconciliationPlan(
+    {
+      actions: [
+        {
+          kind: "close-delete-unbound-topic",
+          target: { chatId: 7, threadId: 92 },
+          observedAtMs: nowMs,
+          reason: "unbound-user-message",
+          leaderEpoch: 1,
+        },
+      ],
+    },
+    {
+      getCurrentLeaderEpoch: () => currentEpoch,
+      async callApi<TResponse>() {
+        return {} as TResponse;
+      },
+      markStaleByTarget(target, syncStatus) {
+        staleTargets.push({ target, syncStatus });
+        currentEpoch = 2;
+        return true;
+      },
+      async persist() {
+        persisted = true;
+      },
+      recordRuntimeEvent() {},
+    },
+  );
+
+  assert.deepEqual(staleTargets, [
+    { target: { chatId: 7, threadId: 92 }, syncStatus: "deleted" },
+  ]);
+  assert.equal(persisted, false);
+});
+
+test("Thread reconciler rechecks leader epoch before expired-pending mutation", async () => {
+  let currentEpoch = 1;
+  let removed = false;
+  await applyThreadReconciliationPlan(
+    {
+      actions: [
+        {
+          kind: "close-delete-expired-pending-provision-topic",
+          target: { chatId: 7, threadId: 93 },
+          reason: "expired-pending-provision",
+          pendingProvisionId: "pending-expired",
+          leaderEpoch: 1,
+        },
+      ],
+    },
+    {
+      getCurrentLeaderEpoch: () => currentEpoch,
+      async callApi<TResponse>(method: string) {
+        if (method === "deleteForumTopic") currentEpoch = 2;
+        return {} as TResponse;
+      },
+      removePendingProvisionById() {
+        removed = true;
+        return true;
+      },
+      recordRuntimeEvent() {},
+    },
+  );
+
+  assert.equal(removed, false);
+});
+
 test("Thread reconciler apply deletes expired pending topics and removes pending state", async () => {
   const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
   const removedIds: string[] = [];
@@ -745,7 +856,8 @@ test("Thread reconciler apply treats stale delete errors as confirmed cleanup", 
   assert.equal(persisted, true);
 });
 
-test("Thread reconciler apply warns when destructive action lacks leader epoch", async () => {
+test("Thread reconciler fails closed when destructive action lacks leader epoch", async () => {
+  let calls = 0;
   const runtimeEvents: Array<{
     category: string;
     error: unknown;
@@ -765,6 +877,7 @@ test("Thread reconciler apply warns when destructive action lacks leader epoch",
     {
       getCurrentLeaderEpoch: () => 5,
       async callApi<TResponse>() {
+        calls += 1;
         return {} as TResponse;
       },
       recordRuntimeEvent(category, error, details) {
@@ -773,6 +886,7 @@ test("Thread reconciler apply warns when destructive action lacks leader epoch",
     },
   );
 
+  assert.equal(calls, 0);
   assert.deepEqual(runtimeEvents.at(0), {
     category: "telegram",
     error: "Thread reconciliation destructive action has no leader epoch",
@@ -784,6 +898,32 @@ test("Thread reconciler apply warns when destructive action lacks leader epoch",
       threadId: 90,
     },
   });
+});
+
+test("Thread reconciler fails closed when ownership probe returns undefined", async () => {
+  const calls: string[] = [];
+  await applyThreadReconciliationPlan(
+    {
+      actions: [
+        {
+          kind: "close-delete-unbound-topic",
+          target: { chatId: 7, threadId: 90 },
+          observedAtMs: nowMs,
+          reason: "unbound-user-message",
+        },
+      ],
+    },
+    {
+      getCurrentLeaderEpoch: () => undefined,
+      async callApi<TResponse>(method: string) {
+        calls.push(method);
+        return {} as TResponse;
+      },
+      recordRuntimeEvent() {},
+    },
+  );
+
+  assert.deepEqual(calls, []);
 });
 
 test("Thread reconciler plans manual disconnect cleanup as a domain action", () => {

@@ -9,6 +9,8 @@ import test from "node:test";
 import {
   appendTelegramLifecycleHooks,
   createTelegramCompactionObserverRuntime,
+  createTelegramSessionContextStore,
+  createTelegramSessionGenerationFence,
   createTelegramMessageActivityTypingHooks,
   registerTelegramLifecycleHooks,
 } from "../lib/lifecycle.ts";
@@ -45,6 +47,80 @@ function getRequiredLifecycleHandler(
 function createLifecycleContext(): ExtensionContext {
   return {} as ExtensionContext;
 }
+
+test("Session generation fence ignores delayed shutdown from a replaced context", async () => {
+  const store = createTelegramSessionContextStore<ExtensionContext>();
+  const shutdowns: ExtensionContext[] = [];
+  const runtime = createTelegramSessionGenerationFence(store, {
+    onSessionStart: async () => undefined,
+    onSessionShutdown: async (_event, ctx) => {
+      shutdowns.push(ctx);
+    },
+  });
+  const oldContext = { cwd: "/old" } as ExtensionContext;
+  const newContext = { cwd: "/new" } as ExtensionContext;
+
+  await runtime.onSessionStart({} as never, oldContext);
+  await runtime.onSessionStart({} as never, newContext);
+  await runtime.onSessionShutdown({} as never, oldContext);
+
+  assert.equal(store.get(), newContext);
+  assert.deepEqual(shutdowns, []);
+  await runtime.onSessionShutdown({} as never, newContext);
+  assert.equal(store.get(), undefined);
+  assert.deepEqual(shutdowns, [newContext]);
+});
+
+test("Session context store accepts only the current explicit session identity", () => {
+  type Context = { session: object };
+  const store = createTelegramSessionContextStore<Context>({
+    getIdentity: (ctx) => ctx.session,
+  });
+  const currentSession = {};
+  const currentStart = { session: currentSession };
+  const currentEvent = { session: currentSession };
+  const unseenStaleEvent = { session: {} };
+
+  const generation = store.set(currentStart);
+  assert.equal(store.isCurrent(currentEvent, generation), true);
+  assert.equal(store.isCurrent(unseenStaleEvent, generation), false);
+  assert.equal(store.isCurrent(unseenStaleEvent), false);
+  assert.equal(store.getGeneration(), generation);
+});
+
+test("Lifecycle composition skips old shutdown extras after replacement during await", async () => {
+  let active = true;
+  let releaseBase: (() => void) | undefined;
+  const baseBlocked = new Promise<void>((resolve) => {
+    releaseBase = resolve;
+  });
+  const events: string[] = [];
+  const ctx = createLifecycleContext();
+  const hooks = appendTelegramLifecycleHooks(
+    {
+      onSessionStart: async () => {},
+      onSessionShutdown: async () => {
+        events.push("base-start");
+        await baseBlocked;
+        events.push("base-end");
+      },
+    },
+    {
+      onSessionShutdown: async () => {
+        events.push("extra-shutdown");
+      },
+    },
+    () => active,
+  );
+
+  const shutdown = hooks.onSessionShutdown({} as never, ctx);
+  await Promise.resolve();
+  active = false;
+  releaseBase?.();
+  await shutdown;
+
+  assert.deepEqual(events, ["base-start", "base-end"]);
+});
 
 test("Lifecycle helpers compose session hooks in order", async () => {
   const events: string[] = [];

@@ -149,6 +149,76 @@ test("Command binding rejects a missing profile without stopping active polling"
   assert.deepEqual(notifications, ['Profile "missing" not found.']);
 });
 
+test("Named profile connect completes old teardown before activating new identity", async () => {
+  const harness = createBindingApiHarness();
+  const events: string[] = [];
+  let activeProfileName: string | undefined = "active";
+  let stopCompleted = false;
+  registerTelegramCommandsAndTools({
+    pi: harness.api,
+    configStore: {
+      get: () => ({ botToken: `${activeProfileName}-token` }),
+      getStoredConfig: () => ({
+        profiles: {
+          active: { botToken: "active-token" },
+          work: { botToken: "work-token" },
+        },
+      }),
+      getActiveProfileName: () => activeProfileName,
+      activateProfile: (profileName?: string) => {
+        assert.equal(stopCompleted, true);
+        events.push(`activate:${profileName ?? "default"}`);
+        activeProfileName = profileName;
+        return true;
+      },
+      getAllowedUserId: () => 840585,
+      getOutboundHandlers: () => [],
+      hasBotToken: () => true,
+      load: async () => events.push("load"),
+      persist: async () => {},
+      set: () => {},
+    },
+    setup: { start: () => true, finish: () => {} },
+    activeTurnRuntime: { get: () => undefined },
+    lockedPollingRuntime: {
+      start: async () => {
+        events.push(`start:${activeProfileName}`);
+        return { ok: true };
+      },
+      stop: async () => {
+        events.push(`stop:${activeProfileName}`);
+        await Promise.resolve();
+        stopCompleted = true;
+      },
+    },
+    getStatusLines: () => [],
+    buttonActionStore: { register: () => "button-action" },
+    sendMarkdownReply: async () => 1,
+    callMultipart: async () => ({ ok: true }),
+    getDefaultChatId: () => 840585,
+    canSendDirect: () => true,
+    updateStatus: () => events.push("status"),
+    recordRuntimeEvent: () => {},
+  } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
+
+  const connect = harness.commands.get("telegram-connect") as {
+    handler: (args: string, ctx: ExtensionContext) => Promise<void>;
+  };
+  await connect.handler("work", {
+    cwd: "/repo",
+    ui: { notify: () => undefined },
+  } as unknown as ExtensionContext);
+
+  assert.equal(activeProfileName, "work");
+  assert.deepEqual(events, [
+    "load",
+    "stop:active",
+    "activate:work",
+    "start:work",
+    "status",
+  ]);
+});
+
 test("Named profile setup cancellation preserves the active runtime", async () => {
   const harness = createBindingApiHarness();
   const events: string[] = [];

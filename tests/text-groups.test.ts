@@ -57,6 +57,42 @@ test("Text group helper delays likely split messages and appends quick continuat
   assert.deepEqual(dispatched, ["ctx:long-enough|tail"]);
 });
 
+test("Text group keeps split messages until asynchronous dispatch succeeds", async () => {
+  const groups = new Map<
+    string,
+    TextGroups.TelegramTextGroupState<TestMessage, string>
+  >();
+  const timers: Array<() => void> = [];
+  let attempts = 0;
+  TextGroups.queueTelegramTextGroupMessage({
+    message: createMessage(1, "long-enough"),
+    context: "ctx",
+    groups,
+    debounceMs: 10,
+    minSplitLength: 8,
+    setTimer: (callback) => {
+      timers.push(callback);
+      return callback as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimer: () => {},
+    dispatchMessages: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("queue admission failed");
+    },
+  });
+
+  timers[0]?.();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(groups.size, 1);
+  assert.equal(timers.length, 2);
+  timers[1]?.();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(attempts, 2);
+  assert.equal(groups.size, 0);
+});
+
 test("Text group controller clears pending timers without stale dispatch", () => {
   const dispatched: string[] = [];
   const timers: Array<{ active: boolean; callback: () => void }> = [];
@@ -91,6 +127,42 @@ test("Text group controller clears pending timers without stale dispatch", () =>
     if (timer.active) timer.callback();
   }
   assert.deepEqual(dispatched, []);
+});
+
+test("Text group suspension resumes admitted input in the replacement context", async () => {
+  const timers: Array<{ active: boolean; callback: () => void }> = [];
+  const dispatched: string[] = [];
+  const controller = TextGroups.createTelegramTextGroupController<
+    TestMessage,
+    string
+  >({
+    debounceMs: 10,
+    minSplitLength: 8,
+    setTimer: (callback) => {
+      const timer = { active: true, callback };
+      timers.push(timer);
+      return timer as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimer: (timer) => {
+      (timer as unknown as { active: boolean }).active = false;
+    },
+  });
+  controller.queueMessage({
+    message: createMessage(1, "long-enough"),
+    context: "old-session",
+    dispatchMessages: (messages, ctx) => {
+      dispatched.push(`${ctx}:${messages.map((item) => item.text).join("|")}`);
+    },
+  });
+
+  controller.suspend();
+  controller.resume("new-session");
+  for (const timer of timers) {
+    if (timer.active) timer.callback();
+  }
+  await Promise.resolve();
+
+  assert.deepEqual(dispatched, ["new-session:long-enough"]);
 });
 
 test("Text group helper uses 3600 as the default near-limit threshold", () => {

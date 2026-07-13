@@ -61,6 +61,45 @@ interface TestUpdate extends Updates.TelegramUpdateFlow {
   callback_query?: TestCallbackQuery;
 }
 
+test("Inbound bus projection owns target authority and local labels", () => {
+  const follower = {
+    instanceId: "follower-a",
+    connectedAtMs: 1,
+    lastHeartbeatMs: 2,
+    target: { chatId: 7, threadId: 11 },
+  };
+  const runtime = Routing.createTelegramInboundBusProjectionRuntime({
+    instanceId: "leader",
+    listFollowers: () => [follower],
+    listThreadRecords: () => [],
+    getLeaderTarget: () => ({ chatId: 7, threadId: 10 }),
+    isFollowerRegistered: () => true,
+    getFollowerTarget: () => ({ chatId: 7, threadId: 11 }),
+    getCurrentIdentity: (target) => ({
+      target,
+      slot: "C",
+      threadName: "Cedar",
+    }),
+  });
+
+  assert.equal(
+    runtime.getTargetOwnership({ chatId: 7, threadId: 11 })?.instanceId,
+    "follower-a",
+  );
+  assert.deepEqual(runtime.getLiveThreadTargets(), [
+    { chatId: 7, threadId: 10 },
+    { chatId: 7, threadId: 11 },
+  ]);
+  assert.equal(
+    runtime.getLocalThreadLabelForTarget({ chatId: 7, threadId: 11 }),
+    "Cedar",
+  );
+  assert.equal(
+    runtime.getLocalThreadLabelForTarget({ chatId: 7, threadId: 99 }),
+    undefined,
+  );
+});
+
 test("Routing runtime forwards authorized text messages into prompt queueing", async () => {
   const events: string[] = [];
   const model: TestModel = { provider: "test", id: "model" };

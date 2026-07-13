@@ -27,6 +27,7 @@ import {
   createTelegramBusLeaderTargetProvisioner,
 } from "../lib/bus-leader.ts";
 import { createTelegramTopicTargetStore } from "../lib/threads.ts";
+import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 
 test("Bus leader binding reality removes dead followers without Telegram cleanup", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-reality-"));
@@ -1008,6 +1009,34 @@ test("Bus leader provisions targets before registering followers", async () => {
   ]);
 });
 
+test("Bus leader rejects follower registration after provisioning loses epoch", async () => {
+  const registry = createTelegramBusFollowerRegistry();
+  let leaderEpoch: number | undefined = 1;
+  const handleEnvelope = createTelegramBusLeaderEnvelopeHandler({
+    followerRegistry: registry,
+    getCurrentLeaderEpoch: () => leaderEpoch,
+    async provisionFollowerTarget() {
+      leaderEpoch = undefined;
+      return { chatId: -1007, threadId: 42 };
+    },
+  });
+
+  assert.deepEqual(
+    await handleEnvelope({
+      kind: "follower.register",
+      requestId: "inst-a:lost",
+      registration: { instanceId: "inst-a", connectedAtMs: 1000 },
+    }),
+    {
+      kind: "bus.ack",
+      requestId: "inst-a:lost",
+      ok: false,
+      message: "Telegram follower registration lost leader ownership.",
+    },
+  );
+  assert.equal(registry.get("inst-a"), undefined);
+});
+
 test("Bus leader records ownership for follower-sent messages", async () => {
   const registry = createTelegramBusFollowerRegistry();
   registry.register({
@@ -1098,6 +1127,75 @@ test("Bus leader handles follower API call envelopes for registered followers", 
       requestId: "missing:1",
       ok: false,
       message: "Unknown Telegram bus follower instance.",
+    },
+  );
+});
+
+test("Bus leader rejects delayed API calls from a replaced follower generation", async () => {
+  const registry = createTelegramBusFollowerRegistry();
+  registry.register({
+    instanceId: "inst-a",
+    connectedAtMs: 2000,
+    registrationGeneration: "generation-new",
+  });
+  let apiCalls = 0;
+  const handleEnvelope = createTelegramBusLeaderEnvelopeHandler({
+    followerRegistry: registry,
+    callApi() {
+      apiCalls += 1;
+      return { ok: true };
+    },
+  });
+
+  assert.deepEqual(
+    await handleEnvelope({
+      kind: "follower.callApi",
+      requestId: "inst-a:old:1",
+      instanceId: "inst-a",
+      registrationGeneration: "generation-old",
+      method: "call",
+      args: ["sendMessage", { chat_id: 1 }],
+      sentAtMs: 3000,
+    }),
+    {
+      kind: "bus.ack",
+      requestId: "inst-a:old:1",
+      ok: false,
+      message: "Stale Telegram bus follower registration generation.",
+    },
+  );
+  assert.equal(apiCalls, 0);
+});
+
+test("Bus leader encodes commit-unknown API failures structurally", async () => {
+  const registry = createTelegramBusFollowerRegistry();
+  registry.register({ instanceId: "inst-a", connectedAtMs: 1000 });
+  const handleEnvelope = createTelegramBusLeaderEnvelopeHandler({
+    followerRegistry: registry,
+    async callApi() {
+      throw new TelegramApiCommitUnknownError(
+        "sendMessage",
+        new Error("response lost"),
+      );
+    },
+  });
+
+  assert.deepEqual(
+    await handleEnvelope({
+      kind: "follower.callApi",
+      requestId: "inst-a:ambiguous:1",
+      instanceId: "inst-a",
+      method: "call",
+      args: ["sendMessage", { chat_id: 1 }],
+      sentAtMs: 4000,
+    }),
+    {
+      kind: "bus.ack",
+      requestId: "inst-a:ambiguous:1",
+      ok: false,
+      message:
+        "Telegram API sendMessage may have committed before transport failed.",
+      error: { code: "commit-unknown", method: "sendMessage" },
     },
   );
 });

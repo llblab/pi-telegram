@@ -10,13 +10,15 @@ import {
   mkdirSync,
   statSync,
   writeFileSync,
-  appendFile,
+  appendFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
 import {
   resolveAgentDir,
   resolveTelegramProfileTempFilePath,
 } from "./paths.ts";
+import { withTelegramFileTransaction } from "./locks.ts";
+import * as Status from "./status.ts";
 
 export type TelegramLogPathInput = string | (() => string);
 
@@ -32,6 +34,8 @@ export interface TelegramRuntimeJsonlLogOptions {
   previousPath?: TelegramLogPathInput;
   maxBytes?: number;
   getNowMs?: () => number;
+  canReset?: () => boolean;
+  commitReset?: (commit: () => void) => boolean;
 }
 
 export interface TelegramRuntimeJsonlLog {
@@ -89,7 +93,8 @@ export function createTelegramRuntimeJsonlLog(
       ? options.path()
       : (options.path ?? getTelegramRuntimeLogPath());
   const resolvePreviousPath = () => {
-    if (typeof options.previousPath === "function") return options.previousPath();
+    if (typeof options.previousPath === "function")
+      return options.previousPath();
     if (options.previousPath) return options.previousPath;
     return resolvePath().replace(/\.jsonl$/u, "._prev.jsonl");
   };
@@ -108,9 +113,12 @@ export function createTelegramRuntimeJsonlLog(
     copyFileSync(path, previousPath);
   };
 
-  const writeReset = (reason: string, scope?: Record<string, unknown>) => {
-    const path = resolvePath();
-    const previousPath = resolvePreviousPath();
+  const writeResetLocked = (
+    path: string,
+    previousPath: string,
+    reason: string,
+    scope?: Record<string, unknown>,
+  ) => {
     ensureParent(path);
     preserveCurrentLog(path, previousPath);
     writeFileSync(
@@ -126,20 +134,49 @@ export function createTelegramRuntimeJsonlLog(
     );
   };
 
+  const writeReset = (
+    reason: string,
+    scope?: Record<string, unknown>,
+  ): boolean => {
+    if (options.canReset && !options.canReset()) return false;
+    const path = resolvePath();
+    let didReset = false;
+    withTelegramFileTransaction(`${path}.transaction`, () => {
+      const commit = () => {
+        writeResetLocked(path, resolvePreviousPath(), reason, scope);
+        didReset = true;
+      };
+      if (options.commitReset) {
+        options.commitReset(commit);
+      } else {
+        commit();
+      }
+    });
+    return didReset;
+  };
+
   const appendLine = (line: string) => {
+    const path = resolvePath();
+    const previousPath = resolvePreviousPath();
     pending = pending
       .catch(() => undefined)
-      .then(async () => {
-        const path = resolvePath();
+      .then(() => {
         ensureParent(path);
-        if (existsSync(path) && statSync(path).size > maxBytes) {
-          writeReset("max-bytes", { maxBytes });
-        }
-        await new Promise<void>((resolve, reject) => {
-          appendFile(path, line, { mode: 0o600 }, (error) => {
-            if (error) reject(error);
-            else resolve();
-          });
+        withTelegramFileTransaction(`${path}.transaction`, () => {
+          if (
+            existsSync(path) &&
+            statSync(path).size > maxBytes &&
+            (!options.canReset || options.canReset())
+          ) {
+            const rotate = () =>
+              writeResetLocked(path, previousPath, "max-bytes", { maxBytes });
+            if (options.commitReset) {
+              options.commitReset(rotate);
+            } else {
+              rotate();
+            }
+          }
+          appendFileSync(path, line, { mode: 0o600 });
         });
       });
   };
@@ -148,9 +185,10 @@ export function createTelegramRuntimeJsonlLog(
     getPath: resolvePath,
     reset(reason, scope) {
       const path = resolvePath();
-      scopeKeys.set(path, scope ? safeJsonLine(scope) : undefined);
       try {
-        writeReset(reason, scope);
+        if (writeReset(reason, scope)) {
+          scopeKeys.set(path, scope ? safeJsonLine(scope) : undefined);
+        }
       } catch {
         // Diagnostics must never break Telegram runtime behavior.
       }
@@ -158,15 +196,136 @@ export function createTelegramRuntimeJsonlLog(
     resetIfScopeChanged(nextScopeKey, reason, scope) {
       const path = resolvePath();
       if (scopeKeys.get(path) === nextScopeKey) return;
-      scopeKeys.set(path, nextScopeKey);
       try {
-        writeReset(reason, scope);
+        if (writeReset(reason, scope)) scopeKeys.set(path, nextScopeKey);
       } catch {
         // Diagnostics must never break Telegram runtime behavior.
       }
     },
     record(event) {
       appendLine(safeJsonLine({ kind: "event", ...event }) + "\n");
+    },
+  };
+}
+
+export interface TelegramRuntimeDiagnosticsRuntime<TContext> {
+  events: Status.TelegramRuntimeEventRecorder;
+  recordRuntimeEvent(
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ): void;
+  bindStorage(ports: {
+    getBotToken(): string | undefined;
+    getProfileName(): string | undefined;
+    canReset(): boolean;
+    commitReset(commit: () => void): boolean;
+  }): void;
+  bindStatus(ports: {
+    instanceId: string;
+    updateStatus(ctx: TContext, error?: string): void;
+    getStatusState(): Status.TelegramBridgeStatusLineState;
+    persistSnapshot(
+      snapshot: ReturnType<typeof Status.createTelegramStatusSnapshot>,
+    ): Promise<void>;
+  }): void;
+  updateStatus(ctx: TContext, error?: string): void;
+  getStatusLines(options?: Status.TelegramBridgeStatusLineOptions): string[];
+  scheduleSnapshotPersist(): void;
+}
+
+export function createTelegramRuntimeDiagnosticsRuntime<
+  TContext,
+>(): TelegramRuntimeDiagnosticsRuntime<TContext> {
+  let getBotToken = (): string | undefined => undefined;
+  let getProfileName = (): string | undefined => undefined;
+  let canReset = (): boolean => false;
+  let commitReset = (_commit: () => void): boolean => false;
+  let statusPorts:
+    | {
+        instanceId: string;
+        updateStatus(ctx: TContext, error?: string): void;
+        getStatusState(): Status.TelegramBridgeStatusLineState;
+        persistSnapshot(
+          snapshot: ReturnType<typeof Status.createTelegramStatusSnapshot>,
+        ): Promise<void>;
+      }
+    | undefined;
+  let requestSnapshotPersist = (): void => {};
+  const events = Status.createTelegramRuntimeEventRecorder({
+    getBotToken: () => getBotToken(),
+  });
+  const jsonl = createTelegramRuntimeJsonlLog({
+    path: () => getTelegramRuntimeLogPath(undefined, getProfileName()),
+    previousPath: () =>
+      getTelegramPreviousRuntimeLogPath(undefined, getProfileName()),
+    canReset: () => canReset(),
+    commitReset: (commit) => commitReset(commit),
+  });
+  const recordRuntimeEvent = function (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ): void {
+    events.record(category, error, details);
+    const latestEvent = events.getEvents().at(-1);
+    if (latestEvent) jsonl.record(latestEvent);
+    requestSnapshotPersist();
+  };
+  const persistCurrentSnapshot = async (): Promise<void> => {
+    if (!statusPorts) return;
+    await statusPorts.persistSnapshot(
+      Status.createTelegramStatusSnapshot(statusPorts.getStatusState()),
+    );
+  };
+  const updateRuntimeLogScope = function (reason: string): void {
+    if (!statusPorts) return;
+    const scope = Status.createTelegramRuntimeLogScope({
+      state: statusPorts.getStatusState(),
+      instanceId: statusPorts.instanceId,
+    });
+    jsonl.resetIfScopeChanged(JSON.stringify(scope), reason, scope);
+  };
+  return {
+    events,
+    recordRuntimeEvent,
+    bindStorage(ports) {
+      getBotToken = ports.getBotToken;
+      getProfileName = ports.getProfileName;
+      canReset = ports.canReset;
+      commitReset = ports.commitReset;
+    },
+    bindStatus(ports) {
+      statusPorts = ports;
+      requestSnapshotPersist =
+        Status.createTelegramRuntimeDiagnosticsSnapshotScheduler({
+          persistSnapshot: persistCurrentSnapshot,
+          recordError(error) {
+            events.record("telegram", error, {
+              phase: "runtime-diagnostics-snapshot-persist",
+            });
+          },
+        });
+    },
+    updateStatus(ctx, error) {
+      if (!statusPorts) return;
+      statusPorts.updateStatus(ctx, error);
+      updateRuntimeLogScope("status-scope-change");
+    },
+    getStatusLines(options) {
+      if (!statusPorts) return [];
+      void persistCurrentSnapshot().catch((error) => {
+        recordRuntimeEvent("telegram", error, {
+          phase: "status-snapshot-persist",
+        });
+      });
+      return Status.buildTelegramBridgeStatusLines(
+        statusPorts.getStatusState(),
+        options,
+      );
+    },
+    scheduleSnapshotPersist() {
+      requestSnapshotPersist();
     },
   };
 }

@@ -36,8 +36,14 @@ function createDirectRuntime(calls: unknown[]): TelegramBridgeApiRuntime {
       calls.push({ kind: "download", fileId, suggestedName });
       return "/tmp/file";
     },
-    deleteWebhook: async () => true,
-    getUpdates: async () => [],
+    deleteWebhook: async () => {
+      calls.push({ kind: "delete-webhook" });
+      return true;
+    },
+    getUpdates: async (body) => {
+      calls.push({ kind: "get-updates", body });
+      return [];
+    },
     setMyCommands: async (commands) => {
       calls.push({ kind: "commands", commands });
       return true;
@@ -111,6 +117,30 @@ test("Bus-aware API runtime uses direct transport while this instance owns Teleg
   assert.deepEqual(directCalls, [
     { kind: "rich", body: { chat_id: 1, rich_message: { markdown: "hi" } } },
   ]);
+  assert.deepEqual(busCalls, []);
+});
+
+test("Bus-aware polling methods fail closed without direct ownership", async () => {
+  const directCalls: unknown[] = [];
+  const busCalls: unknown[] = [];
+  const runtime = createTelegramBusAwareApiRuntime({
+    directRuntime: createDirectRuntime(directCalls),
+    ownsDirect: () => false,
+    callFollowerApi: async (method, args) => {
+      busCalls.push({ method, args });
+      return true;
+    },
+  });
+
+  await assert.rejects(
+    runtime.deleteWebhook(),
+    /deleteWebhook requires direct transport ownership/,
+  );
+  await assert.rejects(
+    runtime.getUpdates({ offset: 1 }),
+    /getUpdates requires direct transport ownership/,
+  );
+  assert.deepEqual(directCalls, []);
   assert.deepEqual(busCalls, []);
 });
 

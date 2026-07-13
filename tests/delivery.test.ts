@@ -11,6 +11,7 @@ import {
   clearTelegramDeliveryRuntime,
   createTelegramBridgeDeliveryRuntime,
   createTelegramDeliveryLifecycleHooks,
+  createTelegramDeliveryTargetPolicyRuntime,
   createTelegramDeliveryRuntime as createConcreteDeliveryRuntime,
   deleteTelegramView,
   editTelegramView,
@@ -23,6 +24,7 @@ import {
   type TelegramDeliveryRuntime,
   type TelegramDeliveryRuntimeDeps,
 } from "../lib/delivery.ts";
+import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 
 const target = { chatId: 42, threadId: 7 };
 
@@ -247,6 +249,46 @@ test("Delivery API converts unexpected runtime errors into transport failures", 
   });
 });
 
+test("Delivery target policy runtime projects live authority and excludes Guest turns", () => {
+  let ownsDirect = false;
+  let followerRegistered = true;
+  let guestQueryId: string | undefined;
+  const runtime = createTelegramDeliveryTargetPolicyRuntime({
+    ownsDirect: () => ownsDirect,
+    isFollowerRegistered: () => followerRegistered,
+    getAllowedChatId: () => 42,
+    getFollowerTarget: () => ({ chatId: 42, threadId: 7 }),
+    getLeaderTarget: () => ({ chatId: 42, threadId: 8 }),
+    listThreadRecords: () => [
+      { target: { chatId: 42, threadId: 7 } },
+      { target: { chatId: 42, threadId: 8 } },
+    ],
+    getActiveTurnTarget: () => ({ chatId: 42, threadId: 7 }),
+    getActiveGuestQueryId: () => guestQueryId,
+  });
+
+  assert.deepEqual(runtime.getTargetPolicyView(), {
+    canDeliver: true,
+    ownsDirect: false,
+    allowedChatId: 42,
+    followerTarget: { chatId: 42, threadId: 7 },
+    leaderTarget: { chatId: 42, threadId: 8 },
+    liveTargets: [
+      { chatId: 42, threadId: 7 },
+      { chatId: 42, threadId: 8 },
+    ],
+  });
+  assert.deepEqual(runtime.getActiveTurnTarget(), {
+    chatId: 42,
+    threadId: 7,
+  });
+  guestQueryId = "guest";
+  assert.equal(runtime.getActiveTurnTarget(), undefined);
+  followerRegistered = false;
+  ownsDirect = false;
+  assert.equal(runtime.getTargetPolicyView().canDeliver, false);
+});
+
 test("Delivery target policy resolves classic, leader, and follower instance surfaces", () => {
   assert.deepEqual(
     resolveTelegramDeliveryInstanceTarget({
@@ -413,6 +455,50 @@ test("Bridge delivery runtime owns rendering and bus-aware transport adaptation"
   ]);
 });
 
+test("Bridge delivery runtime rejects work after transport generation replacement", async () => {
+  let transportActive = true;
+  let apiCalls = 0;
+  const runtime = createTelegramBridgeDeliveryRuntime({
+    generation: "generation-one",
+    isTransportActive: () => transportActive,
+    getTargetPolicyView: () => ({
+      canDeliver: true,
+      ownsDirect: true,
+      allowedChatId: 42,
+      leaderTarget: target,
+    }),
+    getActiveTurnTarget: () => target,
+    api: {
+      async sendMessage() {
+        apiCalls += 1;
+        return { message_id: 101 };
+      },
+      async editMessageText() {
+        apiCalls += 1;
+        return "edited";
+      },
+      async deleteMessage() {
+        apiCalls += 1;
+      },
+      async sendChatAction() {
+        apiCalls += 1;
+        return true;
+      },
+    },
+    recordOwnership() {},
+  });
+  transportActive = false;
+
+  const result = await runtime.sendView(
+    { text: "stale" },
+    { scope: { kind: "instance" } },
+  );
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, "runtime-unavailable");
+  assert.equal(apiCalls, 0);
+});
+
 test("Concrete delivery runtime resolves scopes and rejects unauthorized targets", async () => {
   const { runtime, events } = createConcreteRuntimeHarness();
   const sent = await runtime.sendView(
@@ -475,6 +561,50 @@ test("Concrete delivery runtime anchors first chunk and keyboard on last chunk",
   if (result.ok) assert.deepEqual(result.value.messageIds, [101, 102]);
 });
 
+test("Concrete delivery runtime keeps handles opaque and deeply immutable", async () => {
+  const { runtime } = createConcreteRuntimeHarness();
+  const sent = await runtime.sendView(
+    { text: "hello" },
+    { scope: { kind: "instance" } },
+  );
+  assert.equal(sent.ok, true);
+  if (!sent.ok) return;
+  assert.equal(Object.isFrozen(sent.value), true);
+  assert.equal(Object.isFrozen(sent.value.target), true);
+  assert.equal(Object.isFrozen(sent.value.messageIds), true);
+  assert.throws(() => {
+    (sent.value.target as { threadId?: number }).threadId = 999;
+  }, TypeError);
+  const forged = {
+    ...sent.value,
+    target: { ...sent.value.target },
+    messageIds: [...sent.value.messageIds],
+  };
+  const edited = await runtime.editView(forged, { text: "forged" });
+  assert.equal(edited.ok, false);
+  if (!edited.ok) assert.equal(edited.reason, "stale-handle");
+});
+
+test("Concrete delivery runtime exposes non-idempotent commit-unknown outcomes", async () => {
+  const { runtime } = createConcreteRuntimeHarness({
+    async sendChunk() {
+      throw new TelegramApiCommitUnknownError(
+        "sendMessage",
+        new TypeError("fetch failed"),
+      );
+    },
+  });
+  const result = await runtime.sendView(
+    { text: "hello" },
+    { scope: { kind: "target", target } },
+  );
+  assert.deepEqual(result, {
+    ok: false,
+    reason: "commit-unknown",
+    message: "Telegram delivery send may have committed before transport failed.",
+  });
+});
+
 test("Concrete delivery runtime returns a recoverable handle after partial send failure", async () => {
   let sendCount = 0;
   const deleted: number[] = [];
@@ -511,15 +641,22 @@ test("Concrete delivery runtime returns all visible ids after edit growth failur
   const { runtime } = createConcreteRuntimeHarness({
     async sendChunk() {
       growthSendCount += 1;
-      if (growthSendCount === 2) throw new Error("growth chunk failed");
-      return 12;
+      if (growthSendCount === 3) throw new Error("growth chunk failed");
+      return growthSendCount === 1 ? 11 : 12;
     },
     async deleteMessage(_deliveryTarget, messageId) {
       deleted.push(messageId);
     },
   });
-  const original = handle("generation-one");
-  const result = await runtime.editView(original, { text: "one|two|three" });
+  const initial = await runtime.sendView(
+    { text: "one" },
+    { scope: { kind: "instance" } },
+  );
+  assert.equal(initial.ok, true);
+  if (!initial.ok) return;
+  const result = await runtime.editView(initial.value, {
+    text: "one|two|three",
+  });
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.reason, "transport-failed");
@@ -536,25 +673,26 @@ test("Concrete delivery runtime removes already-deleted ids from partial edit re
   const { runtime } = createConcreteRuntimeHarness({
     async deleteMessage(_deliveryTarget, messageId) {
       deleteCalls.push(messageId);
-      if (messageId === 13 && !failedOnce) {
+      if (messageId === 103 && !failedOnce) {
         failedOnce = true;
         throw new Error("shrink delete failed");
       }
     },
   });
-  const original: TelegramDeliveryHandle = {
-    target,
-    messageIds: [11, 12, 13],
-    generation: "generation-one",
-  };
-  const result = await runtime.editView(original, { text: "one" });
+  const initial = await runtime.sendView(
+    { text: "one|two|three" },
+    { scope: { kind: "instance" } },
+  );
+  assert.equal(initial.ok, true);
+  if (!initial.ok) return;
+  const result = await runtime.editView(initial.value, { text: "one" });
   assert.equal(result.ok, false);
   if (result.ok) return;
-  assert.deepEqual(result.partial?.messageIds, [11, 13]);
+  assert.deepEqual(result.partial?.messageIds, [101, 103]);
   assert.ok(result.partial);
   const cleanup = await runtime.deleteView(result.partial);
   assert.equal(cleanup.ok, true);
-  assert.deepEqual(deleteCalls, [12, 13, 11, 13]);
+  assert.deepEqual(deleteCalls, [102, 103, 101, 103]);
 });
 
 test("Concrete delivery runtime reconciles logical view growth and shrink", async () => {

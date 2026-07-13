@@ -19,6 +19,7 @@ import {
   createTelegramBusFollowerSessionRefreshHook,
   createTelegramBusFollowerSessionReplacementSuspender,
   createTelegramBusFollowerTargetReplacementHandler,
+  createTelegramBusForwardedRouteHandlers,
   createTelegramBusForwardedUpdateReceiverRuntime,
   createTelegramManualFollowerProfileKeyResolver,
   getTelegramFollowerSessionHandoff,
@@ -32,6 +33,7 @@ import {
 } from "../lib/bus.ts";
 import { createTelegramBusLeaderEnvelopeHandler } from "../lib/bus-leader.ts";
 import { createTelegramTopicTargetStore } from "../lib/threads.ts";
+import { isTelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 
 async function waitForCondition(
   predicate: () => boolean,
@@ -45,6 +47,37 @@ async function waitForCondition(
   assert.fail("Timed out waiting for condition");
 }
 
+test("Bus follower route handlers adapt forwarded envelopes", async () => {
+  const events: string[] = [];
+  const handlers = createTelegramBusForwardedRouteHandlers<
+    string,
+    { emoji: string },
+    { id: string },
+    { text: string }
+  >({
+    handleUpdate(update, ctx) {
+      events.push(
+        `${ctx}:${update.callback_query?.id ?? update.message?.text ?? update.edited_message?.text}`,
+      );
+    },
+    handleAuthorizedReactionUpdate(reaction, ctx) {
+      events.push(`${ctx}:${reaction.emoji}`);
+    },
+  });
+
+  await handlers.handleForwardedCallback({ id: "callback" }, "ctx");
+  await handlers.handleForwardedReaction({ emoji: "👍" }, "ctx");
+  await handlers.handleForwardedMessage?.({ text: "message" }, "ctx");
+  await handlers.handleForwardedEditedMessage?.({ text: "edited" }, "ctx");
+
+  assert.deepEqual(events, [
+    "ctx:callback",
+    "ctx:👍",
+    "ctx:message",
+    "ctx:edited",
+  ]);
+});
+
 test("Bus follower profile key resolver follows the active profile", () => {
   let profileName: string | undefined;
   const resolveProfileKey = createTelegramManualFollowerProfileKeyResolver({
@@ -56,7 +89,7 @@ test("Bus follower profile key resolver follows the active profile", () => {
   assert.equal(resolveProfileKey(), "profile:work:manual:7");
 });
 
-test("Bus follower promotion handler transfers binding before starting leader", async () => {
+test("Bus follower promotion handler transfers binding only after leadership acquisition", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-promotion-"));
   const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
   const events: unknown[] = [];
@@ -64,8 +97,10 @@ test("Bus follower promotion handler transfers binding before starting leader", 
     topicTargetStore: store,
     instanceId: "inst-a",
     getActiveProfileName: () => "work",
-    startLeader: (ctx: { cwd: string }) => {
-      events.push(`start:${ctx.cwd}`);
+    startLeader: async (ctx: { cwd: string }, _election, onAcquired) => {
+      events.push(`acquired:${ctx.cwd}`);
+      await onAcquired();
+      return true;
     },
     recordRuntimeEvent: (category, message, details) => {
       events.push({ category, message, details });
@@ -79,11 +114,12 @@ test("Bus follower promotion handler transfers binding before starting leader", 
         slot: "E",
         threadName: "Ember",
       },
+      {},
     );
     assert.equal(store.list()[0]?.profileKey, "profile:work:cwd:/repo");
     assert.equal(store.list()[0]?.owner?.kind, "leader");
-    assert.equal(events.at(-1), "start:/repo");
-    assert.deepEqual(events[0], {
+    assert.equal(events[0], "acquired:/repo");
+    assert.deepEqual(events[1], {
       category: "bus",
       message: "Follower thread binding promoted to leader",
       details: {
@@ -94,6 +130,35 @@ test("Bus follower promotion handler transfers binding before starting leader", 
         threadName: "Ember",
       },
     });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus follower promotion leaves binding unchanged when election is lost", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-election-lost-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+  const promote = createTelegramBusFollowerPromotionHandler({
+    topicTargetStore: store,
+    instanceId: "inst-a",
+    getActiveProfileName: () => "work",
+    startLeader: async () => false,
+    recordRuntimeEvent: () => undefined,
+  });
+  try {
+    assert.equal(
+      await promote(
+        { cwd: "/repo" },
+        {
+          target: { chatId: 42, threadId: 11 },
+          slot: "E",
+          threadName: "Ember",
+        },
+        { expectedOwner: { pid: 99 } },
+      ),
+      false,
+    );
+    assert.deepEqual(store.list(), []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -260,6 +325,46 @@ test("Bus follower receiver handles leader-forwarded updates and target replacem
   }
 });
 
+test("Bus follower receiver rejects delayed work from a replaced registration generation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-forward-generation-"));
+  const socketPath = join(dir, "follower.sock");
+  let handled = 0;
+  const receiver = createTelegramBusForwardedUpdateReceiverRuntime({
+    socketPath,
+    instanceId: "inst-b",
+    getRegistrationGeneration: () => "generation-new",
+    getContext: () => "ctx",
+    handleForwardedCallback() {
+      handled += 1;
+    },
+    handleForwardedReaction() {},
+  });
+  try {
+    await receiver.start();
+    const response = await sendTelegramBusLocalEnvelope({
+      socketPath,
+      envelope: {
+        kind: "leader.forwardCallback",
+        requestId: "leader:old:1",
+        recipientInstanceId: "inst-b",
+        recipientRegistrationGeneration: "generation-old",
+        query: { id: "old" },
+        sentAtMs: 2000,
+      },
+    });
+    assert.equal(handled, 0);
+    assert.deepEqual(response, {
+      kind: "bus.ack",
+      requestId: "leader:old:1",
+      ok: false,
+      message: "Stale Telegram bus follower registration generation.",
+    });
+  } finally {
+    await receiver.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Bus follower heartbeat recovery passes current binding into promotion", async () => {
   const promoted: unknown[] = [];
   let leaderStateCalls = 0;
@@ -282,13 +387,14 @@ test("Bus follower heartbeat recovery passes current binding into promotion", as
     getLeaderState: () => {
       leaderStateCalls += 1;
       return leaderStateCalls === 1
-        ? { kind: "active-elsewhere", lock: {} }
+        ? { kind: "active-elsewhere", lock: { pid: 99 } }
         : { kind: "inactive" };
     },
     setLifecyclePhase: () => undefined,
     updateStatus: () => undefined,
-    promoteToLeader: (_ctx, binding) => {
+    promoteToLeader: async (_ctx, binding) => {
       promoted.push(binding);
+      return true;
     },
     sleep: async () => undefined,
     promotionGraceMs: 0,
@@ -300,6 +406,221 @@ test("Bus follower heartbeat recovery passes current binding into promotion", as
   assert.deepEqual(promoted, [
     { target: { chatId: 42, threadId: 10 }, slot: "F", threadName: "Fjord" },
   ]);
+});
+
+test("Bus follower heartbeat recovery never promotes over a live leader lease", async () => {
+  const promoted: unknown[] = [];
+  const phases: Array<string | undefined> = [];
+  const events: Array<{ message: unknown; phase?: unknown }> = [];
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 });
+  const liveLeader = {
+    kind: "active-elsewhere" as const,
+    lock: {
+      pid: 99,
+      instanceId: "leader-a",
+      leaderEpoch: "epoch-a",
+    },
+  };
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({
+      registerWithLeader: async () => false,
+      setContext: () => undefined,
+      stop: () => undefined,
+    }),
+    getLeaderState: () => liveLeader,
+    setLifecyclePhase: (phase) => {
+      phases.push(phase);
+    },
+    updateStatus: () => undefined,
+    promoteToLeader: async (_ctx, binding) => {
+      promoted.push(binding);
+      return true;
+    },
+    sleep: async () => undefined,
+    promotionGraceMs: 0,
+    recordRuntimeEvent: (_category, message, details) => {
+      events.push({ message, phase: details?.phase });
+    },
+  });
+
+  await handler(new Error("heartbeat failed"), "ctx");
+
+  assert.deepEqual(promoted, []);
+  assert.equal(phases.at(-1), undefined);
+  assert.equal(
+    events.some(
+      (event) => event.phase === "follower-promotion-live-owner",
+    ),
+    true,
+  );
+});
+
+test("Bus follower heartbeat recovery retries until a live lease becomes stale", async () => {
+  let stateReadCount = 0;
+  let scheduledRetry: (() => void) | undefined;
+  let resolvePromoted: (() => void) | undefined;
+  const promoted = new Promise<void>((resolve) => {
+    resolvePromoted = resolve;
+  });
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(
+    true,
+    { chatId: 42, threadId: 10 },
+    { slot: "F", threadName: "Fjord" },
+  );
+  const liveLock = {
+    pid: 99,
+    instanceId: "leader-a",
+    leaderEpoch: "epoch-a",
+  };
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({
+      registerWithLeader: async () => false,
+      setContext: () => undefined,
+      stop: () => undefined,
+    }),
+    getLeaderState: () => {
+      stateReadCount += 1;
+      return stateReadCount <= 2
+        ? { kind: "active-elsewhere", lock: liveLock }
+        : { kind: "stale", lock: liveLock };
+    },
+    setLifecyclePhase: () => undefined,
+    updateStatus: () => undefined,
+    promoteToLeader: async (_ctx, binding, election) => {
+      assert.deepEqual(binding, {
+        target: { chatId: 42, threadId: 10 },
+        slot: "F",
+        threadName: "Fjord",
+      });
+      assert.deepEqual(election, { expectedOwner: liveLock });
+      resolvePromoted?.();
+      return true;
+    },
+    sleep: async () => undefined,
+    scheduleRetry: (retry) => {
+      scheduledRetry = retry;
+    },
+    getActiveContext: () => "ctx",
+    promotionGraceMs: 0,
+    recordRuntimeEvent: () => undefined,
+  });
+
+  await handler(new Error("heartbeat failed"), "ctx");
+  assert.ok(scheduledRetry);
+  scheduledRetry();
+  await promoted;
+});
+
+test("Bus follower election loser schedules re-registration with the winner", async () => {
+  const scheduled: Array<() => void> = [];
+  let registrationCalls = 0;
+  let promotionCalls = 0;
+  let registrationTarget: unknown;
+  let resolveRegistered: (() => void) | undefined;
+  const registered = new Promise<void>((resolve) => {
+    resolveRegistered = resolve;
+  });
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 });
+  const staleLock = { pid: 99, leaderEpoch: "old-epoch" };
+  const winnerLock = { pid: 100, leaderEpoch: "winner-epoch" };
+  let state: "stale" | "winner" = "stale";
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({
+      registerWithLeader: async (_ctx, _leader, options) => {
+        registrationCalls += 1;
+        registrationTarget = options?.target;
+        resolveRegistered?.();
+        return true;
+      },
+      setContext: () => undefined,
+      stop: () => {
+        registrationState.setRegistered(false);
+      },
+    }),
+    getLeaderState: () =>
+      state === "stale"
+        ? { kind: "stale", lock: staleLock }
+        : { kind: "active-elsewhere", lock: winnerLock },
+    setLifecyclePhase: () => undefined,
+    updateStatus: () => undefined,
+    promoteToLeader: async () => {
+      promotionCalls += 1;
+      state = "winner";
+      return false;
+    },
+    sleep: async () => undefined,
+    scheduleRetry: (retry) => {
+      scheduled.push(retry);
+    },
+    getActiveContext: () => "ctx",
+    promotionGraceMs: 0,
+    recordRuntimeEvent: () => undefined,
+  });
+
+  await handler(new Error("heartbeat failed"), "ctx");
+  assert.equal(promotionCalls, 1);
+  assert.equal(scheduled.length, 1);
+  scheduled.shift()?.();
+  await registered;
+  assert.equal(registrationCalls, 1);
+  assert.deepEqual(registrationTarget, { chatId: 42, threadId: 10 });
+});
+
+test("Bus follower scheduled recovery transfers across session context replacement", async () => {
+  const scheduled: Array<() => void> = [];
+  let activeContext: string | undefined = "old-ctx";
+  let stateReads = 0;
+  let promotedContext: string | undefined;
+  let resolvePromoted: (() => void) | undefined;
+  const promoted = new Promise<void>((resolve) => {
+    resolvePromoted = resolve;
+  });
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 });
+  const lock = { pid: 99, leaderEpoch: "epoch-a" };
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({
+      registerWithLeader: async () => false,
+      setContext: () => undefined,
+      stop: () => undefined,
+    }),
+    getLeaderState: () => {
+      stateReads += 1;
+      return stateReads <= 2
+        ? { kind: "active-elsewhere", lock }
+        : { kind: "stale", lock };
+    },
+    setLifecyclePhase: () => undefined,
+    updateStatus: () => undefined,
+    promoteToLeader: async (ctx) => {
+      promotedContext = ctx;
+      resolvePromoted?.();
+      return true;
+    },
+    sleep: async () => undefined,
+    scheduleRetry: (retry) => {
+      scheduled.push(retry);
+    },
+    getActiveContext: () => activeContext,
+    promotionGraceMs: 0,
+    recordRuntimeEvent: () => undefined,
+  });
+
+  await handler(new Error("heartbeat failed"), "old-ctx");
+  activeContext = undefined;
+  scheduled.shift()?.();
+  assert.equal(scheduled.length, 1);
+  activeContext = "new-ctx";
+  scheduled.shift()?.();
+  await promoted;
+  assert.equal(promotedContext, "new-ctx");
 });
 
 test("Bus follower heartbeat recovery swallows stale-context status updates", async () => {
@@ -317,14 +638,14 @@ test("Bus follower heartbeat recovery swallows stale-context status updates", as
     getLeaderState: () => {
       leaderStateCalls += 1;
       return leaderStateCalls === 1
-        ? { kind: "active-elsewhere", lock: {} }
+        ? { kind: "active-elsewhere", lock: { pid: 99 } }
         : { kind: "inactive" };
     },
     setLifecyclePhase: () => undefined,
     updateStatus: () => {
       throw new Error("This extension ctx is stale after session replacement");
     },
-    promoteToLeader: () => undefined,
+    promoteToLeader: async () => true,
     sleep: async () => undefined,
     promotionGraceMs: 0,
     recordRuntimeEvent: (category, error, details) => {
@@ -490,6 +811,7 @@ test("Bus follower assembly wires receiver, recovery, and registration", async (
   const leaderSocketPath = join(dir, "leader.sock");
   const followerSocketPath = join(dir, "follower.sock");
   const registrationState = createTelegramBusFollowerRegistrationState();
+  let requestSequence = 0;
   const leader = createTelegramBusLocalServer({
     socketPath: leaderSocketPath,
     handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
@@ -530,7 +852,7 @@ test("Bus follower assembly wires receiver, recovery, and registration", async (
       getLeaderState: () => ({ kind: "inactive" }),
       setLifecyclePhase: () => undefined,
       updateStatus: () => undefined,
-      promoteToLeader: () => undefined,
+      promoteToLeader: async () => true,
       sleep: async () => undefined,
       promotionGraceMs: 1,
       recordRuntimeEvent: () => undefined,
@@ -540,7 +862,7 @@ test("Bus follower assembly wires receiver, recovery, and registration", async (
       getFollowerBusSocketPath: () => followerSocketPath,
       getLeaderSocketPath: () => leaderSocketPath,
       registrationState,
-      createRequestId: () => "inst-a:1",
+      createRequestId: () => `inst-a:${++requestSequence}`,
     },
   });
   try {
@@ -647,9 +969,10 @@ test("Bus follower re-registration carries its last known target", async () => {
       },
     }),
   });
+  let requestSequence = 0;
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
-    createRequestId: () => "inst-a:reload",
+    createRequestId: () => `inst-a:reload:${++requestSequence}`,
     registrationState: state,
   });
   try {
@@ -815,6 +1138,7 @@ test("Bus follower registration runtime registers with a live leader socket", as
       threadName: "repo",
       cwd: "/repo",
       pid: 123,
+      registrationGeneration: "inst-a:1",
       connectedAtMs: 1000,
       lastHeartbeatMs: 1000,
       target: undefined,
@@ -903,6 +1227,7 @@ test("Bus follower registration runtime reports rejected heartbeat with active c
   );
   const socketPath = join(dir, "bus.sock");
   const failures: unknown[] = [];
+  let requestSequence = 0;
   const server = createTelegramBusLocalServer({
     socketPath,
     handleEnvelope: (envelope) => ({
@@ -917,7 +1242,7 @@ test("Bus follower registration runtime reports rejected heartbeat with active c
   });
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
-    createRequestId: () => "inst-a:1",
+    createRequestId: () => `inst-a:${++requestSequence}`,
     registrationState: createTelegramBusFollowerRegistrationState(),
     heartbeatMs: 10,
     timeoutMs: 50,
@@ -957,9 +1282,10 @@ test("Bus follower registration runtime heartbeats until stopped", async () => {
       getNowMs: () => nowMs,
     }),
   });
+  let requestSequence = 0;
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
-    createRequestId: () => `inst-a:${nowMs}`,
+    createRequestId: () => `inst-a:${++requestSequence}`,
     getNowMs: () => nowMs,
     heartbeatMs: 50,
   });
@@ -1091,6 +1417,72 @@ test("Bus follower API caller sends method calls and returns leader results", as
         sentAtMs: 7000,
       },
     ]);
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus follower API caller preserves structured commit-unknown errors", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-api-ambiguous-"));
+  const socketPath = join(dir, "bus.sock");
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: (envelope) => ({
+      kind: "bus.ack",
+      requestId: envelope.requestId,
+      ok: false,
+      message: "sendMessage response was lost",
+      error: { code: "commit-unknown", method: "sendMessage" },
+    }),
+  });
+  const callApi = createTelegramBusFollowerApiCaller({
+    socketPath,
+    instanceId: "inst-a",
+    createRequestId: () => "inst-a:ambiguous:1",
+  });
+  try {
+    await server.start();
+    await assert.rejects(
+      () => callApi("call", ["sendMessage", { chat_id: 1, text: "hello" }]),
+      isTelegramApiCommitUnknownError,
+    );
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus follower API caller classifies non-idempotent acknowledgement loss as commit-unknown", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-api-ack-loss-"));
+  const socketPath = join(dir, "bus.sock");
+  let executions = 0;
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: (envelope) => {
+      executions += 1;
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: true,
+        result: { message_id: 77 },
+      };
+    },
+    shouldDropResponse: () => true,
+  });
+  const callApi = createTelegramBusFollowerApiCaller({
+    socketPath,
+    instanceId: "inst-a",
+    createRequestId: () => "inst-a:ack-loss:1",
+    timeoutMs: 10,
+  });
+  try {
+    await server.start();
+    await assert.rejects(
+      () => callApi("call", ["sendMessage", { chat_id: 1, text: "hello" }]),
+      isTelegramApiCommitUnknownError,
+    );
+    assert.equal(executions, 1);
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });

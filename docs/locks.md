@@ -129,13 +129,17 @@ Delete `~/.pi/agent/locks.json` to reset singleton runtime ownership for all par
 
 ## Atomicity
 
-Current baseline is read-modify-write JSON. This is enough for interactive pi singleton starts.
+Every ownership mutation runs inside a short cross-process transaction acquired through exclusive file creation. The transaction covers the complete registry read/check/write sequence, so concurrent processes cannot both win an ordinary acquisition or stale-overwrite unrelated extension/profile keys. The registry payload itself still commits through same-directory temp-file replacement.
 
-If multiple instances may start concurrently, use an atomic helper later:
+A guard is written completely to a private staged file and published with one exclusive hard-link operation, so no live empty/partially written generation becomes recoverable by age. A crashed transaction owner leaves a complete guard that a later process recovers only when the recorded owner PID is no longer alive. Recovery contenders serialize through a second atomically published guard so one process cannot rename a newer live transaction generation. Cleanup compares the exact random guard generation before unlinking. Malformed guards, unsupported atomic publication, and unverifiable recovery fail closed after bounded contention rather than risking concurrent registry mutation.
 
-- Lock file around `locks.json`, or
-- Temp file + rename with conflict checks, or
-- OS-level exclusive open for a short critical section
+Transactional reads treat only a missing registry as empty. Read, parse, and shape failures abort without replacing the existing file or erasing unrelated ownership keys.
+
+Each runtime retains the profile key plus exact owner identity it acquired. New leaders receive a collision-resistant epoch independent from heartbeat timestamps and a monotonic same-process runtime generation. Refresh, release, and thread-state snapshot publication commit only while the profile key, PID, cwd, instance id, epoch, and runtime generation still match. Snapshot rename runs inside the same lock-registry transaction guard as its final owner check. Forced replacement additionally requires the exact previously observed owner; same-process lifecycle handoff permits only a newer runtime generation to replace an older one. A delayed old runtime cannot reverse that transition, publish prepared thread state, or reinterpret its retained owner token under another profile key.
+
+Direct Bot API authority follows this exact ownership check. Accepted local queue work may continue through Pi after ownership moves, but stale preview/final/menu/file mutations fail closed instead of bypassing the replacement transport owner. Follower recovery retries registration while the exact external owner remains live and promotes only after an election transaction confirms that the observed owner still remains stale or that no owner appeared after an inactive observation; IPC unreachability alone never authorizes takeover. Simultaneous election losers re-register with the winner using their carried exact thread target.
+
+The ownership heartbeat starts immediately after acquisition, before binding handoff or slow leader startup. It remains active through provisioning/server/polling startup; startup errors release the exact acquired lock after cleanup, and ownership loss during startup stops the partial runtime and returns failure rather than announcing leadership. Topic provisioning also stamps the acquired epoch and rechecks it before and after every persistence and Bot API boundary, including `epoch → undefined` loss.
 
 ## Migration
 

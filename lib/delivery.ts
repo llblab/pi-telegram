@@ -17,9 +17,19 @@ import {
   getTelegramTargetThreadParams,
   type TelegramTarget,
 } from "./target.ts";
-import type { TelegramBridgeApiRuntime } from "./telegram-api.ts";
+import {
+  isTelegramApiCommitUnknownError,
+  type TelegramBridgeApiRuntime,
+} from "./telegram-api.ts";
 
 const TELEGRAM_DELIVERY_RUNTIME_KEY = "__piTelegramDeliveryRuntime__";
+
+class TelegramDeliveryTransportGenerationError extends Error {
+  constructor() {
+    super("Telegram Delivery transport generation is no longer active.");
+    this.name = "TelegramDeliveryTransportGenerationError";
+  }
+}
 
 export type TelegramDeliveryParseMode = "plain" | "html" | "markdown";
 
@@ -49,6 +59,7 @@ export type TelegramDeliveryFailureReason =
   | "target-unauthorized"
   | "stale-handle"
   | "invalid-view"
+  | "commit-unknown"
   | "transport-failed";
 
 export type TelegramDeliveryResult<T> =
@@ -67,10 +78,7 @@ export interface SendTelegramViewOptions {
 }
 
 export type TelegramDeliveryChatAction =
-  | "typing"
-  | "upload_document"
-  | "upload_photo"
-  | "record_voice";
+  "typing" | "upload_document" | "upload_photo" | "record_voice";
 
 /** @internal */
 export interface TelegramDeliveryRuntime {
@@ -114,8 +122,7 @@ export interface TelegramDeliveryTransportOptions {
 }
 
 /** @internal */
-export interface TelegramDeliveryRuntimeDeps
-  extends TelegramDeliveryTargetResolverDeps {
+export interface TelegramDeliveryRuntimeDeps extends TelegramDeliveryTargetResolverDeps {
   generation: string;
   renderView: (
     view: TelegramDeliveryView,
@@ -151,6 +158,7 @@ export interface TelegramBridgeDeliveryRuntimeDeps {
   generation: string;
   getTargetPolicyView: () => TelegramDeliveryTargetPolicyView;
   getActiveTurnTarget: () => TelegramDeliveryTarget | undefined;
+  isTransportActive?: () => boolean;
   api: Pick<
     TelegramBridgeApiRuntime,
     "sendMessage" | "editMessageText" | "deleteMessage" | "sendChatAction"
@@ -191,18 +199,28 @@ export function createTelegramDeliveryLifecycleHooks(
 }
 
 /** @internal */
-export function createTelegramBridgeDeliveryLifecycleHooks(
-  deps: Omit<TelegramBridgeDeliveryRuntimeDeps, "generation"> & {
+export function createTelegramBridgeDeliveryLifecycleHooks<TTransportStamp>(
+  deps: Omit<
+    TelegramBridgeDeliveryRuntimeDeps,
+    "generation" | "isTransportActive"
+  > & {
     generationSeed: string;
+    getTransportStamp?: () => TTransportStamp;
+    isTransportStampActive?: (stamp: TTransportStamp) => boolean;
   },
 ): ReturnType<typeof createTelegramDeliveryLifecycleHooks> {
   let generationSequence = 0;
-  return createTelegramDeliveryLifecycleHooks(() =>
-    createTelegramBridgeDeliveryRuntime({
+  return createTelegramDeliveryLifecycleHooks(() => {
+    const transportStamp = deps.getTransportStamp?.();
+    return createTelegramBridgeDeliveryRuntime({
       ...deps,
       generation: `${deps.generationSeed}:${++generationSequence}`,
-    }),
-  );
+      isTransportActive:
+        transportStamp !== undefined && deps.isTransportStampActive
+          ? () => deps.isTransportStampActive?.(transportStamp) ?? false
+          : undefined,
+    });
+  });
 }
 
 interface TelegramDeliveryRuntimeRegistry {
@@ -212,11 +230,7 @@ interface TelegramDeliveryRuntimeRegistry {
 function getTelegramDeliveryRuntimeRegistry(): TelegramDeliveryRuntimeRegistry {
   const globals = globalThis as Record<string, unknown>;
   const existing = globals[TELEGRAM_DELIVERY_RUNTIME_KEY];
-  if (
-    existing &&
-    typeof existing === "object" &&
-    "runtime" in existing
-  ) {
+  if (existing && typeof existing === "object" && "runtime" in existing) {
     return existing as TelegramDeliveryRuntimeRegistry;
   }
   const registry: TelegramDeliveryRuntimeRegistry = {};
@@ -245,6 +259,43 @@ export interface TelegramDeliveryTargetPolicyView {
 }
 
 /** @internal */
+export interface TelegramDeliveryTargetPolicyRuntime {
+  getTargetPolicyView(): TelegramDeliveryTargetPolicyView;
+  getActiveTurnTarget(): TelegramDeliveryTarget | undefined;
+}
+
+/** @internal */
+export function createTelegramDeliveryTargetPolicyRuntime(deps: {
+  ownsDirect(): boolean;
+  isFollowerRegistered(): boolean;
+  getAllowedChatId(): number | undefined;
+  getFollowerTarget(): TelegramDeliveryTarget | undefined;
+  getLeaderTarget(): TelegramDeliveryTarget | undefined;
+  listThreadRecords(): readonly { target: TelegramDeliveryTarget }[];
+  getActiveTurnTarget(): TelegramDeliveryTarget | undefined;
+  getActiveGuestQueryId(): string | undefined;
+}): TelegramDeliveryTargetPolicyRuntime {
+  return {
+    getTargetPolicyView() {
+      const ownsDirect = deps.ownsDirect();
+      return {
+        canDeliver: ownsDirect || deps.isFollowerRegistered(),
+        ownsDirect,
+        allowedChatId: deps.getAllowedChatId(),
+        followerTarget: deps.getFollowerTarget(),
+        leaderTarget: deps.getLeaderTarget(),
+        liveTargets: deps.listThreadRecords().map((record) => record.target),
+      };
+    },
+    getActiveTurnTarget() {
+      return deps.getActiveGuestQueryId()
+        ? undefined
+        : deps.getActiveTurnTarget();
+    },
+  };
+}
+
+/** @internal */
 export function resolveTelegramDeliveryInstanceTarget(
   view: TelegramDeliveryTargetPolicyView,
 ): TelegramDeliveryTarget | undefined {
@@ -252,7 +303,9 @@ export function resolveTelegramDeliveryInstanceTarget(
   return (
     view.followerTarget ??
     view.leaderTarget ??
-    (view.allowedChatId === undefined ? undefined : { chatId: view.allowedChatId })
+    (view.allowedChatId === undefined
+      ? undefined
+      : { chatId: view.allowedChatId })
   );
 }
 
@@ -338,19 +391,6 @@ function resolveTelegramDeliveryTarget(
   return { ok: true, value: cloneTarget(target) };
 }
 
-function isValidHandleForRuntime(
-  handle: TelegramDeliveryHandle,
-  generation: string,
-): boolean {
-  return (
-    handle.generation === generation &&
-    handle.messageIds.length > 0 &&
-    handle.messageIds.every(
-      (messageId) => Number.isInteger(messageId) && messageId > 0,
-    )
-  );
-}
-
 function createTelegramDeliveryTargetQueue() {
   const queues = new Map<string, Promise<void>>();
   return async function run<T>(
@@ -397,6 +437,10 @@ export function createTelegramDeliveryRuntime(
   deps: TelegramDeliveryRuntimeDeps,
 ): TelegramDeliveryRuntime {
   let active = true;
+  const handleBindings = new WeakMap<
+    TelegramDeliveryHandle,
+    { target: TelegramDeliveryTarget; messageIds: readonly number[] }
+  >();
   const runForTarget = createTelegramDeliveryTargetQueue();
   const render = (
     view: TelegramDeliveryView,
@@ -409,10 +453,18 @@ export function createTelegramDeliveryRuntime(
           typeof chunk.text !== "string" || chunk.text.trim().length === 0,
       )
     ) {
-      return failure("invalid-view", "Telegram delivery view rendered no content.");
+      return failure(
+        "invalid-view",
+        "Telegram delivery view rendered no content.",
+      );
     }
     return { ok: true, value: chunks };
   };
+  const inactive = <T>(): TelegramDeliveryResult<T> =>
+    failure(
+      "runtime-unavailable",
+      "Telegram delivery runtime generation is inactive.",
+    );
   const transportFailure = <T>(
     operation: "send" | "edit" | "delete" | "chat-action",
     error: unknown,
@@ -420,39 +472,58 @@ export function createTelegramDeliveryRuntime(
     partial?: T,
   ): TelegramDeliveryResult<T> => {
     deps.recordFailure?.(operation, error, target);
+    if (error instanceof TelegramDeliveryTransportGenerationError) {
+      return inactive();
+    }
     return failure(
-      "transport-failed",
-      `Telegram delivery ${operation} failed.`,
+      isTelegramApiCommitUnknownError(error)
+        ? "commit-unknown"
+        : "transport-failed",
+      isTelegramApiCommitUnknownError(error)
+        ? `Telegram delivery ${operation} may have committed before transport failed.`
+        : `Telegram delivery ${operation} failed.`,
       partial,
     );
   };
-  const inactive = <T>(): TelegramDeliveryResult<T> =>
-    failure(
-      "runtime-unavailable",
-      "Telegram delivery runtime generation is inactive.",
-    );
   const createHandle = (
     target: TelegramDeliveryTarget,
     messageIds: readonly number[],
-  ): TelegramDeliveryHandle => ({
-    target: cloneTarget(target),
-    messageIds: [...messageIds],
-    generation: deps.generation,
-  });
-  const resolveHandleTarget = (
+  ): TelegramDeliveryHandle => {
+    const canonicalTarget = Object.freeze(cloneTarget(target));
+    const canonicalMessageIds = Object.freeze([...messageIds]);
+    const handle = Object.freeze({
+      target: canonicalTarget,
+      messageIds: canonicalMessageIds,
+      generation: deps.generation,
+    });
+    handleBindings.set(handle, {
+      target: canonicalTarget,
+      messageIds: canonicalMessageIds,
+    });
+    return handle;
+  };
+  const resolveHandle = (
     handle: TelegramDeliveryHandle,
-  ): TelegramDeliveryResult<TelegramDeliveryTarget> => {
+  ): TelegramDeliveryResult<{
+    target: TelegramDeliveryTarget;
+    messageIds: readonly number[];
+  }> => {
     if (!active) return inactive();
-    if (!isValidHandleForRuntime(handle, deps.generation)) {
+    const binding = handleBindings.get(handle);
+    if (!binding || handle.generation !== deps.generation) {
       return failure(
         "stale-handle",
         "Telegram delivery handle belongs to an inactive runtime generation.",
       );
     }
-    return resolveTelegramDeliveryTarget(
-      { kind: "target", target: handle.target },
+    const authorized = resolveTelegramDeliveryTarget(
+      { kind: "target", target: binding.target },
       deps,
     );
+    if (!authorized.ok) {
+      return failure(authorized.reason, authorized.message);
+    }
+    return { ok: true, value: binding };
   };
   return {
     generation: deps.generation,
@@ -501,14 +572,14 @@ export function createTelegramDeliveryRuntime(
       });
     },
     async editView(handle, view) {
-      const resolved = resolveHandleTarget(handle);
+      const resolved = resolveHandle(handle);
       if (!resolved.ok) return failure(resolved.reason, resolved.message);
       const rendered = render(view);
       if (!rendered.ok) return failure(rendered.reason, rendered.message);
-      const target = resolved.value;
+      const target = resolved.value.target;
       return runForTarget(target, async () => {
         if (!active) return inactive();
-        const visibleMessageIds = [...handle.messageIds];
+        const visibleMessageIds = [...resolved.value.messageIds];
         try {
           const sharedCount = Math.min(
             visibleMessageIds.length,
@@ -571,20 +642,22 @@ export function createTelegramDeliveryRuntime(
       });
     },
     async deleteView(handle) {
-      const resolved = resolveHandleTarget(handle);
+      const resolved = resolveHandle(handle);
       if (!resolved.ok) return failure(resolved.reason, resolved.message);
-      const target = resolved.value;
+      const target = resolved.value.target;
       return runForTarget(target, async () => {
         if (!active) return inactive();
         try {
-          for (const messageId of handle.messageIds) {
+          for (const messageId of resolved.value.messageIds) {
             if (!active) return inactive();
             await deps.deleteMessage(target, messageId);
             if (!active) return inactive();
           }
           return { ok: true, value: undefined };
         } catch (error) {
-          return active ? transportFailure("delete", error, target) : inactive();
+          return active
+            ? transportFailure("delete", error, target)
+            : inactive();
         }
       });
     },
@@ -614,6 +687,11 @@ export function createTelegramBridgeDeliveryRuntime(
   deps: TelegramBridgeDeliveryRuntimeDeps,
 ): TelegramDeliveryRuntime {
   const getPolicyView = deps.getTargetPolicyView;
+  const assertTransportActive = (): void => {
+    if (deps.isTransportActive?.() === false) {
+      throw new TelegramDeliveryTransportGenerationError();
+    }
+  };
   return createTelegramDeliveryRuntime({
     generation: deps.generation,
     getActiveTurnTarget: deps.getActiveTurnTarget,
@@ -624,7 +702,10 @@ export function createTelegramBridgeDeliveryRuntime(
       return resolveTelegramDeliveryAggregateTarget(getPolicyView());
     },
     isExplicitTargetAuthorized(target) {
-      return isTelegramDeliveryExplicitTargetAuthorized(target, getPolicyView());
+      return isTelegramDeliveryExplicitTargetAuthorized(
+        target,
+        getPolicyView(),
+      );
     },
     renderView(view) {
       assertTelegramInlineKeyboardCallbackData(view.replyMarkup);
@@ -638,6 +719,7 @@ export function createTelegramBridgeDeliveryRuntime(
       });
     },
     async sendChunk(target, chunk, options) {
+      assertTransportActive();
       const replyParameters = buildTelegramReplyParameters(
         target.chatId,
         options.replyToMessageId,
@@ -656,6 +738,7 @@ export function createTelegramBridgeDeliveryRuntime(
           ? markTelegramBusAggregateDelivery(body)
           : body,
       );
+      assertTransportActive();
       deps.recordOwnership({
         chatId: target.chatId,
         messageId: sent.message_id,
@@ -664,6 +747,7 @@ export function createTelegramBridgeDeliveryRuntime(
       return sent.message_id;
     },
     async editChunk(target, messageId, chunk, options) {
+      assertTransportActive();
       await deps.api.editMessageText({
         chat_id: target.chatId,
         message_id: messageId,
@@ -676,9 +760,11 @@ export function createTelegramBridgeDeliveryRuntime(
       });
     },
     deleteMessage(target, messageId) {
+      assertTransportActive();
       return deps.api.deleteMessage(target.chatId, messageId);
     },
     async sendChatAction(target, action) {
+      assertTransportActive();
       await deps.api.sendChatAction(target.chatId, action, {
         message_thread_id: target.threadId,
       });
@@ -688,8 +774,7 @@ export function createTelegramBridgeDeliveryRuntime(
 }
 
 function getBoundTelegramDeliveryRuntime():
-  | TelegramDeliveryRuntime
-  | TelegramDeliveryResult<never> {
+  TelegramDeliveryRuntime | TelegramDeliveryResult<never> {
   const runtime = getTelegramDeliveryRuntimeRegistry().runtime;
   return (
     runtime ??
@@ -716,7 +801,9 @@ function validateView<T>(
 }
 
 async function runDeliveryOperation<T>(
-  operation: (runtime: TelegramDeliveryRuntime) => Promise<TelegramDeliveryResult<T>>,
+  operation: (
+    runtime: TelegramDeliveryRuntime,
+  ) => Promise<TelegramDeliveryResult<T>>,
 ): Promise<TelegramDeliveryResult<T>> {
   const runtime = getBoundTelegramDeliveryRuntime();
   if (isFailure(runtime)) return runtime;

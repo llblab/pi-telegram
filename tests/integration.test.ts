@@ -169,6 +169,7 @@ function createRuntimeExtensionContext(
 ) {
   return {
     hasUI: true,
+    cwd: process.cwd(),
     model: undefined,
     signal: undefined,
     ui: {
@@ -480,8 +481,8 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
       sendMessageCalls += 1;
       if (sendMessageCalls === 1) {
         return createRuntimeTelegramApiErrorResponse(
-          500,
-          "temporary send failure",
+          429,
+          "temporary rate limit",
         );
       }
       return createRuntimeTelegramApiResponse({ message_id: 100 });
@@ -659,7 +660,7 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
   }
 });
 
-test("Extension runtime dispatches accepted queued work after polling ownership moves away", async () => {
+test("Extension runtime keeps local queue progress but fences delivery after ownership moves away", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
   const sentBodies: Array<Record<string, unknown>> = [];
@@ -755,13 +756,7 @@ test("Extension runtime dispatches accepted queued work after polling ownership 
     // Follow-up dispatch is intentionally routed through the session-bound
     // deferred queue timer; wait on real time instead of setImmediate turns.
     await waitForCondition(() => sentMessages.length === 2);
-    assert.match(
-      String(
-        (sentBodies[0]?.rich_message as { markdown?: string } | undefined)
-          ?.markdown ?? "",
-      ),
-      /First \*\*final\*\*/,
-    );
+    assert.deepEqual(sentBodies, []);
     assert.match(
       getRuntimeHarnessMessageText(sentMessages[1] as RuntimeHarnessMessage),
       /^\[telegram\] second queued$/,
