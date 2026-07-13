@@ -420,10 +420,10 @@ export function registerTelegramBridgeCommands(
   });
   pi.registerCommand("reload", {
     description:
-      "Reload pi runtime: extensions, skills, prompts, themes, and context files",
+      "Reload pi runtime: extensions, skills, prompts, and themes",
     handler: async (_args, ctx) => {
       ctx.ui.notify(
-        "Reloading extensions, skills, prompts, themes, and context files…",
+        "Reloading extensions, skills, prompts, and themes…",
         "info",
       );
       try {

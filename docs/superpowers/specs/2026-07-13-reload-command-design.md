@@ -1,7 +1,7 @@
 # Design: `/reload` command for pi-telegram
 
 - **Date:** 2026-07-13
-- **Status:** Approved (brainstorming gate passed)
+- **Status:** Approved (brainstorming gate passed). Implementation refined two points: (1) the success notify moved to BEFORE `ctx.reload()` because reload tears down the extension instance and a post-reload notify targets a stale context; (2) the reload scope is worded as "extensions, skills, prompts, and themes" to match the pi-core version pi-telegram pins (0.79.6 `ExtensionCommandContext.reload()` docstring; newer 0.80.x adds "and context files").
 - **Upstream issue:** llblab/pi-telegram#124
 - **Branch:** `feat/reload-command`
 
