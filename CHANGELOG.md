@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `[Reload Command]` Added a `/reload` command that calls pi's `ctx.reload()` to reload extensions, skills, prompts, themes, and context files live from Telegram without restarting the bridge. Because pi serializes turns, `/reload` sent during an active turn runs after it completes; success and failure surface through `ctx.ui.notify`. Impact: skill, prompt, context-file, and extension changes — including extension config such as `~/.pi/web-search.json` — can now be picked up over Telegram without dropping the connection or interrupting the current turn.
+
 ## 0.20.6: Guest Attribution And Voice Action Hotfix
 
 - `[Voice Action Syntax]` Hidden `telegram_voice` actions now accept the intuitive paired form `<!-- telegram_voice ... -->...<!-- /telegram_voice -->` alongside inline, attribute-text, and single-comment multiline forms. The parser captures a non-empty multiline body and preserves language/rate attributes while leaving surrounding prose visible. Impact: agents can use an explicit closing tag without leaking the intended TTS payload as ordinary text.
