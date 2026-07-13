@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `[Reload Command]` Added a `/reload` command that calls pi's `ctx.reload()` to reload extensions, skills, prompts, themes, and context files live from Telegram without restarting the bridge. Because pi serializes turns, `/reload` sent during an active turn runs after it completes; success and failure surface through `ctx.ui.notify`. Impact: skill, prompt, context-file, and extension changes — including extension config such as `~/.pi/web-search.json` — can now be picked up over Telegram without dropping the connection or interrupting the current turn.
+- `[Reload Command]` Added a `/reload` command that calls pi's `ctx.reload()` to reload extensions, skills, prompts, themes, and context files live from Telegram without restarting the bridge. `/reload` is not a reserved immediate control, so pi-telegram enqueues it as its own turn and pi runs it after any active turn completes. The handler emits a `Reloading…` info notification before reload (since `ctx.reload()` tears down the current extension instance, a post-reload notify would target a stale context) and reports failures via an `error` notification without rethrowing. Impact: skill, prompt, context-file, and extension changes — including extension config such as `~/.pi/web-search.json` — can now be picked up over Telegram without dropping the connection or interrupting the current turn.
 
 ## 0.20.6: Guest Attribution And Voice Action Hotfix
 

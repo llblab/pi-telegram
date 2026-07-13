@@ -422,12 +422,12 @@ export function registerTelegramBridgeCommands(
     description:
       "Reload pi runtime: extensions, skills, prompts, themes, and context files",
     handler: async (_args, ctx) => {
+      ctx.ui.notify(
+        "Reloading extensions, skills, prompts, themes, and context files…",
+        "info",
+      );
       try {
         await ctx.reload();
-        ctx.ui.notify(
-          "Reloaded extensions, skills, prompts, themes, and context files.",
-          "info",
-        );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         ctx.ui.notify(`Reload failed: ${message}`, "error");

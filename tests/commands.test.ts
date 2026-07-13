@@ -1517,9 +1517,9 @@ test("Command helpers execute command actions through provided handlers", async 
   assert.deepEqual(events, ["stop", "help:start"]);
 });
 
-test("Command helpers register pi reload command that reloads runtime and notifies", async () => {
+test("Command helpers register pi reload command that notifies before reload", async () => {
   const harness = createCommandRegistrationApiHarness();
-  const events: string[] = [];
+  const sequence: string[] = [];
   registerTelegramBridgeCommands(harness.api, {
     promptForConfig: async () => {},
     getStatusLines: () => [],
@@ -1536,17 +1536,21 @@ test("Command helpers register pi reload command that reloads runtime and notifi
 
   const notifications: Array<{ message: string; level?: string }> = [];
   const ctx = createBridgeCommandContext(
-    (message, level) => notifications.push({ message, level }),
+    (message, level) => {
+      notifications.push({ message, level });
+      sequence.push("notify");
+    },
     () => false,
     undefined,
     async () => {
-      events.push("reload");
+      sequence.push("reload");
     },
   );
   await reloadCommand.handler("", ctx);
-  assert.deepEqual(events, ["reload"]);
+  assert.deepEqual(sequence, ["notify", "reload"]);
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].level, "info");
+  assert.match(notifications[0].message, /reloading/i);
 });
 
 test("Command helpers report reload errors without rethrowing", async () => {
@@ -1571,7 +1575,8 @@ test("Command helpers report reload errors without rethrowing", async () => {
     },
   );
   await reloadCommand.handler("", ctx);
-  assert.equal(notifications.length, 1);
-  assert.equal(notifications[0].level, "error");
-  assert.match(notifications[0].message, /boom/);
+  assert.equal(notifications.length, 2);
+  assert.equal(notifications[0].level, "info");
+  assert.equal(notifications[1].level, "error");
+  assert.match(notifications[1].message, /boom/);
 });
