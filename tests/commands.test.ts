@@ -44,6 +44,7 @@ import {
 import type { ExtensionAPI, ExtensionCommandContext } from "../lib/pi.ts";
 
 type RegisteredBridgeCommand = {
+  description?: string;
   handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
 };
 
