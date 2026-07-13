@@ -2,14 +2,14 @@
 
 ## Purpose
 
-`pi-telegram` is a session-local Pi extension that binds one Telegram DM to one running Pi session. It owns the Telegram bridge boundary:
+`pi-telegram` is a session-aware Pi runtime extension that binds Telegram destinations to running Pi instances and routes each accepted prompt into the assigned instance's currently active session. It owns the Telegram bridge boundary:
 
 - Poll Telegram updates and enforce single-user pairing.
 - Translate Telegram text, callbacks, media, and files into Pi turns.
 - Stream previews and deliver final Pi responses back to Telegram.
 - Provide Telegram-native controls for queueing, model/thinking/settings menus, compaction, abort/stop, prompt templates, reactions, and outbound artifacts.
 
-The bridge is a mobile companion for a live Pi session, not a remote terminal. It should let an operator start work in the TUI and continue supervising from Telegram, while staying inside Pi's extension-facing contracts.
+The bridge is a mobile companion for a live Pi runtime, not a remote terminal or session browser. It should let an operator start work in the TUI and continue supervising the instance's active session from Telegram, while staying inside Pi's extension-facing contracts.
 
 This document is the architectural map. Focused behavior standards live in sibling docs:
 
@@ -30,7 +30,7 @@ This document is the architectural map. Focused behavior standards live in sibli
 
 ### Extension Boundary Vs Supervisor Control
 
-`pi-telegram` runs inside the current Pi process as an extension. That gives it safe access to public extension APIs such as aborting work, compacting, sending follow-up prompts, observing lifecycle events, and rendering Telegram-native controls. It does not own the terminal, the interactive-mode chat transcript, or the process lifecycle.
+`pi-telegram` runs inside the current Pi process as an extension. That gives it safe access to public extension APIs such as aborting work, compacting, dispatching queued prompts, observing lifecycle events, and rendering Telegram-native controls. It does not own the terminal, the interactive-mode chat transcript, or the process lifecycle.
 
 Keep this boundary explicit:
 
@@ -38,6 +38,16 @@ Keep this boundary explicit:
 - Do not treat Telegram as a generic remote shell for every Pi slash command.
 - Commands that require interactive session replacement or TUI rerendering, such as a true Telegram `/new`, need a public Pi API that invokes the same runtime path as the terminal command.
 - A separate PTY supervisor or daemon could choose to own those risks, but that would be a different product mode rather than this extension's runtime contract.
+
+### Instance, Session, And Context Cost
+
+A Telegram destination follows a Pi instance, not an immutable Pi session file. Ordinary Telegram prompts enter whichever session is active in that assigned instance when dispatch occurs. If the operator replaces or resumes a session locally, pi-telegram rebinds its session-scoped runtime state while preserving the instance's Telegram target where supported. Telegram currently exposes compaction for the active session, but not new-session, resume, fork, tree navigation, session switching, or full reload; those operations require safe public Pi extension APIs.
+
+`/telegram-connect` never launches a hidden or headless Pi process. A long-lived background Pi process can own Telegram only when something else explicitly launched that process and it satisfies the normal lock/runtime rules. Pi `print` and `json` modes stay passive and exit rather than becoming hidden polling owners.
+
+Pi session JSONL and pi-telegram runtime JSONL serve different purposes. Pi session files contain model conversation, tool, usage, branch, and compaction entries. Profile-scoped `logs.jsonl` / `logs.<profile>.jsonl` contain redacted bridge operations from one or more instances and never become model context. Sharing a Telegram profile or working directory does not by itself merge Pi session identities or model histories.
+
+A Telegram prompt is a normal Pi model turn. It inherits the active post-compaction context just like a TUI prompt in the same session; pi-telegram does not promise context isolation or token cost proportional only to the new message. Current prompt guidance uses a small transient system note and the on-demand `telegram_help` tool instead of persisting the former large guidance suffix in every user turn. Existing session files created by older versions may still contain those historical repeated suffixes until session replacement or compaction removes them from active context.
 
 The repository uses a **Flat Domain DAG**:
 
@@ -193,7 +203,7 @@ Dispatch requires:
 
 A dispatched prompt remains queued until `agent_start` consumes it. This keeps the active Telegram turn bound for previews, attachments, aborts, and final replies.
 
-Post-agent-end queue dispatch uses a session-bound deferred dispatcher. It is activated on session start, clears timers on shutdown, and skips callbacks from older generations before touching `ExtensionContext`. Dispatch stays session-bound after polling ownership moves elsewhere. When a queued Telegram prompt is forwarded into Pi, it uses Pi's explicit `followUp` delivery option so Telegram input preserves the existing non-steering queue contract even if Pi is still settling active work.
+Post-agent-end queue dispatch uses a session-bound deferred dispatcher. It is activated on session start, clears timers on shutdown, and skips callbacks from older generations before touching `ExtensionContext`. Dispatch stays session-bound after polling ownership moves elsewhere. When a queued Telegram prompt is forwarded into Pi, it uses a normal `sendUserMessage(content)` turn after the bridge's idle/dispatch guards pass; it does not use Pi's `followUp` delivery option or inject terminal input.
 
 ### Controls And Menus
 

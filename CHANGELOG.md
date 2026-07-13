@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.21.1: Runtime And Session Semantics Hotfix
+
+- `[Runtime Semantics]` Clarified that Telegram destinations follow running Pi instances and route prompts into each instance's currently active session rather than binding permanently to one session file or session identity. Impact: session replacement and Threaded Mode behavior now match the documented operator mental model without mischaracterizing the bridge as a remote terminal or session browser.
+- `[Session Control]` Documented the exact mobile boundary: Telegram can compact the current session but cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs. Impact: operators can distinguish active-session continuation from unavailable session lifecycle/navigation control.
+- `[Context Cost]` Documented that Telegram prompts are normal Pi model turns and inherit the active post-compaction session context just like TUI prompts; pi-telegram does not promise context isolation or cost proportional only to the new mobile message. Impact: token usage expectations no longer conflate transport metadata with model-context economics.
+- `[Prompt Guidance]` Documented the current small transient system note plus on-demand `telegram_help` design and the historical risk from older releases that persisted large guidance suffixes in every user turn. Impact: operators investigating long-lived sessions can separate current behavior from legacy context growth already stored in old session history.
+- `[Diagnostics Identity]` Distinguished Pi session JSONL from shared profile-scoped pi-telegram `logs*.jsonl`, and clarified that `/telegram-connect` never launches hidden Pi processes while explicitly launched long-lived instances remain subject to normal lock ownership. Impact: shared bridge diagnostics can no longer be mistaken for merged Pi session history or hidden process creation.
+
 ## 0.21.0: Activity And Delivery Extension Platform
 
 - `[Platform Documentation]` Completed 0.21 discoverability across the README, public API inventory/smoke checklist, Activity and Delivery contracts, architecture map, Sections reference, package contents, documented consumer policy examples, and the external demo-project reference. Removed the completed platform epic from `BACKLOG.md` while preserving deferred media/process boundaries and the concrete callback revisit trigger in docs. Impact: extension authors can find and validate the complete supported surface without `/lib` imports, and open-work context now contains only unfinished work.

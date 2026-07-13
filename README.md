@@ -6,7 +6,7 @@
 
 `pi-telegram` turns a private Telegram DM into a mobile operator surface for Pi. It accepts prompts, queues work, streams readable previews, delivers final replies and files, exposes safe controls, and lets companion extensions add Telegram-native capabilities without owning a second bot loop.
 
-It is a **runtime adapter**, not a remote terminal. Start or supervise work in the Pi TUI, then continue from Telegram while away from the keyboard. The bridge preserves Pi session semantics instead of pretending Telegram is a PTY, shell, or process launcher. That boundary is the product: Telegram gets safe runtime handles, not raw terminal power.
+It is a **runtime adapter**, not a remote terminal. Start or supervise work in the Pi TUI, then continue from Telegram while away from the keyboard. Each Telegram destination follows a running Pi instance and sends prompts into that instance's currently active session; it is not permanently bound to one session file or session identity. The bridge preserves Pi session semantics instead of pretending Telegram is a PTY, shell, process launcher, or session browser. That boundary is the product: Telegram gets safe runtime handles, not raw terminal power.
 
 This repository is an actively maintained fork of [`badlogic/pi-telegram`](https://github.com/badlogic/pi-telegram). It started from upstream commit [`cb34008`](https://github.com/badlogic/pi-telegram/commit/cb34008460b6c1ca036d92322f69d87f626be0fc) and has since diverged substantially.
 
@@ -45,7 +45,7 @@ Run this inside Pi:
 
 Paste the bot token. If `~/.pi/agent/telegram.json` already contains a saved token, setup offers it as the default. If no saved token exists, setup can prefill from `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_KEY`, `TELEGRAM_TOKEN`, or `TELEGRAM_KEY`. Named profiles are optional; the ordinary `/telegram-setup` and `/telegram-connect` flow keeps using the default profile. Use `/telegram-setup <name>` only when you want an additional bot profile. Cancelling or failing named-profile token validation leaves the currently active profile and polling runtime unchanged; setup reports the profile as saved and connected only after polling startup succeeds.
 
-### 3. Connect this Pi session
+### 3. Connect this Pi instance and its active session
 
 ```bash
 /telegram-connect
@@ -77,8 +77,8 @@ The first Telegram user to message the bot becomes the allowed owner. Other user
 
 | Lens | What `pi-telegram` owns |
 | --- | --- |
-| Operator companion | A phone-width control surface for a live Pi session |
-| Runtime adapter | Telegram turns mapped into Pi lifecycle, queueing, previews, final replies, and artifacts |
+| Operator companion | A phone-width control surface for the active session of a running Pi instance |
+| Runtime adapter | Telegram targets mapped to Pi instances, then into each instance's current session lifecycle, queueing, previews, final replies, and artifacts |
 | Telegram UI harness | Menus, settings, callbacks, Rich Markdown, drafts, active status, buttons, voice, and files |
 | Multi-instance organism | One leader plus explicit visible followers routed through Telegram private-chat threads |
 | Extension platform | Commands, sections, status rows, update handlers, inbound/outbound handlers, and voice providers |
@@ -194,8 +194,8 @@ Classic private DM mode is the base product mode. When Telegram private-chat Thr
 
 | Mode | Best for | Runtime shape |
 | --- | --- | --- |
-| Classic DM | One live Pi session controlled from one private bot chat | One polling owner, one queue/runtime surface |
-| Threaded Mode | Several visible Pi terminals sharing one bot | One leader owns transport; followers route through named private-chat threads |
+| Classic DM | One running Pi instance and its active session controlled from one private bot chat | One polling owner, one queue/runtime surface |
+| Threaded Mode | Several visible Pi instances sharing one bot | One leader owns transport; each named private-chat thread follows its assigned instance and current session |
 
 ## Environment Configuration
 
@@ -239,7 +239,9 @@ Stable public entrypoints are documented in [Public API](./docs/public-api.md), 
 - Replace Pi session lifecycle without an official Pi API.
 - Let non-owner Telegram users control the bridge.
 
-Telegram is a companion surface around a live Pi runtime, not a second runtime.
+Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, but it cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs for those operations.
+
+A Telegram prompt is a normal model turn in the active Pi session and therefore inherits that session's active post-compaction context; the bridge does not make token cost proportional only to the new mobile message. Current releases keep per-turn guidance small and transient, with detailed bridge instructions available on demand through `telegram_help` instead of persisted in every user turn. Pi session JSONL contains model history; profile-scoped pi-telegram `logs*.jsonl` contains redacted operational events and is never model context.
 
 ## Documentation Map
 
