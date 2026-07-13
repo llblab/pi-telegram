@@ -418,6 +418,22 @@ export function registerTelegramBridgeCommands(
       deps.updateStatus(ctx);
     },
   });
+  pi.registerCommand("reload", {
+    description:
+      "Reload pi runtime: extensions, skills, prompts, themes, and context files",
+    handler: async (_args, ctx) => {
+      try {
+        await ctx.reload();
+        ctx.ui.notify(
+          "Reloaded extensions, skills, prompts, themes, and context files.",
+          "info",
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`Reload failed: ${message}`, "error");
+      }
+    },
+  });
 }
 
 export const TELEGRAM_RESERVED_COMMAND_NAMES = [

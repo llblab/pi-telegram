@@ -67,12 +67,14 @@ function getRequiredCommand(
 }
 
 function createBridgeCommandContext(
-  notify: (message: string) => void = () => {},
+  notify: (message: string, level?: string) => void = () => {},
   confirm: () => Promise<boolean> | boolean = () => false,
   select?: (title: string, items: string[]) => Promise<string | undefined>,
+  reload: () => Promise<void> | void = () => {},
 ): ExtensionCommandContext {
   return {
     cwd: "/repo",
+    reload,
     ui: {
       notify,
       confirm,
@@ -1512,4 +1514,63 @@ test("Command helpers execute command actions through provided handlers", async 
     true,
   );
   assert.deepEqual(events, ["stop", "help:start"]);
+});
+
+test("Command helpers register pi reload command that reloads runtime and notifies", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const events: string[] = [];
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => false,
+    startPolling: async () => {},
+    stopPolling: async () => {},
+    updateStatus: () => {},
+  });
+  const reloadCommand = getRequiredCommand(harness.commands, "reload");
+  assert.ok(
+    reloadCommand.description && reloadCommand.description.length > 0,
+  );
+
+  const notifications: Array<{ message: string; level?: string }> = [];
+  const ctx = createBridgeCommandContext(
+    (message, level) => notifications.push({ message, level }),
+    () => false,
+    undefined,
+    async () => {
+      events.push("reload");
+    },
+  );
+  await reloadCommand.handler("", ctx);
+  assert.deepEqual(events, ["reload"]);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "info");
+});
+
+test("Command helpers report reload errors without rethrowing", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => false,
+    startPolling: async () => {},
+    stopPolling: async () => {},
+    updateStatus: () => {},
+  });
+  const reloadCommand = getRequiredCommand(harness.commands, "reload");
+  const notifications: Array<{ message: string; level?: string }> = [];
+  const ctx = createBridgeCommandContext(
+    (message, level) => notifications.push({ message, level }),
+    () => false,
+    undefined,
+    async () => {
+      throw new Error("boom");
+    },
+  );
+  await reloadCommand.handler("", ctx);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "error");
+  assert.match(notifications[0].message, /boom/);
 });
