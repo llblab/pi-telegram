@@ -269,3 +269,69 @@ test("Settings runtime opens menus and applies stale-message fallback toggles", 
     "answer:Time injection: hidden",
   ]);
 });
+
+test("settings callbacks rehydrate menu state after TTL/session prune", async () => {
+  const calls: string[] = [];
+  let stored: { chatId: number; messageId: number; mode: string } | undefined;
+  const runtime = createTelegramSettingsMenuRuntime({
+    isProactivePushEnabled: () => true,
+    getVoiceReplyMode: () => "manual",
+    isVoiceReplyModeConfigured: () => true,
+    getTimeInjectionMode: () => "hidden",
+    areDraftPreviewsEnabled: () => false,
+    getAssistantRenderingMode: () => "rich",
+    setProactivePushEnabled: async () => {},
+    setDraftPreviewsEnabled: async () => {},
+    setAssistantRenderingMode: async () => {},
+    setVoiceReplyMode: async (mode) => {
+      calls.push(`voice:${mode ?? "hidden"}`);
+    },
+    setTimeInjectionMode: async (mode) => {
+      calls.push(`time:${mode}`);
+    },
+    getModelMenuState: async () => ({
+      chatId: 1,
+      messageId: 7,
+      mode: "settings",
+      page: 0,
+      scope: "all",
+      scopedModels: [],
+      allModels: [],
+    }),
+    getStoredModelMenuState: () => undefined,
+    storeModelMenuState: (next) => {
+      stored = {
+        chatId: next.chatId,
+        messageId: next.messageId,
+        mode: next.mode,
+      };
+      calls.push(`store:${next.mode}:${next.messageId}`);
+    },
+    editInteractiveMessage: async (chatId, messageId) => {
+      calls.push(`edit:${chatId}:${messageId}`);
+    },
+    sendInteractiveMessage: async () => 7,
+    answerCallbackQuery: async (_id, text) => {
+      calls.push(`answer:${text ?? ""}`);
+    },
+  });
+
+  assert.equal(
+    await runtime.handleCallbackQuery(
+      {
+        id: "q-rehydrate",
+        data: "settings:set:time-injection:interval",
+        message: { message_id: 7, chat: { id: 1 } },
+      },
+      "ctx",
+    ),
+    true,
+  );
+
+  assert.deepEqual(stored, { chatId: 1, messageId: 7, mode: "settings" });
+  assert.ok(calls.includes("store:settings:7"));
+  assert.ok(calls.includes("time:interval"));
+  assert.ok(calls.includes("edit:1:7"));
+  assert.ok(calls.includes("answer:Time injection: interval"));
+  assert.ok(!calls.includes("answer:Interactive message expired."));
+});

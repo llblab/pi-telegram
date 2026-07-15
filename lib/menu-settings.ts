@@ -665,11 +665,35 @@ export function createTelegramSettingsMenuRuntime<
       ),
     handleCallbackQuery: async (query) => {
       if (!query.data?.startsWith("settings:")) return false;
-      const state = deps.getStoredModelMenuState(
+      let state = deps.getStoredModelMenuState(
         query.message?.message_id,
         query.message?.chat?.id,
       );
+      // After session reload / menu TTL prune the Telegram message still has
+      // buttons, but in-memory menu state is gone. Settings actions do not need
+      // model list data — rehydrate a minimal state so open/set still persist
+      // and refresh the message instead of silently looking "unsaved".
       if (!state) {
+        const chatId = query.message?.chat?.id;
+        const messageId = query.message?.message_id;
+        if (typeof chatId === "number" && typeof messageId === "number") {
+          state = {
+            chatId,
+            messageId,
+            page: 0,
+            scope: "all",
+            scopedModels: [],
+            allModels: [],
+            mode: "settings",
+            ...(typeof query.message?.message_thread_id === "number"
+              ? { threadId: query.message.message_thread_id }
+              : {}),
+          };
+          deps.storeModelMenuState(state);
+        }
+      }
+      if (!state) {
+        // No message context at all — still honor set actions (persist), no UI.
         const voiceMode = query.data.slice("settings:set:voice-reply:".length);
         if (
           query.data.startsWith("settings:set:voice-reply:") &&
@@ -702,7 +726,9 @@ export function createTelegramSettingsMenuRuntime<
           return true;
         }
         if (query.data.startsWith("settings:set:assistant-rendering:")) {
-          const mode = query.data.slice("settings:set:assistant-rendering:".length);
+          const mode = query.data.slice(
+            "settings:set:assistant-rendering:".length,
+          );
           if (mode === "rich" || mode === "html") {
             await deps.setAssistantRenderingMode(mode);
             await deps.answerCallbackQuery(query.id, `Rendering: ${mode}`);

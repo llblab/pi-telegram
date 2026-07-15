@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `Settings Menu Rehydrate`: If a Telegram settings message is still clickable but in-memory menu state was pruned (session reload/TTL), callbacks rebuild a minimal settings state from `callback_query.message` so open/set still persist to `telegram.json` and refresh the message instead of appearing unsaved or expired.
+
 ## 0.23.1: Context Budget And Runtime Simplification
 
 - `Bus Runtime Simplification`: Removed the no-op follower-binding recovery timer and grace configuration, the unused disconnected-announcement helper, and the duplicate follower-prune callback. Heartbeat pruning now emits one accurate diagnostic while preserving durable thread bindings. Impact: leader/follower recovery carries less dormant state and cannot imply offline cleanup that never occurs.
