@@ -2,9 +2,7 @@
 
 ## Unreleased
 
-### Added
-
-- **Provider companion-text policy** — synthesis providers may set `getVoicePolicy().suppressCompanionText = true`. On voice-tagged turns (`mirror` preferred / `always` required) that already plan a voice reply, the bridge drops leftover companion markdown so only the voice note is delivered. Opt-in, first-true-wins across providers; non-voice turns and legacy dual-delivery stay unchanged. Public helper: `shouldSuppressCompanionTextForVoiceTurn()`.
+- `Voice Companion Text Policy`: Synthesis providers may set `getVoicePolicy().suppressCompanionText = true`. On voice-tagged turns (`mirror` preferred / `always` required) that already plan a voice reply, leftover companion markdown is dropped so only the voice note is delivered. Opt-in, first-true-wins across providers; non-voice turns and legacy dual-delivery stay unchanged. Public helpers: `shouldSuppressCompanionTextForVoiceTurn()`, `applyVoiceCompanionTextPolicy()`.
 
 ## 0.23.1: Context Budget And Runtime Simplification
 

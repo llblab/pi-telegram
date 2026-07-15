@@ -13,6 +13,7 @@ export {
   isVoiceTurn,
   registerTelegramVoiceSynthesisProvider,
   registerTelegramVoiceTranscriptionProvider,
+  applyVoiceCompanionTextPolicy,
   shouldSuppressCompanionTextForVoiceTurn,
   shouldSuppressPreviewForVoice,
   type TelegramVoiceProviderPolicy,

@@ -4,10 +4,7 @@
  * Owns queue item contracts, lane admission, pure queue mutations, and dispatch planning
  */
 
-import {
-  isVoiceTurn,
-  shouldSuppressCompanionTextForVoiceTurn,
-} from "./voice.ts";
+import { applyVoiceCompanionTextPolicy, isVoiceTurn } from "./voice.ts";
 
 // --- Queue Items ---
 
@@ -1210,18 +1207,7 @@ export async function handleTelegramAgentEndRuntime<
       : { markdown: "", voiceText };
   }
 
-  // Provider policy: suppress leftover companion markdown on voice-tagged turns
-  // when a synthesis provider requests it (e.g. mirror/always voice-only UX).
-  // Only applies when a voice reply is already planned; never invents voice.
-  if (
-    turn &&
-    outboundReply &&
-    (outboundReply.voiceText || outboundReply.voiceReplies?.length) &&
-    shouldSuppressCompanionTextForVoiceTurn(turn) &&
-    outboundReply.markdown?.trim()
-  ) {
-    outboundReply = { ...outboundReply, markdown: "" };
-  }
+  outboundReply = applyVoiceCompanionTextPolicy(turn, outboundReply);
 
   const finalText = outboundReply ? outboundReply.markdown : rawFinalText;
   const hasOutboundArtifacts =

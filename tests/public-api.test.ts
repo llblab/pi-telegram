@@ -75,6 +75,7 @@ test("Public package subpaths expose the stable extension API", async () => {
   ]);
   assert.deepEqual(Object.keys(voice).sort(), [
     "TELEGRAM_VOICE_REPLY_MODES",
+    "applyVoiceCompanionTextPolicy",
     "computeVoicePromptContribution",
     "computeVoiceTurnFlags",
     "getTelegramVoiceReplyMode",
@@ -82,6 +83,7 @@ test("Public package subpaths expose the stable extension API", async () => {
     "isVoiceTurn",
     "registerTelegramVoiceSynthesisProvider",
     "registerTelegramVoiceTranscriptionProvider",
+    "shouldSuppressCompanionTextForVoiceTurn",
     "shouldSuppressPreviewForVoice",
   ]);
   assert.deepEqual(Object.keys(keyboard), []);

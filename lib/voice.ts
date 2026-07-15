@@ -319,6 +319,36 @@ export function shouldSuppressCompanionTextForVoiceTurn(
   return false;
 }
 
+/**
+ * Normalize an outbound reply plan for voice-tagged companion-text policy.
+ * When a provider opts into suppression and a voice artifact is already planned,
+ * clears leftover markdown so delivery is voice-only. Never invents voice.
+ */
+export function applyVoiceCompanionTextPolicy<
+  T extends {
+    markdown?: string;
+    voiceText?: string;
+    voiceReplies?: unknown[];
+  },
+>(
+  turn:
+    | { voiceReplyPreferred?: boolean; voiceReplyRequired?: boolean }
+    | null
+    | undefined,
+  plan: T | undefined,
+): T | undefined {
+  if (!plan) return plan;
+  const hasVoiceArtifact = !!(plan.voiceText || plan.voiceReplies?.length);
+  if (
+    !hasVoiceArtifact ||
+    !plan.markdown?.trim() ||
+    !shouldSuppressCompanionTextForVoiceTurn(turn)
+  ) {
+    return plan;
+  }
+  return { ...plan, markdown: "" };
+}
+
 // --- Voice Prompt Contribution ---
 
 export function computeVoicePromptContribution(
