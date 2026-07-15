@@ -619,6 +619,57 @@ test("Native Markdown delivery converts multiline display math to math fences", 
   );
 });
 
+test("Native Markdown delivery preserves Bot API 10.2 structured blocks", async () => {
+  const source = [
+    "# Structured report",
+    "",
+    "| Metric | Value |",
+    "|:-------|------:|",
+    "| Speed | **42 ms** |",
+    "",
+    "Inline formula: $x^2 + y^2$.",
+    "",
+    "$$",
+    "E = mc^2",
+    "$$",
+    "",
+    "```ts",
+    "const ready = true;",
+    "```",
+    "",
+    "<details open><summary>Evidence</summary>",
+    "",
+    "- unordered item",
+    "1. ordered item",
+    "",
+    "> quoted evidence",
+    "",
+    "</details>",
+  ].join("\n");
+  const expected = source
+    .replace("$$\nE = mc^2\n$$", "```math\nE = mc^2\n```")
+    .replace("> quoted evidence", ">quoted evidence");
+
+  assert.equal(normalizeTelegramNativeMarkdown(source), expected);
+  const bodies: Array<Record<string, unknown>> = [];
+  await sendTelegramNativeMarkdownReply(7, undefined, source, {
+    sendRichMessage: async (body) => {
+      bodies.push(body);
+      return { message_id: 1 };
+    },
+  });
+  assert.deepEqual(bodies, [
+    {
+      chat_id: 7,
+      rich_message: {
+        markdown: expected,
+        skip_entity_detection: true,
+      },
+      reply_markup: undefined,
+    },
+  ]);
+});
+
 test("Native Markdown delivery ignores math delimiters inside fences when pairing", () => {
   const markdown = ["$$", "```md", "$$", "```"].join("\n");
   assert.equal(normalizeTelegramNativeMarkdown(markdown), markdown);

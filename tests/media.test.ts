@@ -72,6 +72,54 @@ test("Media helpers collect file infos across Telegram message variants", () => 
   );
 });
 
+test("Media helpers collect embedded Rich Message media", () => {
+  const files = collectTelegramFileInfos([
+    {
+      message_id: 2,
+      rich_message: {
+        blocks: [
+          { type: "paragraph", text: "caption" },
+          {
+            type: "photo",
+            photo: [
+              { file_id: "rich-small", file_size: 1 },
+              { file_id: "rich-large", file_size: 10 },
+            ],
+          },
+          {
+            type: "details",
+            blocks: [
+              {
+                type: "voice_note",
+                voice_note: {
+                  file_id: "rich-voice",
+                  mime_type: "audio/ogg",
+                },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ]);
+  assert.deepEqual(files, [
+    {
+      file_id: "rich-large",
+      fileName: "photo-2-1.jpg",
+      mimeType: "image/jpeg",
+      kind: "photo",
+      isImage: true,
+    },
+    {
+      file_id: "rich-voice",
+      fileName: "voice-2-2.ogg",
+      mimeType: "audio/ogg",
+      kind: "voice",
+      isImage: false,
+    },
+  ]);
+});
+
 test("Media helpers download collected file infos", async () => {
   const downloaded = await downloadTelegramMessageFiles(
     [

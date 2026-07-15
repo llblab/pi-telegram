@@ -11,14 +11,22 @@ import {
   createTelegramActivityBridgeRuntime,
   createTelegramActivityDispatcher,
   createTelegramActivityRuntime,
+  createTelegramAssistantOutputRuntime,
   registerTelegramActivityHandler,
   type TelegramActivityEvent,
+  type TelegramAssistantSegmentEvent,
 } from "../lib/activity.ts";
+import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
 import {
   bindTelegramDeliveryRuntime,
   clearTelegramDeliveryRuntime,
   type TelegramDeliveryRuntime,
 } from "../lib/delivery.ts";
+import {
+  createTelegramAssistantOutputMutationFence,
+  createTelegramAssistantOutputSender,
+} from "../lib/outbound.ts";
+import type { TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
 
 function waitForActivityDispatch(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -215,6 +223,65 @@ test("Activity normalizer classifies source and assistant segment placement", as
     ["intermediate", "final"],
   );
   assert.equal(new Set(received.map((event) => event.activityId)).size, 1);
+});
+
+test("Activity normalizer exposes completed public blocks without reasoning or tools", async () => {
+  const received: TelegramActivityEvent[] = [];
+  registerTelegramActivityHandler({
+    id: "public-block-capture",
+    handle: (event) => {
+      received.push(event);
+    },
+  });
+  const runtime = createTelegramActivityRuntime({
+    generation: "proactive-boundary",
+    dispatcher: createTelegramActivityDispatcher(),
+    now: () => 20,
+  });
+  runtime.recordInputSource("extension");
+  runtime.onAgentStart();
+  runtime.onAssistantEvent({
+    type: "text_end",
+    contentIndex: 0,
+    content: "Checkpoint one.",
+  });
+  runtime.onAssistantEvent({ type: "toolcall_start", contentIndex: 1 });
+  runtime.onAssistantEvent({
+    type: "thinking_end",
+    contentIndex: 2,
+    content: "private reasoning",
+  });
+  runtime.onAssistantEvent({
+    type: "text_end",
+    contentIndex: 3,
+    content: "Final result.",
+  });
+  runtime.onAssistantEvent({ type: "done" });
+  await waitForActivityDispatch();
+
+  const segments = received.filter(
+    (event): event is Extract<TelegramActivityEvent, { type: "assistant-segment" }> =>
+      event.type === "assistant-segment",
+  );
+  assert.deepEqual(
+    segments.map(({ source, text, placement }) => ({ source, text, placement })),
+    [
+      {
+        source: "autonomous",
+        text: "Checkpoint one.",
+        placement: "intermediate",
+      },
+      {
+        source: "autonomous",
+        text: "Final result.",
+        placement: "final",
+      },
+    ],
+  );
+  assert.equal(
+    segments.some((event) => event.text.includes("private reasoning")),
+    false,
+  );
 });
 
 test("Activity normalizer distinguishes local, autonomous, and unknown activities", async () => {
@@ -543,4 +610,188 @@ test("Activity shutdown fences queued handlers and clears normalization state", 
   runtime.onAgentEnd();
   await waitForActivityDispatch();
   assert.deepEqual(received, []);
+});
+
+function assistantSegment(
+  sequence: number,
+  overrides: Partial<TelegramAssistantSegmentEvent> = {},
+): TelegramAssistantSegmentEvent {
+  return {
+    type: "assistant-segment",
+    activityId: "activity-1",
+    sequence,
+    source: "autonomous",
+    timestamp: sequence,
+    contentIndex: sequence - 1,
+    text: `segment-${sequence}`,
+    placement: sequence === 1 ? "intermediate" : "final",
+    ...overrides,
+  };
+}
+
+test("Assistant output projection admits public local blocks once and in order", async () => {
+  let enabled = true;
+  const sent: string[] = [];
+  const failures: string[] = [];
+  const runtime = createTelegramAssistantOutputRuntime({
+    isEnabled: () => enabled,
+    canDeliver: () => true,
+    send: async (event) => {
+      if (event.sequence === 4) throw new Error("failed");
+      sent.push(event.text);
+    },
+    recordFailure: (_event, error) => failures.push((error as Error).message),
+  });
+  runtime.start();
+  runtime.accept(assistantSegment(1));
+  runtime.accept(assistantSegment(1));
+  runtime.accept(assistantSegment(2, { source: "telegram" }));
+  runtime.accept(assistantSegment(3, { text: "  " }));
+  runtime.accept(assistantSegment(4));
+  runtime.accept(assistantSegment(5, { source: "local" }));
+  await runtime.waitForIdle();
+  enabled = false;
+  runtime.accept(assistantSegment(6));
+  await runtime.waitForIdle();
+  assert.deepEqual(sent, ["segment-1", "segment-5"]);
+  assert.deepEqual(failures, ["failed"]);
+});
+
+test("Assistant output projection preserves follower order and admission authority", async () => {
+  const calls: string[] = [];
+  let authority = 1;
+  let releaseFirst!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const api = createTelegramBusAwareApiRuntime({
+    directRuntime: {} as TelegramBridgeApiRuntime,
+    ownsDirect: () => false,
+    callFollowerApi: async (_method, args) => {
+      calls.push(
+        String(
+          (args[1] as { rich_message?: { markdown?: string } }).rich_message
+            ?.markdown,
+        ),
+      );
+      if (calls.length === 1) await gate;
+      return { message_id: calls.length };
+    },
+  });
+  const runtime = createTelegramAssistantOutputRuntime({
+    isEnabled: () => true,
+    captureAuthority: () => authority,
+    isAuthorityActive: (admitted) => admitted === authority,
+    canDeliver: () => true,
+    send: async (event) => {
+      await api.sendRichMessage({
+        chat_id: 10,
+        rich_message: { markdown: event.text },
+      });
+    },
+  });
+  runtime.start();
+  runtime.accept(assistantSegment(1));
+  runtime.accept(assistantSegment(2));
+  await Promise.resolve();
+  assert.deepEqual(calls, ["segment-1"]);
+  authority = 2;
+  releaseFirst();
+  await runtime.waitForIdle();
+  assert.deepEqual(calls, ["segment-1"]);
+});
+
+test("Assistant output mutation fence rejects replaced authority", async () => {
+  let active = true;
+  const calls: string[] = [];
+  const fence = createTelegramAssistantOutputMutationFence(() => active);
+  active = false;
+  await assert.rejects(
+    fence.run(async () => {
+      calls.push("mutation");
+      return 1;
+    }),
+    /lost admission authority before transport mutation/,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("Assistant output Rich and HTML senders fence after async transformation", async () => {
+  for (const rendering of ["rich", "html"] as const) {
+    let active = true;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const transportCalls: string[] = [];
+    const send = createTelegramAssistantOutputSender<string>({
+      sendMessage: async () => {
+        transportCalls.push("html");
+        return { message_id: 1 };
+      },
+      sendRichMessage: async () => {
+        transportCalls.push("rich");
+        return { message_id: 2 };
+      },
+      editMessage: async () => "edited",
+      getAssistantRenderingMode: () => rendering,
+      getHandlers: () => [{ type: "text", template: "/tools/transform" }],
+      execCommand: async (_command, _args, options) => {
+        markStarted();
+        await gate;
+        return {
+          stdout: options?.stdin ?? "",
+          stderr: "",
+          code: 0,
+          killed: false,
+        };
+      },
+    });
+    const delivery = send(
+      assistantSegment(1),
+      {
+        transportStamp: "stamp-1",
+        route: "direct",
+        directEpoch: 1,
+        target: { chatId: 10, threadId: 42 },
+      },
+      () => active,
+    );
+    await started;
+    active = false;
+    release();
+    await assert.rejects(
+      delivery,
+      /lost admission authority before transport mutation/,
+    );
+    assert.deepEqual(transportCalls, []);
+  }
+});
+
+test("Assistant output projection drops queued work after generation stop", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const sent: number[] = [];
+  const runtime = createTelegramAssistantOutputRuntime({
+    isEnabled: () => true,
+    canDeliver: () => true,
+    send: async (event) => {
+      sent.push(event.sequence);
+      if (event.sequence === 1) await gate;
+    },
+  });
+  runtime.start();
+  runtime.accept(assistantSegment(1));
+  runtime.accept(assistantSegment(2));
+  await Promise.resolve();
+  runtime.stop();
+  release();
+  await runtime.waitForIdle();
+  assert.deepEqual(sent, [1]);
 });

@@ -158,28 +158,22 @@ export function getTelegramFollowerTargetOwnership(input: {
     target: TelegramTarget;
   }[];
   currentInstanceId?: string;
-}): { instanceId: string } | undefined {
+}): { instanceId: string; ownerGeneration?: string } | undefined {
   const liveFollower = input.followers.find((follower) => {
     return (
       follower.target?.chatId === input.target.chatId &&
       follower.target.threadId === input.target.threadId
     );
   });
-  if (liveFollower) return { instanceId: liveFollower.instanceId };
-  const record = input.activeThreadRecords?.find((candidate) => {
-    const isFollowerRecord = candidate.owner?.kind
-      ? candidate.owner.kind === "manual-follower"
-      : candidate.profileKey?.startsWith("manual:") === true;
-    return (
-      isFollowerRecord &&
-      candidate.status === "active" &&
-      candidate.instanceId &&
-      candidate.instanceId !== input.currentInstanceId &&
-      candidate.target.chatId === input.target.chatId &&
-      candidate.target.threadId === input.target.threadId
-    );
-  });
-  return record?.instanceId ? { instanceId: record.instanceId } : undefined;
+  if (liveFollower) {
+    return {
+      instanceId: liveFollower.instanceId,
+      ownerGeneration: liveFollower.registrationGeneration,
+    };
+  }
+  // Persisted records are restart hints, not live routing authority. Only an
+  // authenticated current follower registration may receive forwarded work.
+  return undefined;
 }
 
 const TELEGRAM_BUS_AGGREGATE_DELIVERY_FIELD = "__piTelegramAggregateDelivery";
@@ -237,6 +231,7 @@ export function isTelegramFollowerApiCallAllowed(input: {
     "sendDocument",
     "sendMediaGroup",
     "sendPhoto",
+    "sendRichMessage",
     "sendVoice",
   ]);
   const target = input.follower.target;
@@ -364,6 +359,13 @@ export type TelegramBusEnvelope = (
       sentAtMs: number;
     }
   | {
+      kind: "follower.disconnect";
+      requestId: string;
+      instanceId: string;
+      registrationGeneration?: string;
+      sentAtMs: number;
+    }
+  | {
       kind: "leader.forwardCallback";
       requestId: string;
       recipientInstanceId: string;
@@ -385,6 +387,7 @@ export type TelegramBusEnvelope = (
       recipientInstanceId: string;
       recipientRegistrationGeneration?: string;
       message: unknown;
+      forwardCommentBatchPosition?: "comment" | "forward";
       sentAtMs: number;
     }
   | {
@@ -473,6 +476,9 @@ export function parseTelegramBusEnvelope(
     case "follower.heartbeat":
       envelope = parseHeartbeatEnvelope(value, requestId);
       break;
+    case "follower.disconnect":
+      envelope = parseDisconnectEnvelope(value, requestId);
+      break;
     case "leader.forwardCallback":
       envelope = parseForwardCallbackEnvelope(value, requestId);
       break;
@@ -548,12 +554,20 @@ export interface TelegramBusLocalClientOptions {
   recordTransportEvent?: TelegramBusTransportEventRecorder;
 }
 
-export interface TelegramBusForeignOwnedForwarderDeps {
+export interface TelegramBusForeignOwnedForwarderDeps<TMessage = unknown> {
   socketPath: TelegramBusSocketPathSource;
   createRequestId: () => string;
   getNowMs?: () => number;
   timeoutMs?: number;
   getAuthSecret?: () => string | undefined;
+  getForwardCommentBatchPosition?: (
+    message: TMessage,
+  ) => "comment" | "forward" | undefined;
+  recordRuntimeEvent?: (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
 }
 
 export function createTelegramBusForeignOwnedUpdateForwarder<
@@ -562,7 +576,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
   TCallbackQuery,
   TMessage = unknown,
 >(
-  deps: TelegramBusForeignOwnedForwarderDeps,
+  deps: TelegramBusForeignOwnedForwarderDeps<TMessage>,
 ): {
   forwardCallback: (input: {
     query: TCallbackQuery;
@@ -598,7 +612,24 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
         operation: "operation",
       }),
     });
-    return response?.kind === "bus.ack" && response.ok;
+    const accepted = response?.kind === "bus.ack" && response.ok;
+    if (!accepted) {
+      deps.recordRuntimeEvent?.(
+        "bus",
+        response?.kind === "bus.ack"
+          ? response.message ?? "Follower rejected forwarded Telegram update."
+          : "Follower returned no forwarding acknowledgement.",
+        {
+          phase: "foreign-update-forward-rejected",
+          envelopeKind: envelope.kind,
+          recipientInstanceId:
+            "recipientInstanceId" in envelope
+              ? envelope.recipientInstanceId
+              : undefined,
+        },
+      );
+    }
+    return accepted;
   };
   return {
     forwardCallback: ({ query, ownership }) =>
@@ -632,6 +663,12 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
           ? { recipientRegistrationGeneration: ownership.ownerGeneration }
           : {}),
         message,
+        ...(deps.getForwardCommentBatchPosition?.(message) !== undefined
+          ? {
+              forwardCommentBatchPosition:
+                deps.getForwardCommentBatchPosition(message),
+            }
+          : {}),
         sentAtMs: getNowMs(),
       }),
     forwardEditedMessage: ({ message, ownership }) =>
@@ -1287,6 +1324,24 @@ function parseHeartbeatEnvelope(
     : undefined;
 }
 
+function parseDisconnectEnvelope(
+  value: Record<string, unknown>,
+  requestId: string,
+): TelegramBusEnvelope | undefined {
+  return typeof value.instanceId === "string" &&
+    typeof value.sentAtMs === "number"
+    ? {
+        kind: "follower.disconnect",
+        requestId,
+        instanceId: value.instanceId,
+        ...(typeof value.registrationGeneration === "string"
+          ? { registrationGeneration: value.registrationGeneration }
+          : {}),
+        sentAtMs: value.sentAtMs,
+      }
+    : undefined;
+}
+
 function parseForwardCallbackEnvelope(
   value: Record<string, unknown>,
   requestId: string,
@@ -1349,6 +1404,14 @@ function parseForwardMessageEnvelope(
             }
           : {}),
         message: value.message,
+        ...(kind === "leader.forwardMessage" &&
+        (value.forwardCommentBatchPosition === "comment" ||
+          value.forwardCommentBatchPosition === "forward")
+          ? {
+              forwardCommentBatchPosition:
+                value.forwardCommentBatchPosition,
+            }
+          : {}),
         sentAtMs: value.sentAtMs,
       }
     : undefined;

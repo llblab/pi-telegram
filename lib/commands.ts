@@ -307,6 +307,7 @@ export interface TelegramBridgeCommandRegistrationDeps {
     | Promise<void | TelegramBridgeCommandStartPollingResult>
     | TelegramBridgeCommandStartPollingResult;
   stopPolling: () => Promise<void | string>;
+  getDisconnectThreadName?: () => string | undefined;
   updateStatus: (ctx: ExtensionCommandContext) => void;
   getProfileNames?: () => string[];
   activateDefaultProfileConfig?: (ctx: ExtensionCommandContext) => Promise<void>;
@@ -411,11 +412,34 @@ export function registerTelegramBridgeCommands(
     },
   });
   pi.registerCommand("telegram-disconnect", {
-    description: "Stop the Telegram bridge in this Pi session",
+    description:
+      "Stop Telegram; in Threaded Mode, delete this instance's current thread",
     handler: async (_args, ctx) => {
-      const message = await deps.stopPolling();
-      if (message) ctx.ui.notify(message, "info");
-      deps.updateStatus(ctx);
+      const threadName = deps.getDisconnectThreadName?.();
+      if (threadName) {
+        const confirmed = await ctx.ui.confirm(
+          ctx.ui.theme.fg("accent", "pi-telegram"),
+          `Delete Telegram thread ${ctx.ui.theme.fg("warning", threadName)} and disconnect this Pi session?`,
+        );
+        if (!confirmed) {
+          ctx.ui.notify("Telegram disconnect cancelled.", "info");
+          deps.updateStatus(ctx);
+          return;
+        }
+      }
+      try {
+        const message = await deps.stopPolling();
+        if (message) ctx.ui.notify(message, "info");
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(
+          `Telegram disconnect did not complete: ${detail} Keep this Pi session open, restore leader connectivity, inspect /telegram-status --debug, and retry /telegram-disconnect.`,
+          "warning",
+        );
+        throw error;
+      } finally {
+        deps.updateStatus(ctx);
+      }
     },
   });
 }

@@ -560,7 +560,7 @@ test(
       botToken: "123:abc",
       allowedUserId: 77,
       lastUpdateId: 0,
-      proactivePush: true,
+      assistant: { proactivePush: true },
     });
     try {
       const result = await runPiPrintWithTelegram(agentDir, fixtureExtension, {
@@ -588,7 +588,7 @@ test(
         botToken: "123:abc",
         allowedUserId: 77,
         lastUpdateId: 0,
-        proactivePush: true,
+        assistant: { proactivePush: true },
       },
       {
         "@llblab/pi-telegram": {

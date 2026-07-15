@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
+  mkdir,
   mkdtemp,
   readdir,
   readFile,
@@ -70,6 +71,27 @@ test("Telegram config helper returns empty config when file is absent", async ()
     await readTelegramConfig(join(agentDir, "telegram.json")),
     {},
   );
+});
+
+test("Telegram config reads valid atomic snapshots without acquiring the transaction guard", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-config-read-"));
+  const configPath = join(agentDir, "telegram.json");
+  const transactionPath = `${configPath}.transaction`;
+  const generation = "10000000-0000-4000-8000-000000000001";
+  await writeFile(configPath, '{"botToken":"123:abc"}\n', "utf8");
+  await mkdir(transactionPath);
+  await writeFile(
+    join(transactionPath, `owner.${generation}.json`),
+    `${JSON.stringify({ pid: process.pid, acquiredAtMs: Date.now(), generation })}\n`,
+    "utf8",
+  );
+  try {
+    assert.deepEqual(await readTelegramConfig(configPath), {
+      botToken: "123:abc",
+    });
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
 });
 
 test("Telegram proactive target getter prefers active then assigned targets", () => {
@@ -193,7 +215,7 @@ test("Telegram config transactions merge concurrent profile offsets and global f
       while (!existsSync(process.env.START_PATH)) sleep(2);
       store.update((config) => {
         config.lastUpdateId = Number(process.env.OFFSET);
-        if (process.env.FIELD === "proactive") config.proactivePush = true;
+        if (process.env.FIELD === "proactive") config.assistant = { ...(config.assistant ?? {}), proactivePush: true };
         else config.voice = { ...(config.voice ?? {}), replyMode: "mirror" };
       });
       await store.persist();
@@ -241,7 +263,7 @@ test("Telegram config transactions merge concurrent profile offsets and global f
 
     assert.deepEqual(await readTelegramConfig(configPath), {
       botToken: "default-token",
-      proactivePush: true,
+      assistant: { proactivePush: true },
       voice: { replyMode: "mirror" },
       profiles: {
         work: { botToken: "work-token", lastUpdateId: 11 },
@@ -373,6 +395,19 @@ test("Telegram voice reply mode setter persists telegram.json", async () => {
   });
 });
 
+test("Telegram proactive push defaults on and reads only assistant.proactivePush", () => {
+  const store = createTelegramConfigStore({
+    initialConfig: { proactivePush: false } as unknown as TelegramConfig,
+  });
+  const controls = createTelegramConfigControls(store);
+
+  assert.equal(controls.isProactivePushEnabled(), true);
+  store.set({ assistant: { proactivePush: false } });
+  assert.equal(controls.isProactivePushEnabled(), false);
+  store.set({ assistant: { proactivePush: true } });
+  assert.equal(controls.isProactivePushEnabled(), true);
+});
+
 test("Telegram settings setters reload before scoped writes to preserve shared config changes", async () => {
   const agentDir = await mkdtemp(
     join(tmpdir(), "pi-telegram-shared-settings-"),
@@ -394,8 +429,11 @@ test("Telegram settings setters reload before scoped writes to preserve shared c
 
   assert.deepEqual(await readTelegramConfig(configPath), {
     botToken: "123:abc",
-    proactivePush: true,
-    assistant: { draftPreviews: true, rendering: "html" },
+    assistant: {
+      draftPreviews: true,
+      rendering: "html",
+      proactivePush: true,
+    },
     voice: { replyMode: "mirror" },
   });
   assert.equal(controls.getAssistantRenderingMode(), "html");

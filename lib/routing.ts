@@ -1,7 +1,7 @@
 /**
  * Telegram inbound routing composition
  * Zones: telegram inbound, orchestration, queue/menu/command composition
- * Wires authorized updates into menus, commands, media grouping, and prompt queueing
+ * Wires authorized updates into menus, commands, media grouping, and prompt queueing, and owns exact assistant-output target/route authority capture
  */
 
 import { readFile } from "node:fs/promises";
@@ -2470,4 +2470,91 @@ export function createTelegramInboundRouteRuntime<
       return;
     },
   });
+}
+
+// --- Assistant Output Delivery Authority ---
+
+export interface TelegramAssistantOutputAuthority<TTransportStamp> {
+  transportStamp: TTransportStamp;
+  route: "direct" | "follower" | "none";
+  directEpoch?: number | string;
+  followerGeneration?: string;
+  target?: Queue.TelegramQueueTarget;
+}
+
+export interface TelegramAssistantOutputAuthorityRuntime<TTransportStamp> {
+  captureAuthority: () => TelegramAssistantOutputAuthority<TTransportStamp>;
+  isAuthorityActive: (
+    authority: TelegramAssistantOutputAuthority<TTransportStamp>,
+  ) => boolean;
+  canDeliver: () => boolean;
+}
+
+export function createTelegramAssistantOutputAuthorityRuntime<TTransportStamp>(deps: {
+  getPreferredTarget: () => Queue.TelegramQueueTarget | undefined;
+  getFallbackChatId: () => number | undefined;
+  getTransportStamp: () => TTransportStamp;
+  isTransportStampActive: (stamp: TTransportStamp) => boolean;
+  ownsDirect: () => boolean;
+  getDirectEpoch: () => number | string | undefined;
+  isFollowerRegistered: () => boolean;
+  getFollowerGeneration: () => string | undefined;
+}): TelegramAssistantOutputAuthorityRuntime<TTransportStamp> {
+  const getCurrentTarget = (): Queue.TelegramQueueTarget | undefined => {
+    const preferred = deps.getPreferredTarget();
+    if (preferred) return { ...preferred };
+    const chatId = deps.getFallbackChatId();
+    return chatId === undefined ? undefined : { chatId };
+  };
+  return {
+    captureAuthority() {
+      const target = getCurrentTarget();
+      const directEpoch = deps.ownsDirect()
+        ? deps.getDirectEpoch()
+        : undefined;
+      const followerGeneration = deps.isFollowerRegistered()
+        ? deps.getFollowerGeneration()
+        : undefined;
+      return {
+        transportStamp: deps.getTransportStamp(),
+        route:
+          directEpoch !== undefined
+            ? "direct"
+            : followerGeneration !== undefined
+              ? "follower"
+              : "none",
+        directEpoch,
+        followerGeneration,
+        target,
+      };
+    },
+    isAuthorityActive(authority) {
+      if (!deps.isTransportStampActive(authority.transportStamp)) return false;
+      const target = getCurrentTarget();
+      if (
+        authority.target === undefined ||
+        target?.chatId !== authority.target.chatId ||
+        target?.threadId !== authority.target.threadId
+      ) {
+        return false;
+      }
+      if (authority.route === "direct") {
+        return (
+          deps.ownsDirect() &&
+          deps.getDirectEpoch() === authority.directEpoch
+        );
+      }
+      if (authority.route === "follower") {
+        return (
+          !deps.ownsDirect() &&
+          deps.isFollowerRegistered() &&
+          deps.getFollowerGeneration() === authority.followerGeneration
+        );
+      }
+      return false;
+    },
+    canDeliver() {
+      return deps.ownsDirect() || deps.isFollowerRegistered();
+    },
+  };
 }

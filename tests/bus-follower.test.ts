@@ -32,7 +32,11 @@ import {
   sendTelegramBusLocalEnvelope,
 } from "../lib/bus.ts";
 import { createTelegramBusLeaderEnvelopeHandler } from "../lib/bus-leader.ts";
-import { createTelegramTopicTargetStore } from "../lib/threads.ts";
+import {
+  createTelegramTopicTargetStore,
+  getTelegramLeaderSessionHandoff,
+  setTelegramLeaderSessionHandoff,
+} from "../lib/threads.ts";
 import { isTelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 
 async function waitForCondition(
@@ -105,6 +109,8 @@ test("Bus follower promotion handler transfers binding only after leadership acq
     recordRuntimeEvent: (category, message, details) => {
       events.push({ category, message, details });
     },
+    getPid: () => 10,
+    getNowMs: () => 500,
   });
   try {
     await promote(
@@ -130,7 +136,28 @@ test("Bus follower promotion handler transfers binding only after leadership acq
         threadName: "Ember",
       },
     });
+    assert.deepEqual(events[2], {
+      category: "bus",
+      message: "Promoted leader binding retained for session replacement",
+      details: {
+        phase: "follower-promoted-session-handoff",
+        chatId: 42,
+        threadId: 11,
+        slot: "E",
+        threadName: "Ember",
+      },
+    });
+    assert.deepEqual(getTelegramLeaderSessionHandoff(), {
+      pid: 10,
+      instanceId: "inst-a",
+      createdAtMs: 500,
+      profileKey: "profile:work:cwd:/repo",
+      target: { chatId: 42, threadId: 11 },
+      slot: "E",
+      threadName: "Ember",
+    });
   } finally {
+    setTelegramLeaderSessionHandoff(undefined);
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -406,6 +433,64 @@ test("Bus follower heartbeat recovery passes current binding into promotion", as
   assert.deepEqual(promoted, [
     { target: { chatId: 42, threadId: 10 }, slot: "F", threadName: "Fjord" },
   ]);
+});
+
+test("Bus follower election defers a higher slot to the lowest live candidate", async () => {
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(
+    true,
+    { chatId: 42, threadId: 10 },
+    { slot: "D", threadName: "Dawn" },
+  );
+  registrationState.setEligibleElectionSlots(["D", "C"]);
+  let state: "inactive" | "winner" = "inactive";
+  let promoted = 0;
+  let registered = 0;
+  const events: Array<Record<string, unknown> | undefined> = [];
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({
+      registerWithLeader: async () => {
+        registered += 1;
+        return true;
+      },
+      setContext: () => undefined,
+      stop: () => registrationState.setRegistered(false),
+    }),
+    getLeaderState: () =>
+      state === "inactive"
+        ? { kind: "inactive" }
+        : {
+            kind: "active-elsewhere",
+            lock: { pid: 99, instanceId: "slot-c", leaderEpoch: "epoch-c" },
+          },
+    setLifecyclePhase: () => undefined,
+    updateStatus: () => undefined,
+    promoteToLeader: async () => {
+      promoted += 1;
+      return true;
+    },
+    sleep: async () => {
+      state = "winner";
+    },
+    promotionGraceMs: 2500,
+    recordRuntimeEvent: (_category, _message, details) => {
+      events.push(details);
+    },
+  });
+
+  await handler(new Error("leader disconnected"), "ctx");
+
+  assert.equal(promoted, 0);
+  assert.equal(registered, 1);
+  assert.equal(
+    events.some(
+      (details) =>
+        details?.phase === "follower-promotion-slot-priority" &&
+        details.lowerEligibleSlot === "C",
+    ),
+    true,
+  );
 });
 
 test("Bus follower heartbeat recovery never promotes over a live leader lease", async () => {
@@ -1105,15 +1190,19 @@ test("Bus follower registration runtime waits for slow target provisioning", asy
   }
 });
 
-test("Bus follower registration runtime registers with a live leader socket", async () => {
+test("Bus follower registration runtime registers and explicitly disconnects", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-follower-"));
   const socketPath = join(dir, "bus.sock");
   const registry = createTelegramBusFollowerRegistry();
+  let disconnects = 0;
   const server = createTelegramBusLocalServer({
     socketPath,
     handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
       followerRegistry: registry,
       getNowMs: () => 1000,
+      onFollowerDisconnected() {
+        disconnects += 1;
+      },
     }),
   });
   let sequence = 0;
@@ -1143,7 +1232,11 @@ test("Bus follower registration runtime registers with a live leader socket", as
       lastHeartbeatMs: 1000,
       target: undefined,
     });
+    assert.equal(await follower.disconnectFromLeader?.(), true);
+    assert.equal(disconnects, 1);
+    assert.equal(registry.get("inst-a"), undefined);
   } finally {
+    follower.stop();
     await server.stop();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1537,6 +1630,58 @@ test("Bus follower session replacement preserves a same-process handoff", async 
     },
   ]);
   setTelegramFollowerSessionHandoff(undefined);
+});
+
+test("Bus session replacement preserves the promoted leader binding", async () => {
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  const events: unknown[] = [];
+  const suspend = createTelegramBusFollowerSessionReplacementSuspender({
+    registrationState,
+    instanceId: "promoted-inst",
+    suspendPolling: async () => undefined,
+    isLeader: () => true,
+    getLeaderBinding: () => ({
+      target: { chatId: 1, threadId: 3 },
+      slot: "C",
+      threadName: "Cinder",
+    }),
+    getActiveContext: () => ({ cwd: "/repo" }),
+    getActiveProfileName: () => "work",
+    recordRuntimeEvent(category, message, details) {
+      events.push({ category, message, details });
+    },
+    getPid: () => 10,
+    getNowMs: () => 500,
+  });
+
+  try {
+    await suspend();
+    assert.deepEqual(getTelegramLeaderSessionHandoff(), {
+      pid: 10,
+      instanceId: "promoted-inst",
+      createdAtMs: 500,
+      profileKey: "profile:work:cwd:/repo",
+      target: { chatId: 1, threadId: 3 },
+      slot: "C",
+      threadName: "Cinder",
+    });
+    assert.deepEqual(events, [
+      {
+        category: "bus",
+        message: "Telegram leader binding suspended for session replacement",
+        details: {
+          phase: "leader-session-handoff",
+          instanceId: "promoted-inst",
+          chatId: 1,
+          threadId: 3,
+          slot: "C",
+          threadName: "Cinder",
+        },
+      },
+    ]);
+  } finally {
+    setTelegramLeaderSessionHandoff(undefined);
+  }
 });
 
 test("Bus follower session refresh re-registers with the handed-off target", async () => {

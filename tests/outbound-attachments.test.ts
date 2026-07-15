@@ -11,8 +11,10 @@ import test from "node:test";
 
 import {
   createTelegramQueuedOutboundAttachmentSender,
+  createTelegramRichOutboundAttachmentSender,
   deliverTelegramGuestCachedAttachment,
   getTelegramOutboundAttachmentByteLimitFromEnv,
+  planTelegramRichOutboundAttachment,
   queueTelegramOutboundAttachments,
   registerTelegramOutboundAttachmentTool,
   registerTelegramOutboundMessageTool,
@@ -25,6 +27,7 @@ import {
 } from "../lib/outbound-attachments.ts";
 import type { ExtensionAPI } from "../lib/pi.ts";
 import { createTelegramThreadTarget } from "../lib/target.ts";
+import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 
 function createAttachmentQueueTarget(
   queuedAttachments: TelegramOutboundAttachmentQueueTargetView["queuedAttachments"] = [],
@@ -58,6 +61,156 @@ type RegisteredAnyTool = {
     params: Record<string, unknown>,
   ) => Promise<unknown>;
 };
+
+test("Rich outbound attachment planner builds one target-scoped media result", () => {
+  const turn = {
+    ...createAttachmentTurn([
+      { path: "/tmp/report.png", fileName: "report.png" },
+    ]),
+    target: createTelegramThreadTarget(1, 42),
+  };
+  const replyMarkup = { inline_keyboard: [[{ text: "Open", callback_data: "x" }]] };
+  assert.deepEqual(
+    planTelegramRichOutboundAttachment({
+      turn,
+      markdown: "> quoted report",
+      renderingMode: "rich",
+      replyMarkup,
+    }),
+    {
+      method: "sendRichMessage",
+      fields: {
+        chat_id: "1",
+        reply_parameters: JSON.stringify({
+          message_id: 2,
+          allow_sending_without_reply: true,
+        }),
+        message_thread_id: "42",
+        rich_message: JSON.stringify({
+          markdown: ">quoted report\n\n![](tg://photo?id=artifact)",
+          media: [
+            {
+              id: "artifact",
+              media: {
+                type: "photo",
+                media: "attach://rich_media_upload",
+              },
+            },
+          ],
+          skip_entity_detection: true,
+        }),
+        reply_markup: JSON.stringify(replyMarkup),
+      },
+      fileField: "rich_media_upload",
+      filePath: "/tmp/report.png",
+      fileName: "report.png",
+    },
+  );
+});
+
+test("Rich outbound attachment planner classifies probe-confirmed video and audio", () => {
+  for (const fixture of [
+    { path: "/tmp/demo.mp4", type: "video" },
+    { path: "/tmp/demo.mp3", type: "audio" },
+  ]) {
+    const plan = planTelegramRichOutboundAttachment({
+      turn: createAttachmentTurn([
+        { path: fixture.path, fileName: fixture.path.split("/").at(-1)! },
+      ]),
+      markdown: "artifact",
+      renderingMode: "rich",
+    });
+    assert.ok(plan);
+    const richMessage = JSON.parse(plan.fields.rich_message!);
+    assert.equal(richMessage.media[0].media.type, fixture.type);
+    assert.match(richMessage.markdown, new RegExp(`tg://${fixture.type}`));
+  }
+});
+
+test("Rich outbound attachment planner preserves compatibility paths", () => {
+  const base = createAttachmentTurn();
+  assert.equal(
+    planTelegramRichOutboundAttachment({
+      turn: base,
+      markdown: "report",
+      renderingMode: "html",
+    }),
+    undefined,
+  );
+  assert.equal(
+    planTelegramRichOutboundAttachment({
+      turn: createAttachmentTurn([
+        { path: "/tmp/a.png", fileName: "a.png" },
+        { path: "/tmp/b.png", fileName: "b.png" },
+      ]),
+      markdown: "report",
+      renderingMode: "rich",
+    }),
+    undefined,
+  );
+  assert.equal(
+    planTelegramRichOutboundAttachment({
+      turn: createAttachmentTurn([
+        { path: "/tmp/voice.ogg", fileName: "voice.ogg" },
+      ]),
+      markdown: "report",
+      renderingMode: "rich",
+    }),
+    undefined,
+  );
+});
+
+test("Rich outbound attachment sender records exact message ownership", async () => {
+  const ownership: unknown[] = [];
+  const sender = createTelegramRichOutboundAttachmentSender({
+    getRenderingMode: () => "rich",
+    sendMultipart: async () => ({ message_id: 91 }),
+    recordOwnership: (input) => ownership.push(input),
+  });
+  const turn = {
+    ...createAttachmentTurn([
+      { path: "/tmp/report.png", fileName: "report.png" },
+    ]),
+    target: createTelegramThreadTarget(1, 42),
+  };
+  assert.equal(await sender(turn, "report"), true);
+  assert.deepEqual(ownership, [
+    { chatId: 1, messageId: 91, target: { chatId: 1, threadId: 42 } },
+  ]);
+});
+
+test("Rich outbound attachment sender falls back only after known failure", async () => {
+  const events: unknown[] = [];
+  const knownFailureSender = createTelegramRichOutboundAttachmentSender({
+    getRenderingMode: () => "rich",
+    sendMultipart: async () => {
+      throw new Error("known rejection");
+    },
+    recordRuntimeEvent: (_category, error, details) =>
+      events.push([(error as Error).message, details?.phase]),
+  });
+  assert.equal(
+    await knownFailureSender(createAttachmentTurn(), "report"),
+    false,
+  );
+  assert.deepEqual(events, [
+    ["known rejection", "rich-media-known-failure"],
+  ]);
+
+  const ambiguousSender = createTelegramRichOutboundAttachmentSender({
+    getRenderingMode: () => "rich",
+    sendMultipart: async () => {
+      throw new TelegramApiCommitUnknownError(
+        "sendRichMessage",
+        new Error("ack lost"),
+      );
+    },
+  });
+  await assert.rejects(
+    ambiguousSender(createAttachmentTurn(), "report"),
+    TelegramApiCommitUnknownError,
+  );
+});
 
 test("Outbound attachment byte-limit helpers own the outbound file default", () => {
   assert.equal(

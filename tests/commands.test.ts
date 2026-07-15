@@ -68,7 +68,10 @@ function getRequiredCommand(
 
 function createBridgeCommandContext(
   notify: (message: string) => void = () => {},
-  confirm: () => Promise<boolean> | boolean = () => false,
+  confirm: (
+    title: string,
+    prompt: string,
+  ) => Promise<boolean> | boolean = () => false,
   select?: (title: string, items: string[]) => Promise<string | undefined>,
 ): ExtensionCommandContext {
   return {
@@ -298,6 +301,83 @@ test("Command helpers register pi connect and disconnect commands", async () => 
     "stop",
     "update-status",
   ]);
+});
+
+test("Command helpers confirm destructive Threaded Mode disconnects", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const events: string[] = [];
+  const prompts: string[] = [];
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => undefined,
+    getStatusLines: () => [],
+    reloadConfig: async () => undefined,
+    hasBotToken: () => true,
+    startPolling: async () => undefined,
+    stopPolling: async () => {
+      events.push("stop");
+    },
+    getDisconnectThreadName: () => "Cinder",
+    updateStatus: () => {
+      events.push("status");
+    },
+  });
+  const command = getRequiredCommand(
+    harness.commands,
+    "telegram-disconnect",
+  );
+  const cancelled = createBridgeCommandContext(
+    () => undefined,
+    (_title, prompt) => {
+      prompts.push(prompt);
+      return false;
+    },
+  );
+  await command.handler("", cancelled);
+  assert.deepEqual(events, ["status"]);
+  assert.match(prompts[0] ?? "", /Cinder/);
+  assert.match(prompts[0] ?? "", /Delete Telegram thread/);
+
+  const confirmed = createBridgeCommandContext(
+    () => undefined,
+    () => true,
+  );
+  await command.handler("", confirmed);
+  assert.deepEqual(events, ["status", "stop", "status"]);
+});
+
+test("Command helpers keep failed disconnects actionable and retryable", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const notifications: string[] = [];
+  let statusUpdates = 0;
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => undefined,
+    getStatusLines: () => [],
+    reloadConfig: async () => undefined,
+    hasBotToken: () => true,
+    startPolling: async () => undefined,
+    stopPolling: async () => {
+      throw new Error("Telegram thread deletion was not confirmed");
+    },
+    updateStatus: () => {
+      statusUpdates += 1;
+    },
+  });
+  const command = getRequiredCommand(
+    harness.commands,
+    "telegram-disconnect",
+  );
+  const ctx = createBridgeCommandContext((message) => {
+    notifications.push(message);
+  });
+
+  await assert.rejects(
+    async () => command.handler("", ctx),
+    /deletion was not confirmed/,
+  );
+  assert.equal(statusUpdates, 1);
+  assert.match(notifications[0] ?? "", /Keep this Pi session open/);
+  assert.match(notifications[0] ?? "", /telegram-status --debug/);
+  assert.match(notifications[0] ?? "", /retry \/telegram-disconnect/);
 });
 
 test("Command helpers move pi polling ownership after confirmation", async () => {

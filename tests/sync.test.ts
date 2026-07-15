@@ -698,6 +698,50 @@ test("Leader thread sync cleans previous leader records regardless of profile ke
   }
 });
 
+test("Leader thread sync preserves previous leader state when deletion is unconfirmed", async () => {
+  const dir = await mkdtemp(
+    join(tmpdir(), "pi-telegram-leader-cleanup-unconfirmed-"),
+  );
+  const store = createTelegramTopicTargetStore({
+    path: join(dir, "state.json"),
+    getNowMs: () => 2000,
+  });
+  try {
+    store.upsert({
+      profileKey: "leader:previous-id",
+      target: { chatId: 7, threadId: 10 },
+      status: "active",
+      createdAtMs: 1000,
+      updatedAtMs: 1000,
+      instanceId: "previous-instance",
+      slot: "B",
+    });
+    await store.persist();
+
+    await assert.rejects(
+      ensureTelegramLeaderThreadBinding({
+        getAllowedUserId: () => 7,
+        instanceId: "leader-a",
+        cwd: "/repo",
+        topicTargetStore: store,
+        async callApi<TResponse>(method: string) {
+          if (method === "deleteForumTopic") {
+            throw new Error("temporary Bot API failure");
+          }
+          return {} as TResponse;
+        },
+        recordEvent() {},
+      }),
+      /deletion was not confirmed/,
+    );
+
+    assert.equal(store.getByProfileKey("leader:previous-id")?.status, "active");
+    assert.deepEqual(store.listReservations(), []);
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
 test("Leader thread sync aborts local previous-leader cleanup after ownership loss", async () => {
   const dir = await mkdtemp(
     join(tmpdir(), "pi-telegram-leader-cleanup-epoch-loss-"),
@@ -1062,8 +1106,9 @@ test("Topic lifecycle sync does not delete unknown created topics during provisi
   assert.equal(events[0]?.phase, "topic-lifecycle-provisioning-skip");
 });
 
-test("Manual follower disconnect preserves its Telegram thread binding", async () => {
+test("Manual follower disconnect delegates thread deletion to its live leader", async () => {
   const calls: unknown[] = [];
+  let followerDisconnects = 0;
   let offlineCalls = 0;
   let persisted = 0;
   let syncState = createUnknownTelegramSyncState();
@@ -1089,6 +1134,10 @@ test("Manual follower disconnect preserves its Telegram thread binding", async (
     },
     getLeaderTarget: () => undefined,
     clearLeaderTarget: () => undefined,
+    disconnectFollowerThread: async () => {
+      followerDisconnects += 1;
+      return true;
+    },
     getSyncState: () => syncState,
     setSyncState: (state) => {
       syncState = state;
@@ -1100,11 +1149,12 @@ test("Manual follower disconnect preserves its Telegram thread binding", async (
 
   assert.equal(await disconnect(), "stopped");
   assert.deepEqual(calls, []);
+  assert.equal(followerDisconnects, 1);
   assert.equal(offlineCalls, 0);
   assert.equal(persisted, 0);
 });
 
-test("Manual leader disconnect stops local teardown after epoch loss", async () => {
+test("Manual leader disconnect rejects unconfirmed cleanup after epoch loss", async () => {
   const trace: string[] = [];
   let currentEpoch: number | undefined = 1;
   let syncState = createUnknownTelegramSyncState();
@@ -1149,18 +1199,18 @@ test("Manual leader disconnect stops local teardown after epoch loss", async () 
     recordRuntimeEvent: () => undefined,
   });
 
-  assert.equal(await disconnect(), "stopped");
-  assert.deepEqual(trace, ["closeForumTopic", "stop-polling"]);
+  await assert.rejects(disconnect(), /deletion was not confirmed/);
+  assert.deepEqual(trace, ["closeForumTopic"]);
 });
 
-test("Manual leader disconnect rechecks epoch after zero-change offline mutation", async () => {
+test("Promoted leader deletes its inherited follower thread under owned epoch", async () => {
   const trace: string[] = [];
   let currentEpoch: number | undefined = 1;
   let syncState = createUnknownTelegramSyncState();
   const disconnect = createTelegramManualThreadDisconnectHandler({
     instanceId: "leader-runtime:1",
     getCurrentThreadRecord: () => ({
-      owner: { kind: "leader" },
+      owner: { kind: "manual-follower" },
       instanceId: "leader-runtime:1",
       target: { chatId: 7, threadId: 42 },
     }),
@@ -1205,4 +1255,51 @@ test("Manual leader disconnect rechecks epoch after zero-change offline mutation
     "mark-offline",
     "stop-polling",
   ]);
+});
+
+test("Manual leader disconnect remains live when deletion is unconfirmed", async () => {
+  const trace: string[] = [];
+  let syncState = createUnknownTelegramSyncState();
+  const disconnect = createTelegramManualThreadDisconnectHandler({
+    instanceId: "leader-runtime:1",
+    getCurrentThreadRecord: () => ({
+      owner: { kind: "leader" },
+      instanceId: "leader-runtime:1",
+      target: { chatId: 7, threadId: 42 },
+    }),
+    topicTargetStore: {
+      markOfflineByInstanceId: () => {
+        trace.push("mark-offline");
+        return 1;
+      },
+      persist: async () => {
+        trace.push("persist");
+      },
+    },
+    callApi: async <TResponse>(method: string) => {
+      trace.push(method);
+      if (method === "deleteForumTopic") {
+        throw new Error("temporary Bot API failure");
+      }
+      return { ok: true } as TResponse;
+    },
+    getCurrentLeaderEpoch: () => 1,
+    getLeaderTarget: () => ({ chatId: 7, threadId: 42 }),
+    clearLeaderTarget: () => {
+      trace.push("clear-leader-target");
+    },
+    getSyncState: () => syncState,
+    setSyncState: (state) => {
+      trace.push("set-sync-state");
+      syncState = state;
+    },
+    stopPolling: async () => {
+      trace.push("stop-polling");
+      return "stopped";
+    },
+    recordRuntimeEvent: () => undefined,
+  });
+
+  await assert.rejects(disconnect(), /deletion was not confirmed/);
+  assert.deepEqual(trace, ["closeForumTopic", "deleteForumTopic"]);
 });

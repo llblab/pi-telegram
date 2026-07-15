@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createTelegramAssistantOutputBindingRuntime,
   registerTelegramCommandsAndTools,
   registerTelegramLifecycleRuntimeHooks,
 } from "../lib/bindings.ts";
@@ -43,6 +44,52 @@ function createBindingApiHarness() {
   } as unknown as ExtensionAPI;
   return { api, handlers, tools, commands };
 }
+
+test("Assistant output binding composes admission, delivery, and observation", async () => {
+  const sent: string[] = [];
+  const binding = createTelegramAssistantOutputBindingRuntime({
+    isEnabled: () => true,
+    authority: {
+      getPreferredTarget: () => ({ chatId: 7, threadId: 42 }),
+      getFallbackChatId: () => 7,
+      getTransportStamp: () => "stamp-1",
+      isTransportStampActive: (stamp) => stamp === "stamp-1",
+      ownsDirect: () => true,
+      getDirectEpoch: () => 1,
+      isFollowerRegistered: () => false,
+      getFollowerGeneration: () => undefined,
+    },
+    sender: {
+      sendMessage: async () => ({ message_id: 1 }),
+      sendRichMessage: async (body) => {
+        sent.push(body.rich_message.markdown ?? "");
+        return { message_id: 2 };
+      },
+      editMessage: async () => undefined,
+      getAssistantRenderingMode: () => "rich",
+      execCommand: async (_command, _args, options) => ({
+        stdout: options?.stdin ?? "",
+        stderr: "",
+        code: 0,
+        killed: false,
+      }),
+    },
+    recordRuntimeEvent: () => undefined,
+  });
+  binding.runtime.start();
+  binding.observeEvent({
+    type: "assistant-segment",
+    activityId: "activity-1",
+    sequence: 1,
+    source: "local",
+    timestamp: 1,
+    contentIndex: 0,
+    text: "public output",
+    placement: "final",
+  });
+  await binding.runtime.waitForIdle();
+  assert.deepEqual(sent, ["public output"]);
+});
 
 function getRequiredBindingHandler(
   handlers: Map<string, RegisteredBindingHandler>,
@@ -316,6 +363,7 @@ test("Lifecycle binding delegates shutdown to composed session runtime", async (
       onAgentSettled: () => {},
       onSessionShutdown: () => {},
     },
+    assistantOutputRuntime: { start: () => {}, stop: () => {} },
     sessionLifecycleRuntime: {
       onSessionStart: async () => {
         events.push("session-start");
@@ -435,6 +483,10 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
       onAgentEnd: () => events.push("activity:agent-end"),
       onAgentSettled: () => events.push("activity:agent-settled"),
       onSessionShutdown: () => events.push("activity:shutdown"),
+    },
+    assistantOutputRuntime: {
+      start: () => events.push("assistant-output:start"),
+      stop: () => events.push("assistant-output:stop"),
     },
     sessionLifecycleRuntime: {
       onSessionStart: async () => {},

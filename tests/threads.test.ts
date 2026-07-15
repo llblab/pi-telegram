@@ -24,6 +24,8 @@ import {
   getTelegramThreadOwnerKey,
   getTelegramStatePath,
   getTelegramTopicTargetsPath,
+  getTelegramLeaderSessionHandoff,
+  setTelegramLeaderSessionHandoff,
   provisionOwnBusTopic,
   reconcileTelegramFreshAllocationCursor,
   resolveTelegramInstanceThreadIdentity,
@@ -1346,7 +1348,7 @@ test("Thread provisioner does not reuse offline target history by profile key", 
   assert.equal(store.getByProfileKey("cwd:/repo")?.threadName, "Atlas");
 });
 
-test("Thread provisioner does not reuse active manual follower profile across runtime replacement", async () => {
+test("Thread provisioner restores an active manual follower profile across runtime replacement", async () => {
   const calls: unknown[] = [];
   const store = createTelegramTopicTargetStore({
     path: "/tmp/unused-telegram-targets.json",
@@ -1379,13 +1381,11 @@ test("Thread provisioner does not reuse active manual follower profile across ru
     profileKey: "manual:1234",
   });
 
-  assert.equal(result.reused, false);
-  assert.deepEqual(result.target, { chatId: -1001, threadId: 99 });
+  assert.equal(result.reused, true);
+  assert.deepEqual(result.target, { chatId: -1001, threadId: 42 });
   assert.equal(result.record.instanceId, "1234:new");
-  assert.equal(result.record.slot, "D");
-  assert.deepEqual(calls, [
-    { method: "createForumTopic", body: { chat_id: -1001, name: "Delta" } },
-  ]);
+  assert.equal(result.record.slot, "C");
+  assert.deepEqual(calls, []);
 });
 
 test("Thread provisioner allocates a fresh follower slot after stale identity is forgotten", async () => {
@@ -1433,7 +1433,7 @@ test("Thread provisioner allocates a fresh follower slot after stale identity is
   ]);
 });
 
-test("Thread provisioner replaces stale active manual follower runtime with a fresh topic", async () => {
+test("Thread provisioner restores a named manual follower across runtime replacement", async () => {
   const calls: unknown[] = [];
   const store = createTelegramTopicTargetStore({
     path: "/tmp/unused-telegram-targets.json",
@@ -1467,17 +1467,15 @@ test("Thread provisioner replaces stale active manual follower runtime with a fr
     profileKey: "manual:1234",
   });
 
-  assert.equal(result.reused, false);
-  assert.deepEqual(result.target, { chatId: -1001, threadId: 99 });
-  assert.equal(result.record.slot, "U");
-  assert.notEqual(result.record.threadName, "Talon");
-  assert.equal(store.getByProfileKey("manual:1234")?.target.threadId, 99);
-  assert.deepEqual(calls, [
-    { method: "createForumTopic", body: { chat_id: -1001, name: "Umber" } },
-  ]);
+  assert.equal(result.reused, true);
+  assert.deepEqual(result.target, { chatId: -1001, threadId: 42 });
+  assert.equal(result.record.slot, "T");
+  assert.equal(result.record.threadName, "Talon");
+  assert.equal(store.getByProfileKey("manual:1234")?.target.threadId, 42);
+  assert.deepEqual(calls, []);
 });
 
-test("Thread provisioner replaces same-runtime active manual follower with a fresh topic", async () => {
+test("Thread provisioner reuses the same-runtime active manual follower target", async () => {
   const calls: unknown[] = [];
   const store = createTelegramTopicTargetStore({
     path: "/tmp/unused-telegram-targets.json",
@@ -1511,13 +1509,11 @@ test("Thread provisioner replaces same-runtime active manual follower with a fre
     profileKey: "manual:1234",
   });
 
-  assert.equal(result.reused, false);
-  assert.deepEqual(result.target, { chatId: -1001, threadId: 99 });
-  assert.equal(result.record.slot, "U");
-  assert.notEqual(result.record.threadName, "Talon");
-  assert.deepEqual(calls, [
-    { method: "createForumTopic", body: { chat_id: -1001, name: "Umber" } },
-  ]);
+  assert.equal(result.reused, true);
+  assert.deepEqual(result.target, { chatId: -1001, threadId: 42 });
+  assert.equal(result.record.slot, "T");
+  assert.equal(result.record.threadName, "Talon");
+  assert.deepEqual(calls, []);
 });
 
 test("Thread provisioner persists pending provision while creating a fresh topic", async () => {
@@ -2361,6 +2357,11 @@ test("Current-instance thread runtime owns record and live identity selection", 
 
   assert.equal(runtime.findRecord()?.threadName, "Beacon");
   assert.equal(runtime.getRecord(), undefined);
+  assert.deepEqual(runtime.getRestorationIdentity(), {
+    target: { chatId: 7, threadId: 11 },
+    slot: "B",
+    threadName: "Beacon",
+  });
   registered = true;
   assert.equal(runtime.getRecord()?.threadName, "Beacon");
   assert.deepEqual(runtime.getIdentity(), {
@@ -2785,6 +2786,71 @@ test("Own bus topic provisioner reuses promoted follower topic", async () => {
       "Compas",
     );
   } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("Own bus topic provisioner restores a promoted leader session handoff", async () => {
+  const dir = await mkdtemp(
+    join(tmpdir(), "pi-telegram-own-topic-promoted-reload-"),
+  );
+  const path = join(dir, "telegram-targets.json");
+  const store = createTelegramTopicTargetStore({ path });
+  const calls: unknown[] = [];
+  try {
+    store.upsert({
+      profileKey: "manual:stable-follower",
+      owner: { kind: "manual-follower", instanceId: "stable-follower" },
+      target: { chatId: 7, threadId: 12 },
+      status: "active",
+      createdAtMs: 1000,
+      updatedAtMs: 1000,
+      instanceId: `${process.pid}:old-session`,
+      slot: "C",
+      threadName: "Cinder",
+    });
+    await store.persist();
+    setTelegramLeaderSessionHandoff({
+      pid: process.pid,
+      instanceId: `${process.pid}:old-session`,
+      createdAtMs: Date.now(),
+      profileKey: "cwd:/repo",
+      target: { chatId: 7, threadId: 12 },
+      slot: "C",
+      threadName: "Cinder",
+    });
+
+    const result = await provisionOwnBusTopic({
+      getAllowedUserId: () => 7,
+      instanceId: `${process.pid}:replacement-session`,
+      cwd: "/repo",
+      store,
+      async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+        calls.push({ method, body });
+        return { message_thread_id: 99 } as TResponse;
+      },
+      recordEvent() {},
+    });
+
+    assert.deepEqual(result, {
+      target: { chatId: 7, threadId: 12 },
+      slot: "C",
+      threadName: "Cinder",
+      reused: true,
+    });
+    assert.deepEqual(calls, []);
+    assert.equal(getTelegramLeaderSessionHandoff(), undefined);
+    const restored = createTelegramTopicTargetStore({ path });
+    await restored.load();
+    assert.equal(restored.list().length, 1);
+    assert.deepEqual(restored.list()[0]?.owner, {
+      kind: "leader",
+      cwd: "/repo",
+      instanceId: `${process.pid}:replacement-session`,
+    });
+    assert.equal(restored.list()[0]?.threadName, "Cinder");
+  } finally {
+    setTelegramLeaderSessionHandoff(undefined);
     await rm(dir, { force: true, recursive: true });
   }
 });

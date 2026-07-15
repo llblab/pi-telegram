@@ -123,6 +123,7 @@ export interface TelegramManualThreadDisconnectDeps<TSyncState> {
   getLeaderTarget: () => TelegramTarget | undefined;
   getCurrentLeaderEpoch?: () => number | string | undefined;
   clearLeaderTarget: () => void;
+  disconnectFollowerThread?: () => Promise<boolean>;
   getSyncState: () => TSyncState;
   setSyncState: (state: TSyncState) => void;
   stopPolling: () => Promise<string>;
@@ -160,13 +161,25 @@ export function createTelegramManualThreadDisconnectHandler<
     const currentRecord = deps.getCurrentThreadRecord();
     if (currentRecord?.target.threadId) {
       const isManualFollower = currentRecord.owner?.kind === "manual-follower";
-      if (!isManualFollower) {
-        const leaderEpoch = deps.getCurrentLeaderEpoch?.();
+      const leaderEpoch = deps.getCurrentLeaderEpoch?.();
+      const ownsLeader = deps.getCurrentLeaderEpoch
+        ? leaderEpoch !== undefined
+        : !isManualFollower;
+      if (isManualFollower && !ownsLeader) {
+        if (deps.disconnectFollowerThread) {
+          const disconnected = await deps.disconnectFollowerThread();
+          if (!disconnected) {
+            throw new Error(
+              "Telegram follower thread deletion requires a live leader registration.",
+            );
+          }
+        }
+      } else {
         const stillOwnsLeaderEpoch = () =>
           !deps.getCurrentLeaderEpoch ||
           (leaderEpoch !== undefined &&
             deps.getCurrentLeaderEpoch() === leaderEpoch);
-        await ThreadReconciler.applyThreadReconciliationPlan(
+        const cleanup = await ThreadReconciler.applyThreadReconciliationPlan(
           ThreadReconciler.planDisconnectedInstanceThreadCleanup({
             target: currentRecord.target as TelegramTarget & {
               threadId: number;
@@ -185,6 +198,11 @@ export function createTelegramManualThreadDisconnectHandler<
             recordRuntimeEvent: deps.recordRuntimeEvent,
           },
         );
+        if (cleanup.incompleteActions?.length) {
+          throw new Error(
+            "Telegram thread deletion was not confirmed; inspect /telegram-status --debug and retry /telegram-disconnect.",
+          );
+        }
         if (!stillOwnsLeaderEpoch()) return deps.stopPolling();
         const offlineChanged =
           deps.topicTargetStore.markOfflineByInstanceId(deps.instanceId) > 0;
@@ -276,6 +294,15 @@ export interface TelegramStaleTopicApiErrorRecoveryDeps<TSyncState> {
     details?: Record<string, unknown>,
   ) => void;
   getNowMs?: () => number;
+}
+
+export function createTelegramStaleTopicApiErrorRecoveryRuntime<
+  TSyncState extends TelegramSyncState,
+>(
+  deps: TelegramStaleTopicApiErrorRecoveryDeps<TSyncState>,
+): (apiBody: unknown, error: unknown) => Promise<boolean> {
+  return (apiBody, error) =>
+    recoverStaleTelegramTopicApiError(apiBody, error, deps);
 }
 
 export async function recoverStaleTelegramTopicApiError<
@@ -491,6 +518,16 @@ export interface TelegramSyncStateRuntime {
     slice: TelegramSyncSlice,
     options: { nowMs: number; action: string },
   ): void;
+}
+
+export function createTelegramConfigSyncPersister<TConfig>(deps: {
+  persist: (config?: TConfig) => Promise<void>;
+  markConfigChange: (action: string) => void;
+}): (config?: TConfig) => Promise<void> {
+  return async (config) => {
+    await deps.persist(config);
+    deps.markConfigChange("config-persist");
+  };
 }
 
 export function createTelegramSyncStateRuntime(

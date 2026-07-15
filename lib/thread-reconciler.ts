@@ -10,7 +10,13 @@ import type { TelegramTarget } from "./target.ts";
 type ThreadTarget = TelegramTarget & { threadId: number };
 
 type ThreadRecordStatus =
-  "active" | "offline" | "stale" | "pending" | "starting" | "failed";
+  | "active"
+  | "offline"
+  | "stale"
+  | "pending"
+  | "starting"
+  | "probe-required"
+  | "failed";
 
 export interface ThreadReconciliationRecord {
   target: ThreadTarget;
@@ -182,6 +188,7 @@ export interface ThreadReconciliationPlan {
 
 export interface ThreadReconciliationApplyResult {
   changed: boolean;
+  incompleteActions?: ThreadReconciliationAction[];
 }
 
 export interface ThreadReconciliationApplyPorts {
@@ -376,7 +383,7 @@ function getActionLeaderEpoch(
   return "leaderEpoch" in action ? action.leaderEpoch : undefined;
 }
 
-function isTelegramTopicTargetGoneError(error: unknown): boolean {
+function isTelegramTopicTargetDeletedOrMissingError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const message = error.message.toLowerCase();
   return (
@@ -384,7 +391,15 @@ function isTelegramTopicTargetGoneError(error: unknown): boolean {
     message.includes("message thread not found") ||
     message.includes("thread not found") ||
     message.includes("topic not found") ||
-    message.includes("topic deleted") ||
+    message.includes("topic deleted")
+  );
+}
+
+function isTelegramTopicTargetGoneError(error: unknown): boolean {
+  if (isTelegramTopicTargetDeletedOrMissingError(error)) return true;
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return (
     message.includes("topic closed") ||
     message.includes("thread closed") ||
     message.includes("forum topic closed") ||
@@ -503,6 +518,7 @@ export async function applyThreadReconciliationPlan(
 ): Promise<ThreadReconciliationApplyResult> {
   let shouldPersist = false;
   const persistFences: ThreadReconciliationAction[] = [];
+  const incompleteActions: ThreadReconciliationAction[] = [];
   for (const action of plan.actions) {
     if (action.kind === "remove-reservation") {
       shouldPersist =
@@ -521,7 +537,10 @@ export async function applyThreadReconciliationPlan(
       continue;
     }
     if (action.kind === "close-stale-replaced-topic") {
-      if (shouldSkipForStaleLeaderEpoch(action, ports)) continue;
+      if (shouldSkipForStaleLeaderEpoch(action, ports)) {
+        incompleteActions.push(action);
+        continue;
+      }
       if (!ports.callApi) {
         ports.recordRuntimeEvent?.(
           "telegram",
@@ -533,28 +552,35 @@ export async function applyThreadReconciliationPlan(
             threadId: action.target.threadId,
           },
         );
+        incompleteActions.push(action);
         continue;
       }
+      let closeConfirmed = false;
       try {
-        if (shouldSkipForStaleLeaderEpoch(action, ports)) continue;
         await ports.callApi("closeForumTopic", {
           chat_id: action.target.chatId,
           message_thread_id: action.target.threadId,
         });
-        if (!shouldSkipForStaleLeaderEpoch(action, ports)) {
-          const changed =
-            ports.markStaleByTarget?.(action.target, "closed") ?? false;
-          if (changed) persistFences.push(action);
-          shouldPersist = changed || shouldPersist;
-        }
+        closeConfirmed = true;
       } catch (error) {
-        ports.recordRuntimeEvent?.("telegram", error, {
-          phase: `thread-reconciler-${action.reason}-closeForumTopic`,
-          instanceId: action.instanceId,
-          chatId: action.target.chatId,
-          threadId: action.target.threadId,
-        });
+        closeConfirmed = isTelegramTopicTargetGoneError(error);
+        if (!closeConfirmed) {
+          ports.recordRuntimeEvent?.("telegram", error, {
+            phase: `thread-reconciler-${action.reason}-closeForumTopic`,
+            instanceId: action.instanceId,
+            chatId: action.target.chatId,
+            threadId: action.target.threadId,
+          });
+        }
       }
+      if (shouldSkipForStaleLeaderEpoch(action, ports) || !closeConfirmed) {
+        incompleteActions.push(action);
+        continue;
+      }
+      const changed =
+        ports.markStaleByTarget?.(action.target, "closed") ?? false;
+      if (changed) persistFences.push(action);
+      shouldPersist = changed || shouldPersist;
       continue;
     }
     if (
@@ -566,7 +592,10 @@ export async function applyThreadReconciliationPlan(
       action.kind === "close-delete-disconnected-instance-topic" ||
       action.kind === "close-delete-expired-pending-provision-topic"
     ) {
-      if (shouldSkipForStaleLeaderEpoch(action, ports)) continue;
+      if (shouldSkipForStaleLeaderEpoch(action, ports)) {
+        incompleteActions.push(action);
+        continue;
+      }
       if (!ports.callApi) {
         ports.recordRuntimeEvent?.(
           "telegram",
@@ -578,6 +607,7 @@ export async function applyThreadReconciliationPlan(
             threadId: action.target.threadId,
           },
         );
+        incompleteActions.push(action);
         continue;
       }
       let deleteConfirmed = false;
@@ -590,7 +620,11 @@ export async function applyThreadReconciliationPlan(
           });
           if (method === "deleteForumTopic") deleteConfirmed = true;
         } catch (error) {
-          if (isTelegramTopicTargetGoneError(error)) {
+          const confirmsMethodOutcome =
+            method === "deleteForumTopic"
+              ? isTelegramTopicTargetDeletedOrMissingError(error)
+              : isTelegramTopicTargetGoneError(error);
+          if (confirmsMethodOutcome) {
             if (method === "deleteForumTopic") deleteConfirmed = true;
           } else {
             ports.recordRuntimeEvent?.("telegram", error, {
@@ -601,7 +635,10 @@ export async function applyThreadReconciliationPlan(
           }
         }
       }
-      if (shouldSkipForStaleLeaderEpoch(action, ports)) continue;
+      if (shouldSkipForStaleLeaderEpoch(action, ports)) {
+        incompleteActions.push(action);
+        continue;
+      }
       if (!deleteConfirmed) {
         ports.recordRuntimeEvent?.(
           "telegram",
@@ -615,6 +652,7 @@ export async function applyThreadReconciliationPlan(
             ...("messageId" in action ? { messageId: action.messageId } : {}),
           },
         );
+        incompleteActions.push(action);
         continue;
       }
       if (shouldSkipForStaleLeaderEpoch(action, ports)) continue;
@@ -682,12 +720,18 @@ export async function applyThreadReconciliationPlan(
   if (shouldPersist) {
     for (const action of persistFences) {
       if (shouldSkipForStaleLeaderEpoch(action, ports)) {
-        return { changed: true };
+        return {
+          changed: true,
+          ...(incompleteActions.length > 0 ? { incompleteActions } : {}),
+        };
       }
     }
     await ports.persist?.();
   }
-  return { changed: shouldPersist };
+  return {
+    changed: shouldPersist,
+    ...(incompleteActions.length > 0 ? { incompleteActions } : {}),
+  };
 }
 
 export function planThreadReconciliation(

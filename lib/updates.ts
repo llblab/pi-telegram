@@ -249,6 +249,7 @@ export function getAuthorizedTelegramGuestMessage(
 
 export interface TelegramMessageOwnershipView {
   instanceId: string;
+  ownerGeneration?: string;
 }
 
 export type TelegramMessageOwnershipLookup = (
@@ -258,6 +259,7 @@ export type TelegramMessageOwnershipLookup = (
 
 export interface TelegramTargetOwnershipView {
   instanceId: string;
+  ownerGeneration?: string;
 }
 
 export type TelegramTargetOwnershipLookup = (

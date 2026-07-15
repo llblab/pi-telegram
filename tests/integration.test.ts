@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as waitForTimeout } from "node:timers/promises";
 import testRoot, { mock, type TestContext } from "node:test";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
@@ -514,8 +515,96 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
   }
 });
 
+test("Extension runtime coalesces a cross-batch forward comment into one Pi turn", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const sentMessages: RuntimeHarnessMessage[] = [];
+  let resolveDispatch!: (value: RuntimeHarnessMessage) => void;
+  const dispatched = new Promise<RuntimeHarnessMessage>((resolve) => {
+    resolveDispatch = resolve;
+  });
+  const { handlers, commands, pi } = createRuntimePiHarness({
+    sendUserMessage: (content) => {
+      sentMessages.push(content);
+      resolveDispatch(content);
+    },
+  });
+  let getUpdatesCalls = 0;
+  const restoreFetch = setRuntimeTestFetch(async (input) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "deleteWebhook") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "getUpdates") {
+      getUpdatesCalls += 1;
+      if (getUpdatesCalls === 1) {
+        return createRuntimeTelegramApiResponse([
+          {
+            update_id: 10,
+            message: {
+              message_id: 50,
+              chat: { id: 77, type: "private" },
+              from: { id: 77, is_bot: false, first_name: "Owner" },
+              text: "Мой комментарий",
+            },
+          },
+        ]);
+      }
+      if (getUpdatesCalls === 2) {
+        return createRuntimeTelegramApiResponse([
+          {
+            update_id: 11,
+            message: {
+              message_id: 51,
+              chat: { id: 77, type: "private" },
+              from: { id: 77, is_bot: false, first_name: "Owner" },
+              forward_origin: {
+                type: "user",
+                sender_user: {
+                  id: 88,
+                  is_bot: false,
+                  first_name: "Source",
+                  username: "source",
+                },
+              },
+              text: "Пересланный текст",
+            },
+          },
+        ]);
+      }
+      throw new DOMException("stop", "AbortError");
+    }
+    if (method === "sendChatAction") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+    });
+    (await getRuntimeTelegramExtension())(pi);
+    const ctx = createRuntimeExtensionContext();
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    const dispatchedContent = await dispatched;
+    assert.equal(sentMessages.length, 1);
+    const promptBlock = getRuntimeHarnessTextBlock(dispatchedContent);
+    assert.equal(
+      promptBlock.text,
+      "[telegram] Мой комментарий\n\n[forward|from:source] Пересланный текст",
+    );
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    restoreFetch();
+    await telegramConfig.restore();
+  }
+});
+
 test("Extension runtime finalizes queued turn after polling ownership moves away", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const extension = await getRuntimeTelegramExtension();
   let resolveDispatch: (() => void) | undefined;
   const dispatched = new Promise<void>((resolve) => {
     resolveDispatch = resolve;
@@ -524,6 +613,7 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
   const sentTexts: string[] = [];
   const sentBodies: Array<Record<string, unknown>> = [];
   const editedTexts: string[] = [];
+  let releasePolling: (() => void) | undefined;
   const { handlers, commands, pi } = createRuntimePiHarness({
     sendUserMessage: () => {
       resolveDispatch?.();
@@ -551,6 +641,11 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
             },
           },
         ]);
+      }
+      if (getUpdatesCalls === 2) {
+        return new Promise<Response>((resolve) => {
+          releasePolling = () => resolve(createRuntimeTelegramApiResponse([]));
+        });
       }
       throw new DOMException("stop", "AbortError");
     }
@@ -598,7 +693,7 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
       allowedUserId: 77,
       lastUpdateId: 0,
     });
-    (await getRuntimeTelegramExtension())(pi);
+    extension(pi);
     const ctx = createRuntimeExtensionContext();
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
@@ -644,6 +739,7 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
     );
     mock.timers.tick(0);
     await flushMicrotasks(20);
+    await waitForTimeout(20);
     assert.deepEqual(draftTexts, []);
     assert.equal(sentTexts.length, 1);
     assert.match(sentTexts[0] ?? "", /Final \*\*answer\*\*/);
@@ -652,6 +748,7 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
       allow_sending_without_reply: true,
     });
     assert.deepEqual(editedTexts, []);
+    releasePolling?.();
     await handlers.get("session_shutdown")?.({}, ctx);
   } finally {
     mock.timers.reset();
@@ -791,7 +888,7 @@ test("Extension runtime keeps proactive local result disabled even with Telegram
       botToken: "123:abc",
       allowedUserId: 77,
       lastUpdateId: 0,
-      proactivePush: false,
+      assistant: { proactivePush: false },
     });
     await writeRuntimeTelegramLocks({});
     (await getRuntimeTelegramExtension())(pi);
@@ -851,7 +948,7 @@ test("Extension runtime resolves stale same-cwd lock before proactive local resu
       botToken: "123:abc",
       allowedUserId: 77,
       lastUpdateId: 0,
-      proactivePush: true,
+      assistant: { proactivePush: true },
     });
     await writeRuntimeTelegramLocks({
       "@llblab/pi-telegram": {
@@ -863,6 +960,39 @@ test("Extension runtime resolves stale same-cwd lock before proactive local resu
     const ctx = createRuntimeExtensionContext({ cwd });
     await handlers.get("session_start")?.({}, ctx);
     await waitForEventLoopCondition(() => getUpdatesCalls >= 1, 5000);
+    await handlers.get("input")?.(
+      { source: "extension", text: "autonomous continuation" },
+      ctx,
+    );
+    await handlers.get("agent_start")?.({}, ctx);
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Local **done**" }],
+    };
+    await handlers.get("message_update")?.(
+      {
+        message: assistantMessage,
+        assistantMessageEvent: {
+          type: "text_end",
+          contentIndex: 0,
+          content: "Local **done**",
+          partial: assistantMessage,
+        },
+      },
+      ctx,
+    );
+    await handlers.get("message_update")?.(
+      {
+        message: assistantMessage,
+        assistantMessageEvent: {
+          type: "done",
+          reason: "stop",
+          message: assistantMessage,
+        },
+      },
+      ctx,
+    );
+    await flushMicrotasks(20);
     await handlers.get("agent_end")?.(
       {
         messages: [
@@ -890,7 +1020,7 @@ test("Extension runtime resolves stale same-cwd lock before proactive local resu
   }
 });
 
-test("Extension runtime sends proactive local result only while owning Telegram lock", async () => {
+test("Extension runtime sends proactive checkpoints and final once in source order", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentBodies: Array<Record<string, unknown>> = [];
   const { handlers, commands, pi } = createRuntimePiHarness();
@@ -917,7 +1047,7 @@ test("Extension runtime sends proactive local result only while owning Telegram 
       botToken: "123:abc",
       allowedUserId: 77,
       lastUpdateId: 0,
-      proactivePush: true,
+      assistant: { proactivePush: true },
     });
     await writeRuntimeTelegramLocks({});
     (await getRuntimeTelegramExtension())(pi);
@@ -926,6 +1056,82 @@ test("Extension runtime sends proactive local result only while owning Telegram 
     });
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
+    await flushMicrotasks(20);
+    await handlers.get("input")?.(
+      { source: "interactive", text: "local request" },
+      ctx,
+    );
+    await handlers.get("agent_start")?.({}, ctx);
+    const checkpointMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Checkpoint **one**" }],
+    };
+    await handlers.get("message_update")?.(
+      {
+        message: checkpointMessage,
+        assistantMessageEvent: {
+          type: "text_end",
+          contentIndex: 0,
+          content: "Checkpoint **one**",
+          partial: checkpointMessage,
+        },
+      },
+      ctx,
+    );
+    await handlers.get("message_update")?.(
+      {
+        message: checkpointMessage,
+        assistantMessageEvent: {
+          type: "toolcall_start",
+          contentIndex: 1,
+          partial: checkpointMessage,
+        },
+      },
+      ctx,
+    );
+    const reasoningMessage = {
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "private reasoning" }],
+    };
+    await handlers.get("message_update")?.(
+      {
+        message: reasoningMessage,
+        assistantMessageEvent: {
+          type: "thinking_end",
+          contentIndex: 0,
+          content: "private reasoning",
+          partial: reasoningMessage,
+        },
+      },
+      ctx,
+    );
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Local **done**" }],
+    };
+    await handlers.get("message_update")?.(
+      {
+        message: assistantMessage,
+        assistantMessageEvent: {
+          type: "text_end",
+          contentIndex: 0,
+          content: "Local **done**",
+          partial: assistantMessage,
+        },
+      },
+      ctx,
+    );
+    await handlers.get("message_update")?.(
+      {
+        message: assistantMessage,
+        assistantMessageEvent: {
+          type: "done",
+          reason: "stop",
+          message: assistantMessage,
+        },
+      },
+      ctx,
+    );
     await flushMicrotasks(20);
     await handlers.get("agent_end")?.(
       {
@@ -938,18 +1144,145 @@ test("Extension runtime sends proactive local result only while owning Telegram 
       },
       ctx,
     );
-    assert.equal(sentBodies.length, 1);
-    assert.equal(sentBodies[0]?.chat_id, 77);
-    assert.match(
-      String(
-        (sentBodies[0]?.rich_message as { markdown?: string } | undefined)
-          ?.markdown ?? "",
-      ),
-      /Local \*\*done\*\*/,
+    assert.equal(sentBodies.length, 2);
+    assert.deepEqual(
+      sentBodies.map((body) => body.chat_id),
+      [77, 77],
+    );
+    const sentMarkdown = sentBodies.map(
+      (body) =>
+        (body.rich_message as { markdown?: string } | undefined)?.markdown ?? "",
+    );
+    assert.match(sentMarkdown[0] ?? "", /Checkpoint \*\*one\*\*/);
+    assert.match(sentMarkdown[1] ?? "", /Local \*\*done\*\*/);
+    assert.equal(
+      sentMarkdown.some((text) => text.includes("private reasoning")),
+      false,
     );
     await commands.get("telegram-disconnect")?.handler("", ctx);
     await handlers.get("session_shutdown")?.({}, ctx);
   } finally {
+    restoreFetch();
+    await telegramConfig.restore();
+  }
+});
+
+test("Extension runtime drops queued proactive blocks after session replacement", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  let sendCalls = 0;
+  let getUpdatesCalls = 0;
+  let markFirstSendStarted!: () => void;
+  const firstSendStarted = new Promise<void>((resolve) => {
+    markFirstSendStarted = resolve;
+  });
+  let releaseFirstSend!: () => void;
+  const firstSendGate = new Promise<void>((resolve) => {
+    releaseFirstSend = resolve;
+  });
+  const { handlers, pi } = createRuntimePiHarness();
+  const restoreFetch = setRuntimeTestFetch(async (input) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "deleteWebhook") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "getUpdates") {
+      getUpdatesCalls += 1;
+      throw new DOMException("stop", "AbortError");
+    }
+    if (method === "sendRichMessage") {
+      sendCalls += 1;
+      if (sendCalls === 1) {
+        markFirstSendStarted();
+        await firstSendGate;
+      }
+      return createRuntimeTelegramApiResponse({ message_id: 100 + sendCalls });
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    const cwd = "/repo/proactive-replacement";
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+      assistant: { proactivePush: true },
+    });
+    await writeRuntimeTelegramLocks({
+      "@llblab/pi-telegram": { pid: process.pid + 1_000_000, cwd },
+    });
+    (await getRuntimeTelegramExtension())(pi);
+    const oldCtx = createRuntimeExtensionContext({ cwd });
+    await handlers.get("session_start")?.({}, oldCtx);
+    await waitForEventLoopCondition(() => getUpdatesCalls >= 1, 5000);
+    await handlers.get("input")?.(
+      { source: "extension", text: "replacement probe" },
+      oldCtx,
+    );
+    await handlers.get("agent_start")?.({}, oldCtx);
+    const checkpointMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Old checkpoint" }],
+    };
+    await handlers.get("message_update")?.(
+      {
+        message: checkpointMessage,
+        assistantMessageEvent: {
+          type: "text_end",
+          contentIndex: 0,
+          content: "Old checkpoint",
+          partial: checkpointMessage,
+        },
+      },
+      oldCtx,
+    );
+    await handlers.get("message_update")?.(
+      {
+        message: checkpointMessage,
+        assistantMessageEvent: {
+          type: "toolcall_start",
+          contentIndex: 1,
+          partial: checkpointMessage,
+        },
+      },
+      oldCtx,
+    );
+    const finalMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Old queued final" }],
+    };
+    await handlers.get("message_update")?.(
+      {
+        message: finalMessage,
+        assistantMessageEvent: {
+          type: "text_end",
+          contentIndex: 0,
+          content: "Old queued final",
+          partial: finalMessage,
+        },
+      },
+      oldCtx,
+    );
+    await handlers.get("message_update")?.(
+      {
+        message: finalMessage,
+        assistantMessageEvent: {
+          type: "done",
+          reason: "stop",
+          message: finalMessage,
+        },
+      },
+      oldCtx,
+    );
+    await firstSendStarted;
+    await handlers.get("session_shutdown")?.({}, oldCtx);
+    const newCtx = createRuntimeExtensionContext({ cwd });
+    await handlers.get("session_start")?.({}, newCtx);
+    releaseFirstSend();
+    await flushMicrotasks(50);
+    assert.equal(sendCalls, 1);
+    await handlers.get("session_shutdown")?.({}, newCtx);
+  } finally {
+    releaseFirstSend();
     restoreFetch();
     await telegramConfig.restore();
   }
@@ -972,7 +1305,7 @@ test("Extension runtime skips proactive local result without Telegram lock owner
       botToken: "123:abc",
       allowedUserId: 77,
       lastUpdateId: 0,
-      proactivePush: true,
+      assistant: { proactivePush: true },
     });
     await writeRuntimeTelegramLocks({
       "@llblab/pi-telegram": {
@@ -1141,7 +1474,7 @@ test("Extension runtime clears queued follow-ups after a Telegram stop", async (
     assert.equal(promptText, "[telegram] new request");
     assert.equal(promptText.includes("follow up"), false);
     assert.equal(
-      sendTexts.includes("Aborted current turn. Cleared 1 queued turn."),
+      sendTexts.some((text) => text.startsWith("Aborted current turn.")),
       true,
     );
     await handlers.get("session_shutdown")?.({}, idleCtx);

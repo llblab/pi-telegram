@@ -9,9 +9,11 @@ import { basename, dirname, join } from "node:path";
 
 import {
   buildTelegramReplyContextBlock,
+  collectTelegramFileInfos,
   collectTelegramMessageIds,
   downloadTelegramMessageFiles,
   extractTelegramForwardContextText,
+  extractTelegramMessageText,
   extractTelegramMessagesPromptText,
   extractTelegramMessagesText,
   formatTelegramHistoryText,
@@ -132,9 +134,34 @@ function appendTelegramAttachmentSection(
   return `${prefix}${header}\n${items.map((item) => `- ${item}`).join("\n")}`;
 }
 
-function appendTelegramSourceContext(text: string, sourceContext: string | undefined): string {
+function appendTelegramSourceContext(
+  text: string,
+  sourceContext: string | undefined,
+): string {
   if (!sourceContext) return text;
   return text ? `${text}\n\n${sourceContext}` : sourceContext;
+}
+
+
+function buildTelegramForwardContextBlock(options: {
+  context: string;
+  text: string;
+  files: DownloadedTelegramTurnFile[];
+}): string {
+  const metadata = options.context.replace(/:\s+/g, ":");
+  const from = metadata.match(/^from:(.+)$/)?.[1];
+  let block = `[forward|${metadata}]${options.text ? ` ${options.text}` : ""}`;
+  if (options.files.length === 0) return block;
+  const dirs = [...new Set(options.files.map((file) => dirname(file.path)))];
+  const sameDir = dirs.length === 1;
+  const header = `[attachments${from ? `|from:${from}` : ""}]${
+    sameDir ? ` ${dirs[0]}` : ""
+  }`;
+  const items = sameDir
+    ? options.files.map((file) => `/${basename(file.path)}`)
+    : options.files.map((file) => file.path);
+  block += `\n\n${header}\n${items.map((item) => `- ${item}`).join("\n")}`;
+  return block;
 }
 
 function appendTelegramPromptText(prompt: string, rawText: string): string {
@@ -165,6 +192,7 @@ export function buildTelegramTurnPrompt(options: {
   rawText: string;
   files: DownloadedTelegramTurnFile[];
   promptFiles?: DownloadedTelegramTurnFile[];
+  displayFiles?: DownloadedTelegramTurnFile[];
   handlerOutputs?: string[];
   sourceContext?: string;
   historyTurns?: Pick<PendingTelegramTurn, "historyText">[];
@@ -186,14 +214,15 @@ export function buildTelegramTurnPrompt(options: {
         ? `${prompt}\n${options.rawText}`
         : appendTelegramPromptText(prompt, options.rawText);
   }
-  const promptFiles = options.promptFiles ?? options.files;
-  prompt = appendTelegramAttachmentSection(prompt, promptFiles);
-  prompt = appendTelegramSourceContext(prompt, options.sourceContext);
+  const displayFiles =
+    options.displayFiles ?? options.promptFiles ?? options.files;
+  prompt = appendTelegramAttachmentSection(prompt, displayFiles);
   prompt = appendTelegramListSection(
     prompt,
     "outputs",
     options.handlerOutputs ?? [],
   );
+  prompt = appendTelegramSourceContext(prompt, options.sourceContext);
   if (options.voiceContext) {
     prompt = appendTelegramVoiceContext(prompt, options.voiceContext);
   }
@@ -375,6 +404,7 @@ export interface BuildTelegramPromptTurnOptions {
   statusText?: string;
   files: DownloadedTelegramTurnFile[];
   promptFiles?: DownloadedTelegramTurnFile[];
+  displayFiles?: DownloadedTelegramTurnFile[];
   handlerOutputs?: string[];
   sourceContext?: string;
   timeLine?: string | null;
@@ -433,9 +463,26 @@ export function createTelegramPromptTurnRuntimeBuilder<
     const replyContext = firstMessage
       ? buildTelegramReplyContextBlock(firstMessage, replyFiles)
       : "";
-    const forwardContext = firstMessage
-      ? extractTelegramForwardContextText(firstMessage, deps.getAllowedUserId?.())
-      : "";
+    const forwardEntries = messages.flatMap((message) => {
+      const context = extractTelegramForwardContextText(
+        message,
+        deps.getAllowedUserId?.(),
+      );
+      return context
+        ? [
+            {
+              context,
+              text: extractTelegramMessageText(message),
+              message,
+              fileNames: new Set(
+                collectTelegramFileInfos(message.rich_message ? [message] : []).map(
+                  (file) => file.fileName,
+                ),
+              ),
+            },
+          ]
+        : [];
+    });
     const files = await downloadTelegramMessageFiles(messages, {
       downloadFile: deps.downloadFile,
     });
@@ -444,13 +491,51 @@ export function createTelegramPromptTurnRuntimeBuilder<
       : { rawText, promptFiles: files };
     const sourceBlocks: string[] = [];
     let promptRawText = processed.rawText;
-    if (forwardContext) {
+    const forwardedFilePaths = new Set<string>();
+    const getForwardFiles = (entry: (typeof forwardEntries)[number]) =>
+      (processed.promptFiles ?? files).filter((file) => {
+        if (!entry.fileNames.has(file.fileName)) return false;
+        forwardedFilePaths.add(file.path);
+        return true;
+      });
+    if (forwardEntries.length === 1 && messages.length === 1) {
+      const [forward] = forwardEntries;
       sourceBlocks.push(
-        `[forward|${forwardContext.replace(/:\s+/g, ":")}]${
-          processed.rawText ? ` ${processed.rawText}` : ""
-        }`,
+        buildTelegramForwardContextBlock({
+          context: forward!.context,
+          text: processed.rawText,
+          files: getForwardFiles(forward!),
+        }),
       );
       promptRawText = "";
+    } else if (forwardEntries.length > 0 && processed.rawText === rawText) {
+      const forwardedMessages = new Set(
+        forwardEntries.map((entry) => entry.message),
+      );
+      promptRawText = messages
+        .filter((message) => !forwardedMessages.has(message))
+        .map(extractTelegramMessageText)
+        .filter(Boolean)
+        .join("\n\n");
+      sourceBlocks.push(
+        ...forwardEntries.map((entry) =>
+          buildTelegramForwardContextBlock({
+            context: entry.context,
+            text: entry.text,
+            files: getForwardFiles(entry),
+          }),
+        ),
+      );
+    } else if (forwardEntries.length > 0) {
+      sourceBlocks.push(
+        ...forwardEntries.map((entry) =>
+          buildTelegramForwardContextBlock({
+            context: entry.context,
+            text: "",
+            files: getForwardFiles(entry),
+          }),
+        ),
+      );
     }
     if (replyContext) sourceBlocks.push(replyContext);
     const sourceContext = sourceBlocks.join("\n\n");
@@ -475,6 +560,9 @@ export function createTelegramPromptTurnRuntimeBuilder<
       statusText: processed.rawText,
       files,
       promptFiles: processed.promptFiles,
+      displayFiles: (processed.promptFiles ?? files).filter(
+        (file) => !forwardedFilePaths.has(file.path),
+      ),
       handlerOutputs: processed.handlerOutputs,
       timeLine,
       inferImageMimeType: guessMediaType,
@@ -522,6 +610,7 @@ export async function buildTelegramPromptTurn(
         rawText: options.rawText,
         files: options.files,
         promptFiles: options.promptFiles,
+        displayFiles: options.displayFiles,
         handlerOutputs: options.handlerOutputs,
         sourceContext: options.sourceContext,
         historyTurns: options.historyTurns,
@@ -566,14 +655,14 @@ export async function buildTelegramPromptTurn(
     historyText: appendTelegramSourceContext(
       formatTelegramHistoryText(
         options.rawText,
-        options.promptFiles ?? options.files,
+        options.displayFiles ?? options.promptFiles ?? options.files,
         options.handlerOutputs,
       ),
       options.sourceContext,
     ),
     statusSummary: formatTelegramTurnStatusSummary(
       options.statusText ?? options.rawText,
-      options.promptFiles ?? options.files,
+      options.displayFiles ?? options.promptFiles ?? options.files,
       options.handlerOutputs,
     ),
     // Voice tagging (used for preview suppression and prompt guidance)

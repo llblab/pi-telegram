@@ -55,7 +55,15 @@ test("Settings menu text and reply markup expose built-in controls", () => {
 });
 
 test("Settings detail markups show active values", () => {
-  assert.match(buildProactivePushSettingsText(true), /<code>on<\/code>/);
+  const proactiveText = buildProactivePushSettingsText(true);
+  assert.match(proactiveText, /<code>on<\/code>/);
+  assert.match(proactiveText, /<code>off<\/code>:/);
+  assert.match(proactiveText, /<code>on<\/code> \(default\):/);
+  assert.match(proactiveText, /visible checkpoints and the final answer/);
+  assert.ok(
+    proactiveText.indexOf("<code>on</code> (default):") <
+      proactiveText.indexOf("<code>off</code>:"),
+  );
   assert.match(buildDraftPreviewsSettingsText(false), /<code>off<\/code>/);
   assert.equal(
     buildDraftPreviewsSettingsReplyMarkup(true).inline_keyboard[1]?.[0]?.text,

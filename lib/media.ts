@@ -682,11 +682,107 @@ export async function downloadTelegramMessageFiles(
   return downloaded;
 }
 
+function collectTelegramRichBlockFileInfos(
+  blocks: unknown,
+  messageId: number,
+): TelegramFileInfo[] {
+  if (!Array.isArray(blocks)) return [];
+  const files: TelegramFileInfo[] = [];
+  let mediaIndex = 0;
+  const visit = (entries: unknown): void => {
+    if (!Array.isArray(entries)) return;
+    for (const entry of entries) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const type = getObjectField(entry, "type");
+      if (
+        type === "photo" ||
+        type === "animation" ||
+        type === "audio" ||
+        type === "video" ||
+        type === "voice_note"
+      ) {
+        mediaIndex += 1;
+      }
+      if (type === "photo") {
+        const photos = getObjectField(entry, "photo");
+        if (Array.isArray(photos)) {
+          const photo = photos
+            .filter(
+              (value): value is TelegramPhotoSize =>
+                typeof value === "object" &&
+                value !== null &&
+                typeof getObjectField(value, "file_id") === "string",
+            )
+            .sort((a, b) => (a.file_size ?? 0) - (b.file_size ?? 0))
+            .at(-1);
+          if (photo) {
+            files.push({
+              file_id: photo.file_id,
+              fileName: `photo-${messageId}-${mediaIndex}.jpg`,
+              mimeType: "image/jpeg",
+              kind: "photo",
+              isImage: true,
+            });
+          }
+        }
+      }
+      const fileField =
+        type === "animation"
+          ? "animation"
+          : type === "audio"
+            ? "audio"
+            : type === "video"
+              ? "video"
+              : type === "voice_note"
+                ? "voice_note"
+                : undefined;
+      if (fileField) {
+        const media = getObjectField(entry, fileField);
+        const fileId = getObjectField(media, "file_id");
+        const mimeType = getObjectField(media, "mime_type");
+        const fileName = getObjectField(media, "file_name");
+        if (typeof fileId === "string") {
+          const kind =
+            type === "voice_note" ? "voice" : (type as TelegramAttachmentKind);
+          const fallbackExtension =
+            kind === "voice" ? ".ogg" : kind === "audio" ? ".mp3" : ".mp4";
+          files.push({
+            file_id: fileId,
+            fileName:
+              typeof fileName === "string"
+                ? fileName
+                : `${kind}-${messageId}-${mediaIndex}${guessExtensionFromMime(
+                    typeof mimeType === "string" ? mimeType : undefined,
+                    fallbackExtension,
+                  )}`,
+            mimeType: typeof mimeType === "string" ? mimeType : undefined,
+            kind,
+            isImage: false,
+          });
+        }
+      }
+      visit(getObjectField(entry, "blocks"));
+      const items = getObjectField(entry, "items");
+      if (Array.isArray(items)) {
+        for (const item of items) visit(getObjectField(item, "blocks"));
+      }
+    }
+  };
+  visit(blocks);
+  return files;
+}
+
 export function collectTelegramFileInfos(
   messages: TelegramMediaMessage[],
 ): TelegramFileInfo[] {
   const files: TelegramFileInfo[] = [];
   for (const message of messages) {
+    files.push(
+      ...collectTelegramRichBlockFileInfos(
+        message.rich_message?.blocks,
+        message.message_id,
+      ),
+    );
     if (Array.isArray(message.photo) && message.photo.length > 0) {
       const photo = [...message.photo]
         .sort((a, b) => (a.file_size ?? 0) - (b.file_size ?? 0))
@@ -786,5 +882,10 @@ export function collectTelegramFileInfos(
       });
     }
   }
-  return files;
+  const seenFileIds = new Set<string>();
+  return files.filter((file) => {
+    if (seenFileIds.has(file.file_id)) return false;
+    seenFileIds.add(file.file_id);
+    return true;
+  });
 }

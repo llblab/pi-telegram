@@ -161,7 +161,15 @@ test("Bus-aware API runtime routes follower outbound calls through the leader", 
   assert.deepEqual(
     await runtime.sendRichMessage({
       chat_id: 1,
-      rich_message: { markdown: "hi" },
+      rich_message: {
+        markdown: "hi\n\n![](tg://photo?id=result)",
+        media: [
+          {
+            id: "result",
+            media: { type: "photo", media: "cached-photo" },
+          },
+        ],
+      },
     }),
     {
       message_id: 77,
@@ -201,7 +209,18 @@ test("Bus-aware API runtime routes follower outbound calls through the leader", 
       method: "call",
       args: [
         "sendRichMessage",
-        { chat_id: 1, rich_message: { markdown: "hi" } },
+        {
+          chat_id: 1,
+          rich_message: {
+            markdown: "hi\n\n![](tg://photo?id=result)",
+            media: [
+              {
+                id: "result",
+                media: { type: "photo", media: "cached-photo" },
+              },
+            ],
+          },
+        },
       ],
     },
     {
@@ -327,13 +346,22 @@ test("Bus-aware API runtime routes follower multipart uploads through the leader
     },
   });
 
+  const richMessage = {
+    markdown: "Voice\n\n![](tg://audio?id=voice)",
+    media: [
+      {
+        id: "voice",
+        media: { type: "voice_note", media: "attach://voice_upload" },
+      },
+    ],
+  };
   assert.deepEqual(
     await runtime.callMultipart(
-      "sendDocument",
-      { chat_id: "1" },
-      "document",
-      "/tmp/a.txt",
-      "a.txt",
+      "sendRichMessage",
+      { chat_id: "1", rich_message: JSON.stringify(richMessage) },
+      "voice_upload",
+      "/tmp/voice.ogg",
+      "voice.ogg",
     ),
     { ok: true },
   );
@@ -341,11 +369,11 @@ test("Bus-aware API runtime routes follower multipart uploads through the leader
     {
       method: "callMultipart",
       args: [
-        "sendDocument",
-        { chat_id: "1" },
-        "document",
-        "/tmp/a.txt",
-        "a.txt",
+        "sendRichMessage",
+        { chat_id: "1", rich_message: JSON.stringify(richMessage) },
+        "voice_upload",
+        "/tmp/voice.ogg",
+        "voice.ogg",
         undefined,
       ],
     },

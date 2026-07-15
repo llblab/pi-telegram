@@ -6,6 +6,12 @@ Normal Telegram-turn replies are intentionally prompt-driven: the agent writes M
 
 Text handlers use the portable [Command Template Standard](./command-templates.md). Programmatic outbound handlers use `registerTelegramOutboundHandler(kind, handler)`. Voice replies can use configured command-template handlers or the provider API described in [Voice Integration](./voice.md).
 
+## Proactive Public Output
+
+Proactive projection defaults on. With `assistant.proactivePush` omitted or set to `true`, completed public assistant text blocks from local or autonomous Pi work are projected to the instance's authorized Telegram target; set it explicitly to `false` to opt out. A visible intermediate commentary/checkpoint and the final answer become separate Telegram messages in source order; this is not a final-only `agent_end` notification. The bridge consumes normalized Activity `assistant-segment` events, not raw token deltas, reasoning, or tool traffic.
+
+Proactive blocks use `assistant.rendering` independently of voice policy. Rich mode sends native Rich Markdown and HTML mode keeps the established HTML renderer; proactive projection does not synthesize voice or attach queued files merely because Rich rendering is active. The queue revalidates exact target, profile/token transport generation, leader epoch or follower registration generation, and session generation before each send. Telegram-owned turns remain on their ordinary reply path, and `commit-unknown` never permits proactive replay.
+
 ## Standard
 
 An outbound handler is selected by `type`. Text replies and assistant markup map to handler types:
@@ -17,6 +23,16 @@ An outbound handler is selected by `type`. Text replies and assistant markup map
 | `telegram_button` | Built-in | Attach inline button |
 
 The voice pipeline is detailed below: configured `type: "voice"` handlers first, then programmatic handlers, then registered synthesis providers.
+
+### Single Rich attachment result
+
+When `assistant.rendering` is `"rich"`, a Telegram-originated turn that queues exactly one probe-confirmed PNG/JPEG photo, MP4 video, or MP3 audio file through `telegram_attach` can combine that artifact with the final assistant Markdown in one multipart `sendRichMessage` result. The bridge normalizes the Markdown, adds one `tg://photo`, `tg://video`, or `tg://audio` reference, preserves the triggering-message reply anchor and assigned thread, carries assistant-authored inline buttons, and records the returned message id under the exact local/follower ownership scope.
+
+The optimization is deliberately narrow. HTML rendering, empty final text, multiple files, documents and other unsupported formats, Guest Mode, explicit `telegram_voice`, voice-preferred turns, and OGG/Opus artifacts retain their established text/attachment/voice paths. A known-safe Rich upload rejection falls back to those paths. A `commit-unknown` transport outcome or a nominally successful upload without a verifiable message id never falls back or replays because the first non-idempotent send may already have committed.
+
+This behavior does not generate media or alter voice policy. `telegram_attach` still represents an explicit assistant artifact decision, while `manual`, `mirror`, and `always` continue to decide voice synthesis independently.
+
+Core assistant output accepts only the Markdown or HTML `InputRichMessage` forms and does not construct explicit block arrays or `InputRichBlockThinking`. Telegram's Thinking block is draft-only and must never become a projection of hidden reasoning or chain-of-thought. Any future use for Activity would require an explicitly public user-visible summary rather than provider reasoning content.
 
 ### Guest Mode media boundary
 

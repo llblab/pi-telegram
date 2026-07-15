@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { extractTelegramMessageText } from "../lib/media.ts";
 import * as TextGroups from "../lib/text-groups.ts";
 
 type TestMessage = TextGroups.TelegramTextGroupMessage;
@@ -55,6 +56,122 @@ test("Text group helper delays likely split messages and appends quick continuat
   assert.deepEqual(dispatched, []);
   timers.at(-1)?.();
   assert.deepEqual(dispatched, ["ctx:long-enough|tail"]);
+});
+
+test("Text group controller coalesces same-batch forward comments and bounds ordinary text delay", async () => {
+  const timers: Array<{
+    active: boolean;
+    callback: () => void;
+    delay: number;
+  }> = [];
+  const dispatched: string[] = [];
+  const controller = TextGroups.createTelegramTextGroupController<
+    TestMessage,
+    string
+  >({
+    debounceMs: 1000,
+    setTimer: (callback, delay) => {
+      const timer = { active: true, callback, delay };
+      timers.push(timer);
+      return timer as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimer: (timer) => {
+      (timer as unknown as { active: boolean }).active = false;
+    },
+  });
+  const comment = createMessage(10, "Посмотри на это");
+  const forwarded = createMessage(11, "Пересланный текст", {
+    forward_origin: { type: "user" },
+  });
+  controller.prepareUpdateBatch([
+    { message: comment },
+    { message: forwarded },
+  ]);
+  const dispatchMessages = (messages: TestMessage[]) => {
+    dispatched.push(messages.map((message) => message.text).join("|"));
+  };
+  assert.equal(
+    controller.queueMessage({
+      message: comment,
+      context: "ctx",
+      dispatchMessages,
+    }),
+    true,
+  );
+  assert.equal(timers[0]?.delay, 1000);
+  assert.equal(
+    controller.queueMessage({
+      message: forwarded,
+      context: "ctx",
+      dispatchMessages,
+    }),
+    true,
+  );
+  assert.equal(timers[0]?.active, false);
+  assert.equal(timers[1]?.delay, 0);
+  timers[1]?.callback();
+  await Promise.resolve();
+  assert.deepEqual(dispatched, ["Посмотри на это|Пересланный текст"]);
+
+  assert.equal(
+    controller.queueMessage({
+      message: createMessage(20, "Обычный короткий текст"),
+      context: "ctx",
+      dispatchMessages,
+    }),
+    true,
+  );
+  assert.equal(timers.at(-1)?.delay, 1000);
+});
+
+test("Text group controller coalesces a cross-batch comment with a rich forwarded message", async () => {
+  const timers: Array<{
+    active: boolean;
+    callback: () => void;
+    delay: number;
+  }> = [];
+  const dispatched: string[] = [];
+  const controller = TextGroups.createTelegramTextGroupController<
+    TestMessage,
+    string
+  >({
+    debounceMs: 1000,
+    setTimer: (callback, delay) => {
+      const timer = { active: true, callback, delay };
+      timers.push(timer);
+      return timer as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimer: (timer) => {
+      (timer as unknown as { active: boolean }).active = false;
+    },
+  });
+  const dispatchMessages = (messages: TestMessage[]) => {
+    dispatched.push(
+      messages.map((message) => extractTelegramMessageText(message)).join("|"),
+    );
+  };
+  const comment = createMessage(30, "Комментарий");
+  const forwarded = createMessage(31, "", {
+    text: undefined,
+    rich_message: {
+      blocks: [{ type: "paragraph", text: "Rich forward" }],
+    },
+    forward_origin: { type: "user" },
+  });
+  assert.equal(
+    controller.queueMessage({ message: comment, context: "ctx", dispatchMessages }),
+    true,
+  );
+  assert.equal(timers[0]?.delay, 1000);
+  assert.equal(
+    controller.queueMessage({ message: forwarded, context: "ctx", dispatchMessages }),
+    true,
+  );
+  assert.equal(timers[0]?.active, false);
+  assert.equal(timers[1]?.delay, 0);
+  timers[1]?.callback();
+  await Promise.resolve();
+  assert.deepEqual(dispatched, ["Комментарий|Rich forward"]);
 });
 
 test("Text group keeps split messages until asynchronous dispatch succeeds", async () => {

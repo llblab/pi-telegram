@@ -360,6 +360,22 @@ test("Structural update and media domains stay decoupled from concrete API trans
   });
 });
 
+test("Core assistant output never constructs Telegram Thinking blocks", () => {
+  for (const file of [
+    "replies.ts",
+    "preview.ts",
+    "outbound-attachments.ts",
+    "queue.ts",
+  ]) {
+    const source = readFileSync(join(PROJECT_ROOT, "lib", file), "utf8");
+    assert.doesNotMatch(
+      source,
+      /tg-thinking|InputRichBlockThinking|type\s*:\s*["']thinking["']/,
+      `${file} must not project hidden reasoning into Telegram Thinking blocks`,
+    );
+  }
+});
+
 test("Outbound attachment delivery stays decoupled from queue, inbound media, and API helpers", () => {
   const attachmentImports = getImportSpecifiers(
     join("lib", "outbound-attachments.ts"),
