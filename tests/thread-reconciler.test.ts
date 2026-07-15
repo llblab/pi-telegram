@@ -531,6 +531,53 @@ test("Thread reconciler apply closes replaced instance topics and marks them sta
   assert.equal(persisted, true);
 });
 
+test("Thread reconciler reports failed replaced-topic closure as incomplete", async () => {
+  const result = await applyThreadReconciliationPlan(
+    {
+      actions: [
+        {
+          kind: "close-stale-replaced-topic",
+          target: { chatId: 7, threadId: 89 },
+          reason: "replaced-instance-binding",
+          instanceId: "inst-a",
+        },
+      ],
+    },
+    {
+      async callApi() {
+        throw new Error("temporary Bot API failure");
+      },
+    },
+  );
+
+  assert.equal(result.incompleteActions?.length, 1);
+  assert.equal(result.changed, false);
+});
+
+test("Thread reconciler reports unfenced replaced-topic closure as incomplete", async () => {
+  const result = await applyThreadReconciliationPlan(
+    {
+      actions: [
+        {
+          kind: "close-stale-replaced-topic",
+          target: { chatId: 7, threadId: 89 },
+          reason: "replaced-instance-binding",
+          instanceId: "inst-a",
+        },
+      ],
+    },
+    {
+      getCurrentLeaderEpoch: () => 2,
+      async callApi<TResponse>() {
+        return {} as TResponse;
+      },
+    },
+  );
+
+  assert.equal(result.incompleteActions?.length, 1);
+  assert.equal(result.changed, false);
+});
+
 test("Thread reconciler apply skips destructive actions from stale leader epochs", async () => {
   const calls: unknown[] = [];
   const runtimeEvents: unknown[] = [];
@@ -765,7 +812,7 @@ test("Thread reconciler apply keeps expired pending state when cleanup API fails
   assert.equal(persisted, false);
 });
 
-test("Thread reconciler apply does not mark deleted when cleanup API fails", async () => {
+test("Thread reconciler apply reports incomplete cleanup API failures", async () => {
   const staleTargets: unknown[] = [];
   const runtimeEvents: Array<{
     category: string;
@@ -773,7 +820,7 @@ test("Thread reconciler apply does not mark deleted when cleanup API fails", asy
     details?: Record<string, unknown>;
   }> = [];
   let persisted = false;
-  await applyThreadReconciliationPlan(
+  const result = await applyThreadReconciliationPlan(
     {
       actions: [
         {
@@ -804,6 +851,7 @@ test("Thread reconciler apply does not mark deleted when cleanup API fails", asy
 
   assert.deepEqual(staleTargets, []);
   assert.equal(persisted, false);
+  assert.equal(result.incompleteActions?.length, 1);
   assert.equal(
     runtimeEvents.some(
       (event) =>
@@ -854,6 +902,43 @@ test("Thread reconciler apply treats stale delete errors as confirmed cleanup", 
     { target: { chatId: 7, threadId: 90 }, syncStatus: "deleted" },
   ]);
   assert.equal(persisted, true);
+});
+
+test("Thread reconciler does not treat a closed-only topic as deleted", async () => {
+  const staleTargets: unknown[] = [];
+  let persisted = false;
+  const result = await applyThreadReconciliationPlan(
+    {
+      actions: [
+        {
+          kind: "close-delete-unbound-topic",
+          target: { chatId: 7, threadId: 90 },
+          observedAtMs: nowMs,
+          messageId: 123,
+          reason: "unbound-user-message",
+        },
+      ],
+    },
+    {
+      async callApi<TResponse>(method: string) {
+        if (method === "deleteForumTopic") {
+          throw new Error("Bad Request: topic closed");
+        }
+        return {} as TResponse;
+      },
+      markStaleByTarget(target, syncStatus) {
+        staleTargets.push({ target, syncStatus });
+        return true;
+      },
+      async persist() {
+        persisted = true;
+      },
+    },
+  );
+
+  assert.equal(result.incompleteActions?.length, 1);
+  assert.deepEqual(staleTargets, []);
+  assert.equal(persisted, false);
 });
 
 test("Thread reconciler fails closed when destructive action lacks leader epoch", async () => {

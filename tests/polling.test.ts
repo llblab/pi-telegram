@@ -637,8 +637,9 @@ test("Poll loop runner ignores stale-context status failures while retrying", as
   ]);
 });
 
-test("Poll loop initializes lastUpdateId and processes updates", async () => {
+test("Poll loop initializes lastUpdateId and processes prepared update batches", async () => {
   const handled: number[] = [];
+  const lifecycle: string[] = [];
   const config: { botToken: string; lastUpdateId?: number } = {
     botToken: "123:abc",
   };
@@ -664,7 +665,11 @@ test("Poll loop initializes lastUpdateId and processes updates", async () => {
       persistCount += 1;
     },
     handleUpdate: async (update) => {
+      lifecycle.push(`handle:${update.update_id}`);
       handled.push(update.update_id);
+    },
+    prepareUpdateBatch: (updates) => {
+      lifecycle.push(`batch:${updates.map((update) => update.update_id).join(",")}`);
     },
     onErrorStatus: () => {},
     onStatusReset: () => {},
@@ -672,6 +677,7 @@ test("Poll loop initializes lastUpdateId and processes updates", async () => {
   });
   assert.equal(config.lastUpdateId, 7);
   assert.deepEqual(handled, [6, 7]);
+  assert.deepEqual(lifecycle, ["batch:6,7", "handle:6", "handle:7"]);
   assert.equal(persistCount, 3);
 });
 

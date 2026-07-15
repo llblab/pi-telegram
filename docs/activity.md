@@ -234,6 +234,14 @@ Pi lifecycle must not wait for extension rendering or Telegram transport.
 
 The Delivery API independently serializes concrete Telegram operations per target. Activity serialization preserves semantic event order; delivery serialization preserves transport order.
 
+### Core proactive projection
+
+When `assistant.proactivePush` is enabled, Activity's built-in assistant-output projection uses the same normalized `assistant-segment` boundary exposed to public handlers. It projects every completed public block from `local` or `autonomous` activity, including intermediate commentary/checkpoints and the final block. It never projects text token deltas, reasoning events, tool events or payloads, Telegram-owned activity, unknown-source activity, or empty text.
+
+The projection does not delay Activity dispatch or Pi lifecycle. Its ordered admission tail deduplicates normalized event identity, while existing routing and outbound owners revalidate the immutable admission-time target, profile/token transport generation, direct leader epoch or follower registration generation, and session generation immediately before each send. A replacement or stale owner drops queued work rather than rerouting it. An already-started non-idempotent Bot API mutation follows the normal `commit-unknown` no-replay contract.
+
+This projection consumes ordinary normalized Pi output. It has no runtime dependency on any workflow, loop, or companion extension that produced the public blocks.
+
 ## Lifecycle Mapping
 
 The bridge maps Pi hooks as follows:

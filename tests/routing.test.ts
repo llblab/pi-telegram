@@ -66,6 +66,7 @@ test("Inbound bus projection owns target authority and local labels", () => {
     instanceId: "follower-a",
     connectedAtMs: 1,
     lastHeartbeatMs: 2,
+    registrationGeneration: "registration-a",
     target: { chatId: 7, threadId: 11 },
   };
   const runtime = Routing.createTelegramInboundBusProjectionRuntime({
@@ -82,9 +83,12 @@ test("Inbound bus projection owns target authority and local labels", () => {
     }),
   });
 
-  assert.equal(
-    runtime.getTargetOwnership({ chatId: 7, threadId: 11 })?.instanceId,
-    "follower-a",
+  assert.deepEqual(
+    runtime.getTargetOwnership({ chatId: 7, threadId: 11 }),
+    {
+      instanceId: "follower-a",
+      ownerGeneration: "registration-a",
+    },
   );
   assert.deepEqual(runtime.getLiveThreadTargets(), [
     { chatId: 7, threadId: 10 },
@@ -172,7 +176,7 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
     textGroupRuntime: TextGroups.createTelegramTextGroupController<
       TestMessage,
       TestContext
-    >(),
+    >({ forwardCommentWaitMs: false }),
     telegramQueueStore,
     queueMutationRuntime,
     modelMenuRuntime: Menu.createTelegramModelMenuRuntime<TestModel>(),
@@ -472,7 +476,7 @@ function createRouteHarness(options: RouteHarnessOptions = {}) {
     textGroupRuntime: TextGroups.createTelegramTextGroupController<
       TestMessage,
       TestContext
-    >(),
+    >({ forwardCommentWaitMs: false }),
     telegramQueueStore,
     queueMutationRuntime,
     modelMenuRuntime: Menu.createTelegramModelMenuRuntime<TestModel>(),

@@ -1,7 +1,7 @@
 /**
  * Telegram activity lifecycle normalization and extension dispatch
  * Zones: pi agent lifecycle, extension API, operational delivery
- * Owns stable handler registration, evidence-based activity/source identity, assistant segment and reasoning normalization, executed-tool and compaction events, isolated non-blocking queues, shutdown fencing, diagnostics, and fresh delivery contexts; excludes Pi hook wiring, visibility policy, Telegram rendering, and consumer-extension behavior
+ * Owns stable handler registration, evidence-based activity/source identity, assistant segment and reasoning normalization, ordered public-output projection, executed-tool and compaction events, isolated non-blocking queues, shutdown fencing, diagnostics, and fresh delivery contexts; excludes Pi hook wiring, Telegram rendering implementation, raw transport clients, and consumer-extension behavior
  */
 
 import {
@@ -90,6 +90,9 @@ export type TelegramActivityPayload =
 
 export type TelegramActivityEvent = TelegramActivityEnvelope &
   TelegramActivityPayload;
+
+export type TelegramAssistantSegmentEvent = TelegramActivityEnvelope &
+  Extract<TelegramActivityPayload, { type: "assistant-segment" }>;
 
 export interface TelegramActivityContext {
   activityId: string;
@@ -383,6 +386,7 @@ export function createTelegramActivityDispatcher(deps: {
 /** @internal */
 export function createTelegramActivityBridgeRuntime(deps: {
   generation: string;
+  observeEvent?: (event: TelegramActivityEvent) => void;
   recordFailure?: (
     handlerId: string,
     event: TelegramActivityEvent,
@@ -401,6 +405,11 @@ export function createTelegramActivityBridgeRuntime(deps: {
         dispatcher: createTelegramActivityDispatcher({
           recordFailure: deps.recordFailure,
         }),
+        observeEvent: deps.observeEvent,
+        recordObserverFailure: deps.recordFailure
+          ? (event, error) =>
+              deps.recordFailure!("@llblab/pi-telegram/proactive", event, error)
+          : undefined,
         now: deps.now,
       });
     },
@@ -507,6 +516,11 @@ interface PendingAssistantSegment {
 export function createTelegramActivityRuntime(deps: {
   generation: string;
   dispatcher: TelegramActivityDispatcher;
+  observeEvent?: (event: TelegramActivityEvent) => void;
+  recordObserverFailure?: (
+    event: TelegramActivityEvent,
+    error: unknown,
+  ) => void;
   now?: () => number;
 }): TelegramActivityRuntime {
   const now = deps.now ?? Date.now;
@@ -542,14 +556,20 @@ export function createTelegramActivityRuntime(deps: {
   const emit = (event: TelegramActivityPayload): void => {
     const currentActivityId = ensureActivity();
     sequence += 1;
-    deps.dispatcher.dispatch({
+    const normalizedEvent = {
       ...event,
       activityId: currentActivityId,
       sequence,
       source: activitySource,
       ...(activityTarget ? { target: activityTarget } : {}),
       timestamp: now(),
-    } as TelegramActivityEvent);
+    } as TelegramActivityEvent;
+    try {
+      deps.observeEvent?.(normalizedEvent);
+    } catch (error) {
+      deps.recordObserverFailure?.(normalizedEvent, error);
+    }
+    deps.dispatcher.dispatch(normalizedEvent);
   };
   const flushPendingSegment = (
     placement: "intermediate" | "final" | "terminal-partial",
@@ -678,6 +698,83 @@ export function createTelegramActivityRuntime(deps: {
       pendingInputSource = "unknown";
       clearActivity();
       deps.dispatcher.stop();
+    },
+  };
+}
+
+// --- Public Assistant Output Projection ---
+
+export interface TelegramAssistantOutputRuntime {
+  start: () => void;
+  accept: (event: TelegramAssistantSegmentEvent) => void;
+  waitForIdle: () => Promise<void>;
+  stop: () => void;
+}
+
+export function createTelegramAssistantOutputRuntime<TAuthority = undefined>(deps: {
+  isEnabled: () => boolean;
+  captureAuthority?: () => TAuthority;
+  isAuthorityActive?: (authority: TAuthority) => boolean;
+  canDeliver: (event: TelegramAssistantSegmentEvent) => boolean;
+  send: (
+    event: TelegramAssistantSegmentEvent,
+    authority: TAuthority,
+    isAuthorityActive: () => boolean,
+  ) => Promise<void>;
+  recordFailure?: (
+    event: TelegramAssistantSegmentEvent,
+    error: unknown,
+  ) => void;
+}): TelegramAssistantOutputRuntime {
+  let generation = 0;
+  let running = false;
+  let tail: Promise<void> = Promise.resolve();
+  const admitted = new Set<string>();
+  const isEligibleSource = (
+    source: TelegramAssistantSegmentEvent["source"],
+  ): boolean => source === "local" || source === "autonomous";
+
+  return {
+    start() {
+      generation += 1;
+      running = true;
+      admitted.clear();
+      tail = Promise.resolve();
+    },
+    accept(event) {
+      if (!running || !deps.isEnabled()) return;
+      if (!isEligibleSource(event.source) || !event.text.trim()) return;
+      const key = `${event.activityId}:${event.sequence}`;
+      if (admitted.has(key)) return;
+      admitted.add(key);
+      const admittedGeneration = generation;
+      const admittedAuthority = deps.captureAuthority?.();
+      tail = tail.then(async () => {
+        const isAdmittedAuthorityActive = () =>
+          running &&
+          generation === admittedGeneration &&
+          deps.isEnabled() &&
+          (deps.isAuthorityActive === undefined ||
+            deps.isAuthorityActive(admittedAuthority as TAuthority));
+        if (!isAdmittedAuthorityActive() || !deps.canDeliver(event)) return;
+        try {
+          await deps.send(
+            event,
+            admittedAuthority as TAuthority,
+            isAdmittedAuthorityActive,
+          );
+        } catch (error) {
+          deps.recordFailure?.(event, error);
+        }
+      });
+    },
+    waitForIdle() {
+      return tail;
+    },
+    stop() {
+      generation += 1;
+      running = false;
+      admitted.clear();
     },
   };
 }

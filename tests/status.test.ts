@@ -242,11 +242,12 @@ test("Status bar text renders bridge connection and queue states", () => {
       pollingActive: false,
       paired: true,
       busLifecyclePhase: "electing",
+      instanceThreadName: "Cinder",
       compactionInProgress: false,
       processing: false,
       queuedStatus: "",
     }),
-    "<accent>telegram</accent> <warning>electing</warning>",
+    "<accent>Cinder</accent> <warning>electing</warning>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {

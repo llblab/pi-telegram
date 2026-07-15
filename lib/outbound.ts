@@ -1,14 +1,22 @@
 /**
  * Telegram outbound surface helpers
  * Zones: telegram outbound, command templates, voice delivery
- * Owns configured outbound handler execution, text transforms, voice-file generation/delivery, runtime-event bridge, and compatibility re-exports; assistant markup parsing lives in outbound-markup and button callback actions live in outbound-buttons
+ * Owns configured outbound handler execution, text transforms, public assistant-output reply composition and mutation fencing, voice-file generation/delivery, runtime-event bridge, and compatibility re-exports; assistant markup parsing lives in outbound-markup and button callback actions live in outbound-buttons
  */
 
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
+import type { TelegramAssistantSegmentEvent } from "./activity.ts";
 import { resolveTelegramTempDir } from "./paths.ts";
+import * as Replies from "./replies.ts";
+import type {
+  TelegramEditMessageTextBody,
+  TelegramSendMessageBody,
+  TelegramSendRichMessageBody,
+  TelegramSentMessage,
+} from "./telegram-api.ts";
 
 import {
   planTelegramButtonReply,
@@ -903,5 +911,102 @@ export function createTelegramOutboundReplyArtifactSender(
         "Failed to send voice reply: every voice synthesis provider failed.",
       );
     }
+  };
+}
+
+// --- Public Assistant Output Delivery ---
+
+export interface TelegramAssistantOutputMutationFence {
+  run: <TArgs extends unknown[], TResult>(
+    mutation: (...args: TArgs) => Promise<TResult>,
+    ...args: TArgs
+  ) => Promise<TResult>;
+}
+
+export interface TelegramAssistantOutputDeliveryAuthority<TTransportStamp> {
+  transportStamp: TTransportStamp;
+  route: "direct" | "follower" | "none";
+  directEpoch?: number | string;
+  followerGeneration?: string;
+  target?: TelegramTarget;
+}
+
+export function createTelegramAssistantOutputMutationFence(
+  isAuthorityActive: () => boolean,
+): TelegramAssistantOutputMutationFence {
+  return {
+    run(mutation, ...args) {
+      if (!isAuthorityActive()) {
+        return Promise.reject(
+          new Error(
+            "Assistant output lost admission authority before transport mutation.",
+          ),
+        );
+      }
+      return mutation(...args);
+    },
+  };
+}
+
+export function createTelegramAssistantOutputSender<
+  TTransportStamp,
+  TReplyMarkup = unknown,
+>(deps: {
+  recordOwnership?: Replies.TelegramReplyOwnershipRecorder["record"];
+  sendMessage: (
+    body: TelegramSendMessageBody,
+  ) => Promise<TelegramSentMessage>;
+  sendRichMessage: (
+    body: TelegramSendRichMessageBody,
+  ) => Promise<TelegramSentMessage>;
+  editMessage: (
+    body: TelegramEditMessageTextBody,
+  ) => Promise<unknown>;
+  getAssistantRenderingMode: () => "rich" | "html";
+  execCommand: TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup>["execCommand"];
+  getHandlers?: TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup>["getHandlers"];
+  recordRuntimeEvent?: TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup>["recordRuntimeEvent"];
+}): (
+  event: TelegramAssistantSegmentEvent,
+  authority: TelegramAssistantOutputDeliveryAuthority<TTransportStamp>,
+  isAuthorityActive: () => boolean,
+) => Promise<void> {
+  return async function sendAssistantOutput(
+    event,
+    authority,
+    isAuthorityActive,
+  ) {
+    const target = authority.target;
+    if (!target) {
+      throw new Error("Assistant output has no authorized Telegram target.");
+    }
+    const mutationFence =
+      createTelegramAssistantOutputMutationFence(isAuthorityActive);
+    const replyRuntime = Replies.createTelegramRenderedMessageDeliveryRuntime({
+      recordOwnership: deps.recordOwnership,
+      sendMessage(body) {
+        return mutationFence.run(deps.sendMessage, body);
+      },
+      sendRichMessage(body) {
+        return mutationFence.run(deps.sendRichMessage, body);
+      },
+      getAssistantRenderingMode: deps.getAssistantRenderingMode,
+      editMessage(body) {
+        return mutationFence.run(deps.editMessage, body);
+      },
+    });
+    const outboundRuntime = createTelegramOutboundTextReplyRuntime({
+      sendTextReply: replyRuntime.sendTextReply,
+      sendMarkdownReply: replyRuntime.sendMarkdownReply,
+      execCommand: deps.execCommand,
+      getHandlers: deps.getHandlers,
+      recordRuntimeEvent: deps.recordRuntimeEvent,
+    });
+    await outboundRuntime.sendMarkdownReply(
+      target.chatId,
+      undefined,
+      event.text,
+      { target },
+    );
   };
 }

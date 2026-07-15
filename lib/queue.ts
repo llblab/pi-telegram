@@ -954,6 +954,11 @@ export interface TelegramAgentEndRuntimeDeps<
     options?: { target?: TelegramQueueTarget },
   ) => Promise<unknown>;
   sendQueuedAttachments: (turn: TTurn) => Promise<void>;
+  sendRichAttachmentReply?: (
+    turn: TTurn,
+    markdown: string,
+    options?: { replyMarkup?: TReplyMarkup },
+  ) => Promise<boolean>;
   answerGuestQuery?: (
     guestQueryId: string,
     text?: string,
@@ -978,10 +983,6 @@ export interface TelegramAgentEndRuntimeDeps<
     plan: TelegramAgentEndOutboundReplyPlan,
     options?: { replyToPrompt?: boolean },
   ) => Promise<void>;
-  getDefaultChatId?: () => number | undefined;
-  getDefaultTarget?: () => TelegramQueueTarget | undefined;
-  isProactivePushEnabled?: () => boolean;
-  canSendProactivePush?: () => boolean;
   recordRuntimeEvent?: (
     category: string,
     error: unknown,
@@ -1029,6 +1030,10 @@ export interface TelegramAgentEndHookRuntimeDeps<
   >["sendMarkdownReply"];
   sendTextReply: TelegramAgentEndRuntimeDeps<TTurn>["sendTextReply"];
   sendQueuedAttachments: (turn: TTurn) => Promise<void>;
+  sendRichAttachmentReply?: TelegramAgentEndRuntimeDeps<
+    TTurn,
+    TReplyMarkup
+  >["sendRichAttachmentReply"];
   answerGuestQuery?: TelegramAgentEndRuntimeDeps<TTurn>["answerGuestQuery"];
   sendGuestReply?: TelegramAgentEndRuntimeDeps<TTurn>["sendGuestReply"];
   sendGuestAttachment?: TelegramAgentEndRuntimeDeps<TTurn>["sendGuestAttachment"];
@@ -1038,10 +1043,6 @@ export interface TelegramAgentEndHookRuntimeDeps<
     TReplyMarkup
   >["planOutboundReply"];
   sendOutboundReplyArtifacts?: TelegramAgentEndRuntimeDeps<TTurn>["sendOutboundReplyArtifacts"];
-  getDefaultChatId?: TelegramAgentEndRuntimeDeps<TTurn>["getDefaultChatId"];
-  getDefaultTarget?: TelegramAgentEndRuntimeDeps<TTurn>["getDefaultTarget"];
-  isProactivePushEnabled?: TelegramAgentEndRuntimeDeps<TTurn>["isProactivePushEnabled"];
-  canSendProactivePush?: (ctx: TContext) => boolean;
   recordRuntimeEvent?: TelegramAgentEndRuntimeDeps<TTurn>["recordRuntimeEvent"];
 }
 
@@ -1135,12 +1136,9 @@ export function createTelegramAgentEndHook<
     await deps.loadConfig?.();
     if (deps.isSessionActive && !deps.isSessionActive(ctx)) return;
     const turn = deps.getActiveTurn();
-    const proactiveEnabled = deps.isProactivePushEnabled?.() ?? false;
-    const canProactivePush = deps.canSendProactivePush?.(ctx) ?? false;
     await handleTelegramAgentEndRuntime({
       turn,
-      assistant:
-        turn || proactiveEnabled ? deps.extractAssistant(event.messages) : {},
+      assistant: turn ? deps.extractAssistant(event.messages) : {},
       foldQueuedPromptsIntoHistory: deps.getFoldQueuedPromptsIntoHistory(),
       resetRuntimeState: deps.resetRuntimeState,
       isSessionActive: () => deps.isSessionActive?.(ctx) ?? true,
@@ -1165,16 +1163,13 @@ export function createTelegramAgentEndHook<
       sendMarkdownReply: deps.sendMarkdownReply,
       sendTextReply: deps.sendTextReply,
       sendQueuedAttachments: deps.sendQueuedAttachments,
+      sendRichAttachmentReply: deps.sendRichAttachmentReply,
       answerGuestQuery: deps.answerGuestQuery,
       sendGuestReply: deps.sendGuestReply,
       sendGuestAttachment: deps.sendGuestAttachment,
       sendGuestVoiceReply: deps.sendGuestVoiceReply,
       planOutboundReply: deps.planOutboundReply,
       sendOutboundReplyArtifacts: deps.sendOutboundReplyArtifacts,
-      getDefaultChatId: deps.getDefaultChatId,
-      getDefaultTarget: deps.getDefaultTarget,
-      isProactivePushEnabled: deps.isProactivePushEnabled,
-      canSendProactivePush: () => canProactivePush,
       recordRuntimeEvent: deps.recordRuntimeEvent,
     });
   };
@@ -1241,35 +1236,6 @@ export async function handleTelegramAgentEndRuntime<
     foldQueuedPromptsIntoHistory: deps.foldQueuedPromptsIntoHistory,
   });
   if (!turn) {
-    const proactiveEnabled = deps.isProactivePushEnabled?.() ?? false;
-    const canProactivePush = deps.canSendProactivePush?.() ?? false;
-    if (proactiveEnabled && finalText && !assistant.errorMessage) {
-      if (canProactivePush) {
-        const defaultTarget = deps.getDefaultTarget?.();
-        const defaultChatId =
-          defaultTarget?.chatId ?? deps.getDefaultChatId?.();
-        if (defaultChatId !== undefined) {
-          try {
-            await deps.sendMarkdownReply(defaultChatId, undefined, finalText, {
-              target: defaultTarget,
-            });
-          } catch (error) {
-            deps.recordRuntimeEvent?.("proactive-push", error, {
-              chatId: defaultChatId,
-              threadId: defaultTarget?.threadId,
-            });
-          }
-        }
-      } else {
-        deps.recordRuntimeEvent?.(
-          "proactive-push",
-          new Error(
-            "Proactive push skipped because this instance does not own Telegram polling.",
-          ),
-          { phase: "ownership" },
-        );
-      }
-    }
     if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
     return;
   }
@@ -1346,7 +1312,34 @@ export async function handleTelegramAgentEndRuntime<
     if (!finalText && hasOutboundArtifacts)
       await deps.clearPreview(turn.chatId, { target: turn.target });
     if (!isDeliveryActive()) return;
-    if (endPlan.kind === "text" && finalText) {
+    let richAttachmentDelivered = false;
+    if (
+      endPlan.kind === "text" &&
+      finalText &&
+      !hasOutboundArtifacts &&
+      deps.sendRichAttachmentReply
+    ) {
+      try {
+        richAttachmentDelivered = await deps.sendRichAttachmentReply(
+          turn,
+          finalText,
+          { replyMarkup },
+        );
+        if (!isDeliveryActive()) return;
+        if (richAttachmentDelivered) {
+          await deps.clearPreview(turn.chatId, { target: turn.target });
+        }
+      } catch (error) {
+        deps.recordRuntimeEvent?.("delivery", error, {
+          phase: "rich-attachment-commit-unknown",
+          chatId: turn.chatId,
+        });
+        if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
+        return;
+      }
+    }
+    if (!isDeliveryActive()) return;
+    if (!richAttachmentDelivered && endPlan.kind === "text" && finalText) {
       try {
         const finalized = await deps.finalizeMarkdownPreview(
           turn.chatId,
@@ -1414,7 +1407,7 @@ export async function handleTelegramAgentEndRuntime<
       }
     }
     if (!isDeliveryActive()) return;
-    if (endPlan.shouldSendAttachmentNotice) {
+    if (!richAttachmentDelivered && endPlan.shouldSendAttachmentNotice) {
       await deps.sendTextReply(
         turn.chatId,
         turn.replyToMessageId,
@@ -1423,7 +1416,7 @@ export async function handleTelegramAgentEndRuntime<
       );
     }
     if (!isDeliveryActive()) return;
-    await deps.sendQueuedAttachments(turn);
+    if (!richAttachmentDelivered) await deps.sendQueuedAttachments(turn);
     if (!isDeliveryActive()) return;
     if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
   };

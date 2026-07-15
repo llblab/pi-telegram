@@ -212,19 +212,83 @@ export type TelegramSendMessageBody = Record<string, unknown> & {
   reply_parameters?: TelegramReplyParameters;
 };
 
-export type TelegramInputRichMessage =
-  | {
-      markdown: string;
-      html?: never;
-      is_rtl?: boolean;
-      skip_entity_detection?: boolean;
-    }
-  | {
-      html: string;
-      markdown?: never;
-      is_rtl?: boolean;
-      skip_entity_detection?: boolean;
-    };
+export interface TelegramInputMediaPhoto extends Record<string, unknown> {
+  type: "photo";
+  media: string;
+  has_spoiler?: boolean;
+}
+
+export interface TelegramInputMediaVideo extends Record<string, unknown> {
+  type: "video";
+  media: string;
+  thumbnail?: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+  supports_streaming?: boolean;
+  has_spoiler?: boolean;
+}
+
+export interface TelegramInputMediaAnimation extends Record<string, unknown> {
+  type: "animation";
+  media: string;
+  thumbnail?: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+  has_spoiler?: boolean;
+}
+
+export interface TelegramInputMediaAudio extends Record<string, unknown> {
+  type: "audio";
+  media: string;
+  thumbnail?: string;
+  duration?: number;
+  performer?: string;
+  title?: string;
+}
+
+export interface TelegramInputMediaVoiceNote extends Record<string, unknown> {
+  type: "voice_note";
+  media: string;
+  caption?: string;
+  parse_mode?: string;
+  caption_entities?: unknown[];
+  duration?: number;
+}
+
+export type TelegramInputRichMessageMediaValue =
+  | TelegramInputMediaAnimation
+  | TelegramInputMediaAudio
+  | TelegramInputMediaPhoto
+  | TelegramInputMediaVideo
+  | TelegramInputMediaVoiceNote;
+
+export interface TelegramInputRichMessageMedia {
+  id: string;
+  media: TelegramInputRichMessageMediaValue;
+}
+
+type TelegramInputRichMessageCommon = {
+  is_rtl?: boolean;
+  skip_entity_detection?: boolean;
+};
+
+export type TelegramInputRichMessage = TelegramInputRichMessageCommon &
+  (
+    | {
+        markdown: string;
+        html?: never;
+        blocks?: never;
+        media?: TelegramInputRichMessageMedia[];
+      }
+    | {
+        html: string;
+        markdown?: never;
+        blocks?: never;
+        media?: TelegramInputRichMessageMedia[];
+      }
+  );
 
 export type TelegramSendRichMessageBody = Record<string, unknown> & {
   chat_id: number;

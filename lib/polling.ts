@@ -160,6 +160,7 @@ export function createTelegramPollingControllerRuntime<
       getUpdates: deps.getUpdates,
       persistConfig: deps.persistConfig,
       handleUpdate: deps.handleUpdate,
+      prepareUpdateBatch: deps.prepareUpdateBatch,
       updateStatus: deps.updateStatus,
       sleep: deps.sleep,
       maxUpdateFailures: deps.maxUpdateFailures,
@@ -909,6 +910,7 @@ export interface TelegramPollLoopDeps<
   ) => Promise<TUpdate[]>;
   persistConfig: (config: TelegramPollingConfig) => Promise<void>;
   handleUpdate: (update: TUpdate, ctx: TContext) => Promise<void>;
+  prepareUpdateBatch?: (updates: readonly TUpdate[]) => void;
   onErrorStatus: (message: string) => void;
   onStatusReset: () => void;
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -927,6 +929,7 @@ export interface TelegramPollLoopRunnerDeps<
   ) => Promise<TUpdate[]>;
   persistConfig: (config: TelegramPollingConfig) => Promise<void>;
   handleUpdate: (update: TUpdate, ctx: TContext) => Promise<void>;
+  prepareUpdateBatch?: (updates: readonly TUpdate[]) => void;
   updateStatus: (ctx: TContext, message?: string) => void;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   maxUpdateFailures?: number;
@@ -973,6 +976,7 @@ export function createTelegramPollLoopRunner<
       getUpdates: deps.getUpdates,
       persistConfig: deps.persistConfig,
       handleUpdate: deps.handleUpdate,
+      prepareUpdateBatch: deps.prepareUpdateBatch,
       onErrorStatus: (message) => {
         updateTelegramPollingStatusSafely(deps.updateStatus, ctx, {
           message,
@@ -1039,6 +1043,7 @@ export async function runTelegramPollLoop<
         buildTelegramLongPollRequest(deps.config.lastUpdateId),
         deps.signal,
       );
+      deps.prepareUpdateBatch?.(updates);
       consecutiveGetUpdatesConflicts = 0;
       for (const update of updates) {
         if (admittedUpdates.has(update.update_id)) {

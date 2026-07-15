@@ -51,6 +51,26 @@ test("Turn helpers build prompt text with history and attachments", () => {
   assert.match(prompt, /\[attachments\] \/tmp\n- \/demo.png/);
 });
 
+test("Turn helpers keep attachment outputs with user content before reply context", () => {
+  const prompt = buildTelegramTurnPrompt({
+    telegramPrefix: "[telegram]",
+    rawText: "",
+    files: [
+      {
+        path: "/tmp/voice.ogg",
+        fileName: "voice.ogg",
+        isImage: false,
+      },
+    ],
+    handlerOutputs: ["transcribed voice"],
+    sourceContext: "[reply|from:alice] Earlier message",
+  });
+  assert.equal(
+    prompt,
+    "[telegram]\n\n[attachments] /tmp\n- /voice.ogg\n\n[outputs]\n- transcribed voice\n\n[reply|from:alice] Earlier message",
+  );
+});
+
 test("Turn helpers omit [time] section by default", () => {
   const prompt = buildTelegramTurnPrompt({
     telegramPrefix: "[telegram]",
@@ -246,6 +266,87 @@ test("Turn runtime builder identifies forwarded messages from non-owner users", 
     (turn.content[0] as { type: "text"; text: string }).text,
     "[telegram]\n\n[forward|from:alice] forwarded text",
   );
+});
+
+test("Turn runtime builder keeps a same-turn comment before forwarded content", async () => {
+  const buildTurn = createTelegramPromptTurnRuntimeBuilder({
+    allocateQueueOrder: () => 1,
+    downloadFile: async (_fileId, fileName) => `/tmp/${fileName}`,
+    getAllowedUserId: () => 100,
+  });
+  const turn = await buildTurn([
+    {
+      message_id: 20,
+      chat: { id: 5 },
+      from: { id: 100, first_name: "Owner" },
+      text: "Мой комментарий",
+    },
+    {
+      message_id: 21,
+      chat: { id: 5 },
+      from: { id: 100, first_name: "Owner" },
+      forward_origin: {
+        type: "user",
+        sender_user: { id: 200, first_name: "Alice", username: "alice" },
+      },
+      text: "forwarded text",
+    },
+  ]);
+  assert.equal(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    "[telegram] Мой комментарий\n\n[forward|from:alice] forwarded text",
+  );
+});
+
+test("Turn runtime builder keeps forwarded Rich media in source attachment context", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-forward-rich-"));
+  const buildTurn = createTelegramPromptTurnRuntimeBuilder({
+    allocateQueueOrder: () => 1,
+    downloadFile: async (_fileId, fileName) => {
+      const path = join(dir, fileName);
+      await writeFile(path, "image");
+      return path;
+    },
+    getAllowedUserId: () => 100,
+  });
+  const turn = await buildTurn([
+    {
+      message_id: 20,
+      chat: { id: 5 },
+      from: { id: 100, first_name: "Owner" },
+      text: "Мой комментарий",
+    },
+    {
+      message_id: 21,
+      chat: { id: 5 },
+      from: { id: 100, first_name: "Owner" },
+      forward_origin: {
+        type: "user",
+        sender_user: { id: 200, first_name: "Alice", username: "alice" },
+      },
+      rich_message: {
+        blocks: [
+          { type: "paragraph", text: "forwarded text" },
+          {
+            type: "photo",
+            photo: [{ file_id: "rich-photo", file_size: 100 }],
+          },
+        ],
+      },
+    },
+  ]);
+  assert.equal(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    [
+      "[telegram] Мой комментарий",
+      "",
+      "[forward|from:alice] forwarded text",
+      "",
+      `[attachments|from:alice] ${dir}`,
+      "- /photo-21-1.jpg",
+    ].join("\n"),
+  );
+  assert.equal(turn.content.filter((item) => item.type === "image").length, 1);
 });
 
 test("Turn runtime builder places replied-message attachments in source attachment context", async () => {

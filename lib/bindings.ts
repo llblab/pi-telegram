@@ -19,6 +19,7 @@ import * as Preview from "./preview.ts";
 import * as Prompts from "./prompts.ts";
 import * as Queue from "./queue.ts";
 import * as Replies from "./replies.ts";
+import * as Routing from "./routing.ts";
 import * as Runtime from "./runtime.ts";
 import * as Setup from "./setup.ts";
 import * as Status from "./status.ts";
@@ -35,6 +36,60 @@ type TelegramRuntimeEventRecorder = (
 type TelegramBridgeStatusUpdater =
   Status.TelegramStatusRuntime<Pi.ExtensionContext>["updateStatus"];
 
+export interface TelegramAssistantOutputBindingRuntime<
+  TTransportStamp,
+> {
+  runtime: Activity.TelegramAssistantOutputRuntime;
+  observeEvent: (event: Activity.TelegramActivityEvent) => void;
+  authority: Routing.TelegramAssistantOutputAuthorityRuntime<TTransportStamp>;
+}
+
+export function createTelegramAssistantOutputBindingRuntime<
+  TTransportStamp,
+>(deps: {
+  isEnabled: () => boolean;
+  authority: {
+    getPreferredTarget: () => OutboundAttachments.TelegramQueuedOutboundAttachmentTurnView["target"] | undefined;
+    getFallbackChatId: () => number | undefined;
+    getTransportStamp: () => TTransportStamp;
+    isTransportStampActive: (stamp: TTransportStamp) => boolean;
+    ownsDirect: () => boolean;
+    getDirectEpoch: () => number | string | undefined;
+    isFollowerRegistered: () => boolean;
+    getFollowerGeneration: () => string | undefined;
+  };
+  sender: Parameters<
+    typeof OutboundHandlers.createTelegramAssistantOutputSender<TTransportStamp>
+  >[0];
+  recordRuntimeEvent: TelegramRuntimeEventRecorder;
+}): TelegramAssistantOutputBindingRuntime<TTransportStamp> {
+  const authority =
+    Routing.createTelegramAssistantOutputAuthorityRuntime(deps.authority);
+  const send =
+    OutboundHandlers.createTelegramAssistantOutputSender<TTransportStamp>(
+      deps.sender,
+    );
+  const runtime = Activity.createTelegramAssistantOutputRuntime({
+    isEnabled: deps.isEnabled,
+    ...authority,
+    send,
+    recordFailure(event, error) {
+      deps.recordRuntimeEvent("proactive-push", error, {
+        activityId: event.activityId,
+        sequence: event.sequence,
+        placement: event.placement,
+      });
+    },
+  });
+  return {
+    runtime,
+    authority,
+    observeEvent(event) {
+      if (event.type === "assistant-segment") runtime.accept(event);
+    },
+  };
+}
+
 interface TelegramCommandsAndToolsBindingDeps {
   pi: Pi.ExtensionAPI;
   configStore: Config.TelegramConfigStore;
@@ -43,6 +98,7 @@ interface TelegramCommandsAndToolsBindingDeps {
   activeTurnRuntime: Queue.TelegramActiveTurnStore<Queue.PendingTelegramTurn>;
   lockedPollingRuntime: Locks.TelegramLockedPollingRuntime<Pi.ExtensionContext>;
   stopPolling?: () => Promise<void | string>;
+  getDisconnectThreadName?: () => string | undefined;
   onTransportChanged?: () => Promise<void> | void;
   getStatusLines: (
     options?: Status.TelegramBridgeStatusLineOptions,
@@ -70,6 +126,7 @@ export function registerTelegramCommandsAndTools({
   activeTurnRuntime,
   lockedPollingRuntime,
   stopPolling,
+  getDisconnectThreadName,
   onTransportChanged,
   getStatusLines,
   buttonActionStore,
@@ -186,6 +243,7 @@ export function registerTelegramCommandsAndTools({
     hasBotToken: configStore.hasBotToken,
     startPolling: lockedPollingRuntime.start,
     stopPolling: stopPolling ?? lockedPollingRuntime.stop,
+    getDisconnectThreadName,
     updateStatus,
     getProfileNames: () =>
       Config.getTelegramProfileNames(configStore.getStoredConfig()),
@@ -217,6 +275,10 @@ export function registerTelegramCommandsAndTools({
 interface TelegramLifecycleBindingDeps {
   pi: Pi.ExtensionAPI;
   activityRuntime: Activity.TelegramActivityRuntime;
+  assistantOutputRuntime: Pick<
+    Activity.TelegramAssistantOutputRuntime,
+    "start" | "stop"
+  >;
   sessionLifecycleRuntime: Pick<
     Lifecycle.TelegramLifecycleRegistrationDeps,
     "onSessionStart" | "onSessionShutdown" | "onModelSelect"
@@ -285,7 +347,12 @@ interface TelegramLifecycleBindingDeps {
   proactivePushChatIdGetter: () => number | undefined;
   proactivePushTargetGetter: () => Queue.TelegramQueueTarget | undefined;
   isProactivePushEnabled: () => boolean;
-  canSendProactivePush: (ctx: Pi.ExtensionContext) => boolean;
+  getAssistantRenderingMode: () => "rich" | "html";
+  recordMessageOwnership?: (input: {
+    chatId: number;
+    messageId: number;
+    target?: Queue.TelegramQueueTarget;
+  }) => void;
   canSendAgentActivity: (ctx: Pi.ExtensionContext) => boolean;
   isSessionContextActive: (ctx: Pi.ExtensionContext) => boolean;
   isTurnTransportActive?: (turn: Queue.PendingTelegramTurn) => boolean;
@@ -296,6 +363,7 @@ interface TelegramLifecycleBindingDeps {
 export function registerTelegramLifecycleRuntimeHooks({
   pi,
   activityRuntime,
+  assistantOutputRuntime,
   sessionLifecycleRuntime,
   configStore,
   abort,
@@ -322,7 +390,8 @@ export function registerTelegramLifecycleRuntimeHooks({
   proactivePushChatIdGetter,
   proactivePushTargetGetter,
   isProactivePushEnabled,
-  canSendProactivePush,
+  getAssistantRenderingMode,
+  recordMessageOwnership,
   canSendAgentActivity,
   isSessionContextActive = () => true,
   isTurnTransportActive,
@@ -341,6 +410,13 @@ export function registerTelegramLifecycleRuntimeHooks({
     OutboundAttachments.createTelegramQueuedOutboundAttachmentSender({
       sendMultipart: callMultipart,
       sendTextReply,
+      recordRuntimeEvent,
+    });
+  const richAttachmentSender =
+    OutboundAttachments.createTelegramRichOutboundAttachmentSender({
+      sendMultipart: callMultipart,
+      getRenderingMode: getAssistantRenderingMode,
+      recordOwnership: recordMessageOwnership,
       recordRuntimeEvent,
     });
   const sendGuestAttachment = async (
@@ -499,16 +575,13 @@ export function registerTelegramLifecycleRuntimeHooks({
     sendMarkdownReply,
     sendTextReply,
     sendQueuedAttachments: queuedAttachmentSender,
+    sendRichAttachmentReply: richAttachmentSender,
     answerGuestQuery,
     sendGuestReply,
     sendGuestAttachment,
     sendGuestVoiceReply,
     planOutboundReply: outboundReplyPlanner,
     sendOutboundReplyArtifacts: outboundReplyArtifactSender,
-    getDefaultChatId: proactivePushChatIdGetter,
-    getDefaultTarget: proactivePushTargetGetter,
-    isProactivePushEnabled,
-    canSendProactivePush,
     recordRuntimeEvent,
     getActiveToolExecutions: lifecycle.getActiveToolExecutions,
     setActiveToolExecutions: lifecycle.setActiveToolExecutions,
@@ -565,12 +638,14 @@ export function registerTelegramLifecycleRuntimeHooks({
     },
     async onSessionStart(event, ctx) {
       previewRuntime.invalidate();
+      assistantOutputRuntime.start();
       activityRuntime.onSessionStart?.();
       await sessionLifecycleRuntime.onSessionStart(event, ctx);
     },
     async onSessionShutdown(event, ctx) {
       if (!isSessionContextActive(ctx)) return;
       activityRuntime.onSessionShutdown();
+      assistantOutputRuntime.stop();
       compactionObserver.onSessionShutdown();
       await sessionLifecycleRuntime.onSessionShutdown(event, ctx);
     },

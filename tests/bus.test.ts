@@ -244,6 +244,21 @@ test("Bus contract encodes and parses follower registration envelopes", () => {
   );
 });
 
+test("Bus contract encodes and parses explicit follower disconnect envelopes", () => {
+  const envelope = {
+    kind: "follower.disconnect" as const,
+    requestId: "inst-a:2",
+    instanceId: "inst-a",
+    registrationGeneration: "inst-a:1",
+    sentAtMs: 2000,
+  };
+
+  assert.deepEqual(
+    parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()),
+    envelope,
+  );
+});
+
 test("Bus contract encodes and parses follower target replacement envelopes", () => {
   assert.deepEqual(
     parseTelegramBusEnvelope(
@@ -283,6 +298,18 @@ test("Bus contract encodes and parses follower target replacement envelopes", ()
 });
 
 test("Bus contract encodes and parses follower API call envelopes", () => {
+  const richBody = {
+    chat_id: 1,
+    rich_message: {
+      markdown: "hi\n\n![](tg://photo?id=result)",
+      media: [
+        {
+          id: "result",
+          media: { type: "photo", media: "cached-photo" },
+        },
+      ],
+    },
+  };
   assert.deepEqual(
     parseTelegramBusEnvelope(
       encodeTelegramBusEnvelope({
@@ -290,7 +317,7 @@ test("Bus contract encodes and parses follower API call envelopes", () => {
         requestId: "inst-a:4",
         instanceId: "inst-a",
         method: "sendRichMessage",
-        args: [{ chat_id: 1, rich_message: { markdown: "hi" } }],
+        args: [richBody],
         sentAtMs: 4000,
       }).trimEnd(),
     ),
@@ -299,7 +326,7 @@ test("Bus contract encodes and parses follower API call envelopes", () => {
       requestId: "inst-a:4",
       instanceId: "inst-a",
       method: "sendRichMessage",
-      args: [{ chat_id: 1, rich_message: { markdown: "hi" } }],
+      args: [richBody],
       sentAtMs: 4000,
     },
   );
@@ -475,7 +502,7 @@ test("Bus follower API authorizer delegates message ownership with follower iden
   assert.deepEqual(calls, ["follower-a:7:9"]);
 });
 
-test("Bus follower API allowlist permits scoped own-thread voice uploads", () => {
+test("Bus follower API allowlist permits scoped own-thread Rich media uploads", () => {
   const follower = {
     instanceId: "inst-a",
     connectedAtMs: 1000,
@@ -523,6 +550,51 @@ test("Bus follower API allowlist permits scoped own-thread voice uploads", () =>
       ],
     }),
     true,
+  );
+  const richMessage = JSON.stringify({
+    markdown: "![](tg://photo?id=photo)",
+    media: [
+      {
+        id: "photo",
+        media: { type: "photo", media: "attach://photo_upload" },
+      },
+    ],
+  });
+  assert.equal(
+    isTelegramFollowerApiCallAllowed({
+      follower,
+      method: "callMultipart",
+      args: [
+        "sendRichMessage",
+        {
+          chat_id: "10",
+          message_thread_id: "42",
+          rich_message: richMessage,
+        },
+        "photo_upload",
+        "/tmp/photo.jpg",
+        "photo.jpg",
+      ],
+    }),
+    true,
+  );
+  assert.equal(
+    isTelegramFollowerApiCallAllowed({
+      follower,
+      method: "callMultipart",
+      args: [
+        "sendRichMessage",
+        {
+          chat_id: "10",
+          message_thread_id: "99",
+          rich_message: richMessage,
+        },
+        "photo_upload",
+        "/tmp/photo.jpg",
+        "photo.jpg",
+      ],
+    }),
+    false,
   );
   assert.equal(
     isTelegramFollowerApiCallAllowed({
@@ -1326,7 +1398,10 @@ test("Bus foreign-owned update forwarder sends routed update envelopes", async (
     assert.equal(
       await forwarder.forwardMessage({
         message: { message_id: 8 },
-        ownership: { instanceId: "inst-b" },
+        ownership: {
+          instanceId: "inst-b",
+          ownerGeneration: "registration-b",
+        },
         ctx: "ctx",
       }),
       true,
@@ -1358,6 +1433,7 @@ test("Bus foreign-owned update forwarder sends routed update envelopes", async (
         kind: "leader.forwardMessage",
         requestId: "leader:3",
         recipientInstanceId: "inst-b",
+        recipientRegistrationGeneration: "registration-b",
         message: { message_id: 8 },
         sentAtMs: 9000,
       },
@@ -1453,8 +1529,29 @@ test("Bus follower registry replaces stale registrations by profile and target",
   );
 });
 
-test("Bus follower target ownership falls back only to follower thread records", () => {
+test("Bus follower target ownership carries the live registration generation", () => {
   assert.deepEqual(
+    getTelegramFollowerTargetOwnership({
+      target: { chatId: 1, threadId: 2 },
+      followers: [
+        {
+          instanceId: "follower-live",
+          target: { chatId: 1, threadId: 2 },
+          registrationGeneration: "registration-2",
+          connectedAtMs: 2000,
+          lastHeartbeatMs: 2001,
+        },
+      ],
+    }),
+    {
+      instanceId: "follower-live",
+      ownerGeneration: "registration-2",
+    },
+  );
+});
+
+test("Bus follower target ownership never treats persisted bindings as live authority", () => {
+  assert.equal(
     getTelegramFollowerTargetOwnership({
       target: { chatId: 1, threadId: 2 },
       followers: [],
@@ -1469,7 +1566,7 @@ test("Bus follower target ownership falls back only to follower thread records",
         },
       ],
     }),
-    { instanceId: "follower-a" },
+    undefined,
   );
   assert.equal(
     getTelegramFollowerTargetOwnership({

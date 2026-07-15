@@ -10,7 +10,10 @@ import { basename } from "node:path";
 import { Type } from "@sinclair/typebox";
 
 import type { ExtensionAPI } from "./pi.ts";
-import { buildTelegramMultipartReplyParameters } from "./replies.ts";
+import {
+  buildTelegramMultipartReplyParameters,
+  normalizeTelegramNativeMarkdown,
+} from "./replies.ts";
 import {
   getTelegramTargetThreadParams,
   type TelegramTarget,
@@ -95,6 +98,152 @@ export interface TelegramQueuedOutboundAttachmentTurnView extends TelegramOutbou
   chatId: number;
   replyToMessageId: number;
   target?: TelegramTarget;
+}
+
+class TelegramRichAttachmentCommitUnknownError extends Error {
+  readonly kind = "commit-unknown" as const;
+
+  constructor(cause: unknown) {
+    super("Telegram Rich media upload may have committed without a message id.");
+    this.name = "TelegramRichAttachmentCommitUnknownError";
+    this.cause = cause;
+  }
+}
+
+function isTelegramRichAttachmentCommitUnknownError(error: unknown): boolean {
+  return (
+    error instanceof TelegramRichAttachmentCommitUnknownError ||
+    (typeof error === "object" &&
+      error !== null &&
+      (error as { kind?: unknown }).kind === "commit-unknown")
+  );
+}
+
+export interface TelegramRichOutboundAttachmentPlan {
+  method: "sendRichMessage";
+  fields: Record<string, string>;
+  fileField: "rich_media_upload";
+  filePath: string;
+  fileName: string;
+}
+
+export interface TelegramRichOutboundAttachmentSenderDeps extends TelegramOutboundAttachmentRuntimeEventRecorderPort {
+  sendMultipart: TelegramQueuedOutboundAttachmentDeliveryDeps["sendMultipart"];
+  getRenderingMode: () => "rich" | "html";
+  recordOwnership?: (input: {
+    chatId: number;
+    messageId: number;
+    target?: TelegramTarget;
+  }) => void;
+}
+
+export function planTelegramRichOutboundAttachment(options: {
+  turn: TelegramQueuedOutboundAttachmentTurnView;
+  markdown: string;
+  renderingMode: "rich" | "html";
+  replyMarkup?: unknown;
+}): TelegramRichOutboundAttachmentPlan | undefined {
+  if (options.renderingMode !== "rich") return undefined;
+  if (!options.markdown.trim()) return undefined;
+  if (options.turn.queuedAttachments.length !== 1) return undefined;
+  const attachment = options.turn.queuedAttachments[0]!;
+  const normalizedPath = attachment.path.toLowerCase();
+  const mediaType = normalizedPath.endsWith(".jpg") ||
+      normalizedPath.endsWith(".jpeg") ||
+      normalizedPath.endsWith(".png")
+    ? "photo"
+    : normalizedPath.endsWith(".mp4")
+      ? "video"
+      : normalizedPath.endsWith(".mp3")
+        ? "audio"
+        : undefined;
+  if (!mediaType) return undefined;
+  const mediaId = "artifact";
+  const richMessage = {
+    markdown: `${normalizeTelegramNativeMarkdown(options.markdown)}\n\n![](tg://${mediaType}?id=${mediaId})`,
+    media: [
+      {
+        id: mediaId,
+        media: {
+          type: mediaType,
+          media: "attach://rich_media_upload",
+        },
+      },
+    ],
+    skip_entity_detection: true,
+  };
+  const replyParameters =
+    options.turn.replyToMessageId > 0
+      ? JSON.stringify({
+          message_id: options.turn.replyToMessageId,
+          allow_sending_without_reply: true,
+        })
+      : undefined;
+  return {
+    method: "sendRichMessage",
+    fields: {
+      chat_id: String(options.turn.chatId),
+      ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+      ...getTelegramMultipartTargetFields(options.turn.target),
+      rich_message: JSON.stringify(richMessage),
+      ...(options.replyMarkup
+        ? { reply_markup: JSON.stringify(options.replyMarkup) }
+        : {}),
+    },
+    fileField: "rich_media_upload",
+    filePath: attachment.path,
+    fileName: attachment.fileName,
+  };
+}
+
+export function createTelegramRichOutboundAttachmentSender(
+  deps: TelegramRichOutboundAttachmentSenderDeps,
+) {
+  return async (
+    turn: TelegramQueuedOutboundAttachmentTurnView,
+    markdown: string,
+    options?: { replyMarkup?: unknown },
+  ): Promise<boolean> => {
+    const plan = planTelegramRichOutboundAttachment({
+      turn,
+      markdown,
+      renderingMode: deps.getRenderingMode(),
+      replyMarkup: options?.replyMarkup,
+    });
+    if (!plan) return false;
+    try {
+      const result = await deps.sendMultipart(
+        plan.method,
+        plan.fields,
+        plan.fileField,
+        plan.filePath,
+        plan.fileName,
+      );
+      const messageId =
+        result && typeof result === "object" &&
+          Number.isInteger((result as { message_id?: unknown }).message_id)
+          ? (result as { message_id: number }).message_id
+          : undefined;
+      if (messageId === undefined) {
+        throw new TelegramRichAttachmentCommitUnknownError(
+          new Error("Successful Rich media upload omitted message_id."),
+        );
+      }
+      deps.recordOwnership?.({
+        chatId: turn.chatId,
+        messageId,
+        target: turn.target,
+      });
+      return true;
+    } catch (error) {
+      if (isTelegramRichAttachmentCommitUnknownError(error)) throw error;
+      deps.recordRuntimeEvent?.("attachment", error, {
+        phase: "rich-media-known-failure",
+        fileName: plan.fileName,
+      });
+      return false;
+    }
+  };
 }
 
 export type TelegramGuestCachedAttachmentResult =

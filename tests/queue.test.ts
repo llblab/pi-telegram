@@ -994,6 +994,90 @@ test("Agent end runtime resets state, finalizes replies, sends attachments, and 
   ]);
 });
 
+test("Agent end runtime delivers one Rich attachment result without duplicate text or upload", async () => {
+  const events: string[] = [];
+  const turn = createQueueTestPromptTurn({
+    queuedAttachments: [{ path: "/tmp/demo.png", fileName: "demo.png" }],
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "final" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => events.push("reset"),
+    updateStatus: () => events.push("status"),
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {
+      events.push("clear");
+    },
+    setPreviewPendingText: () => events.push("preview"),
+    finalizeMarkdownPreview: async () => {
+      events.push("unexpected:finalize");
+      return false;
+    },
+    sendMarkdownReply: async () => {
+      events.push("unexpected:markdown");
+    },
+    sendTextReply: async () => {
+      events.push("unexpected:text");
+    },
+    sendQueuedAttachments: async () => {
+      events.push("unexpected:attachment");
+    },
+    sendRichAttachmentReply: async (_nextTurn, markdown) => {
+      events.push(`rich:${markdown}`);
+      return true;
+    },
+  });
+  assert.deepEqual(events, [
+    "reset",
+    "status",
+    "preview",
+    "rich:final",
+    "clear",
+    "dispatch",
+  ]);
+});
+
+test("Agent end runtime never falls back after ambiguous Rich attachment delivery", async () => {
+  const events: string[] = [];
+  await handleTelegramAgentEndRuntime({
+    turn: createQueueTestPromptTurn({
+      queuedAttachments: [{ path: "/tmp/demo.png", fileName: "demo.png" }],
+    }),
+    assistant: { text: "final" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {
+      events.push("unexpected:clear");
+    },
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => {
+      events.push("unexpected:finalize");
+      return false;
+    },
+    sendMarkdownReply: async () => {
+      events.push("unexpected:markdown");
+    },
+    sendTextReply: async () => {
+      events.push("unexpected:text");
+    },
+    sendQueuedAttachments: async () => {
+      events.push("unexpected:attachment");
+    },
+    sendRichAttachmentReply: async () => {
+      throw new Error("commit unknown");
+    },
+    recordRuntimeEvent: (_category, _error, details) =>
+      events.push(`record:${details?.phase}`),
+  });
+  assert.deepEqual(events, [
+    "record:rich-attachment-commit-unknown",
+    "dispatch",
+  ]);
+});
+
 test("Agent end runtime delivers one Guest Mode attachment instead of a text article", async () => {
   const events: unknown[] = [];
   const turn: PendingTelegramTurn = createQueueTestPromptTurn({
@@ -1215,6 +1299,91 @@ test("Agent end scheduled delivery stops after session generation loss", async (
   assert.deepEqual(events, ["reset", "status"]);
 });
 
+test("Agent end Rich attachment delivery never starts through a replacement session", async () => {
+  const events: string[] = [];
+  let active = true;
+  let scheduledTask: (() => Promise<void>) | undefined;
+  await handleTelegramAgentEndRuntime({
+    turn: createQueueTestPromptTurn({
+      queuedAttachments: [{ path: "/tmp/demo.png", fileName: "demo.png" }],
+    }),
+    assistant: { text: "stale rich final" },
+    foldQueuedPromptsIntoHistory: false,
+    isSessionActive: () => active,
+    resetRuntimeState: () => events.push("reset"),
+    updateStatus: () => events.push("status"),
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    scheduleActiveTurnDelivery: (task) => {
+      scheduledTask = task;
+    },
+    clearPreview: async () => {
+      events.push("clear");
+    },
+    setPreviewPendingText: () => events.push("preview"),
+    sendRichAttachmentReply: async () => {
+      events.push("rich");
+      return true;
+    },
+    finalizeMarkdownPreview: async () => {
+      events.push("finalize");
+      return true;
+    },
+    sendMarkdownReply: async () => {
+      events.push("markdown");
+    },
+    sendTextReply: async () => {
+      events.push("text");
+    },
+    sendQueuedAttachments: async () => {
+      events.push("attachments");
+    },
+  });
+  active = false;
+  await scheduledTask?.();
+
+  assert.deepEqual(events, ["reset", "status"]);
+});
+
+test("Agent end Rich attachment delivery stops stale continuation after replacement", async () => {
+  const events: string[] = [];
+  let active = true;
+  await handleTelegramAgentEndRuntime({
+    turn: createQueueTestPromptTurn({
+      queuedAttachments: [{ path: "/tmp/demo.png", fileName: "demo.png" }],
+    }),
+    assistant: { text: "in-flight rich final" },
+    foldQueuedPromptsIntoHistory: false,
+    isSessionActive: () => active,
+    resetRuntimeState: () => events.push("reset"),
+    updateStatus: () => events.push("status"),
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {
+      events.push("clear");
+    },
+    setPreviewPendingText: () => events.push("preview"),
+    sendRichAttachmentReply: async () => {
+      events.push("rich");
+      active = false;
+      return true;
+    },
+    finalizeMarkdownPreview: async () => {
+      events.push("finalize");
+      return true;
+    },
+    sendMarkdownReply: async () => {
+      events.push("markdown");
+    },
+    sendTextReply: async () => {
+      events.push("text");
+    },
+    sendQueuedAttachments: async () => {
+      events.push("attachments");
+    },
+  });
+
+  assert.deepEqual(events, ["reset", "status", "preview", "rich"]);
+});
+
 test("Agent end stops old-profile delivery after preview finalization yields", async () => {
   const events: string[] = [];
   let transportActive = true;
@@ -1336,59 +1505,15 @@ test("Agent end runtime records final delivery failures and dispatches", async (
   ]);
 });
 
-test("Agent end runtime sends proactive local result", async () => {
+test("Agent end runtime leaves proactive local output to Activity projection", async () => {
   const events: string[] = [];
   await handleTelegramAgentEndRuntime({
     turn: undefined,
     assistant: { text: "done" },
     foldQueuedPromptsIntoHistory: false,
-    resetRuntimeState: () => {
-      events.push("reset");
-    },
-    updateStatus: () => {
-      events.push("status");
-    },
-    dispatchNextQueuedTelegramTurn: () => {
-      events.push("dispatch");
-    },
-    clearPreview: async () => {},
-    setPreviewPendingText: () => {},
-    finalizeMarkdownPreview: async () => false,
-    sendMarkdownReply: async (chatId, replyToMessageId, markdown, options) => {
-      events.push(
-        `markdown:${chatId}:${replyToMessageId}:${options?.target?.threadId ?? "none"}:${markdown}`,
-      );
-    },
-    sendTextReply: async () => {},
-    sendQueuedAttachments: async () => {},
-    getDefaultChatId: () => 7,
-    getDefaultTarget: () => ({ chatId: 7, threadId: 42 }),
-    isProactivePushEnabled: () => true,
-    canSendProactivePush: () => true,
-  });
-  assert.deepEqual(events, [
-    "reset",
-    "status",
-    "markdown:7:undefined:42:done",
-    "dispatch",
-  ]);
-});
-
-test("Agent end runtime skips proactive local result without ownership", async () => {
-  const events: string[] = [];
-  await handleTelegramAgentEndRuntime({
-    turn: undefined,
-    assistant: { text: "done" },
-    foldQueuedPromptsIntoHistory: false,
-    resetRuntimeState: () => {
-      events.push("reset");
-    },
-    updateStatus: () => {
-      events.push("status");
-    },
-    dispatchNextQueuedTelegramTurn: () => {
-      events.push("dispatch");
-    },
+    resetRuntimeState: () => events.push("reset"),
+    updateStatus: () => events.push("status"),
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
     clearPreview: async () => {},
     setPreviewPendingText: () => {},
     finalizeMarkdownPreview: async () => false,
@@ -1397,20 +1522,8 @@ test("Agent end runtime skips proactive local result without ownership", async (
     },
     sendTextReply: async () => {},
     sendQueuedAttachments: async () => {},
-    getDefaultChatId: () => 7,
-    isProactivePushEnabled: () => true,
-    canSendProactivePush: () => false,
-    recordRuntimeEvent: (category, error, details) => {
-      const message = error instanceof Error ? error.message : String(error);
-      events.push(`${category}:${details?.phase}:${message}`);
-    },
   });
-  assert.deepEqual(events, [
-    "reset",
-    "status",
-    "proactive-push:ownership:Proactive push skipped because this instance does not own Telegram polling.",
-    "dispatch",
-  ]);
+  assert.deepEqual(events, ["reset", "status", "dispatch"]);
 });
 
 test("Agent end runtime keeps queued Telegram turn delivery independent from polling ownership", async () => {

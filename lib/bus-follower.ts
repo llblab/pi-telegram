@@ -98,6 +98,7 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
     options?: { target?: TelegramTarget },
   ) => Promise<boolean>;
   setContext: (ctx: TContext) => void;
+  disconnectFromLeader?: () => Promise<boolean>;
   stop: () => void;
 }
 
@@ -108,6 +109,10 @@ export interface TelegramBusFollowerSessionReplacementSuspenderDeps {
   >;
   instanceId: string;
   suspendPolling: () => Promise<void>;
+  isLeader?: () => boolean;
+  getLeaderBinding?: () => TelegramBusFollowerPromotedBinding | undefined;
+  getActiveContext?: () => { cwd?: string } | undefined;
+  getActiveProfileName?: () => string | undefined;
   recordRuntimeEvent: (
     category: string,
     error: unknown,
@@ -139,6 +144,8 @@ export interface TelegramBusFollowerRegistrationState {
   getSlot: () => string | undefined;
   getThreadName: () => string | undefined;
   getGeneration: () => string | undefined;
+  getEligibleElectionSlots: () => readonly string[];
+  setEligibleElectionSlots: (slots: readonly string[]) => void;
   setRegistered: (
     registered: boolean,
     target?: TelegramTarget,
@@ -151,12 +158,20 @@ export interface TelegramBusForwardedUpdateReceiverRuntime {
   stop: () => Promise<void>;
 }
 
-export interface TelegramBusFollowerClientRuntimeDeps {
+export interface TelegramBusFollowerClientRuntimeDeps<TMessage = unknown> {
   socketPath: TelegramBusSocketPathSource;
   instanceId: string;
   getApiAuthSecret?: () => string | undefined;
   getForwardingAuthSecret?: () => string | undefined;
   getRegistrationGeneration?: () => string | undefined;
+  getForwardCommentBatchPosition?: (
+    message: TMessage,
+  ) => "comment" | "forward" | undefined;
+  recordRuntimeEvent?: (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
   timeoutMs?: number;
 }
 
@@ -239,9 +254,11 @@ export function createTelegramBusFollowerPromotionHandler<
     error: unknown,
     details?: Record<string, unknown>,
   ) => void;
+  getNowMs?: () => number;
+  getPid?: () => number;
 }): TelegramBusFollowerPromotionHandler<TContext> {
-  return async (ctx, binding, election) =>
-    input.startLeader(ctx, election, async () => {
+  return async (ctx, binding, election) => {
+    const promoted = await input.startLeader(ctx, election, async () => {
       const promotedRecord =
         await Threads.promoteTelegramFollowerBindingToLeader({
           store: input.topicTargetStore,
@@ -266,6 +283,39 @@ export function createTelegramBusFollowerPromotionHandler<
         );
       }
     });
+    if (promoted && typeof binding.target?.threadId === "number") {
+      const profileKey = Threads.getTelegramThreadOwnerKey({
+        kind: "leader",
+        cwd: ctx.cwd,
+        instanceId: input.instanceId,
+        telegramProfile: input.getActiveProfileName(),
+      });
+      Threads.setTelegramLeaderSessionHandoff({
+        pid: input.getPid?.() ?? process.pid,
+        instanceId: input.instanceId,
+        createdAtMs: input.getNowMs?.() ?? Date.now(),
+        profileKey,
+        target: {
+          chatId: binding.target.chatId,
+          threadId: binding.target.threadId,
+        },
+        slot: binding.slot,
+        threadName: binding.threadName,
+      });
+      input.recordRuntimeEvent(
+        "bus",
+        "Promoted leader binding retained for session replacement",
+        {
+          phase: "follower-promoted-session-handoff",
+          chatId: binding.target.chatId,
+          threadId: binding.target.threadId,
+          slot: binding.slot,
+          threadName: binding.threadName,
+        },
+      );
+    }
+    return promoted;
+  };
 }
 
 export interface TelegramBusFollowerTargetReplacementHandlerDeps<TContext> {
@@ -309,7 +359,11 @@ export interface TelegramBusFollowerPromotedBinding {
 export interface TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext> {
   registrationState: Pick<
     TelegramBusFollowerRegistrationState,
-    "getTarget" | "getSlot" | "getThreadName" | "setRegistered"
+    | "getTarget"
+    | "getSlot"
+    | "getThreadName"
+    | "getEligibleElectionSlots"
+    | "setRegistered"
   >;
   getRegistrationRuntime: () => TelegramBusFollowerRegistrationRuntime<TContext>;
   getLeaderState: () => TelegramBusFollowerLeaderState;
@@ -350,6 +404,10 @@ export interface TelegramBusForwardedUpdateReceiverRuntimeDeps<
     reactionUpdate: TReactionUpdate,
     ctx: TContext,
   ) => Promise<void> | void;
+  prepareForwardedMessage?: (
+    message: TMessage,
+    position: "comment" | "forward",
+  ) => void;
   handleForwardedMessage?: (
     message: TMessage,
     ctx: TContext,
@@ -564,7 +622,7 @@ export function createTelegramBusFollowerClientRuntime<
   TReactionUpdate,
   TCallbackQuery,
   TMessage = unknown,
->(deps: TelegramBusFollowerClientRuntimeDeps) {
+>(deps: TelegramBusFollowerClientRuntimeDeps<TMessage>) {
   const createRequestId = createTelegramBusRequestIdFactory(deps.instanceId);
   const sharedClientDeps = {
     socketPath: deps.socketPath,
@@ -587,6 +645,9 @@ export function createTelegramBusFollowerClientRuntime<
     >({
       ...sharedClientDeps,
       getAuthSecret: deps.getForwardingAuthSecret,
+      getForwardCommentBatchPosition:
+        deps.getForwardCommentBatchPosition,
+      recordRuntimeEvent: deps.recordRuntimeEvent,
     }),
     targetController: createTelegramBusFollowerTargetController({
       ...sharedClientDeps,
@@ -689,6 +750,41 @@ export function createTelegramBusFollowerSessionReplacementSuspender(
           threadId: target.threadId,
         },
       );
+    } else if (deps.isLeader?.()) {
+      const leaderBinding = deps.getLeaderBinding?.();
+      if (typeof leaderBinding?.target?.threadId === "number") {
+        const activeContext = deps.getActiveContext?.();
+        const profileKey = Threads.getTelegramThreadOwnerKey({
+          kind: "leader",
+          cwd: activeContext?.cwd,
+          instanceId: deps.instanceId,
+          telegramProfile: deps.getActiveProfileName?.(),
+        });
+        Threads.setTelegramLeaderSessionHandoff({
+          pid: getPid(),
+          instanceId: deps.instanceId,
+          createdAtMs: getNowMs(),
+          profileKey,
+          target: {
+            chatId: leaderBinding.target.chatId,
+            threadId: leaderBinding.target.threadId,
+          },
+          slot: leaderBinding.slot,
+          threadName: leaderBinding.threadName,
+        });
+        deps.recordRuntimeEvent(
+          "bus",
+          "Telegram leader binding suspended for session replacement",
+          {
+            phase: "leader-session-handoff",
+            instanceId: deps.instanceId,
+            chatId: leaderBinding.target.chatId,
+            threadId: leaderBinding.target.threadId,
+            slot: leaderBinding.slot,
+            threadName: leaderBinding.threadName,
+          },
+        );
+      }
     }
     await deps.suspendPolling();
   };
@@ -751,12 +847,19 @@ export function createTelegramBusFollowerRegistrationState(): TelegramBusFollowe
   let slot: string | undefined;
   let threadName: string | undefined;
   let generation: string | undefined;
+  let eligibleElectionSlots: string[] = [];
   return {
     isRegistered: () => registered,
     getTarget: () => (target ? { ...target } : undefined),
     getSlot: () => slot,
     getThreadName: () => threadName,
     getGeneration: () => generation,
+    getEligibleElectionSlots: () => [...eligibleElectionSlots],
+    setEligibleElectionSlots: (slots) => {
+      eligibleElectionSlots = Array.from(
+        new Set(slots.filter((slot) => /^[A-Z]$/.test(slot))),
+      ).sort();
+    },
     setRegistered: (next, nextTarget, metadata) => {
       registered = next;
       target = next ? (nextTarget ? { ...nextTarget } : undefined) : undefined;
@@ -868,7 +971,7 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
     deps.getRegistrationRuntime().stop();
     deps.setLifecyclePhase("electing");
     safeUpdateStatus(ctx);
-    deps.recordRuntimeEvent("bus", "Telegram follower elected for promotion", {
+    deps.recordRuntimeEvent("bus", "Telegram follower attempting promotion", {
       phase: "follower-promotion-electing",
     });
     const promoted = await deps.promoteToLeader(ctx, binding, election);
@@ -886,6 +989,51 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
       },
     );
     if (!promoted) scheduleRecovery(reason, ctx, binding);
+  };
+  const attemptPreferredPromotion = async (
+    reason: unknown,
+    ctx: TContext,
+    binding: TelegramBusFollowerPromotedBinding,
+    candidateState: TelegramBusFollowerLeaderState,
+  ): Promise<void> => {
+    const slot = binding.slot;
+    const lowerEligibleSlot = slot
+      ? deps.registrationState
+          .getEligibleElectionSlots()
+          .find((candidate) => candidate < slot)
+      : undefined;
+    if (lowerEligibleSlot) {
+      deps.recordRuntimeEvent(
+        "bus",
+        "Telegram follower deferring to a lower-slot election candidate",
+        {
+          phase: "follower-promotion-slot-priority",
+          slot,
+          lowerEligibleSlot,
+        },
+      );
+      await sleep(promotionGraceMs);
+      candidateState = deps.getLeaderState();
+      if (candidateState.kind === "active-elsewhere") {
+        if (
+          !(await tryRegisterWithLeader(
+            ctx,
+            candidateState.lock,
+            "follower-register-preferred-successor",
+            binding,
+          ))
+        ) {
+          scheduleRecovery(reason, ctx, binding);
+        }
+        return;
+      }
+    }
+    if (candidateState.kind !== "stale" && candidateState.kind !== "inactive")
+      return;
+    await promoteToLeader(reason, ctx, binding, {
+      expectedOwner:
+        candidateState.kind === "stale" ? candidateState.lock : undefined,
+    });
   };
   const recover = async (
     error: unknown,
@@ -943,19 +1091,15 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
           scheduleRecovery(error, ctx, initialBinding);
           return;
         }
-        if (graceState.kind === "stale" || graceState.kind === "inactive") {
-          await promoteToLeader(error, ctx, initialBinding, {
-            expectedOwner:
-              graceState.kind === "stale" ? graceState.lock : undefined,
-          });
-        }
+        await attemptPreferredPromotion(
+          error,
+          ctx,
+          initialBinding,
+          graceState,
+        );
         return;
       }
-      if (state.kind === "stale" || state.kind === "inactive") {
-        await promoteToLeader(error, ctx, initialBinding, {
-          expectedOwner: state.kind === "stale" ? state.lock : undefined,
-        });
-      }
+      await attemptPreferredPromotion(error, ctx, initialBinding, state);
     } catch (promotionError) {
       deps.setLifecyclePhase(undefined);
       safeUpdateStatus(ctx);
@@ -1035,6 +1179,17 @@ export function createTelegramBusFollowerRegistrationRuntime<
           sentAtMs: getNowMs(),
         },
       });
+      if (response?.kind === "bus.ack" && response.ok) {
+        const heartbeatResult = isRecord(response.result)
+          ? response.result
+          : undefined;
+        const slots = Array.isArray(heartbeatResult?.eligibleElectionSlots)
+          ? heartbeatResult.eligibleElectionSlots.filter(
+              (slot): slot is string => typeof slot === "string",
+            )
+          : [];
+        deps.registrationState?.setEligibleElectionSlots(slots);
+      }
       if (response?.kind === "bus.ack" && !response.ok) {
         throw new Error(
           response.message ?? "Telegram bus follower heartbeat was rejected.",
@@ -1172,6 +1327,33 @@ export function createTelegramBusFollowerRegistrationRuntime<
     setContext(ctx) {
       activeContext = ctx;
     },
+    async disconnectFromLeader() {
+      if (!activeLeaderSocketPath || !activeRegistrationGeneration) {
+        return false;
+      }
+      const response = await sendTelegramBusLocalEnvelope({
+        socketPath: activeLeaderSocketPath,
+        timeoutMs: registrationTimeoutMs,
+        retry: getTelegramBusTransportRetryPolicy({
+          endpoint: activeLeaderSocketPath,
+          operation: "operation",
+        }),
+        envelope: {
+          kind: "follower.disconnect",
+          requestId: deps.createRequestId(),
+          auth: activeAuthSecret,
+          instanceId: deps.instanceId,
+          registrationGeneration: activeRegistrationGeneration,
+          sentAtMs: getNowMs(),
+        },
+      });
+      if (response?.kind === "bus.ack" && response.ok) return true;
+      throw new Error(
+        response?.kind === "bus.ack"
+          ? (response.message ?? "Telegram follower disconnect was rejected.")
+          : "Telegram follower disconnect was not acknowledged.",
+      );
+    },
     stop,
   };
 }
@@ -1250,6 +1432,12 @@ export function createTelegramBusForwardedUpdateReceiverRuntime<
             ctx,
           );
         } else if (envelope.kind === "leader.forwardMessage") {
+          if (envelope.forwardCommentBatchPosition) {
+            deps.prepareForwardedMessage?.(
+              envelope.message as TMessage,
+              envelope.forwardCommentBatchPosition,
+            );
+          }
           if (!deps.handleForwardedMessage) {
             throw new Error(
               "Telegram bus receiver cannot handle this envelope.",

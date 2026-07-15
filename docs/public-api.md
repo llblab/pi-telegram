@@ -41,7 +41,7 @@ Stable commands inside Pi:
 
 - `/telegram-setup` — configure/update the bot token.
 - `/telegram-connect` — start polling here and acquire external Telegram control ownership. Accepted queue/reply state stays local if ownership later moves elsewhere.
-- `/telegram-disconnect` — stop polling and release ownership without deleting or silencing accepted local queue state.
+- `/telegram-disconnect` — stop polling and release ownership without deleting or silencing accepted local queue state. In Threaded Mode it first asks for confirmation, then deletes this instance's current Telegram thread; a follower waits for its active leader to confirm generation-fenced cleanup before stopping.
 - `/telegram-status` — show connection, polling, execution, queue, and recent event diagnostics.
 
 ### Telegram commands
@@ -61,7 +61,7 @@ This command surface is a mobile companion subset, not a raw terminal-command br
 
 ### Tools and assistant-authored actions
 
-- `telegram_attach(paths, chat_id?, thread_id?, caption?)` is the stable artifact delivery tool for generated files. During Telegram turns it queues files for the active reply; outside Telegram turns it sends files directly to the paired/default chat, the registered follower's assigned thread, or an explicit `chat_id` plus optional `thread_id` when this Pi instance owns `/telegram-connect` or is registered with the multi-instance bus.
+- `telegram_attach(paths, chat_id?, thread_id?, caption?)` is the stable artifact delivery tool for generated files. During Telegram turns it queues files for the active reply; with `assistant.rendering: "rich"`, exactly one PNG/JPEG, MP4, or MP3 artifact plus non-empty final Markdown can become one reply-anchored Rich Message. HTML mode, multiple/unsupported files, Guest Mode, and voice outputs retain their established paths. Outside Telegram turns the tool sends files directly to the paired/default chat, the registered follower's assigned thread, or an explicit `chat_id` plus optional `thread_id` when this Pi instance owns `/telegram-connect` or is registered with the multi-instance bus.
 - `telegram_message(text, chat_id?, thread_id?)` sends a direct Telegram Markdown message from local/TUI-initiated work when this Pi instance owns `/telegram-connect` or is registered with the multi-instance bus. Top-level `telegram_button` comments inside `text` are parsed with the same planner used for normal replies and attached to that message; buttons are never standalone Telegram messages.
 - `telegram_help()` returns detailed agent-facing guidance for pi-telegram delivery actions, Threaded Mode, formatting, and debugging. The regular prompt only points agents at this tool instead of repeating the full guidance on every turn.
 - `telegram_voice` hidden comments request Telegram-native voice delivery.
@@ -84,10 +84,14 @@ interface TelegramConfig {
   botId?: number; // runtime-managed
   allowedUserId?: number;
   lastUpdateId?: number; // runtime-managed
-  proactivePush?: boolean;
   inboundHandlers?: TelegramInboundHandlerConfig[];
   attachmentHandlers?: TelegramInboundHandlerConfig[]; // compatibility alias
   outboundHandlers?: TelegramOutboundHandlerConfig[];
+  assistant?: {
+    draftPreviews?: boolean;
+    rendering?: "rich" | "html";
+    proactivePush?: boolean;
+  };
   voice?: {
     replyMode?: "manual" | "mirror" | "always";
     sendTranscript?: boolean;
@@ -101,11 +105,12 @@ interface TelegramConfig {
 
 Hidden/default semantics are represented by absence:
 
+- `assistant.proactivePush` defaults to `true`; omit it to keep projection enabled, or set it explicitly to `false` to disable it. When enabled, each completed public assistant text block from local or autonomous work is projected to the authorized Telegram target once and in source order. This includes visible intermediate commentary/checkpoints and the final block. It excludes token deltas, hidden reasoning, tool calls/arguments/results, Telegram-owned turns, empty blocks, and stale authority. Projection uses the configured Rich or HTML assistant renderer and binds admitted work to the exact target, profile/token transport generation, direct leader epoch or follower registration generation, and session generation. The old top-level `proactivePush` key is ignored; move the setting manually under `assistant`.
 - Voice Reply `hidden`: no `voice.replyMode` key is persisted.
 - Agent activity status is not configurable in this release. Telegram uses native `sendChatAction(typing)` / product `...active` status as the only automatic in-chat work signal before the final reply.
 - Time Injection `hidden`: no `time.injectionMode` key is persisted; if `time` becomes empty, the whole `time` object may be omitted.
 
-Assistant Markdown delivery is native: final replies are sent as `InputRichMessage.markdown` via `sendRichMessage`, and draft previews use `sendRichMessageDraft` when a structurally closed preview frame is available. Draft-frame failures are recorded and skipped rather than converted into raw plain preview messages, because partial Markdown can be temporarily invalid while the final answer remains valid. Long native replies are split at Telegram Rich Message transport limits, with oversized fenced code, display-math, and fully wrapped inline-formatting blocks rewrapped per chunk so persisted chunks remain structurally valid. Guest replies use `InputRichMessageContent` in `answerGuestQuery` results. Bridge-owned UI surfaces such as menus, status, queue controls, commands, and sections keep explicit Telegram HTML/plain rendering by default because those texts are authored by the bridge or companion extensions for Telegram UI. Companion extension sections may explicitly request `"markdown"`, `"html"`, or `"plain"` per view. There is no `telegram.json` rendering toggle for assistant delivery. The bridge sets `skip_entity_detection: true` for assistant and guest Markdown so technical text such as `/commands`, hashtags, URLs, phone numbers, and card-like numbers does not gain unintended automatic entities; explicit Markdown links still belong in the Markdown source.
+With `assistant.rendering: "rich"` (the default), assistant Markdown delivery is native: final replies are sent as `InputRichMessage.markdown` via `sendRichMessage`, and draft previews use `sendRichMessageDraft` when a structurally closed preview frame is available. Draft-frame failures are recorded and skipped rather than converted into raw plain preview messages, because partial Markdown can be temporarily invalid while the final answer remains valid. Long native replies are split at Telegram Rich Message transport limits, with oversized fenced code, display-math, and fully wrapped inline-formatting blocks rewrapped per chunk so persisted chunks remain structurally valid. Guest replies use `InputRichMessageContent` in `answerGuestQuery` results. Bridge-owned UI surfaces such as menus, status, queue controls, commands, and sections keep explicit Telegram HTML/plain rendering by default because those texts are authored by the bridge or companion extensions for Telegram UI. Companion extension sections may explicitly request `"markdown"`, `"html"`, or `"plain"` per view. `assistant.rendering: "html"` keeps the compatibility path that converts assistant Markdown to Telegram HTML before ordinary message delivery. The bridge sets `skip_entity_detection: true` for assistant and guest Markdown so technical text such as `/commands`, hashtags, URLs, phone numbers, and card-like numbers does not gain unintended automatic entities; explicit Markdown links still belong in the Markdown source.
 
 Environment variables are stable only where documented in the README: bot-token bootstrap, proxy behavior, agent root, and inbound/outbound file size limits.
 

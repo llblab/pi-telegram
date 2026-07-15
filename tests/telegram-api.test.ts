@@ -37,6 +37,7 @@ import {
   prepareTelegramTempDir,
   TELEGRAM_FILE_MAX_BYTES,
   type TelegramApiClient,
+  type TelegramInputRichMessage,
 } from "../lib/telegram-api.ts";
 
 function createApiResponseBody(result: unknown): { ok: true; result: unknown } {
@@ -129,6 +130,12 @@ function createApiRuntimeClient(
     ...overrides,
   };
 }
+
+test("Outgoing Rich Message type excludes explicit structured blocks", () => {
+  // @ts-expect-error Core output supports Markdown/HTML only; blocks include draft-only Thinking.
+  const unsupported: TelegramInputRichMessage = { blocks: [] };
+  assert.deepEqual(unsupported, { blocks: [] });
+});
 
 test("Telegram API byte-limit helpers expose the inbound file default", () => {
   assert.equal(TELEGRAM_FILE_MAX_BYTES, 50 * 1024 * 1024);
@@ -938,6 +945,19 @@ test("Telegram bridge API runtime exposes typed Bot API helpers", async () => {
         if (method === "getUpdates") return [{ update_id: 10 }] as TResponse;
         return true as TResponse;
       },
+      callMultipart: async <TResponse>(
+        method: string,
+        fields: Record<string, string>,
+        fileField: string,
+        filePath: string,
+        fileName: string,
+      ) => {
+        calls.push({
+          method,
+          body: { fields, fileField, filePath, fileName },
+        });
+        return { message_id: 10 } as TResponse;
+      },
     }),
   });
   assert.equal(await runtime.deleteWebhook(), true);
@@ -980,7 +1000,24 @@ test("Telegram bridge API runtime exposes typed Bot API helpers", async () => {
   assert.deepEqual(
     await runtime.sendRichMessage({
       chat_id: 1,
-      rich_message: { markdown: "# hello" },
+      rich_message: {
+        markdown:
+          "# hello\n\n![](tg://photo?id=cover)\n\n![](tg://audio?id=voice)",
+        media: [
+          {
+            id: "cover",
+            media: { type: "photo", media: "https://example.com/cover.jpg" },
+          },
+          {
+            id: "voice",
+            media: {
+              type: "voice_note",
+              media: "cached-voice",
+              duration: 4,
+            },
+          },
+        ],
+      },
     }),
     { message_id: 9 },
   );
@@ -991,6 +1028,25 @@ test("Telegram bridge API runtime exposes typed Bot API helpers", async () => {
       rich_message: { markdown: "**draft**" },
     }),
     true,
+  );
+  const uploadRichMessage = {
+    markdown: "Voice\n\n![](tg://audio?id=voice)",
+    media: [
+      {
+        id: "voice",
+        media: { type: "voice_note", media: "attach://voice_upload" },
+      },
+    ],
+  };
+  assert.deepEqual(
+    await runtime.callMultipart(
+      "sendRichMessage",
+      { chat_id: "1", rich_message: JSON.stringify(uploadRichMessage) },
+      "voice_upload",
+      "/tmp/voice.ogg",
+      "voice.ogg",
+    ),
+    { message_id: 10 },
   );
   assert.deepEqual(calls, [
     { method: "deleteWebhook", body: { drop_pending_updates: false } },
@@ -1069,7 +1125,30 @@ test("Telegram bridge API runtime exposes typed Bot API helpers", async () => {
     { method: "sendMessage", body: { chat_id: 1, text: "hello" } },
     {
       method: "sendRichMessage",
-      body: { chat_id: 1, rich_message: { markdown: "# hello" } },
+      body: {
+        chat_id: 1,
+        rich_message: {
+          markdown:
+            "# hello\n\n![](tg://photo?id=cover)\n\n![](tg://audio?id=voice)",
+          media: [
+            {
+              id: "cover",
+              media: {
+                type: "photo",
+                media: "https://example.com/cover.jpg",
+              },
+            },
+            {
+              id: "voice",
+              media: {
+                type: "voice_note",
+                media: "cached-voice",
+                duration: 4,
+              },
+            },
+          ],
+        },
+      },
     },
     {
       method: "sendRichMessageDraft",
@@ -1077,6 +1156,18 @@ test("Telegram bridge API runtime exposes typed Bot API helpers", async () => {
         chat_id: 1,
         draft_id: 3,
         rich_message: { markdown: "**draft**" },
+      },
+    },
+    {
+      method: "sendRichMessage",
+      body: {
+        fields: {
+          chat_id: "1",
+          rich_message: JSON.stringify(uploadRichMessage),
+        },
+        fileField: "voice_upload",
+        filePath: "/tmp/voice.ogg",
+        fileName: "voice.ogg",
       },
     },
   ]);

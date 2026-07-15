@@ -1,10 +1,47 @@
+#### July 14, 2026
+
+**Bot API 10.2**
+
+**Rich Messages**
+
+- Added the class [InputRichMessageMedia](#inputrichmessagemedia) and the field _media_ to the class [InputRichMessage](#inputrichmessage), allowing bots to explicitly specify media used in _markdown_ or _html_ formatting when sending a rich message.
+- Added the class [InputMediaVoiceNote](#inputmediavoicenote), representing a voice message to be sent.
+- Added the class [InputRichBlockListItem](#inputrichblocklistitem), which represents an item in a list to be sent.
+- Added the classes [InputRichBlockParagraph](#inputrichblockparagraph), [InputRichBlockSectionHeading](#inputrichblocksectionheading), [InputRichBlockPreformatted](#inputrichblockpreformatted), [InputRichBlockFooter](#inputrichblockfooter), [InputRichBlockDivider](#inputrichblockdivider), [InputRichBlockMathematicalExpression](#inputrichblockmathematicalexpression), [InputRichBlockAnchor](#inputrichblockanchor), [InputRichBlockList](#inputrichblocklist), [InputRichBlockBlockQuotation](#inputrichblockblockquotation), [InputRichBlockPullQuotation](#inputrichblockpullquotation), [InputRichBlockCollage](#inputrichblockcollage), [InputRichBlockSlideshow](#inputrichblockslideshow), [InputRichBlockTable](#inputrichblocktable), [InputRichBlockDetails](#inputrichblockdetails), [InputRichBlockMap](#inputrichblockmap), [InputRichBlockAnimation](#inputrichblockanimation), [InputRichBlockAudio](#inputrichblockaudio), [InputRichBlockPhoto](#inputrichblockphoto), [InputRichBlockVideo](#inputrichblockvideo), [InputRichBlockVoiceNote](#inputrichblockvoicenote) and [InputRichBlockThinking](#inputrichblockthinking), which represent different types of blocks available to format an outgoing rich message.
+- Added the field _blocks_ to the class [InputRichMessage](#inputrichmessage), allowing bots to specify rich message formatting via block entities.
+
+**Ephemeral Messages**
+
+- Introduced support for [Ephemeral Messages](https://core.telegram.org/bots/features#ephemeral-messages), allowing bots to send group messages and receive commands that are visible only to a specific user and the bot.
+- Added the field _is\_ephemeral_ to the class [BotCommand](#botcommand).
+- Added the field _receiver\_user_ to the class [Message](#message).
+- Added the field _ephemeral\_message\_id_ to the class [Message](#message).
+- Added the parameters _receiver\_user\_id_ and _callback\_query\_id_ to the methods [sendMessage](#sendmessage), [sendAnimation](#sendanimation), [sendAudio](#sendaudio), [sendDocument](#senddocument), [sendPhoto](#sendphoto), [sendSticker](#sendsticker), [sendVideo](#sendvideo), [sendVideoNote](#sendvideonote), [sendVoice](#sendvoice), [sendContact](#sendcontact), [sendLocation](#sendlocation), [sendVenue](#sendvenue).
+- Added the field _ephemeral\_message\_id_ to the class [ReplyParameters](#replyparameters), allowing bots to reply to ephemeral messages.
+- Marked the field _message\_id_ in the class [ReplyParameters](#replyparameters) as optional if the field _ephemeral\_message\_id_ is present.
+- Added the methods [editEphemeralMessageText](#editephemeralmessagetext), [editEphemeralMessageMedia](#editephemeralmessagemedia), [editEphemeralMessageCaption](#editephemeralmessagecaption), and [editEphemeralMessageReplyMarkup](#editephemeralmessagereplymarkup) allowing bots to edit ephemeral messages.
+- Added the method [deleteEphemeralMessage](#deleteephemeralmessage) allowing bots to delete ephemeral messages.
+
+**Communities**
+
+- Introduced initial support for **Communities** - several supergroups, channels, and bots linked together around a shared topic or audience.
+- Added the class [Community](#community) which represents a community.
+- Added the class [CommunityChatAdded](#communitychatadded) and the field _community\_chat\_added_ to the class [Message](#message).
+- Added the class [CommunityChatRemoved](#communitychatremoved) and the field _community\_chat\_removed_ to the class [Message](#message).
+- Added the field _community_ to the class [ChatFullInfo](#chatfullinfo).
+
+**General**
+
+- Added updates about changes to a user payment subscription, represented by the class [BotSubscriptionUpdated](#botsubscriptionupdated) and the field _subscription_ in the class [Update](#update).
+- Hardened the security of Mini Apps by disallowing the usage of Mini App methods from origins different from the original Mini App domain. The protection will be automatically enabled for all Mini Apps on July 20, 2026. You can opt-out from the protection through the [@BotFather](https://t.me/BotFather) Mini App. If you do so, you acknowledge that it is the responsibility of the bot to ensure that the Mini App has no links to untrusted sites.
+
 #### June 11, 2026
 
 **Bot API 10.1**
 
 **Rich Messages**
 
-- Added support for [Rich Messages](#rich-messages), allowing bots to send highly structured text and stream AI-generated replies with seamless rich formatting.
+- Added support for [Rich Messages](https://core.telegram.org/bots/features#rich-messages), allowing bots to send highly structured text and stream AI-generated replies with seamless rich formatting.
 - Added the classes [RichTextBold](#richtextbold), [RichTextItalic](#richtextitalic), [RichTextUnderline](#richtextunderline), [RichTextStrikethrough](#richtextstrikethrough), [RichTextSpoiler](#richtextspoiler), [RichTextDateTime](#richtextdatetime), [RichTextTextMention](#richtexttextmention), [RichTextSubscript](#richtextsubscript), [RichTextSuperscript](#richtextsuperscript), [RichTextMarked](#richtextmarked), [RichTextCode](#richtextcode), [RichTextCustomEmoji](#richtextcustomemoji), [RichTextMathematicalExpression](#richtextmathematicalexpression), [RichTextUrl](#richtexturl), [RichTextEmailAddress](#richtextemailaddress), [RichTextPhoneNumber](#richtextphonenumber), [RichTextBankCardNumber](#richtextbankcardnumber), [RichTextMention](#richtextmention), [RichTextHashtag](#richtexthashtag), [RichTextCashtag](#richtextcashtag), [RichTextBotCommand](#richtextbotcommand), [RichTextAnchor](#richtextanchor), [RichTextAnchorLink](#richtextanchorlink), [RichTextReference](#richtextreference) and [RichTextReferenceLink](#richtextreferencelink), which represent different types of rich formatted text.
 - Added the class [RichText](#richtext), which represents rich formatted text.
 - Added the class [RichBlockCaption](#richblockcaption), which represents the caption of a rich formatted text.
@@ -39,7 +76,7 @@
 
 **Guest Mode**
 
-- Introduced support for guest mode, allowing bots to receive certain messages and issue replies within chats they are not a member of.
+- Introduced support for [guest mode](https://core.telegram.org/bots/features#guest-bots), allowing bots to receive certain messages and issue replies within chats they are not a member of.
 - Added the field _supports\_guest\_queries_ to the class [User](#user).
 - Added the fields _guest\_bot\_caller\_user_ and _guest\_bot\_caller\_chat_ to the class [Message](#message).
 - Added the field _guest\_query\_id_ to the class [Message](#message).
@@ -81,7 +118,7 @@
 
 **General**
 
-- Allowed Secretary Bots to manage accounts of users without a Telegram Premium subscription.
+- Allowed [Secretary Bots](https://core.telegram.org/bots/features#secretary-bots) to manage accounts of users without a Telegram Premium subscription.
 - Added the ability to send messages to other bots via username if both bots enabled bot-to-bot communication.
 - Added the ability to reply to other bots from a business bot if the business bot enabled bot-to-bot communication.
 - Allowed bots to pass an empty text in the method [sendMessageDraft](#sendmessagedraft).
@@ -89,50 +126,11 @@
 - Added the method [setManagedBotAccessSettings](#setmanagedbotaccesssettings).
 - Added the method [getUserPersonalChatMessages](#getuserpersonalchatmessages).
 
-#### April 3, 2026
-
-**Bot API 9.6**
-
-**Managed Bots**
-
-- Added the field _can\_manage\_bots_ to the class [User](#user).
-- Added the class [KeyboardButtonRequestManagedBot](#keyboardbuttonrequestmanagedbot) and the field _request\_managed\_bot_ to the class [KeyboardButton](#keyboardbutton).
-- Added the class [ManagedBotCreated](#managedbotcreated) and the field _managed\_bot\_created_ to the class [Message](#message).
-- Added updates about the creation of managed bots and the change of their token, represented by the class [ManagedBotUpdated](#managedbotupdated) and the field _managed\_bot_ in the class [Update](#update).
-- Added the methods [getManagedBotToken](#getmanagedbottoken) and [replaceManagedBotToken](#replacemanagedbottoken).
-- Added the class [PreparedKeyboardButton](#preparedkeyboardbutton) and the method [savePreparedKeyboardButton](#savepreparedkeyboardbutton), allowing bots to request users, chats and managed bots from Mini Apps.
-- Added the method _requestChat_ to the class [WebApp](https://core.telegram.org/bots/webapps#initializing-mini-apps).
-- Added support for `https://t.me/newbot/{manager_bot_username}/{suggested_bot_username}[?name={suggested_bot_name}]` links, allowing bots to request the creation of a managed bot via a link.
-
-**Polls**
-
-- Added support for quizzes with multiple correct answers.
-- Replaced the field _correct\_option\_id_ with the field _correct\_option\_ids_ in the class [Poll](#poll).
-- Replaced the parameter _correct\_option\_id_ with the parameter _correct\_option\_ids_ in the method [sendPoll](#sendpoll).
-- Allowed to pass _allows\_multiple\_answers_ for quizzes in the method [sendPoll](#sendpoll).
-- Increased the maximum time for automatic poll closure to 2628000 seconds.
-- Added the field _allows\_revoting_ to the class [Poll](#poll).
-- Added the parameter _allows\_revoting_ to the method [sendPoll](#sendpoll).
-- Added the parameter _shuffle\_options_ to the method [sendPoll](#sendpoll).
-- Added the parameter _allow\_adding\_options_ to the method [sendPoll](#sendpoll).
-- Added the parameter _hide\_results\_until\_closes_ to the method [sendPoll](#sendpoll).
-- Added the fields _description_ and _description\_entities_ to the class [Poll](#poll).
-- Added the parameters _description_, _description\_parse\_mode_, and _description\_entities_ to the method [sendPoll](#sendpoll).
-- Added the field _persistent\_id_ to the class [PollOption](#polloption), representing a persistent identifier for the option.
-- Added the field _option\_persistent\_ids_ to the class [PollAnswer](#pollanswer).
-- Added the fields _added\_by\_user_ and _added\_by\_chat_ to the class [PollOption](#polloption), denoting the user and the chat which added the option.
-- Added the field _addition\_date_ to the class [PollOption](#polloption), describing the date when the option was added.
-- Added the class [PollOptionAdded](#polloptionadded) and the field _poll\_option\_added_ to the class [Message](#message).
-- Added the class [PollOptionDeleted](#polloptiondeleted) and the field _poll\_option\_deleted_ to the class [Message](#message).
-- Added the field _poll\_option\_id_ to the class [ReplyParameters](#replyparameters), allowing bots to reply to a specific poll option.
-- Added the field _reply\_to\_poll\_option\_id_ to the class [Message](#message).
-- Allowed “date\_time” entities in [checklist](#inputchecklist) title, [checklist task](#inputchecklisttask) text, [TextQuote](#textquote), [ReplyParameters](#replyparameters) quote, [sendGift](#sendgift), and [giftPremiumSubscription](#giftpremiumsubscription).
-
-**See earlier changes »**
+**[See earlier changes »](https://core.telegram.org/bots/api-changelog)**
 
 ### Authorizing your bot
 
-Each bot is given a unique authentication token when it is created. The token looks something like `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`, but we'll use simply **<token>** in this document instead. You can learn about obtaining tokens and generating new ones in this document.
+Each bot is given a unique authentication token [when it is created](https://core.telegram.org/bots/features#botfather). The token looks something like `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`, but we'll use simply **<token>** in this document instead. You can learn about obtaining tokens and generating new ones in [this document](https://core.telegram.org/bots/features#botfather).
 
 ### Making requests
 
@@ -149,7 +147,7 @@ We support **GET** and **POST** HTTP methods. We support four ways of passing pa
 - application/json (except for uploading files)
 - multipart/form-data (use to upload files)
 
-The response contains a JSON object, which always has a Boolean field 'ok' and may have an optional String field 'description' with a human-readable description of the result. If 'ok' equals _True_, the request was successful and the result of the query can be found in the 'result' field. In case of an unsuccessful request, 'ok' equals false and the error is explained in the 'description'. An Integer 'error\_code' field is also returned, but its contents are subject to change in the future. Some errors may also have an optional field 'parameters' of the type [ResponseParameters](#responseparameters), which can help to automatically handle the error.
+The response contains a JSON object, which always has a Boolean field 'ok' and may have an optional String field 'description' with a human-readable description of the result. If 'ok' equals _True_, the request was successful and the result of the query can be found in the 'result' field. In case of an unsuccessful request, 'ok' equals _False_ and the error is explained in the 'description'. An Integer 'error\_code' field is also returned, but its contents are subject to change in the future. Some errors may also have an optional field 'parameters' of the type [ResponseParameters](#responseparameters), which can help to automatically handle the error.
 
 - All methods in the Bot API are case-insensitive.
 - All queries must be made using UTF-8.
@@ -185,8 +183,7 @@ Regardless of which option you choose, you will receive JSON-serialized [Update]
 
 #### Update
 
-This [object](#available-types) represents an incoming update.  
-At most **one** of the optional fields can be present in any given update.
+This [object](#available-types) represents an incoming update.<br>At most **one** of the optional fields can be present in any given update.
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -216,6 +213,7 @@ At most **one** of the optional fields can be present in any given update.
 | chat\_boost | [ChatBoostUpdated](#chatboostupdated) | _Optional_. A chat boost was added or changed. The bot must be an administrator in the chat to receive these updates. |
 | removed\_chat\_boost | [ChatBoostRemoved](#chatboostremoved) | _Optional_. A boost was removed from a chat. The bot must be an administrator in the chat to receive these updates. |
 | managed\_bot | [ManagedBotUpdated](#managedbotupdated) | _Optional_. A new bot was created to be managed by the bot, or token or owner of a managed bot was changed |
+| subscription | [BotSubscriptionUpdated](#botsubscriptionupdated) | _Optional_. User payment subscription has changed |
 
 #### getUpdates
 
@@ -226,11 +224,9 @@ Use this method to receive incoming updates using long polling ([wiki](https://e
 | offset | Integer | Optional | Identifier of the first update to be returned. Must be greater by one than the highest among the identifiers of previously received updates. By default, updates starting with the earliest unconfirmed update are returned. An update is considered confirmed as soon as [getUpdates](#getupdates) is called with an _offset_ higher than its _update\_id_. The negative offset can be specified to retrieve updates starting from _\-offset_ update from the end of the updates queue. All previous updates will be forgotten. |
 | limit | Integer | Optional | Limits the number of updates to be retrieved. Values between 1-100 are accepted. Defaults to 100. |
 | timeout | Integer | Optional | Timeout in seconds for long polling. Defaults to 0, i.e. usual short polling. Should be positive, short polling should be used for testing purposes only. |
-| allowed\_updates | Array of String | Optional | A JSON-serialized list of the update types you want your bot to receive. For example, specify `["message", "edited_channel_post", "callback_query"]` to only receive updates of these types. See [Update](#update) for a complete list of available update types. Specify an empty list to receive all update types except _chat\_member_, _message\_reaction_, and _message\_reaction\_count_ (default). If not specified, the previous setting will be used.  <br>  <br>Please note that this parameter doesn't affect updates created before the call to getUpdates, so unwanted updates may be received for a short period of time. |
+| allowed\_updates | Array of String | Optional | A JSON-serialized list of the update types you want your bot to receive. For example, specify `["message", "edited_channel_post", "callback_query"]` to only receive updates of these types. See [Update](#update) for a complete list of available update types. Specify an empty list to receive all update types except _chat\_member_, _message\_reaction_, and _message\_reaction\_count_ (default). If not specified, the previous setting will be used.<br><br>Please note that this parameter doesn't affect updates created before the call to getUpdates, so unwanted updates may be received for a short period of time. |
 
-> **Notes**  
-> **1.** This method will not work if an outgoing webhook is set up.  
-> **2.** In order to avoid getting duplicate updates, recalculate _offset_ after each server response.
+> **Notes**<br>**1.** This method will not work if an outgoing webhook is set up.<br>**2.** In order to avoid getting duplicate updates, recalculate _offset_ after each server response.
 
 #### setWebhook
 
@@ -244,15 +240,12 @@ If you'd like to make sure that the webhook was set by you, you can specify secr
 | certificate | [InputFile](#inputfile) | Optional | Upload your public key certificate so that the root certificate in use can be checked. See our [self-signed guide](https://core.telegram.org/bots/self-signed) for details. |
 | ip\_address | String | Optional | The fixed IP address which will be used to send webhook requests instead of the IP address resolved through DNS |
 | max\_connections | Integer | Optional | The maximum allowed number of simultaneous HTTPS connections to the webhook for update delivery, 1-100. Defaults to _40_. Use lower values to limit the load on your bot's server, and higher values to increase your bot's throughput. |
-| allowed\_updates | Array of String | Optional | A JSON-serialized list of the update types you want your bot to receive. For example, specify `["message", "edited_channel_post", "callback_query"]` to only receive updates of these types. See [Update](#update) for a complete list of available update types. Specify an empty list to receive all update types except _chat\_member_, _message\_reaction_, and _message\_reaction\_count_ (default). If not specified, the previous setting will be used.  <br>Please note that this parameter doesn't affect updates created before the call to the setWebhook, so unwanted updates may be received for a short period of time. |
+| allowed\_updates | Array of String | Optional | A JSON-serialized list of the update types you want your bot to receive. For example, specify `["message", "edited_channel_post", "callback_query"]` to only receive updates of these types. See [Update](#update) for a complete list of available update types. Specify an empty list to receive all update types except _chat\_member_, _message\_reaction_, and _message\_reaction\_count_ (default). If not specified, the previous setting will be used.<br>Please note that this parameter doesn't affect updates created before the call to the setWebhook, so unwanted updates may be received for a short period of time. |
 | drop\_pending\_updates | Boolean | Optional | Pass _True_ to drop all pending updates |
 | secret\_token | String | Optional | A secret token to be sent in a header “X-Telegram-Bot-Api-Secret-Token” in every webhook request, 1-256 characters. Only characters `A-Z`, `a-z`, `0-9`, `_` and `-` are allowed. The header is useful to ensure that the request comes from a webhook set by you. |
 
-> **Notes**  
-> **1.** You will not be able to receive updates using [getUpdates](#getupdates) for as long as an outgoing webhook is set up.  
-> **2.** To use a self-signed certificate, you need to upload your [public key certificate](https://core.telegram.org/bots/self-signed) using _certificate_ parameter. Please upload as InputFile, sending a String will not work.  
-> **3.** Ports currently supported _for webhooks_: **443, 80, 88, 8443**.
-> 
+> **Notes**<br>**1.** You will not be able to receive updates using [getUpdates](#getupdates) for as long as an outgoing webhook is set up.<br>**2.** To use a self-signed certificate, you need to upload your [public key certificate](https://core.telegram.org/bots/self-signed) using _certificate_ parameter. Please upload as InputFile, sending a String will not work.<br>**3.** Ports currently supported _for webhooks_: **443, 80, 88, 8443**.
+>
 > If you're having any trouble setting up webhooks, please check out this [amazing guide to webhooks](https://core.telegram.org/bots/webhooks).
 
 #### deleteWebhook
@@ -297,7 +290,7 @@ This object represents a Telegram user or bot.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | Integer | Unique identifier for this user or bot. This number may have more than 32 significant bits and some programming languages may have difficulty/silent defects in interpreting it. But it has at most 52 significant bits, so a 64-bit integer or double-precision float type are safe for storing this identifier. |
+| id | Integer | Unique identifier for this user or bot. This number may have more than 32 significant bits and some programming languages may have difficulty/silent defects in interpreting it. But it has at most 52 significant bits, so a 64-bit integer or double-precision float type are safe for storing this identifier. |
 | is\_bot | Boolean | _True_, if this user is a bot |
 | first\_name | String | User's or bot's first name |
 | last\_name | String | _Optional_. User's or bot's last name |
@@ -306,7 +299,7 @@ This object represents a Telegram user or bot.
 | is\_premium | True | _Optional_. _True_, if this user is a Telegram Premium user |
 | added\_to\_attachment\_menu | True | _Optional_. _True_, if this user added the bot to the attachment menu |
 | can\_join\_groups | Boolean | _Optional_. _True_, if the bot can be invited to groups. Returned only in [getMe](#getme). |
-| can\_read\_all\_group\_messages | Boolean | _Optional_. _True_, if privacy mode is disabled for the bot. Returned only in [getMe](#getme). |
+| can\_read\_all\_group\_messages | Boolean | _Optional_. _True_, if [privacy mode](https://core.telegram.org/bots/features#privacy-mode) is disabled for the bot. Returned only in [getMe](#getme). |
 | supports\_guest\_queries | Boolean | _Optional_. _True_, if the bot supports guest queries from chats it is not a member of. Returned only in [getMe](#getme). |
 | supports\_inline\_queries | Boolean | _Optional_. _True_, if the bot supports inline queries. Returned only in [getMe](#getme). |
 | can\_connect\_to\_business | Boolean | _Optional_. _True_, if the bot can be connected to a user account to manage it. Returned only in [getMe](#getme). |
@@ -322,7 +315,7 @@ This object represents a chat.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | Integer | Unique identifier for this chat. This number may have more than 32 significant bits and some programming languages may have difficulty/silent defects in interpreting it. But it has at most 52 significant bits, so a signed 64-bit integer or double-precision float type are safe for storing this identifier. |
+| id | Integer | Unique identifier for this chat. This number may have more than 32 significant bits and some programming languages may have difficulty/silent defects in interpreting it. But it has at most 52 significant bits, so a signed 64-bit integer or double-precision float type are safe for storing this identifier. |
 | type | String | Type of the chat, can be either “private”, “group”, “supergroup” or “channel” |
 | title | String | _Optional_. Title, for supergroups, channels and group chats |
 | username | String | _Optional_. Username, for private chats, supergroups and channels if available |
@@ -337,7 +330,7 @@ This object contains full information about a chat.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | Integer | Unique identifier for this chat. This number may have more than 32 significant bits and some programming languages may have difficulty/silent defects in interpreting it. But it has at most 52 significant bits, so a signed 64-bit integer or double-precision float type are safe for storing this identifier. |
+| id | Integer | Unique identifier for this chat. This number may have more than 32 significant bits and some programming languages may have difficulty/silent defects in interpreting it. But it has at most 52 significant bits, so a signed 64-bit integer or double-precision float type are safe for storing this identifier. |
 | type | String | Type of the chat, can be either “private”, “group”, “supergroup” or “channel” |
 | title | String | _Optional_. Title, for supergroups, channels and group chats |
 | username | String | _Optional_. Username, for private chats, supergroups and channels if available |
@@ -389,6 +382,7 @@ This object contains full information about a chat.
 | unique\_gift\_colors | [UniqueGiftColors](#uniquegiftcolors) | _Optional_. The color scheme based on a unique gift that must be used for the chat's name, message replies and link previews |
 | paid\_message\_star\_count | Integer | _Optional_. The number of Telegram Stars a general user has to pay to send a message to the chat |
 | guard\_bot | [User](#user) | _Optional_. The bot that processes join request queries in the chat. The field is only available to chat administrators. |
+| community | [Community](#community) | _Optional_. The [Community](#community) to which the chat belongs |
 
 #### Message
 
@@ -396,7 +390,7 @@ This object represents a message.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| message\_id | Integer | Unique message identifier inside this chat. In specific instances (e.g., message containing a video sent to a big chat), the server might automatically schedule a message instead of sending it immediately. In such cases, this field will be 0 and the relevant message will be unusable until it is actually sent. |
+| message\_id | Integer | Unique message identifier inside this chat; 0 for ephemeral messages. In specific instances (e.g., a message containing a video sent to a big chat), the server might automatically schedule a message instead of sending it immediately. In such cases, this field will be 0 and the relevant message will be unusable until it is actually sent. |
 | message\_thread\_id | Integer | _Optional_. Unique identifier of a message thread or forum topic to which the message belongs; for supergroups and private chats only |
 | direct\_messages\_topic | [DirectMessagesTopic](#directmessagestopic) | _Optional_. Information about the direct messages chat topic that contains the message |
 | from | [User](#user) | _Optional_. Sender of the message; may be empty for messages sent to channels. For backward compatibility, if the message was sent on behalf of a chat, the field contains a fake sender user in non-channel chats. |
@@ -404,6 +398,8 @@ This object represents a message.
 | sender\_boost\_count | Integer | _Optional_. If the sender of the message boosted the chat, the number of boosts added by the user |
 | sender\_business\_bot | [User](#user) | _Optional_. The bot that actually sent the message on behalf of the business account. Available only for outgoing messages sent on behalf of the connected business account. |
 | sender\_tag | String | _Optional_. Tag or custom title of the sender of the message; for supergroups only |
+| receiver\_user | [User](#user) | _Optional_. For ephemeral messages, the user who received the message |
+| ephemeral\_message\_id | Integer | _Optional_. For ephemeral messages, identifier of the ephemeral message inside this chat. The identifier may be reused for another ephemeral message after the message is deleted or expires. |
 | date | Integer | Date the message was sent in Unix time. It is always a positive number, representing a valid date. |
 | guest\_query\_id | String | _Optional_. The unique identifier for the guest query. Use this identifier with the method [answerGuestQuery](#answerguestquery) to send a response message. If non-empty, the message belongs to the chat where the guest bot was summoned, which may not coincide with other existing bot chats sharing the same identifier. |
 | business\_connection\_id | String | _Optional_. Unique identifier of the business connection from which the message was received. If non-empty, the message belongs to a chat of the corresponding business account that is independent from any potential bot chat which might share the same identifier. |
@@ -411,7 +407,7 @@ This object represents a message.
 | forward\_origin | [MessageOrigin](#messageorigin) | _Optional_. Information about the original message for forwarded messages |
 | is\_topic\_message | True | _Optional_. _True_, if the message is sent to a topic in a forum supergroup or a private chat with the bot |
 | is\_automatic\_forward | True | _Optional_. _True_, if the message is a channel post that was automatically forwarded to the connected discussion group |
-| reply\_to\_message | [Message](#message) | _Optional_. For replies in the same chat and message thread, the original message. Note that the [Message](#message) object in this field will not contain further _reply\_to\_message_ fields even if it itself is a reply. |
+| reply\_to\_message | [Message](#message) | _Optional_. For replies in the same chat and message thread, the original message. Note that the [Message](#message) object in this field will not contain further _reply\_to\_message_ fields even if it itself is a reply. If the message is a reply to an ephemeral message, then this field may be omitted. |
 | external\_reply | [ExternalReplyInfo](#externalreplyinfo) | _Optional_. Information about the message that is being replied to, which may come from another chat or forum topic |
 | quote | [TextQuote](#textquote) | _Optional_. For replies that quote part of the original message, the quoted part of the message |
 | reply\_to\_story | [Story](#story) | _Optional_. For replies to a story, the original story |
@@ -485,6 +481,8 @@ This object represents a message.
 | chat\_background\_set | [ChatBackground](#chatbackground) | _Optional_. Service message: chat background set |
 | checklist\_tasks\_done | [ChecklistTasksDone](#checklisttasksdone) | _Optional_. Service message: some tasks in a checklist were marked as done or not done |
 | checklist\_tasks\_added | [ChecklistTasksAdded](#checklisttasksadded) | _Optional_. Service message: tasks were added to a checklist |
+| community\_chat\_added | [CommunityChatAdded](#communitychatadded) | _Optional_. Service message: chat added to a [Community](#community) |
+| community\_chat\_removed | [CommunityChatRemoved](#communitychatremoved) | _Optional_. Service message: chat removed from a [Community](#community) |
 | direct\_message\_price\_changed | [DirectMessagePriceChanged](#directmessagepricechanged) | _Optional_. Service message: the price for paid messages in the corresponding direct messages chat of a channel has changed |
 | forum\_topic\_created | [ForumTopicCreated](#forumtopiccreated) | _Optional_. Service message: forum topic created |
 | forum\_topic\_edited | [ForumTopicEdited](#forumtopicedited) | _Optional_. Service message: forum topic edited |
@@ -510,7 +508,7 @@ This object represents a message.
 | video\_chat\_ended | [VideoChatEnded](#videochatended) | _Optional_. Service message: video chat ended |
 | video\_chat\_participants\_invited | [VideoChatParticipantsInvited](#videochatparticipantsinvited) | _Optional_. Service message: new participants invited to a video chat |
 | web\_app\_data | [WebAppData](#webappdata) | _Optional_. Service message: data sent by a Web App |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message. `login_url` buttons are represented as ordinary `url` buttons. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message. `login_url` buttons are represented as ordinary `url` buttons. |
 
 #### MessageId
 
@@ -603,10 +601,11 @@ Describes reply parameters for the message that is being sent.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| message\_id | Integer | Identifier of the message that will be replied to in the current chat, or in the chat _chat\_id_ if it is specified |
-| chat\_id | Integer or String | _Optional_. If the message to be replied to is from a different chat, unique identifier for the chat or username of the bot, supergroup or channel in the format `@username`. Not supported for messages sent on behalf of a business account and messages from channel direct messages chats. |
-| allow\_sending\_without\_reply | Boolean | _Optional_. Pass _True_ if the message should be sent even if the specified message to be replied to is not found. Always _False_ for replies in another chat or forum topic. Always _True_ for messages sent on behalf of a business account. |
-| quote | String | _Optional_. Quoted part of the message to be replied to; 0-1024 characters after entities parsing. The quote must be an exact substring of the message to be replied to, including _bold_, _italic_, _underline_, _strikethrough_, _spoiler_, _custom\_emoji_, and _date\_time_ entities. The message will fail to send if the quote isn't found in the original message. |
+| message\_id | Integer | _Optional_. Identifier of the message that will be replied to in the current chat, or in the chat _chat\_id_ if it is specified. Required if _ephemeral\_message\_id_ isn't specified. |
+| chat\_id | Integer or String | _Optional_. If the message to be replied to is from a different chat, unique identifier for the chat or username of the bot, supergroup or channel in the format `@username`. Not supported for messages sent on behalf of a business account, messages from channel direct messages chats and ephemeral messages. |
+| ephemeral\_message\_id | Integer | _Optional_. Identifier of the incoming ephemeral message that will be replied to in the current chat. A reply to an ephemeral message must itself be an ephemeral message. An ephemeral message may only be replied to within 15 seconds of being sent. Required if _message\_id_ isn't specified. |
+| allow\_sending\_without\_reply | Boolean | _Optional_. Pass _True_ if the message should be sent even if the specified message to be replied to is not found. Always _False_ for replies in another chat or forum topic, and sent ephemeral messages. Always _True_ for messages sent on behalf of a business account. |
+| quote | String | _Optional_. Quoted part of the message to be replied to; 0-1024 characters after entities parsing. The quote must be an exact substring of the message to be replied to, including _bold_, _italic_, _underline_, _strikethrough_, _spoiler_, _custom\_emoji_, and _date\_time_ entities. The message will fail to send if the quote isn't found in the original message. Ignored for ephemeral messages. |
 | quote\_parse\_mode | String | _Optional_. Mode for parsing entities in the quote. See [formatting options](#formatting-options) for more details. |
 | quote\_entities | Array of [MessageEntity](#messageentity) | _Optional_. A JSON-serialized list of special entities that appear in the quote. It can be specified instead of _quote\_parse\_mode_. |
 | quote\_position | Integer | _Optional_. Position of the quote in the original message in UTF-16 code units |
@@ -744,7 +743,7 @@ This object represents a story.
 | Field | Type | Description |
 | --- | --- | --- |
 | chat | [Chat](#chat) | Chat that posted the story |
-| id  | Integer | Unique identifier for the story in the chat |
+| id | Integer | Unique identifier for the story in the chat |
 
 #### VideoQuality
 
@@ -878,7 +877,7 @@ This object represents an animated emoji that displays a random value.
 | Field | Type | Description |
 | --- | --- | --- |
 | emoji | String | Emoji on which the dice throw animation is based |
-| value | Integer | Value of the dice, 1-6 for “🎲”, “🎯” and “🎳” base emoji, 1-5 for “🏀” and “⚽” base emoji, 1-64 for “🎰” base emoji |
+| value | Integer | Value of the dice, 1-6 for “![🎲](//telegram.org/img/emoji/40/F09F8EB2.png)”, “![🎯](//telegram.org/img/emoji/40/F09F8EAF.png)” and “![🎳](//telegram.org/img/emoji/40/F09F8EB3.png)” base emoji, 1-5 for “![🏀](//telegram.org/img/emoji/40/F09F8F80.png)” and “![⚽](//telegram.org/img/emoji/40/E29ABD.png)” base emoji, 1-64 for “![🎰](//telegram.org/img/emoji/40/F09F8EB0.png)” base emoji |
 
 #### Link
 
@@ -975,7 +974,7 @@ This object contains information about a poll.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | String | Unique poll identifier |
+| id | String | Unique poll identifier |
 | question | String | Poll question, 1-300 characters |
 | question\_entities | Array of [MessageEntity](#messageentity) | _Optional_. Special entities that appear in the _question_. Currently, only custom emoji entities are allowed in poll questions |
 | options | Array of [PollOption](#polloption) | List of poll options |
@@ -1003,7 +1002,7 @@ Describes a task in a checklist.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | Integer | Unique identifier of the task |
+| id | Integer | Unique identifier of the task |
 | text | String | Text of the task |
 | text\_entities | Array of [MessageEntity](#messageentity) | _Optional_. Special entities that appear in the task text |
 | completed\_by\_user | [User](#user) | _Optional_. User that completed the task; omitted if the task wasn't completed by a user |
@@ -1028,7 +1027,7 @@ Describes a task to add to a checklist.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | Integer | Unique identifier of the task; must be positive and unique among all task identifiers currently present in the checklist |
+| id | Integer | Unique identifier of the task; must be positive and unique among all task identifiers currently present in the checklist |
 | text | String | Text of the task; 1-100 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the text. See [formatting options](#formatting-options) for more details. |
 | text\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the text, which can be specified instead of parse\_mode. Currently, only _bold_, _italic_, _underline_, _strikethrough_, _spoiler_, _custom\_emoji_, and _date\_time_ entities are allowed. |
@@ -1045,25 +1044,6 @@ Describes a checklist to create.
 | tasks | Array of [InputChecklistTask](#inputchecklisttask) | List of 1-30 tasks in the checklist |
 | others\_can\_add\_tasks | Boolean | _Optional_. Pass _True_ if other users can add tasks to the checklist |
 | others\_can\_mark\_tasks\_as\_done | Boolean | _Optional_. Pass _True_ if other users can mark tasks as done or not done in the checklist |
-
-#### ChecklistTasksDone
-
-Describes a service message about checklist tasks marked as done or not done.
-
-| Field | Type | Description |
-| --- | --- | --- |
-| checklist\_message | [Message](#message) | _Optional_. Message containing the checklist whose tasks were marked as done or not done. Note that the [Message](#message) object in this field will not contain the _reply\_to\_message_ field even if it itself is a reply. |
-| marked\_as\_done\_task\_ids | Array of Integer | _Optional_. Identifiers of the tasks that were marked as done |
-| marked\_as\_not\_done\_task\_ids | Array of Integer | _Optional_. Identifiers of the tasks that were marked as not done |
-
-#### ChecklistTasksAdded
-
-Describes a service message about tasks added to a checklist.
-
-| Field | Type | Description |
-| --- | --- | --- |
-| checklist\_message | [Message](#message) | _Optional_. Message containing the checklist to which the tasks were added. Note that the [Message](#message) object in this field will not contain the _reply\_to\_message_ field even if it itself is a reply. |
-| tasks | Array of [ChecklistTask](#checklisttask) | List of tasks added to the checklist |
 
 #### Location
 
@@ -1135,6 +1115,16 @@ This object contains information about the creation, token update, or owner upda
 | --- | --- | --- |
 | user | [User](#user) | User that created the bot |
 | bot | [User](#user) | Information about the bot. Token of the bot can be fetched using the method [getManagedBotToken](#getmanagedbottoken). |
+
+#### BotSubscriptionUpdated
+
+This object contains information about changes to a user payment subscription toward the current bot.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| user | [User](#user) | User who subscribed for payments toward the bot |
+| invoice\_payload | String | Bot-specified invoice payload |
+| state | String | The new state of the subscription. Currently, it can be one of “canceled” if the user canceled the subscription, “active” if the user re-enabled a previously canceled subscription, or “failed” if payment for the subscription failed. |
 
 #### PollOptionAdded
 
@@ -1264,6 +1254,37 @@ This object represents a chat background.
 | --- | --- | --- |
 | type | [BackgroundType](#backgroundtype) | Type of the background |
 
+#### ChecklistTasksDone
+
+Describes a service message about checklist tasks marked as done or not done.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| checklist\_message | [Message](#message) | _Optional_. Message containing the checklist whose tasks were marked as done or not done. Note that the [Message](#message) object in this field will not contain the _reply\_to\_message_ field even if it itself is a reply. |
+| marked\_as\_done\_task\_ids | Array of Integer | _Optional_. Identifiers of the tasks that were marked as done |
+| marked\_as\_not\_done\_task\_ids | Array of Integer | _Optional_. Identifiers of the tasks that were marked as not done |
+
+#### ChecklistTasksAdded
+
+Describes a service message about tasks added to a checklist.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| checklist\_message | [Message](#message) | _Optional_. Message containing the checklist to which the tasks were added. Note that the [Message](#message) object in this field will not contain the _reply\_to\_message_ field even if it itself is a reply. |
+| tasks | Array of [ChecklistTask](#checklisttask) | List of tasks added to the checklist |
+
+#### CommunityChatAdded
+
+Describes a service message about a chat being added to a community.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| community | [Community](#community) | The new community to which the chat belongs |
+
+#### CommunityChatRemoved
+
+Describes a service message about a chat being removed from a community. Currently holds no information.
+
 #### ForumTopicCreated
 
 This object represents a service message about a new forum topic created in the chat.
@@ -1385,7 +1406,7 @@ Describes a service message about a change in the price of direct messages sent 
 
 | Field | Type | Description |
 | --- | --- | --- |
-| are\_direct\_messages\_enabled | Boolean | _True_, if direct messages are enabled for the channel chat; false otherwise |
+| are\_direct\_messages\_enabled | Boolean | _True_, if direct messages are enabled for the channel chat; _False_ otherwise |
 | direct\_message\_star\_count | Integer | _Optional_. The new number of Telegram Stars that must be paid by users for each direct message sent to the channel. Does not apply to users who have been exempted by administrators. Defaults to 0. |
 
 #### SuggestedPostApproved
@@ -1423,8 +1444,8 @@ Describes a service message about a successful payment for a suggested post.
 | Field | Type | Description |
 | --- | --- | --- |
 | suggested\_post\_message | [Message](#message) | _Optional_. Message containing the suggested post. Note that the [Message](#message) object in this field will not contain the _reply\_to\_message_ field even if it itself is a reply. |
-| currency | String | Currency in which the payment was made. Currently, one of “XTR” for Telegram Stars or “TON” for toncoins. |
-| amount | Integer | _Optional_. The amount of the currency that was received by the channel in nanotoncoins; for payments in toncoins only |
+| currency | String | Currency in which the payment was made. Currently, one of “XTR” for Telegram Stars or “TON” for TON grams. |
+| amount | Integer | _Optional_. The amount of the currency that was received by the channel in nanograms; for payments in TON grams only |
 | star\_amount | [StarAmount](#staramount) | _Optional_. The amount of Telegram Stars that was received by the channel; for payments in Telegram Stars only |
 
 #### SuggestedPostRefunded
@@ -1508,8 +1529,8 @@ Describes the price of a suggested post.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| currency | String | Currency in which the post will be paid. Currently, must be one of “XTR” for Telegram Stars or “TON” for toncoins. |
-| amount | Integer | The amount of the currency that will be paid for the post in the _smallest units_ of the currency, i.e. Telegram Stars or nanotoncoins. Currently, price in Telegram Stars must be between 5 and 100000, and price in nanotoncoins must be between 10000000 and 10000000000000. |
+| currency | String | Currency in which the post will be paid. Currently, must be one of “XTR” for Telegram Stars or “TON” for TON grams. |
+| amount | Integer | The amount of the currency that will be paid for the post in the _smallest units_ of the currency, i.e. Telegram Stars or nanograms. Currently, price in Telegram Stars must be between 5 and 100000, and price in nanograms must be between 10000000 and 10000000000000. |
 
 #### SuggestedPostInfo
 
@@ -1580,16 +1601,16 @@ Describes a [Web App](https://core.telegram.org/bots/webapps).
 
 #### ReplyKeyboardMarkup
 
-This object represents a custom keyboard with reply options (see Introduction to bots for details and examples). Not supported in channels and for messages sent on behalf of a business account.
+This object represents a [custom keyboard](https://core.telegram.org/bots/features#keyboards) with reply options (see [Introduction to bots](https://core.telegram.org/bots/features#keyboards) for details and examples). Not supported in channels and for messages sent on behalf of a business account.
 
 | Field | Type | Description |
 | --- | --- | --- |
 | keyboard | Array of Array of [KeyboardButton](#keyboardbutton) | Array of button rows, each represented by an Array of [KeyboardButton](#keyboardbutton) objects |
-| is\_persistent | Boolean | _Optional_. Requests clients to always show the keyboard when the regular keyboard is hidden. Defaults to _false_, in which case the custom keyboard can be hidden and opened with a keyboard icon. |
-| resize\_keyboard | Boolean | _Optional_. Requests clients to resize the keyboard vertically for optimal fit (e.g., make the keyboard smaller if there are just two rows of buttons). Defaults to _false_, in which case the custom keyboard is always of the same height as the app's standard keyboard. |
-| one\_time\_keyboard | Boolean | _Optional_. Requests clients to hide the keyboard as soon as it's been used. The keyboard will still be available, but clients will automatically display the usual letter-keyboard in the chat - the user can press a special button in the input field to see the custom keyboard again. Defaults to _false_. |
+| is\_persistent | Boolean | _Optional_. Requests clients to always show the keyboard when the regular keyboard is hidden. Defaults to _False_, in which case the custom keyboard can be hidden and opened with a keyboard icon. |
+| resize\_keyboard | Boolean | _Optional_. Requests clients to resize the keyboard vertically for optimal fit (e.g., make the keyboard smaller if there are just two rows of buttons). Defaults to _False_, in which case the custom keyboard is always of the same height as the app's standard keyboard. |
+| one\_time\_keyboard | Boolean | _Optional_. Requests clients to hide the keyboard as soon as it's been used. The keyboard will still be available, but clients will automatically display the usual letter-keyboard in the chat - the user can press a special button in the input field to see the custom keyboard again. Defaults to _False_. |
 | input\_field\_placeholder | String | _Optional_. The placeholder to be shown in the input field when the keyboard is active; 1-64 characters |
-| selective | Boolean | _Optional_. Use this parameter if you want to show the keyboard to specific users only. Targets: 1) users that are @mentioned in the _text_ of the [Message](#message) object; 2) if the bot's message is a reply to a message in the same chat and forum topic, sender of the original message.  <br>  <br>_Example:_ A user requests to change the bot's language, bot replies to the request with a keyboard to select the new language. Other users in the group don't see the keyboard. |
+| selective | Boolean | _Optional_. Use this parameter if you want to show the keyboard to specific users only. Targets: 1) users that are @mentioned in the _text_ of the [Message](#message) object; 2) if the bot's message is a reply to a message in the same chat and forum topic, sender of the original message.<br><br>_Example:_ A user requests to change the bot's language, bot replies to the request with a keyboard to select the new language. Other users in the group don't see the keyboard. |
 
 #### KeyboardButton
 
@@ -1598,7 +1619,7 @@ This object represents one button of the reply keyboard. At most one of the fiel
 | Field | Type | Description |
 | --- | --- | --- |
 | text | String | Text of the button. If none of the fields other than _text_, _icon\_custom\_emoji\_id_, and _style_ are used, it will be sent as a message when the button is pressed. |
-| icon\_custom\_emoji\_id | String | _Optional_. Unique identifier of the custom emoji shown before the text of the button. Can only be used by bots that purchased additional usernames on [Fragment](https://fragment.com/) or in the messages directly sent by the bot to private, group and supergroup chats if the owner of the bot has a Telegram Premium subscription. |
+| icon\_custom\_emoji\_id | String | _Optional_. Unique identifier of the custom emoji shown before the text of the button. Can only be used by bots that purchased additional usernames on [Fragment](https://fragment.com) or in the messages directly sent by the bot to private, group and supergroup chats if the owner of the bot has a Telegram Premium subscription. |
 | style | String | _Optional_. Style of the button. Must be one of “danger” (red), “success” (green) or “primary” (blue). If omitted, then an app-specific style is used. |
 | request\_users | [KeyboardButtonRequestUsers](#keyboardbuttonrequestusers) | _Optional_. If specified, pressing the button will open a list of suitable users. Identifiers of selected users will be sent to the bot in a “users\_shared” service message. Available in private chats only. |
 | request\_chat | [KeyboardButtonRequestChat](#keyboardbuttonrequestchat) | _Optional_. If specified, pressing the button will open a list of suitable chats. Tapping on a chat will send its identifier to the bot in a “chat\_shared” service message. Available in private chats only. |
@@ -1610,7 +1631,7 @@ This object represents one button of the reply keyboard. At most one of the fiel
 
 #### KeyboardButtonRequestUsers
 
-This object defines the criteria used to request suitable users. Information about the selected users will be shared with the bot when the corresponding button is pressed. More about requesting users »
+This object defines the criteria used to request suitable users. Information about the selected users will be shared with the bot when the corresponding button is pressed. [More about requesting users »](https://core.telegram.org/bots/features#chat-and-user-selection)
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -1624,7 +1645,7 @@ This object defines the criteria used to request suitable users. Information abo
 
 #### KeyboardButtonRequestChat
 
-This object defines the criteria used to request a suitable chat. Information about the selected chat will be shared with the bot when the corresponding button is pressed. The bot will be granted requested rights in the chat if appropriate. More about requesting chats ».
+This object defines the criteria used to request a suitable chat. Information about the selected chat will be shared with the bot when the corresponding button is pressed. The bot will be granted requested rights in the chat if appropriate. [More about requesting chats »](https://core.telegram.org/bots/features#chat-and-user-selection).
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -1665,11 +1686,11 @@ Upon receiving a message with this object, Telegram clients will remove the curr
 | Field | Type | Description |
 | --- | --- | --- |
 | remove\_keyboard | True | Requests clients to remove the custom keyboard (user will not be able to summon this keyboard; if you want to hide the keyboard from sight but keep it accessible, use _one\_time\_keyboard_ in [ReplyKeyboardMarkup](#replykeyboardmarkup)) |
-| selective | Boolean | _Optional_. Use this parameter if you want to remove the keyboard for specific users only. Targets: 1) users that are @mentioned in the _text_ of the [Message](#message) object; 2) if the bot's message is a reply to a message in the same chat and forum topic, sender of the original message.  <br>  <br>_Example:_ A user votes in a poll, bot returns confirmation message in reply to the vote and removes the keyboard for that user, while still showing the keyboard with poll options to users who haven't voted yet. |
+| selective | Boolean | _Optional_. Use this parameter if you want to remove the keyboard for specific users only. Targets: 1) users that are @mentioned in the _text_ of the [Message](#message) object; 2) if the bot's message is a reply to a message in the same chat and forum topic, sender of the original message.<br><br>_Example:_ A user votes in a poll, bot returns confirmation message in reply to the vote and removes the keyboard for that user, while still showing the keyboard with poll options to users who haven't voted yet. |
 
 #### InlineKeyboardMarkup
 
-This object represents an inline keyboard that appears right next to the message it belongs to.
+This object represents an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) that appears right next to the message it belongs to.
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -1682,24 +1703,24 @@ This object represents one button of an inline keyboard. Exactly one of the fiel
 | Field | Type | Description |
 | --- | --- | --- |
 | text | String | Label text on the button |
-| icon\_custom\_emoji\_id | String | _Optional_. Unique identifier of the custom emoji shown before the text of the button. Can only be used by bots that purchased additional usernames on [Fragment](https://fragment.com/) or in the messages directly sent by the bot to private, group and supergroup chats if the owner of the bot has a Telegram Premium subscription. |
+| icon\_custom\_emoji\_id | String | _Optional_. Unique identifier of the custom emoji shown before the text of the button. Can only be used by bots that purchased additional usernames on [Fragment](https://fragment.com) or in the messages directly sent by the bot to private, group and supergroup chats if the owner of the bot has a Telegram Premium subscription. |
 | style | String | _Optional_. Style of the button. Must be one of “danger” (red), “success” (green) or “primary” (blue). If omitted, then an app-specific style is used. |
 | url | String | _Optional_. HTTP or tg:// URL to be opened when the button is pressed. Links `tg://user?id=<user_id>` can be used to mention a user by their identifier without using a username, if this is allowed by their privacy settings. |
 | callback\_data | String | _Optional_. Data to be sent in a [callback query](#callbackquery) to the bot when the button is pressed, 1-64 bytes |
 | web\_app | [WebAppInfo](#webappinfo) | _Optional_. Description of the [Web App](https://core.telegram.org/bots/webapps) that will be launched when the user presses the button. The Web App will be able to send an arbitrary message on behalf of the user using the method [answerWebAppQuery](#answerwebappquery). Available only in private chats between a user and the bot. Not supported for messages sent on behalf of a business account. |
 | login\_url | [LoginUrl](#loginurl) | _Optional_. An HTTPS URL used to automatically authorize the user. Can be used as a replacement for the [Telegram Login Widget](https://core.telegram.org/widgets/login). |
 | switch\_inline\_query | String | _Optional_. If set, pressing the button will prompt the user to select one of their chats, open that chat and insert the bot's username and the specified inline query in the input field. May be empty, in which case just the bot's username will be inserted. Not supported for messages sent in channel direct messages chats and on behalf of a business account. |
-| switch\_inline\_query\_current\_chat | String | _Optional_. If set, pressing the button will insert the bot's username and the specified inline query in the current chat's input field. May be empty, in which case only the bot's username will be inserted.  <br>  <br>This offers a quick way for the user to open your bot in inline mode in the same chat - good for selecting something from multiple options. Not supported in channels and for messages sent in channel direct messages chats and on behalf of a business account. |
+| switch\_inline\_query\_current\_chat | String | _Optional_. If set, pressing the button will insert the bot's username and the specified inline query in the current chat's input field. May be empty, in which case only the bot's username will be inserted.<br><br>This offers a quick way for the user to open your bot in inline mode in the same chat - good for selecting something from multiple options. Not supported in channels and for messages sent in channel direct messages chats and on behalf of a business account. |
 | switch\_inline\_query\_chosen\_chat | [SwitchInlineQueryChosenChat](#switchinlinequerychosenchat) | _Optional_. If set, pressing the button will prompt the user to select one of their chats of the specified type, open that chat and insert the bot's username and the specified inline query in the input field. Not supported for messages sent in channel direct messages chats and on behalf of a business account. |
 | copy\_text | [CopyTextButton](#copytextbutton) | _Optional_. Description of the button that copies the specified text to the clipboard |
-| callback\_game | [CallbackGame](#callbackgame) | _Optional_. Description of the game that will be launched when the user presses the button.  <br>  <br>**NOTE:** This type of button **must** always be the first button in the first row. |
-| pay | Boolean | _Optional_. Specify _True_, to send a [Pay button](#payments). Substrings “⭐” and “XTR” in the buttons's text will be replaced with a Telegram Star icon.  <br>  <br>**NOTE:** This type of button **must** always be the first button in the first row and can only be used in invoice messages. |
+| callback\_game | [CallbackGame](#callbackgame) | _Optional_. Description of the game that will be launched when the user presses the button.<br><br>**NOTE:** This type of button **must** always be the first button in the first row. |
+| pay | Boolean | _Optional_. Specify _True_, to send a [Pay button](#payments). Substrings “![⭐](//telegram.org/img/emoji/40/E2AD90.png)” and “XTR” in the buttons's text will be replaced with a Telegram Star icon.<br><br>**NOTE:** This type of button **must** always be the first button in the first row and can only be used in invoice messages. |
 
 #### LoginUrl
 
 This object represents a parameter of the inline keyboard button used to automatically authorize a user. Serves as a great replacement for the [Telegram Login Widget](https://core.telegram.org/widgets/login) when the user is coming from Telegram. All the user needs to do is tap/click a button and confirm that they want to log in:
 
-[TITLE](https://core.telegram.org/file/811140015/1734/8VZFkwWXalM.97872/6127fa62d8a0bf2b3c)
+[![TITLE](/file/811140909/1631/20k1Z53eiyY.23995/c541e89b74253623d9 "TITLE")](https://core.telegram.org/file/811140015/1734/8VZFkwWXalM.97872/6127fa62d8a0bf2b3c)
 
 Telegram apps support these buttons as of [version 5.7](https://telegram.org/blog/privacy-discussions-web-bots#meet-seamless-web-bots).
 
@@ -1707,7 +1728,7 @@ Telegram apps support these buttons as of [version 5.7](https://telegram.org/blo
 
 | Field | Type | Description |
 | --- | --- | --- |
-| url | String | An HTTPS URL to be opened with user authorization data added to the query string when the button is pressed. If the user refuses to provide authorization data, the original URL without information about the user will be opened. The data added is the same as described in [Receiving authorization data](https://core.telegram.org/widgets/login#receiving-authorization-data).  <br>  <br>**NOTE:** You **must** always check the hash of the received data to verify the authentication and the integrity of the data as described in [Checking authorization](https://core.telegram.org/widgets/login#checking-authorization). |
+| url | String | An HTTPS URL to be opened with user authorization data added to the query string when the button is pressed. If the user refuses to provide authorization data, the original URL without information about the user will be opened. The data added is the same as described in [Receiving authorization data](https://core.telegram.org/widgets/login#receiving-authorization-data).<br><br>**NOTE:** You **must** always check the hash of the received data to verify the authentication and the integrity of the data as described in [Checking authorization](https://core.telegram.org/widgets/login#checking-authorization). |
 | forward\_text | String | _Optional_. New text of the button in forwarded messages |
 | bot\_username | String | _Optional_. Username of a bot, which will be used for user authorization. See [Setting up a bot](https://core.telegram.org/widgets/login#setting-up-a-bot) for more details. If not specified, the current bot's username will be assumed. The _url_'s domain must be the same as the domain linked with the bot. See [Linking your domain to the bot](https://core.telegram.org/widgets/login#linking-your-domain-to-the-bot) for more details. |
 | request\_write\_access | Boolean | _Optional_. Pass _True_ to request the permission for your bot to send messages to the user |
@@ -1734,11 +1755,11 @@ This object represents an inline keyboard button that copies specified text to t
 
 #### CallbackQuery
 
-This object represents an incoming callback query from a callback button in an inline keyboard. If the button that originated the query was attached to a message sent by the bot, the field _message_ will be present. If the button was attached to a message sent via the bot (in [inline mode](#inline-mode)), the field _inline\_message\_id_ will be present. Exactly one of the fields _data_ or _game\_short\_name_ will be present.
+This object represents an incoming callback query from a callback button in an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards). If the button that originated the query was attached to a message sent by the bot, the field _message_ will be present. If the button was attached to a message sent via the bot (in [inline mode](#inline-mode)), the field _inline\_message\_id_ will be present. Exactly one of the fields _data_ or _game\_short\_name_ will be present.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | String | Unique identifier for this query |
+| id | String | Unique identifier for this query |
 | from | [User](#user) | Sender |
 | message | [MaybeInaccessibleMessage](#maybeinaccessiblemessage) | _Optional_. Message sent by the bot with the callback button that originated the query |
 | inline\_message\_id | String | _Optional_. Identifier of the message sent via the bot in inline mode, that originated the query |
@@ -1750,7 +1771,7 @@ This object represents an incoming callback query from a callback button in an i
 
 #### ForceReply
 
-Upon receiving a message with this object, Telegram clients will display a reply interface to the user (act as if the user has selected the bot's message and tapped 'Reply'). This can be extremely useful if you want to create user-friendly step-by-step interfaces without having to sacrifice privacy mode. Not supported in channels and for messages sent on behalf of a user account.
+Upon receiving a message with this object, Telegram clients will display a reply interface to the user (act as if the user has selected the bot's message and tapped 'Reply'). This can be extremely useful if you want to create user-friendly step-by-step interfaces without having to sacrifice [privacy mode](https://core.telegram.org/bots/features#privacy-mode). Not supported in channels and for messages sent on behalf of a user account.
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -1759,11 +1780,20 @@ Upon receiving a message with this object, Telegram clients will display a reply
 | selective | Boolean | _Optional_. Use this parameter if you want to force reply from specific users only. Targets: 1) users that are @mentioned in the _text_ of the [Message](#message) object; 2) if the bot's message is a reply to a message in the same chat and forum topic, sender of the original message. |
 
 > **Example:** A [poll bot](https://t.me/PollBot) for groups runs in privacy mode (only receives commands, replies to its messages and mentions). There could be two ways to create a new poll:
-> 
-> - Explain the user how to send a command with parameters (e.g. /newpoll question answer1 answer2). May be appealing for hardcore users but lacks modern day polish.
-> - Guide the user through a step-by-step process. 'Please send me your question', 'Cool, now let's add the first answer option', 'Great. Keep adding answer options, then send /done when you're ready'.
-> 
+>
+> -   Explain the user how to send a command with parameters (e.g. /newpoll question answer1 answer2). May be appealing for hardcore users but lacks modern day polish.
+> -   Guide the user through a step-by-step process. 'Please send me your question', 'Cool, now let's add the first answer option', 'Great. Keep adding answer options, then send /done when you're ready'.
+>
 > The last option is definitely more attractive. And if you use [ForceReply](#forcereply) in your bot's questions, it will receive the user's answers even if it only receives replies, commands and mentions - without any extra work for the user.
+
+#### Community
+
+Represents a community (a group of chats).
+
+| Field | Type | Description |
+| --- | --- | --- |
+| id | Integer | Unique identifier for this community. This number may have more than 32 significant bits and some programming languages may have difficulty/silent defects in interpreting it. But it has at most 52 significant bits, so a signed 64-bit integer or double-precision float type are safe for storing this identifier. |
+| name | String | Name of the community |
 
 #### ChatPhoto
 
@@ -1816,7 +1846,7 @@ Represents the rights of an administrator in a chat.
 | can\_pin\_messages | Boolean | _Optional_. _True_, if the user is allowed to pin messages; for groups and supergroups only |
 | can\_manage\_topics | Boolean | _Optional_. _True_, if the user is allowed to create, rename, close, and reopen forum topics; for supergroups only |
 | can\_manage\_direct\_messages | Boolean | _Optional_. _True_, if the administrator can manage direct messages of the channel and decline suggested posts; for channels only |
-| can\_manage\_tags | Boolean | _Optional_. _True_, if the administrator can edit the tags of regular members; for groups and supergroups only. If omitted defaults to the value of can\_pin\_messages. |
+| can\_manage\_tags | Boolean | _Optional_. _True_, if the administrator can edit the tags of regular members; for groups and supergroups only. If omitted, defaults to the value of can\_pin\_messages. |
 
 #### ChatMemberUpdated
 
@@ -1880,7 +1910,7 @@ Represents a [chat member](#chatmember) that has some additional privileges.
 | can\_pin\_messages | Boolean | _Optional_. _True_, if the user is allowed to pin messages; for groups and supergroups only |
 | can\_manage\_topics | Boolean | _Optional_. _True_, if the user is allowed to create, rename, close, and reopen forum topics; for supergroups only |
 | can\_manage\_direct\_messages | Boolean | _Optional_. _True_, if the administrator can manage direct messages of the channel and decline suggested posts; for channels only |
-| can\_manage\_tags | Boolean | _Optional_. _True_, if the administrator can edit the tags of regular members; for groups and supergroups only. If omitted defaults to the value of can\_pin\_messages. |
+| can\_manage\_tags | Boolean | _Optional_. _True_, if the administrator can edit the tags of regular members; for groups and supergroups only. If omitted, defaults to the value of can\_pin\_messages. |
 | custom\_title | String | _Optional_. Custom title for this user |
 
 #### ChatMemberMember
@@ -1953,7 +1983,7 @@ Represents a join request sent to a chat.
 | date | Integer | Date the request was sent in Unix time |
 | bio | String | _Optional_. Bio of the user |
 | invite\_link | [ChatInviteLink](#chatinvitelink) | _Optional_. Chat invite link that was used by the user to send the join request |
-| query\_id | String | _Optional_. Identifier of the join request query. If present, then the bot must call [sendChatJoinRequestWebApp](#sendchatjoinrequestwebapp) or directly call [answerChatJoinRequestQuery](#answerchatjoinrequestquery) within 10 seconds. |
+| query\_id | String | _Optional_. Identifier of the join request query; for bots assigned to process join requests only. If present, then the bot must call [sendChatJoinRequestWebApp](#sendchatjoinrequestwebapp) or directly call [answerChatJoinRequestQuery](#answerchatjoinrequestquery) within 10 seconds. |
 
 #### ChatPermissions
 
@@ -1976,7 +2006,7 @@ Describes actions that a non-administrator user is allowed to take in a chat.
 | can\_change\_info | Boolean | _Optional_. _True_, if the user is allowed to change the chat title, photo and other settings. Ignored in public supergroups. |
 | can\_invite\_users | Boolean | _Optional_. _True_, if the user is allowed to invite new users to the chat |
 | can\_pin\_messages | Boolean | _Optional_. _True_, if the user is allowed to pin messages. Ignored in public supergroups. |
-| can\_manage\_topics | Boolean | _Optional_. _True_, if the user is allowed to create forum topics. If omitted defaults to the value of can\_pin\_messages. |
+| can\_manage\_topics | Boolean | _Optional_. _True_, if the user is allowed to create forum topics. If omitted, defaults to the value of can\_pin\_messages. |
 
 #### Birthdate
 
@@ -2154,7 +2184,7 @@ The reaction is based on an emoji.
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the reaction, always “emoji” |
-| emoji | String | Reaction emoji. Currently, it can be one of "❤", "👍", "👎", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢", "🎉", "🤩", "🤮", "💩", "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳", "❤‍🔥", "🌚", "🌭", "💯", "🤣", "⚡", "🍌", "🏆", "💔", "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈", "😴", "😭", "🤓", "👻", "👨‍💻", "👀", "🎃", "🙈", "😇", "😨", "🤝", "✍", "🤗", "🫡", "🎅", "🎄", "☃", "💅", "🤪", "🗿", "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊", "😎", "👾", "🤷‍♂", "🤷", "🤷‍♀", "😡". |
+| emoji | String | Reaction emoji. Currently, it can be one of "![❤](//telegram.org/img/emoji/40/E29DA4.png)", "![👍](//telegram.org/img/emoji/40/F09F918D.png)", "![👎](//telegram.org/img/emoji/40/F09F918E.png)", "![🔥](//telegram.org/img/emoji/40/F09F94A5.png)", "![🥰](//telegram.org/img/emoji/40/F09FA5B0.png)", "![👏](//telegram.org/img/emoji/40/F09F918F.png)", "![😁](//telegram.org/img/emoji/40/F09F9881.png)", "![🤔](//telegram.org/img/emoji/40/F09FA494.png)", "![🤯](//telegram.org/img/emoji/40/F09FA4AF.png)", "![😱](//telegram.org/img/emoji/40/F09F98B1.png)", "![🤬](//telegram.org/img/emoji/40/F09FA4AC.png)", "![😢](//telegram.org/img/emoji/40/F09F98A2.png)", "![🎉](//telegram.org/img/emoji/40/F09F8E89.png)", "![🤩](//telegram.org/img/emoji/40/F09FA4A9.png)", "![🤮](//telegram.org/img/emoji/40/F09FA4AE.png)", "![💩](//telegram.org/img/emoji/40/F09F92A9.png)", "![🙏](//telegram.org/img/emoji/40/F09F998F.png)", "![👌](//telegram.org/img/emoji/40/F09F918C.png)", "![🕊](//telegram.org/img/emoji/40/F09F958A.png)", "![🤡](//telegram.org/img/emoji/40/F09FA4A1.png)", "![🥱](//telegram.org/img/emoji/40/F09FA5B1.png)", "![🥴](//telegram.org/img/emoji/40/F09FA5B4.png)", "![😍](//telegram.org/img/emoji/40/F09F988D.png)", "![🐳](//telegram.org/img/emoji/40/F09F90B3.png)", "![❤‍🔥](//telegram.org/img/emoji/40/E29DA4E2808DF09F94A5.png)", "![🌚](//telegram.org/img/emoji/40/F09F8C9A.png)", "![🌭](//telegram.org/img/emoji/40/F09F8CAD.png)", "![💯](//telegram.org/img/emoji/40/F09F92AF.png)", "![🤣](//telegram.org/img/emoji/40/F09FA4A3.png)", "![⚡](//telegram.org/img/emoji/40/E29AA1.png)", "![🍌](//telegram.org/img/emoji/40/F09F8D8C.png)", "![🏆](//telegram.org/img/emoji/40/F09F8F86.png)", "![💔](//telegram.org/img/emoji/40/F09F9294.png)", "![🤨](//telegram.org/img/emoji/40/F09FA4A8.png)", "![😐](//telegram.org/img/emoji/40/F09F9890.png)", "![🍓](//telegram.org/img/emoji/40/F09F8D93.png)", "![🍾](//telegram.org/img/emoji/40/F09F8DBE.png)", "![💋](//telegram.org/img/emoji/40/F09F928B.png)", "![🖕](//telegram.org/img/emoji/40/F09F9695.png)", "![😈](//telegram.org/img/emoji/40/F09F9888.png)", "![😴](//telegram.org/img/emoji/40/F09F98B4.png)", "![😭](//telegram.org/img/emoji/40/F09F98AD.png)", "![🤓](//telegram.org/img/emoji/40/F09FA493.png)", "![👻](//telegram.org/img/emoji/40/F09F91BB.png)", "![👨‍💻](//telegram.org/img/emoji/40/F09F91A8E2808DF09F92BB.png)", "![👀](//telegram.org/img/emoji/40/F09F9180.png)", "![🎃](//telegram.org/img/emoji/40/F09F8E83.png)", "![🙈](//telegram.org/img/emoji/40/F09F9988.png)", "![😇](//telegram.org/img/emoji/40/F09F9887.png)", "![😨](//telegram.org/img/emoji/40/F09F98A8.png)", "![🤝](//telegram.org/img/emoji/40/F09FA49D.png)", "![✍](//telegram.org/img/emoji/40/E29C8D.png)", "![🤗](//telegram.org/img/emoji/40/F09FA497.png)", "![🫡](//telegram.org/img/emoji/40/F09FABA1.png)", "![🎅](//telegram.org/img/emoji/40/F09F8E85.png)", "![🎄](//telegram.org/img/emoji/40/F09F8E84.png)", "![☃](//telegram.org/img/emoji/40/E29883.png)", "![💅](//telegram.org/img/emoji/40/F09F9285.png)", "![🤪](//telegram.org/img/emoji/40/F09FA4AA.png)", "![🗿](//telegram.org/img/emoji/40/F09F97BF.png)", "![🆒](//telegram.org/img/emoji/40/F09F8692.png)", "![💘](//telegram.org/img/emoji/40/F09F9298.png)", "![🙉](//telegram.org/img/emoji/40/F09F9989.png)", "![🦄](//telegram.org/img/emoji/40/F09FA684.png)", "![😘](//telegram.org/img/emoji/40/F09F9898.png)", "![💊](//telegram.org/img/emoji/40/F09F928A.png)", "![🙊](//telegram.org/img/emoji/40/F09F998A.png)", "![😎](//telegram.org/img/emoji/40/F09F988E.png)", "![👾](//telegram.org/img/emoji/40/F09F91BE.png)", "![🤷‍♂](//telegram.org/img/emoji/40/F09FA4B7E2808DE29982.png)", "![🤷](//telegram.org/img/emoji/40/F09FA4B7.png)", "![🤷‍♀](//telegram.org/img/emoji/40/F09FA4B7E2808DE29980.png)", "![😡](//telegram.org/img/emoji/40/F09F98A1.png)". |
 
 #### ReactionTypeCustomEmoji
 
@@ -2235,7 +2265,7 @@ This object represents a gift that can be sent by the bot.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | String | Unique identifier of the gift |
+| id | String | Unique identifier of the gift |
 | sticker | [Sticker](#sticker) | The sticker that represents the gift |
 | star\_count | Integer | The number of Telegram Stars that must be paid to send the sticker |
 | upgrade\_star\_count | Integer | _Optional_. The number of Telegram Stars that must be paid to upgrade the gift to a unique one |
@@ -2356,8 +2386,8 @@ Describes a service message about a unique gift that was sent or received.
 | --- | --- | --- |
 | gift | [UniqueGift](#uniquegift) | Information about the gift |
 | origin | String | Origin of the gift. Currently, either “upgrade” for gifts upgraded from regular gifts, “transfer” for gifts transferred from other users or channels, “resale” for gifts bought from other users, “gifted\_upgrade” for upgrades purchased after the gift was sent, or “offer” for gifts bought or sold through gift purchase offers. |
-| last\_resale\_currency | String | _Optional_. For gifts bought from other users, the currency in which the payment for the gift was done. Currently, one of “XTR” for Telegram Stars or “TON” for toncoins. |
-| last\_resale\_amount | Integer | _Optional_. For gifts bought from other users, the price paid for the gift in either Telegram Stars or nanotoncoins |
+| last\_resale\_currency | String | _Optional_. For gifts bought from other users, the currency in which the payment for the gift was done. Currently, one of “XTR” for Telegram Stars or “TON” for TON grams. |
+| last\_resale\_amount | Integer | _Optional_. For gifts bought from other users, the price paid for the gift in either Telegram Stars or nanograms |
 | owned\_gift\_id | String | _Optional_. Unique identifier of the received gift for the bot; only present for gifts received on behalf of business accounts |
 | transfer\_star\_count | Integer | _Optional_. Number of Telegram Stars that must be paid to transfer the gift; omitted if the bot cannot transfer the gift |
 | next\_transfer\_date | Integer | _Optional_. Point in time (Unix timestamp) when the gift can be transferred. If it is in the past, then the gift can be transferred now. |
@@ -2455,6 +2485,7 @@ This object represents a bot command.
 | --- | --- | --- |
 | command | String | Text of the command; 1-32 characters. Can contain only lowercase English letters, digits and underscores. |
 | description | String | Description of the command; 1-256 characters |
+| is\_ephemeral | Boolean | _Optional_. _True_, if the command sends an ephemeral message, which can be seen only by the sender of the message and the bot |
 
 #### BotCommandScope
 
@@ -2736,7 +2767,7 @@ Describes the connection of the bot with a business account.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | String | Unique identifier of the business connection |
+| id | String | Unique identifier of the business connection |
 | user | [User](#user) | Business account user that created the business connection |
 | user\_chat\_id | Integer | Identifier of a private chat with the user who created the business connection. This number may have more than 32 significant bits and some programming languages may have difficulty/silent defects in interpreting it. But it has at most 52 significant bits, so a 64-bit integer or double-precision float type are safe for storing this identifier. |
 | date | Integer | Date the connection was established in Unix time |
@@ -2775,7 +2806,7 @@ Describes an inline message to be sent by a user of a Mini App.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | String | Unique identifier of the prepared message |
+| id | String | Unique identifier of the prepared message |
 | expiration\_date | Integer | Expiration date of the prepared message, in Unix time. Expired prepared messages can no longer be used. |
 
 #### PreparedKeyboardButton
@@ -2784,7 +2815,7 @@ Describes a keyboard button to be used by a user of a Mini App.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | String | Unique identifier of the keyboard button |
+| id | String | Unique identifier of the keyboard button |
 
 #### ResponseParameters
 
@@ -2818,7 +2849,7 @@ Represents an animation file (GIF or H.264/MPEG-4 AVC video without sound) to be
 | caption | String | _Optional_. Caption of the animation to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the animation caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
 | width | Integer | _Optional_. Animation width |
 | height | Integer | _Optional_. Animation height |
 | duration | Integer | _Optional_. Animation duration in seconds |
@@ -2875,7 +2906,7 @@ Represents a live photo to be sent.
 | caption | String | _Optional_. Caption of the live photo to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the live photo caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
 | has\_spoiler | Boolean | _Optional_. Pass _True_ if the live photo needs to be covered with a spoiler animation |
 
 #### InputMediaLocation
@@ -2900,7 +2931,7 @@ Represents a photo to be sent.
 | caption | String | _Optional_. Caption of the photo to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the photo caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
 | has\_spoiler | Boolean | _Optional_. Pass _True_ if the photo needs to be covered with a spoiler animation |
 
 #### InputMediaSticker
@@ -2943,12 +2974,25 @@ Represents a video to be sent.
 | caption | String | _Optional_. Caption of the video to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the video caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
 | width | Integer | _Optional_. Video width |
 | height | Integer | _Optional_. Video height |
 | duration | Integer | _Optional_. Video duration in seconds |
 | supports\_streaming | Boolean | _Optional_. Pass _True_ if the uploaded video is suitable for streaming |
 | has\_spoiler | Boolean | _Optional_. Pass _True_ if the video needs to be covered with a spoiler animation |
+
+#### InputMediaVoiceNote
+
+Represents a voice message file to be sent.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the media, must be _voice\_note_ |
+| media | String | File to send. Pass a file\_id to send a file that exists on the Telegram servers (recommended), pass an HTTP URL for Telegram to get a file from the Internet, or pass "attach://<file\_attach\_name>" to upload a new one using multipart/form-data under <file\_attach\_name> name. [More information on Sending Files »](#sending-files) |
+| caption | String | _Optional_. Caption of the voice message to be sent, 0-1024 characters after entities parsing |
+| parse\_mode | String | _Optional_. Mode for parsing entities in the voice message caption. See [formatting options](#formatting-options) for more details. |
+| caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
+| duration | Integer | _Optional_. Duration of the voice message in seconds |
 
 #### InputFile
 
@@ -3080,20 +3124,20 @@ Colors with identifiers 0 (red), 1 (orange), 2 (purple/violet), 3 (green), 4 (cy
 
 | Color identifier | Light colors | Dark colors |
 | --- | --- | --- |
-| 7   | E15052 F9AE63 | FF9380 992F37 |
-| 8   | E0802B FAC534 | ECB04E C35714 |
-| 9   | A05FF3 F48FFF | C697FF 5E31C8 |
-| 10  | 27A910 A7DC57 | A7EB6E 167E2D |
-| 11  | 27ACCE 82E8D6 | 40D8D0 045C7F |
-| 12  | 3391D4 7DD3F0 | 52BFFF 0B5494 |
-| 13  | DD4371 FFBE9F | FF86A6 8E366E |
-| 14  | 247BED F04856 FFFFFF | 3FA2FE E5424F FFFFFF |
-| 15  | D67722 1EA011 FFFFFF | FF905E 32A527 FFFFFF |
-| 16  | 179E42 E84A3F FFFFFF | 66D364 D5444F FFFFFF |
-| 17  | 2894AF 6FC456 FFFFFF | 22BCE2 3DA240 FFFFFF |
-| 18  | 0C9AB3 FFAD95 FFE6B5 | 22BCE2 FF9778 FFDA6B |
-| 19  | 7757D6 F79610 FFDE8E | 9791FF F2731D FFDB59 |
-| 20  | 1585CF F2AB1D FFFFFF | 3DA6EB EEA51D FFFFFF |
+| 7 | E15052 F9AE63 | FF9380 992F37 |
+| 8 | E0802B FAC534 | ECB04E C35714 |
+| 9 | A05FF3 F48FFF | C697FF 5E31C8 |
+| 10 | 27A910 A7DC57 | A7EB6E 167E2D |
+| 11 | 27ACCE 82E8D6 | 40D8D0 045C7F |
+| 12 | 3391D4 7DD3F0 | 52BFFF 0B5494 |
+| 13 | DD4371 FFBE9F | FF86A6 8E366E |
+| 14 | 247BED F04856 FFFFFF | 3FA2FE E5424F FFFFFF |
+| 15 | D67722 1EA011 FFFFFF | FF905E 32A527 FFFFFF |
+| 16 | 179E42 E84A3F FFFFFF | 66D364 D5444F FFFFFF |
+| 17 | 2894AF 6FC456 FFFFFF | 22BCE2 3DA240 FFFFFF |
+| 18 | 0C9AB3 FFAD95 FFE6B5 | 22BCE2 FF9778 FFDA6B |
+| 19 | 7757D6 F79610 FFDE8E | 9791FF F2731D FFDB59 |
+| 20 | 1585CF F2AB1D FFFFFF | 3DA6EB EEA51D FFFFFF |
 
 #### Profile accent colors
 
@@ -3101,22 +3145,22 @@ Currently, the following colors in RGB format are in use for profile backgrounds
 
 | Color identifier | Light colors | Dark colors |
 | --- | --- | --- |
-| 0   | BA5650 | 9C4540 |
-| 1   | C27C3E | 945E2C |
-| 2   | 956AC8 | 715099 |
-| 3   | 49A355 | 33713B |
-| 4   | 3E97AD | 387E87 |
-| 5   | 5A8FBB | 477194 |
-| 6   | B85378 | 944763 |
-| 7   | 7F8B95 | 435261 |
-| 8   | C9565D D97C57 | 994343 AC583E |
-| 9   | CF7244 CC9433 | 8F552F A17232 |
-| 10  | 9662D4 B966B6 | 634691 9250A2 |
-| 11  | 3D9755 89A650 | 296A43 5F8F44 |
-| 12  | 3D95BA 50AD98 | 306C7C 3E987E |
-| 13  | 538BC2 4DA8BD | 38618C 458BA1 |
-| 14  | B04F74 D1666D | 884160 A65259 |
-| 15  | 637482 7B8A97 | 53606E 384654 |
+| 0 | BA5650 | 9C4540 |
+| 1 | C27C3E | 945E2C |
+| 2 | 956AC8 | 715099 |
+| 3 | 49A355 | 33713B |
+| 4 | 3E97AD | 387E87 |
+| 5 | 5A8FBB | 477194 |
+| 6 | B85378 | 944763 |
+| 7 | 7F8B95 | 435261 |
+| 8 | C9565D D97C57 | 994343 AC583E |
+| 9 | CF7244 CC9433 | 8F552F A17232 |
+| 10 | 9662D4 B966B6 | 634691 9250A2 |
+| 11 | 3D9755 89A650 | 296A43 5F8F44 |
+| 12 | 3D95BA 50AD98 | 306C7C 3E987E |
+| 13 | 538BC2 4DA8BD | 38618C 458BA1 |
+| 14 | B04F74 D1666D | 884160 A65259 |
+| 15 | 637482 7B8A97 | 53606E 384654 |
 
 #### Inline mode objects
 
@@ -3124,8 +3168,7 @@ Objects and methods used in the inline mode are described in the [Inline mode se
 
 ### Available methods
 
-> All methods in the Bot API are case-insensitive. We support **GET** and **POST** HTTP methods. Use either [URL query string](https://en.wikipedia.org/wiki/Query_string) or _application/json_ or _application/x-www-form-urlencoded_ or _multipart/form-data_ for passing parameters in Bot API requests.  
-> On successful call, a JSON-object containing the result will be returned.
+> All methods in the Bot API are case-insensitive. We support **GET** and **POST** HTTP methods. Use either [URL query string](https://en.wikipedia.org/wiki/Query_string) or _application/json_ or _application/x-www-form-urlencoded_ or _multipart/form-data_ for passing parameters in Bot API requests.<br>On successful call, a JSON-object containing the result will be returned.
 
 #### getMe
 
@@ -3149,6 +3192,8 @@ Use this method to send text messages. On success, the sent [Message](#message) 
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | text | String | Yes | Text of the message to be sent, 1-4096 characters after entities parsing |
 | parse\_mode | String | Optional | Mode for parsing entities in the message text. See [formatting options](#formatting-options) for more details. |
 | entities | Array of [MessageEntity](#messageentity) | Optional | A JSON-serialized list of special entities that appear in message text, which can be specified instead of _parse\_mode_ |
@@ -3159,7 +3204,7 @@ Use this method to send text messages. On success, the sent [Message](#message) 
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### Formatting options
 
@@ -3167,11 +3212,7 @@ The Bot API supports basic formatting for messages. You can use bold, italic, un
 
 Note that Telegram clients will display an **alert** to the user before opening an inline link ('Open this link?' together with the full URL).
 
-Message entities can be nested, providing following restrictions are met:  
-\- If two entities have common characters, then one of them is fully contained inside another.  
-\- _bold_, _italic_, _underline_, _strikethrough_, and _spoiler_ entities can contain and can be part of any other entities, except _pre_ and _code_.  
-\- _blockquote_ and _expandable\_blockquote_ entities can't be nested.  
-\- All other entities can't contain each other.
+Message entities can be nested, providing following restrictions are met:<br>\- If two entities have common characters, then one of them is fully contained inside another.<br>\- _bold_, _italic_, _underline_, _strikethrough_, and _spoiler_ entities can contain and can be part of any other entities, except _pre_ and _code_.<br>\- _blockquote_ and _expandable\_blockquote_ entities can't be nested.<br>\- All other entities can't contain each other.
 
 Links `tg://user?id=<user_id>` can be used to mention a user by their identifier without using a username. Please note:
 
@@ -3239,7 +3280,7 @@ Please note:
 - In all other places characters '\_', '\*', '\[', '\]', '(', ')', '~', '\`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!' must be escaped with the preceding character '\\'.
 - In case of ambiguity between `italic` and `underline` entities `__` is always greedily treated from left to right as beginning or end of an `underline` entity, so instead of `___italic underline___` use `___italic underline_**__`, adding an empty bold entity as a separator.
 - A valid emoji must be provided as an alternative value for the custom emoji. The emoji will be shown instead of the custom emoji in places where a custom emoji cannot be displayed (e.g., system notifications) or if the message is forwarded by a non-premium user. It is recommended to use the emoji from the **emoji** field of the custom emoji [sticker](#sticker).
-- Custom emoji entities can only be used by bots that purchased additional usernames on [Fragment](https://fragment.com/) or in the messages directly sent by the bot to private, group and supergroup chats if the owner of the bot has a Telegram Premium subscription.
+- Custom emoji entities can only be used by bots that purchased additional usernames on [Fragment](https://fragment.com) or in the messages directly sent by the bot to private, group and supergroup chats if the owner of the bot has a Telegram Premium subscription.
 - See [date-time entity formatting](#date-time-entity-formatting) for more details about supported date-time formats.
 
 ###### HTML style
@@ -3263,8 +3304,15 @@ To use this mode, pass _HTML_ in the _parse\_mode_ field. The following tags are
 <code>inline fixed-width code</code>
 <pre>pre-formatted fixed-width code block</pre>
 <pre><code class="language-python">pre-formatted fixed-width code block written in the Python programming language</code></pre>
-<blockquote>Block quotation started\nBlock quotation continued\nThe last line of the block quotation</blockquote>
-<blockquote expandable>Expandable block quotation started\nExpandable block quotation continued\nExpandable block quotation continued\nHidden by default part of the block quotation started\nExpandable block quotation continued\nThe last line of the block quotation</blockquote>
+<blockquote>Block quotation started
+Block quotation continued
+The last line of the block quotation</blockquote>
+<blockquote expandable>Expandable block quotation started
+Expandable block quotation continued
+Expandable block quotation continued
+Hidden by default part of the block quotation started
+Expandable block quotation continued
+The last line of the block quotation</blockquote>
 ```
 
 Please note:
@@ -3276,7 +3324,7 @@ Please note:
 - Use nested `pre` and `code` tags, to define programming language for `pre` entity.
 - Programming language can't be specified for standalone `code` tags.
 - A valid emoji must be used as the content of the `tg-emoji` tag. The emoji will be shown instead of the custom emoji in places where a custom emoji cannot be displayed (e.g., system notifications) or if the message is forwarded by a non-premium user. It is recommended to use the emoji from the **emoji** field of the custom emoji [sticker](#sticker).
-- Custom emoji entities can only be used by bots that purchased additional usernames on [Fragment](https://fragment.com/) or in the messages directly sent by the bot to private, group and supergroup chats if the owner of the bot has a Telegram Premium subscription.
+- Custom emoji entities can only be used by bots that purchased additional usernames on [Fragment](https://fragment.com) or in the messages directly sent by the bot to private, group and supergroup chats if the owner of the bot has a Telegram Premium subscription.
 - See [date-time entity formatting](#date-time-entity-formatting) for more details about supported date-time formats.
 
 ###### Markdown style
@@ -3303,6 +3351,24 @@ Please note:
 - There is no way to specify “underline”, “strikethrough”, “spoiler”, “blockquote”, “expandable\_blockquote”, “custom\_emoji”, and “date\_time” entities, use parse mode [MarkdownV2](#markdownv2-style) instead.
 - To escape characters '\_', '\*', '\`', '\[' outside of an entity, prepend the character '\\' before them.
 - Escaping inside entities is not allowed, so entity must be closed first and reopened again: use `_snake_\__case_` for italic `snake_case` and `*2*\**2=4*` for bold `2*2=4`.
+
+#### Ephemeral Messages and Commands
+
+Ephemeral interactions allow a bot and an individual member of a group or supergroup chat to communicate privately on the public timeline without cluttering the chat for other members. They may disappear automatically after some time, or if the app is restarted.
+
+**Ephemeral Commands (User to Bot)**<br>Bots can declare ephemeral commands by setting the _is\_ephemeral_ field to _True_ in the [BotCommand](#botcommand) class. A user can then send an ephemeral command that is received by the target bot but remains invisible to all members of the chat, including both users and other bots.
+
+**Ephemeral Messages**<br>Bots can send an ephemeral message response back to a specific user designated by the _receiver\_user\_id_ parameter. Other members of the group or supergroup chat will not see the message.
+
+> It is **not guaranteed** that the ephemeral message will be received, especially if the user is offline.
+
+**Reply Targets and Conditions**
+
+- Any bot can send an ephemeral message to a user within **15 seconds** of the incoming eligible action. The message will be sent to the exact client application that triggered the action. For this the bot must provide either:
+
+    - The _callback\_query\_id_ from a received callback query, or
+    - The _reply\_parameters.ephemeral\_message\_id_ from an incoming ephemeral message.
+- If the bot is a chat administrator, it can send an ephemeral message to any non-bot member of the chat at any time without needing to specify a _callback\_query\_id_ or _reply\_parameters.ephemeral\_message\_id_. In this case, the message may be delivered across multiple active client applications of the user, but is regardless not guaranteed to be delivered to any of them.
 
 #### Paid Broadcasts
 
@@ -3331,7 +3397,7 @@ Use this method to forward messages of any kind. Service messages and messages w
 
 #### forwardMessages
 
-Use this method to forward multiple messages of any kind. If some of the specified messages can't be found or forwarded, they are skipped. Service messages and messages with protected content can't be forwarded. Album grouping is kept for forwarded messages. On success, an array of [MessageId](#messageid) of the sent messages is returned.
+Use this method to forward multiple messages of any kind. If some of the specified messages can't be found or forwarded, they are skipped. Service messages and messages with protected content can't be forwarded. Album grouping is kept for forwarded messages. On success, an Array of [MessageId](#messageid) of the sent messages is returned.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -3358,18 +3424,18 @@ Use this method to copy messages of any kind. Service messages, paid media messa
 | caption | String | Optional | New caption for media, 0-1024 characters after entities parsing. If not specified, the original caption is kept. |
 | parse\_mode | String | Optional | Mode for parsing entities in the new caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | Optional | A JSON-serialized list of special entities that appear in the new caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | Optional | Pass _True_, if the caption must be shown above the message media. Ignored if a new caption isn't specified. |
+| show\_caption\_above\_media | Boolean | Optional | Pass _True_ if the caption must be shown above the message media. Ignored if a new caption isn't specified. |
 | disable\_notification | Boolean | Optional | Sends the message [silently](https://telegram.org/blog/channels-2-0#silent-messages). Users will receive a notification with no sound. |
 | protect\_content | Boolean | Optional | Protects the contents of the sent message from forwarding and saving |
 | allow\_paid\_broadcast | Boolean | Optional | Pass _True_ to allow up to 1000 messages per second, ignoring [broadcasting limits](https://core.telegram.org/bots/faq#how-can-i-message-all-of-my-bot-39s-subscribers-at-once) for a fee of 0.1 Telegram Stars per message. The relevant Stars will be withdrawn from the bot's balance. |
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; only available when copying to private chats |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### copyMessages
 
-Use this method to copy messages of any kind. If some of the specified messages can't be found or copied, they are skipped. Service messages, paid media messages, giveaway messages, giveaway winners messages, and invoice messages can't be copied. A quiz [poll](#poll) can be copied only if the value of the field _correct\_option\_id_ is known to the bot. The method is analogous to the method [forwardMessages](#forwardmessages), but the copied messages don't have a link to the original message. Album grouping is kept for copied messages. On success, an array of [MessageId](#messageid) of the sent messages is returned.
+Use this method to copy messages of any kind. If some of the specified messages can't be found or copied, they are skipped. Service messages, paid media messages, giveaway messages, giveaway winners messages, and invoice messages can't be copied. A quiz [poll](#poll) can be copied only if the value of the field _correct\_option\_id_ is known to the bot. The method is analogous to the method [forwardMessages](#forwardmessages), but the copied messages don't have a link to the original message. Album grouping is kept for copied messages. On success, an Array of [MessageId](#messageid) of the sent messages is returned.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -3392,11 +3458,13 @@ Use this method to send photos. On success, the sent [Message](#message) is retu
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | photo | [InputFile](#inputfile) or String | Yes | Photo to send. Pass a file\_id as String to send a photo that exists on the Telegram servers (recommended), pass an HTTP URL as a String for Telegram to get a photo from the Internet, or upload a new photo using multipart/form-data. The photo must be at most 10 MB in size. The photo's width and height must not exceed 10000 in total. Width and height ratio must be at most 20. [More information on Sending Files »](#sending-files) |
 | caption | String | Optional | Photo caption (may also be used when resending photos by _file\_id_), 0-1024 characters after entities parsing |
 | parse\_mode | String | Optional | Mode for parsing entities in the photo caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | Optional | A JSON-serialized list of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | Optional | Pass _True_, if the caption must be shown above the message media |
+| show\_caption\_above\_media | Boolean | Optional | Pass _True_ if the caption must be shown above the message media |
 | has\_spoiler | Boolean | Optional | Pass _True_ if the photo needs to be covered with a spoiler animation |
 | disable\_notification | Boolean | Optional | Sends the message [silently](https://telegram.org/blog/channels-2-0#silent-messages). Users will receive a notification with no sound. |
 | protect\_content | Boolean | Optional | Protects the contents of the sent message from forwarding and saving |
@@ -3404,7 +3472,7 @@ Use this method to send photos. On success, the sent [Message](#message) is retu
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendLivePhoto
 
@@ -3416,12 +3484,14 @@ Use this method to send live photos. On success, the sent [Message](#message) is
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target channel (in the format `@channelusername`) |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | live\_photo | [InputFile](#inputfile) or String | Yes | Live photo video to send. The video must be no longer than 10 seconds and must not exceed 10 MB in size. Pass a file\_id as String to send a video that exists on the Telegram servers (recommended) or upload a new video using multipart/form-data. [More information on Sending Files »](#sending-files). Sending live photos by a URL is currently unsupported. |
 | photo | [InputFile](#inputfile) or String | Yes | The static photo to send. Pass a file\_id as String to send a photo that exists on the Telegram servers (recommended) or upload a new video using multipart/form-data. [More information on Sending Files »](#sending-files). Sending live photos by a URL is currently unsupported. |
 | caption | String | Optional | Video caption (may also be used when resending videos by _file\_id_), 0-1024 characters after entities parsing |
 | parse\_mode | String | Optional | Mode for parsing entities in the video caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | Optional | A JSON-serialized list of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | Optional | Pass _True_, if the caption must be shown above the message media |
+| show\_caption\_above\_media | Boolean | Optional | Pass _True_ if the caption must be shown above the message media |
 | has\_spoiler | Boolean | Optional | Pass _True_ if the video needs to be covered with a spoiler animation |
 | disable\_notification | Boolean | Optional | Sends the message [silently](https://telegram.org/blog/channels-2-0#silent-messages). Users will receive a notification with no sound. |
 | protect\_content | Boolean | Optional | Protects the contents of the sent message from forwarding and saving |
@@ -3429,7 +3499,7 @@ Use this method to send live photos. On success, the sent [Message](#message) is
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendAudio
 
@@ -3443,6 +3513,8 @@ For sending voice messages, use the [sendVoice](#sendvoice) method instead.
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | audio | [InputFile](#inputfile) or String | Yes | Audio file to send. Pass a file\_id as String to send an audio file that exists on the Telegram servers (recommended), pass an HTTP URL as a String for Telegram to get an audio file from the Internet, or upload a new one using multipart/form-data. [More information on Sending Files »](#sending-files) |
 | caption | String | Optional | Audio caption, 0-1024 characters after entities parsing |
 | parse\_mode | String | Optional | Mode for parsing entities in the audio caption. See [formatting options](#formatting-options) for more details. |
@@ -3457,7 +3529,7 @@ For sending voice messages, use the [sendVoice](#sendvoice) method instead.
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendDocument
 
@@ -3469,6 +3541,8 @@ Use this method to send general files. On success, the sent [Message](#message) 
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | document | [InputFile](#inputfile) or String | Yes | File to send. Pass a file\_id as String to send a file that exists on the Telegram servers (recommended), pass an HTTP URL as a String for Telegram to get a file from the Internet, or upload a new one using multipart/form-data. [More information on Sending Files »](#sending-files) |
 | thumbnail | [InputFile](#inputfile) or String | Optional | Thumbnail of the file sent; can be ignored if thumbnail generation for the file is supported server-side. The thumbnail should be in JPEG format and less than 200 kB in size. A thumbnail's width and height should not exceed 320. Ignored if the file is not uploaded using multipart/form-data. Thumbnails can't be reused and can be only uploaded as a new file, so you can pass “attach://<file\_attach\_name>” if the thumbnail was uploaded using multipart/form-data under <file\_attach\_name>. [More information on Sending Files »](#sending-files) |
 | caption | String | Optional | Document caption (may also be used when resending documents by _file\_id_), 0-1024 characters after entities parsing |
@@ -3481,7 +3555,7 @@ Use this method to send general files. On success, the sent [Message](#message) 
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendVideo
 
@@ -3493,6 +3567,8 @@ Use this method to send video files, Telegram clients support MPEG4 videos (othe
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | video | [InputFile](#inputfile) or String | Yes | Video to send. Pass a file\_id as String to send a video that exists on the Telegram servers (recommended), pass an HTTP URL as a String for Telegram to get a video from the Internet, or upload a new video using multipart/form-data. [More information on Sending Files »](#sending-files) |
 | duration | Integer | Optional | Duration of sent video in seconds |
 | width | Integer | Optional | Video width |
@@ -3503,7 +3579,7 @@ Use this method to send video files, Telegram clients support MPEG4 videos (othe
 | caption | String | Optional | Video caption (may also be used when resending videos by _file\_id_), 0-1024 characters after entities parsing |
 | parse\_mode | String | Optional | Mode for parsing entities in the video caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | Optional | A JSON-serialized list of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | Optional | Pass _True_, if the caption must be shown above the message media |
+| show\_caption\_above\_media | Boolean | Optional | Pass _True_ if the caption must be shown above the message media |
 | has\_spoiler | Boolean | Optional | Pass _True_ if the video needs to be covered with a spoiler animation |
 | supports\_streaming | Boolean | Optional | Pass _True_ if the uploaded video is suitable for streaming |
 | disable\_notification | Boolean | Optional | Sends the message [silently](https://telegram.org/blog/channels-2-0#silent-messages). Users will receive a notification with no sound. |
@@ -3512,7 +3588,7 @@ Use this method to send video files, Telegram clients support MPEG4 videos (othe
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendAnimation
 
@@ -3524,6 +3600,8 @@ Use this method to send animation files (GIF or H.264/MPEG-4 AVC video without s
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | animation | [InputFile](#inputfile) or String | Yes | Animation to send. Pass a file\_id as String to send an animation that exists on the Telegram servers (recommended), pass an HTTP URL as a String for Telegram to get an animation from the Internet, or upload a new animation using multipart/form-data. [More information on Sending Files »](#sending-files) |
 | duration | Integer | Optional | Duration of sent animation in seconds |
 | width | Integer | Optional | Animation width |
@@ -3532,7 +3610,7 @@ Use this method to send animation files (GIF or H.264/MPEG-4 AVC video without s
 | caption | String | Optional | Animation caption (may also be used when resending animation by _file\_id_), 0-1024 characters after entities parsing |
 | parse\_mode | String | Optional | Mode for parsing entities in the animation caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | Optional | A JSON-serialized list of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | Optional | Pass _True_, if the caption must be shown above the message media |
+| show\_caption\_above\_media | Boolean | Optional | Pass _True_ if the caption must be shown above the message media |
 | has\_spoiler | Boolean | Optional | Pass _True_ if the animation needs to be covered with a spoiler animation |
 | disable\_notification | Boolean | Optional | Sends the message [silently](https://telegram.org/blog/channels-2-0#silent-messages). Users will receive a notification with no sound. |
 | protect\_content | Boolean | Optional | Protects the contents of the sent message from forwarding and saving |
@@ -3540,7 +3618,7 @@ Use this method to send animation files (GIF or H.264/MPEG-4 AVC video without s
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendVoice
 
@@ -3552,6 +3630,8 @@ Use this method to send audio files, if you want Telegram clients to display the
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | voice | [InputFile](#inputfile) or String | Yes | Audio file to send. Pass a file\_id as String to send a file that exists on the Telegram servers (recommended), pass an HTTP URL as a String for Telegram to get a file from the Internet, or upload a new one using multipart/form-data. [More information on Sending Files »](#sending-files) |
 | caption | String | Optional | Voice message caption, 0-1024 characters after entities parsing |
 | parse\_mode | String | Optional | Mode for parsing entities in the voice message caption. See [formatting options](#formatting-options) for more details. |
@@ -3563,7 +3643,7 @@ Use this method to send audio files, if you want Telegram clients to display the
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendVideoNote
 
@@ -3575,6 +3655,8 @@ As of [v.4.0](https://telegram.org/blog/video-messages-and-telescope), Telegram 
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | video\_note | [InputFile](#inputfile) or String | Yes | Video note to send. Pass a file\_id as String to send a video note that exists on the Telegram servers (recommended) or upload a new video using multipart/form-data. [More information on Sending Files »](#sending-files). Sending video notes by a URL is currently unsupported. |
 | duration | Integer | Optional | Duration of sent video in seconds |
 | length | Integer | Optional | Video width and height, i.e. diameter of the video message |
@@ -3585,7 +3667,7 @@ As of [v.4.0](https://telegram.org/blog/video-messages-and-telescope), Telegram 
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendPaidMedia
 
@@ -3598,22 +3680,22 @@ Use this method to send paid media. On success, the sent [Message](#message) is 
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
 | star\_count | Integer | Yes | The number of Telegram Stars that must be paid to buy access to the media; 1-25000 |
-| media | Array of [InputPaidMedia](#inputpaidmedia) | Yes | A JSON-serialized array describing the media to be sent; up to 10 items |
+| media | Array of [InputPaidMedia](#inputpaidmedia) | Yes | A JSON-serialized Array describing the media to be sent; up to 10 items |
 | payload | String | Optional | Bot-defined paid media payload, 0-128 bytes. This will not be displayed to the user, use it for your internal processes. |
 | caption | String | Optional | Media caption, 0-1024 characters after entities parsing |
 | parse\_mode | String | Optional | Mode for parsing entities in the media caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | Optional | A JSON-serialized list of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | Optional | Pass _True_, if the caption must be shown above the message media |
+| show\_caption\_above\_media | Boolean | Optional | Pass _True_ if the caption must be shown above the message media |
 | disable\_notification | Boolean | Optional | Sends the message [silently](https://telegram.org/blog/channels-2-0#silent-messages). Users will receive a notification with no sound. |
 | protect\_content | Boolean | Optional | Protects the contents of the sent message from forwarding and saving |
 | allow\_paid\_broadcast | Boolean | Optional | Pass _True_ to allow up to 1000 messages per second, ignoring [broadcasting limits](https://core.telegram.org/bots/faq#how-can-i-message-all-of-my-bot-39s-subscribers-at-once) for a fee of 0.1 Telegram Stars per message. The relevant Stars will be withdrawn from the bot's balance. |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendMediaGroup
 
-Use this method to send a group of photos, live photos, videos, documents or audios as an album. Documents and audio files can be only grouped in an album with messages of the same type. On success, an array of [Message](#message) objects that were sent is returned.
+Use this method to send a group of photos, live photos, videos, documents or audios as an album. Documents and audio files can be only grouped in an album with messages of the same type. On success, an Array of [Message](#message) objects that were sent is returned.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -3621,7 +3703,7 @@ Use this method to send a group of photos, live photos, videos, documents or aud
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the messages will be sent; required if the messages are sent to a direct messages chat |
-| media | Array of [InputMediaAudio](#inputmediaaudio), [InputMediaDocument](#inputmediadocument), [InputMediaLivePhoto](#inputmedialivephoto), [InputMediaPhoto](#inputmediaphoto) and [InputMediaVideo](#inputmediavideo) | Yes | A JSON-serialized array describing messages to be sent, must include 2-10 items |
+| media | Array of [InputMediaAudio](#inputmediaaudio), [InputMediaDocument](#inputmediadocument), [InputMediaLivePhoto](#inputmedialivephoto), [InputMediaPhoto](#inputmediaphoto) and [InputMediaVideo](#inputmediavideo) | Yes | A JSON-serialized Array describing messages to be sent, must include 2-10 items |
 | disable\_notification | Boolean | Optional | Sends messages [silently](https://telegram.org/blog/channels-2-0#silent-messages). Users will receive a notification with no sound. |
 | protect\_content | Boolean | Optional | Protects the contents of the sent messages from forwarding and saving |
 | allow\_paid\_broadcast | Boolean | Optional | Pass _True_ to allow up to 1000 messages per second, ignoring [broadcasting limits](https://core.telegram.org/bots/faq#how-can-i-message-all-of-my-bot-39s-subscribers-at-once) for a fee of 0.1 Telegram Stars per message. The relevant Stars will be withdrawn from the bot's balance. |
@@ -3638,10 +3720,12 @@ Use this method to send point on the map. On success, the sent [Message](#messag
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | latitude | Float | Yes | Latitude of the location |
 | longitude | Float | Yes | Longitude of the location |
 | horizontal\_accuracy | Float | Optional | The radius of uncertainty for the location, measured in meters; 0-1500 |
-| live\_period | Integer | Optional | Period in seconds during which the location will be updated (see [Live Locations](https://telegram.org/blog/live-locations), should be between 60 and 86400, or 0x7FFFFFFF for live locations that can be edited indefinitely |
+| live\_period | Integer | Optional | Period in seconds during which the location will be updated (see [Live Locations](https://telegram.org/blog/live-locations)), must be between 60 and 86400, or 0x7FFFFFFF for live locations that can be edited indefinitely. Must be 0 for ephemeral messages. |
 | heading | Integer | Optional | For live locations, a direction in which the user is moving, in degrees. Must be between 1 and 360 if specified. |
 | proximity\_alert\_radius | Integer | Optional | For live locations, a maximum distance for proximity alerts about approaching another chat member, in meters. Must be between 1 and 100000 if specified. |
 | disable\_notification | Boolean | Optional | Sends the message [silently](https://telegram.org/blog/channels-2-0#silent-messages). Users will receive a notification with no sound. |
@@ -3650,7 +3734,7 @@ Use this method to send point on the map. On success, the sent [Message](#messag
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendVenue
 
@@ -3662,6 +3746,8 @@ Use this method to send information about a venue. On success, the sent [Message
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | latitude | Float | Yes | Latitude of the venue |
 | longitude | Float | Yes | Longitude of the venue |
 | title | String | Yes | Name of the venue |
@@ -3676,7 +3762,7 @@ Use this method to send information about a venue. On success, the sent [Message
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendContact
 
@@ -3688,6 +3774,8 @@ Use this method to send phone contacts. On success, the sent [Message](#message)
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | phone\_number | String | Yes | Contact's phone number |
 | first\_name | String | Yes | Contact's first name |
 | last\_name | String | Optional | Contact's last name |
@@ -3698,7 +3786,7 @@ Use this method to send phone contacts. On success, the sent [Message](#message)
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendPoll
 
@@ -3715,12 +3803,12 @@ Use this method to send a native poll. On success, the sent [Message](#message) 
 | options | Array of [InputPollOption](#inputpolloption) | Yes | A JSON-serialized list of 1-12 answer options |
 | is\_anonymous | Boolean | Optional | _True_, if the poll needs to be anonymous, defaults to _True_ |
 | type | String | Optional | Poll type, “quiz” or “regular”, defaults to “regular” |
-| allows\_multiple\_answers | Boolean | Optional | Pass _True_, if the poll allows multiple answers, defaults to _False_ |
-| allows\_revoting | Boolean | Optional | Pass _True_, if the poll allows to change chosen answer options, defaults to _False_ for quizzes and to _True_ for regular polls |
-| shuffle\_options | Boolean | Optional | Pass _True_, if the poll options must be shown in random order |
-| allow\_adding\_options | Boolean | Optional | Pass _True_, if answer options can be added to the poll after creation; not supported for anonymous polls and quizzes |
-| hide\_results\_until\_closes | Boolean | Optional | Pass _True_, if poll results must be shown only after the poll closes |
-| members\_only | Boolean | Optional | Pass _True_, if voting is limited to users who have been members of the chat where the poll is being sent for more than 24 hours; for channel chats only |
+| allows\_multiple\_answers | Boolean | Optional | Pass _True_ if the poll allows multiple answers, defaults to _False_ |
+| allows\_revoting | Boolean | Optional | Pass _True_ if the poll allows to change chosen answer options, defaults to _False_ for quizzes and to _True_ for regular polls |
+| shuffle\_options | Boolean | Optional | Pass _True_ if the poll options must be shown in random order |
+| allow\_adding\_options | Boolean | Optional | Pass _True_ if answer options can be added to the poll after creation; not supported for anonymous polls and quizzes |
+| hide\_results\_until\_closes | Boolean | Optional | Pass _True_ if poll results must be shown only after the poll closes |
+| members\_only | Boolean | Optional | Pass _True_ if voting is limited to users who have been members of the chat where the poll is being sent for more than 24 hours; for channel chats only |
 | country\_codes | Array of String | Optional | A JSON-serialized list of 0-12 two-letter [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) country codes indicating the countries from which users can vote in the poll; for channel chats only. Use “FT” as a country code to allow users with anonymous numbers to vote. If omitted or empty, then users from any country can participate in the poll. |
 | correct\_option\_ids | Array of Integer | Optional | A JSON-serialized list of monotonically increasing 0-based identifiers of the correct answer options, required for polls in quiz mode |
 | explanation | String | Optional | Text that is shown when a user chooses an incorrect answer or taps on the lamp icon in a quiz-style poll, 0-200 characters with at most 2 line feeds after entities parsing |
@@ -3739,7 +3827,7 @@ Use this method to send a native poll. On success, the sent [Message](#message) 
 | allow\_paid\_broadcast | Boolean | Optional | Pass _True_ to allow up to 1000 messages per second, ignoring [broadcasting limits](https://core.telegram.org/bots/faq#how-can-i-message-all-of-my-bot-39s-subscribers-at-once) for a fee of 0.1 Telegram Stars per message. The relevant Stars will be withdrawn from the bot's balance. |
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendChecklist
 
@@ -3754,7 +3842,7 @@ Use this method to send a checklist on behalf of a connected business account. O
 | protect\_content | Boolean | Optional | Protects the contents of the sent message from forwarding and saving |
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | A JSON-serialized object for description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an inline keyboard |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
 
 #### sendDice
 
@@ -3766,14 +3854,14 @@ Use this method to send an animated emoji that will display a random value. On s
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
-| emoji | String | Optional | Emoji on which the dice throw animation is based. Currently, must be one of “🎲”, “🎯”, “🏀”, “⚽”, “🎳”, or “🎰”. Dice can have values 1-6 for “🎲”, “🎯” and “🎳”, values 1-5 for “🏀” and “⚽”, and values 1-64 for “🎰”. Defaults to “🎲”. |
+| emoji | String | Optional | Emoji on which the dice throw animation is based. Currently, must be one of “![🎲](//telegram.org/img/emoji/40/F09F8EB2.png)”, “![🎯](//telegram.org/img/emoji/40/F09F8EAF.png)”, “![🏀](//telegram.org/img/emoji/40/F09F8F80.png)”, “![⚽](//telegram.org/img/emoji/40/E29ABD.png)”, “![🎳](//telegram.org/img/emoji/40/F09F8EB3.png)”, or “![🎰](//telegram.org/img/emoji/40/F09F8EB0.png)”. Dice can have values 1-6 for “![🎲](//telegram.org/img/emoji/40/F09F8EB2.png)”, “![🎯](//telegram.org/img/emoji/40/F09F8EAF.png)” and “![🎳](//telegram.org/img/emoji/40/F09F8EB3.png)”, values 1-5 for “![🏀](//telegram.org/img/emoji/40/F09F8F80.png)” and “![⚽](//telegram.org/img/emoji/40/E29ABD.png)”, and values 1-64 for “![🎰](//telegram.org/img/emoji/40/F09F8EB0.png)”. Defaults to “![🎲](//telegram.org/img/emoji/40/F09F8EB2.png)”. |
 | disable\_notification | Boolean | Optional | Sends the message [silently](https://telegram.org/blog/channels-2-0#silent-messages). Users will receive a notification with no sound. |
 | protect\_content | Boolean | Optional | Protects the contents of the sent message from forwarding |
 | allow\_paid\_broadcast | Boolean | Optional | Pass _True_ to allow up to 1000 messages per second, ignoring [broadcasting limits](https://core.telegram.org/bots/faq#how-can-i-message-all-of-my-bot-39s-subscribers-at-once) for a fee of 0.1 Telegram Stars per message. The relevant Stars will be withdrawn from the bot's balance. |
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendMessageDraft
 
@@ -4055,12 +4143,12 @@ Use this method to process a received chat join request query. Returns _True_ on
 
 #### sendChatJoinRequestWebApp
 
-Use this method to process a received chat join request query by showing a Mini App to the user before deciding the outcome. Returns _True_ on success.
+Use this method to process a received chat join request query by showing a Mini App to the user before deciding the outcome. Call [answerChatJoinRequestQuery](#answerchatjoinrequestquery) to resolve the join request query based on the user interaction with the Mini App. Returns _True_ on success.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | chat\_join\_request\_query\_id | String | Yes | Unique identifier of the join request query |
-| web\_app\_url | String | Yes | The URL of the Mini App to be opened |
+| web\_app\_url | String | Yes | An HTTPS URL of a Web App to be opened with additional data as specified in [Initializing Web Apps](https://core.telegram.org/bots/webapps#initializing-mini-apps) |
 
 #### setChatPhoto
 
@@ -4153,7 +4241,7 @@ Use this method to get a list of administrators in a chat. Returns an Array of [
 
 #### getChatMemberCount
 
-Use this method to get the number of members in a chat. Returns _Int_ on success.
+Use this method to get the number of members in a chat. Returns _Integer_ on success.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -4170,7 +4258,7 @@ Use this method to get information about a member of a chat. The method is only 
 
 #### getUserPersonalChatMessages
 
-Use this method to get the last messages from the personal chat (i.e., the chat currently added to their profile) of a given user. On success, an array of [Message](#message) objects is returned.
+Use this method to get the last messages from the personal chat (i.e., the chat currently added to their profile) of a given user. On success, an Array of [Message](#message) objects is returned.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -4307,7 +4395,7 @@ Use this method to clear the list of pinned messages in a General forum topic. T
 
 #### answerCallbackQuery
 
-Use this method to send answers to callback queries sent from inline keyboards. The answer will be displayed to the user as a notification at the top of the chat screen or as an alert. On success, _True_ is returned.
+Use this method to send answers to callback queries sent from [inline keyboards](https://core.telegram.org/bots/features#inline-keyboards). The answer will be displayed to the user as a notification at the top of the chat screen or as an alert. On success, _True_ is returned.
 
 > Alternatively, the user can be redirected to the specified Game URL. For this option to work, you must first create a game for your bot via [@BotFather](https://t.me/botfather) and accept the terms. Otherwise, you may use links like `t.me/your_bot?start=XXXX` that open your bot with a parameter.
 
@@ -4315,8 +4403,8 @@ Use this method to send answers to callback queries sent from inline keyboards. 
 | --- | --- | --- | --- |
 | callback\_query\_id | String | Yes | Unique identifier for the query to be answered |
 | text | String | Optional | Text of the notification. If not specified, nothing will be shown to the user, 0-200 characters. |
-| show\_alert | Boolean | Optional | If _True_, an alert will be shown by the client instead of a notification at the top of the chat screen. Defaults to _false_. |
-| url | String | Optional | URL that will be opened by the user's client. If you have created a [Game](#game) and accepted the conditions via [@BotFather](https://t.me/botfather), specify the URL that opens your game - note that this will only work if the query comes from a [_callback\_game_](#inlinekeyboardbutton) button.  <br>  <br>Otherwise, you may use links like `t.me/your_bot?start=XXXX` that open your bot with a parameter. |
+| show\_alert | Boolean | Optional | If _True_, an alert will be shown by the client instead of a notification at the top of the chat screen. Defaults to _False_. |
+| url | String | Optional | URL that will be opened by the user's client. If you have created a [Game](#game) and accepted the conditions via [@BotFather](https://t.me/botfather), specify the URL that opens your game - note that this will only work if the query comes from a [_callback\_game_](#inlinekeyboardbutton) button.<br><br>Otherwise, you may use links like `t.me/your_bot?start=XXXX` that open your bot with a parameter. |
 | cache\_time | Integer | Optional | The maximum amount of time in seconds that the result of the callback query may be cached client-side. Telegram apps will support caching starting in version 3.14. Defaults to 0. |
 
 #### answerGuestQuery
@@ -4376,12 +4464,12 @@ Use this method to change the access settings of a managed bot. Returns _True_ o
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | user\_id | Integer | Yes | User identifier of the managed bot whose access settings will be changed |
-| is\_access\_restricted | Boolean | Yes | Pass _True_, if only selected users can access the bot. The bot's owner can always access it. |
-| added\_user\_ids | Array of Integer | Optional | A JSON-serialized list of up to 10 identifiers of users who will have access to the bot in addition to its owner. Ignored if _is\_access\_restricted_ is false. |
+| is\_access\_restricted | Boolean | Yes | Pass _True_ if only selected users can access the bot. The bot's owner can always access it. |
+| added\_user\_ids | Array of Integer | Optional | A JSON-serialized list of up to 10 identifiers of users who will have access to the bot in addition to its owner. Ignored if _is\_access\_restricted_ is _False_. |
 
 #### setMyCommands
 
-Use this method to change the list of the bot's commands. See this manual for more details about bot commands. Returns _True_ on success.
+Use this method to change the list of the bot's commands. See [this manual](https://core.telegram.org/bots/features#commands) for more details about bot commands. Returns _True_ on success.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -4642,7 +4730,7 @@ Changes the privacy settings pertaining to incoming gifts in a managed business 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | business\_connection\_id | String | Yes | Unique identifier of the business connection |
-| show\_gift\_button | Boolean | Yes | Pass _True_, if a button for sending a gift to the user or by the business account must always be shown in the input field |
+| show\_gift\_button | Boolean | Yes | Pass _True_ if a button for sending a gift to the user or by the business account must always be shown in the input field |
 | accepted\_gift\_types | [AcceptedGiftTypes](#acceptedgifttypes) | Yes | Types of gifts accepted by the business account |
 
 #### getBusinessAccountStarBalance
@@ -4834,9 +4922,9 @@ Methods and objects used in the inline mode are described in the [Inline mode se
 
 ### Updating messages
 
-The following methods allow you to change an existing message in the message history instead of sending a new one with a result of an action. This is most useful for messages with inline keyboards using callback queries, but can also help reduce clutter in conversations with regular chat bots.
+The following methods allow you to change an existing message in the message history instead of sending a new one with a result of an action. This is most useful for messages with [inline keyboards](https://core.telegram.org/bots/features#inline-keyboards) using callback queries, but can also help reduce clutter in conversations with regular chat bots.
 
-Please note, that it is currently only possible to edit messages without _reply\_markup_ or with inline keyboards.
+Please note, that it is currently only possible to edit messages without _reply\_markup_ or with [inline keyboards](https://core.telegram.org/bots/features#inline-keyboards).
 
 #### editMessageText
 
@@ -4852,8 +4940,8 @@ Use this method to edit text, rich and [game](#games) messages. On success, if t
 | parse\_mode | String | Optional | Mode for parsing entities in the message text. See [formatting options](#formatting-options) for more details. |
 | entities | Array of [MessageEntity](#messageentity) | Optional | A JSON-serialized list of special entities that appear in message text, which can be specified instead of _parse\_mode_ |
 | link\_preview\_options | [LinkPreviewOptions](#linkpreviewoptions) | Optional | Link preview generation options for the message |
-| rich\_message | [InputRichMessage](#inputrichmessage) | Optional | New rich content of the message; required if _text_ isn't specified |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an inline keyboard |
+| rich\_message | [InputRichMessage](#inputrichmessage) | Optional | New rich content of the message; required if _text_ isn't specified. Direct upload of new files isn't supported when an inline message is edited. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
 
 #### editMessageCaption
 
@@ -4868,8 +4956,8 @@ Use this method to edit captions of messages. On success, if the edited message 
 | caption | String | Optional | New caption of the message, 0-1024 characters after entities parsing |
 | parse\_mode | String | Optional | Mode for parsing entities in the message caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | Optional | A JSON-serialized list of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | Optional | Pass _True_, if the caption must be shown above the message media. Supported only for animation, photo and video messages. |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an inline keyboard |
+| show\_caption\_above\_media | Boolean | Optional | Pass _True_ if the caption must be shown above the message media. Supported only for animation, photo and video messages. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
 
 #### editMessageMedia
 
@@ -4881,8 +4969,8 @@ Use this method to edit animation, audio, document, live photo, photo, or video 
 | chat\_id | Integer or String | Optional | Required if _inline\_message\_id_ is not specified. Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username`. |
 | message\_id | Integer | Optional | Required if _inline\_message\_id_ is not specified. Identifier of the message to edit. |
 | inline\_message\_id | String | Optional | Required if _chat\_id_ and _message\_id_ are not specified. Identifier of the inline message. |
-| media | [InputMedia](#inputmedia) | Yes | A JSON-serialized object for a new media content of the message |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for a new inline keyboard |
+| media | [InputMedia](#inputmedia) | Yes | A JSON-serialized object for the new media content of the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for a new [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
 
 #### editMessageLiveLocation
 
@@ -4900,7 +4988,7 @@ Use this method to edit live location messages. A location can be edited until i
 | horizontal\_accuracy | Float | Optional | The radius of uncertainty for the location, measured in meters; 0-1500 |
 | heading | Integer | Optional | Direction in which the user is moving, in degrees. Must be between 1 and 360 if specified. |
 | proximity\_alert\_radius | Integer | Optional | The maximum distance for proximity alerts about approaching another chat member, in meters. Must be between 1 and 100000 if specified. |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for a new inline keyboard |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for a new [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
 
 #### stopMessageLiveLocation
 
@@ -4912,7 +5000,7 @@ Use this method to stop updating a live location message before _live\_period_ e
 | chat\_id | Integer or String | Optional | Required if _inline\_message\_id_ is not specified. Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username`. |
 | message\_id | Integer | Optional | Required if _inline\_message\_id_ is not specified. Identifier of the message with live location to stop. |
 | inline\_message\_id | String | Optional | Required if _chat\_id_ and _message\_id_ are not specified. Identifier of the inline message. |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for a new inline keyboard |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for a new [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
 
 #### editMessageChecklist
 
@@ -4924,7 +5012,7 @@ Use this method to edit a checklist on behalf of a connected business account. O
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot in the format `@username` |
 | message\_id | Integer | Yes | Unique identifier for the target message |
 | checklist | [InputChecklist](#inputchecklist) | Yes | A JSON-serialized object for the new checklist |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for the new inline keyboard for the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for the new [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) for the message |
 
 #### editMessageReplyMarkup
 
@@ -4936,7 +5024,7 @@ Use this method to edit only the reply markup of messages. On success, if the ed
 | chat\_id | Integer or String | Optional | Required if _inline\_message\_id_ is not specified. Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username`. |
 | message\_id | Integer | Optional | Required if _inline\_message\_id_ is not specified. Identifier of the message to edit. |
 | inline\_message\_id | String | Optional | Required if _chat\_id_ and _message\_id_ are not specified. Identifier of the inline message. |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an inline keyboard |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
 
 #### stopPoll
 
@@ -4947,7 +5035,59 @@ Use this method to stop a poll which was sent by the bot. On success, the stoppe
 | business\_connection\_id | String | Optional | Unique identifier of the business connection on behalf of which the message to be edited was sent |
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_id | Integer | Yes | Identifier of the original message with the poll |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for a new message inline keyboard |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for a new message [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
+
+#### editEphemeralMessageText
+
+Use this method to edit an ephemeral text message. Note that it is not guaranteed that the user will receive the message edit event, especially if they are offline. On success, _True_ is returned.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target supergroup in the format `@username` |
+| receiver\_user\_id | Integer | Yes | Identifier of the user who received the message |
+| ephemeral\_message\_id | Integer | Yes | Identifier of the ephemeral message to edit |
+| text | String | Yes | New text of the message, 1-4096 characters after entity parsing |
+| parse\_mode | String | Optional | Mode for parsing entities in the message text. See [formatting options](#formatting-options) for more details. |
+| entities | Array of [MessageEntity](#messageentity) | Optional | A JSON-serialized list of special entities that appear in message text, which can be specified instead of _parse\_mode_ |
+| link\_preview\_options | [LinkPreviewOptions](#linkpreviewoptions) | Optional | Link preview generation options for the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
+
+#### editEphemeralMessageMedia
+
+Use this method to edit the media of an ephemeral message. Note that it is not guaranteed that the user will receive the message edit event, especially if they are offline. On success, _True_ is returned.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target supergroup in the format `@username` |
+| receiver\_user\_id | Integer | Yes | Identifier of the user who received the message |
+| ephemeral\_message\_id | Integer | Yes | Identifier of the ephemeral message to edit |
+| media | [InputMedia](#inputmedia) | Yes | A JSON-serialized object for the new media content of the message. A new file can't be uploaded; use a previously uploaded file via its file\_id or specify a URL. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
+
+#### editEphemeralMessageCaption
+
+Use this method to edit the caption of an ephemeral message. Note that it is not guaranteed that the user will receive the message edit event, especially if they are offline. On success, _True_ is returned.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target supergroup in the format `@username` |
+| receiver\_user\_id | Integer | Yes | Identifier of the user who received the message |
+| ephemeral\_message\_id | Integer | Yes | Identifier of the ephemeral message to edit |
+| caption | String | Optional | New caption of the message, 0-1024 characters after entities parsing |
+| parse\_mode | String | Optional | Mode for parsing entities in the message caption. See [formatting options](#formatting-options) for more details. |
+| caption\_entities | Array of [MessageEntity](#messageentity) | Optional | A JSON-serialized list of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
+
+#### editEphemeralMessageReplyMarkup
+
+Use this method to edit only the reply markup of an ephemeral message. Note that it is not guaranteed that the user will receive the message edit event, especially if they are offline. On success, _True_ is returned.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target supergroup in the format `@username` |
+| receiver\_user\_id | Integer | Yes | Identifier of the user who received the message |
+| ephemeral\_message\_id | Integer | Yes | Identifier of the ephemeral message to edit |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) |
 
 #### approveSuggestedPost
 
@@ -4971,17 +5111,7 @@ Use this method to decline a suggested post in a direct messages chat. The bot m
 
 #### deleteMessage
 
-Use this method to delete a message, including service messages, with the following limitations:  
-\- A message can only be deleted if it was sent less than 48 hours ago.  
-\- Service messages about a supergroup, channel, or forum topic creation can't be deleted.  
-\- A dice message in a private chat can only be deleted if it was sent more than 24 hours ago.  
-\- Bots can delete outgoing messages in private chats, groups, and supergroups.  
-\- Bots can delete incoming messages in private chats.  
-\- Bots granted _can\_post\_messages_ permissions can delete outgoing messages in channels.  
-\- If the bot is an administrator of a group, it can delete any message there.  
-\- If the bot has _can\_delete\_messages_ administrator right in a supergroup or a channel, it can delete any message there.  
-\- If the bot has _can\_manage\_direct\_messages_ administrator right in a channel, it can delete any message in the corresponding direct messages chat.  
-Returns _True_ on success.
+Use this method to delete a message, including service messages, with the following limitations:<br>\- A message can only be deleted if it was sent less than 48 hours ago.<br>\- Service messages about a supergroup, channel, or forum topic creation can't be deleted.<br>\- A dice message in a private chat can only be deleted if it was sent more than 24 hours ago.<br>\- Bots can delete outgoing messages in private chats, groups, and supergroups.<br>\- Bots can delete incoming messages in private chats.<br>\- Bots granted _can\_post\_messages_ permissions can delete outgoing messages in channels.<br>\- If the bot is an administrator of a group, it can delete any message there.<br>\- If the bot has _can\_delete\_messages_ administrator right in a supergroup or a channel, it can delete any message there.<br>\- If the bot has _can\_manage\_direct\_messages_ administrator right in a channel, it can delete any message in the corresponding direct messages chat.<br>Returns _True_ on success.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -4996,6 +5126,16 @@ Use this method to delete multiple messages simultaneously. If some of the speci
 | --- | --- | --- | --- |
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_ids | Array of Integer | Yes | A JSON-serialized list of 1-100 identifiers of messages to delete. See [deleteMessage](#deletemessage) for limitations on which messages can be deleted. |
+
+#### deleteEphemeralMessage
+
+Use this method to delete an ephemeral message. Note that it is not guaranteed that the user will receive the message deletion event, especially if they are offline. Returns _True_ on success.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target supergroup in the format `@username` |
+| receiver\_user\_id | Integer | Yes | Identifier of the user who received the message |
+| ephemeral\_message\_id | Integer | Yes | Identifier of the ephemeral message to delete |
 
 #### deleteMessageReaction
 
@@ -5089,6 +5229,8 @@ Use this method to send static .WEBP, [animated](https://telegram.org/blog/anima
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
+| receiver\_user\_id | Integer | Optional | For outgoing ephemeral messages, unique identifier of the user who will receive the message; for group and supergroup chats only. It is not guaranteed that the user will receive the message, especially if they are offline. See [ephemeral message sending](#ephemeral-messages-and-commands) for more details. |
+| callback\_query\_id | String | Optional | For outgoing ephemeral messages, identifier of the callback query which triggerred the message if any |
 | sticker | [InputFile](#inputfile) or String | Yes | Sticker to send. Pass a file\_id as String to send a file that exists on the Telegram servers (recommended), pass an HTTP URL as a String for Telegram to get a .WEBP sticker from the Internet, or upload a new .WEBP, .TGS, or .WEBM sticker using multipart/form-data. [More information on Sending Files »](#sending-files). Video and animated stickers can't be sent via an HTTP URL. |
 | emoji | String | Optional | Emoji associated with the sticker; only for just uploaded stickers |
 | disable\_notification | Boolean | Optional | Sends the message [silently](https://telegram.org/blog/channels-2-0#silent-messages). Users will receive a notification with no sound. |
@@ -5097,7 +5239,7 @@ Use this method to send static .WEBP, [animated](https://telegram.org/blog/anima
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### getStickerSet
 
@@ -5246,9 +5388,11 @@ The following methods and objects allow your bot to handle and send rich message
 
 #### Rich Message Formatting Options
 
-[Rich messages](#inputrichmessage) support advanced structured formatting options like headings, lists, tables, media, block quotations, collapsible blocks, footnotes, and formulas. Telegram clients will render them accordingly. You can specify rich message content using [Markdown-style](#rich-markdown-style) or [HTML-style](#rich-html-style) formatting.
+[Rich messages](#inputrichmessage) support advanced structured formatting options like headings, lists, tables, media, block quotations, collapsible blocks, footnotes, and formulas. Telegram clients will render them accordingly. You can specify rich message content using [Markdown-style](#rich-markdown-style) or [HTML-style](#rich-html-style) formatting, or explicit [blocks](#inputrichblock).
 
 Plain URLs, e-mail addresses, username mentions, hashtags, cashtags, bot commands, phone numbers, and bank card numbers are detected automatically. To disable automatic entity detection, pass _True_ in the _skip\_entity\_detection_ field. Note that Telegram clients will display an alert to the user before opening an inline link ('Open this link?' together with the full URL).
+
+When [Markdown-style](#rich-markdown-style) or [HTML-style](#rich-html-style) formatting is used, you can use links in the form `tg://photo?id=...`, `tg://video?id=...`, and `tg://audio?id=...` instead of an HTTP URL to reuse previously uploaded files or upload a new file.
 
 ###### Rich Message Limits
 
@@ -5403,15 +5547,22 @@ For formatting features that don't have Markdown syntax, use [HTML tags](#rich-h
 <tg-slideshow><img src="https://telegram.org/example/photo.jpg"/><video src="https://telegram.org/example/video.mp4"/><figcaption>Slideshow caption<cite>The Author</cite></figcaption></tg-slideshow>
 ```
 
+Additionally, you can use the following tag in [sendRichMessageDraft](#sendrichmessagedraft):
+
+```
+<tg-thinking>Thinking...</tg-thinking>
+```
+
 Please note:
 
 - Rich Markdown is compatible with GitHub Flavored Markdown where possible and can contain arbitrary HTML. Supported rich message HTML tags are parsed as described in [Rich HTML style](#rich-html-style).
 - Media can be specified only as a separate block.
 - Media blocks support only HTTP and HTTPS URLs.
 - Media type is determined by the MIME type and the URL of the media.
-- In media syntax, the optional title after the URL is used as the caption; for example,  displays “Photo caption” under the media.
+- In media syntax, the optional title after the URL is used as the caption; for example, ![](url "Photo caption") displays “Photo caption” under the media.
 - Table cells can contain only inline formatting.
 - Formula source is treated as raw LaTeX.
+- Markdown isn't parsed inside block HTML tags other than <details>, <tg-collage> and <tg-slideshow>, therefore only HTML tags can be used there.
 - See [date-time entity formatting](#date-time-entity-formatting) for more details about supported date-time formats.
 
 ###### Rich HTML style
@@ -5505,6 +5656,12 @@ all the text above was on the same line
 <tg-math-block>E = mc^2</tg-math-block>
 ```
 
+Additionally, you can use the following tag in [sendRichMessageDraft](#sendrichmessagedraft):
+
+```
+<tg-thinking>Thinking...</tg-thinking>
+```
+
 Please note:
 
 - Only the tags mentioned above are currently supported.
@@ -5533,14 +5690,25 @@ Rich formatted message.
 
 #### InputRichMessage
 
-Describes a rich message to be sent. Exactly **one** of the fields _html_ or _markdown_ must be used.
+Describes a rich message to be sent. Exactly **one** of the fields _html_, _markdown_, or _blocks_ must be used.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| html | String | _Optional_. Content of the rich message to send described using HTML formatting. See [rich message formatting options](#rich-message-formatting-options) for more details. |
-| markdown | String | _Optional_. Content of the rich message to send described using Markdown formatting. See [rich message formatting options](#rich-message-formatting-options) for more details. |
+| blocks | Array of [InputRichBlock](#inputrichblock) | _Optional_. Content of the rich message to send described as a list of blocks |
+| html | String | _Optional_. Content of the rich message to send described using HTML formatting. See [rich message formatting options](#rich-message-formatting-options) for more details. Use _media_ field to specify the media used in the message. |
+| markdown | String | _Optional_. Content of the rich message to send described using Markdown formatting. See [rich message formatting options](#rich-message-formatting-options) for more details. Use _media_ field to specify the media used in the message. |
+| media | Array of [InputRichMessageMedia](#inputrichmessagemedia) | _Optional_. List of media that are specified in the _markdown_ or _html_ fields using `tg://photo?id=`, `tg://video?id=`, and `tg://audio?id=` links |
 | is\_rtl | Boolean | _Optional_. Pass _True_ if the rich message must be shown right-to-left |
 | skip\_entity\_detection | Boolean | _Optional_. Pass _True_ to skip automatic detection of entities (e.g., URLs, email addresses, username mentions, hashtags, cashtags, bot commands, or phone numbers) in the text |
+
+#### InputRichMessageMedia
+
+Describes a media element embedded in an outgoing rich message.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| id | String | Unique identifier of the media used in a `tg://photo?id=`, `tg://video?id=`, or `tg://audio?id=` link. 1-64 characters, only `A-Z`, `a-z`, `0-9`, `_` and `-` are allowed. |
+| media | [InputMediaAnimation](#inputmediaanimation) or [InputMediaAudio](#inputmediaaudio) or [InputMediaPhoto](#inputmediaphoto) or [InputMediaVideo](#inputmediavideo) or [InputMediaVoiceNote](#inputmediavoicenote) | The media to be sent. Everything except the media itself and its properties is ignored. |
 
 #### sendRichMessage
 
@@ -5548,7 +5716,7 @@ Use this method to send rich messages. If the message contains a block with a me
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| business\_connection\_id | String | Optional | Unique identifier of the business connection on behalf of which the message will be sent |
+| business\_connection\_id | String | Optional | Unique identifier of the business connection on behalf of which the message will be sent. Bot can send rich messages on behalf of a business account only if the corresponding user can send rich messages. |
 | chat\_id | Integer or String | Yes | Unique identifier for the target chat or username of the target bot, supergroup or channel in the format `@username` |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread (topic) of a forum; for forum supergroups and private chats of bots with forum topic mode enabled only |
 | direct\_messages\_topic\_id | Integer | Optional | Identifier of the direct messages topic to which the message will be sent; required if the message is sent to a direct messages chat |
@@ -5559,7 +5727,7 @@ Use this method to send rich messages. If the message contains a block with a me
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an inline keyboard, custom reply keyboard, instructions to remove a reply keyboard or to force a reply from the user. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) or [ReplyKeyboardMarkup](#replykeyboardmarkup) or [ReplyKeyboardRemove](#replykeyboardremove) or [ForceReply](#forcereply) | Optional | Additional interface options. A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards), [custom reply keyboard](https://core.telegram.org/bots/features#keyboards), instructions to remove a reply keyboard or to force a reply from the user. |
 
 #### sendRichMessageDraft
 
@@ -5570,7 +5738,7 @@ Use this method to stream a partial rich message to a user while the message is 
 | chat\_id | Integer | Yes | Unique identifier for the target private chat |
 | message\_thread\_id | Integer | Optional | Unique identifier for the target message thread |
 | draft\_id | Integer | Yes | Unique identifier of the message draft; must be non-zero. Changes to drafts with the same identifier are animated. |
-| rich\_message | [InputRichMessage](#inputrichmessage) | Yes | The partial message to be streamed |
+| rich\_message | [InputRichMessage](#inputrichmessage) | Yes | The partial message to be streamed. Direct upload of new files isn't supported. |
 
 #### RichText
 
@@ -6075,7 +6243,7 @@ A block with a music file, corresponding to the HTML tag `<audio>`.
 
 #### RichBlockPhoto
 
-A block with a photo, corresponding to the HTML tag `<photo>`.
+A block with a photo, corresponding to the HTML tag `<img>`.
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -6107,17 +6275,262 @@ A block with a voice note, corresponding to the HTML tag `<audio>`.
 
 #### RichBlockThinking
 
-A block with a “Thinking…” placeholder, corresponding to the custom HTML tag `<tg-thinking>`. The block may be used only in [sendRichMessageDraft](#sendrichmessagedraft), therefore it can't be received in messages. See [](https://t.me/addemoji/AIActions)[https://t.me/addemoji/AIActions](https://t.me/addemoji/AIActions) for examples of custom emoji, which are recommended for usage in the block.
+A block with a “Thinking…” placeholder, corresponding to the custom HTML tag `<tg-thinking>`. The block may be used only in [sendRichMessageDraft](#sendrichmessagedraft), therefore it can't be received in messages. See [](https://t.me/addemoji/AIActions)[https://t.me/addemoji/AIActions](https://t.me/addemoji/AIActions) for examples of custom emoji that are recommended for usage in the block.
 
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the block, always “thinking” |
-| text | [RichText](#richtext) | Text of the block. See [](https://t.me/addemoji/AIActions)[https://t.me/addemoji/AIActions](https://t.me/addemoji/AIActions) for examples of custom emoji, which are recommended for usage in the block. |
+| text | [RichText](#richtext) | Text of the block. See [](https://t.me/addemoji/AIActions)[https://t.me/addemoji/AIActions](https://t.me/addemoji/AIActions) for examples of custom emoji that are recommended for usage in the block. |
+
+#### InputRichBlockListItem
+
+An item of a list to be sent.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| blocks | Array of [InputRichBlock](#inputrichblock) | The content of the item |
+| has\_checkbox | True | _Optional_. Pass _True_ if the item has a checkbox |
+| is\_checked | True | _Optional_. Pass _True_ if the item has a checked checkbox |
+| value | Integer | _Optional_. For ordered lists, the numeric value of the item label |
+| type | String | _Optional_. For ordered lists, the type of the item label; must be one of “a” for lowercase letters, “A” for uppercase letters, “i” for lowercase Roman numerals, “I” for uppercase Roman numerals, or “1” for decimal numbers |
+
+#### InputRichBlock
+
+This object represents a block in a rich formatted message to be sent. Currently, it can be any of the following types:
+
+- [InputRichBlockParagraph](#inputrichblockparagraph)
+- [InputRichBlockSectionHeading](#inputrichblocksectionheading)
+- [InputRichBlockPreformatted](#inputrichblockpreformatted)
+- [InputRichBlockFooter](#inputrichblockfooter)
+- [InputRichBlockDivider](#inputrichblockdivider)
+- [InputRichBlockMathematicalExpression](#inputrichblockmathematicalexpression)
+- [InputRichBlockAnchor](#inputrichblockanchor)
+- [InputRichBlockList](#inputrichblocklist)
+- [InputRichBlockBlockQuotation](#inputrichblockblockquotation)
+- [InputRichBlockPullQuotation](#inputrichblockpullquotation)
+- [InputRichBlockCollage](#inputrichblockcollage)
+- [InputRichBlockSlideshow](#inputrichblockslideshow)
+- [InputRichBlockTable](#inputrichblocktable)
+- [InputRichBlockDetails](#inputrichblockdetails)
+- [InputRichBlockMap](#inputrichblockmap)
+- [InputRichBlockAnimation](#inputrichblockanimation)
+- [InputRichBlockAudio](#inputrichblockaudio)
+- [InputRichBlockPhoto](#inputrichblockphoto)
+- [InputRichBlockVideo](#inputrichblockvideo)
+- [InputRichBlockVoiceNote](#inputrichblockvoicenote)
+- [InputRichBlockThinking](#inputrichblockthinking)
+
+#### InputRichBlockParagraph
+
+A text paragraph, corresponding to the HTML tag `<p>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “paragraph” |
+| text | [RichText](#richtext) | Text of the block |
+
+#### InputRichBlockSectionHeading
+
+A section heading, corresponding to the HTML tags `<h1>`, `<h2>`, `<h3>`, `<h4>`, `<h5>`, or `<h6>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “heading” |
+| text | [RichText](#richtext) | Text of the block |
+| size | Integer | Relative size of the text font; 1-6, 1 is the largest, 6 is the smallest |
+
+#### InputRichBlockPreformatted
+
+A preformatted text block, corresponding to the nested HTML tags `<pre>` and `<code>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “pre” |
+| text | [RichText](#richtext) | Text of the block |
+| language | String | _Optional_. The programming language of the text |
+
+#### InputRichBlockFooter
+
+A footer, corresponding to the HTML tag `<footer>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “footer” |
+| text | [RichText](#richtext) | Text of the block |
+
+#### InputRichBlockDivider
+
+A divider, corresponding to the HTML tag `<hr/>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “divider” |
+
+#### InputRichBlockMathematicalExpression
+
+A block with a mathematical expression in LaTeX format, corresponding to the custom HTML tag `<tg-math-block>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “mathematical\_expression” |
+| expression | String | The mathematical expression in LaTeX format |
+
+#### InputRichBlockAnchor
+
+A block with an anchor, corresponding to the HTML tag `<a>` with the attribute `name`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “anchor” |
+| name | String | The name of the anchor |
+
+#### InputRichBlockList
+
+A list of blocks, corresponding to the HTML tag `<ul>` or `<ol>` with multiple nested tags `<li>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “list” |
+| items | Array of [InputRichBlockListItem](#inputrichblocklistitem) | Items of the list |
+
+#### InputRichBlockBlockQuotation
+
+A block quotation, corresponding to the HTML tag `<blockquote>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “blockquote” |
+| blocks | Array of [InputRichBlock](#inputrichblock) | Content of the block |
+| credit | [RichText](#richtext) | _Optional_. Credit of the block |
+
+#### InputRichBlockPullQuotation
+
+A quotation with centered text, loosely corresponding to the HTML tag `<aside>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “pullquote” |
+| text | [RichText](#richtext) | Text of the block |
+| credit | [RichText](#richtext) | _Optional_. Credit of the block |
+
+#### InputRichBlockCollage
+
+A collage, corresponding to the custom HTML tag `<tg-collage>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “collage” |
+| blocks | Array of [InputRichBlock](#inputrichblock) | Elements of the collage |
+| caption | [RichBlockCaption](#richblockcaption) | _Optional_. Caption of the block |
+
+#### InputRichBlockSlideshow
+
+A slideshow, corresponding to the custom HTML tag `<tg-slideshow>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “slideshow” |
+| blocks | Array of [InputRichBlock](#inputrichblock) | Elements of the slideshow |
+| caption | [RichBlockCaption](#richblockcaption) | _Optional_. Caption of the block |
+
+#### InputRichBlockTable
+
+A table, corresponding to the HTML tag `<table>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “table” |
+| cells | Array of Array of [RichBlockTableCell](#richblocktablecell) | Cells of the table |
+| is\_bordered | True | _Optional_. Pass _True_ if the table has borders |
+| is\_striped | True | _Optional_. Pass _True_ if the table is striped |
+| caption | [RichText](#richtext) | _Optional_. Caption of the table |
+
+#### InputRichBlockDetails
+
+An expandable block for details disclosure, corresponding to the HTML tag `<details>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “details” |
+| summary | [RichText](#richtext) | Always shown summary of the block |
+| blocks | Array of [InputRichBlock](#inputrichblock) | Content of the block |
+| is\_open | True | _Optional_. Pass _True_ if the content of the block is visible by default |
+
+#### InputRichBlockMap
+
+A block with a map, corresponding to the custom HTML tag `<tg-map>`. The map's width and height must not exceed 10000 in total. The width and height ratio must be at most 20.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “map” |
+| location | [Location](#location) | Location of the center of the map |
+| zoom | Integer | Map zoom level; 0-24 |
+| width | Integer | Map width; 0-10000 |
+| height | Integer | Map height; 0-10000 |
+| caption | [RichBlockCaption](#richblockcaption) | _Optional_. Caption of the block |
+
+#### InputRichBlockAnimation
+
+A block with an animation, corresponding to the HTML tag `<video>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “animation” |
+| animation | [InputMediaAnimation](#inputmediaanimation) | The animation. Caption is ignored. |
+| caption | [RichBlockCaption](#richblockcaption) | _Optional_. Caption of the block |
+
+#### InputRichBlockAudio
+
+A block with a music file, corresponding to the HTML tag `<audio>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “audio” |
+| audio | [InputMediaAudio](#inputmediaaudio) | The audio. Caption is ignored. |
+| caption | [RichBlockCaption](#richblockcaption) | _Optional_. Caption of the block |
+
+#### InputRichBlockPhoto
+
+A block with a photo, corresponding to the HTML tag `<img>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “photo” |
+| photo | [InputMediaPhoto](#inputmediaphoto) | The photo. Caption is ignored. |
+| caption | [RichBlockCaption](#richblockcaption) | _Optional_. Caption of the block |
+
+#### InputRichBlockVideo
+
+A block with a video, corresponding to the HTML tag `<video>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “video” |
+| video | [InputMediaVideo](#inputmediavideo) | The video. Caption is ignored. |
+| caption | [RichBlockCaption](#richblockcaption) | _Optional_. Caption of the block |
+
+#### InputRichBlockVoiceNote
+
+A block with a voice note, corresponding to the HTML tag `<audio>`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “voice\_note” |
+| voice\_note | [InputMediaVoiceNote](#inputmediavoicenote) | The voice note. Caption is ignored. |
+| caption | [RichBlockCaption](#richblockcaption) | _Optional_. Caption of the block |
+
+#### InputRichBlockThinking
+
+A block with a “Thinking…” placeholder, corresponding to the custom HTML tag `<tg-thinking>`. The block may be used only in [sendRichMessageDraft](#sendrichmessagedraft), therefore it can't be received in messages. See [](https://t.me/addemoji/AIActions)[https://t.me/addemoji/AIActions](https://t.me/addemoji/AIActions) for examples of custom emoji that are recommended for usage in the block.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| type | String | Type of the block, always “thinking” |
+| text | [RichText](#richtext) | Text of the block. See [](https://t.me/addemoji/AIActions)[https://t.me/addemoji/AIActions](https://t.me/addemoji/AIActions) for examples of custom emoji that are recommended for usage in the block. |
 
 ### Inline mode
 
-The following methods and objects allow your bot to work in [inline mode](https://core.telegram.org/bots/inline).  
-Please see our [Introduction to Inline bots](https://core.telegram.org/bots/inline) for more details.
+The following methods and objects allow your bot to work in [inline mode](https://core.telegram.org/bots/inline).<br>Please see our [Introduction to Inline bots](https://core.telegram.org/bots/inline) for more details.
 
 To enable this option, send the `/setinline` command to [@BotFather](https://t.me/botfather) and provide the placeholder text that the user will see in the input field after typing your bot's name.
 
@@ -6127,7 +6540,7 @@ This object represents an incoming inline query. When the user sends an empty qu
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | String | Unique identifier for this query |
+| id | String | Unique identifier for this query |
 | from | [User](#user) | Sender |
 | query | String | Text of the query (up to 256 characters) |
 | offset | String | Offset of the results to be returned, can be controlled by the bot |
@@ -6136,13 +6549,12 @@ This object represents an incoming inline query. When the user sends an empty qu
 
 #### answerInlineQuery
 
-Use this method to send answers to an inline query. On success, _True_ is returned.  
-No more than **50** results per query are allowed.
+Use this method to send answers to an inline query. On success, _True_ is returned.<br>No more than **50** results per query are allowed.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | inline\_query\_id | String | Yes | Unique identifier for the answered query |
-| results | Array of [InlineQueryResult](#inlinequeryresult) | Yes | A JSON-serialized array of results for the inline query |
+| results | Array of [InlineQueryResult](#inlinequeryresult) | Yes | A JSON-serialized Array of results for the inline query |
 | cache\_time | Integer | Optional | The maximum amount of time in seconds that the result of the inline query may be cached on the server. Defaults to 300. |
 | is\_personal | Boolean | Optional | Pass _True_ if results may be cached on the server side only for the user that sent the query. By default, results may be returned to any user who sends the same query. |
 | next\_offset | String | Optional | Pass the offset that a client should send in the next query with the same text to receive more results. Pass an empty string if there are no more results or if you don't support pagination. Offset length can't exceed 64 bytes. |
@@ -6156,7 +6568,7 @@ This object represents a button to be shown above inline query results. You **mu
 | --- | --- | --- |
 | text | String | Label text on the button |
 | web\_app | [WebAppInfo](#webappinfo) | _Optional_. Description of the [Web App](https://core.telegram.org/bots/webapps) that will be launched when the user presses the button. The Web App will be able to switch back to the inline mode using the method [switchInlineQuery](https://core.telegram.org/bots/webapps#initializing-mini-apps) inside the Web App. |
-| start\_parameter | String | _Optional_. Deep-linking parameter for the /start message sent to the bot when a user presses the button. 1-64 characters, only `A-Z`, `a-z`, `0-9`, `_` and `-` are allowed.  <br>  <br>_Example:_ An inline bot that sends YouTube videos can ask the user to connect the bot to their YouTube account to adapt search results accordingly. To do this, it displays a 'Connect your YouTube account' button above the results, or even before showing any. The user presses the button, switches to a private chat with the bot and, in doing so, passes a start parameter that instructs the bot to return an OAuth link. Once done, the bot can offer a [_switch\_inline_](#inlinekeyboardmarkup) button so that the user can easily return to the chat where they wanted to use the bot's inline capabilities. |
+| start\_parameter | String | _Optional_. [Deep-linking](https://core.telegram.org/bots/features#deep-linking) parameter for the /start message sent to the bot when a user presses the button. 1-64 characters, only `A-Z`, `a-z`, `0-9`, `_` and `-` are allowed.<br><br>_Example:_ An inline bot that sends YouTube videos can ask the user to connect the bot to their YouTube account to adapt search results accordingly. To do this, it displays a 'Connect your YouTube account' button above the results, or even before showing any. The user presses the button, switches to a private chat with the bot and, in doing so, passes a start parameter that instructs the bot to return an OAuth link. Once done, the bot can offer a [_switch\_inline_](#inlinekeyboardmarkup) button so that the user can easily return to the chat where they wanted to use the bot's inline capabilities. |
 
 #### InlineQueryResult
 
@@ -6192,10 +6604,10 @@ Represents a link to an article or web page.
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _article_ |
-| id  | String | Unique identifier for this result, 1-64 Bytes |
+| id | String | Unique identifier for this result, 1-64 Bytes |
 | title | String | Title of the result |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | Content of the message to be sent |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | url | String | _Optional_. URL of the result |
 | description | String | _Optional_. Short description of the result |
 | thumbnail\_url | String | _Optional_. Url of the thumbnail for the result |
@@ -6209,7 +6621,7 @@ Represents a link to a photo. By default, this photo will be sent by the user wi
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _photo_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | photo\_url | String | A valid URL of the photo. Photo must be in **JPEG** format. Photo size must not exceed 5MB. |
 | thumbnail\_url | String | URL of the thumbnail for the photo |
 | photo\_width | Integer | _Optional_. Width of the photo |
@@ -6219,8 +6631,8 @@ Represents a link to a photo. By default, this photo will be sent by the user wi
 | caption | String | _Optional_. Caption of the photo to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the photo caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the photo |
 
 #### InlineQueryResultGif
@@ -6230,7 +6642,7 @@ Represents a link to an animated GIF file. By default, this animated GIF file wi
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _gif_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | gif\_url | String | A valid URL for the GIF file |
 | gif\_width | Integer | _Optional_. Width of the GIF |
 | gif\_height | Integer | _Optional_. Height of the GIF |
@@ -6241,8 +6653,8 @@ Represents a link to an animated GIF file. By default, this animated GIF file wi
 | caption | String | _Optional_. Caption of the GIF file to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the GIF animation |
 
 #### InlineQueryResultMpeg4Gif
@@ -6252,7 +6664,7 @@ Represents a link to a video animation (H.264/MPEG-4 AVC video without sound). B
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _mpeg4\_gif_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | mpeg4\_url | String | A valid URL for the MPEG4 file |
 | mpeg4\_width | Integer | _Optional_. Video width |
 | mpeg4\_height | Integer | _Optional_. Video height |
@@ -6263,8 +6675,8 @@ Represents a link to a video animation (H.264/MPEG-4 AVC video without sound). B
 | caption | String | _Optional_. Caption of the MPEG-4 file to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the video animation |
 
 #### InlineQueryResultVideo
@@ -6276,7 +6688,7 @@ Represents a link to a page containing an embedded video player or a video file.
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _video_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | video\_url | String | A valid URL for the embedded video player or video file |
 | mime\_type | String | MIME type of the content of the video URL, “text/html” or “video/mp4” |
 | thumbnail\_url | String | URL of the thumbnail (JPEG only) for the video |
@@ -6284,12 +6696,12 @@ Represents a link to a page containing an embedded video player or a video file.
 | caption | String | _Optional_. Caption of the video to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the video caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
 | video\_width | Integer | _Optional_. Video width |
 | video\_height | Integer | _Optional_. Video height |
 | video\_duration | Integer | _Optional_. Video duration in seconds |
 | description | String | _Optional_. Short description of the result |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the video. This field is **required** if InlineQueryResultVideo is used to send an HTML-page as a result (e.g., a YouTube video). |
 
 #### InlineQueryResultAudio
@@ -6299,7 +6711,7 @@ Represents a link to an MP3 audio file. By default, this audio file will be sent
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _audio_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | audio\_url | String | A valid URL for the audio file |
 | title | String | Title |
 | caption | String | _Optional_. Caption, 0-1024 characters after entities parsing |
@@ -6307,7 +6719,7 @@ Represents a link to an MP3 audio file. By default, this audio file will be sent
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
 | performer | String | _Optional_. Performer |
 | audio\_duration | Integer | _Optional_. Audio duration in seconds |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the audio |
 
 #### InlineQueryResultVoice
@@ -6317,14 +6729,14 @@ Represents a link to a voice recording in an .OGG container encoded with OPUS. B
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _voice_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | voice\_url | String | A valid URL for the voice recording |
 | title | String | Recording title |
 | caption | String | _Optional_. Caption, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the voice message caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
 | voice\_duration | Integer | _Optional_. Recording duration in seconds |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the voice recording |
 
 #### InlineQueryResultDocument
@@ -6334,7 +6746,7 @@ Represents a link to a file. By default, this file will be sent by the user with
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _document_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | title | String | Title for the result |
 | caption | String | _Optional_. Caption of the document to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the document caption. See [formatting options](#formatting-options) for more details. |
@@ -6342,7 +6754,7 @@ Represents a link to a file. By default, this file will be sent by the user with
 | document\_url | String | A valid URL for the file |
 | mime\_type | String | MIME type of the content of the file, either “application/pdf” or “application/zip” |
 | description | String | _Optional_. Short description of the result |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the file |
 | thumbnail\_url | String | _Optional_. URL of the thumbnail (JPEG only) for the file |
 | thumbnail\_width | Integer | _Optional_. Thumbnail width |
@@ -6355,7 +6767,7 @@ Represents a location on a map. By default, the location will be sent by the use
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _location_ |
-| id  | String | Unique identifier for this result, 1-64 Bytes |
+| id | String | Unique identifier for this result, 1-64 Bytes |
 | latitude | Float | Location latitude in degrees |
 | longitude | Float | Location longitude in degrees |
 | title | String | Location title |
@@ -6363,7 +6775,7 @@ Represents a location on a map. By default, the location will be sent by the use
 | live\_period | Integer | _Optional_. Period in seconds during which the location can be updated, must be between 60 and 86400, or 0x7FFFFFFF for live locations that can be edited indefinitely |
 | heading | Integer | _Optional_. For live locations, a direction in which the user is moving, in degrees. Must be between 1 and 360 if specified. |
 | proximity\_alert\_radius | Integer | _Optional_. For live locations, a maximum distance for proximity alerts about approaching another chat member, in meters. Must be between 1 and 100000 if specified. |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the location |
 | thumbnail\_url | String | _Optional_. Url of the thumbnail for the result |
 | thumbnail\_width | Integer | _Optional_. Thumbnail width |
@@ -6376,7 +6788,7 @@ Represents a venue. By default, the venue will be sent by the user. Alternativel
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _venue_ |
-| id  | String | Unique identifier for this result, 1-64 Bytes |
+| id | String | Unique identifier for this result, 1-64 Bytes |
 | latitude | Float | Latitude of the venue location in degrees |
 | longitude | Float | Longitude of the venue location in degrees |
 | title | String | Title of the venue |
@@ -6385,7 +6797,7 @@ Represents a venue. By default, the venue will be sent by the user. Alternativel
 | foursquare\_type | String | _Optional_. Foursquare type of the venue, if known. (For example, “arts\_entertainment/default”, “arts\_entertainment/aquarium” or “food/icecream”.) |
 | google\_place\_id | String | _Optional_. Google Places identifier of the venue |
 | google\_place\_type | String | _Optional_. Google Places type of the venue. (See [supported types](https://developers.google.com/places/web-service/supported_types).) |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the venue |
 | thumbnail\_url | String | _Optional_. Url of the thumbnail for the result |
 | thumbnail\_width | Integer | _Optional_. Thumbnail width |
@@ -6398,12 +6810,12 @@ Represents a contact with a phone number. By default, this contact will be sent 
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _contact_ |
-| id  | String | Unique identifier for this result, 1-64 Bytes |
+| id | String | Unique identifier for this result, 1-64 Bytes |
 | phone\_number | String | Contact's phone number |
 | first\_name | String | Contact's first name |
 | last\_name | String | _Optional_. Contact's last name |
 | vcard | String | _Optional_. Additional data about the contact in the form of a [vCard](https://en.wikipedia.org/wiki/VCard), 0-2048 bytes |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the contact |
 | thumbnail\_url | String | _Optional_. Url of the thumbnail for the result |
 | thumbnail\_width | Integer | _Optional_. Thumbnail width |
@@ -6416,9 +6828,9 @@ Represents a [Game](#games).
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _game_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | game\_short\_name | String | Short name of the game |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 
 #### InlineQueryResultCachedPhoto
 
@@ -6427,15 +6839,15 @@ Represents a link to a photo stored on the Telegram servers. By default, this ph
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _photo_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | photo\_file\_id | String | A valid file identifier of the photo |
 | title | String | _Optional_. Title for the result |
 | description | String | _Optional_. Short description of the result |
 | caption | String | _Optional_. Caption of the photo to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the photo caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the photo |
 
 #### InlineQueryResultCachedGif
@@ -6445,14 +6857,14 @@ Represents a link to an animated GIF file stored on the Telegram servers. By def
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _gif_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | gif\_file\_id | String | A valid file identifier for the GIF file |
 | title | String | _Optional_. Title for the result |
 | caption | String | _Optional_. Caption of the GIF file to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the GIF animation |
 
 #### InlineQueryResultCachedMpeg4Gif
@@ -6462,14 +6874,14 @@ Represents a link to a video animation (H.264/MPEG-4 AVC video without sound) st
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _mpeg4\_gif_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | mpeg4\_file\_id | String | A valid file identifier for the MPEG4 file |
 | title | String | _Optional_. Title for the result |
 | caption | String | _Optional_. Caption of the MPEG-4 file to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the video animation |
 
 #### InlineQueryResultCachedSticker
@@ -6479,9 +6891,9 @@ Represents a link to a sticker stored on the Telegram servers. By default, this 
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _sticker_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | sticker\_file\_id | String | A valid file identifier of the sticker |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the sticker |
 
 #### InlineQueryResultCachedDocument
@@ -6491,14 +6903,14 @@ Represents a link to a file stored on the Telegram servers. By default, this fil
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _document_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | title | String | Title for the result |
 | document\_file\_id | String | A valid file identifier for the file |
 | description | String | _Optional_. Short description of the result |
 | caption | String | _Optional_. Caption of the document to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the document caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the file |
 
 #### InlineQueryResultCachedVideo
@@ -6508,15 +6920,15 @@ Represents a link to a video file stored on the Telegram servers. By default, th
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _video_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | video\_file\_id | String | A valid file identifier for the video file |
 | title | String | Title for the result |
 | description | String | _Optional_. Short description of the result |
 | caption | String | _Optional_. Caption of the video to be sent, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the video caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_, if the caption must be shown above the message media |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| show\_caption\_above\_media | Boolean | _Optional_. Pass _True_ if the caption must be shown above the message media |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the video |
 
 #### InlineQueryResultCachedVoice
@@ -6526,13 +6938,13 @@ Represents a link to a voice message stored on the Telegram servers. By default,
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _voice_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | voice\_file\_id | String | A valid file identifier for the voice message |
 | title | String | Voice message title |
 | caption | String | _Optional_. Caption, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the voice message caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the voice message |
 
 #### InlineQueryResultCachedAudio
@@ -6542,12 +6954,12 @@ Represents a link to an MP3 audio file stored on the Telegram servers. By defaul
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Type of the result, must be _audio_ |
-| id  | String | Unique identifier for this result, 1-64 bytes |
+| id | String | Unique identifier for this result, 1-64 bytes |
 | audio\_file\_id | String | A valid file identifier for the audio file |
 | caption | String | _Optional_. Caption, 0-1024 characters after entities parsing |
 | parse\_mode | String | _Optional_. Mode for parsing entities in the audio caption. See [formatting options](#formatting-options) for more details. |
 | caption\_entities | Array of [MessageEntity](#messageentity) | _Optional_. List of special entities that appear in the caption, which can be specified instead of _parse\_mode_ |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. Inline keyboard attached to the message |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | _Optional_. [Inline keyboard](https://core.telegram.org/bots/features#inline-keyboards) attached to the message |
 | input\_message\_content | [InputMessageContent](#inputmessagecontent) | _Optional_. Content of the message to be sent instead of the audio |
 
 #### InputMessageContent
@@ -6632,7 +7044,7 @@ Represents the [content](#inputmessagecontent) of an invoice message to be sent 
 | currency | String | Three-letter ISO 4217 currency code, see [more on currencies](https://core.telegram.org/bots/payments#supported-currencies). Pass “XTR” for payments in [Telegram Stars](https://t.me/BotNews/90). |
 | prices | Array of [LabeledPrice](#labeledprice) | Price breakdown, a JSON-serialized list of components (e.g. product price, tax, discount, delivery cost, delivery tax, bonus, etc.). Must contain exactly one item for payments in [Telegram Stars](https://t.me/BotNews/90). |
 | max\_tip\_amount | Integer | _Optional_. The maximum accepted amount for tips in the _smallest units_ of the currency (integer, **not** float/double). For example, for a maximum tip of `US$ 1.45` pass `max_tip_amount = 145`. See the _exp_ parameter in [currencies.json](https://core.telegram.org/bots/payments/currencies.json), it shows the number of digits past the decimal point for each currency (2 for the majority of currencies). Defaults to 0. Not supported for payments in [Telegram Stars](https://t.me/BotNews/90). |
-| suggested\_tip\_amounts | Array of Integer | _Optional_. A JSON-serialized array of suggested amounts of tip in the _smallest units_ of the currency (integer, **not** float/double). At most 4 suggested tip amounts can be specified. The suggested tip amounts must be positive, passed in a strictly increased order and must not exceed _max\_tip\_amount_. |
+| suggested\_tip\_amounts | Array of Integer | _Optional_. A JSON-serialized Array of suggested amounts of tip in the _smallest units_ of the currency (integer, **not** float/double). At most 4 suggested tip amounts can be specified. The suggested tip amounts must be positive, passed in a strictly increased order and must not exceed _max\_tip\_amount_. |
 | provider\_data | String | _Optional_. A JSON-serialized object for data about the invoice, which will be shared with the payment provider. A detailed description of the required fields should be provided by the payment provider. |
 | photo\_url | String | _Optional_. URL of the product photo for the invoice. Can be a photo of the goods or a marketing image for a service. |
 | photo\_size | Integer | _Optional_. Photo size in bytes |
@@ -6680,7 +7092,7 @@ Use this method to send invoices. On success, the sent [Message](#message) is re
 | currency | String | Yes | Three-letter ISO 4217 currency code, see [more on currencies](https://core.telegram.org/bots/payments#supported-currencies). Pass “XTR” for payments in [Telegram Stars](https://t.me/BotNews/90). |
 | prices | Array of [LabeledPrice](#labeledprice) | Yes | Price breakdown, a JSON-serialized list of components (e.g. product price, tax, discount, delivery cost, delivery tax, bonus, etc.). Must contain exactly one item for payments in [Telegram Stars](https://t.me/BotNews/90). |
 | max\_tip\_amount | Integer | Optional | The maximum accepted amount for tips in the _smallest units_ of the currency (integer, **not** float/double). For example, for a maximum tip of `US$ 1.45` pass `max_tip_amount = 145`. See the _exp_ parameter in [currencies.json](https://core.telegram.org/bots/payments/currencies.json), it shows the number of digits past the decimal point for each currency (2 for the majority of currencies). Defaults to 0. Not supported for payments in [Telegram Stars](https://t.me/BotNews/90). |
-| suggested\_tip\_amounts | Array of Integer | Optional | A JSON-serialized array of suggested amounts of tips in the _smallest units_ of the currency (integer, **not** float/double). At most 4 suggested tip amounts can be specified. The suggested tip amounts must be positive, passed in a strictly increased order and must not exceed _max\_tip\_amount_. |
+| suggested\_tip\_amounts | Array of Integer | Optional | A JSON-serialized Array of suggested amounts of tips in the _smallest units_ of the currency (integer, **not** float/double). At most 4 suggested tip amounts can be specified. The suggested tip amounts must be positive, passed in a strictly increased order and must not exceed _max\_tip\_amount_. |
 | start\_parameter | String | Optional | Unique deep-linking parameter. If left empty, **forwarded copies** of the sent message will have a _Pay_ button, allowing multiple users to pay directly from the forwarded message, using the same invoice. If non-empty, forwarded copies of the sent message will have a _URL_ button with a deep link to the bot (instead of a _Pay_ button), with the value used as the start parameter. |
 | provider\_data | String | Optional | JSON-serialized data about the invoice, which will be shared with the payment provider. A detailed description of required fields should be provided by the payment provider. |
 | photo\_url | String | Optional | URL of the product photo for the invoice. Can be a photo of the goods or a marketing image for a service. People like it better when they see what they are paying for. |
@@ -6700,7 +7112,7 @@ Use this method to send invoices. On success, the sent [Message](#message) is re
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | suggested\_post\_parameters | [SuggestedPostParameters](#suggestedpostparameters) | Optional | A JSON-serialized object containing the parameters of the suggested post to send; for direct messages chats only. If the message is sent as a reply to another suggested post, then that suggested post is automatically declined. |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an inline keyboard. If empty, one 'Pay `total price`' button will be shown. If not empty, the first button must be a Pay button. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards). If empty, one 'Pay `total price`' button will be shown. If not empty, the first button must be a Pay button. |
 
 #### createInvoiceLink
 
@@ -6717,7 +7129,7 @@ Use this method to create a link for an invoice. Returns the created invoice lin
 | prices | Array of [LabeledPrice](#labeledprice) | Yes | Price breakdown, a JSON-serialized list of components (e.g. product price, tax, discount, delivery cost, delivery tax, bonus, etc.). Must contain exactly one item for payments in [Telegram Stars](https://t.me/BotNews/90). |
 | subscription\_period | Integer | Optional | The number of seconds the subscription will be active for before the next payment. The currency must be set to “XTR” (Telegram Stars) if the parameter is used. Currently, it must always be 2592000 (30 days) if specified. Any number of subscriptions can be active for a given bot at the same time, including multiple concurrent subscriptions from the same user. Subscription price must no exceed 10000 Telegram Stars. |
 | max\_tip\_amount | Integer | Optional | The maximum accepted amount for tips in the _smallest units_ of the currency (integer, **not** float/double). For example, for a maximum tip of `US$ 1.45` pass `max_tip_amount = 145`. See the _exp_ parameter in [currencies.json](https://core.telegram.org/bots/payments/currencies.json), it shows the number of digits past the decimal point for each currency (2 for the majority of currencies). Defaults to 0. Not supported for payments in [Telegram Stars](https://t.me/BotNews/90). |
-| suggested\_tip\_amounts | Array of Integer | Optional | A JSON-serialized array of suggested amounts of tips in the _smallest units_ of the currency (integer, **not** float/double). At most 4 suggested tip amounts can be specified. The suggested tip amounts must be positive, passed in a strictly increased order and must not exceed _max\_tip\_amount_. |
+| suggested\_tip\_amounts | Array of Integer | Optional | A JSON-serialized Array of suggested amounts of tips in the _smallest units_ of the currency (integer, **not** float/double). At most 4 suggested tip amounts can be specified. The suggested tip amounts must be positive, passed in a strictly increased order and must not exceed _max\_tip\_amount_. |
 | provider\_data | String | Optional | JSON-serialized data about the invoice, which will be shared with the payment provider. A detailed description of required fields should be provided by the payment provider. |
 | photo\_url | String | Optional | URL of the product photo for the invoice. Can be a photo of the goods or a marketing image for a service. |
 | photo\_size | Integer | Optional | Photo size in bytes |
@@ -6738,8 +7150,8 @@ If you sent an invoice requesting a shipping address and the parameter _is\_flex
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | shipping\_query\_id | String | Yes | Unique identifier for the query to be answered |
-| ok  | Boolean | Yes | Pass _True_ if delivery to the specified address is possible and _False_ if there are any problems (for example, if delivery to the specified address is not possible) |
-| shipping\_options | Array of [ShippingOption](#shippingoption) | Optional | Required if _ok_ is _True_. A JSON-serialized array of available shipping options. |
+| ok | Boolean | Yes | Pass _True_ if delivery to the specified address is possible and _False_ if there are any problems (for example, if delivery to the specified address is not possible) |
+| shipping\_options | Array of [ShippingOption](#shippingoption) | Optional | Required if _ok_ is _True_. A JSON-serialized Array of available shipping options. |
 | error\_message | String | Optional | Required if _ok_ is _False_. Error message in human readable form that explains why it is impossible to complete the order (e.g. “Sorry, delivery to your desired address is unavailable”). Telegram will display this message to the user. |
 
 #### answerPreCheckoutQuery
@@ -6749,7 +7161,7 @@ Once the user has confirmed their payment and shipping details, the Bot API send
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | pre\_checkout\_query\_id | String | Yes | Unique identifier for the query to be answered |
-| ok  | Boolean | Yes | Specify _True_ if everything is alright (goods are available, etc.) and the bot is ready to proceed with the order. Use _False_ if there are any problems. |
+| ok | Boolean | Yes | Specify _True_ if everything is alright (goods are available, etc.) and the bot is ready to proceed with the order. Use _False_ if there are any problems. |
 | error\_message | String | Optional | Required if _ok_ is _False_. Error message in human readable form that explains the reason for failure to proceed with the checkout (e.g. "Sorry, somebody just bought the last of our amazing black T-shirts while you were busy filling out your payment details. Please choose a different color or garment!"). Telegram will display this message to the user. |
 
 #### getMyStarBalance
@@ -6835,7 +7247,7 @@ This object represents one shipping option.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | String | Shipping option identifier |
+| id | String | Shipping option identifier |
 | title | String | Option title |
 | prices | Array of [LabeledPrice](#labeledprice) | List of price portions |
 
@@ -6874,7 +7286,7 @@ This object contains information about an incoming shipping query.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | String | Unique query identifier |
+| id | String | Unique query identifier |
 | from | [User](#user) | User who sent the query |
 | invoice\_payload | String | Bot-specified invoice payload |
 | shipping\_address | [ShippingAddress](#shippingaddress) | User specified shipping address |
@@ -6885,7 +7297,7 @@ This object contains information about an incoming pre-checkout query.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | String | Unique query identifier |
+| id | String | Unique query identifier |
 | from | [User](#user) | User who sent the query |
 | currency | String | Three-letter ISO 4217 [currency](https://core.telegram.org/bots/payments#supported-currencies) code, or “XTR” for payments in [Telegram Stars](https://t.me/BotNews/90) |
 | total\_amount | Integer | Total price in the _smallest units_ of the currency (integer, **not** float/double). For example, for a price of `US$ 1.45` pass `amount = 145`. See the _exp_ parameter in [currencies.json](https://core.telegram.org/bots/payments/currencies.json), it shows the number of digits past the decimal point for each currency (2 for the majority of currencies). |
@@ -7037,7 +7449,7 @@ Describes a Telegram Star transaction. Note that if the buyer initiates a charge
 
 | Field | Type | Description |
 | --- | --- | --- |
-| id  | String | Unique identifier of the transaction. Coincides with the identifier of the original transaction for refund transactions. Coincides with _SuccessfulPayment.telegram\_payment\_charge\_id_ for successful incoming payments from users. |
+| id | String | Unique identifier of the transaction. Coincides with the identifier of the original transaction for refund transactions. Coincides with _SuccessfulPayment.telegram\_payment\_charge\_id_ for successful incoming payments from users. |
 | amount | Integer | Integer amount of Telegram Stars transferred by the transaction |
 | nanostar\_amount | Integer | _Optional_. The number of 1/1000000000 shares of Telegram Stars transferred by the transaction; from 0 to 999999999 |
 | date | Integer | Date the transaction was created in Unix time |
@@ -7112,7 +7524,7 @@ Use this if the data submitted by the user doesn't satisfy the standards your se
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | user\_id | Integer | Yes | User identifier |
-| errors | Array of [PassportElementError](#passportelementerror) | Yes | A JSON-serialized array describing the errors |
+| errors | Array of [PassportElementError](#passportelementerror) | Yes | A JSON-serialized Array describing the errors |
 
 #### PassportElementError
 
@@ -7257,7 +7669,7 @@ Use this method to send a game. On success, the sent [Message](#message) is retu
 | allow\_paid\_broadcast | Boolean | Optional | Pass _True_ to allow up to 1000 messages per second, ignoring [broadcasting limits](https://core.telegram.org/bots/faq#how-can-i-message-all-of-my-bot-39s-subscribers-at-once) for a fee of 0.1 Telegram Stars per message. The relevant Stars will be withdrawn from the bot's balance. |
 | message\_effect\_id | String | Optional | Unique identifier of the message effect to be added to the message; for private chats only |
 | reply\_parameters | [ReplyParameters](#replyparameters) | Optional | Description of the message to reply to |
-| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an inline keyboard. If empty, one 'Play game\_title' button will be shown. If not empty, the first button must launch the game. |
+| reply\_markup | [InlineKeyboardMarkup](#inlinekeyboardmarkup) | Optional | A JSON-serialized object for an [inline keyboard](https://core.telegram.org/bots/features#inline-keyboards). If empty, one 'Play game\_title' button will be shown. If not empty, the first button must launch the game. |
 
 #### Game
 
@@ -7312,3 +7724,7 @@ This object represents one row of the high scores table for a game.
 | position | Integer | Position in high score table for the game |
 | user | [User](#user) | User |
 | score | Integer | Score |
+
+* * *
+
+And that's about all we've got for now.<br>If you've got any questions, please check out our [**Bot FAQ »**](https://core.telegram.org/bots/faq)

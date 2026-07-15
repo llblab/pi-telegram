@@ -159,7 +159,10 @@ export function buildProactivePushSettingsText(
   return [
     `${PROACTIVE_PUSH_SETTINGS_TITLE} <code>${proactivePushEnabled ? "on" : "off"}</code>`,
     "",
-    "Send successful local Pi task results to Telegram when the bridge is connected.",
+    "Control whether public assistant output from local/autonomous work is projected to Telegram.",
+    "",
+    "<code>-</code> <code>on</code> (default): send each completed public block, including visible checkpoints and the final answer, while connected.",
+    "<code>-</code> <code>off</code>: keep local/autonomous assistant blocks in Pi; Telegram-originated replies still use their normal delivery path.",
   ].join("\n");
 }
 

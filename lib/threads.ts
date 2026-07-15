@@ -44,7 +44,13 @@ export interface TelegramThreadNameInput {
 }
 
 export type TelegramTopicTargetStatus =
-  "active" | "offline" | "stale" | "pending" | "starting" | "failed";
+  | "active"
+  | "offline"
+  | "stale"
+  | "pending"
+  | "starting"
+  | "probe-required"
+  | "failed";
 
 export type TelegramTopicSyncStatus = "open" | "closed" | "deleted" | "unknown";
 
@@ -438,6 +444,60 @@ export function getTelegramTopicTargetsPath(
   return getTelegramStatePath(agentDir, profileName);
 }
 
+const TELEGRAM_LEADER_SESSION_HANDOFF_KEY =
+  "__piTelegramLeaderSessionHandoff";
+export const TELEGRAM_LEADER_SESSION_HANDOFF_TTL_MS = 30_000;
+
+export interface TelegramLeaderSessionHandoff {
+  pid: number;
+  instanceId: string;
+  createdAtMs: number;
+  profileKey: string;
+  target: TelegramTarget & { threadId: number };
+  slot?: string;
+  threadName?: string;
+}
+
+export function getTelegramLeaderSessionHandoff():
+  | TelegramLeaderSessionHandoff
+  | undefined {
+  const value = (globalThis as Record<string, unknown>)[
+    TELEGRAM_LEADER_SESSION_HANDOFF_KEY
+  ];
+  if (!value || typeof value !== "object") return undefined;
+  const handoff = value as Partial<TelegramLeaderSessionHandoff>;
+  if (
+    typeof handoff.pid !== "number" ||
+    typeof handoff.instanceId !== "string" ||
+    typeof handoff.createdAtMs !== "number" ||
+    typeof handoff.profileKey !== "string" ||
+    typeof handoff.target?.chatId !== "number" ||
+    typeof handoff.target.threadId !== "number"
+  ) {
+    return undefined;
+  }
+  return handoff as TelegramLeaderSessionHandoff;
+}
+
+export function setTelegramLeaderSessionHandoff(
+  handoff: TelegramLeaderSessionHandoff | undefined,
+): void {
+  const store = globalThis as Record<string, unknown>;
+  if (!handoff) delete store[TELEGRAM_LEADER_SESSION_HANDOFF_KEY];
+  else store[TELEGRAM_LEADER_SESSION_HANDOFF_KEY] = handoff;
+}
+
+export function isTelegramLeaderSessionHandoffFresh(
+  handoff: TelegramLeaderSessionHandoff | undefined,
+  options: { pid?: number; nowMs?: number; ttlMs?: number } = {},
+): handoff is TelegramLeaderSessionHandoff {
+  if (!handoff) return false;
+  const pid = options.pid ?? process.pid;
+  const nowMs = options.nowMs ?? Date.now();
+  const ttlMs = options.ttlMs ?? TELEGRAM_LEADER_SESSION_HANDOFF_TTL_MS;
+  return handoff.pid === pid && nowMs - handoff.createdAtMs <= ttlMs;
+}
+
 export function getTelegramThreadOwnerKey(owner: TelegramThreadOwner): string {
   switch (owner.kind) {
     case "leader": {
@@ -593,6 +653,7 @@ function normalizeRecord(
     status !== "stale" &&
     status !== "pending" &&
     status !== "starting" &&
+    status !== "probe-required" &&
     status !== "failed"
   )
     return undefined;
@@ -653,6 +714,10 @@ function isCurrentThreadRecord(record: TelegramTopicTargetRecord): boolean {
     record.status === "starting" ||
     record.status === "pending"
   );
+}
+
+function isPersistedThreadRecord(record: TelegramTopicTargetRecord): boolean {
+  return isCurrentThreadRecord(record) || record.status === "probe-required";
 }
 
 function normalizeIdentityRecord(
@@ -882,7 +947,7 @@ function parseTopicTargetFile(value: unknown): TelegramTopicTargetFile {
     .map((record) => normalizeRecord(record))
     .filter(
       (record): record is TelegramTopicTargetRecord =>
-        !!record && isCurrentThreadRecord(record),
+        !!record && isPersistedThreadRecord(record),
     );
   return {
     version: 1,
@@ -1172,7 +1237,7 @@ export function createTelegramTopicTargetStore(
           isPendingProvisionLiveOrTargeted(provision, nowMs),
         );
         const currentRecords = Array.from(records.values())
-          .filter(isCurrentThreadRecord)
+          .filter(isPersistedThreadRecord)
           .map(cloneRecord);
         records = new Map(
           currentRecords.map((record) => [
@@ -1411,7 +1476,7 @@ export function createTelegramTopicTargetStore(
           records.delete(getRecordOwnerKey(existing));
         }
       }
-      if (!isCurrentThreadRecord(next)) {
+      if (!isPersistedThreadRecord(next)) {
         rememberIdentity(next);
         records.delete(nextOwnerKey);
         markDirty();
@@ -1996,6 +2061,51 @@ export async function provisionOwnBusTopic(
     instanceId: deps.instanceId,
     ...(deps.telegramProfile ? { telegramProfile: deps.telegramProfile } : {}),
   };
+  const leaderSessionHandoff = getTelegramLeaderSessionHandoff();
+  if (
+    isTelegramLeaderSessionHandoffFresh(leaderSessionHandoff) &&
+    leaderSessionHandoff.profileKey === profileKey
+  ) {
+    const existingHandoffRecord = deps.store
+      .list()
+      .find((record) => targetMatches(record.target, leaderSessionHandoff.target));
+    deps.store.upsert({
+      profileKey,
+      owner: currentLeaderOwner,
+      target: { ...leaderSessionHandoff.target },
+      status: "active",
+      createdAtMs: existingHandoffRecord?.createdAtMs ?? leaderSessionHandoff.createdAtMs,
+      updatedAtMs: nowMs,
+      threadName:
+        existingHandoffRecord?.threadName ?? leaderSessionHandoff.threadName,
+      instanceId: deps.instanceId,
+      slot: existingHandoffRecord?.slot ?? leaderSessionHandoff.slot,
+      ...(existingHandoffRecord?.syncStatus
+        ? { syncStatus: existingHandoffRecord.syncStatus }
+        : {}),
+      ...(existingHandoffRecord?.lastSyncObservedAtMs !== undefined
+        ? {
+            lastSyncObservedAtMs:
+              existingHandoffRecord.lastSyncObservedAtMs,
+          }
+        : {}),
+      lastReconcileAction: "leader-session-handoff-restored",
+    });
+    await deps.store.persist();
+    setTelegramLeaderSessionHandoff(undefined);
+    deps.recordEvent("bus", "Bus leader session handoff restored", {
+      phase: "leader-session-handoff-restore",
+      chatId: leaderSessionHandoff.target.chatId,
+      threadId: leaderSessionHandoff.target.threadId,
+      slot: existingHandoffRecord?.slot ?? leaderSessionHandoff.slot,
+      threadName:
+        existingHandoffRecord?.threadName ?? leaderSessionHandoff.threadName,
+      previousInstanceId: leaderSessionHandoff.instanceId,
+      instanceId: deps.instanceId,
+    });
+  } else if (leaderSessionHandoff) {
+    setTelegramLeaderSessionHandoff(undefined);
+  }
   const recordsBeforePreviousLeaderCleanup = deps.store.list();
   const previousLeaderCleanupPlan = ThreadReconciler.planThreadReconciliation({
     nowMs,
@@ -2051,7 +2161,7 @@ export async function provisionOwnBusTopic(
       continue;
     }
     const previousLeaderCleanupStartedAtMs = Date.now();
-    await ThreadReconciler.applyThreadReconciliationPlan(
+    const cleanup = await ThreadReconciler.applyThreadReconciliationPlan(
       { actions: [action] },
       {
         callApi: deps.callApi,
@@ -2095,6 +2205,11 @@ export async function provisionOwnBusTopic(
       );
       throw new Error(
         "Telegram leader ownership changed during topic reconciliation.",
+      );
+    }
+    if (cleanup.incompleteActions?.length) {
+      throw new Error(
+        "Previous Telegram leader topic deletion was not confirmed.",
       );
     }
     deps.store.markStaleByTarget(record.target);
@@ -2256,6 +2371,7 @@ export interface TelegramCurrentInstanceThreadRuntime {
   findRecord(): TelegramTopicTargetRecord | undefined;
   getRecord(): TelegramTopicTargetRecord | undefined;
   getIdentity(target?: TelegramTarget): TelegramInstanceThreadIdentityCandidate;
+  getRestorationIdentity(): TelegramInstanceThreadIdentityCandidate;
 }
 
 export function createTelegramCurrentInstanceThreadRuntime(deps: {
@@ -2299,6 +2415,14 @@ export function createTelegramCurrentInstanceThreadRuntime(deps: {
         follower: follower?.registered ? follower : undefined,
         leader: deps.getLeader(),
         record,
+      });
+    },
+    getRestorationIdentity() {
+      const follower = deps.getFollower();
+      return resolveTelegramInstanceThreadIdentity({
+        follower: follower?.registered ? follower : undefined,
+        leader: deps.getLeader(),
+        record: findRecord(),
       });
     },
   };
@@ -2657,25 +2781,9 @@ export function createTelegramTopicTargetProvisioner(
     };
     assertLeaderEpoch("start");
     normalizeCurrentThreadNameSlots(deps.store);
-    let existing = deps.store.getByProfileKey(request.profileKey);
+    const existing = deps.store.getByProfileKey(request.profileKey);
     const isManualFollowerRequest = request.owner?.kind === "manual-follower";
-    if (
-      isManualFollowerRequest &&
-      existing &&
-      isCurrentThreadRecord(existing)
-    ) {
-      deps.store.markStaleByTarget(
-        existing.target,
-        "unknown",
-        "Manual follower runtime was replaced before reconnect.",
-      );
-      deps.store.forgetIdentityByProfileKey(request.profileKey);
-      existing = undefined;
-    }
-    const identity =
-      isManualFollowerRequest && !existing
-        ? undefined
-        : deps.store.getIdentityByProfileKey(request.profileKey);
+    const identity = deps.store.getIdentityByProfileKey(request.profileKey);
     const nowMs = getNowMs();
     if (existing && isCurrentThreadRecord(existing)) {
       const slot = existing.slot ?? deps.store.allocateSlot(request.profileKey);

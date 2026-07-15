@@ -8,6 +8,8 @@
 
 It is a **runtime adapter**, not a remote terminal. Start or supervise work in the Pi TUI, then continue from Telegram while away from the keyboard. Each Telegram destination follows a running Pi instance and sends prompts into that instance's currently active session; it is not permanently bound to one session file or session identity. The bridge preserves Pi session semantics instead of pretending Telegram is a PTY, shell, process launcher, or session browser. That boundary is the product: Telegram gets safe runtime handles, not raw terminal power.
 
+Proactive push is enabled by default. `assistant.proactivePush` projects every completed public assistant text block from local or autonomous work—including visible checkpoints and the final answer—to the authorized Telegram target once and in order; set it explicitly to `false` to disable projection. It never mirrors local prompts, hidden reasoning, tool traffic, token deltas, Telegram-owned turns, or stale-generation work. See [Outbound](docs/outbound.md#proactive-public-output) and the [configuration reference](docs/public-api.md#configuration-api).
+
 This repository is an actively maintained fork of [`badlogic/pi-telegram`](https://github.com/badlogic/pi-telegram). It started from upstream commit [`cb34008`](https://github.com/badlogic/pi-telegram/commit/cb34008460b6c1ca036d92322f69d87f626be0fc) and has since diverged substantially.
 
 ## Install
@@ -150,7 +152,7 @@ Run these inside Pi.
 | `/telegram-setup <profile>` | Save or update a named-profile bot token |
 | `/telegram-connect` | Activate the default profile and acquire its transport ownership |
 | `/telegram-connect <profile>` | Activate a named profile and acquire its transport ownership |
-| `/telegram-disconnect` | Stop polling and release ownership |
+| `/telegram-disconnect` | Stop polling and release ownership; in Threaded Mode, confirm deletion of this instance's current Telegram thread |
 | `/telegram-status` | Inspect connection, mode, queue, transport, and recent diagnostics |
 
 Named profile identifiers contain only lowercase ASCII letters and digits (maximum 32 characters); `default`, `main`, and `active` remain reserved.

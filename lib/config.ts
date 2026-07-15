@@ -60,10 +60,10 @@ export interface TelegramConfig {
   inboundHandlers?: TelegramInboundHandlerConfig[];
   attachmentHandlers?: TelegramInboundHandlerConfig[];
   outboundHandlers?: TelegramOutboundHandlerConfig[];
-  proactivePush?: boolean;
   assistant?: {
     draftPreviews?: boolean;
     rendering?: TelegramAssistantRenderingMode;
+    proactivePush?: boolean;
   };
   /** @deprecated use assistant.draftPreviews */
   draftPreviews?: boolean;
@@ -85,7 +85,7 @@ export interface TelegramConfig {
  * Per-profile bot/session identity fields.
  * Stored under `profiles.<name>` in telegram.json.
  * Shared bridge settings (inboundHandlers, outboundHandlers, voice, time,
- * assistant, proactivePush) stay at the top level.
+ * assistant) stay at the top level.
  */
 export interface TelegramBotProfile {
   botToken: string;
@@ -259,31 +259,39 @@ export async function readTelegramConfig(
     onInvalidConfig?: (recovery: TelegramInvalidConfigRecovery) => void;
   } = {},
 ): Promise<TelegramConfig> {
-  return withTelegramFileTransaction(`${configPath}.transaction`, () => {
-    if (!existsSync(configPath)) return {};
-    const identity = statSync(configPath);
-    const content = readFileSync(configPath, "utf8");
-    try {
-      return JSON.parse(content) as TelegramConfig;
-    } catch (error) {
-      const currentIdentity = statSync(configPath);
-      if (
-        currentIdentity.dev !== identity.dev ||
-        currentIdentity.ino !== identity.ino ||
-        currentIdentity.size !== identity.size ||
-        currentIdentity.mtimeMs !== identity.mtimeMs
-      ) {
-        throw new Error(
-          `Telegram config changed while validating invalid content: ${configPath}`,
-          { cause: error },
-        );
+  if (!existsSync(configPath)) return {};
+  const content = readFileSync(configPath, "utf8");
+  try {
+    return JSON.parse(content) as TelegramConfig;
+  } catch {
+    // Atomic config publication makes ordinary reads safe without serialization.
+    // Acquire the transaction only before destructive invalid-file recovery.
+    return withTelegramFileTransaction(`${configPath}.transaction`, () => {
+      if (!existsSync(configPath)) return {};
+      const identity = statSync(configPath);
+      const currentContent = readFileSync(configPath, "utf8");
+      try {
+        return JSON.parse(currentContent) as TelegramConfig;
+      } catch (error) {
+        const currentIdentity = statSync(configPath);
+        if (
+          currentIdentity.dev !== identity.dev ||
+          currentIdentity.ino !== identity.ino ||
+          currentIdentity.size !== identity.size ||
+          currentIdentity.mtimeMs !== identity.mtimeMs
+        ) {
+          throw new Error(
+            `Telegram config changed while validating invalid content: ${configPath}`,
+            { cause: error },
+          );
+        }
+        const recoveryPath = getInvalidTelegramConfigRecoveryPath(configPath);
+        renameSync(configPath, recoveryPath);
+        options.onInvalidConfig?.({ configPath, recoveryPath, error });
+        return {};
       }
-      const recoveryPath = getInvalidTelegramConfigRecoveryPath(configPath);
-      renameSync(configPath, recoveryPath);
-      options.onInvalidConfig?.({ configPath, recoveryPath, error });
-      return {};
-    }
-  });
+    });
+  }
 }
 
 export async function writeTelegramConfig(
@@ -538,7 +546,7 @@ export function createTelegramConfigStore(
 export function createTelegramProactivePushChecker(
   configStore: Pick<TelegramConfigStore, "get">,
 ): () => boolean {
-  return () => configStore.get().proactivePush ?? false;
+  return () => configStore.get().assistant?.proactivePush ?? true;
 }
 
 export function createTelegramProactivePushSetter(
@@ -546,7 +554,11 @@ export function createTelegramProactivePushSetter(
 ): (enabled: boolean) => Promise<void> {
   return async (enabled) => {
     await loadLatestTelegramConfig(configStore);
-    const config = { ...configStore.get(), proactivePush: enabled };
+    const current = configStore.get();
+    const config = {
+      ...current,
+      assistant: { ...current.assistant, proactivePush: enabled },
+    };
     configStore.set(config);
     await configStore.persist(config);
   };
