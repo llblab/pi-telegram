@@ -30,7 +30,7 @@ When `assistant.rendering` is `"rich"`, a Telegram-originated turn that queues e
 
 The optimization is deliberately narrow. HTML rendering, empty final text, multiple files, documents and other unsupported formats, Guest Mode, explicit `telegram_voice`, voice-preferred turns, and OGG/Opus artifacts retain their established text/attachment/voice paths. A known-safe Rich upload rejection falls back to those paths. A `commit-unknown` transport outcome or a nominally successful upload without a verifiable message id never falls back or replays because the first non-idempotent send may already have committed.
 
-This behavior does not generate media or alter voice policy. `telegram_attach` still represents an explicit assistant artifact decision, while `manual`, `mirror`, and `always` continue to decide voice synthesis independently.
+This behavior does not generate media or alter voice policy. `telegram_attach` still represents an explicit assistant artifact decision, while `hidden`, `mirror`, and `always` continue to decide voice synthesis independently.
 
 Core assistant output accepts only the Markdown or HTML `InputRichMessage` forms and does not construct explicit block arrays or `InputRichBlockThinking`. Telegram's Thinking block is draft-only and must never become a projection of hidden reasoning or chain-of-thought. Any future use for Activity would require an explicitly public user-visible summary rather than provider reasoning content.
 

@@ -38,7 +38,7 @@ function getNextAvailableProviderId<T>(
   return id;
 }
 
-export type TelegramVoiceReplyMode = "mirror" | "always" | "manual";
+export type TelegramVoiceReplyMode = "hidden" | "mirror" | "always";
 
 export type TelegramVoiceSynthesisProviderResult =
   | string
@@ -67,9 +67,7 @@ export interface TelegramVoiceSynthesisProvider {
 }
 
 export type TelegramVoiceTranscriptionProviderResult =
-  | string
-  | { text: string; language?: string }
-  | undefined;
+  string | { text: string; language?: string } | undefined;
 
 export interface TelegramVoiceTranscriptionFile {
   path: string;
@@ -217,16 +215,17 @@ export function clearTelegramVoiceTranscriptionProviders(): void {
 // --- Voice Reply Modes ---
 
 export const TELEGRAM_VOICE_REPLY_MODES = [
+  "hidden",
   "mirror",
   "always",
-  "manual",
 ] as const;
 
 /**
  * Returns the active voice reply mode for the current session.
  *
  * Pi-telegram owns reply-mode policy through telegram.json. If
- * config.voice.replyMode is missing or invalid, the safe default is manual.
+ * config.voice.replyMode is missing, invalid, or legacy `manual`, the effective
+ * mode is hidden.
  */
 export function getTelegramVoiceReplyMode(config?: {
   voice?: { replyMode?: string };
@@ -238,7 +237,7 @@ export function getTelegramVoiceReplyMode(config?: {
   ) {
     return configMode as TelegramVoiceReplyMode;
   }
-  return "manual";
+  return "hidden";
 }
 
 /**

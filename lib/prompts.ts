@@ -16,7 +16,7 @@ Telegram bridge available. Do not use it from local/TUI prompts unless explicitl
 
 const TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX = `
 
-Telegram turn note: If context was compacted or you need the pi-telegram bridge contract, call tool \`telegram_help\`; hidden comments are valid only for explicit \`telegram_voice\` or \`telegram_button\` actions with payload. For voice use a top-level HTML action: \`<!-- telegram_voice: Speak this. -->\`, multiline \`<!-- telegram_voice lang=ru\nSpeak this.\n-->\`, or paired \`<!-- telegram_voice lang=ru -->\nSpeak this.\n<!-- /telegram_voice -->\`.`;
+Telegram turn note: Call \`telegram_help\` if you need the pi-telegram bridge action contract.`;
 
 function buildTelegramHelpText(profileName?: string): string {
   const diagnosticsPaths = getTelegramDiagnosticsDisplayPaths(profileName);
@@ -26,7 +26,8 @@ How to understand Telegram turns:
 - \`[telegram|thread:name|from:user|guest:group]\` marks Telegram origin and attributes.
 - \`thread\` is the visible Thread identity in Threaded Mode; it is not a bus role.
 - \`[reply]\` is quoted context only; act on the user's current instruction.
-- \`[attachments]\` are local files; \`[outputs]\` are handler results/transcripts; \`[time]\` is wall-clock context; \`[voice]\` gives reply-mode policy.
+- \`[attachments]\` are local files; \`[outputs]\` are handler results/transcripts; \`[time]\` is wall-clock context.
+- \`[voice] delivery: automatic voice\` means pi-telegram will synthesize ordinary assistant text for this turn; no \`[voice]\` line means no automatic voice policy.
 
 How to answer Telegram turns:
 - Reply in concise, scannable mobile Telegram Rich Markdown.
@@ -41,6 +42,7 @@ Assistant-authored Telegram actions:
 - Keep the complete action at top level and include a non-empty voice payload.
 - Keep voice text TTS-friendly; avoid raw Markdown, code, and tables in voice text.
 - Voice delivery generates and attaches OGG automatically; do not also call \`telegram_attach\` for the same audio.
+- Voice reply modes are compact: \`hidden\` emits no automatic context, \`mirror\` emits it for voice/audio input, and \`always\` emits it for every Telegram turn. Explicit \`telegram_voice\` remains available for an intentionally distinct spoken payload.
 - Button forms: \`<!-- telegram_button: OK -->\`, \`<!-- telegram_button label=Continue prompt="Continue with the current plan." -->\`, or multiline \`<!-- telegram_button label="Show risks"\nList the main risks first.\n-->\`.
 - If hidden comments would be the whole reply, add visible text such as \`Choose one:\`.
 

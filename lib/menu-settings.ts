@@ -4,10 +4,6 @@
  * Owns hidden settings-menu rendering, settings callbacks, and persisted toggle wiring
  */
 
-import {
-  getTelegramExtensionSettingsRows,
-  type TelegramSectionRegistry,
-} from "./sections.ts";
 import type {
   TelegramAssistantRenderingMode,
   TelegramTimeMode,
@@ -15,6 +11,10 @@ import type {
 import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
 import type { TelegramModelMenuState } from "./menu-model.ts";
 import type { MenuModel } from "./model.ts";
+import {
+  getTelegramExtensionSettingsRows,
+  type TelegramSectionRegistry,
+} from "./sections.ts";
 import type { TelegramVoiceReplyMode } from "./voice.ts";
 
 export type TelegramSettingsMenuReplyMarkup = TelegramInlineKeyboardMarkup;
@@ -201,10 +201,9 @@ export function buildVoiceReplyModeSettingsText(
     "",
     "Controls when pi-telegram converts assistant text replies into Telegram voice messages.",
     "",
-    "<code>-</code> <code>hidden</code> (default): same behavior as 'manual', but no voice policy is added to prompt context.",
-    "<code>-</code> <code>manual</code>: agent decides; explicit 'telegram_voice' markup still works and reply mode is visible in prompt context.",
-    "<code>-</code> <code>mirror</code>: voice input prefers a voice reply; text input gracefully follows 'manual' behavior.",
-    "<code>-</code> <code>always</code>: every reply is converted to voice when delivery succeeds.",
+    "<code>-</code> <code>hidden</code> (default): add no automatic voice context; explicit 'telegram_voice' actions still work.",
+    "<code>-</code> <code>mirror</code>: voice input activates automatic voice delivery; text input follows 'hidden' behavior.",
+    "<code>-</code> <code>always</code>: activate automatic voice delivery for every reply.",
   ].join("\n");
 }
 
@@ -225,18 +224,19 @@ export function buildTimeInjectionModeSettingsText(
 export function buildTelegramSettingsMenuReplyMarkup(
   proactivePushEnabled: boolean,
   draftPreviewsEnabled: boolean,
-  assistantRenderingModeOrVoiceReplyMode: TelegramAssistantRenderingMode | TelegramVoiceReplyMode,
+  assistantRenderingModeOrVoiceReplyMode:
+    TelegramAssistantRenderingMode | TelegramVoiceReplyMode,
   voiceReplyModeOrTimeInjectionMode: TelegramVoiceReplyMode | TelegramTimeMode,
-  timeInjectionModeOrSectionRegistry?: TelegramTimeMode | TelegramSectionRegistry,
+  timeInjectionModeOrSectionRegistry?:
+    TelegramTimeMode | TelegramSectionRegistry,
   sectionRegistryOrVoiceReplyModeConfigured?: TelegramSectionRegistry | boolean,
   voiceReplyModeConfigured = true,
 ): TelegramSettingsMenuReplyMarkup {
   const hasRenderingMode =
     assistantRenderingModeOrVoiceReplyMode === "rich" ||
     assistantRenderingModeOrVoiceReplyMode === "html";
-  const assistantRenderingMode: TelegramAssistantRenderingMode = hasRenderingMode
-    ? assistantRenderingModeOrVoiceReplyMode
-    : "rich";
+  const assistantRenderingMode: TelegramAssistantRenderingMode =
+    hasRenderingMode ? assistantRenderingModeOrVoiceReplyMode : "rich";
   const voiceReplyMode = hasRenderingMode
     ? (voiceReplyModeOrTimeInjectionMode as TelegramVoiceReplyMode)
     : (assistantRenderingModeOrVoiceReplyMode as TelegramVoiceReplyMode);
@@ -245,9 +245,9 @@ export function buildTelegramSettingsMenuReplyMarkup(
     : (voiceReplyModeOrTimeInjectionMode as TelegramTimeMode);
   const sectionRegistry = hasRenderingMode
     ? (sectionRegistryOrVoiceReplyModeConfigured as
-        | TelegramSectionRegistry
-        | undefined)
-    : (timeInjectionModeOrSectionRegistry as TelegramSectionRegistry | undefined);
+        TelegramSectionRegistry | undefined)
+    : (timeInjectionModeOrSectionRegistry as
+        TelegramSectionRegistry | undefined);
   const effectiveVoiceReplyModeConfigured = hasRenderingMode
     ? voiceReplyModeConfigured
     : typeof sectionRegistryOrVoiceReplyModeConfigured === "boolean"
@@ -268,7 +268,10 @@ export function buildTelegramSettingsMenuReplyMarkup(
       {
         text: `👄 Voice reply: ${getTelegramSettingsStateValueLabel(
           getVoiceReplyModeLabel(
-            getVoiceReplyModeSetting(voiceReplyMode, effectiveVoiceReplyModeConfigured),
+            getVoiceReplyModeSetting(
+              voiceReplyMode,
+              effectiveVoiceReplyModeConfigured,
+            ),
           ),
         )}`,
         callback_data: "settings:open:voice-reply",
@@ -361,7 +364,7 @@ export function buildDraftPreviewsSettingsReplyMarkup(
         },
         {
           text: enabled ? "⚫️ Off" : "🟡 Off",
-          callback_data: "settings:set:draft-previews:off"
+          callback_data: "settings:set:draft-previews:off",
         },
       ],
     ],
@@ -407,12 +410,7 @@ export function buildVoiceReplyModeSettingsReplyMarkup(
   configured = true,
 ): TelegramSettingsMenuReplyMarkup {
   const activeMode = getVoiceReplyModeSetting(mode, configured);
-  const modes: TelegramVoiceReplyModeSetting[] = [
-    "hidden",
-    "manual",
-    "mirror",
-    "always",
-  ];
+  const modes: TelegramVoiceReplyModeSetting[] = ["hidden", "mirror", "always"];
   return {
     inline_keyboard: [
       [{ text: "⬆️ Back", callback_data: "settings:list" }],
@@ -511,7 +509,10 @@ export async function handleTelegramSettingsMenuCallbackAction(
     await deps.answerCallbackQuery(callbackQueryId);
     return true;
   }
-  if (data === "settings:open:draft-previews" || data === "settings:open:rich-drafts") {
+  if (
+    data === "settings:open:draft-previews" ||
+    data === "settings:open:rich-drafts"
+  ) {
     await updateDraftPreviewsSettingsMessage(deps);
     await deps.answerCallbackQuery(callbackQueryId);
     return true;
@@ -536,12 +537,7 @@ export async function handleTelegramSettingsMenuCallbackAction(
   }
   if (data.startsWith("settings:set:voice-reply:")) {
     const mode = data.slice("settings:set:voice-reply:".length);
-    if (
-      mode === "hidden" ||
-      mode === "manual" ||
-      mode === "mirror" ||
-      mode === "always"
-    ) {
+    if (mode === "hidden" || mode === "mirror" || mode === "always") {
       await deps.setVoiceReplyMode(mode === "hidden" ? undefined : mode);
       await updateVoiceReplyModeSettingsMessage(deps);
       await deps.answerCallbackQuery(
@@ -663,79 +659,23 @@ export function createTelegramSettingsMenuRuntime<
         },
         sectionRegistry,
       ),
-    handleCallbackQuery: async (query) => {
+    handleCallbackQuery: async (query, ctx) => {
       if (!query.data?.startsWith("settings:")) return false;
-      const state = deps.getStoredModelMenuState(
-        query.message?.message_id,
-        query.message?.chat?.id,
-      );
+      const messageId = query.message?.message_id;
+      const chatId = query.message?.chat?.id;
+      let state = deps.getStoredModelMenuState(messageId, chatId);
       if (!state) {
-        const voiceMode = query.data.slice("settings:set:voice-reply:".length);
-        if (
-          query.data.startsWith("settings:set:voice-reply:") &&
-          (voiceMode === "hidden" ||
-            voiceMode === "manual" ||
-            voiceMode === "mirror" ||
-            voiceMode === "always")
-        ) {
-          await deps.setVoiceReplyMode(
-            voiceMode === "hidden" ? undefined : voiceMode,
-          );
+        if (typeof messageId !== "number" || typeof chatId !== "number") {
           await deps.answerCallbackQuery(
             query.id,
-            `Voice reply mode: ${voiceMode}`,
+            "Interactive message expired.",
           );
           return true;
         }
-        if (
-          query.data === "settings:set:draft-previews:on" ||
-          query.data === "settings:set:draft-previews:off" ||
-          query.data === "settings:set:rich-drafts:on" ||
-          query.data === "settings:set:rich-drafts:off"
-        ) {
-          const enabled = query.data.endsWith(":on");
-          await deps.setDraftPreviewsEnabled(enabled);
-          await deps.answerCallbackQuery(
-            query.id,
-            `Draft previews ${enabled ? "enabled" : "disabled"}`,
-          );
-          return true;
-        }
-        if (query.data.startsWith("settings:set:assistant-rendering:")) {
-          const mode = query.data.slice("settings:set:assistant-rendering:".length);
-          if (mode === "rich" || mode === "html") {
-            await deps.setAssistantRenderingMode(mode);
-            await deps.answerCallbackQuery(query.id, `Rendering: ${mode}`);
-            return true;
-          }
-        }
-        const hasTimeInjectionPrefix = query.data.startsWith(
-          "settings:set:time-injection:",
-        );
-        const timeMode = hasTimeInjectionPrefix
-          ? query.data.slice("settings:set:time-injection:".length)
-          : query.data.slice("settings:set:time:".length);
-        if (
-          (hasTimeInjectionPrefix ||
-            query.data.startsWith("settings:set:time:")) &&
-          (timeMode === "off" ||
-            timeMode === "hidden" ||
-            timeMode === "always" ||
-            timeMode === "interval")
-        ) {
-          const normalizedMode = timeMode === "off" ? "hidden" : timeMode;
-          await deps.setTimeInjectionMode(normalizedMode);
-          await deps.answerCallbackQuery(
-            query.id,
-            `Time injection: ${normalizedMode}`,
-          );
-          return true;
-        }
-        await deps.answerCallbackQuery(
-          query.id,
-          "Interactive message expired.",
-        );
-        return true;
+        state = await deps.getModelMenuState(chatId, ctx);
+        state.messageId = messageId;
+        state.mode = "settings";
+        deps.storeModelMenuState(state);
       }
       return handleTelegramSettingsMenuCallbackAction(query.id, query.data, {
         isProactivePushEnabled: deps.isProactivePushEnabled,

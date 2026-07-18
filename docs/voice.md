@@ -33,14 +33,13 @@ Voice provider extensions can also register STT backends with `registerTelegramV
 
 ## Voice Reply Policy
 
-The bridge decides **when** to reply with voice from `voice.replyMode` in `TelegramConfig` (stored in `telegram.json`). If config does not set a valid mode, the bridge uses the `hidden` default: manual behavior without adding voice policy text to the prompt context.
+The bridge decides **when** to reply with voice from `voice.replyMode` in `TelegramConfig` (stored in `telegram.json`). Missing, invalid, `hidden`, and legacy `manual` values resolve to the silent `hidden` default.
 
 ### Modes
 
-- **`hidden` (default):** no `voice.replyMode` is stored; same behavior as manual, no prompt voice context.
-- **`manual`:** only reply with voice when the agent authors `<!-- telegram_voice -->` markup; explicit prompt context is added.
-- **`mirror`:** reply with voice when the inbound message was a voice note or audio file. Text input stays on the manual path where explicit `telegram_voice` markup still works.
-- **`always`:** always reply with voice.
+- **`hidden` (default):** no `voice.replyMode` is stored and no automatic voice context is added; explicit agent-authored `telegram_voice` actions still work.
+- **`mirror`:** voice/audio input activates automatic voice delivery. Text input follows `hidden` behavior.
+- **`always`:** every Telegram turn activates automatic voice delivery.
 
 **Warning:** In `always` mode, the bridge transparently intercepts ALL text replies and converts them to voice on success. Users will only receive voice messages when voice generation succeeds. If voice generation fails, the bridge falls back to sending the planned text reply.
 
@@ -97,7 +96,7 @@ Registration returns a disposer function for cleanup. Stable provider registrati
 
 ## Outbound Voice Handlers
 
-Users can also configure `outboundHandlers` with `type: "voice"` in `telegram.json`. This is the command-template path for TTS without a provider extension. Reply modes (`manual`, `mirror`, `always`) affect these handlers the same way they affect providers: explicit `telegram_voice` blocks and automatic mirror/always interception both produce a voice reply plan, then delivery tries configured outbound voice handlers first and registered synthesis providers as progressive fallbacks.
+Users can also configure `outboundHandlers` with `type: "voice"` in `telegram.json`. This is the command-template path for TTS without a provider extension. Reply modes (`hidden`, `mirror`, `always`) affect these handlers the same way they affect providers: explicit `telegram_voice` blocks and automatic mirror/always interception both produce a voice reply plan, then delivery tries configured outbound voice handlers first and registered synthesis providers as progressive fallbacks.
 
 Voice handlers receive the text on stdin in composed pipelines and can use `{text}`, `{lang}`, `{rate}`, `{mp3}`, and `{ogg}` placeholders. Set `output` to `"ogg"` or another placeholder name when the template writes to a known path:
 
@@ -167,7 +166,7 @@ Voice provider extensions can register a Voice Extension Section (settings UI) v
 
 ## Prompt Guidance
 
-The bridge keeps voice prompt context compact and policy-owned. It adds `[voice] reply mode: ...` only when `telegram.json` explicitly contains a valid `voice.replyMode`. `hidden`/no configured mode behaves like manual, but prompts stay silent. When explicit, voice-originated `manual` turns add `[voice] reply mode: manual`, voice-originated `mirror` turns add `[voice] reply mode: mirror`, and `always` mode adds `[voice] reply mode: always` for every turn. If voice context later contains multiple fields, the bridge renders it as a `[voice]` list. The marker is appended after `[outputs]` when handler output exists, otherwise after `[attachments]`. Voice inputs also appear in `[attachments]` with their downloaded file names, MIME data, and handler output, so agents can infer concrete voice-file context from attachment metadata.
+The bridge keeps voice prompt context compact, effective, and policy-owned. `hidden` and text-originated `mirror` turns add no voice line. Voice/audio-originated `mirror` turns and every `always` turn add exactly `[voice] delivery: automatic voice`, describing the current delivery environment without exposing the underlying mode matrix or an instruction list. The marker is appended after `[outputs]` when handler output exists, otherwise after `[attachments]`. Voice inputs also appear in `[attachments]` with their downloaded file names, MIME data, and handler output, so agents can infer concrete voice-file context from attachment metadata.
 
 Voice synthesis providers can supply prompt guidance through `getVoicePromptContribution(view)`, but provider text should stay optional and provider-specific. Reply-mode context belongs to pi-telegram.
 
@@ -204,12 +203,12 @@ Voice synthesis providers can supply prompt guidance through `getVoicePromptCont
 ```json
 {
   "voice": {
-    "replyMode": "manual"
+    "replyMode": "mirror"
   }
 }
 ```
 
-Valid stored values: `"manual"`, `"mirror"`, `"always"`. Missing or invalid values are shown in Settings as `hidden`, behave like manual, and stay silent in prompt context.
+Valid modes are `"hidden"`, `"mirror"`, and `"always"`; selecting `hidden` removes the key. Missing, invalid, and legacy `"manual"` values resolve to `hidden` and stay silent in prompt context.
 
 The bridge reads `voice.replyMode` from the config when building a turn.
 

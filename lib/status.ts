@@ -767,7 +767,7 @@ export function buildTelegramStatusBarText(
 ): string {
   const label = theme.fg("accent", getTelegramStatusBarLabel(state));
   if (state.error) {
-    return `${label} ${theme.fg("error", "error")} ${theme.fg("muted", state.error)}`;
+    return `${label} ${theme.fg("error", "error")}`;
   }
   const queued = state.queuedStatus
     ? theme.fg("success", state.queuedStatus)

@@ -850,14 +850,55 @@ export function createTelegramAgentLifecycleHooks<
     TReplyMarkup
   >,
 ) {
+  const onAgentStart = createTelegramAgentStartHook<TTurn, TContext>(deps);
+  const deliverAgentEnd = createTelegramAgentEndHook<
+    TTurn,
+    TContext,
+    TMessage,
+    TReplyMarkup
+  >(deps);
+  let retainedErrorEvent: TelegramAgentEndHookEvent<TMessage> | undefined;
   return {
-    onAgentStart: createTelegramAgentStartHook<TTurn, TContext>(deps),
-    onAgentEnd: createTelegramAgentEndHook<
-      TTurn,
-      TContext,
-      TMessage,
-      TReplyMarkup
-    >(deps),
+    onAgentStart,
+    async onAgentEnd(
+      event: TelegramAgentEndHookEvent<TMessage>,
+      ctx: TContext,
+    ): Promise<void> {
+      const turn = deps.getActiveTurn();
+      const assistant = turn ? deps.extractAssistant(event.messages) : {};
+      if (turn && assistant.stopReason === "error") {
+        retainedErrorEvent = event;
+        deps.recordRuntimeEvent?.(
+          "provider-retry",
+          new Error("Retained Telegram turn after retryable agent error"),
+          { phase: "retained", hasFinalText: !!assistant.text?.trim() },
+        );
+        return;
+      }
+      if (retainedErrorEvent) {
+        retainedErrorEvent = undefined;
+        deps.recordRuntimeEvent?.(
+          "provider-retry",
+          new Error("Recovered retained Telegram turn after agent retry"),
+          { phase: "recovered" },
+        );
+      }
+      await deliverAgentEnd(event, ctx, assistant);
+    },
+    async onAgentSettled(_event: unknown, ctx: TContext): Promise<void> {
+      const event = retainedErrorEvent;
+      if (!event) return;
+      retainedErrorEvent = undefined;
+      deps.recordRuntimeEvent?.(
+        "provider-retry",
+        new Error("Finalized retained Telegram turn after agent settled"),
+        { phase: "settled-failure" },
+      );
+      await deliverAgentEnd(event, ctx);
+    },
+    clearRetainedAgentEnd(): void {
+      retainedErrorEvent = undefined;
+    },
     ...createTelegramToolExecutionHooks<TContext>(deps),
   };
 }
@@ -1132,13 +1173,16 @@ export function createTelegramAgentEndHook<
   return async (
     event: TelegramAgentEndHookEvent<TMessage>,
     ctx: TContext,
+    assistantOverride?: TelegramAgentEndAssistantResult,
   ): Promise<void> => {
     await deps.loadConfig?.();
     if (deps.isSessionActive && !deps.isSessionActive(ctx)) return;
     const turn = deps.getActiveTurn();
     await handleTelegramAgentEndRuntime({
       turn,
-      assistant: turn ? deps.extractAssistant(event.messages) : {},
+      assistant:
+        assistantOverride ??
+        (turn ? deps.extractAssistant(event.messages) : {}),
       foldQueuedPromptsIntoHistory: deps.getFoldQueuedPromptsIntoHistory(),
       resetRuntimeState: deps.resetRuntimeState,
       isSessionActive: () => deps.isSessionActive?.(ctx) ?? true,

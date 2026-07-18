@@ -93,7 +93,7 @@ interface TelegramConfig {
     proactivePush?: boolean;
   };
   voice?: {
-    replyMode?: "manual" | "mirror" | "always";
+    replyMode?: "hidden" | "mirror" | "always";
     sendTranscript?: boolean;
   };
   time?: {
@@ -106,7 +106,7 @@ interface TelegramConfig {
 Hidden/default semantics are represented by absence:
 
 - `assistant.proactivePush` defaults to `true`; omit it to keep projection enabled, or set it explicitly to `false` to disable it. When enabled, each completed public assistant text block from local or autonomous work is projected to the authorized Telegram target once and in source order. This includes visible intermediate commentary/checkpoints and the final block. It excludes token deltas, hidden reasoning, tool calls/arguments/results, Telegram-owned turns, empty blocks, and stale authority. Projection uses the configured Rich or HTML assistant renderer and binds admitted work to the exact target, profile/token transport generation, direct leader epoch or follower registration generation, and session generation. The old top-level `proactivePush` key is ignored; move the setting manually under `assistant`.
-- Voice Reply `hidden`: no `voice.replyMode` key is persisted.
+- Voice Reply `hidden`: no `voice.replyMode` key is persisted; legacy `manual` resolves to this silent default. `mirror` adds `[voice] delivery: automatic voice` only to voice/audio-input turns, while `always` adds the same effective line to every Telegram turn.
 - Agent activity status is not configurable in this release. Telegram uses native `sendChatAction(typing)` / product `...active` status as the only automatic in-chat work signal before the final reply.
 - Time Injection `hidden`: no `time.injectionMode` key is persisted; if `time` becomes empty, the whole `time` object may be omitted.
 

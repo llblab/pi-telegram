@@ -38,12 +38,12 @@ import {
   createTelegramQueueDispatchWatchdogRuntime,
   createTelegramQueueMutationController,
   createTelegramQueueStore,
-  createTelegramTransportStampedQueueStore,
-  createTelegramTransportStampRuntime,
   createTelegramSessionLifecycleHooks,
   createTelegramSessionLifecycleRuntime,
   createTelegramSessionStateApplier,
   createTelegramToolExecutionHooks,
+  createTelegramTransportStampedQueueStore,
+  createTelegramTransportStampRuntime,
   enqueueTelegramPromptTurnRuntime,
   executeTelegramControlItemRuntime,
   executeTelegramQueueDispatchPlan,
@@ -2536,6 +2536,99 @@ test("Agent lifecycle hooks bind start, end, and tool lifecycle ports", async ()
   ]);
 });
 
+test("Agent lifecycle retains retryable errors until recovery or settlement", async () => {
+  const events: string[] = [];
+  const turn = createQueueTestPromptTurn({ chatId: 7, replyToMessageId: 8 });
+  let activeTurn: PendingTelegramTurn | undefined = turn;
+  const hooks = createTelegramAgentLifecycleHooks<
+    PendingTelegramTurn,
+    string,
+    { result: "error" | "success" }
+  >({
+    setAbortHandler: () => {},
+    getQueuedItems: () => [],
+    hasPendingDispatch: () => false,
+    hasActiveTurn: () => !!activeTurn,
+    resetToolExecutions: () => {},
+    resetPendingModelSwitch: () => {},
+    setQueuedItems: () => {},
+    clearDispatchPending: () => {},
+    setFoldQueuedPromptsIntoHistory: () => {},
+    setActiveTurn: (nextTurn) => {
+      activeTurn = nextTurn;
+    },
+    createPreviewState: () => {},
+    startTypingLoop: () => {},
+    updateStatus: () => {},
+    getActiveTurn: () => activeTurn,
+    extractAssistant: ([message]) =>
+      message?.result === "success"
+        ? { text: "Recovered answer" }
+        : { stopReason: "error", errorMessage: "WebSocket error" },
+    getFoldQueuedPromptsIntoHistory: () => false,
+    resetRuntimeState: () => {
+      activeTurn = undefined;
+      events.push("reset");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    requestDeferredDispatchNextQueuedTelegramTurn: (dispatch) => {
+      dispatch("ctx");
+    },
+    clearPreview: async () => {
+      events.push("clear");
+    },
+    setPreviewPendingText: (text) => {
+      events.push(`preview:${text}`);
+    },
+    finalizeMarkdownPreview: async (_chatId, text) => {
+      events.push(`final:${text}`);
+      return true;
+    },
+    sendMarkdownReply: async () => {},
+    sendTextReply: async (_chatId, _replyToMessageId, text) => {
+      events.push(`error:${text}`);
+    },
+    sendQueuedAttachments: async () => {},
+    getActiveToolExecutions: () => 0,
+    setActiveToolExecutions: () => {},
+    triggerPendingModelSwitchAbort: () => {},
+    recordRuntimeEvent: (category, _error, details) => {
+      events.push(`${category}:${details?.phase}`);
+    },
+  });
+
+  await hooks.onAgentEnd({ messages: [{ result: "error" }] }, "ctx");
+  assert.equal(activeTurn?.replyToMessageId, 8);
+  assert.deepEqual(events, ["provider-retry:retained"]);
+
+  await hooks.onAgentEnd({ messages: [{ result: "success" }] }, "ctx");
+  assert.equal(activeTurn, undefined);
+  assert.deepEqual(events, [
+    "provider-retry:retained",
+    "provider-retry:recovered",
+    "reset",
+    "preview:Recovered answer",
+    "final:Recovered answer",
+    "dispatch",
+  ]);
+
+  activeTurn = turn;
+  events.length = 0;
+  await hooks.onAgentEnd({ messages: [{ result: "error" }] }, "ctx");
+  await hooks.onAgentSettled({}, "ctx");
+  assert.equal(activeTurn, undefined);
+  assert.deepEqual(events, [
+    "provider-retry:retained",
+    "provider-retry:settled-failure",
+    "reset",
+    "clear",
+    "error:WebSocket error",
+    "dispatch",
+  ]);
+});
+
 test("Agent start hook binds abort handler and runtime ports", async () => {
   const events: string[] = [];
   const prompt: PendingTelegramTurn = createQueueTestPromptTurn();
@@ -3308,7 +3401,10 @@ test("Dispatch controller skips inactive stale contexts before readiness checks"
 test("Dispatch controller drops stale transport work before sending the next prompt", () => {
   const stale = createQueueTestPromptTurn({ chatId: 1, replyToMessageId: 11 });
   stale.transportStamp = { profile: "a", generation: "epoch-a" };
-  const current = createQueueTestPromptTurn({ chatId: 2, replyToMessageId: 22 });
+  const current = createQueueTestPromptTurn({
+    chatId: 2,
+    replyToMessageId: 22,
+  });
   current.transportStamp = { profile: "b", generation: "epoch-b" };
   let items: TelegramQueueItem<string>[] = [stale, current];
   const sent: number[] = [];
@@ -4002,7 +4098,8 @@ await test("executeTelegramQueueDispatchPlan sends ready prompts as normal user 
   await t.test(
     "sendUserMessage is called without followUp delivery option for prompt plan",
     () => {
-      let sendUserMessageArgs: { content: unknown; options: unknown } | undefined;
+      let sendUserMessageArgs:
+        { content: unknown; options: unknown } | undefined;
       let onPromptDispatchChatId: number | undefined;
 
       const deps: TelegramDispatchRuntimeDeps = {

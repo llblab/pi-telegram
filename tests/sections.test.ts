@@ -3,18 +3,18 @@
  * Zones: telegram ui, extension platform, callback routing
  */
 
-import { test } from "node:test";
 import assert from "node:assert/strict";
+import { test } from "node:test";
 import {
   createTelegramExtensionSectionRegistry,
   getTelegramExtensionSettingsRows,
   getTelegramSectionMainMenuRows,
-  parseTelegramSectionCallback,
-  handleTelegramSectionOpen,
   handleTelegramSectionCallback,
+  handleTelegramSectionOpen,
   handleTelegramSectionSettingsOpen,
-  type TelegramSectionRegistration,
+  parseTelegramSectionCallback,
   type TelegramSectionCallbackHandlerDeps,
+  type TelegramSectionRegistration,
 } from "../lib/sections.ts";
 
 function stubSection(
@@ -650,7 +650,7 @@ test("buildTelegramSettingsMenuReplyMarkup injects extension settings rows", asy
   const markup = buildTelegramSettingsMenuReplyMarkup(
     false,
     false,
-    "manual",
+    "hidden",
     "hidden",
     registry,
   );
