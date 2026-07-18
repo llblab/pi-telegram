@@ -36,9 +36,7 @@ type TelegramRuntimeEventRecorder = (
 type TelegramBridgeStatusUpdater =
   Status.TelegramStatusRuntime<Pi.ExtensionContext>["updateStatus"];
 
-export interface TelegramAssistantOutputBindingRuntime<
-  TTransportStamp,
-> {
+export interface TelegramAssistantOutputBindingRuntime<TTransportStamp> {
   runtime: Activity.TelegramAssistantOutputRuntime;
   observeEvent: (event: Activity.TelegramActivityEvent) => void;
   authority: Routing.TelegramAssistantOutputAuthorityRuntime<TTransportStamp>;
@@ -49,7 +47,9 @@ export function createTelegramAssistantOutputBindingRuntime<
 >(deps: {
   isEnabled: () => boolean;
   authority: {
-    getPreferredTarget: () => OutboundAttachments.TelegramQueuedOutboundAttachmentTurnView["target"] | undefined;
+    getPreferredTarget: () =>
+      | OutboundAttachments.TelegramQueuedOutboundAttachmentTurnView["target"]
+      | undefined;
     getFallbackChatId: () => number | undefined;
     getTransportStamp: () => TTransportStamp;
     isTransportStampActive: (stamp: TTransportStamp) => boolean;
@@ -63,8 +63,9 @@ export function createTelegramAssistantOutputBindingRuntime<
   >[0];
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }): TelegramAssistantOutputBindingRuntime<TTransportStamp> {
-  const authority =
-    Routing.createTelegramAssistantOutputAuthorityRuntime(deps.authority);
+  const authority = Routing.createTelegramAssistantOutputAuthorityRuntime(
+    deps.authority,
+  );
   const send =
     OutboundHandlers.createTelegramAssistantOutputSender<TTransportStamp>(
       deps.sender,
@@ -640,6 +641,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     },
     async onSessionShutdown(event, ctx) {
       if (!isSessionContextActive(ctx)) return;
+      agentLifecycleHooks.clearRetainedAgentEnd();
       activityRuntime.onSessionShutdown();
       assistantOutputRuntime.stop();
       compactionObserver.onSessionShutdown();
@@ -706,8 +708,9 @@ export function registerTelegramLifecycleRuntimeHooks({
       activityRuntime.onAgentEnd();
       await agentLifecycleHooks.onAgentEnd(event, ctx);
     },
-    onAgentSettled(_event, ctx) {
+    async onAgentSettled(event, ctx) {
       if (!isSessionContextActive(ctx)) return;
+      await agentLifecycleHooks.onAgentSettled(event, ctx);
       activityRuntime.onAgentSettled();
     },
     onBeforeAgentStart: Prompts.createTelegramProactiveBeforeAgentStartHook({

@@ -23,6 +23,7 @@ import type { TelegramConfig } from "../lib/config.ts";
 import {
   createTelegramConfigControls,
   createTelegramConfigStore,
+  createTelegramPollingOffsetPersister,
   createTelegramProactivePushTargetGetter,
   createTelegramTimeInjectionModeGetter,
   createTelegramTimeInjectionModeSetter,
@@ -257,7 +258,10 @@ test("Telegram config transactions merge concurrent profile offsets and global f
     ) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    assert.equal(children.every((child) => existsSync(child.readyPath)), true);
+    assert.equal(
+      children.every((child) => existsSync(child.readyPath)),
+      true,
+    );
     await writeFile(startPath, "start");
     await Promise.all(children.map((child) => child.done));
 
@@ -286,7 +290,10 @@ test("Telegram config keeps same-profile polling offsets monotonic", async () =>
   );
   try {
     const stale = createTelegramConfigStore({ agentDir: dir, configPath });
-    const replacement = createTelegramConfigStore({ agentDir: dir, configPath });
+    const replacement = createTelegramConfigStore({
+      agentDir: dir,
+      configPath,
+    });
     await stale.load();
     await replacement.load();
     assert.equal(stale.activateProfile("work"), true);
@@ -351,21 +358,21 @@ test("Telegram config load recovers invalid JSON and records a diagnostic", asyn
   assert.match(events[0] ?? "", /^config:SyntaxError:load:/);
 });
 
-test("Telegram voice reply mode helpers distinguish implicit and explicit manual", () => {
+test("Telegram voice reply mode helpers normalize legacy manual to hidden", () => {
   let config: TelegramConfig = {};
   const store = { get: () => config };
   const getMode = createTelegramVoiceReplyModeGetter(store);
   const isConfigured = createTelegramVoiceReplyModeConfiguredChecker(store);
 
-  assert.equal(getMode(), "manual");
+  assert.equal(getMode(), "hidden");
   assert.equal(isConfigured(), false);
 
-  config = { voice: { replyMode: "manual" } };
-  assert.equal(getMode(), "manual");
-  assert.equal(isConfigured(), true);
+  config = { voice: { replyMode: "manual" } } as unknown as TelegramConfig;
+  assert.equal(getMode(), "hidden");
+  assert.equal(isConfigured(), false);
 
   config = { voice: { replyMode: "invalid" } } as unknown as TelegramConfig;
-  assert.equal(getMode(), "manual");
+  assert.equal(getMode(), "hidden");
   assert.equal(isConfigured(), false);
 });
 
@@ -387,7 +394,7 @@ test("Telegram voice reply mode setter persists telegram.json", async () => {
     voice: { replyMode: "mirror" },
   });
 
-  await setMode(undefined);
+  await setMode("hidden");
 
   assert.equal(store.get().voice, undefined);
   assert.deepEqual(await readTelegramConfig(configPath), {
@@ -438,6 +445,35 @@ test("Telegram settings setters reload before scoped writes to preserve shared c
   });
   assert.equal(controls.getAssistantRenderingMode(), "html");
   assert.deepEqual(secondStore.get().voice, { replyMode: "mirror" });
+});
+
+test("Polling offset persistence cannot erase settings written after poll start", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-poll-settings-"));
+  const configPath = join(agentDir, "telegram.json");
+  await writeTelegramConfig(agentDir, configPath, {
+    botToken: "123:abc",
+    lastUpdateId: 10,
+    assistant: { rendering: "rich", draftPreviews: false },
+  });
+  const store = createTelegramConfigStore({ agentDir, configPath });
+  await store.load();
+  const stalePollingConfig = store.get();
+
+  await createTelegramVoiceReplyModeSetter(store)("mirror");
+  await createTelegramConfigControls(store).setProactivePushEnabled(false);
+  stalePollingConfig.lastUpdateId = 11;
+  await createTelegramPollingOffsetPersister(store)(stalePollingConfig);
+
+  assert.deepEqual(await readTelegramConfig(configPath), {
+    botToken: "123:abc",
+    lastUpdateId: 11,
+    assistant: {
+      rendering: "rich",
+      draftPreviews: false,
+      proactivePush: false,
+    },
+    voice: { replyMode: "mirror" },
+  });
 });
 
 test("Telegram draft preview config reads and migrates legacy rich flag", async () => {

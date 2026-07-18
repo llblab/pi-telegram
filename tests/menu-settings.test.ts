@@ -7,12 +7,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  buildProactivePushSettingsReplyMarkup,
-  buildProactivePushSettingsText,
   buildAssistantRenderingSettingsReplyMarkup,
   buildAssistantRenderingSettingsText,
   buildDraftPreviewsSettingsReplyMarkup,
   buildDraftPreviewsSettingsText,
+  buildProactivePushSettingsReplyMarkup,
+  buildProactivePushSettingsText,
   buildTelegramSettingsMenuReplyMarkup,
   buildTelegramSettingsMenuText,
   buildTimeInjectionModeSettingsReplyMarkup,
@@ -27,7 +27,7 @@ test("Settings menu text and reply markup expose built-in controls", () => {
   const markup = buildTelegramSettingsMenuReplyMarkup(
     true,
     false,
-    "manual",
+    "hidden",
     "hidden",
     undefined,
     false,
@@ -39,7 +39,7 @@ test("Settings menu text and reply markup expose built-in controls", () => {
       "menu:back",
       "settings:open:voice-reply",
       "settings:open:time-injection",
-        "settings:open:draft-previews",
+      "settings:open:draft-previews",
       "settings:open:assistant-rendering",
       "settings:open:proactive",
     ],
@@ -69,7 +69,10 @@ test("Settings detail markups show active values", () => {
     buildDraftPreviewsSettingsReplyMarkup(true).inline_keyboard[1]?.[0]?.text,
     "🟢 On",
   );
-  assert.match(buildAssistantRenderingSettingsText("html"), /<code>html<\/code>/);
+  assert.match(
+    buildAssistantRenderingSettingsText("html"),
+    /<code>html<\/code>/,
+  );
   assert.equal(
     buildAssistantRenderingSettingsReplyMarkup("rich").inline_keyboard[1]?.[0]
       ?.text,
@@ -86,11 +89,11 @@ test("Settings detail markups show active values", () => {
   );
   assert.equal(
     buildVoiceReplyModeSettingsReplyMarkup("mirror", true)
-      .inline_keyboard[3]?.[0]?.text,
+      .inline_keyboard[2]?.[0]?.text,
     "🟢 mirror",
   );
   assert.equal(
-    buildVoiceReplyModeSettingsReplyMarkup("manual", false)
+    buildVoiceReplyModeSettingsReplyMarkup("hidden", false)
       .inline_keyboard[1]?.[0]?.text,
     "🟢 hidden",
   );
@@ -100,7 +103,7 @@ test("Settings callback action mutates voice, time, and proactive settings", asy
   const calls: string[] = [];
   const deps = {
     isProactivePushEnabled: () => false,
-    getVoiceReplyMode: () => "manual" as const,
+    getVoiceReplyMode: () => "hidden" as const,
     isVoiceReplyModeConfigured: () => true,
     getTimeInjectionMode: () => "hidden" as const,
     areDraftPreviewsEnabled: () => false,
@@ -115,7 +118,7 @@ test("Settings callback action mutates voice, time, and proactive settings", asy
       calls.push(`rendering:${mode}`);
     },
     setVoiceReplyMode: async (
-      mode: "manual" | "mirror" | "always" | undefined,
+      mode: "hidden" | "mirror" | "always" | undefined,
     ) => {
       calls.push(`voice:${mode ?? "hidden"}`);
     },
@@ -177,7 +180,7 @@ test("Settings callback action mutates voice, time, and proactive settings", asy
 
   assert.deepEqual(calls, [
     "voice:hidden",
-    "update:<b>👄 Voice reply mode:</b> <code>manual</code>",
+    "update:<b>👄 Voice reply mode:</b> <code>hidden</code>",
     "answer:Voice reply mode: hidden",
     "time:hidden",
     "update:<b>🕒 Time injection mode:</b> <code>hidden</code>",
@@ -194,7 +197,7 @@ test("Settings callback action mutates voice, time, and proactive settings", asy
   ]);
 });
 
-test("Settings runtime opens menus and applies stale-message fallback toggles", async () => {
+test("Settings runtime opens menus and rehydrates stale callback state", async () => {
   const state: any = {
     chatId: 1,
     messageId: 2,
@@ -205,9 +208,10 @@ test("Settings runtime opens menus and applies stale-message fallback toggles", 
     allModels: [],
   };
   const calls: string[] = [];
+  let storedState: typeof state | undefined;
   const runtime = createTelegramSettingsMenuRuntime({
     isProactivePushEnabled: () => true,
-    getVoiceReplyMode: () => "manual",
+    getVoiceReplyMode: () => "hidden",
     isVoiceReplyModeConfigured: () => true,
     getTimeInjectionMode: () => "hidden",
     areDraftPreviewsEnabled: () => false,
@@ -228,8 +232,11 @@ test("Settings runtime opens menus and applies stale-message fallback toggles", 
       calls.push(`time:${mode}`);
     },
     getModelMenuState: async () => state,
-    getStoredModelMenuState: () => undefined,
-    storeModelMenuState: (nextState) => calls.push(`store:${nextState.mode}`),
+    getStoredModelMenuState: () => storedState,
+    storeModelMenuState: (nextState) => {
+      storedState = nextState;
+      calls.push(`store:${nextState.mode}`);
+    },
     editInteractiveMessage: async () => {
       calls.push("edit");
     },
@@ -245,27 +252,39 @@ test("Settings runtime opens menus and applies stale-message fallback toggles", 
   await runtime.openSettingsMenu(1, 2, "ctx");
   assert.equal(state.messageId, 99);
   assert.equal(state.mode, "settings");
+  assert.deepEqual(calls, ["send:html", "store:settings"]);
 
+  storedState = undefined;
+  calls.length = 0;
   assert.equal(
     await runtime.handleCallbackQuery(
-      { id: "q1", data: "settings:set:voice-reply:always" },
+      {
+        id: "q1",
+        data: "settings:set:voice-reply:always",
+        message: { message_id: 99, chat: { id: 1 } },
+      },
       "ctx",
     ),
     true,
   );
   assert.equal(
     await runtime.handleCallbackQuery(
-      { id: "q2", data: "settings:set:time:off" },
+      {
+        id: "q2",
+        data: "settings:set:time:off",
+        message: { message_id: 99, chat: { id: 1 } },
+      },
       "ctx",
     ),
     true,
   );
   assert.deepEqual(calls, [
-    "send:html",
     "store:settings",
     "voice:always",
+    "edit",
     "answer:Voice reply mode: always",
     "time:hidden",
+    "edit",
     "answer:Time injection: hidden",
   ]);
 });

@@ -9,7 +9,6 @@ import { basename, dirname } from "node:path";
 import * as Bus from "./bus.ts";
 import * as Commands from "./commands.ts";
 import type { TelegramConfigStore } from "./config.ts";
-import type { TelegramSectionRegistry } from "./sections.ts";
 import type { TelegramInboundHandlerRuntime } from "./inbound.ts";
 import * as Media from "./media.ts";
 import * as Menu from "./menu.ts";
@@ -18,12 +17,13 @@ import * as OutboundHandlers from "./outbound.ts";
 import * as PromptTemplates from "./prompt-templates.ts";
 import * as Queue from "./queue.ts";
 import type { TelegramBridgeRuntime } from "./runtime.ts";
+import type { TelegramSectionRegistry } from "./sections.ts";
 import * as TextGroups from "./text-groups.ts";
+import * as ThreadReconciler from "./thread-reconciler.ts";
 import type {
   TelegramInstanceThreadIdentityCandidate,
   TelegramTopicTargetRecord,
 } from "./threads.ts";
-import * as ThreadReconciler from "./thread-reconciler.ts";
 import * as Turns from "./turns.ts";
 
 interface TelegramPromptPeerView {
@@ -408,10 +408,10 @@ function formatTelegramUnboundRerouteChooserText(
     : [formatTelegramUnboundTopicGuidance(), "", rerouteText].join("\n");
 }
 
-import { getTelegramVoiceReplyMode } from "./voice.ts";
-import type { TelegramUser } from "./updates.ts";
 import * as Threads from "./threads.ts";
+import type { TelegramUser } from "./updates.ts";
 import * as Updates from "./updates.ts";
+import { getTelegramVoiceReplyMode } from "./voice.ts";
 
 async function deleteReservedTelegramTopicThroughReconciler(
   deps: {
@@ -1524,13 +1524,8 @@ export function createTelegramInboundRouteRuntime<
     resolveTimeLine: deps.resolveTimeLine,
     getAllowedUserId: deps.configStore.getAllowedUserId,
 
-    // Voice policy for the current turn. Missing config still behaves as manual,
-    // but only explicit telegram.json voice.replyMode is shown in prompt context.
+    // Voice policy resolves missing, invalid, and legacy manual config to hidden.
     getVoiceReplyMode: () => getTelegramVoiceReplyMode(deps.configStore.get()),
-    isVoiceReplyModeConfigured: () => {
-      const mode = deps.configStore.get().voice?.replyMode;
-      return mode === "manual" || mode === "mirror" || mode === "always";
-    },
     getTelegramThreadLabel(message) {
       if (!deps.threadStore) return undefined;
       const chatId = message.chat.id;
@@ -2490,7 +2485,9 @@ export interface TelegramAssistantOutputAuthorityRuntime<TTransportStamp> {
   canDeliver: () => boolean;
 }
 
-export function createTelegramAssistantOutputAuthorityRuntime<TTransportStamp>(deps: {
+export function createTelegramAssistantOutputAuthorityRuntime<
+  TTransportStamp,
+>(deps: {
   getPreferredTarget: () => Queue.TelegramQueueTarget | undefined;
   getFallbackChatId: () => number | undefined;
   getTransportStamp: () => TTransportStamp;
@@ -2509,9 +2506,7 @@ export function createTelegramAssistantOutputAuthorityRuntime<TTransportStamp>(d
   return {
     captureAuthority() {
       const target = getCurrentTarget();
-      const directEpoch = deps.ownsDirect()
-        ? deps.getDirectEpoch()
-        : undefined;
+      const directEpoch = deps.ownsDirect() ? deps.getDirectEpoch() : undefined;
       const followerGeneration = deps.isFollowerRegistered()
         ? deps.getFollowerGeneration()
         : undefined;
@@ -2540,8 +2535,7 @@ export function createTelegramAssistantOutputAuthorityRuntime<TTransportStamp>(d
       }
       if (authority.route === "direct") {
         return (
-          deps.ownsDirect() &&
-          deps.getDirectEpoch() === authority.directEpoch
+          deps.ownsDirect() && deps.getDirectEpoch() === authority.directEpoch
         );
       }
       if (authority.route === "follower") {

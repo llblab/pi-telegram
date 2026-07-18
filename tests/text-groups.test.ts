@@ -174,6 +174,81 @@ test("Text group controller coalesces a cross-batch comment with a rich forwarde
   assert.deepEqual(dispatched, ["Комментарий|Rich forward"]);
 });
 
+test("Text group controller coalesces media-only forwards and comments in either order", async () => {
+  const runPair = async (
+    messages: TestMessage[],
+    flushRemainder = false,
+  ): Promise<number[][]> => {
+    const timers: Array<{
+      active: boolean;
+      callback: () => void;
+      delay: number;
+    }> = [];
+    const dispatched: number[][] = [];
+    const controller = TextGroups.createTelegramTextGroupController<
+      TestMessage,
+      string
+    >({
+      debounceMs: 1000,
+      setTimer: (callback, delay) => {
+        const timer = { active: true, callback, delay };
+        timers.push(timer);
+        return timer as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimer: (timer) => {
+        (timer as unknown as { active: boolean }).active = false;
+      },
+    });
+    for (const message of messages) {
+      assert.equal(
+        controller.queueMessage({
+          message,
+          context: "ctx",
+          dispatchMessages: (group) => {
+            dispatched.push(group.map((item) => item.message_id));
+          },
+        }),
+        true,
+      );
+    }
+    assert.equal(timers[0]?.delay, 1000);
+    assert.equal(timers[0]?.active, false);
+    assert.equal(timers[1]?.delay, 0);
+    timers[1]?.callback();
+    await Promise.resolve();
+    if (flushRemainder) {
+      assert.equal(timers[2]?.delay, 1000);
+      timers[2]?.callback();
+      await Promise.resolve();
+    }
+    return dispatched;
+  };
+  const mediaForward = (messageId: number): TestMessage =>
+    createMessage(messageId, "", {
+      text: undefined,
+      forward_origin: { type: "user" },
+    });
+
+  assert.deepEqual(
+    await runPair([
+      createMessage(40, "Комментарий"),
+      mediaForward(41),
+    ]),
+    [[40, 41]],
+  );
+  assert.deepEqual(
+    await runPair([
+      mediaForward(50),
+      createMessage(51, "Комментарий"),
+    ]),
+    [[50, 51]],
+  );
+  assert.deepEqual(
+    await runPair([mediaForward(60), mediaForward(61)], true),
+    [[60], [61]],
+  );
+});
+
 test("Text group keeps split messages until asynchronous dispatch succeeds", async () => {
   const groups = new Map<
     string,

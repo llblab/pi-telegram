@@ -92,7 +92,7 @@ The first Telegram user to message the bot becomes the allowed owner. Other user
 
 | Surface | What you can do | Why it matters |
 | --- | --- | --- |
-| Prompt intake | Send text, replies, edits, images, files, albums, voice notes, and handler output into Pi. | Telegram becomes a real mobile input surface with file/context references, not just a text tunnel. |
+| Prompt intake | Send text, replies, edits, images, files, albums, voice notes, forwards with adjacent comments, and handler output into Pi. | Telegram becomes a real mobile input surface; one forward-plus-comment gesture stays one attributed prompt even for photo-only forwards. |
 | Queue control | Inspect waiting turns, delete stale work, promote important prompts, continue, abort, stop, or force the next queued item. | Long Pi tasks keep running while new mobile prompts stay visible and controllable instead of interrupting or disappearing. |
 | Operator menu | Use `/start` for status, prompt templates, model, thinking, settings, queue, extension sections, and diagnostics. | The bot is an operator panel, not a command cheat sheet. |
 | Prompt templates | Run Pi prompt templates as Telegram-safe commands such as `/fix_tests`. | Reusable local workflows become phone-accessible without exposing arbitrary terminal commands. |
@@ -104,7 +104,7 @@ The first Telegram user to message the bot becomes the allowed owner. Other user
 | Inbound files | Download inbound files to the Pi agent temp directory with size limits. | Screenshots, PDFs, datasets, and artifacts enter Pi as inspectable local files. |
 | Outbound artifacts | Return generated files through `telegram_attach` during active turns or explicit direct delivery. | Agents send real artifacts as files, not pasted blobs. |
 | Voice input | Route audio through configured command-template handlers, programmatic handlers, or STT providers. | Voice notes become usable prompt context. |
-| Voice output | Use `telegram_voice`, reply modes, configured voice handlers, and TTS providers. | Replies can become Telegram voice messages when the workflow calls for it. |
+| Voice output | Choose `hidden`, `mirror`, or `always`; active automatic turns carry one compact `[voice] delivery: automatic voice` line, while explicit `telegram_voice` remains available. | Voice policy stays dynamic and model-legible without duplicating the full action contract in every prompt. |
 | Buttons | Turn top-level `telegram_button` comments into inline buttons. | Assistant-authored choices become native Telegram interactions. |
 | Callback routing | Route known callbacks to the owner extension and unknown callbacks back into Pi. | Companion extensions can build UI without polling Telegram themselves. |
 | Threaded Mode | Run one leader plus visible follower Pi instances through named private-chat threads. | One bot can host a local multi-instance Pi organism without hidden process spawning. |
@@ -165,7 +165,7 @@ Named profile identifiers contain only lowercase ASCII letters and digits (maxim
 
 ### Queue Runtime
 
-Messages sent while Pi is busy become queued turns. Priority lanes support control actions and model-switch continuations. Queue controls let you inspect, delete, promote, and dispatch work from Telegram without touching the terminal.
+Messages sent while Pi is busy become queued turns. Priority lanes support control actions and model-switch continuations. Queue controls let you inspect, delete, promote, and dispatch work from Telegram without touching the terminal. If Pi automatically retries a transient provider failure, the active Telegram turn stays bound until the successful reply arrives or Pi confirms that the run has settled.
 
 ### Native Rich Markdown
 

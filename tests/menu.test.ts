@@ -413,7 +413,9 @@ test("Menu helpers omit pagination controls for one-page unscoped model lists", 
   });
   const markup = buildModelMenuReplyMarkup(state, modelA, 6);
   assert.deepEqual(
-    markup.inline_keyboard.map((row) => row.map((button) => button.callback_data)),
+    markup.inline_keyboard.map((row) =>
+      row.map((button) => button.callback_data),
+    ),
     [["menu:back"], ["model:open:0"], ["model:open:1"]],
   );
 });
@@ -987,13 +989,7 @@ test("Menu runtime routes stored callback queries through callback action ports"
     mode: "status",
   };
   let thinkingLevel:
-    | "off"
-    | "minimal"
-    | "low"
-    | "medium"
-    | "high"
-    | "xhigh"
-    | "max" = "medium";
+    "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" = "medium";
   await handleTelegramMenuCallbackRuntime(
     { id: "callback-1", data: "menu:thinking", message: { message_id: 2 } },
     { idle: true },
@@ -2211,7 +2207,7 @@ test("Section callback actions preserve callback thread target", async () => {
 
 test("Settings menu labels proactive push with state text", () => {
   assert.deepEqual(
-    buildTelegramSettingsMenuReplyMarkup(true, false, "manual", "hidden")
+    buildTelegramSettingsMenuReplyMarkup(true, false, "hidden", "hidden")
       .inline_keyboard[5],
     [
       {
@@ -2221,7 +2217,7 @@ test("Settings menu labels proactive push with state text", () => {
     ],
   );
   assert.deepEqual(
-    buildTelegramSettingsMenuReplyMarkup(false, false, "manual", "hidden")
+    buildTelegramSettingsMenuReplyMarkup(false, false, "hidden", "hidden")
       .inline_keyboard[5],
     [
       {
@@ -2234,7 +2230,7 @@ test("Settings menu labels proactive push with state text", () => {
 
 test("Settings menu exposes time injection mode selection", () => {
   assert.deepEqual(
-    buildTelegramSettingsMenuReplyMarkup(false, false, "manual", "hidden")
+    buildTelegramSettingsMenuReplyMarkup(false, false, "hidden", "hidden")
       .inline_keyboard[2],
     [
       {
@@ -2244,7 +2240,7 @@ test("Settings menu exposes time injection mode selection", () => {
     ],
   );
   assert.deepEqual(
-    buildTelegramSettingsMenuReplyMarkup(false, false, "manual", "interval")
+    buildTelegramSettingsMenuReplyMarkup(false, false, "hidden", "interval")
       .inline_keyboard[2],
     [
       {
@@ -2275,18 +2271,18 @@ test("Settings menu exposes time injection mode selection", () => {
 
 test("Settings menu marks voice mode selection with model-style dot", () => {
   assert.deepEqual(
-    buildVoiceReplyModeSettingsReplyMarkup("manual", false).inline_keyboard[1],
+    buildVoiceReplyModeSettingsReplyMarkup("hidden", false).inline_keyboard[1],
     [{ text: "🟢 hidden", callback_data: "settings:set:voice-reply:hidden" }],
   );
   assert.deepEqual(
-    buildVoiceReplyModeSettingsReplyMarkup("mirror").inline_keyboard[3],
+    buildVoiceReplyModeSettingsReplyMarkup("mirror").inline_keyboard[2],
     [{ text: "🟢 mirror", callback_data: "settings:set:voice-reply:mirror" }],
   );
   assert.deepEqual(
     buildTelegramSettingsMenuReplyMarkup(
       false,
       false,
-      "manual",
+      "hidden",
       "hidden",
       undefined,
       false,
@@ -2310,32 +2306,39 @@ test("Settings menu marks voice mode selection with model-style dot", () => {
   );
 });
 
-test("Settings menu persists voice mode even when the menu message state expired", async () => {
-  let mode: "manual" | "mirror" | "always" | undefined = "always";
-  let configured = true;
-  const answers: string[] = [];
+test("Settings menu rehydrates expired state before persisting and rendering voice mode", async () => {
+  let mode: "hidden" | "mirror" | "always" | undefined;
+  let configured = false;
+  const events: string[] = [];
   const runtime = createTelegramSettingsMenuRuntime({
-    getModelMenuState: async () => ({
-      chatId: 1,
-      messageId: 2,
-      mode: "settings" as const,
-      page: 0,
-      scope: "all" as const,
-      scopedModels: [],
-      allModels: [],
-    }),
+    getModelMenuState: async (chatId) => {
+      events.push(`rehydrate:${chatId}`);
+      return {
+        chatId,
+        messageId: 0,
+        mode: "model" as const,
+        page: 2,
+        scope: "all" as const,
+        scopedModels: [],
+        allModels: [],
+      };
+    },
     getStoredModelMenuState: () => undefined,
-    storeModelMenuState: () => {},
-    editInteractiveMessage: async () => {},
+    storeModelMenuState: (state) => {
+      events.push(`store:${state.chatId}:${state.messageId}:${state.mode}`);
+    },
+    editInteractiveMessage: async (chatId, messageId, text) => {
+      events.push(`edit:${chatId}:${messageId}:${text.includes("mirror")}`);
+    },
     sendInteractiveMessage: async () => 2,
     answerCallbackQuery: async (_id, text) => {
-      answers.push(text ?? "");
+      events.push(`answer:${text ?? ""}`);
     },
     isProactivePushEnabled: () => false,
     areDraftPreviewsEnabled: () => false,
     getAssistantRenderingMode: () => "rich" as const,
     getTimeInjectionMode: () => "hidden",
-    getVoiceReplyMode: () => mode ?? "manual",
+    getVoiceReplyMode: () => mode ?? "hidden",
     isVoiceReplyModeConfigured: () => configured,
     setProactivePushEnabled: async () => {},
     setDraftPreviewsEnabled: async () => {},
@@ -2343,6 +2346,7 @@ test("Settings menu persists voice mode even when the menu message state expired
     setVoiceReplyMode: async (nextMode) => {
       mode = nextMode;
       configured = nextMode !== undefined;
+      events.push(`set:${nextMode}`);
     },
     setTimeInjectionMode: async () => {},
   });
@@ -2351,16 +2355,22 @@ test("Settings menu persists voice mode even when the menu message state expired
     await runtime.handleCallbackQuery(
       {
         id: "cb1",
-        data: "settings:set:voice-reply:manual",
-        message: { message_id: 99 },
+        data: "settings:set:voice-reply:mirror",
+        message: { message_id: 99, chat: { id: 1 } },
       },
       {},
     ),
     true,
   );
 
-  assert.equal(mode, "manual");
-  assert.deepEqual(answers, ["Voice reply mode: manual"]);
+  assert.equal(mode, "mirror");
+  assert.deepEqual(events, [
+    "rehydrate:1",
+    "store:1:99:settings",
+    "set:mirror",
+    "edit:1:99:true",
+    "answer:Voice reply mode: mirror",
+  ]);
 });
 
 test("Settings submenu headings include current values", () => {
@@ -2373,7 +2383,7 @@ test("Settings submenu headings include current values", () => {
     /^<b>🕒 Time injection mode:<\/b> <code>interval<\/code>/,
   );
   assert.match(
-    buildVoiceReplyModeSettingsText("manual", false),
+    buildVoiceReplyModeSettingsText("hidden", false),
     /^<b>👄 Voice reply mode:<\/b> <code>hidden<\/code>/,
   );
 });
