@@ -4,7 +4,10 @@
  * Owns Telegram slash-command normalization, bot command metadata, and pi-side command registration behind runtime ports
  */
 
-import { pairTelegramUserIfNeeded } from "./config.ts";
+import {
+  pairTelegramUserIfNeeded,
+  TELEGRAM_DEFAULT_PROFILE_NAME,
+} from "./config.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
 import type { TelegramBridgeStatusLineOptions } from "./status.ts";
 import {
@@ -321,7 +324,7 @@ function parseTelegramProfileArg(args: string): string | undefined {
   const word = args.trim().split(/\s+/)[0];
   if (!word || word.length === 0) return undefined;
   if (word.startsWith("-")) return undefined;
-  return word;
+  return word === TELEGRAM_DEFAULT_PROFILE_NAME ? undefined : word;
 }
 
 function formatTelegramTakeoverTitle(ctx: ExtensionCommandContext): string {

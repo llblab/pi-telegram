@@ -15,7 +15,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
-import { resolveAgentDir, resolveTelegramConfigPath } from "./paths.ts";
+import {
+  resolveAgentDir,
+  resolveTelegramConfigPath,
+  TELEGRAM_DEFAULT_PROFILE_NAME,
+} from "./paths.ts";
+export { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.ts";
 
 import type { CommandTemplateObjectConfig } from "./command-templates.ts";
 import type { TelegramInboundHandlerConfig } from "./inbound.ts";
@@ -52,10 +57,15 @@ export interface ResolvedTelegramTimeConfig {
 export type TelegramAssistantRenderingMode = "rich" | "html";
 
 export interface TelegramConfig {
+  /** @deprecated persisted identity belongs in profiles.default; retained for effective/legacy views */
   botToken?: string;
+  /** @deprecated persisted identity belongs in profiles.default; retained for effective/legacy views */
   botUsername?: string;
+  /** @deprecated persisted identity belongs in profiles.default; retained for effective/legacy views */
   botId?: number;
+  /** @deprecated persisted identity belongs in profiles.default; retained for effective/legacy views */
   allowedUserId?: number;
+  /** @deprecated persisted identity belongs in profiles.default; retained for effective/legacy views */
   lastUpdateId?: number;
   inboundHandlers?: TelegramInboundHandlerConfig[];
   attachmentHandlers?: TelegramInboundHandlerConfig[];
@@ -77,7 +87,7 @@ export interface TelegramConfig {
     sendTranscript?: boolean;
   };
   time?: TelegramTimeConfig;
-  /** Named bot/session profiles (e.g. "work", "omp"). */
+  /** Canonical bot/session profiles, including profiles.default. */
   profiles?: Record<string, TelegramBotProfile>;
 }
 
@@ -98,7 +108,6 @@ export interface TelegramBotProfile {
 /** Profile names must contain only lowercase ASCII letters and digits; max 32 chars. */
 const TELEGRAM_PROFILE_NAME_PATTERN = /^[a-z0-9]{1,32}$/;
 const TELEGRAM_RESERVED_PROFILE_NAMES: ReadonlySet<string> = new Set([
-  "default",
   "main",
   "active",
 ]);
@@ -111,10 +120,8 @@ export function isValidTelegramProfileName(name: string): boolean {
 }
 
 /**
- * Resolve the effective config for a named (or default) profile.
- * Returns bot/session fields from the named profile, falling back to
- * top-level fields for the default profile. Shared bridge settings
- * always come from the top level.
+ * Resolve bot/session identity from the canonical default or named profile.
+ * Shared bridge settings always remain top-level.
  */
 export function resolveTelegramActiveProfile(
   config: TelegramConfig,
@@ -126,16 +133,9 @@ export function resolveTelegramActiveProfile(
   allowedUserId?: number;
   lastUpdateId?: number;
 } {
-  if (!profileName || !config.profiles?.[profileName]) {
-    return {
-      botToken: config.botToken,
-      botUsername: config.botUsername,
-      botId: config.botId,
-      allowedUserId: config.allowedUserId,
-      lastUpdateId: config.lastUpdateId,
-    };
-  }
-  const profile = config.profiles[profileName];
+  const effectiveProfileName = profileName ?? TELEGRAM_DEFAULT_PROFILE_NAME;
+  const profile = config.profiles?.[effectiveProfileName];
+  if (!profile) return {};
   return {
     botToken: profile.botToken,
     botUsername: profile.botUsername,
@@ -154,6 +154,7 @@ export interface TelegramConfigStore {
   get: () => TelegramConfig;
   getStoredConfig: () => TelegramConfig;
   set: (config: TelegramConfig) => void;
+  setProfile: (profileName: string, profile: TelegramBotProfile) => void;
   update: (mutate: (config: TelegramConfig) => void) => void;
   activateProfile: (profileName: string | undefined) => boolean;
   getActiveProfileName: () => string | undefined;
@@ -396,10 +397,91 @@ export function getTelegramProfileFields(
   if (!token) return undefined;
   return {
     botToken: token,
-    botUsername: config.botUsername,
-    botId: config.botId,
-    allowedUserId: config.allowedUserId,
-    lastUpdateId: config.lastUpdateId,
+    ...(config.botUsername !== undefined
+      ? { botUsername: config.botUsername }
+      : {}),
+    ...(config.botId !== undefined ? { botId: config.botId } : {}),
+    ...(config.allowedUserId !== undefined
+      ? { allowedUserId: config.allowedUserId }
+      : {}),
+    ...(config.lastUpdateId !== undefined
+      ? { lastUpdateId: config.lastUpdateId }
+      : {}),
+  };
+}
+
+function omitTelegramRootProfileFields(config: TelegramConfig): TelegramConfig {
+  const {
+    botToken: _botToken,
+    botUsername: _botUsername,
+    botId: _botId,
+    allowedUserId: _allowedUserId,
+    lastUpdateId: _lastUpdateId,
+    ...sharedConfig
+  } = config;
+  return sharedConfig;
+}
+
+export function normalizeTelegramDefaultProfileConfig(config: TelegramConfig): {
+  config: TelegramConfig;
+  changed: boolean;
+} {
+  const hasLegacyRootProfile = [
+    "botToken",
+    "botUsername",
+    "botId",
+    "allowedUserId",
+    "lastUpdateId",
+  ].some((field) => Object.hasOwn(config, field));
+  if (!hasLegacyRootProfile) return { config, changed: false };
+  const canonicalProfile = config.profiles?.[TELEGRAM_DEFAULT_PROFILE_NAME];
+  const legacyToken = config.botToken?.trim();
+  if (Object.hasOwn(config, "botToken") && !legacyToken) {
+    throw new Error("Legacy Telegram default profile has no bot token");
+  }
+  const legacyProfile: Partial<TelegramBotProfile> = {
+    ...(legacyToken ? { botToken: legacyToken } : {}),
+    ...(config.botUsername !== undefined
+      ? { botUsername: config.botUsername }
+      : {}),
+    ...(config.botId !== undefined ? { botId: config.botId } : {}),
+    ...(config.allowedUserId !== undefined
+      ? { allowedUserId: config.allowedUserId }
+      : {}),
+    ...(config.lastUpdateId !== undefined
+      ? { lastUpdateId: config.lastUpdateId }
+      : {}),
+  };
+  if (!canonicalProfile && !legacyToken) {
+    throw new Error("Legacy Telegram default profile has no bot token");
+  }
+  const hasConflict = canonicalProfile
+    ? Object.entries(legacyProfile).some(
+        ([field, value]) =>
+          Object.hasOwn(canonicalProfile, field) &&
+          !configValuesEqual(
+            canonicalProfile[field as keyof TelegramBotProfile],
+            value,
+          ),
+      )
+    : false;
+  if (hasConflict) {
+    throw new Error(
+      "Conflicting Telegram default profile identity at root and profiles.default",
+    );
+  }
+  const normalizedProfile: TelegramBotProfile = canonicalProfile
+    ? { ...legacyProfile, ...canonicalProfile }
+    : (legacyProfile as TelegramBotProfile);
+  return {
+    config: {
+      ...omitTelegramRootProfileFields(config),
+      profiles: {
+        ...(config.profiles ?? {}),
+        [TELEGRAM_DEFAULT_PROFILE_NAME]: normalizedProfile,
+      },
+    },
+    changed: true,
   };
 }
 
@@ -407,16 +489,12 @@ function applyTelegramProfile(
   config: TelegramConfig,
   profileName: string | undefined,
 ): TelegramConfig {
-  if (!profileName) return config;
-  const profile = config.profiles?.[profileName];
-  if (!profile) return config;
+  const effectiveProfileName = profileName ?? TELEGRAM_DEFAULT_PROFILE_NAME;
+  const profile = config.profiles?.[effectiveProfileName];
+  if (!profile) return omitTelegramRootProfileFields(config);
   return {
-    ...config,
-    botToken: profile.botToken,
-    botUsername: profile.botUsername,
-    botId: profile.botId,
-    allowedUserId: profile.allowedUserId,
-    lastUpdateId: profile.lastUpdateId,
+    ...omitTelegramRootProfileFields(config),
+    ...profile,
   };
 }
 
@@ -425,18 +503,13 @@ function storeTelegramEffectiveConfig(
   nextConfig: TelegramConfig,
   profileName: string | undefined,
 ): TelegramConfig {
-  if (!profileName) return nextConfig;
+  const effectiveProfileName = profileName ?? TELEGRAM_DEFAULT_PROFILE_NAME;
   const profile = getTelegramProfileFields(nextConfig);
   const profiles = { ...(baseConfig.profiles ?? {}) };
-  if (profile) profiles[profileName] = profile;
-  else delete profiles[profileName];
+  if (profile) profiles[effectiveProfileName] = profile;
+  else delete profiles[effectiveProfileName];
   return {
-    ...nextConfig,
-    botToken: baseConfig.botToken,
-    botUsername: baseConfig.botUsername,
-    botId: baseConfig.botId,
-    allowedUserId: baseConfig.allowedUserId,
-    lastUpdateId: baseConfig.lastUpdateId,
+    ...omitTelegramRootProfileFields(nextConfig),
     profiles: Object.keys(profiles).length > 0 ? profiles : undefined,
   };
 }
@@ -444,7 +517,9 @@ function storeTelegramEffectiveConfig(
 export function createTelegramConfigStore(
   options: TelegramConfigStoreOptions = {},
 ): TelegramConfigStore {
-  let config: TelegramConfig = cloneTelegramConfig(options.initialConfig ?? {});
+  let config: TelegramConfig = normalizeTelegramDefaultProfileConfig(
+    cloneTelegramConfig(options.initialConfig ?? {}),
+  ).config;
   let persistedConfig: TelegramConfig = {};
   let mutationVersion = 0;
   let persistQueue: Promise<void> = Promise.resolve();
@@ -465,14 +540,33 @@ export function createTelegramConfigStore(
     get: getEffectiveConfig,
     getStoredConfig: () => config,
     set: setEffectiveConfig,
+    setProfile: (profileName, profile) => {
+      config = {
+        ...omitTelegramRootProfileFields(config),
+        profiles: {
+          ...(config.profiles ?? {}),
+          [profileName]: cloneTelegramConfig(profile),
+        },
+      };
+      mutationVersion += 1;
+    },
     update: (mutate) => {
       const nextConfig = getEffectiveConfig();
       mutate(nextConfig);
       setEffectiveConfig(nextConfig);
     },
     activateProfile: (profileName) => {
-      if (profileName && !config.profiles?.[profileName]) return false;
-      activeProfileName = profileName;
+      const normalizedProfileName =
+        !profileName || profileName === TELEGRAM_DEFAULT_PROFILE_NAME
+          ? undefined
+          : profileName;
+      if (
+        normalizedProfileName &&
+        !config.profiles?.[normalizedProfileName]
+      ) {
+        return false;
+      }
+      activeProfileName = normalizedProfileName;
       return true;
     },
     getActiveProfileName: () => activeProfileName,
@@ -491,7 +585,7 @@ export function createTelegramConfigStore(
       setEffectiveConfig(nextConfig);
     },
     load: async () => {
-      config = await readTelegramConfig(configPath, {
+      const loadedConfig = await readTelegramConfig(configPath, {
         onInvalidConfig: (recovery) => {
           options.recordRuntimeEvent?.("config", recovery.error, {
             phase: "load",
@@ -500,6 +594,32 @@ export function createTelegramConfigStore(
           });
         },
       });
+      let normalized: ReturnType<typeof normalizeTelegramDefaultProfileConfig>;
+      try {
+        normalized = normalizeTelegramDefaultProfileConfig(loadedConfig);
+      } catch (error) {
+        options.recordRuntimeEvent?.("config", error, {
+          phase: "default-profile-normalize",
+          configPath,
+        });
+        throw error;
+      }
+      config = normalized.changed
+        ? withTelegramFileTransaction(`${configPath}.transaction`, () => {
+            const latestConfig = readTelegramConfigForTransaction(configPath);
+            const latestNormalized = normalizeTelegramDefaultProfileConfig(
+              latestConfig,
+            );
+            if (latestNormalized.changed) {
+              writeTelegramConfigInTransaction(
+                agentDir,
+                configPath,
+                latestNormalized.config,
+              );
+            }
+            return latestNormalized.config;
+          })
+        : normalized.config;
       persistedConfig = cloneTelegramConfig(config);
       mutationVersion += 1;
     },

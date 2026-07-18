@@ -280,9 +280,13 @@ test("Setup prompt runtime persists the first validated config to missing or emp
 
       assert.equal(result.status, "success");
       assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), {
-        botToken: "env-token",
-        botUsername: "first_run_bot",
-        botId: 77,
+        profiles: {
+          default: {
+            botToken: "env-token",
+            botUsername: "first_run_bot",
+            botId: 77,
+          },
+        },
       });
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -332,9 +336,8 @@ test("Setup prompt runtime persists a first named profile without changing sibli
 
     assert.equal(result.status, "success");
     assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), {
-      botToken: "default-token",
-      botId: 1,
       profiles: {
+        default: { botToken: "default-token", botId: 1 },
         existing: { botToken: "existing-token", botId: 2 },
         fresh: {
           botToken: "fresh-token",

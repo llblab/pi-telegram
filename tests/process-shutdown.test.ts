@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -129,13 +129,15 @@ async function createPiPrintFixtureExtension(tempDir: string): Promise<string> {
   const fixturePath = join(tempDir, "fixture-provider.ts");
   await writeFile(
     fixturePath,
-    `import { appendFileSync, writeFileSync } from "node:fs";\n` +
+    `import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";\n` +
       `import { join } from "node:path";\n` +
       `import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";\n\n` +
       `export default function (pi) {\n` +
       `  const agentDir = process.env.PI_CODING_AGENT_DIR;\n` +
       `  if (process.env.PI_TELEGRAM_TEST_LOCK_MODE === "owner" && agentDir) {\n` +
-      `    writeFileSync(join(agentDir, "locks.json"), JSON.stringify({ "@llblab/pi-telegram": { pid: process.pid } }) + "\\n");\n` +
+      `    const ownersDir = join(agentDir, "tmp", "telegram");\n` +
+      `    mkdirSync(ownersDir, { recursive: true });\n` +
+      `    writeFileSync(join(ownersDir, "owners.json"), JSON.stringify({ default: { pid: process.pid } }) + "\\n");\n` +
       `  }\n` +
       `  pi.on("session_start", (_event, ctx) => {\n` +
       `    const forcedMode = process.env.PI_TELEGRAM_TEST_CTX_MODE;\n` +
@@ -200,8 +202,10 @@ async function createPiPrintAgentDir(
     JSON.stringify(config, null, "\t") + "\n",
     "utf8",
   );
+  const ownersDir = join(agentDir, "tmp", "telegram");
+  await mkdir(ownersDir, { recursive: true });
   await writeFile(
-    join(agentDir, "locks.json"),
+    join(ownersDir, "owners.json"),
     JSON.stringify(locks, null, "\t") + "\n",
     "utf8",
   );
@@ -248,16 +252,18 @@ test("Child process sharing the agent dir does not poll while parent owns Telegr
   });
   const extensionUrl = new URL("../index.ts", import.meta.url).href;
   const parentScript = `
-    import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+    import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
     import { join } from "node:path";
 
     const agentDir = process.env.PI_CODING_AGENT_DIR;
     const markerPath = process.env.PI_TELEGRAM_TEST_METHOD_MARKER;
     const stopPath = process.env.PI_TELEGRAM_TEST_STOP_PATH;
     const cwd = "/repo/parent-owner";
+    const ownersDir = join(agentDir, "tmp", "telegram");
+    mkdirSync(ownersDir, { recursive: true });
     writeFileSync(
-      join(agentDir, "locks.json"),
-      JSON.stringify({ "@llblab/pi-telegram": { pid: process.pid, cwd } }) + "\\n",
+      join(ownersDir, "owners.json"),
+      JSON.stringify({ default: { pid: process.pid, cwd } }) + "\\n",
     );
     globalThis.fetch = async (input, init = {}) => {
       const method = String(input).split("/").at(-1);
@@ -414,7 +420,7 @@ test("Direct Telegram tools refuse delivery from a non-owner process", async () 
       lastUpdateId: 0,
     },
     {
-      "@llblab/pi-telegram": {
+      default: {
         pid: process.pid,
         cwd: "/repo/live-owner",
       },
@@ -591,7 +597,7 @@ test(
         assistant: { proactivePush: true },
       },
       {
-        "@llblab/pi-telegram": {
+        default: {
           pid: process.pid,
           cwd: "/repo/another-live-owner",
         },
@@ -628,8 +634,6 @@ test("Extension session shutdown without active lock lets process exit", async (
       JSON.stringify({ botToken: "123:abc", allowedUserId: 77, lastUpdateId: 0 }) + "\\n",
       "utf8",
     );
-    await writeFile(join(agentDir, "locks.json"), "{}\\n", "utf8");
-
     const handlers = new Map();
     const pi = {
       on: (event, handler) => handlers.set(event, handler),
@@ -665,7 +669,7 @@ test("Extension session shutdown without active lock lets process exit", async (
 test("Extension session shutdown lets an active polling owner process exit", async () => {
   const extensionUrl = new URL("../index.ts", import.meta.url).href;
   const result = await runNodeScript(`
-    import { mkdtemp, rm, writeFile } from "node:fs/promises";
+    import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
     import { tmpdir } from "node:os";
     import { join } from "node:path";
 
@@ -677,9 +681,11 @@ test("Extension session shutdown lets an active polling owner process exit", asy
       JSON.stringify({ botToken: "123:abc", allowedUserId: 77, lastUpdateId: 0 }) + "\\n",
       "utf8",
     );
+    const ownersDir = join(agentDir, "tmp", "telegram");
+    await mkdir(ownersDir, { recursive: true });
     await writeFile(
-      join(agentDir, "locks.json"),
-      JSON.stringify({ "@llblab/pi-telegram": { pid: process.pid, cwd } }) + "\\n",
+      join(ownersDir, "owners.json"),
+      JSON.stringify({ default: { pid: process.pid, cwd } }) + "\\n",
       "utf8",
     );
 

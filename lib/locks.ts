@@ -1,7 +1,7 @@
 /**
  * Telegram singleton lock helpers
- * Zones: shared singleton, filesystem, telegram runtime ownership
- * Owns shared locks.json access and Telegram bridge ownership semantics
+ * Zones: telegram ownership, filesystem, transport authority
+ * Owns extension-local owners.json access and Telegram bridge ownership semantics
  */
 
 import {
@@ -19,9 +19,9 @@ import {
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
-import { resolveTelegramLocksPath } from "./paths.ts";
+import { resolveTelegramOwnersPath } from "./paths.ts";
 
-export const TELEGRAM_LOCK_KEY = "@llblab/pi-telegram";
+export const TELEGRAM_LOCK_KEY = "default";
 export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 5_000;
 const TELEGRAM_LOCK_WRITE_RETRY_ATTEMPTS = 5;
 const TELEGRAM_LOCK_WRITE_RETRY_DELAY_MS = 25;
@@ -42,18 +42,17 @@ function allocateTelegramLockRuntimeGeneration(): number {
   return generation;
 }
 
-function getLocksPath(): string {
-  return resolveTelegramLocksPath();
+function getOwnersPath(): string {
+  return resolveTelegramOwnersPath();
 }
 
 /**
- * Resolve the scoped lock key for the active Telegram profile.
- * Default profile → @llblab/pi-telegram
- * Named profile → @llblab/pi-telegram:<name>
+ * Resolve the extension-local owner slot for the active Telegram profile.
+ * Default profile → default
+ * Named profile → the validated profile name
  */
 export function resolveTelegramLockKey(activeProfile?: string): string {
-  if (activeProfile) return `${TELEGRAM_LOCK_KEY}:${activeProfile}`;
-  return TELEGRAM_LOCK_KEY;
+  return activeProfile || TELEGRAM_LOCK_KEY;
 }
 
 export interface TelegramActiveProfileGetter {
@@ -139,7 +138,7 @@ export interface TelegramLockRuntimeOptions {
   staleHeartbeatMs?: number;
 }
 
-export function readLocks(path = getLocksPath()): Record<string, unknown> {
+export function readLocks(path = getOwnersPath()): Record<string, unknown> {
   if (!existsSync(path)) return {};
   try {
     const value = JSON.parse(readFileSync(path, "utf8"));
@@ -161,7 +160,7 @@ function readLocksForTransaction(path: string): Record<string, unknown> {
   }
   const value: unknown = JSON.parse(source);
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`Invalid Telegram lock registry: ${path}`);
+    throw new Error(`Invalid Telegram owner store: ${path}`);
   }
   return value as Record<string, unknown>;
 }
@@ -856,7 +855,7 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
   options: TelegramLockRuntimeOptions = {},
 ): TelegramLockRuntime<TContext> {
   const key = options.key ?? TELEGRAM_LOCK_KEY;
-  const locksPath = options.locksPath ?? getLocksPath();
+  const locksPath = options.locksPath ?? getOwnersPath();
   const pid = options.pid ?? process.pid;
   const isAlive = options.isProcessAlive ?? isProcessAlive;
   const getNowMs = options.getNowMs ?? Date.now;

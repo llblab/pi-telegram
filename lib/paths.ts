@@ -10,6 +10,8 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
+export const TELEGRAM_DEFAULT_PROFILE_NAME = "default";
+
 export interface TelegramAgentDirResolutionInput {
   env?: Partial<Pick<NodeJS.ProcessEnv, "PI_CODING_AGENT_DIR">>;
   execPath?: string;
@@ -45,18 +47,19 @@ export function resolveTelegramConfigPath(): string {
   return join(resolveAgentDir(), "telegram.json");
 }
 
-/** Telegram singleton lock file (<agentDir>/locks.json). */
-export function resolveTelegramLocksPath(): string {
-  return join(resolveAgentDir(), "locks.json");
-}
-
 /** Telegram bridge temporary directory (<agentDir>/tmp/telegram). */
 export function resolveTelegramTempDir(agentDir = resolveAgentDir()): string {
   return join(agentDir, "tmp", "telegram");
 }
 
+/** Telegram transport ownership store (<agentDir>/tmp/telegram/owners.json). */
+export function resolveTelegramOwnersPath(): string {
+  return join(resolveTelegramTempDir(), "owners.json");
+}
+
 export function getTelegramProfilePathSuffix(profileName?: string): string {
-  return profileName ? `.${profileName.replace(/[^a-zA-Z0-9._-]+/g, "_")}` : "";
+  if (!profileName || profileName === TELEGRAM_DEFAULT_PROFILE_NAME) return "";
+  return `.${profileName.replace(/[^a-zA-Z0-9._-]+/g, "_")}`;
 }
 
 export function resolveTelegramProfileTempFilePath(

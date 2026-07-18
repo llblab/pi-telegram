@@ -204,15 +204,7 @@ export function registerTelegramCommandsAndTools({
               );
             }
             await configStore.load();
-            const latestConfig = configStore.getStoredConfig();
-            configStore.activateProfile(undefined);
-            configStore.set({
-              ...latestConfig,
-              profiles: {
-                ...(latestConfig.profiles ?? {}),
-                [profileName]: profile,
-              },
-            });
+            configStore.setProfile(profileName, profile);
             configStore.activateProfile(profileName);
             await onTransportChanged?.();
             await persistConfig(configStore.get());

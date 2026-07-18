@@ -9,11 +9,14 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
+  getTelegramDiagnosticsDisplayPaths,
+  getTelegramProfilePathSuffix,
   resolveAgentDir,
   resolveTelegramConfigPath,
-  resolveTelegramLocksPath,
-  resolveTelegramTempDir,
+  resolveTelegramOwnersPath,
+  resolveTelegramProfileTempFilePath,
   resolveTelegramRuntimeLogPath,
+  resolveTelegramTempDir,
 } from "../lib/paths.ts";
 
 await test("resolveAgentDir", async (t) => {
@@ -61,10 +64,10 @@ await test("resolveTelegramConfigPath", () => {
   );
 });
 
-await test("resolveTelegramLocksPath", () => {
+await test("resolveTelegramOwnersPath", () => {
   assert.ok(
-    resolveTelegramLocksPath().endsWith("locks.json"),
-    "locks path ends with locks.json",
+    resolveTelegramOwnersPath().endsWith("/tmp/telegram/owners.json"),
+    "owners path ends with /tmp/telegram/owners.json",
   );
 });
 
@@ -79,5 +82,17 @@ await test("resolveTelegramRuntimeLogPath", () => {
   assert.ok(
     resolveTelegramRuntimeLogPath().endsWith("/tmp/telegram/logs.jsonl"),
     "runtime log path ends with logs.jsonl",
+  );
+});
+
+await test("explicit default profile keeps canonical unsuffixed paths", () => {
+  assert.equal(getTelegramProfilePathSuffix("default"), "");
+  assert.equal(
+    resolveTelegramProfileTempFilePath("state", "json", "/agent", "default"),
+    resolveTelegramProfileTempFilePath("state", "json", "/agent"),
+  );
+  assert.deepEqual(
+    getTelegramDiagnosticsDisplayPaths("default"),
+    getTelegramDiagnosticsDisplayPaths(),
   );
 });

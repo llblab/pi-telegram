@@ -255,6 +255,48 @@ test("Command helpers register pi setup and status commands", async () => {
   assert.deepEqual(notifications, ["bot: @demo\npolling: stopped"]);
 });
 
+test("Bare and explicit default setup/connect commands select the same profile", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const events: string[] = [];
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async (_ctx, profileName) => {
+      events.push(`setup:${profileName ?? "default"}`);
+    },
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async () => {
+      events.push("start");
+    },
+    stopPolling: async () => {},
+    updateStatus: () => {},
+    activateDefaultProfileConfig: async () => {
+      events.push("activate:default");
+    },
+    activateProfileConfig: async (_ctx, profileName) => {
+      events.push(`unexpected:${profileName}`);
+      return false;
+    },
+  });
+  const ctx = createBridgeCommandContext();
+  const setup = getRequiredCommand(harness.commands, "telegram-setup");
+  const connect = getRequiredCommand(harness.commands, "telegram-connect");
+
+  await setup.handler("", ctx);
+  await setup.handler("default", ctx);
+  await connect.handler("", ctx);
+  await connect.handler("default", ctx);
+
+  assert.deepEqual(events, [
+    "setup:default",
+    "setup:default",
+    "activate:default",
+    "start",
+    "activate:default",
+    "start",
+  ]);
+});
+
 test("Command helpers register pi connect and disconnect commands", async () => {
   const harness = createCommandRegistrationApiHarness();
   const events: string[] = [];
