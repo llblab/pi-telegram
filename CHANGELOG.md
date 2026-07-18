@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.23.3: Thread-Scoped Settings Hotfix
 
 - `Thread-Scoped Settings Rehydration`: Preserved `message_thread_id` when rebuilding full Settings menu state after session reload or TTL expiry. Impact: a stale Settings message in Threaded Mode retains its exact Telegram target when later callbacks reopen menus or cross into model/status controls.
+- `Composition Root Hygiene`: Sorted the local domain imports in `index.ts` and normalized adjacent wrapping without changing runtime composition. Impact: the entrypoint remains easier to scan and review while preserving the existing dependency graph and behavior.
 
 ## 0.23.2: Voice Policy And Turn Delivery Hotfix
 

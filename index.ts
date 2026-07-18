@@ -7,18 +7,18 @@
 import * as Activity from "./lib/activity.ts";
 import * as Bindings from "./lib/bindings.ts";
 import * as BusApi from "./lib/bus-api.ts";
-import * as Bus from "./lib/bus.ts";
 import * as BusFollower from "./lib/bus-follower.ts";
 import * as BusLeader from "./lib/bus-leader.ts";
 import * as BusTransport from "./lib/bus-transport.ts";
+import * as Bus from "./lib/bus.ts";
 import * as CommandTemplates from "./lib/command-templates.ts";
 import * as Commands from "./lib/commands.ts";
 import * as Config from "./lib/config.ts";
 import * as Delivery from "./lib/delivery.ts";
-import * as Threads from "./lib/threads.ts";
 import * as Inbound from "./lib/inbound.ts";
 import * as Lifecycle from "./lib/lifecycle.ts";
 import * as Locks from "./lib/locks.ts";
+import * as Logs from "./lib/logs.ts";
 import * as Media from "./lib/media.ts";
 import * as MenuQueue from "./lib/menu-queue.ts";
 import * as MenuSettings from "./lib/menu-settings.ts";
@@ -35,13 +35,13 @@ import * as Queue from "./lib/queue.ts";
 import * as Replies from "./lib/replies.ts";
 import * as Routing from "./lib/routing.ts";
 import * as Runtime from "./lib/runtime.ts";
-import * as Logs from "./lib/logs.ts";
 import * as Sections from "./lib/sections.ts";
 import * as Status from "./lib/status.ts";
 import * as Sync from "./lib/sync.ts";
 import * as TelegramApi from "./lib/telegram-api.ts";
 import * as TextGroups from "./lib/text-groups.ts";
 import * as ThreadReconciler from "./lib/thread-reconciler.ts";
+import * as Threads from "./lib/threads.ts";
 import * as TimeInjection from "./lib/time-injection.ts";
 import * as Updates from "./lib/updates.ts";
 import * as Voice from "./lib/voice.ts";
@@ -465,8 +465,7 @@ export default function (pi: Pi.ExtensionAPI) {
         isTransportStampActive: telegramTransportStampRuntime.isActive,
         ownsDirect: lockRuntime.owns,
         getDirectEpoch: lockRuntime.getOwnedLeaderEpoch,
-        isFollowerRegistered:
-          telegramBusFollowerRegistrationState.isRegistered,
+        isFollowerRegistered: telegramBusFollowerRegistrationState.isRegistered,
         getFollowerGeneration:
           telegramBusFollowerRegistrationState.getGeneration,
       },
@@ -776,8 +775,7 @@ export default function (pi: Pi.ExtensionAPI) {
           return telegramActiveBusAuthSecret;
         },
         ...forwardedRouteHandlers,
-        prepareForwardedMessage:
-          textGroupRuntime.prepareForwardedMessage,
+        prepareForwardedMessage: textGroupRuntime.prepareForwardedMessage,
         recordRuntimeEvent,
       },
       targetReplacement: {
