@@ -222,6 +222,11 @@ export default function (pi: Pi.ExtensionAPI) {
       persist: configStore.persist,
       markConfigChange: telegramSyncStateRuntime.markConfigChange,
     });
+  const persistTelegramPollingOffset =
+    Config.createTelegramPollingOffsetPersister(
+      configStore,
+      persistTelegramConfigWithSync,
+    );
   const currentInstanceThreadRuntime =
     Threads.createTelegramCurrentInstanceThreadRuntime({
       instanceId: telegramInstanceId,
@@ -822,12 +827,7 @@ export default function (pi: Pi.ExtensionAPI) {
     hasBotToken: configStore.hasBotToken,
     deleteWebhook,
     getUpdates,
-    // Polling holds a loop-local config snapshot; only fold lastUpdateId into the
-    // live store so offset advances cannot clobber settings writes.
-    persistConfig: Config.createTelegramPollingConfigPersister(
-      configStore,
-      persistTelegramConfigWithSync,
-    ),
+    persistConfig: persistTelegramPollingOffset,
     prepareUpdateBatch: textGroupRuntime.prepareUpdateBatch,
     handleUpdate: Updates.createTelegramUpdateHandle({
       defaultHandle: inboundRouteRuntime.handleUpdate,

@@ -39,7 +39,7 @@ export interface TelegramTextGroupState<TMessage, TContext = unknown> {
   suspended?: boolean;
   reschedule?: (delayMs?: number) => void;
   dispatchLimit?: number;
-  forwardCommentCandidate?: boolean;
+  forwardPairCandidate?: TelegramForwardCommentBatchPosition;
 }
 
 export type TelegramForwardCommentBatchPosition = "comment" | "forward";
@@ -131,7 +131,12 @@ function getTelegramTextGroupKey(
 ): string | undefined {
   if (message.media_group_id) return undefined;
   if (!message.from || message.from.is_bot) return undefined;
-  if (!extractTelegramTextGroupText(message)) return undefined;
+  if (
+    !extractTelegramTextGroupText(message) &&
+    !isTelegramForwardedMessage(message)
+  ) {
+    return undefined;
+  }
   const threadKey =
     typeof message.message_thread_id === "number"
       ? `thread:${message.message_thread_id}`
@@ -160,7 +165,7 @@ function canAppendTelegramTextGroupMessage<
     message.message_id > previous.message_id &&
     message.message_id <=
       previous.message_id + TELEGRAM_TEXT_GROUP_MAX_MESSAGE_ID_GAP &&
-    text.length > 0 &&
+    (text.length > 0 || isTelegramForwardedMessage(message)) &&
     !isTelegramTextGroupCommand(text)
   );
 }
@@ -182,7 +187,7 @@ export function queueTelegramTextGroupMessage<
   ) => unknown | Promise<unknown>;
   forceStart?: boolean;
   dispatchImmediately?: boolean;
-  forwardCommentCandidate?: boolean;
+  forwardPairCandidate?: TelegramForwardCommentBatchPosition;
   delayMs?: number;
 }): boolean {
   const key = getTelegramTextGroupKey(options.message);
@@ -202,7 +207,7 @@ export function queueTelegramTextGroupMessage<
   const state = existing ?? { messages: [] };
   state.messages.push(options.message);
   state.context = options.context;
-  state.forwardCommentCandidate = options.forwardCommentCandidate;
+  state.forwardPairCandidate = options.forwardPairCandidate;
   const dispatchQueued = (): void => {
       state.flushTimer = undefined;
       const queued = options.groups.get(key);
@@ -335,21 +340,30 @@ export function createTelegramTextGroupController<
         if (existing.flushTimer) clearTimer(existing.flushTimer);
         groups.delete(key!);
       }
+      const candidatePosition: TelegramForwardCommentBatchPosition = forwarded
+        ? "forward"
+        : "comment";
+      const existingCandidate = existing?.forwardPairCandidate;
+      const pairCompleted =
+        existingCandidate !== undefined &&
+        existingCandidate !== candidatePosition;
       const separateFromCandidate =
-        !!existing?.forwardCommentCandidate &&
-        !forwarded &&
+        existingCandidate === candidatePosition &&
         !isTelegramTextGroupCommand(text);
-      if (separateFromCandidate) {
+      if (separateFromCandidate && existing) {
         existing.dispatchLimit = existing.messages.length;
       }
       const forceStart =
         plannedStart ||
         (forwardCommentWaitMs !== false &&
-          !forwarded &&
           !!key &&
-          typeof message.text === "string" &&
-          !isTelegramTextGroupCommand(extractTelegramTextGroupText(message)));
+          (forwarded ||
+            (typeof message.text === "string" &&
+              !isTelegramTextGroupCommand(
+                extractTelegramTextGroupText(message),
+              ))));
       const dispatchImmediately =
+        pairCompleted ||
         separateFromCandidate ||
         plannedForwardCommentEnds.delete(identity) ||
         (forwarded && !!key && groups.has(key));
@@ -364,10 +378,10 @@ export function createTelegramTextGroupController<
         dispatchMessages,
         forceStart,
         dispatchImmediately,
-        forwardCommentCandidate:
-          forceStart &&
-          !forwarded &&
-          !canStartTelegramTextGroup(message, minSplitLength),
+        forwardPairCandidate:
+          forceStart && !canStartTelegramTextGroup(message, minSplitLength)
+            ? candidatePosition
+            : undefined,
         delayMs:
           forceStart && !canStartTelegramTextGroup(message, minSplitLength)
             ? forwardCommentWaitMs === false

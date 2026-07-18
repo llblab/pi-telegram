@@ -113,8 +113,8 @@ test("Prompt helpers add full Telegram-turn guidance for Telegram prompts", () =
   );
   assert.doesNotMatch(defaultSystemPrompt, /telegram_attach/);
   assert.doesNotMatch(defaultSystemPrompt, /telegram_message/);
-  assert.match(defaultSystemPrompt, /telegram_voice: Speak this/);
-  assert.match(defaultSystemPrompt, /\/telegram_voice/);
+  assert.doesNotMatch(defaultSystemPrompt, /telegram_voice: Speak this/);
+  assert.doesNotMatch(defaultSystemPrompt, /\/telegram_voice/);
   assert.doesNotMatch(defaultSystemPrompt, /telegram_button: OK/);
   assert.doesNotMatch(defaultSystemPrompt, /state\.json/);
   assert.doesNotMatch(defaultSystemPrompt, /logs\.jsonl/);
@@ -142,6 +142,8 @@ test("Prompt helpers add full Telegram-turn guidance for Telegram prompts", () =
 test("Prompt helpers expose detailed Telegram guidance through agent help tool", async () => {
   const help = getTelegramHelpText();
   assert.match(help, /Assistant-authored Telegram actions/);
+  assert.match(help, /\[voice\] delivery: automatic voice/);
+  assert.match(help, /hidden.*mirror.*always/);
   assert.match(help, /telegram_voice text="Short summary"/);
   assert.match(help, /telegram_button: OK/);
   assert.match(help, /inboundHandlers/);

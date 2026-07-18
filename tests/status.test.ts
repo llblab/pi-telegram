@@ -350,7 +350,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       queuedStatus: "",
       error: "typing failed",
     }),
-    "<accent>telegram</accent> <error>error</error> <muted>typing failed</muted>",
+    "<accent>telegram</accent> <error>error</error>",
   );
 });
 
@@ -393,7 +393,7 @@ test("Status runtime updates the status bar and exposes bridge lines", () => {
   runtime.updateStatus(ctx, "demo error");
   assert.equal(
     events[0],
-    "telegram:<accent>telegram</accent> <error>error</error> <muted>demo error</muted>",
+    "telegram:<accent>telegram</accent> <error>error</error>",
   );
   assert.deepEqual(runtime.getStatusLines().slice(0, 3), [
     "connection:",

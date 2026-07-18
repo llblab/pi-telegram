@@ -171,8 +171,8 @@ Rules:
 
 Examples:
 
+- `hidden`
 - `🟢 mirror`
-- `manual`
 - `always`
 
 ## Navigation

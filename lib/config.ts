@@ -17,8 +17,8 @@ import {
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { resolveAgentDir, resolveTelegramConfigPath } from "./paths.ts";
 
-import type { TelegramInboundHandlerConfig } from "./inbound.ts";
 import type { CommandTemplateObjectConfig } from "./command-templates.ts";
+import type { TelegramInboundHandlerConfig } from "./inbound.ts";
 import { withTelegramFileTransaction } from "./locks.ts";
 
 const CONFIG_RUNTIME_KEY = "__piTelegramConfigRuntime__";
@@ -72,7 +72,7 @@ export interface TelegramConfig {
   /** @deprecated use assistant.rendering */
   assistantRendering?: TelegramAssistantRenderingMode;
   voice?: {
-    replyMode?: "manual" | "mirror" | "always";
+    replyMode?: "hidden" | "mirror" | "always";
     /** Whether to attach the provider's transcriptText as caption on voice messages */
     sendTranscript?: boolean;
   };
@@ -543,6 +543,27 @@ export function createTelegramConfigStore(
   };
 }
 
+export function createTelegramPollingOffsetPersister(
+  configStore: Pick<TelegramConfigStore, "get" | "set" | "persist">,
+  persist: () => Promise<void> = () => configStore.persist(),
+): (pollingConfig: { lastUpdateId?: number }) => Promise<void> {
+  return async (pollingConfig) => {
+    const nextOffset = pollingConfig.lastUpdateId;
+    if (typeof nextOffset === "number") {
+      const current = configStore.get();
+      const currentOffset = current.lastUpdateId;
+      configStore.set({
+        ...current,
+        lastUpdateId:
+          typeof currentOffset === "number"
+            ? Math.max(currentOffset, nextOffset)
+            : nextOffset,
+      });
+    }
+    await persist();
+  };
+}
+
 export function createTelegramProactivePushChecker(
   configStore: Pick<TelegramConfigStore, "get">,
 ): () => boolean {
@@ -625,12 +646,10 @@ export function createTelegramAssistantRenderingModeSetter(
 
 export function createTelegramVoiceReplyModeGetter(
   configStore: Pick<TelegramConfigStore, "get">,
-): () => "manual" | "mirror" | "always" {
+): () => "hidden" | "mirror" | "always" {
   return () => {
     const mode = configStore.get().voice?.replyMode;
-    return mode === "mirror" || mode === "always" || mode === "manual"
-      ? mode
-      : "manual";
+    return mode === "mirror" || mode === "always" ? mode : "hidden";
   };
 }
 
@@ -639,17 +658,17 @@ export function createTelegramVoiceReplyModeConfiguredChecker(
 ): () => boolean {
   return () => {
     const mode = configStore.get().voice?.replyMode;
-    return mode === "mirror" || mode === "always" || mode === "manual";
+    return mode === "mirror" || mode === "always";
   };
 }
 
 export function createTelegramVoiceReplyModeSetter(
   configStore: TelegramMutableConfigStore,
-): (replyMode: "manual" | "mirror" | "always" | undefined) => Promise<void> {
+): (replyMode: "hidden" | "mirror" | "always" | undefined) => Promise<void> {
   return async (replyMode) => {
     await loadLatestTelegramConfig(configStore);
     const current = configStore.get();
-    if (replyMode === undefined) {
+    if (replyMode === undefined || replyMode === "hidden") {
       const { replyMode: _replyMode, ...remainingVoice } = current.voice ?? {};
       const next = { ...current };
       if (Object.keys(remainingVoice).length > 0) next.voice = remainingVoice;
@@ -769,30 +788,6 @@ export function createTelegramConfigControls(
     setVoiceReplyMode: createTelegramVoiceReplyModeSetter(configStore),
     getTimeInjectionMode: createTelegramTimeInjectionModeGetter(configStore),
     setTimeInjectionMode: createTelegramTimeInjectionModeSetter(configStore),
-  };
-}
-
-/**
- * Polling captures a config object once per loop and mutates lastUpdateId on it.
- * Settings setters replace the live store object, so persisting that stale full
- * snapshot can clobber voice/time/assistant settings. Only fold the offset into
- * the live store, then persist the live config.
- */
-export function createTelegramPollingConfigPersister(
-  configStore: Pick<TelegramConfigStore, "update" | "persist">,
-  persist: (config?: TelegramConfig) => Promise<void> = (config) =>
-    configStore.persist(config),
-): (pollingSnapshot?: Pick<TelegramConfig, "lastUpdateId">) => Promise<void> {
-  return async (pollingSnapshot) => {
-    if (typeof pollingSnapshot?.lastUpdateId === "number") {
-      const nextId = pollingSnapshot.lastUpdateId;
-      configStore.update((live) => {
-        const current = live.lastUpdateId;
-        live.lastUpdateId =
-          typeof current === "number" ? Math.max(current, nextId) : nextId;
-      });
-    }
-    await persist();
   };
 }
 
