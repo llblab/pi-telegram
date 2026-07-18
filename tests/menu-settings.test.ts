@@ -231,7 +231,10 @@ test("Settings runtime opens menus and rehydrates stale callback state", async (
     setTimeInjectionMode: async (mode) => {
       calls.push(`time:${mode}`);
     },
-    getModelMenuState: async () => state,
+    getModelMenuState: async (_chatId, _ctx, threadId) => {
+      state.threadId = threadId;
+      return state;
+    },
     getStoredModelMenuState: () => storedState,
     storeModelMenuState: (nextState) => {
       storedState = nextState;
@@ -261,12 +264,13 @@ test("Settings runtime opens menus and rehydrates stale callback state", async (
       {
         id: "q1",
         data: "settings:set:voice-reply:always",
-        message: { message_id: 99, chat: { id: 1 } },
+        message: { message_id: 99, message_thread_id: 7, chat: { id: 1 } },
       },
       "ctx",
     ),
     true,
   );
+  assert.equal(storedState?.threadId, 7);
   assert.equal(
     await runtime.handleCallbackQuery(
       {

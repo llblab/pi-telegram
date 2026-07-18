@@ -74,7 +74,11 @@ export interface TelegramSettingsMenuRuntime<TContext> {
     query: {
       id: string;
       data?: string;
-      message?: { message_id?: number; chat?: { id?: number } };
+      message?: {
+        message_id?: number;
+        message_thread_id?: number;
+        chat?: { id?: number };
+      };
     },
     ctx: TContext,
   ) => Promise<boolean>;
@@ -98,6 +102,7 @@ export interface TelegramSettingsMenuRuntimeDeps<
   getModelMenuState: (
     chatId: number,
     ctx: TContext,
+    threadId?: number,
   ) => Promise<TelegramModelMenuState<TModel>>;
   getStoredModelMenuState: (
     messageId: number | undefined,
@@ -672,7 +677,11 @@ export function createTelegramSettingsMenuRuntime<
           );
           return true;
         }
-        state = await deps.getModelMenuState(chatId, ctx);
+        state = await deps.getModelMenuState(
+          chatId,
+          ctx,
+          query.message?.message_thread_id,
+        );
         state.messageId = messageId;
         state.mode = "settings";
         deps.storeModelMenuState(state);
