@@ -136,7 +136,7 @@ This means:
 
 ## Ownership semantics
 
-The handler registry is ownership-agnostic and does not interact with the `locks.json` singleton lock documented in [Locks](./locks.md). When the locked polling runtime stops `pi-telegram`'s `getUpdates` loop, for example after ownership is moved to another pi process, handlers stop receiving updates because no updates are being fetched. They are not unregistered.
+The handler registry is ownership-agnostic and does not interact with the extension-local transport owner slots documented in [Architecture](./architecture.md#configuration-and-ownership). When the polling runtime loses its `owners.json` slot and stops `getUpdates`, handlers stop receiving updates because no updates are being fetched; they are not unregistered.
 
 If a layered extension needs to react to ownership changes, it should observe `pi-telegram` lifecycle events through the standard pi extension hooks rather than through the handler registry.
 

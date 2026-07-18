@@ -71,16 +71,16 @@ The operator experience:
 
 In Threaded Mode, the lock means "this instance is the current Telegram bus leader" rather than "this instance is the only usable Telegram extension".
 
-Classic lock meaning:
+Classic ownership meaning:
 
 ```text
-locks.json / @llblab/pi-telegram -> polling/control owner
+tmp/telegram/owners.json / <profile-slot> -> polling/control owner
 ```
 
 Threaded Mode meaning:
 
 ```text
-locks.json / @llblab/pi-telegram -> bus leader identity + heartbeat
+tmp/telegram/owners.json / <profile-slot> -> bus leader identity + heartbeat
 ```
 
 Followers do not poll. They register with the leader and receive routed inbound updates from it. Followers still own their local queue, active-turn state, previews, final delivery planning, model switches, and Pi lifecycle. The leader owns only Telegram transport and update fanout. Pi session replacement (`new`) changes follower agent context, not bus membership: a registered follower preserves its registration and refreshes the live context instead of disconnecting. The Telegram bus belongs to the local set of cooperating visible Pi instances rather than to the first terminal session forever: if the visible terminal leader exits, a live registered follower can take over leadership.
@@ -200,7 +200,7 @@ Current portability audit:
 
 - Local bus transport: adapted. Unix-like platforms use filesystem socket paths; native Windows uses named pipes so no POSIX socket pathname is required.
 - Bus endpoint permissions: Unix sockets/directories use `chmod`; Windows named-pipe endpoints skip POSIX chmod/unlink path handling because the pipe is not a filesystem node.
-- Shared lock/config/state/temp files: path construction uses `path.join`/`path.resolve` under the Pi agent directory. File permission calls remain best-effort private-mode hardening; native Windows may emulate POSIX modes, so broad Windows ACL auditing is outside this extension's current local-bus baseline.
+- Ownership/config/state/temp files: path construction uses `path.join`/`path.resolve` under the Pi agent directory. File permission calls remain best-effort private-mode hardening; native Windows may emulate POSIX modes, so broad Windows ACL auditing is outside this extension's current local-bus baseline.
 - Process liveness: lock ownership uses `process.kill(pid, 0)`, which Node supports on Windows for existence checks. Cross-user permission failures are treated as alive, matching Unix semantics.
 - Shell/provider commands: outbound handler command templates remain operator-configured and platform-dependent; Threaded Mode bus portability does not guarantee every configured STT/TTS/shell provider is Windows-native.
 - Manual follower identity: process ids are used as local liveness/profile hints only, not cross-machine identifiers.
@@ -323,14 +323,20 @@ Target-scoped state requirements:
 
 There is no public `telegram.json` switch for the bus. Telegram private-chat Threaded Mode is the runtime switch: when Telegram exposes threads for the bot, the bridge enables the local bus; when Telegram runs as an ordinary private DM, the bridge uses classic private-chat flow as the base mode.
 
-Typical config remains just bot identity and authorization:
+Typical config remains just bot identity and authorization, stored in the canonical default profile:
 
 ```json
 {
-  "botToken": "...",
-  "allowedUserId": 123456789
+  "profiles": {
+    "default": {
+      "botToken": "...",
+      "allowedUserId": 123456789
+    }
+  }
 }
 ```
+
+Named bots use sibling `profiles.<name>` entries. Shared bridge settings remain top-level.
 
 Rules:
 
@@ -345,8 +351,8 @@ Rules:
 
 Current state under the agent dir:
 
-- `locks.json`: current bus leader identity, capability secret, heartbeat, and cleanup fencing epoch. The local bus endpoint is derived from the agent directory by default; legacy `busSocketPath` entries are tolerated but are not required.
-- `tmp/telegram/state.json`: volatile extension+bot observable/debug snapshot, not routing authority. It writes `source: "snapshot"` and `writtenAtMs` so consumers do not confuse it with an authoritative database. Every process on one Telegram profile reads this shared path, but only the active transport lock owner may persist it; followers become writers only after promotion. Status-only persistence refreshes disk-backed bindings before serialization so an already-loaded stale view cannot erase newer leader records. It mirrors `/telegram-status`-style projections: top-level `bot` stores bot-wide capability state such as `threadMode: "unknown" | "enabled" | "disabled"`, `runtime` identifies leader/follower role and process status, `liveRoster` mirrors followers/current targets/reservations, `diagnostics` mirrors status/debug signals, `threads` stores current routeable bindings, `bot.lastSlot` stores the compact slot cursor used when all current threads are gone, and `reservations` records short-lived slot collision guards.
+- `tmp/telegram/owners.json`: authoritative extension-local transport owners keyed by `default` or named profile. Each owner contains the bus leader identity, capability secret, heartbeat, generation, and cleanup fencing epoch. Mutations serialize through `owners.json.transaction`; followers never write owner slots. The local bus endpoint is derived from the agent directory by default; legacy `busSocketPath` entry fields are tolerated inside current owner records but are not required.
+- `tmp/telegram/state.json`: volatile extension+bot observable/debug snapshot, not routing authority. It writes `source: "snapshot"` and `writtenAtMs` so consumers do not confuse it with an authoritative database. Every process on one Telegram profile reads this shared path, but only the active transport owner may persist it; followers become writers only after promotion. Status-only persistence refreshes disk-backed bindings before serialization so an already-loaded stale view cannot erase newer leader records. It mirrors `/telegram-status`-style projections: top-level `bot` stores bot-wide capability state such as `threadMode: "unknown" | "enabled" | "disabled"`, `runtime` identifies leader/follower role and process status, `liveRoster` mirrors followers/current targets/reservations, `diagnostics` mirrors status/debug signals, `threads` stores current routeable bindings, `bot.lastSlot` stores the compact slot cursor used when all current threads are gone, and `reservations` records short-lived slot collision guards.
 - Local bus endpoints: Unix-like platforms expose stable `tmp/telegram/bus.sock` and `tmp/telegram/followers/*` symlinks backed by private generation sockets; native Windows uses deterministic named pipes under `\\.\pipe\pi-telegram-...`. These are transient IPC endpoints, not durable routing state.
 
 The bridge must not keep a separate durable `telegram-targets.json` history. `state.json` retains current stable manual-follower bindings as restart hints, but they never authorize routing without a matching authenticated live registration. Stale/offline/failed observations are not reusable delivery authority. `sync` remains event-driven assumption reconciliation rather than a full Telegram bot-state mirror because Bot API exposes no complete thread listing surface. Non-current routeable thread bindings are pruned during load/persist; old session records must not be retained just to compute the next slot because `bot.lastSlot` is the only durable cursor. Previous-process leader bindings are treated as occupied TTL-bounded reservations until Telegram confirms deletion: reload/startup may close/delete/probe the old thread, known reservations are retried proactively on leader startup, and if Telegram still accepts the old thread id, the new leader should provision the next free slot (`B`, `C`, …) rather than creating a duplicate same-letter tab or blocking startup on Telegram UI convergence. Routing must use live current threads/follower registry, never reservations. The bus leader provisions its own thread during bus startup/connect and provisions follower threads on `follower.register`; registered followers also live in the leader's in-memory registry and communicate over the local bus socket. The live follower registry can resolve a follower by exact `{ chatId, threadId? }`; the leader uses that target ownership to forward message and edited-message updates to followers, and the follower receiver accepts those updates in addition to callbacks and reactions. Terminal status and `[telegram|thread:name]` resolve the matching current-instance identity through the same target-aware path, preferring registered local metadata over stale shared bindings. Media album grouping and split-text coalescing keys include the thread target, queue reaction mutations can scope by chat/thread to avoid cross-target message-id collisions, active-turn target is exposed for lifecycle cleanup and local direct-tool defaults, transport reply dedup is chat/thread-scoped, stored menu state is keyed by chat/message so callback state lookup cannot collide across chats, and generated button turns plus section prompt/open actions preserve the callback thread target. `telegram_message` and immediate `telegram_attach` delivery can also carry an explicit `thread_id` with `chat_id`; when a follower is registered, their default direct-tool target is the assigned thread target and the bus-aware API runtime routes the send through the leader instead of calling Bot API transport locally.

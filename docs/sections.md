@@ -436,7 +436,7 @@ Available programmatically via `getTelegramSectionDiagnostics()`. Main-menu/sett
 
 - [Callback Namespaces](./callback-namespaces.md): defines `section:` as pi-telegram-owned prefix. Sections use namespaced callbacks but authors never hand-roll them
 - [Updates](./updates.md): raw update interception for direct Telegram update access. Sections are the structured UI layer above
-- [Extension Locks](../docs/locks.md) (polling): same identity key rules (`package.json/name` → canonical id)
+- [Architecture](./architecture.md#configuration-and-ownership): pi-telegram transport ownership is extension-local and independent from section registration identity
 - [Command Templates](./command-templates.md): sections do not execute command templates by default. UI registration + callback routing, not shell execution
 
 ## 15. Demo Extension

@@ -33,6 +33,7 @@ import {
   createTelegramVoiceReplyModeSetter,
   getTelegramAuthorizationState,
   isValidTelegramProfileName,
+  normalizeTelegramDefaultProfileConfig,
   pairTelegramUserIfNeeded,
   readTelegramConfig,
   setGlobalTelegramConfigRuntime,
@@ -51,8 +52,8 @@ test("Telegram profile names allow only lowercase letters and digits", () => {
   assert.equal(isValidTelegramProfileName("work2"), true);
   assert.equal(isValidTelegramProfileName("previous"), true);
   assert.equal(isValidTelegramProfileName("prev"), true);
+  assert.equal(isValidTelegramProfileName("default"), true);
   for (const name of [
-    "default",
     "main",
     "active",
     "Work",
@@ -138,6 +139,146 @@ test("Telegram config helpers persist and reload config", async () => {
   );
 });
 
+test("Telegram default profile normalization moves legacy root identity", () => {
+  const normalized = normalizeTelegramDefaultProfileConfig({
+    botToken: "123:abc",
+    botUsername: "demo_bot",
+    botId: 123,
+    allowedUserId: 7,
+    lastUpdateId: 9,
+    voice: { replyMode: "mirror" },
+    profiles: { work: { botToken: "456:def" } },
+  });
+
+  assert.equal(normalized.changed, true);
+  assert.deepEqual(normalized.config, {
+    voice: { replyMode: "mirror" },
+    profiles: {
+      default: {
+        botToken: "123:abc",
+        botUsername: "demo_bot",
+        botId: 123,
+        allowedUserId: 7,
+        lastUpdateId: 9,
+      },
+      work: { botToken: "456:def" },
+    },
+  });
+});
+
+test("Telegram default profile normalization rejects conflicting identity", () => {
+  assert.throws(
+    () =>
+      normalizeTelegramDefaultProfileConfig({
+        botToken: "123:abc",
+        profiles: { default: { botToken: "456:def" } },
+      }),
+    /Conflicting Telegram default profile identity/,
+  );
+});
+
+test("Telegram default profile normalization collapses identical duplicates", () => {
+  const normalized = normalizeTelegramDefaultProfileConfig({
+    botToken: "123:abc",
+    allowedUserId: 7,
+    profiles: {
+      default: { botToken: "123:abc", allowedUserId: 7 },
+      work: { botToken: "456:def" },
+    },
+  });
+
+  assert.equal(normalized.changed, true);
+  assert.deepEqual(normalized.config, {
+    profiles: {
+      default: { botToken: "123:abc", allowedUserId: 7 },
+      work: { botToken: "456:def" },
+    },
+  });
+});
+
+test("Telegram default profile normalization merges non-conflicting fields", () => {
+  const normalized = normalizeTelegramDefaultProfileConfig({
+    botToken: "123:abc",
+    allowedUserId: 7,
+    profiles: {
+      default: { botToken: "123:abc", botUsername: "demo_bot" },
+    },
+  });
+
+  assert.equal(normalized.changed, true);
+  assert.deepEqual(normalized.config, {
+    profiles: {
+      default: {
+        botToken: "123:abc",
+        botUsername: "demo_bot",
+        allowedUserId: 7,
+      },
+    },
+  });
+});
+
+test("Telegram default profile normalization accepts root session fields without a duplicate token", () => {
+  const normalized = normalizeTelegramDefaultProfileConfig({
+    lastUpdateId: 9,
+    profiles: {
+      default: { botToken: "123:abc", allowedUserId: 7 },
+    },
+  });
+
+  assert.equal(normalized.changed, true);
+  assert.deepEqual(normalized.config, {
+    profiles: {
+      default: {
+        botToken: "123:abc",
+        allowedUserId: 7,
+        lastUpdateId: 9,
+      },
+    },
+  });
+});
+
+test("Telegram config load rejects conflicting default identity without mutation", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-default-conflict-"));
+  const configPath = join(agentDir, "telegram.json");
+  const original = `${JSON.stringify({
+    botToken: "123:abc",
+    profiles: { default: { botToken: "456:def" } },
+  }, null, 2)}\n`;
+  await writeFile(configPath, original, "utf8");
+  try {
+    const store = createTelegramConfigStore({ agentDir, configPath });
+    await assert.rejects(
+      store.load(),
+      /Conflicting Telegram default profile identity/,
+    );
+    assert.equal(await readFile(configPath, "utf8"), original);
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("Telegram config load atomically normalizes the default profile", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-default-profile-"));
+  const configPath = join(agentDir, "telegram.json");
+  await writeTelegramConfig(agentDir, configPath, {
+    botToken: "123:abc",
+    allowedUserId: 7,
+    assistant: { proactivePush: false },
+  });
+  const store = createTelegramConfigStore({ agentDir, configPath });
+
+  await store.load();
+
+  assert.equal(store.getBotToken(), "123:abc");
+  assert.equal(store.getAllowedUserId(), 7);
+  assert.deepEqual(await readTelegramConfig(configPath), {
+    assistant: { proactivePush: false },
+    profiles: {
+      default: { botToken: "123:abc", allowedUserId: 7 },
+    },
+  });
+});
+
 test("Telegram config store persists active named profile session fields without overwriting default", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-profile-config-"));
   const configPath = join(agentDir, "telegram.json");
@@ -167,11 +308,13 @@ test("Telegram config store persists active named profile session fields without
   await store.persist({ ...store.get(), lastUpdateId: 99 });
 
   assert.deepEqual(await readTelegramConfig(configPath), {
-    botToken: "default-token",
-    botUsername: "default_bot",
-    allowedUserId: 1,
     voice: { replyMode: "mirror" },
     profiles: {
+      default: {
+        botToken: "default-token",
+        botUsername: "default_bot",
+        allowedUserId: 1,
+      },
       omp: {
         botToken: "omp-token",
         botUsername: "omp_bot",
@@ -266,10 +409,10 @@ test("Telegram config transactions merge concurrent profile offsets and global f
     await Promise.all(children.map((child) => child.done));
 
     assert.deepEqual(await readTelegramConfig(configPath), {
-      botToken: "default-token",
       assistant: { proactivePush: true },
       voice: { replyMode: "mirror" },
       profiles: {
+        default: { botToken: "default-token" },
         work: { botToken: "work-token", lastUpdateId: 11 },
         personal: { botToken: "personal-token", lastUpdateId: 22 },
       },
@@ -390,7 +533,7 @@ test("Telegram voice reply mode setter persists telegram.json", async () => {
 
   assert.deepEqual(store.get().voice, { replyMode: "mirror" });
   assert.deepEqual(await readTelegramConfig(configPath), {
-    botToken: "123:abc",
+    profiles: { default: { botToken: "123:abc" } },
     voice: { replyMode: "mirror" },
   });
 
@@ -398,7 +541,7 @@ test("Telegram voice reply mode setter persists telegram.json", async () => {
 
   assert.equal(store.get().voice, undefined);
   assert.deepEqual(await readTelegramConfig(configPath), {
-    botToken: "123:abc",
+    profiles: { default: { botToken: "123:abc" } },
   });
 });
 
@@ -435,7 +578,7 @@ test("Telegram settings setters reload before scoped writes to preserve shared c
   await controls.setAssistantRenderingMode("html");
 
   assert.deepEqual(await readTelegramConfig(configPath), {
-    botToken: "123:abc",
+    profiles: { default: { botToken: "123:abc" } },
     assistant: {
       draftPreviews: true,
       rendering: "html",
@@ -465,8 +608,9 @@ test("Polling offset persistence cannot erase settings written after poll start"
   await createTelegramPollingOffsetPersister(store)(stalePollingConfig);
 
   assert.deepEqual(await readTelegramConfig(configPath), {
-    botToken: "123:abc",
-    lastUpdateId: 11,
+    profiles: {
+      default: { botToken: "123:abc", lastUpdateId: 11 },
+    },
     assistant: {
       rendering: "rich",
       draftPreviews: false,
@@ -490,7 +634,7 @@ test("Telegram draft preview config reads and migrates legacy rich flag", async 
   assert.equal(controls.areDraftPreviewsEnabled(), true);
   await controls.setDraftPreviewsEnabled(false);
   assert.deepEqual(await readTelegramConfig(configPath), {
-    botToken: "123:abc",
+    profiles: { default: { botToken: "123:abc" } },
     assistant: { draftPreviews: false },
   });
 });
@@ -559,7 +703,7 @@ test("Telegram settings menu callbacks persist voice and time settings to telegr
     true,
   );
   assert.deepEqual(await readTelegramConfig(configPath), {
-    botToken: "123:abc",
+    profiles: { default: { botToken: "123:abc" } },
     assistant: { draftPreviews: true },
     voice: { replyMode: "mirror" },
     time: { injectionMode: "always" },
@@ -583,7 +727,7 @@ test("Telegram time injection mode setter persists telegram.json", async () => {
 
   assert.equal(getMode(), "interval");
   assert.deepEqual(await readTelegramConfig(configPath), {
-    botToken: "123:abc",
+    profiles: { default: { botToken: "123:abc" } },
     time: { interval: 5000, injectionMode: "interval" },
   });
 
@@ -591,7 +735,7 @@ test("Telegram time injection mode setter persists telegram.json", async () => {
 
   assert.equal(getMode(), "hidden");
   assert.deepEqual(await readTelegramConfig(configPath), {
-    botToken: "123:abc",
+    profiles: { default: { botToken: "123:abc" } },
     time: { interval: 5000 },
   });
 });
@@ -625,6 +769,7 @@ test("Telegram config store owns load, mutation, and persistence", async () => {
     configPath,
   });
   assert.deepEqual(store.get(), {
+    profiles: { default: { botToken: "initial" } },
     botToken: "initial",
     inboundHandlers: [{ type: "text", template: "translate" }],
     attachmentHandlers: [{ mime: "audio/*", template: "transcribe {file}" }],
@@ -646,18 +791,25 @@ test("Telegram config store owns load, mutation, and persistence", async () => {
   assert.equal(store.getAllowedUserId(), 43);
   await store.persist();
   assert.deepEqual(await readTelegramConfig(configPath), {
-    botToken: "initial",
     inboundHandlers: [{ type: "text", template: "translate" }],
     attachmentHandlers: [{ mime: "audio/*", template: "transcribe {file}" }],
-    allowedUserId: 43,
+    profiles: {
+      default: { botToken: "initial", allowedUserId: 43 },
+    },
   });
   store.set({ botToken: "next" });
-  assert.deepEqual(store.get(), { botToken: "next" });
+  assert.deepEqual(store.get(), {
+    profiles: { default: { botToken: "next" } },
+    botToken: "next",
+  });
   await store.load();
   assert.deepEqual(store.get(), {
-    botToken: "initial",
     inboundHandlers: [{ type: "text", template: "translate" }],
     attachmentHandlers: [{ mime: "audio/*", template: "transcribe {file}" }],
+    profiles: {
+      default: { botToken: "initial", allowedUserId: 43 },
+    },
+    botToken: "initial",
     allowedUserId: 43,
   });
 });

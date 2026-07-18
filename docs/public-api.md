@@ -78,12 +78,16 @@ Configuration lives in `~/.pi/agent/telegram.json` unless `PI_CODING_AGENT_DIR` 
 Stable config keys:
 
 ```ts
-interface TelegramConfig {
-  botToken?: string;
+interface TelegramBotProfile {
+  botToken: string;
   botUsername?: string; // runtime-managed
   botId?: number; // runtime-managed
   allowedUserId?: number;
   lastUpdateId?: number; // runtime-managed
+}
+
+interface TelegramConfig {
+  profiles?: Record<string, TelegramBotProfile>; // includes `default`
   inboundHandlers?: TelegramInboundHandlerConfig[];
   attachmentHandlers?: TelegramInboundHandlerConfig[]; // compatibility alias
   outboundHandlers?: TelegramOutboundHandlerConfig[];
@@ -102,6 +106,8 @@ interface TelegramConfig {
   };
 }
 ```
+
+Bot/session identity always persists under `profiles.<name>`. The ordinary setup path uses `profiles.default`; `/telegram-setup default` and `/telegram-connect default` are exact aliases for the bare commands. Named profiles use the same shape. Shared handlers plus `assistant`, `voice`, and `time` remain top-level. On the first `0.24.0` load, unambiguous legacy root identity moves atomically into `profiles.default`; identical duplicates collapse, complementary fields merge, and conflicting values fail closed without modifying the file.
 
 Hidden/default semantics are represented by absence:
 

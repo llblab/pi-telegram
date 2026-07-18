@@ -20,5 +20,4 @@ Living index of project documentation in `/docs`.
 - [multi-instance-bus.md](./multi-instance-bus.md) — Optional multi-instance Telegram bus architecture: profile-scoped transport, leader/follower routing, thread targets, instance slots, manual follower registration, and recovery semantics
 - [sections.md](./sections.md) — Telegram Extension Sections Standard: registration contract, context ports, callback routing, navigation hierarchy, and demo reference for pi extensions that want Telegram UI surfaces
 - [voice.md](./voice.md) — Voice integration guide: detection, reply policy, STT/TTS provider registration, provider-owned conversion, and transparent interception
-- [locks.md](./locks.md) — Shared `locks.json` standard for singleton extension ownership
 - [ui-style.md](./ui-style.md) — Inline UI style guide for buttons, toggles, tabs, option lists, cards, and dialogs

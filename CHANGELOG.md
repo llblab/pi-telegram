@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+## 0.24.0: Canonical Profiles And Extension-Local Ownership
+
+- `Canonical Default Profile`: Persisted bot/session identity under `profiles.default` and named siblings while keeping shared settings top-level. Legacy root identity migrates atomically when unambiguous and conflicts fail closed; bare and explicit `default` setup/connect commands now behave identically without changing default runtime paths. Live reload preserved token, pairing, offset, ownership, and Telegram delivery.
+- `Extension-Local Transport Ownership`: Replaced shared agent-level `locks.json` ownership with private profile-scoped `tmp/telegram/owners.json`, serialized through `owners.json.transaction`; followers remain outside owner-slot writes. Breaking: `0.24.0` intentionally does not migrate legacy ownership, so upgrading resets the transport owner and may require `/telegram-connect`. Live reload confirmed isolated default ownership while leaving the legacy registry untouched.
+
 ## 0.23.3: Thread-Scoped Settings Hotfix
 
 - `Thread-Scoped Settings Rehydration`: Preserved `message_thread_id` when rebuilding full Settings menu state after session reload or TTL expiry. Impact: a stale Settings message in Threaded Mode retains its exact Telegram target when later callbacks reopen menus or cross into model/status controls.

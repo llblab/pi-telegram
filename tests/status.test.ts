@@ -566,6 +566,7 @@ test("Bridge status runtime builds status state from live ports", () => {
       allowedUserId: 7,
       lastUpdateId: 99,
     }),
+    getActiveProfileName: () => undefined,
     isPollingActive: () => true,
     getActiveSourceMessageIds: () => [1, 2],
     hasActiveTurn: () => false,
@@ -597,6 +598,7 @@ test("Bridge status runtime builds status state from live ports", () => {
   assert.deepEqual(runtime.getStatusLines(), [
     "connection:",
     "- bot: @demo_bot",
+    "- profile: default",
     "- user: 7",
     "- owner: active here",
     "",

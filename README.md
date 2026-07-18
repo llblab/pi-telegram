@@ -45,7 +45,7 @@ Run this inside Pi:
 /telegram-setup
 ```
 
-Paste the bot token. If `~/.pi/agent/telegram.json` already contains a saved token, setup offers it as the default. If no saved token exists, setup can prefill from `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_KEY`, `TELEGRAM_TOKEN`, or `TELEGRAM_KEY`. Named profiles are optional; the ordinary `/telegram-setup` and `/telegram-connect` flow keeps using the default profile. Use `/telegram-setup <name>` only when you want an additional bot profile. Cancelling or failing named-profile token validation leaves the currently active profile and polling runtime unchanged; setup reports the profile as saved and connected only after polling startup succeeds.
+Paste the bot token. If `~/.pi/agent/telegram.json` already contains a saved token, setup offers it as the default. If no saved token exists, setup can prefill from `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_KEY`, `TELEGRAM_TOKEN`, or `TELEGRAM_KEY`. Bot/session identity persists under `profiles.default`; shared handlers and assistant/voice/time settings remain top-level. `/telegram-setup default` and `/telegram-connect default` are exact aliases for the bare commands. Use `/telegram-setup <name>` only when you want an additional bot profile. Cancelling or failing named-profile token validation leaves the currently active profile and polling runtime unchanged; setup reports the profile as saved and connected only after polling startup succeeds.
 
 ### 3. Connect this Pi instance and its active session
 
@@ -53,7 +53,7 @@ Paste the bot token. If `~/.pi/agent/telegram.json` already contains a saved tok
 /telegram-connect
 ```
 
-The connected Pi instance owns Telegram polling. Use `/telegram-connect <name>` to activate a named profile. Each profile is a parallel bot runtime with isolated polling, diagnostics, Threaded Mode state, and local bus transport; the unnamed default profile keeps legacy paths. In classic mode each profile uses a singleton lock. When Telegram private-chat Threaded Mode is available, one live instance becomes the profile's leader and later visible Pi instances register as followers.
+The connected Pi instance owns Telegram polling. Use `/telegram-connect <name>` to activate a named profile. Each profile is a parallel bot runtime with isolated polling, diagnostics, Threaded Mode state, and local bus transport; the `default` profile keeps unsuffixed runtime paths. In classic mode each profile uses a singleton lock. When Telegram private-chat Threaded Mode is available, one live instance becomes the profile's leader and later visible Pi instances register as followers.
 
 ### 4. Pair your Telegram account
 
@@ -148,9 +148,9 @@ Run these inside Pi.
 
 | Command | Purpose |
 | --- | --- |
-| `/telegram-setup` | Save or update the default bot token |
+| `/telegram-setup` / `/telegram-setup default` | Save or update `profiles.default` |
 | `/telegram-setup <profile>` | Save or update a named-profile bot token |
-| `/telegram-connect` | Activate the default profile and acquire its transport ownership |
+| `/telegram-connect` / `/telegram-connect default` | Activate `profiles.default` and acquire its transport ownership |
 | `/telegram-connect <profile>` | Activate a named profile and acquire its transport ownership |
 | `/telegram-disconnect` | Stop polling and release ownership; in Threaded Mode, confirm deletion of this instance's current Telegram thread |
 | `/telegram-status` | Inspect connection, mode, queue, transport, and recent diagnostics |
@@ -257,7 +257,6 @@ A Telegram prompt is a normal model turn in the active Pi session and therefore 
 - [Extension Sections](./docs/sections.md) — Telegram-native companion UI surfaces.
 - [Updates](./docs/updates.md) — update handler registry and callback interop.
 - [Multi-Instance Bus](./docs/multi-instance-bus.md) — leader/follower routing in Threaded Mode.
-- [Locks](./docs/locks.md) — singleton ownership and shared lock conventions.
 - [UI Style](./docs/ui-style.md) — menu, emoji, labels, dialogs, and inline keyboard standards.
 - [Callback Namespaces](./docs/callback-namespaces.md) — callback ownership and routing.
 - [Command Templates](./docs/command-templates.md) — handler command-template conventions.

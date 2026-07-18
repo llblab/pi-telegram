@@ -428,13 +428,13 @@ test("Thread store denies follower writes until transport ownership promotes", a
   }
 });
 
-test("Thread store snapshot commit is fenced by exact lock ownership", async () => {
+test("Thread store snapshot commit is fenced by exact transport ownership", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-state-fence-"));
   const path = join(dir, "state.json");
-  const locksPath = join(dir, "locks.json");
+  const ownersPath = join(dir, "owners.json");
   try {
     const owner = createTelegramLockRuntime({
-      locksPath,
+      locksPath: ownersPath,
       instanceId: "leader:first",
     });
     const acquired = owner.acquire({ cwd: "/repo" });
@@ -465,7 +465,7 @@ test("Thread store snapshot commit is fenced by exact lock ownership", async () 
       slot: "B",
     });
     const replacement = createTelegramLockRuntime({
-      locksPath,
+      locksPath: ownersPath,
       instanceId: "leader:replacement",
     });
     const replaced = replacement.acquire(

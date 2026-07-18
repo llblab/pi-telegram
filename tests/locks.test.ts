@@ -1,6 +1,6 @@
 /**
- * Regression tests for Telegram singleton lock helpers
- * Covers locks.json ownership, stale-lock replacement, and locked polling auto-start behavior
+ * Regression tests for Telegram transport ownership helpers
+ * Covers owners.json authority, stale-owner replacement, and owner-gated polling behavior
  */
 
 import assert from "node:assert/strict";
@@ -33,8 +33,8 @@ import {
 } from "../lib/locks.ts";
 
 function createTempLockPath(): { dir: string; path: string } {
-  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-locks-"));
-  return { dir, path: join(dir, "locks.json") };
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-owners-"));
+  return { dir, path: join(dir, "owners.json") };
 }
 
 async function waitForCondition(
@@ -181,16 +181,16 @@ test("Lock runtime acquires, refreshes, and releases its own key", () => {
   }
 });
 
-test("Lock key resolver preserves default compatibility and scopes named profiles", () => {
+test("Owner slot resolver uses local default and named profile keys", () => {
   let activeProfileName: string | undefined;
   const resolveKey = createTelegramLockKeyResolver({
     getActiveProfileName: () => activeProfileName,
   });
 
-  assert.equal(resolveTelegramLockKey(), TELEGRAM_LOCK_KEY);
-  assert.equal(resolveKey(), TELEGRAM_LOCK_KEY);
+  assert.equal(resolveTelegramLockKey(), "default");
+  assert.equal(resolveKey(), "default");
   activeProfileName = "omp";
-  assert.equal(resolveKey(), `${TELEGRAM_LOCK_KEY}:omp`);
+  assert.equal(resolveKey(), "omp");
 });
 
 test("Lock runtime releases only the active profile key", () => {
@@ -216,11 +216,11 @@ test("Lock runtime releases only the active profile key", () => {
     assert.equal(other.acquire({ cwd: "/repo" }).ok, true);
 
     assert.equal(other.release().kind, "active-here");
-    assert.deepEqual(readLocks(temp.path)[`${TELEGRAM_LOCK_KEY}:work`], {
+    assert.deepEqual(readLocks(temp.path).work, {
       pid: 10,
       cwd: "/repo",
     });
-    assert.equal(readLocks(temp.path)[`${TELEGRAM_LOCK_KEY}:omp`], undefined);
+    assert.equal(readLocks(temp.path).omp, undefined);
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
@@ -789,7 +789,7 @@ test("Lock transaction preserves keys acquired by concurrent profiles", async ()
   const temp = createTempLockPath();
   const startPath = join(temp.dir, "start");
   const readyPaths = [join(temp.dir, "ready-a"), join(temp.dir, "ready-b")];
-  const keys = [TELEGRAM_LOCK_KEY, `${TELEGRAM_LOCK_KEY}:work`];
+  const keys = [TELEGRAM_LOCK_KEY, "work"];
   try {
     const children = keys.map((key, index) =>
       spawnLockRaceChild({
@@ -813,14 +813,14 @@ test("Lock transaction preserves keys acquired by concurrent profiles", async ()
   }
 });
 
-test("Lock runtime preserves other extension keys and refuses live polling owners", () => {
+test("Lock runtime preserves other profile owners and refuses a live default owner", () => {
   const temp = createTempLockPath();
   try {
     writeFileSync(
       temp.path,
       JSON.stringify(
         {
-          "other-extension": { pid: 123 },
+          work: { pid: 123 },
           [TELEGRAM_LOCK_KEY]: { pid: 99 },
         },
         null,
@@ -835,7 +835,7 @@ test("Lock runtime preserves other extension keys and refuses live polling owner
     const acquired = lock.acquire({ cwd: "/repo" });
     assert.equal(acquired.ok, false);
     assert.equal(lock.getStatusLabel(), "active elsewhere (pid 99)");
-    assert.deepEqual(readLocks(temp.path)["other-extension"], { pid: 123 });
+    assert.deepEqual(readLocks(temp.path).work, { pid: 123 });
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
@@ -1676,7 +1676,7 @@ test("Retained lock ownership cannot cross a dynamic profile key", () => {
     });
     assert.equal(lock.acquire({ cwd: "/repo" }).ok, true);
     const locks = readLocks(temp.path);
-    locks[`${TELEGRAM_LOCK_KEY}:work`] = { pid: 10, cwd: "/repo" };
+    locks.work = { pid: 10, cwd: "/repo" };
     writeLocks(temp.path, locks);
 
     activeProfileName = "work";
@@ -1684,8 +1684,8 @@ test("Retained lock ownership cannot cross a dynamic profile key", () => {
     assert.equal(lock.refresh({ cwd: "/repo" }), false);
     lock.release();
     assert.deepEqual(readLocks(temp.path), {
-      [TELEGRAM_LOCK_KEY]: { pid: 10, cwd: "/repo" },
-      [`${TELEGRAM_LOCK_KEY}:work`]: { pid: 10, cwd: "/repo" },
+      default: { pid: 10, cwd: "/repo" },
+      work: { pid: 10, cwd: "/repo" },
     });
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });

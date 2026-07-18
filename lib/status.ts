@@ -4,6 +4,8 @@
  * Builds usage, cost, and context summaries for the interactive Telegram status view
  */
 
+const TELEGRAM_STATUS_DEFAULT_PROFILE_NAME = "default";
+
 export type TelegramStatusQueueLane = "control" | "priority" | "default";
 
 export interface TelegramUsageStats {
@@ -624,7 +626,9 @@ export function createTelegramBridgeStatusRuntime<
     getBridgeStatusLineState: () => {
       const config = deps.getConfig();
       const botThreadMode = deps.getBotThreadMode?.();
-      const activeProfileName = deps.getActiveProfileName?.();
+      const activeProfileName = deps.getActiveProfileName
+        ? (deps.getActiveProfileName() ?? TELEGRAM_STATUS_DEFAULT_PROFILE_NAME)
+        : undefined;
       return {
         hasBotToken: Boolean(config.botToken),
         botUsername: config.botUsername,
@@ -1066,13 +1070,16 @@ function buildTelegramBridgeCompactStatusLines(
     : state.activeSourceMessageIds?.length
       ? "active"
       : "idle";
-  const profileSuffix = state.activeProfileName
-    ? `.${state.activeProfileName.replace(/[^a-zA-Z0-9._-]+/g, "_")}`
+  const diagnosticsProfileName =
+    state.activeProfileName === TELEGRAM_STATUS_DEFAULT_PROFILE_NAME
+      ? undefined
+      : state.activeProfileName;
+  const profileSuffix = diagnosticsProfileName
+    ? `.${diagnosticsProfileName.replace(/[^a-zA-Z0-9._-]+/g, "_")}`
     : "";
-  const profileSlug = profileSuffix.slice(1);
   const diagnosticsPaths = state.diagnosticPaths ?? {
     state: `~/.pi/agent/tmp/telegram/state${profileSuffix}.json`,
-    logs: `~/.pi/agent/tmp/telegram/logs${profileSlug ? `.${profileSlug}` : ""}.jsonl`,
+    logs: `~/.pi/agent/tmp/telegram/logs${profileSuffix}.jsonl`,
   };
   return [
     "connection:",

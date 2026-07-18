@@ -133,9 +133,10 @@ async function writeRuntimeTelegramLocks(
   locks: Record<string, unknown>,
 ): Promise<void> {
   const agentDir = await ensureRuntimeAgentDir();
-  await mkdir(agentDir, { recursive: true });
+  const telegramRuntimeDir = join(agentDir, "tmp", "telegram");
+  await mkdir(telegramRuntimeDir, { recursive: true });
   await writeFile(
-    join(agentDir, "locks.json"),
+    join(telegramRuntimeDir, "owners.json"),
     JSON.stringify(locks, null, "\t") + "\n",
     "utf8",
   );
@@ -699,20 +700,12 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
     await commands.get("telegram-connect")?.handler("", ctx);
     await dispatched;
     await handlers.get("agent_start")?.({}, ctx);
-    await writeFile(
-      join(await ensureRuntimeAgentDir(), "locks.json"),
-      JSON.stringify(
-        {
-          "@llblab/pi-telegram": {
-            pid: process.pid + 1_000_000,
-            cwd: "/tmp/other-pi-instance",
-          },
-        },
-        null,
-        "\t",
-      ) + "\n",
-      "utf8",
-    );
+    await writeRuntimeTelegramLocks({
+      default: {
+        pid: process.pid + 1_000_000,
+        cwd: "/tmp/other-pi-instance",
+      },
+    });
     mock.timers.tick(1100);
     await flushMicrotasks(20);
     await handlers.get("message_update")?.(
@@ -834,7 +827,7 @@ test("Extension runtime keeps local queue progress but fences delivery after own
     );
     await handlers.get("agent_start")?.({}, ctx);
     await writeRuntimeTelegramLocks({
-      "@llblab/pi-telegram": {
+      default: {
         pid: process.pid + 1_000_000,
         cwd: "/repo/queue-owner-b",
       },
@@ -951,7 +944,7 @@ test("Extension runtime resolves stale same-cwd lock before proactive local resu
       assistant: { proactivePush: true },
     });
     await writeRuntimeTelegramLocks({
-      "@llblab/pi-telegram": {
+      default: {
         pid: process.pid + 1_000_000,
         cwd,
       },
@@ -1208,7 +1201,7 @@ test("Extension runtime drops queued proactive blocks after session replacement"
       assistant: { proactivePush: true },
     });
     await writeRuntimeTelegramLocks({
-      "@llblab/pi-telegram": { pid: process.pid + 1_000_000, cwd },
+      default: { pid: process.pid + 1_000_000, cwd },
     });
     (await getRuntimeTelegramExtension())(pi);
     const oldCtx = createRuntimeExtensionContext({ cwd });
@@ -1308,7 +1301,7 @@ test("Extension runtime skips proactive local result without Telegram lock owner
       assistant: { proactivePush: true },
     });
     await writeRuntimeTelegramLocks({
-      "@llblab/pi-telegram": {
+      default: {
         pid: process.pid + 1_000_000,
         cwd: "/repo/another-instance",
       },
