@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `Thread-Scoped Settings Rehydration`: Preserved `message_thread_id` when rebuilding full Settings menu state after session reload or TTL expiry. Impact: a stale Settings message in Threaded Mode retains its exact Telegram target when later callbacks reopen menus or cross into model/status controls.
+
 ## 0.23.2: Voice Policy And Turn Delivery Hotfix
 
 - `Settings Persistence Race`: Rebuilt expired Settings callback state from the live model-menu context before applying mutations. Polling now persists only its monotonic `lastUpdateId` into the current config-store snapshot instead of later submitting the detached full config object captured when polling started. Impact: a subsequent Telegram update can no longer erase freshly persisted `voice.replyMode`, `assistant.proactivePush`, or other Settings values and return the menu to stale defaults.
