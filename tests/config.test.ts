@@ -133,7 +133,9 @@ test("Telegram config helpers persist and reload config", async () => {
   assert.deepEqual(reloaded, config);
   const raw = await readFile(configPath, "utf8");
   assert.match(raw, /demo_bot/);
-  assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+    assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+  }
   assert.deepEqual(
     (await readdir(agentDir)).filter((entry) => entry.includes(".tmp-")),
     [],

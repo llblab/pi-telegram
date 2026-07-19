@@ -208,7 +208,9 @@ test("writeLocks writes private lock files", () => {
   const temp = createTempLockPath();
   try {
     writeLocks(temp.path, { [TELEGRAM_LOCK_KEY]: { pid: 10 } });
-    assert.equal(statSync(temp.path).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal(statSync(temp.path).mode & 0o777, 0o600);
+    }
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
@@ -220,9 +222,13 @@ test("File transaction publishes a private directory guard with owner metadata",
   try {
     withTelegramFileTransaction(transactionPath, () => {
       assert.equal(statSync(transactionPath).isDirectory(), true);
-      assert.equal(statSync(transactionPath).mode & 0o777, 0o700);
+      if (process.platform !== "win32") {
+        assert.equal(statSync(transactionPath).mode & 0o777, 0o700);
+      }
       const ownerPath = join(transactionPath, readdirSync(transactionPath)[0]);
-      assert.equal(statSync(ownerPath).mode & 0o777, 0o600);
+      if (process.platform !== "win32") {
+        assert.equal(statSync(ownerPath).mode & 0o777, 0o600);
+      }
       const owner = JSON.parse(readFileSync(ownerPath, "utf8")) as {
         pid: number;
         acquiredAtMs: number;

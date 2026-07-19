@@ -33,6 +33,7 @@ import {
   getTelegramBusEndpointDiagnostics,
   getTelegramBusFollowerEndpoint,
   getTelegramBusLeaderEndpoint,
+  getTelegramBusPipePath,
   getTelegramBusTransportRetryPolicy,
   isTelegramBusPipePath,
   isRetryableTelegramBusTransportError,
@@ -524,8 +525,16 @@ export type TelegramBusSocketPathSource = string | (() => string);
 
 export function resolveTelegramBusSocketPath(
   source: TelegramBusSocketPathSource,
+  platform: NodeJS.Platform | string = getPlatform(),
 ): string {
-  return typeof source === "function" ? source() : source;
+  const endpoint = typeof source === "function" ? source() : source;
+  if (platform !== "win32" || isTelegramBusPipePath(endpoint)) {
+    return endpoint;
+  }
+  return getTelegramBusPipePath({
+    agentDir: dirname(endpoint),
+    scope: basename(endpoint),
+  });
 }
 
 export interface TelegramBusLocalServerDeps {
@@ -1128,16 +1137,20 @@ function sendTelegramBusLocalEnvelopeOnce(
 export async function sendTelegramBusLocalEnvelope(
   options: TelegramBusLocalClientOptions,
 ): Promise<TelegramBusEnvelope | undefined> {
-  const attempts = Math.max(1, options.retry?.attempts ?? 1);
-  const delayMs = Math.max(0, options.retry?.delayMs ?? 0);
+  const resolvedOptions = {
+    ...options,
+    socketPath: resolveTelegramBusSocketPath(options.socketPath),
+  };
+  const attempts = Math.max(1, resolvedOptions.retry?.attempts ?? 1);
+  const delayMs = Math.max(0, resolvedOptions.retry?.delayMs ?? 0);
   for (let attempt = 1; ; attempt += 1) {
     try {
-      return await sendTelegramBusLocalEnvelopeOnce(options);
+      return await sendTelegramBusLocalEnvelopeOnce(resolvedOptions);
     } catch (error) {
       const info = classifyTelegramBusTransportError(error);
-      options.recordTransportEvent?.("client-failed", {
-        ...getTelegramBusEndpointDiagnostics(options.socketPath),
-        ...getTelegramBusEnvelopeDiagnostics(options.envelope),
+      resolvedOptions.recordTransportEvent?.("client-failed", {
+        ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
+        ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
         attempt,
         attempts,
         ...info,
@@ -1145,9 +1158,9 @@ export async function sendTelegramBusLocalEnvelope(
       if (attempt >= attempts || !isRetryableTelegramBusTransportError(error)) {
         throw error;
       }
-      options.recordTransportEvent?.("client-retry", {
-        ...getTelegramBusEndpointDiagnostics(options.socketPath),
-        ...getTelegramBusEnvelopeDiagnostics(options.envelope),
+      resolvedOptions.recordTransportEvent?.("client-retry", {
+        ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
+        ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
         attempt,
         attempts,
         delayMs,

@@ -38,6 +38,7 @@ import {
   isTelegramFollowerApiCallAllowed,
   markTelegramBusAggregateDelivery,
   parseTelegramBusEnvelope,
+  resolveTelegramBusSocketPath,
   stripTelegramBusApiMetadata,
   sendTelegramBusLocalEnvelope,
 } from "../lib/bus.ts";
@@ -93,6 +94,12 @@ test("Bus transport boundary derives socket and pipe endpoints", () => {
   assert.match(pipe, /^\\\\\.\\pipe\\pi-telegram-.+-bus$/);
   assert.equal(getTelegramBusTransportKind(pipe), "pipe");
   assert.equal(getTelegramBusTransportKind("/tmp/bus.sock"), "socket");
+  assert.equal(
+    getTelegramBusTransportKind(
+      resolveTelegramBusSocketPath("C:\\tmp\\legacy.sock", "win32"),
+    ),
+    "pipe",
+  );
 });
 
 test("Bus transport retry policy is operation-aware", () => {
@@ -1132,7 +1139,10 @@ test("Bus local server memoizes completed and in-flight request results", async 
     };
     const first = sendTelegramBusLocalEnvelope({ socketPath, envelope });
     const duplicate = sendTelegramBusLocalEnvelope({ socketPath, envelope });
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    const deadline = Date.now() + 1000;
+    while (executions === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     assert.equal(executions, 1);
     release?.();
     const [firstResult, duplicateResult] = await Promise.all([first, duplicate]);
@@ -1296,8 +1306,10 @@ test("Bus local IPC server handles request/response envelopes over a private Uni
   });
   try {
     await server.start();
-    assert.equal(statSync(dir).mode & 0o777, 0o700);
-    assert.equal(statSync(socketPath).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal(statSync(dir).mode & 0o777, 0o700);
+      assert.equal(statSync(socketPath).mode & 0o777, 0o600);
+    }
     const response = await sendTelegramBusLocalEnvelope({
       socketPath,
       envelope: {

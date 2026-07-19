@@ -508,8 +508,7 @@ export async function waitForTelegramTypingLoopIdle(
   await Promise.race([
     inFlight,
     new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, timeoutMs);
-      timer.unref?.();
+      setTimeout(resolve, timeoutMs);
     }),
   ]);
 }

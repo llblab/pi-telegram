@@ -179,8 +179,10 @@ test("Thread store persists explicit owner target mappings privately", async () 
     });
     await store.persist();
 
-    const mode = (await stat(path)).mode & 0o777;
-    assert.equal(mode, 0o600);
+    if (process.platform !== "win32") {
+      const mode = (await stat(path)).mode & 0o777;
+      assert.equal(mode, 0o600);
+    }
 
     const reloaded = createTelegramTopicTargetStore({ path });
     await reloaded.load();

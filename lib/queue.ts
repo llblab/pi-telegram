@@ -1764,7 +1764,6 @@ export async function shutdownTelegramSessionRuntime<TQueueItem>(
       deps.clearPreview(activeTurnChatId, target ? { target } : undefined),
       new Promise<void>((resolve) => {
         timeout = setTimeout(resolve, previewTimeoutMs);
-        timeout.unref?.();
       }),
     ]).finally(() => {
       if (timeout) clearTimeout(timeout);

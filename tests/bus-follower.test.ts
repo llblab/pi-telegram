@@ -1122,7 +1122,7 @@ test("Bus follower registration runtime retries while leader endpoint is startin
   try {
     setTimeout(() => {
       void server.start();
-    }, 25).unref?.();
+    }, 25);
     assert.equal(
       await follower.registerWithLeader(
         { cwd: "/repo" },
