@@ -149,6 +149,7 @@ The core product loop is mobile continuation: start or supervise work in the ter
 
 - Treat queue handling, compaction interaction, and lifecycle-hook state transitions as regression-prone areas; validate them after changing dispatch logic
 - Keep the standard `npm run typecheck` gate strict about unused locals and parameters so stale imports and abandoned adapters fail validation instead of accumulating silently
+- Keep push/PR CI on minimum Node `22.19.0` across Ubuntu, macOS, and Windows with typecheck, tests, and package dry-run on every OS; run audit once on Ubuntu, require the native Windows named-pipe roundtrip to execute, and keep Unix-only skips explicit by protected boundary.
 - Route important runtime failures through the recent runtime event recorder so `/telegram-status` remains useful for post-mortem debugging. Keep the compact TUI status bar bounded to the generic `error` state; detailed error messages belong only in diagnostics/logs, never inline beside the status label.
 - Treat remaining Markdown-to-HTML rendering as Telegram UI/compat output work, not generic Markdown rendering or assistant reply delivery
 - Preserve literal code content in Telegram rendering
