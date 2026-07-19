@@ -358,7 +358,7 @@ export function createTelegramExtensionSectionRegistry(): TelegramSectionRegistr
   >();
   let nextToken = 0;
 
-  const register = (section: TelegramSectionRegistration): () => void => {
+  const register = (section: TelegramSectionRegistration): (() => void) => {
     const duplicate = [...sections.values()].find((s) => s.id === section.id);
     if (duplicate) {
       throw new Error(`Telegram section id already registered: ${section.id}`);
@@ -701,53 +701,6 @@ export async function handleTelegramSectionSettingsOpen(
   } catch (error) {
     const message = sectionErrorMessage(error);
     registry.recordError(token, message, "settings_open");
-    await deps.answerCallbackQuery(
-      callbackQueryId,
-      `Section error: ${message}`,
-    );
-    return true;
-  }
-}
-
-export async function handleTelegramSectionSettingsCallback(
-  registry: TelegramSectionRegistry,
-  token: TelegramSectionToken,
-  action: string,
-  payload: string,
-  chatId: number,
-  messageId: number,
-  callbackQueryId: string,
-  deps: TelegramSectionCallbackHandlerDeps,
-): Promise<boolean> {
-  const section = registry.getByToken(token);
-  if (!section || !section.registration.settings?.handleCallback) {
-    await deps.answerCallbackQuery(
-      callbackQueryId,
-      "This section is no longer available.",
-    );
-    return true;
-  }
-  try {
-    const ctx = buildTelegramSectionCallbackContext(
-      section.id,
-      token,
-      chatId,
-      messageId,
-      action,
-      payload,
-      callbackQueryId,
-      deps,
-      `settings:list`,
-    );
-    const result = await section.registration.settings.handleCallback(ctx);
-    if (result === "pass") {
-      await deps.answerCallbackQuery(callbackQueryId);
-    }
-    registry.clearError(token, "settings_callback");
-    return true;
-  } catch (error) {
-    const message = sectionErrorMessage(error);
-    registry.recordError(token, message, "settings_callback");
     await deps.answerCallbackQuery(
       callbackQueryId,
       `Section error: ${message}`,

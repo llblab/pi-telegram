@@ -102,6 +102,12 @@ export function createTelegramRuntimeJsonlLog(
   const getNowMs = options.getNowMs ?? Date.now;
   const scopeKeys = new Map<string, string | undefined>();
   let pending: Promise<void> = Promise.resolve();
+  let appendScheduled = false;
+  let queuedAppends: {
+    path: string;
+    previousPath: string;
+    line: string;
+  }[] = [];
 
   const ensureParent = (path: string) => {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -156,27 +162,79 @@ export function createTelegramRuntimeJsonlLog(
   };
 
   const appendLine = (line: string) => {
-    const path = resolvePath();
-    const previousPath = resolvePreviousPath();
+    queuedAppends.push({
+      path: resolvePath(),
+      previousPath: resolvePreviousPath(),
+      line,
+    });
+    if (appendScheduled) return;
+    appendScheduled = true;
     pending = pending
       .then(() => {
-        ensureParent(path);
-        withTelegramFileTransaction(`${path}.transaction`, () => {
-          if (
-            existsSync(path) &&
-            statSync(path).size > maxBytes &&
-            (!options.canReset || options.canReset())
-          ) {
-            const rotate = () =>
-              writeResetLocked(path, previousPath, "max-bytes", { maxBytes });
-            if (options.commitReset) {
-              options.commitReset(rotate);
-            } else {
-              rotate();
-            }
+        appendScheduled = false;
+        const batch = queuedAppends;
+        queuedAppends = [];
+        const groups = new Map<
+          string,
+          { path: string; previousPath: string; lines: string[] }
+        >();
+        for (const entry of batch) {
+          const key = `${entry.path}\u0000${entry.previousPath}`;
+          const group = groups.get(key);
+          if (group) group.lines.push(entry.line);
+          else groups.set(key, { ...entry, lines: [entry.line] });
+        }
+        for (const group of groups.values()) {
+          try {
+            ensureParent(group.path);
+            withTelegramFileTransaction(`${group.path}.transaction`, () => {
+              let currentSize = existsSync(group.path)
+                ? statSync(group.path).size
+                : 0;
+              let chunk = "";
+              let chunkBytes = 0;
+              const flushChunk = () => {
+                if (!chunk) return;
+                appendFileSync(group.path, chunk, { mode: 0o600 });
+                currentSize += chunkBytes;
+                chunk = "";
+                chunkBytes = 0;
+              };
+              const rotate = (): boolean => {
+                if (options.canReset && !options.canReset()) return false;
+                let rotated = false;
+                const commit = () => {
+                  writeResetLocked(
+                    group.path,
+                    group.previousPath,
+                    "max-bytes",
+                    { maxBytes },
+                  );
+                  rotated = true;
+                };
+                if (options.commitReset) options.commitReset(commit);
+                else commit();
+                if (rotated) currentSize = statSync(group.path).size;
+                return rotated;
+              };
+              for (const line of group.lines) {
+                const lineBytes = Buffer.byteLength(line);
+                if (
+                  currentSize + chunkBytes > 0 &&
+                  currentSize + chunkBytes + lineBytes > maxBytes
+                ) {
+                  flushChunk();
+                  rotate();
+                }
+                chunk += line;
+                chunkBytes += lineBytes;
+              }
+              flushChunk();
+            });
+          } catch {
+            // Diagnostics failures for one profile must not drop other groups.
           }
-          appendFileSync(path, line, { mode: 0o600 });
-        });
+        }
       })
       .catch(() => undefined);
   };

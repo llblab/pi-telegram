@@ -4,6 +4,8 @@
  */
 
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
@@ -30,7 +32,7 @@ test("Command templates accept shorthand string configs", () => {
     "/work",
   );
   assert.deepEqual(invocation, {
-    command: "/work/tts",
+    command: resolve("/work", "tts"),
     args: ["--text", "hello world", "--lang", "ru"],
   });
 });
@@ -196,7 +198,7 @@ test("Command templates resolve defaults and inline placeholder defaults", () =>
     "/work",
   );
   assert.deepEqual(invocation, {
-    command: "/work/tts",
+    command: resolve("/work", "tts"),
     args: ["--text", "hello world", "--lang", "ru", "--rate", "+30%"],
   });
 });
@@ -295,12 +297,12 @@ test("Command template timeout escalates when SIGTERM is ignored", async () => {
 });
 
 test("Command template retry succeeds on second attempt", async () => {
-  const counterFile = `/tmp/ct-retry-${process.pid}.txt`;
+  const counterFile = join(tmpdir(), `ct-retry-${process.pid}.txt`);
   const { writeFileSync, readFileSync, unlinkSync } = await import("node:fs");
   writeFileSync(counterFile, "0");
   const script = `
     const fs = require("fs");
-    const p = "${counterFile}";
+    const p = ${JSON.stringify(counterFile)};
     let n = parseInt(fs.readFileSync(p, "utf8"));
     n++;
     fs.writeFileSync(p, String(n));

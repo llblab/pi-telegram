@@ -35,20 +35,16 @@ export interface TelegramBusTransportRetryPolicyOverrides {
 
 export type TelegramBusTransportOperation = "registration" | "operation";
 
-export const TELEGRAM_BUS_REGISTRATION_RETRY: TelegramBusTransportRetryPolicy = {
-  attempts: 10,
-  delayMs: 150,
-};
+export const TELEGRAM_BUS_REGISTRATION_RETRY: TelegramBusTransportRetryPolicy =
+  {
+    attempts: 10,
+    delayMs: 150,
+  };
 
 export const TELEGRAM_BUS_OPERATION_RETRY: TelegramBusTransportRetryPolicy = {
   attempts: 3,
   delayMs: 100,
 };
-
-export const TELEGRAM_BUS_PIPE_REGISTRATION_RETRY =
-  TELEGRAM_BUS_REGISTRATION_RETRY;
-
-export const TELEGRAM_BUS_PIPE_OPERATION_RETRY = TELEGRAM_BUS_OPERATION_RETRY;
 
 export function getTelegramBusPipePath(input: {
   agentDir: string;
@@ -200,13 +196,11 @@ export function createTelegramBusTransportTimeoutError(
 
 export function delayTelegramBusTransportRetry(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
+    setTimeout(resolve, ms);
   });
 }
 
-export interface TelegramBusTransportProbeResult
-  extends TelegramBusTransportEndpointDiagnostics {
+export interface TelegramBusTransportProbeResult extends TelegramBusTransportEndpointDiagnostics {
   reachable: boolean;
   error?: TelegramBusTransportErrorInfo;
 }
@@ -238,7 +232,6 @@ export function probeTelegramBusEndpoint(input: {
         ),
       });
     }, timeoutMs);
-    timeout.unref?.();
     socket.once("connect", () => settle({ ...diagnostics, reachable: true }));
     socket.once("error", (error) =>
       settle({

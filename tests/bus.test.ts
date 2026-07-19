@@ -38,6 +38,7 @@ import {
   isTelegramFollowerApiCallAllowed,
   markTelegramBusAggregateDelivery,
   parseTelegramBusEnvelope,
+  resolveTelegramBusSocketPath,
   stripTelegramBusApiMetadata,
   sendTelegramBusLocalEnvelope,
 } from "../lib/bus.ts";
@@ -93,6 +94,22 @@ test("Bus transport boundary derives socket and pipe endpoints", () => {
   assert.match(pipe, /^\\\\\.\\pipe\\pi-telegram-.+-bus$/);
   assert.equal(getTelegramBusTransportKind(pipe), "pipe");
   assert.equal(getTelegramBusTransportKind("/tmp/bus.sock"), "socket");
+  assert.equal(
+    getTelegramBusTransportKind(
+      resolveTelegramBusSocketPath("C:\\tmp\\legacy.sock", "win32"),
+    ),
+    "pipe",
+  );
+  const longMacEndpoint = resolveTelegramBusSocketPath(
+    `/var/folders/${"nested/".repeat(20)}bus.sock`,
+    "darwin",
+  );
+  assert.equal(getTelegramBusTransportKind(longMacEndpoint), "socket");
+  assert.ok(Buffer.byteLength(longMacEndpoint) < 104);
+  assert.equal(
+    resolveTelegramBusSocketPath(longMacEndpoint, "darwin"),
+    longMacEndpoint,
+  );
 });
 
 test("Bus transport retry policy is operation-aware", () => {
@@ -159,11 +176,11 @@ test("Bus transport error classifier marks transient IPC failures retryable", ()
 
 test("Bus socket path is scoped under the agent temp directory", () => {
   assert.equal(
-    getTelegramBusSocketPath("/agent"),
+    getTelegramBusSocketPath("/agent", "linux"),
     join("/agent", "tmp", "telegram", "bus.sock"),
   );
   assert.equal(
-    getTelegramBusFollowerSocketPath("pid:123", "/agent"),
+    getTelegramBusFollowerSocketPath("pid:123", "/agent", "linux"),
     join("/agent", "tmp", "telegram", "followers", "pid_123.sock"),
   );
 });
@@ -831,25 +848,26 @@ test("Bus follower API allowlist permits scoped own-topic cleanup only", () => {
 test("Bus transport probe reports reachable and unreachable endpoints", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-probe-"));
   const socketPath = join(dir, "bus.sock");
+  const endpoint = resolveTelegramBusSocketPath(socketPath);
   const server = createTelegramBusLocalServer({
     socketPath,
     handleEnvelope: () => ({ kind: "bus.ack", requestId: "probe", ok: true }),
   });
   try {
     const missing = await probeTelegramBusEndpoint({
-      endpoint: socketPath,
+      endpoint,
       timeoutMs: 50,
     });
     assert.equal(missing.reachable, false);
-    assert.equal(missing.transport, "socket");
+    assert.equal(missing.transport, getTelegramBusTransportKind(endpoint));
     await server.start();
     const reachable = await probeTelegramBusEndpoint({
-      endpoint: socketPath,
+      endpoint,
       timeoutMs: 50,
     });
     assert.deepEqual(reachable, {
-      endpoint: socketPath,
-      transport: "socket",
+      endpoint,
+      transport: getTelegramBusTransportKind(endpoint),
       reachable: true,
     });
   } finally {
@@ -858,7 +876,38 @@ test("Bus transport probe reports reachable and unreachable endpoints", async ()
   }
 });
 
-test("Bus local server resolves the active profile endpoint on each start", async () => {
+test("Bus local server roundtrips through a bounded long-path fallback", { skip: process.platform === "win32" }, async () => {
+  const socketPath = join(
+    tmpdir(),
+    "pi-telegram-very-long-endpoint-segment".repeat(4),
+    "bus.sock",
+  );
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: (envelope) => ({
+      kind: "bus.ack",
+      requestId: envelope.requestId,
+      ok: true,
+    }),
+  });
+  try {
+    await server.start();
+    const response = await sendTelegramBusLocalEnvelope({
+      socketPath,
+      envelope: {
+        kind: "follower.heartbeat",
+        requestId: "long-path",
+        instanceId: "follower-a",
+        sentAtMs: 1000,
+      },
+    });
+    assert.equal(response?.kind, "bus.ack");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("Bus local server resolves the active profile endpoint on each start", { skip: process.platform === "win32" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-profile-switch-"));
   let profileName = "work";
   const getSocketPath = () =>
@@ -868,25 +917,28 @@ test("Bus local server resolves the active profile endpoint on each start", asyn
     handleEnvelope: () => ({ kind: "bus.ack", requestId: "profile", ok: true }),
   });
   const workSocketPath = getSocketPath();
+  const resolvedWorkSocketPath = resolveTelegramBusSocketPath(workSocketPath);
   try {
     await server.start();
-    assert.equal(existsSync(workSocketPath), true);
+    assert.equal(existsSync(resolvedWorkSocketPath), true);
     await server.stop();
-    assert.equal(existsSync(workSocketPath), false);
+    assert.equal(existsSync(resolvedWorkSocketPath), false);
 
     profileName = "personal";
     const personalSocketPath = getSocketPath();
+    const resolvedPersonalSocketPath =
+      resolveTelegramBusSocketPath(personalSocketPath);
     await server.start();
     assert.notEqual(personalSocketPath, workSocketPath);
-    assert.equal(existsSync(personalSocketPath), true);
-    assert.equal(existsSync(workSocketPath), false);
+    assert.equal(existsSync(resolvedPersonalSocketPath), true);
+    assert.equal(existsSync(resolvedWorkSocketPath), false);
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("Old bus server stop cannot invalidate a replacement endpoint generation", async () => {
+test("Old bus server stop cannot invalidate a replacement endpoint generation", { skip: process.platform === "win32" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-generation-"));
   const socketPath = join(dir, "bus.sock");
   const first = createTelegramBusLocalServer({
@@ -915,7 +967,7 @@ test("Old bus server stop cannot invalidate a replacement endpoint generation", 
     assert.equal(
       (
         await probeTelegramBusEndpoint({
-          endpoint: socketPath,
+          endpoint: resolveTelegramBusSocketPath(socketPath),
           timeoutMs: 50,
         })
       ).reachable,
@@ -943,7 +995,7 @@ test("Old bus server stop cannot invalidate a replacement endpoint generation", 
   }
 });
 
-test("Stale bus server cannot publish over a replacement endpoint generation", async () => {
+test("Stale bus server cannot publish over a replacement endpoint generation", { skip: process.platform === "win32" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-publish-fence-"));
   const socketPath = join(dir, "bus.sock");
   let releasePublication: (() => void) | undefined;
@@ -1002,7 +1054,7 @@ test("Stale bus server cannot publish over a replacement endpoint generation", a
   }
 });
 
-test("Bus local server rebinds an externally unlinked Unix endpoint", async () => {
+test("Bus local server rebinds an externally unlinked Unix endpoint", { skip: process.platform === "win32" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-rebind-"));
   const socketPath = join(dir, "bus.sock");
   const phases: string[] = [];
@@ -1013,11 +1065,12 @@ test("Bus local server rebinds an externally unlinked Unix endpoint", async () =
   });
   try {
     await server.start();
-    unlinkSync(socketPath);
-    assert.equal(existsSync(socketPath), false);
+    const resolvedSocketPath = resolveTelegramBusSocketPath(socketPath);
+    unlinkSync(resolvedSocketPath);
+    assert.equal(existsSync(resolvedSocketPath), false);
 
     assert.equal(await server.ensureEndpoint(), true);
-    assert.equal(existsSync(socketPath), true);
+    assert.equal(existsSync(resolvedSocketPath), true);
     assert.equal(await server.ensureEndpoint(), false);
     assert.deepEqual(
       phases.filter((phase) => phase.includes("endpoint")),
@@ -1026,7 +1079,7 @@ test("Bus local server rebinds an externally unlinked Unix endpoint", async () =
     assert.equal(
       (
         await probeTelegramBusEndpoint({
-          endpoint: socketPath,
+          endpoint: resolvedSocketPath,
           timeoutMs: 50,
         })
       ).reachable,
@@ -1060,7 +1113,10 @@ test("Bus local client transport events include request diagnostics", async () =
     assert.equal(events[0].phase, "client-failed");
     assert.equal(events[0].details.envelopeKind, "follower.heartbeat");
     assert.equal(events[0].details.requestId, "inst-a:events");
-    assert.equal(events[0].details.transport, "socket");
+    assert.equal(
+      events[0].details.transport,
+      getTelegramBusTransportKind(resolveTelegramBusSocketPath(socketPath)),
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1132,7 +1188,10 @@ test("Bus local server memoizes completed and in-flight request results", async 
     };
     const first = sendTelegramBusLocalEnvelope({ socketPath, envelope });
     const duplicate = sendTelegramBusLocalEnvelope({ socketPath, envelope });
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    const deadline = Date.now() + 1000;
+    while (executions === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     assert.equal(executions, 1);
     release?.();
     const [firstResult, duplicateResult] = await Promise.all([first, duplicate]);
@@ -1276,7 +1335,10 @@ test("Bus local IPC server reports handler failures as protocol acks", async () 
     );
     assert.equal(failure?.details.envelopeKind, "follower.heartbeat");
     assert.equal(failure?.details.requestId, "inst-a:failed-handler");
-    assert.equal(failure?.details.transport, "socket");
+    assert.equal(
+      failure?.details.transport,
+      getTelegramBusTransportKind(resolveTelegramBusSocketPath(socketPath)),
+    );
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -1296,8 +1358,10 @@ test("Bus local IPC server handles request/response envelopes over a private Uni
   });
   try {
     await server.start();
-    assert.equal(statSync(dir).mode & 0o777, 0o700);
-    assert.equal(statSync(socketPath).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal(statSync(dir).mode & 0o777, 0o700);
+      assert.equal(statSync(socketPath).mode & 0o777, 0o600);
+    }
     const response = await sendTelegramBusLocalEnvelope({
       socketPath,
       envelope: {

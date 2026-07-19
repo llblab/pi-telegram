@@ -118,25 +118,6 @@ export type {
   TelegramThinkingMenuOpenDeps,
 } from "./menu-thinking.ts";
 
-export interface TelegramMenuEffectPort<TModel extends MenuModel = MenuModel> {
-  answerCallbackQuery: (
-    callbackQueryId: string,
-    text?: string,
-  ) => Promise<void>;
-  updateModelMenuMessage: () => Promise<void>;
-  updateThinkingMenuMessage: () => Promise<void>;
-  updateStatusMessage: () => Promise<void>;
-  persistScopedModelPatterns?: (patterns: string[]) => Promise<void>;
-  setModel: (model: TModel) => Promise<boolean>;
-  setCurrentModel: (model: TModel) => void;
-  setThinkingLevel: (level: ThinkingLevel) => void;
-  getCurrentThinkingLevel: () => ThinkingLevel;
-  stagePendingModelSwitch: (selection: ScopedTelegramModel<TModel>) => void;
-  restartInterruptedTelegramTurn: (
-    selection: ScopedTelegramModel<TModel>,
-  ) => Promise<boolean> | boolean;
-}
-
 export interface TelegramMenuCallbackEntryDeps {
   handleStatusAction: () => Promise<boolean>;
   handleThinkingAction: () => Promise<boolean>;

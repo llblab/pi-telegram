@@ -89,6 +89,7 @@ test("Status helpers build runtime log scope and persisted snapshot projections"
 
 test("Status runtime diagnostics scheduler coalesces snapshot persists", async () => {
   let scheduled: (() => void) | undefined;
+  let scheduledDelayMs: number | undefined;
   let persistCount = 0;
   const errors: unknown[] = [];
   const schedule = createTelegramRuntimeDiagnosticsSnapshotScheduler({
@@ -96,8 +97,9 @@ test("Status runtime diagnostics scheduler coalesces snapshot persists", async (
       persistCount += 1;
     },
     recordError: (error) => errors.push(error),
-    setTimer(callback) {
+    setTimer(callback, ms) {
       scheduled = callback as () => void;
+      scheduledDelayMs = ms;
       return { unref() {} } as ReturnType<typeof setTimeout>;
     },
   });
@@ -107,6 +109,7 @@ test("Status runtime diagnostics scheduler coalesces snapshot persists", async (
   scheduled?.();
   await Promise.resolve();
 
+  assert.equal(scheduledDelayMs, 100);
   assert.equal(persistCount, 1);
   assert.deepEqual(errors, []);
 });

@@ -1764,7 +1764,6 @@ export async function shutdownTelegramSessionRuntime<TQueueItem>(
       deps.clearPreview(activeTurnChatId, target ? { target } : undefined),
       new Promise<void>((resolve) => {
         timeout = setTimeout(resolve, previewTimeoutMs);
-        timeout.unref?.();
       }),
     ]).finally(() => {
       if (timeout) clearTimeout(timeout);
@@ -2239,10 +2238,6 @@ export function createTelegramQueueDispatchWatchdogRuntime<TContext = unknown>(
 export interface TelegramPromptDeliveryOptions {
   deliverAs: "followUp";
 }
-
-export const TELEGRAM_PROMPT_FOLLOW_UP_DELIVERY = {
-  deliverAs: "followUp",
-} as const satisfies TelegramPromptDeliveryOptions;
 
 export interface TelegramDispatchRuntimeDeps<TContext = unknown> {
   executeControlItem: (

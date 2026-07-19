@@ -262,9 +262,10 @@ export interface TelegramBridgeStatusRuntimeDeps<
   statusKey?: string;
   getConfig: () => TelegramBridgeStatusConfig;
   getActiveProfileName?: () => string | undefined;
-  getDiagnosticPaths?: (
-    profileName?: string,
-  ) => { state: string; logs: string };
+  getDiagnosticPaths?: (profileName?: string) => {
+    state: string;
+    logs: string;
+  };
   isPollingActive: () => boolean;
   getActiveSourceMessageIds: () => number[] | undefined;
   hasActiveTurn: () => boolean;
@@ -295,8 +296,7 @@ export interface TelegramBridgeStatusRuntimeDeps<
     TelegramBridgeStatusSyncSlice | undefined
   >;
   getThreadReconciliationState?: () =>
-    | TelegramBridgeThreadReconciliationState
-    | undefined;
+    TelegramBridgeThreadReconciliationState | undefined;
   getInstanceSlot?: () => string | undefined;
   getInstanceThreadName?: () => string | undefined;
   getNowMs?: () => number;
@@ -726,6 +726,8 @@ export function createTelegramStatusSnapshot(
   };
 }
 
+const TELEGRAM_DIAGNOSTICS_SNAPSHOT_COALESCE_MS = 100;
+
 export function createTelegramRuntimeDiagnosticsSnapshotScheduler(deps: {
   persistSnapshot: () => Promise<void>;
   recordError: (error: unknown) => void;
@@ -738,7 +740,7 @@ export function createTelegramRuntimeDiagnosticsSnapshotScheduler(deps: {
     timer = setTimer(() => {
       timer = undefined;
       void deps.persistSnapshot().catch(deps.recordError);
-    }, 0);
+    }, TELEGRAM_DIAGNOSTICS_SNAPSHOT_COALESCE_MS);
     if (typeof timer !== "number") timer?.unref?.();
   };
 }
@@ -1084,7 +1086,9 @@ function buildTelegramBridgeCompactStatusLines(
   return [
     "connection:",
     `- bot: ${formatTelegramBridgeBotStatus(state)}`,
-    ...(state.activeProfileName ? [`- profile: ${state.activeProfileName}`] : []),
+    ...(state.activeProfileName
+      ? [`- profile: ${state.activeProfileName}`]
+      : []),
     `- user: ${state.allowedUserId ?? "not paired"}`,
     ...(state.botThreadMode ? [`- thread mode: ${state.botThreadMode}`] : []),
     ...(state.busRole ? [`- role: ${state.busRole}`] : []),
@@ -1139,7 +1143,9 @@ export function buildTelegramBridgeDiagnosticStatusLines(
   return [
     "connection:",
     `- bot: ${formatTelegramBridgeBotStatus(state)}`,
-    ...(state.activeProfileName ? [`- profile: ${state.activeProfileName}`] : []),
+    ...(state.activeProfileName
+      ? [`- profile: ${state.activeProfileName}`]
+      : []),
     `- allowed user: ${state.allowedUserId ?? "not paired"}`,
     ...(state.botThreadMode
       ? [

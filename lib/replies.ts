@@ -871,29 +871,6 @@ export function dedupSendTextReply(
   };
 }
 
-/** Wrap a sendMarkdownReply with reply dedup. */
-export function dedupSendMarkdownReply<TReplyMarkup = unknown>(
-  dedup: ReplyDedupRuntime,
-  inner: (
-    chatId: number,
-    replyToMessageId: number | undefined,
-    markdown: string,
-    options?: { replyMarkup?: TReplyMarkup },
-  ) => Promise<number | undefined>,
-): (
-  chatId: number,
-  replyToMessageId: number,
-  markdown: string,
-  options?: { replyMarkup?: TReplyMarkup },
-) => Promise<number | undefined> {
-  return async (chatId, replyToMessageId, markdown, options) => {
-    const effectiveReplyTo = dedup.shouldReply(replyToMessageId)
-      ? replyToMessageId
-      : undefined;
-    return inner(chatId, effectiveReplyTo, markdown, options);
-  };
-}
-
 /**
  * Guest reply sender: answers guest queries with native Rich Markdown content.
  * Guest queries use InlineQueryResult input_message_content rather than chat

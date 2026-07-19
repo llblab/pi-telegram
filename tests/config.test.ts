@@ -4,7 +4,6 @@
  */
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   mkdir,
@@ -13,12 +12,14 @@ import {
   readFile,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { runNodeEval } from "./fixtures/node-eval.ts";
 import type { TelegramConfig } from "../lib/config.ts";
 import {
   createTelegramConfigControls,
@@ -132,7 +133,9 @@ test("Telegram config helpers persist and reload config", async () => {
   assert.deepEqual(reloaded, config);
   const raw = await readFile(configPath, "utf8");
   assert.match(raw, /demo_bot/);
-  assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+    assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+  }
   assert.deepEqual(
     (await readdir(agentDir)).filter((entry) => entry.includes(".tmp-")),
     [],
@@ -238,12 +241,18 @@ test("Telegram default profile normalization accepts root session fields without
 });
 
 test("Telegram config load rejects conflicting default identity without mutation", async () => {
-  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-default-conflict-"));
+  const agentDir = await mkdtemp(
+    join(tmpdir(), "pi-telegram-default-conflict-"),
+  );
   const configPath = join(agentDir, "telegram.json");
-  const original = `${JSON.stringify({
-    botToken: "123:abc",
-    profiles: { default: { botToken: "456:def" } },
-  }, null, 2)}\n`;
+  const original = `${JSON.stringify(
+    {
+      botToken: "123:abc",
+      profiles: { default: { botToken: "456:def" } },
+    },
+    null,
+    2,
+  )}\n`;
   await writeFile(configPath, original, "utf8");
   try {
     const store = createTelegramConfigStore({ agentDir, configPath });
@@ -258,7 +267,9 @@ test("Telegram config load rejects conflicting default identity without mutation
 });
 
 test("Telegram config load atomically normalizes the default profile", async () => {
-  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-default-profile-"));
+  const agentDir = await mkdtemp(
+    join(tmpdir(), "pi-telegram-default-profile-"),
+  );
   const configPath = join(agentDir, "telegram.json");
   await writeTelegramConfig(agentDir, configPath, {
     botToken: "123:abc",
@@ -364,32 +375,18 @@ test("Telegram config transactions merge concurrent profile offsets and global f
       });
       await store.persist();
     `;
-    const child = spawn(
-      process.execPath,
-      ["--experimental-strip-types", "--input-type=module", "--eval", source],
-      {
-        env: {
-          ...process.env,
-          AGENT_DIR: dir,
-          CONFIG_PATH: configPath,
-          PROFILE: profile,
-          OFFSET: offset,
-          FIELD: field,
-          READY_PATH: readyPath,
-          START_PATH: startPath,
-        },
-        stdio: ["ignore", "ignore", "pipe"],
+    const done = runNodeEval(source, {
+      env: {
+        AGENT_DIR: dir,
+        CONFIG_PATH: configPath,
+        PROFILE: profile,
+        OFFSET: offset,
+        FIELD: field,
+        READY_PATH: readyPath,
+        START_PATH: startPath,
       },
-    );
-    const done = new Promise<void>((resolve, reject) => {
-      let stderr = "";
-      child.stderr.on("data", (chunk) => (stderr += String(chunk)));
-      child.on("error", reject);
-      child.on("exit", (code) =>
-        code === 0
-          ? resolve()
-          : reject(new Error(`config child exited ${code}: ${stderr}`)),
-      );
+    }).then(({ code, stderr }) => {
+      if (code !== 0) throw new Error(`config child exited ${code}: ${stderr}`);
     });
     return { readyPath, done };
   });
@@ -417,6 +414,89 @@ test("Telegram config transactions merge concurrent profile offsets and global f
         personal: { botToken: "personal-token", lastUpdateId: 22 },
       },
     });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Stale config persistence preserves unrelated global and profile disk deltas", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-config-delta-"));
+  const configPath = join(dir, "telegram.json");
+  try {
+    await writeTelegramConfig(dir, configPath, {
+      profiles: {
+        default: { botToken: "default-token" },
+        work: { botToken: "work-token", lastUpdateId: 10 },
+      },
+      assistant: { rendering: "rich" },
+    });
+    const stale = createTelegramConfigStore({ agentDir: dir, configPath });
+    await stale.load();
+
+    await writeTelegramConfig(dir, configPath, {
+      profiles: {
+        default: { botToken: "default-token" },
+        work: {
+          botToken: "work-token",
+          lastUpdateId: 10,
+          allowedUserId: 42,
+        },
+      },
+      assistant: { rendering: "rich" },
+      time: { interval: 5000, injectionMode: "interval" },
+    });
+    stale.update((config) => {
+      config.voice = { replyMode: "mirror" };
+    });
+    await stale.persist();
+
+    assert.deepEqual(await readTelegramConfig(configPath), {
+      profiles: {
+        default: { botToken: "default-token" },
+        work: {
+          botToken: "work-token",
+          lastUpdateId: 10,
+          allowedUserId: 42,
+        },
+      },
+      assistant: { rendering: "rich" },
+      time: { interval: 5000, injectionMode: "interval" },
+      voice: { replyMode: "mirror" },
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("No-op config persistence adopts newer disk state without rewriting it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-config-noop-"));
+  const configPath = join(dir, "telegram.json");
+  try {
+    await writeTelegramConfig(dir, configPath, {
+      profiles: { default: { botToken: "default-token" } },
+    });
+    const store = createTelegramConfigStore({ agentDir: dir, configPath });
+    await store.load();
+    await writeTelegramConfig(dir, configPath, {
+      profiles: { default: { botToken: "default-token" } },
+      time: { interval: 5000, injectionMode: "interval" },
+    });
+    const stableTime = new Date("2001-01-01T00:00:00.000Z");
+    await utimes(configPath, stableTime, stableTime);
+
+    await store.persist();
+
+    assert.deepEqual(store.get().time, {
+      interval: 5000,
+      injectionMode: "interval",
+    });
+    assert.deepEqual(await readTelegramConfig(configPath), {
+      profiles: { default: { botToken: "default-token" } },
+      time: { interval: 5000, injectionMode: "interval" },
+    });
+    assert.ok(
+      Math.abs((await stat(configPath)).mtimeMs - stableTime.getTime()) < 5,
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -618,6 +698,48 @@ test("Polling offset persistence cannot erase settings written after poll start"
     },
     voice: { replyMode: "mirror" },
   });
+});
+
+test("Stale same-profile polling persistence preserves settings from another instance", async () => {
+  const agentDir = await mkdtemp(
+    join(tmpdir(), "pi-telegram-cross-instance-settings-"),
+  );
+  const configPath = join(agentDir, "telegram.json");
+  try {
+    await writeTelegramConfig(agentDir, configPath, {
+      botToken: "123:abc",
+      lastUpdateId: 10,
+      assistant: { rendering: "rich", draftPreviews: false },
+    });
+    const settingsStore = createTelegramConfigStore({ agentDir, configPath });
+    const pollingStore = createTelegramConfigStore({ agentDir, configPath });
+    await settingsStore.load();
+    await pollingStore.load();
+    const stalePollingConfig = pollingStore.get();
+
+    await createTelegramVoiceReplyModeSetter(settingsStore)("mirror");
+    await createTelegramConfigControls(settingsStore).setProactivePushEnabled(
+      false,
+    );
+    stalePollingConfig.lastUpdateId = 11;
+    await createTelegramPollingOffsetPersister(pollingStore)(
+      stalePollingConfig,
+    );
+
+    assert.deepEqual(await readTelegramConfig(configPath), {
+      profiles: {
+        default: { botToken: "123:abc", lastUpdateId: 11 },
+      },
+      assistant: {
+        rendering: "rich",
+        draftPreviews: false,
+        proactivePush: false,
+      },
+      voice: { replyMode: "mirror" },
+    });
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
 });
 
 test("Telegram draft preview config reads and migrates legacy rich flag", async () => {

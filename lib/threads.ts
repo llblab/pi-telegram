@@ -443,8 +443,7 @@ export function getTelegramTopicTargetsPath(
   return getTelegramStatePath(agentDir, profileName);
 }
 
-const TELEGRAM_LEADER_SESSION_HANDOFF_KEY =
-  "__piTelegramLeaderSessionHandoff";
+const TELEGRAM_LEADER_SESSION_HANDOFF_KEY = "__piTelegramLeaderSessionHandoff";
 export const TELEGRAM_LEADER_SESSION_HANDOFF_TTL_MS = 30_000;
 
 export interface TelegramLeaderSessionHandoff {
@@ -458,8 +457,7 @@ export interface TelegramLeaderSessionHandoff {
 }
 
 export function getTelegramLeaderSessionHandoff():
-  | TelegramLeaderSessionHandoff
-  | undefined {
+  TelegramLeaderSessionHandoff | undefined {
   const value = (globalThis as Record<string, unknown>)[
     TELEGRAM_LEADER_SESSION_HANDOFF_KEY
   ];
@@ -981,6 +979,18 @@ function parseTopicTargetFile(value: unknown): TelegramTopicTargetFile {
   };
 }
 
+function serializeTelegramStateSemanticSnapshot(
+  value: unknown,
+): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  const { writtenAtMs: _writtenAtMs, ...semantic } = value as Record<
+    string,
+    unknown
+  >;
+  return JSON.stringify(semantic);
+}
+
 function targetMatches(left: TelegramTarget, right: TelegramTarget): boolean {
   return left.chatId === right.chatId && left.threadId === right.threadId;
 }
@@ -1083,6 +1093,7 @@ export function createTelegramTopicTargetStore(
   let loadedPath: string | undefined;
   let dirty = false;
   let mutationRevision = 0;
+  let statusRevision = 0;
   let persistQueue: Promise<void> = Promise.resolve();
   let statusSnapshot: {
     runtime?: Record<string, unknown>;
@@ -1245,6 +1256,7 @@ export function createTelegramTopicTargetStore(
           ]),
         );
         const persistedRevision = mutationRevision;
+        const persistedStatusRevision = statusRevision;
         const file = {
           version: 1,
           source: "snapshot",
@@ -1266,6 +1278,24 @@ export function createTelegramTopicTargetStore(
             return serialized;
           }),
         };
+        let persistedSemanticSnapshot: string | undefined;
+        try {
+          persistedSemanticSnapshot = serializeTelegramStateSemanticSnapshot(
+            JSON.parse(await readFile(path, "utf8")),
+          );
+        } catch {
+          /* missing or invalid snapshots must be replaced */
+        }
+        if (
+          persistedSemanticSnapshot ===
+            serializeTelegramStateSemanticSnapshot(file) &&
+          mutationRevision === persistedRevision &&
+          statusRevision === persistedStatusRevision
+        ) {
+          loaded = true;
+          dirty = false;
+          return;
+        }
         await writeFile(tempPath, `${JSON.stringify(file, null, 2)}\n`, {
           encoding: "utf8",
           mode: 0o600,
@@ -1407,6 +1437,7 @@ export function createTelegramTopicTargetStore(
     setStatusSnapshot(snapshot) {
       if (!loadedPath) loadedPath = getPath();
       statusSnapshot = { ...snapshot };
+      statusRevision += 1;
     },
     getByProfileKey(profileKey) {
       const ownerKey = getTelegramThreadOwnerKey(
@@ -2025,13 +2056,16 @@ export async function provisionOwnBusTopic(
   ) {
     const existingHandoffRecord = deps.store
       .list()
-      .find((record) => targetMatches(record.target, leaderSessionHandoff.target));
+      .find((record) =>
+        targetMatches(record.target, leaderSessionHandoff.target),
+      );
     deps.store.upsert({
       profileKey,
       owner: currentLeaderOwner,
       target: { ...leaderSessionHandoff.target },
       status: "active",
-      createdAtMs: existingHandoffRecord?.createdAtMs ?? leaderSessionHandoff.createdAtMs,
+      createdAtMs:
+        existingHandoffRecord?.createdAtMs ?? leaderSessionHandoff.createdAtMs,
       updatedAtMs: nowMs,
       threadName:
         existingHandoffRecord?.threadName ?? leaderSessionHandoff.threadName,
@@ -2042,8 +2076,7 @@ export async function provisionOwnBusTopic(
         : {}),
       ...(existingHandoffRecord?.lastSyncObservedAtMs !== undefined
         ? {
-            lastSyncObservedAtMs:
-              existingHandoffRecord.lastSyncObservedAtMs,
+            lastSyncObservedAtMs: existingHandoffRecord.lastSyncObservedAtMs,
           }
         : {}),
       lastReconcileAction: "leader-session-handoff-restored",

@@ -876,6 +876,11 @@ test("Turn edit runtime keeps reply context prompt-only when queued messages cha
 });
 
 test("Turn helpers preserve queued prompt attachments when captions are edited", () => {
+  const attachmentDir = join(tmpdir(), "pi-telegram-turn-attachments");
+  const attachmentBlock =
+    `[attachments] ${attachmentDir}\n` +
+    "- /demo.png\n" +
+    "- /report.txt";
   const turn = {
     kind: "prompt" as const,
     chatId: 99,
@@ -888,16 +893,11 @@ test("Turn helpers preserve queued prompt attachments when captions are edited",
     content: [
       {
         type: "text" as const,
-        text:
-          "[telegram] old caption\n\n" +
-          "[attachments] /tmp\n" +
-          "- /demo.png\n" +
-          "- /report.txt",
+        text: `[telegram] old caption\n\n${attachmentBlock}`,
       },
       { type: "image" as const, data: "abc", mimeType: "image/png" },
     ],
-    historyText:
-      "old caption\n\n[attachments] /tmp\n- /demo.png\n- /report.txt",
+    historyText: `old caption\n\n${attachmentBlock}`,
     statusSummary: "old caption",
   };
   const updated = updateTelegramPromptTurnText({
@@ -907,16 +907,10 @@ test("Turn helpers preserve queued prompt attachments when captions are edited",
   });
   assert.equal(
     (updated.content[0] as { type: "text"; text: string }).text,
-    "[telegram] new caption\n\n" +
-      "[attachments] /tmp\n" +
-      "- /demo.png\n" +
-      "- /report.txt",
+    `[telegram] new caption\n\n${attachmentBlock}`,
   );
   assert.deepEqual(updated.content[1], turn.content[1]);
-  assert.equal(
-    updated.historyText,
-    "new caption\n\n[attachments] /tmp\n- /demo.png\n- /report.txt",
-  );
+  assert.equal(updated.historyText, `new caption\n\n${attachmentBlock}`);
   assert.equal(updated.statusSummary, "new caption");
 });
 

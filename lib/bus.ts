@@ -5,7 +5,7 @@
  * cross-instance forwarding helpers, and the live follower registry model.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -23,7 +23,7 @@ import {
   type Server,
   type Socket,
 } from "node:net";
-import { platform as getPlatform } from "node:os";
+import { platform as getPlatform, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 import {
@@ -33,6 +33,7 @@ import {
   getTelegramBusEndpointDiagnostics,
   getTelegramBusFollowerEndpoint,
   getTelegramBusLeaderEndpoint,
+  getTelegramBusPipePath,
   getTelegramBusTransportRetryPolicy,
   isTelegramBusPipePath,
   isRetryableTelegramBusTransportError,
@@ -42,8 +43,6 @@ import {
 } from "./bus-transport.ts";
 import type { TelegramTarget } from "./target.ts";
 import { resolveAgentDir } from "./paths.ts";
-
-export type TelegramBusRole = "leader" | "follower";
 
 export interface TelegramBusProcessRuntime {
   instanceId: string;
@@ -524,10 +523,38 @@ export interface TelegramBusLocalServer {
 
 export type TelegramBusSocketPathSource = string | (() => string);
 
+const TELEGRAM_BUS_MAX_DIRECT_UNIX_ENDPOINT_BYTES = 80;
+
 export function resolveTelegramBusSocketPath(
   source: TelegramBusSocketPathSource,
+  platform: NodeJS.Platform | string = getPlatform(),
 ): string {
-  return typeof source === "function" ? source() : source;
+  const endpoint = typeof source === "function" ? source() : source;
+  if (platform === "win32") {
+    if (isTelegramBusPipePath(endpoint)) return endpoint;
+    return getTelegramBusPipePath({
+      agentDir: dirname(endpoint),
+      scope: basename(endpoint),
+    });
+  }
+  const ownerScope = process.getuid?.() ?? "user";
+  const fallbackDir = join(tmpdir(), `pi-telegram-${ownerScope}`);
+  if (
+    dirname(endpoint) === fallbackDir &&
+    /^[0-9a-f]{16}\.sock$/u.test(basename(endpoint))
+  ) {
+    return endpoint;
+  }
+  if (
+    Buffer.byteLength(endpoint) <= TELEGRAM_BUS_MAX_DIRECT_UNIX_ENDPOINT_BYTES
+  ) {
+    return endpoint;
+  }
+  const digest = createHash("sha256")
+    .update(endpoint)
+    .digest("hex")
+    .slice(0, 16);
+  return join(fallbackDir, `${digest}.sock`);
 }
 
 export interface TelegramBusLocalServerDeps {
@@ -617,7 +644,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
       deps.recordRuntimeEvent?.(
         "bus",
         response?.kind === "bus.ack"
-          ? response.message ?? "Follower rejected forwarded Telegram update."
+          ? (response.message ?? "Follower rejected forwarded Telegram update.")
           : "Follower returned no forwarding acknowledgement.",
         {
           phase: "foreign-update-forward-rejected",
@@ -885,7 +912,7 @@ export function createTelegramBusLocalServer(
       const endpointGeneration = randomBytes(8).toString("hex");
       const listenPath = usesWindowsPipe
         ? socketPath
-        : join(dirname(socketPath), `.pi-telegram-${endpointGeneration}.sock`);
+        : join(dirname(socketPath), `.pt-${endpointGeneration}.sock`);
       activeSocketPath = socketPath;
       activeListenPath = listenPath;
       deps.recordTransportEvent?.(
@@ -1110,7 +1137,6 @@ function sendTelegramBusLocalEnvelopeOnce(
         ),
       );
     }, timeoutMs);
-    timeout.unref?.();
     socket.setEncoding("utf8");
     socket.once("connect", () => {
       socket.write(encodeTelegramBusEnvelope(options.envelope));
@@ -1130,16 +1156,20 @@ function sendTelegramBusLocalEnvelopeOnce(
 export async function sendTelegramBusLocalEnvelope(
   options: TelegramBusLocalClientOptions,
 ): Promise<TelegramBusEnvelope | undefined> {
-  const attempts = Math.max(1, options.retry?.attempts ?? 1);
-  const delayMs = Math.max(0, options.retry?.delayMs ?? 0);
+  const resolvedOptions = {
+    ...options,
+    socketPath: resolveTelegramBusSocketPath(options.socketPath),
+  };
+  const attempts = Math.max(1, resolvedOptions.retry?.attempts ?? 1);
+  const delayMs = Math.max(0, resolvedOptions.retry?.delayMs ?? 0);
   for (let attempt = 1; ; attempt += 1) {
     try {
-      return await sendTelegramBusLocalEnvelopeOnce(options);
+      return await sendTelegramBusLocalEnvelopeOnce(resolvedOptions);
     } catch (error) {
       const info = classifyTelegramBusTransportError(error);
-      options.recordTransportEvent?.("client-failed", {
-        ...getTelegramBusEndpointDiagnostics(options.socketPath),
-        ...getTelegramBusEnvelopeDiagnostics(options.envelope),
+      resolvedOptions.recordTransportEvent?.("client-failed", {
+        ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
+        ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
         attempt,
         attempts,
         ...info,
@@ -1147,9 +1177,9 @@ export async function sendTelegramBusLocalEnvelope(
       if (attempt >= attempts || !isRetryableTelegramBusTransportError(error)) {
         throw error;
       }
-      options.recordTransportEvent?.("client-retry", {
-        ...getTelegramBusEndpointDiagnostics(options.socketPath),
-        ...getTelegramBusEnvelopeDiagnostics(options.envelope),
+      resolvedOptions.recordTransportEvent?.("client-retry", {
+        ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
+        ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
         attempt,
         attempts,
         delayMs,
@@ -1408,8 +1438,7 @@ function parseForwardMessageEnvelope(
         (value.forwardCommentBatchPosition === "comment" ||
           value.forwardCommentBatchPosition === "forward")
           ? {
-              forwardCommentBatchPosition:
-                value.forwardCommentBatchPosition,
+              forwardCommentBatchPosition: value.forwardCommentBatchPosition,
             }
           : {}),
         sentAtMs: value.sentAtMs,

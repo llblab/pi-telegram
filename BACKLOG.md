@@ -2,27 +2,25 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P1 — Native Windows Threaded Mode Follow-Ups
+## P1 — Cross-Platform Runtime Persistence Optimization
 
-Context: Native Windows smoke on the WIP `dev` build now passes for classic mode, classic ownership handoff, hot upgrade to Threaded Mode, leader/follower registration and delivery, and hot downgrade back to classic with follower disconnect. The observed downgrade status convergence can take around 10 seconds, which is acceptable for the current retry-based safety model but should remain evidence-gated if it becomes user-visible friction.
+Context: `owners.json`, `state.json`, and `logs.jsonl` protect different ownership, recovery, and diagnostics boundaries. Their optimized persistence paths must preserve multiple concurrent Pi instances, classic singleton ownership, Threaded Mode leader election, exact owner/generation/epoch fencing, crash recovery, and native Windows behavior. Deterministic regressions, docs, and all local release gates pass; native Windows remains the final environment-only proof.
 
 Open work:
 
-- [ ] Capture text diagnostics if Windows classic restore/status convergence repeatedly exceeds the intended 5–15 second fallback window.
-- [ ] Add a focused regression or transport/status adjustment only if new Windows evidence shows a repeatable named-pipe, lock, heartbeat, queue, or status-convergence issue.
-- [ ] For every Windows connect/runtime crash report, classify the failing boundary (`owners.json` atomic write, named pipe, heartbeat, polling, queue, or status), ensure `logs.jsonl` captures enough redacted evidence before shutdown, and add a minimized regression when the failure can be simulated deterministically.
+- [ ] Run the current diff through native Windows classic and Threaded Mode smoke: connect, ownership handoff, leader/follower registration, stale recovery, live downgrade, diagnostics rotation, and shutdown cleanup. Record named-pipe and atomic-file evidence explicitly rather than treating Linux tests as cross-platform proof.
 
-Done when: new Windows-specific runtime issues are either fixed with targeted coverage or left out of the backlog because the native smoke remains green.
+Done when: native Windows evidence confirms that the measured filesystem-write reductions do not weaken singleton or leader/follower authority, recovery, diagnostics, or shutdown behavior.
 
 ## P1 — Evidence-Backed Telegram Client Follow-Ups
 
-Context: The release should avoid speculative live-test matrices. Future Telegram-client quirks should be handled only when there is concrete evidence or a minimized fixture.
+Context: The release should avoid speculative live-test matrices. Future Telegram-client quirks should be handled only when concrete evidence or a minimized fixture exists.
 
 Open work:
 
 - [ ] Capture any new Telegram client or Bot API behavior that contradicts the documented Threaded Mode contract, including a live local/autonomous `…typing` observation when convenient.
 - [ ] Add a focused regression or documented client caveat only for confirmed behavior.
-- [ ] Keep one-off live environment names, thread names, and operator-specific observations out of repository context unless they demonstrate a general product issue.
+- [ ] Keep one-off environment names, thread names, and operator-specific observations out of repository context unless they demonstrate a general product issue.
 
 Done when: new client quirks are either fixed with targeted coverage or documented as evidence-backed exceptions, without keeping broad manual smoke matrices in the backlog.
 
