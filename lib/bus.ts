@@ -523,6 +523,8 @@ export interface TelegramBusLocalServer {
 
 export type TelegramBusSocketPathSource = string | (() => string);
 
+const TELEGRAM_BUS_MAX_DIRECT_UNIX_ENDPOINT_BYTES = 80;
+
 export function resolveTelegramBusSocketPath(
   source: TelegramBusSocketPathSource,
   platform: NodeJS.Platform | string = getPlatform(),
@@ -535,7 +537,11 @@ export function resolveTelegramBusSocketPath(
       scope: basename(endpoint),
     });
   }
-  if (Buffer.byteLength(endpoint) <= 96) return endpoint;
+  if (
+    Buffer.byteLength(endpoint) <= TELEGRAM_BUS_MAX_DIRECT_UNIX_ENDPOINT_BYTES
+  ) {
+    return endpoint;
+  }
   const digest = createHash("sha256")
     .update(endpoint)
     .digest("hex")
