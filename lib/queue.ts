@@ -2240,10 +2240,6 @@ export interface TelegramPromptDeliveryOptions {
   deliverAs: "followUp";
 }
 
-export const TELEGRAM_PROMPT_FOLLOW_UP_DELIVERY = {
-  deliverAs: "followUp",
-} as const satisfies TelegramPromptDeliveryOptions;
-
 export interface TelegramDispatchRuntimeDeps<TContext = unknown> {
   executeControlItem: (
     item: Extract<

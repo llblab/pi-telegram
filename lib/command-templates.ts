@@ -36,9 +36,7 @@ export interface CommandTemplateObjectConfig {
 }
 
 export type CommandTemplateValue =
-  | string
-  | CommandTemplateConfig[]
-  | CommandTemplateObjectConfig;
+  string | CommandTemplateConfig[] | CommandTemplateObjectConfig;
 
 export type CommandTemplateConfig = string | CommandTemplateObjectConfig;
 
@@ -89,12 +87,6 @@ const COMMAND_TEMPLATE_RISK_LABEL_ORDER: CommandTemplateRiskLabel[] = [
   "risk.long_running",
   "risk.platform_specific",
 ];
-
-export type CommandTemplateExecCommand = (
-  command: string,
-  args: string[],
-  options?: CommandTemplateExecOptions,
-) => Promise<CommandTemplateExecResult>;
 
 function normalizeCommandTemplateArgs(value: string[] | undefined): string[] {
   if (!Array.isArray(value)) return [];
@@ -257,9 +249,18 @@ function getLeafCommandTemplateRiskLabels(
     labels.add("risk.broad_fs_write");
   }
   if (
-    ["curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "telnet", "ftp"].includes(
-      command,
-    ) ||
+    [
+      "curl",
+      "wget",
+      "ssh",
+      "scp",
+      "sftp",
+      "rsync",
+      "nc",
+      "ncat",
+      "telnet",
+      "ftp",
+    ].includes(command) ||
     (command === "git" &&
       hasAnyArg(args, ["clone", "fetch", "pull", "push", "ls-remote"])) ||
     ["npm", "pnpm", "yarn", "pip", "cargo"].includes(command)
@@ -283,13 +284,32 @@ function getLeafCommandTemplateRiskLabels(
     labels.add("risk.long_running");
   }
   if (
-    ["systemctl", "launchctl", "osascript", "open", "xdg-open", "powershell", "pwsh", "cmd.exe", "apt", "apt-get", "dnf", "yum", "brew", "pacman", "apk", "xclip", "wl-copy"].includes(
-      command,
-    )
+    [
+      "systemctl",
+      "launchctl",
+      "osascript",
+      "open",
+      "xdg-open",
+      "powershell",
+      "pwsh",
+      "cmd.exe",
+      "apt",
+      "apt-get",
+      "dnf",
+      "yum",
+      "brew",
+      "pacman",
+      "apk",
+      "xclip",
+      "wl-copy",
+    ].includes(command)
   ) {
     labels.add("risk.platform_specific");
   }
-  if (["pass", "gpg", "ssh-add"].includes(command) || hasSecretTouchingText(parts)) {
+  if (
+    ["pass", "gpg", "ssh-add"].includes(command) ||
+    hasSecretTouchingText(parts)
+  ) {
     labels.add("risk.secret_touching");
   }
   return sortRiskLabels(labels);
@@ -345,10 +365,6 @@ function getLeafCommandTemplateWarnings(
 
 function pad(value: number, width: number): string {
   return String(value).padStart(width, "0");
-}
-
-export function isCommandTemplateRepeatPlaceholder(name: string): boolean {
-  return /^_{0,6}(?:index|prev|next|repeat)$/.test(name);
 }
 
 export function getCommandTemplateRepeatDefaults(

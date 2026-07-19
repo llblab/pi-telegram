@@ -484,7 +484,11 @@ export function createTelegramModelMenuStateBuilder<
     TelegramModelMenuStateBuilderContext<TModel>,
 >(
   deps: TelegramModelMenuStateBuilderDeps<TModel, TContext>,
-): (chatId: number, ctx: TContext, threadId?: number) => Promise<TelegramModelMenuState<TModel>> {
+): (
+  chatId: number,
+  ctx: TContext,
+  threadId?: number,
+) => Promise<TelegramModelMenuState<TModel>> {
   return async (chatId, ctx, threadId) => {
     const settingsManager = deps.createSettingsManager(ctx.cwd);
     return deps.runtime.buildState({
@@ -743,17 +747,6 @@ export function setTelegramModelScope(
     state.scope = "all";
   }
   return { patterns, enabled };
-}
-
-export function toggleTelegramModelScope(
-  state: TelegramModelMenuState,
-  model: MenuModel,
-): { patterns: string[]; enabled: boolean } {
-  return setTelegramModelScope(
-    state,
-    model,
-    !isTelegramModelScoped(state, model),
-  );
 }
 
 export function buildTelegramModelCallbackPlan<

@@ -297,10 +297,6 @@ export type TelegramSendRichMessageBody = Record<string, unknown> & {
   reply_parameters?: TelegramReplyParameters;
 };
 
-export type TelegramInputRichMessageContent = {
-  rich_message: TelegramInputRichMessage;
-};
-
 export type TelegramEditMessageTextBody = Record<string, unknown> & {
   chat_id: number;
   message_id: number;

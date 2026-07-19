@@ -390,15 +390,6 @@ export function appendTelegramReplyContext(
   return text ? `${text}\n\n${replyContext}` : `_\n\n${replyContext}`;
 }
 
-export function appendTelegramForwardContext(
-  text: string,
-  forwardContext: string,
-): string {
-  if (!forwardContext) return text;
-  const forwardBlock = `[forward|${forwardContext.replace(/:\s+/g, ":")}]`;
-  return text ? `\n\n${forwardBlock} ${text}` : `\n\n${forwardBlock}`;
-}
-
 export function extractTelegramMessagePromptText(
   message: TelegramMediaMessage,
 ): string {

@@ -4,7 +4,6 @@
  */
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -20,12 +19,14 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
 
+import { runNodeEval } from "./fixtures/node-eval.ts";
 import {
   createTelegramLockedPollingRuntime,
   createTelegramLockKeyResolver,
   createTelegramLockRuntime,
   readLocks,
   resolveTelegramLockKey,
+  TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
   TELEGRAM_LOCK_KEY,
   withTelegramFileTransaction,
   writeLocks,
@@ -74,40 +75,17 @@ function spawnLockRaceChild(input: {
     process.stdout.write(JSON.stringify({ ok: acquired.ok, pid: acquired.ok ? acquired.lock.pid : undefined }));
     if (acquired.ok) sleep(300);
   `;
-  const child = spawn(
-    process.execPath,
-    ["--experimental-strip-types", "--input-type=module", "--eval", source],
-    {
-      env: {
-        ...process.env,
-        LOCKS_PATH: input.locksPath,
-        LOCK_KEY: input.key,
-        READY_PATH: input.readyPath,
-        START_PATH: input.startPath,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
+  const result = runNodeEval(source, {
+    env: {
+      LOCKS_PATH: input.locksPath,
+      LOCK_KEY: input.key,
+      READY_PATH: input.readyPath,
+      START_PATH: input.startPath,
     },
-  );
-  const result = new Promise<{ ok: boolean; pid?: number }>(
-    (resolve, reject) => {
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (chunk) => {
-        stdout += String(chunk);
-      });
-      child.stderr.on("data", (chunk) => {
-        stderr += String(chunk);
-      });
-      child.on("error", reject);
-      child.on("exit", (code) => {
-        if (code !== 0) {
-          reject(new Error(`Lock race child exited ${code}: ${stderr}`));
-          return;
-        }
-        resolve(JSON.parse(stdout) as { ok: boolean; pid?: number });
-      });
-    },
-  );
+  }).then(({ code, stdout, stderr }) => {
+    if (code !== 0) throw new Error(`Lock race child exited ${code}: ${stderr}`);
+    return JSON.parse(stdout) as { ok: boolean; pid?: number };
+  });
   return { result };
 }
 
@@ -333,20 +311,16 @@ test("Lock transaction releases recovered ownership when recovery cleanup fails"
     }
     assert.throws(
       () =>
-        withTelegramFileTransaction(
-          transactionPath,
-          () => undefined,
-          {
-            recoveryRename(fromPath, toPath) {
-              if (fromPath === recoveryPath) {
-                throw Object.assign(new Error("injected recovery cleanup busy"), {
-                  code: "EBUSY",
-                });
-              }
-              renameSync(fromPath, toPath);
-            },
+        withTelegramFileTransaction(transactionPath, () => undefined, {
+          recoveryRename(fromPath, toPath) {
+            if (fromPath === recoveryPath) {
+              throw Object.assign(new Error("injected recovery cleanup busy"), {
+                code: "EBUSY",
+              });
+            }
+            renameSync(fromPath, toPath);
           },
-        ),
+        }),
       /injected recovery cleanup busy/,
     );
     assert.equal(existsSync(transactionPath), false);
@@ -366,10 +340,7 @@ test("Lock transaction rollback retry restores peer-process recovery", async () 
   try {
     mkdirSync(transactionPath, { mode: 0o700 });
     writeFileSync(
-      join(
-        transactionPath,
-        "owner.dead-main-before-rename-failure.json",
-      ),
+      join(transactionPath, "owner.dead-main-before-rename-failure.json"),
       JSON.stringify({
         pid: 2_147_483_647,
         acquiredAtMs: Date.now(),
@@ -379,27 +350,23 @@ test("Lock transaction rollback retry restores peer-process recovery", async () 
     );
     assert.throws(
       () =>
-        withTelegramFileTransaction(
-          transactionPath,
-          () => undefined,
-          {
-            recoveryRename(fromPath, toPath) {
-              const isRollback = basename(String(fromPath)).startsWith(
-                "owner.reclaim.",
-              );
-              if (
-                fromPath === transactionPath ||
-                (isRollback && !rollbackFailed)
-              ) {
-                if (isRollback) rollbackFailed = true;
-                throw Object.assign(new Error("injected transient busy"), {
-                  code: "EBUSY",
-                });
-              }
-              renameSync(fromPath, toPath);
-            },
+        withTelegramFileTransaction(transactionPath, () => undefined, {
+          recoveryRename(fromPath, toPath) {
+            const isRollback = basename(String(fromPath)).startsWith(
+              "owner.reclaim.",
+            );
+            if (
+              fromPath === transactionPath ||
+              (isRollback && !rollbackFailed)
+            ) {
+              if (isRollback) rollbackFailed = true;
+              throw Object.assign(new Error("injected transient busy"), {
+                code: "EBUSY",
+              });
+            }
+            renameSync(fromPath, toPath);
           },
-        ),
+        }),
       /injected transient busy/,
     );
     assert.deepEqual(readdirSync(transactionPath), [
@@ -426,10 +393,7 @@ test("Lock transaction reclaims an inactive same-process marker after rollback f
   try {
     mkdirSync(transactionPath, { mode: 0o700 });
     writeFileSync(
-      join(
-        transactionPath,
-        "owner.dead-main-before-rollback-failure.json",
-      ),
+      join(transactionPath, "owner.dead-main-before-rollback-failure.json"),
       JSON.stringify({
         pid: 2_147_483_647,
         acquiredAtMs: Date.now(),
@@ -439,23 +403,19 @@ test("Lock transaction reclaims an inactive same-process marker after rollback f
     );
     assert.throws(
       () =>
-        withTelegramFileTransaction(
-          transactionPath,
-          () => undefined,
-          {
-            recoveryRename(fromPath, toPath) {
-              if (
-                fromPath === transactionPath ||
-                basename(String(fromPath)).startsWith("owner.reclaim.")
-              ) {
-                throw Object.assign(new Error("injected rollback busy"), {
-                  code: "EBUSY",
-                });
-              }
-              renameSync(fromPath, toPath);
-            },
+        withTelegramFileTransaction(transactionPath, () => undefined, {
+          recoveryRename(fromPath, toPath) {
+            if (
+              fromPath === transactionPath ||
+              basename(String(fromPath)).startsWith("owner.reclaim.")
+            ) {
+              throw Object.assign(new Error("injected rollback busy"), {
+                code: "EBUSY",
+              });
+            }
+            renameSync(fromPath, toPath);
           },
-        ),
+        }),
       AggregateError,
     );
     assert.match(readdirSync(transactionPath)[0], /^owner\.reclaim\./u);
@@ -611,31 +571,26 @@ test("Delayed stale recovery cannot claim a replacement generation", () => {
     );
     assert.throws(
       () =>
-        withTelegramFileTransaction(
-          transactionPath,
-          () => undefined,
-          {
-            recoveryRename(fromPath, toPath) {
-              if (
-                !replaced &&
-                basename(String(fromPath)) === "owner.stale-generation.json"
-              ) {
-                replaced = true;
-                rmSync(transactionPath, { recursive: true, force: true });
-                mkdirSync(transactionPath, { mode: 0o700 });
-                writeFileSync(
-                  join(
-                    transactionPath,
-                    "owner.replacement-generation.json",
-                  ),
-                  JSON.stringify(replacementOwner),
-                  { mode: 0o600 },
-                );
-              }
-              renameSync(fromPath, toPath);
-            },
+        withTelegramFileTransaction(transactionPath, () => undefined, {
+          attempts: 2,
+          retryDelayMs: 0,
+          recoveryRename(fromPath, toPath) {
+            if (
+              !replaced &&
+              basename(String(fromPath)) === "owner.stale-generation.json"
+            ) {
+              replaced = true;
+              rmSync(transactionPath, { recursive: true, force: true });
+              mkdirSync(transactionPath, { mode: 0o700 });
+              writeFileSync(
+                join(transactionPath, "owner.replacement-generation.json"),
+                JSON.stringify(replacementOwner),
+                { mode: 0o600 },
+              );
+            }
+            renameSync(fromPath, toPath);
           },
-        ),
+        }),
       /Timed out acquiring Telegram lock transaction/,
     );
     assert.deepEqual(
@@ -675,9 +630,13 @@ test("Lock transaction fails closed on an unverified guard", () => {
   const temp = createTempLockPath();
   try {
     writeFileSync(`${temp.path}.transaction`, "");
-    const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
     assert.throws(
-      () => lock.acquire({ cwd: "/repo" }),
+      () =>
+        withTelegramFileTransaction(
+          `${temp.path}.transaction`,
+          () => undefined,
+          { attempts: 2, retryDelayMs: 0 },
+        ),
       /Timed out acquiring Telegram lock transaction/,
     );
     assert.equal(readFileSync(`${temp.path}.transaction`, "utf8"), "");
@@ -691,9 +650,12 @@ test("Lock transaction fails closed on an unverified directory guard", () => {
   const transactionPath = `${temp.path}.transaction`;
   try {
     mkdirSync(transactionPath, { mode: 0o700 });
-    const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
     assert.throws(
-      () => lock.acquire({ cwd: "/repo" }),
+      () =>
+        withTelegramFileTransaction(transactionPath, () => undefined, {
+          attempts: 2,
+          retryDelayMs: 0,
+        }),
       /Timed out acquiring Telegram lock transaction/,
     );
     assert.equal(statSync(transactionPath).isDirectory(), true);
@@ -737,11 +699,10 @@ test("Lock transaction elects exactly one concurrent child process", async () =>
     writeFileSync(startPath, "start");
     const results = await Promise.all(children.map((child) => child.result));
     assert.equal(results.filter((result) => result.ok).length, 1);
-    const persisted = readLocks(temp.path)[TELEGRAM_LOCK_KEY] as { pid: number };
-    assert.equal(
-      persisted.pid,
-      results.find((result) => result.ok)?.pid,
-    );
+    const persisted = readLocks(temp.path)[TELEGRAM_LOCK_KEY] as {
+      pid: number;
+    };
+    assert.equal(persisted.pid, results.find((result) => result.ok)?.pid);
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
@@ -805,7 +766,10 @@ test("Lock transaction preserves keys acquired by concurrent profiles", async ()
     );
     writeFileSync(startPath, "start");
     const results = await Promise.all(children.map((child) => child.result));
-    assert.equal(results.every((result) => result.ok), true);
+    assert.equal(
+      results.every((result) => result.ok),
+      true,
+    );
     const persisted = readLocks(temp.path);
     assert.deepEqual(Object.keys(persisted).sort(), [...keys].sort());
   } finally {
@@ -977,12 +941,40 @@ test("Lock election cannot replace an observed stale owner after its lease refre
       { cwd: "/repo" },
       {
         election: true,
-        expectedOwner:
-          observed.kind === "stale" ? observed.lock : undefined,
+        expectedOwner: observed.kind === "stale" ? observed.lock : undefined,
       },
     );
     assert.equal(result.ok, false);
     assert.equal(leader.owns({ cwd: "/repo" }), true);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Lock runtime applies the eight-second bus leader stale threshold", () => {
+  const temp = createTempLockPath();
+  try {
+    let nowMs = 1000;
+    const leader = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "leader",
+      getNowMs: () => nowMs,
+      staleHeartbeatMs: TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
+    });
+    assert.equal(leader.acquire({ cwd: "/leader" }).ok, true);
+    const follower = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 11,
+      instanceId: "follower",
+      getNowMs: () => nowMs,
+      staleHeartbeatMs: TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
+      isProcessAlive: () => true,
+    });
+    nowMs = 8999;
+    assert.equal(follower.getState().kind, "active-elsewhere");
+    nowMs = 9001;
+    assert.equal(follower.getState().kind, "stale");
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
@@ -1039,7 +1031,10 @@ test("Lock runtime mints collision-resistant epochs independently of heartbeat t
     });
     const secondResult = second.acquire({ cwd: "/repo" });
     assert.equal(secondResult.ok, true);
-    assert.equal(typeof (firstResult.ok && firstResult.lock.leaderEpoch), "string");
+    assert.equal(
+      typeof (firstResult.ok && firstResult.lock.leaderEpoch),
+      "string",
+    );
     assert.notEqual(
       firstResult.ok ? firstResult.lock.leaderEpoch : undefined,
       secondResult.ok ? secondResult.lock.leaderEpoch : undefined,
@@ -1156,6 +1151,73 @@ test("Lock runtime treats stale bus heartbeats as replaceable even when pid is a
       leaderEpoch: 3000,
       runtimeGeneration: 1,
     });
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Stale leader election admits one observed-owner candidate and fences the old leader", () => {
+  const temp = createTempLockPath();
+  try {
+    let nowMs = 1000;
+    const leader = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "leader",
+      runtimeGeneration: 1,
+      getNowMs: () => nowMs,
+      mintLeaderEpoch: () => "leader-epoch",
+      staleHeartbeatMs: TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
+    });
+    assert.equal(leader.acquire({ cwd: "/leader" }).ok, true);
+    const createCandidate = (pid: number, instanceId: string) =>
+      createTelegramLockRuntime({
+        locksPath: temp.path,
+        pid,
+        instanceId,
+        runtimeGeneration: pid,
+        getNowMs: () => nowMs,
+        mintLeaderEpoch: () => `${instanceId}-epoch`,
+        staleHeartbeatMs: TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
+        isProcessAlive: () => true,
+      });
+    const first = createCandidate(11, "candidate-a");
+    const second = createCandidate(12, "candidate-b");
+    nowMs = 9001;
+    const firstObservation = first.getState();
+    const secondObservation = second.getState();
+    assert.equal(firstObservation.kind, "stale");
+    assert.equal(secondObservation.kind, "stale");
+    assert.equal(
+      first.acquire(
+        { cwd: "/candidate-a" },
+        {
+          election: true,
+          expectedOwner:
+            firstObservation.kind === "stale"
+              ? firstObservation.lock
+              : undefined,
+        },
+      ).ok,
+      true,
+    );
+    assert.equal(
+      second.acquire(
+        { cwd: "/candidate-b" },
+        {
+          election: true,
+          expectedOwner:
+            secondObservation.kind === "stale"
+              ? secondObservation.lock
+              : undefined,
+        },
+      ).ok,
+      false,
+    );
+    assert.equal(first.owns({ cwd: "/candidate-a" }), true);
+    assert.equal(second.owns({ cwd: "/candidate-b" }), false);
+    assert.equal(leader.refresh({ cwd: "/leader" }), false);
+    assert.equal(first.getOwnedLeaderEpoch(), "candidate-a-epoch");
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
@@ -1540,19 +1602,16 @@ test("Locked polling runtime hands same-process ownership to a replacement insta
 test("Default runtime generation supersedes a pre-reload same-process counter", () => {
   const temp = createTempLockPath();
   try {
-    writeLocks(
-      temp.path,
-      {
-        [TELEGRAM_LOCK_KEY]: {
-          pid: 10,
-          cwd: "/repo",
-          instanceId: "10:old-reload",
-          heartbeatMs: Date.now(),
-          leaderEpoch: "old-epoch",
-          runtimeGeneration: 2,
-        },
+    writeLocks(temp.path, {
+      [TELEGRAM_LOCK_KEY]: {
+        pid: 10,
+        cwd: "/repo",
+        instanceId: "10:old-reload",
+        heartbeatMs: Date.now(),
+        leaderEpoch: "old-epoch",
+        runtimeGeneration: 2,
       },
-    );
+    });
     const replacement = createTelegramLockRuntime({
       locksPath: temp.path,
       pid: 10,
@@ -1772,6 +1831,7 @@ test("Locked polling runtime refreshes ownership during slow startup", async () 
       stopPolling: async () => undefined,
       updateStatus: () => undefined,
       ownershipCheckMs: 5,
+      ownershipRefreshMs: 5,
     });
 
     const started = runtime.start({ cwd: "/repo" });
@@ -1787,6 +1847,50 @@ test("Locked polling runtime refreshes ownership during slow startup", async () 
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
+});
+
+test("Locked polling runtime checks ownership more often than it refreshes the lease", async () => {
+  let ownsCalls = 0;
+  let refreshCalls = 0;
+  const lock = {
+    acquire: () => ({
+      ok: true,
+      lock: { pid: 10, cwd: "/repo" },
+      replacedStale: false as const,
+    }),
+    release: () => ({ kind: "inactive" as const }),
+    getState: () => ({
+      kind: "active-here" as const,
+      lock: { pid: 10, cwd: "/repo" },
+    }),
+    getStatusLabel: () => "active here",
+    getOwnedLeaderEpoch: () => undefined,
+    owns: () => {
+      ownsCalls += 1;
+      return true;
+    },
+    commitIfOwned: (commit: () => void) => {
+      commit();
+      return true;
+    },
+    refresh: () => {
+      refreshCalls += 1;
+      return true;
+    },
+  };
+  const runtime = createTelegramLockedPollingRuntime({
+    lock,
+    hasBotToken: () => true,
+    ownershipCheckMs: 5,
+    ownershipRefreshMs: 20,
+    startPolling: async () => undefined,
+    stopPolling: async () => undefined,
+    updateStatus: () => undefined,
+  });
+  assert.equal((await runtime.start({ cwd: "/repo" })).ok, true);
+  await waitForCondition(() => ownsCalls >= 4 && refreshCalls >= 2);
+  assert.ok(ownsCalls >= refreshCalls * 2);
+  await runtime.stop();
 });
 
 test("Locked polling runtime fails startup closed after ownership loss", async () => {
@@ -2143,9 +2247,16 @@ test("Locked polling runtime records refresh write failures instead of throwing 
   }[] = [];
   let refreshCalls = 0;
   const lock = {
-    acquire: () => ({ ok: true, lock: { pid: 10, cwd: "/repo" }, replacedStale: false as const }),
+    acquire: () => ({
+      ok: true,
+      lock: { pid: 10, cwd: "/repo" },
+      replacedStale: false as const,
+    }),
     release: () => ({ kind: "inactive" as const }),
-    getState: () => ({ kind: "active-here" as const, lock: { pid: 10, cwd: "/repo" } }),
+    getState: () => ({
+      kind: "active-here" as const,
+      lock: { pid: 10, cwd: "/repo" },
+    }),
     getStatusLabel: () => "active here",
     getOwnedLeaderEpoch: () => undefined,
     owns: () => true,
@@ -2163,6 +2274,7 @@ test("Locked polling runtime records refresh write failures instead of throwing 
     lock,
     hasBotToken: () => true,
     ownershipCheckMs: 1,
+    ownershipRefreshMs: 1,
     startPolling: async () => {
       events.push("start");
     },

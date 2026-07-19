@@ -22,7 +22,8 @@ import { basename, dirname, join } from "node:path";
 import { resolveTelegramOwnersPath } from "./paths.ts";
 
 export const TELEGRAM_LOCK_KEY = "default";
-export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 5_000;
+export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 8_000;
+const TELEGRAM_OWNERSHIP_REFRESH_MS = 2_000;
 const TELEGRAM_LOCK_WRITE_RETRY_ATTEMPTS = 5;
 const TELEGRAM_LOCK_WRITE_RETRY_DELAY_MS = 25;
 const TELEGRAM_LOCK_TRANSACTION_ATTEMPTS = 80;
@@ -181,8 +182,7 @@ interface TelegramLockTransactionOwner {
   generation: string;
 }
 
-const TELEGRAM_TRANSACTION_OWNER_PATTERN =
-  /^owner\.([A-Za-z0-9-]+)\.json$/u;
+const TELEGRAM_TRANSACTION_OWNER_PATTERN = /^owner\.([A-Za-z0-9-]+)\.json$/u;
 
 function getLockTransactionOwnerFile(generation: string): string {
   return `owner.${generation}.json`;
@@ -350,6 +350,8 @@ type TelegramTransactionGlobal = typeof globalThis & {
 
 export interface TelegramFileTransactionOptions {
   recoveryRename?: typeof renameSync;
+  attempts?: number;
+  retryDelayMs?: number;
 }
 
 function getActiveTransactionReclaims(): Set<string> {
@@ -366,7 +368,13 @@ function reclaimAbandonedDirectoryGuard(
   } catch {
     return false;
   }
-  const entries = readdirSync(path);
+  let entries: string[];
+  try {
+    entries = readdirSync(path);
+  } catch {
+    // Another recovery candidate may remove the observed guard after lstat.
+    return false;
+  }
   if (entries.length !== 1) return false;
   const entry = entries[0];
   let observedPid: number;
@@ -382,10 +390,7 @@ function reclaimAbandonedDirectoryGuard(
     observedReclaimGeneration = match[2];
   }
   const activeReclaims = getActiveTransactionReclaims();
-  if (
-    observedPid === process.pid &&
-    observedReclaimGeneration !== undefined
-  ) {
+  if (observedPid === process.pid && observedReclaimGeneration !== undefined) {
     if (activeReclaims.has(observedReclaimGeneration)) return false;
   } else if (isProcessAlive(observedPid)) {
     return false;
@@ -564,10 +569,7 @@ function recoverAbandonedLockTransaction(
   }
 
   const recoveryGuardPath = `${path}.recovery`;
-  const recoveryOwner = acquireLegacyRecoveryGuard(
-    recoveryGuardPath,
-    options,
-  );
+  const recoveryOwner = acquireLegacyRecoveryGuard(recoveryGuardPath, options);
   if (!recoveryOwner) return undefined;
   let recoveredOwner: TelegramLockTransactionOwner | undefined;
   try {
@@ -606,24 +608,28 @@ function acquireLockTransaction(
   path: string,
   options: TelegramFileTransactionOptions = {},
 ): TelegramLockTransactionOwner {
+  const attempts = Math.max(
+    1,
+    options.attempts ?? TELEGRAM_LOCK_TRANSACTION_ATTEMPTS,
+  );
+  const retryDelayMs = Math.max(
+    0,
+    options.retryDelayMs ?? TELEGRAM_LOCK_TRANSACTION_RETRY_DELAY_MS,
+  );
   mkdirSync(dirname(path), { recursive: true });
-  for (
-    let attempt = 0;
-    attempt < TELEGRAM_LOCK_TRANSACTION_ATTEMPTS;
-    attempt += 1
-  ) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       return createLockTransactionGuard(path);
     } catch (error) {
       if (!isLockTransactionContentionError(error, path)) throw error;
       const recoveredOwner = recoverAbandonedLockTransaction(path, options);
       if (recoveredOwner !== undefined) return recoveredOwner;
-      if (attempt === TELEGRAM_LOCK_TRANSACTION_ATTEMPTS - 1) {
+      if (attempt === attempts - 1) {
         throw new Error(
           `Timed out acquiring Telegram lock transaction: ${path}`,
         );
       }
-      sleepSync(TELEGRAM_LOCK_TRANSACTION_RETRY_DELAY_MS);
+      sleepSync(retryDelayMs);
     }
   }
   throw new Error(`Failed to acquire Telegram lock transaction: ${path}`);
@@ -1140,6 +1146,7 @@ export interface TelegramLockedPollingRuntimeDeps<
     details?: Record<string, unknown>,
   ) => void;
   ownershipCheckMs?: number;
+  ownershipRefreshMs?: number;
 }
 
 function snapshotLockContext(ctx: TelegramLockContext): TelegramLockContext {
@@ -1151,16 +1158,20 @@ export function createTelegramLockedPollingRuntime<
 >(
   deps: TelegramLockedPollingRuntimeDeps<TContext>,
 ): TelegramLockedPollingRuntime<TContext> {
-  let ownershipInterval: ReturnType<typeof setInterval> | undefined;
+  let ownershipCheckInterval: ReturnType<typeof setInterval> | undefined;
+  let ownershipRefreshInterval: ReturnType<typeof setInterval> | undefined;
   let ownershipStop: Promise<void> | undefined;
   let takeoverCandidate: TelegramLockEntry | undefined;
   let sessionAutoStartRun: Promise<void> | undefined;
   let sessionAutoStartGeneration = 0;
   const ownershipCheckMs = deps.ownershipCheckMs ?? 1000;
+  const ownershipRefreshMs =
+    deps.ownershipRefreshMs ?? TELEGRAM_OWNERSHIP_REFRESH_MS;
   const stopOwnershipWatcher = () => {
-    if (!ownershipInterval) return;
-    clearInterval(ownershipInterval);
-    ownershipInterval = undefined;
+    if (ownershipCheckInterval) clearInterval(ownershipCheckInterval);
+    if (ownershipRefreshInterval) clearInterval(ownershipRefreshInterval);
+    ownershipCheckInterval = undefined;
+    ownershipRefreshInterval = undefined;
   };
   const suspendPolling = async () => {
     sessionAutoStartGeneration += 1;
@@ -1190,15 +1201,24 @@ export function createTelegramLockedPollingRuntime<
   const startOwnershipWatcher = (ctx: TContext) => {
     const owner = snapshotLockContext(ctx);
     stopOwnershipWatcher();
-    ownershipInterval = setInterval(() => {
+    ownershipCheckInterval = setInterval(() => {
+      try {
+        if (deps.lock.owns(owner)) return;
+      } catch (error) {
+        deps.recordRuntimeEvent?.("lock", error, { phase: "check" });
+      }
+      stopAfterOwnershipLoss();
+    }, ownershipCheckMs);
+    ownershipRefreshInterval = setInterval(() => {
       try {
         if (deps.lock.refresh(owner)) return;
       } catch (error) {
         deps.recordRuntimeEvent?.("lock", error, { phase: "refresh" });
       }
       stopAfterOwnershipLoss();
-    }, ownershipCheckMs);
-    ownershipInterval.unref?.();
+    }, ownershipRefreshMs);
+    ownershipCheckInterval.unref?.();
+    ownershipRefreshInterval.unref?.();
   };
   const runOwnedPollingStart = async (
     ctx: TContext,

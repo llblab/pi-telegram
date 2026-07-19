@@ -147,7 +147,7 @@ A registered instance exposes:
 
 ## Leader Election
 
-Leader election is heartbeat-gated and lock-backed:
+Leader election is heartbeat-gated and lock-backed. The polling owner checks exact lock ownership every second, refreshes its durable lease every two seconds, and becomes stale after eight seconds; the serialized expected-owner transaction remains the final cross-platform election authority.
 
 1. On startup, read the Telegram lock.
 2. If no leader exists, acquire leadership and start polling.

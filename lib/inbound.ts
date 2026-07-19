@@ -23,8 +23,7 @@ const MAX_INBOUND_HANDLER_OUTPUT_LENGTH = 12_000;
 const MAX_INBOUND_HANDLER_FAILURE_STREAM_LENGTH = 4_000;
 
 type TelegramInboundCommandTemplateConfig =
-  | string
-  | CommandTemplateObjectConfig;
+  string | CommandTemplateObjectConfig;
 
 export interface TelegramInboundHandlerConfig {
   match?: string | string[];
@@ -74,10 +73,6 @@ export interface TelegramInboundHandlerExecResult {
   killed: boolean;
 }
 
-export interface TelegramInboundHandlerRuntimeContext {
-  cwd: string;
-}
-
 export interface TelegramInboundHandlerRuntimeDeps<TContext> {
   getHandlers: () => TelegramInboundHandlerConfig[] | undefined;
   execCommand: (
@@ -102,9 +97,7 @@ export interface TelegramInboundHandlerRuntime<TContext> {
 }
 
 export type TelegramInboundProgrammaticHandlerResult =
-  | string
-  | { text: string }
-  | undefined;
+  string | { text: string } | undefined;
 
 export interface TelegramInboundProgrammaticHandlerInput {
   kind: string;
@@ -177,12 +170,6 @@ export function getTelegramInboundProgrammaticHandlers(
     ...(registry.handlers.get(kind) ?? []),
     ...(kind === "*" ? [] : (registry.handlers.get("*") ?? [])),
   ];
-}
-
-export function hasTelegramInboundHandler(kind?: string): boolean {
-  const registry = getOrCreateInboundHandlerRegistry();
-  if (kind !== undefined) return (registry.handlers.get(kind)?.length ?? 0) > 0;
-  return Array.from(registry.handlers.values()).some((list) => list.length > 0);
 }
 
 export function clearTelegramInboundHandlers(): void {
@@ -279,13 +266,6 @@ export function findTelegramInboundHandlers(
       typeof handler === "object" &&
       telegramInboundHandlerMatchesFile(handler, file),
   );
-}
-
-export function findTelegramInboundHandler(
-  handlers: TelegramInboundHandlerConfig[] | undefined,
-  file: TelegramInboundHandlerFile,
-): TelegramInboundHandlerConfig | undefined {
-  return findTelegramInboundHandlers(handlers, file)[0];
 }
 
 function hasInboundFilePlaceholder(value: string): boolean {
@@ -420,9 +400,13 @@ function formatTelegramInboundHandlerFailure(
     `Inbound handler exited with code ${result.code}${result.killed ? " (killed)" : ""}`,
   ];
   if (result.stderr.trim())
-    parts.push(`stderr:\n${truncateTelegramInboundFailureStream(result.stderr)}`);
+    parts.push(
+      `stderr:\n${truncateTelegramInboundFailureStream(result.stderr)}`,
+    );
   if (result.stdout.trim())
-    parts.push(`stdout:\n${truncateTelegramInboundFailureStream(result.stdout)}`);
+    parts.push(
+      `stdout:\n${truncateTelegramInboundFailureStream(result.stdout)}`,
+    );
   return parts.join("\n\n");
 }
 
@@ -445,7 +429,13 @@ async function executeTelegramInboundHandlerInvocation(
     cwd,
     timeout,
     ...(typeof handler === "object" && handler.retry !== undefined
-      ? { retry: resolveTelegramInboundNumericControlField(handler.retry, {}, "retry") }
+      ? {
+          retry: resolveTelegramInboundNumericControlField(
+            handler.retry,
+            {},
+            "retry",
+          ),
+        }
       : {}),
     ...(stdin !== undefined ? { stdin } : {}),
   });
@@ -519,7 +509,13 @@ async function executeTelegramTextHandlerInvocation(
     timeout,
     stdin: text,
     ...(typeof handler === "object" && handler.retry !== undefined
-      ? { retry: resolveTelegramInboundNumericControlField(handler.retry, {}, "retry") }
+      ? {
+          retry: resolveTelegramInboundNumericControlField(
+            handler.retry,
+            {},
+            "retry",
+          ),
+        }
       : {}),
   });
   if (result.code !== 0)

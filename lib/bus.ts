@@ -43,8 +43,6 @@ import {
 import type { TelegramTarget } from "./target.ts";
 import { resolveAgentDir } from "./paths.ts";
 
-export type TelegramBusRole = "leader" | "follower";
-
 export interface TelegramBusProcessRuntime {
   instanceId: string;
   manualFollowerOwnerId: string;
@@ -617,7 +615,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
       deps.recordRuntimeEvent?.(
         "bus",
         response?.kind === "bus.ack"
-          ? response.message ?? "Follower rejected forwarded Telegram update."
+          ? (response.message ?? "Follower rejected forwarded Telegram update.")
           : "Follower returned no forwarding acknowledgement.",
         {
           phase: "foreign-update-forward-rejected",
@@ -1408,8 +1406,7 @@ function parseForwardMessageEnvelope(
         (value.forwardCommentBatchPosition === "comment" ||
           value.forwardCommentBatchPosition === "forward")
           ? {
-              forwardCommentBatchPosition:
-                value.forwardCommentBatchPosition,
+              forwardCommentBatchPosition: value.forwardCommentBatchPosition,
             }
           : {}),
         sentAtMs: value.sentAtMs,

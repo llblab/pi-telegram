@@ -196,19 +196,6 @@ export function createTelegramSessionContextStore<TContext>(
   };
 }
 
-export function createTelegramSessionContextTracker(
-  store: Pick<TelegramSessionContextStore<ExtensionContext>, "set" | "clear">,
-): TelegramSessionLifecycleHooks {
-  return {
-    onSessionStart: async (_event, ctx) => {
-      store.set(ctx);
-    },
-    onSessionShutdown: async (_event, ctx) => {
-      store.clear(ctx);
-    },
-  };
-}
-
 export function createTelegramSessionGenerationFence(
   store: TelegramSessionContextStore<ExtensionContext>,
   hooks: TelegramSessionLifecycleHooks,

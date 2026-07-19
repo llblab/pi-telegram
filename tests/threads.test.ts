@@ -491,6 +491,35 @@ test("Thread store snapshot commit is fenced by exact transport ownership", asyn
   }
 });
 
+test("Thread store skips semantically unchanged state snapshots", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-state-semantic-"));
+  const path = join(dir, "state.json");
+  try {
+    let nowMs = 1000;
+    const store = createTelegramTopicTargetStore({
+      path,
+      getNowMs: () => nowMs,
+    });
+    store.setBotState({ threadMode: "enabled" });
+    await store.persist();
+    const initial = await readFile(path, "utf8");
+    nowMs = 2000;
+    await store.persist();
+    assert.equal(await readFile(path, "utf8"), initial);
+    store.setStatusSnapshot({ diagnostics: { recentEvents: 1 } });
+    await store.persist();
+    const diagnostic = await readFile(path, "utf8");
+    assert.notEqual(diagnostic, initial);
+    assert.equal(JSON.parse(diagnostic).writtenAtMs, 2000);
+    nowMs = 3000;
+    store.setStatusSnapshot({ diagnostics: { recentEvents: 1 } });
+    await store.persist();
+    assert.equal(await readFile(path, "utf8"), diagnostic);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("Thread store load does not clobber unpersisted thread mutations", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-state-"));
   const path = join(dir, "state.json");
@@ -506,7 +535,6 @@ test("Thread store load does not clobber unpersisted thread mutations", async ()
       slot: "A",
     });
     await seeded.persist();
-
     const store = createTelegramTopicTargetStore({ path });
     await store.load();
     store.upsert({
@@ -521,7 +549,6 @@ test("Thread store load does not clobber unpersisted thread mutations", async ()
     });
     await store.load();
     await store.persist();
-
     const reloaded = createTelegramTopicTargetStore({ path });
     await reloaded.load();
     assert.equal(reloaded.getByProfileKey("cwd:/repo")?.target.threadId, 42);
@@ -549,9 +576,7 @@ test("Thread store concurrent persists use unique temp files", async () => {
       updatedAtMs: 1000,
       slot: "A",
     });
-
     await Promise.all([store.persist(), store.persist(), store.persist()]);
-
     const file = JSON.parse(await readFile(path, "utf8"));
     assert.equal(file.threads.length, 1);
     assert.equal(file.threads[0].target.threadId, 42);
@@ -592,22 +617,26 @@ test("Thread store retains mutations that arrive during snapshot commit", async 
       updatedAtMs: 1000,
       slot: "A",
     });
-
     await store.persist();
     let file = JSON.parse(await readFile(path, "utf8"));
     assert.deepEqual(
-      file.threads.map((record: { target: { threadId: number } }) =>
-        record.target.threadId
+      file.threads.map(
+        (record: { target: { threadId: number } }) => record.target.threadId,
       ),
       [42],
     );
-    assert.equal(store.getByProfileKey("manual:follower-b")?.target.threadId, 43);
+    assert.equal(
+      store.getByProfileKey("manual:follower-b")?.target.threadId,
+      43,
+    );
 
     await store.persist();
     file = JSON.parse(await readFile(path, "utf8"));
     assert.deepEqual(
       file.threads
-        .map((record: { target: { threadId: number } }) => record.target.threadId)
+        .map(
+          (record: { target: { threadId: number } }) => record.target.threadId,
+        )
         .sort(),
       [42, 43],
     );
@@ -627,7 +656,6 @@ test("Thread store persists bot-wide capability state separately from threads", 
       lastReconcileAction: "thread-mode-unavailable",
     });
     await store.persist();
-
     const reloaded = createTelegramTopicTargetStore({ path });
     await reloaded.load();
     assert.deepEqual(reloaded.getBotState(), {
@@ -676,7 +704,6 @@ test("Thread store migrates legacy displayName fields to threadName on load", as
 
     const store = createTelegramTopicTargetStore({ path });
     await store.load();
-
     assert.equal(store.getByProfileKey("cwd:/repo")?.threadName, "Cedar");
     assert.equal(
       store.getIdentityByProfileKey("cwd:/repo")?.threadName,
@@ -701,7 +728,6 @@ test("Thread store returns defensive copies and prunes offline/stale observation
     instanceId: "inst-a",
   });
   record.target.threadId = 99;
-
   assert.deepEqual(store.getByProfileKey("cwd:/repo")?.target, {
     chatId: -1001,
     threadId: 42,
@@ -714,7 +740,6 @@ test("Thread store returns defensive copies and prunes offline/stale observation
   assert.equal(store.getByProfileKey("cwd:/repo")?.threadName, "Blue Unit");
   assert.equal(store.markOfflineByInstanceId("inst-a"), 1);
   assert.equal(store.getByProfileKey("cwd:/repo"), undefined);
-
   store.upsert({
     profileKey: "cwd:/repo",
     target: { chatId: -1001, threadId: 42 },
@@ -840,7 +865,6 @@ test("Thread slot allocator starts from the cursor instead of higher live slots"
     slot: "I",
   });
   store.setBotState({ lastSlot: "D" });
-
   assert.equal(store.allocateSlot("manual:new"), "E");
 });
 
@@ -857,7 +881,6 @@ test("Thread slot allocator treats unexpired reservations as occupied", () => {
     updatedAtMs: 900,
     expiresAtMs: 2000,
   });
-
   assert.equal(store.allocateSlot("cwd:/repo"), "B");
 });
 
@@ -874,7 +897,6 @@ test("Thread slot allocator treats live pending provisions as occupied", () => {
     startedAtMs: 900,
     expiresAtMs: 2000,
   });
-
   assert.equal(store.allocateSlot("cwd:/repo"), "B");
 });
 
@@ -962,7 +984,6 @@ test("Thread store retains expired targeted pending provisions for reconciler cl
       getNowMs: () => 2000,
     });
     await store.load();
-
     assert.deepEqual(store.listPendingProvisions(), [
       {
         id: "expired-targeted",
@@ -999,7 +1020,6 @@ test("Thread slot allocator continues after persisted last slot when no threads 
       getNowMs: () => 2000,
     });
     await store.load();
-
     assert.equal(store.allocateSlot("manual:new"), "I");
     store.upsert({
       profileKey: "manual:new",
@@ -1290,7 +1310,6 @@ test("Thread store preserves thread identity after stale target pruning", async 
       owner: { kind: "leader", cwd: "/repo", instanceId: "leader-b" },
       profileKey: "cwd:/repo",
     });
-
     assert.equal(result.record.threadName, "Axial");
     assert.equal(result.record.slot, "A");
     assert.deepEqual(calls, [
@@ -1554,7 +1573,6 @@ test("Thread provisioner persists pending provision while creating a fresh topic
       instanceId: "inst-a",
       profileKey: "manual:inst-a",
     });
-
     assert.equal(result.reused, false);
     assert.equal(result.record.status, "active");
     assert.deepEqual(store.listPendingProvisions(), []);
@@ -1683,7 +1701,9 @@ test("Thread provisioner fails closed before mutation without leader ownership",
 });
 
 test("Thread provisioner preserves its intent and stops binding after create loses ownership", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-provision-epoch-loss-"));
+  const dir = await mkdtemp(
+    join(tmpdir(), "pi-telegram-provision-epoch-loss-"),
+  );
   const path = join(dir, "state.json");
   let currentEpoch: number | undefined = 1;
   try {
@@ -1706,7 +1726,6 @@ test("Thread provisioner preserves its intent and stops binding after create los
       provision({ instanceId: "inst-a", profileKey: "manual:inst-a" }),
       /lost leader ownership/,
     );
-
     assert.deepEqual(store.list(), []);
     assert.deepEqual(store.listPendingProvisions(), [
       {
@@ -1792,7 +1811,6 @@ test("Thread provisioner keeps targeted pending provision after post-create bind
         }),
       /binding persist failed/,
     );
-
     assert.deepEqual(store.listPendingProvisions(), [
       {
         id: "provision:inst-a:A:2000",
@@ -2647,7 +2665,6 @@ test("Own bus topic provisioner assigns a leader topic through the common provis
         events.push({ category, message, details });
       },
     });
-
     assert.deepEqual(result, {
       target: { chatId: 7, threadId: 11 },
       slot: "A",
@@ -2714,7 +2731,6 @@ test("Own bus topic provisioner cleans previous leader before reusing promoted f
       },
       recordEvent() {},
     });
-
     assert.deepEqual(result, {
       target: { chatId: 7, threadId: 12 },
       slot: "C",
@@ -2773,7 +2789,6 @@ test("Own bus topic provisioner reuses promoted follower topic", async () => {
       },
       recordEvent() {},
     });
-
     assert.deepEqual(result, {
       target: { chatId: 7, threadId: 12 },
       slot: "C",
@@ -2831,7 +2846,6 @@ test("Own bus topic provisioner restores a promoted leader session handoff", asy
       },
       recordEvent() {},
     });
-
     assert.deepEqual(result, {
       target: { chatId: 7, threadId: 12 },
       slot: "C",
@@ -2883,7 +2897,6 @@ test("Own bus topic provisioner does not claim pending follower topics", async (
       },
       recordEvent() {},
     });
-
     assert.deepEqual(result, {
       target: { chatId: 7, threadId: 11 },
       slot: "C",
@@ -2931,7 +2944,6 @@ test("Own bus topic provisioner ignores non-current offline history", async () =
       },
       recordEvent() {},
     });
-
     assert.deepEqual(result, {
       target: { chatId: 7, threadId: 11 },
       slot: "A",
@@ -2980,7 +2992,6 @@ test("Own bus topic provisioner reuses a current topic without visible startup p
       },
       recordEvent() {},
     });
-
     assert.deepEqual(result, {
       target: { chatId: 7, threadId: 10 },
       slot: "A",

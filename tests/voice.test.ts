@@ -281,105 +281,76 @@ test("Voice synthesis provider registry accepts both function and object form", 
   assert.equal(typeof providers[1], "object");
 });
 
-test("Voice synthesis generated ids skip existing registry entries", () => {
-  registerTelegramVoiceSynthesisProvider(() => Promise.resolve("stable.ogg"), {
-    id: "voice-synthesis-provider-0",
+interface VoiceProviderRegistryFixture {
+  label: string;
+  generatedId: string;
+  fixtureId: string;
+  register(value: string, id?: string): () => void;
+  count(): number;
+}
+
+const voiceProviderRegistries: VoiceProviderRegistryFixture[] = [
+  {
+    label: "synthesis",
+    generatedId: "voice-synthesis-provider-0",
+    fixtureId: "fixture-tts",
+    register: (value, id) =>
+      registerTelegramVoiceSynthesisProvider(
+        () => Promise.resolve(value),
+        id ? { id } : undefined,
+      ),
+    count: () => getTelegramVoiceSynthesisProviders().length,
+  },
+  {
+    label: "transcription",
+    generatedId: "voice-transcription-provider-0",
+    fixtureId: "fixture-stt",
+    register: (value, id) =>
+      registerTelegramVoiceTranscriptionProvider(
+        () => Promise.resolve(value),
+        id ? { id } : undefined,
+      ),
+    count: () => getTelegramVoiceTranscriptionProviders().length,
+  },
+];
+
+for (const registry of voiceProviderRegistries) {
+  test(`Voice ${registry.label} generated ids skip existing registry entries`, () => {
+    registry.register("stable", registry.generatedId);
+    registry.register("generated");
+    assert.equal(registry.count(), 2);
   });
-  registerTelegramVoiceSynthesisProvider(() =>
-    Promise.resolve("generated.ogg"),
-  );
-  assert.equal(getTelegramVoiceSynthesisProviders().length, 2);
-});
 
-test("Voice synthesis stable id stale disposer does not delete replacement", () => {
-  const disposeFirst = registerTelegramVoiceSynthesisProvider(
-    () => Promise.resolve("first.ogg"),
-    { id: "stable" },
-  );
-  registerTelegramVoiceSynthesisProvider(() => Promise.resolve("second.ogg"), {
-    id: "stable",
+  test(`Voice ${registry.label} stable id stale disposer does not delete replacement`, () => {
+    const disposeFirst = registry.register("first", "stable");
+    registry.register("second", "stable");
+    disposeFirst();
+    assert.equal(registry.count(), 1);
   });
-  disposeFirst();
-  assert.equal(getTelegramVoiceSynthesisProviders().length, 1);
-});
 
-test("Voice synthesis fixture re-registers cleanly across lifecycle boundaries", () => {
-  const registerFixture = (generation: string) =>
-    registerTelegramVoiceSynthesisProvider(
-      () => Promise.resolve(`${generation}.ogg`),
-      { id: "fixture-tts" },
-    );
-  const disposeSessionStart = registerFixture("session-start");
-  const disposeResume = registerFixture("resume");
-  const disposeReload = registerFixture("reload");
+  test(`Voice ${registry.label} fixture re-registers cleanly across lifecycle boundaries`, () => {
+    const registerFixture = (generation: string) =>
+      registry.register(generation, registry.fixtureId);
+    const disposeSessionStart = registerFixture("session-start");
+    const disposeResume = registerFixture("resume");
+    const disposeReload = registerFixture("reload");
 
-  assert.equal(getTelegramVoiceSynthesisProviders().length, 1);
-  disposeSessionStart();
-  disposeResume();
-  assert.equal(getTelegramVoiceSynthesisProviders().length, 1);
-  disposeReload();
-  assert.equal(getTelegramVoiceSynthesisProviders().length, 0);
-});
-
-test("Voice synthesis generated ids do not collide after disposal", () => {
-  const disposeFirst = registerTelegramVoiceSynthesisProvider(() =>
-    Promise.resolve("first.ogg"),
-  );
-  registerTelegramVoiceSynthesisProvider(() => Promise.resolve("second.ogg"));
-  disposeFirst();
-  registerTelegramVoiceSynthesisProvider(() => Promise.resolve("third.ogg"));
-  assert.equal(getTelegramVoiceSynthesisProviders().length, 2);
-});
-
-test("Voice transcription generated ids skip existing registry entries", () => {
-  registerTelegramVoiceTranscriptionProvider(() => Promise.resolve("stable"), {
-    id: "voice-transcription-provider-0",
+    assert.equal(registry.count(), 1);
+    disposeSessionStart();
+    disposeResume();
+    assert.equal(registry.count(), 1);
+    disposeReload();
+    assert.equal(registry.count(), 0);
   });
-  registerTelegramVoiceTranscriptionProvider(() =>
-    Promise.resolve("generated"),
-  );
-  assert.equal(getTelegramVoiceTranscriptionProviders().length, 2);
-});
 
-test("Voice transcription stable id stale disposer does not delete replacement", () => {
-  const disposeFirst = registerTelegramVoiceTranscriptionProvider(
-    () => Promise.resolve("first"),
-    { id: "stable" },
-  );
-  registerTelegramVoiceTranscriptionProvider(() => Promise.resolve("second"), {
-    id: "stable",
+  test(`Voice ${registry.label} generated ids do not collide after disposal`, () => {
+    const disposeFirst = registry.register("first");
+    registry.register("second");
+    disposeFirst();
+    registry.register("third");
+    assert.equal(registry.count(), 2);
   });
-  disposeFirst();
-  assert.equal(getTelegramVoiceTranscriptionProviders().length, 1);
-});
-
-test("Voice transcription fixture re-registers cleanly across lifecycle boundaries", () => {
-  const registerFixture = (generation: string) =>
-    registerTelegramVoiceTranscriptionProvider(
-      () => Promise.resolve(generation),
-      { id: "fixture-stt" },
-    );
-  const disposeSessionStart = registerFixture("session-start");
-  const disposeResume = registerFixture("resume");
-  const disposeReload = registerFixture("reload");
-
-  assert.equal(getTelegramVoiceTranscriptionProviders().length, 1);
-  disposeSessionStart();
-  disposeResume();
-  assert.equal(getTelegramVoiceTranscriptionProviders().length, 1);
-  disposeReload();
-  assert.equal(getTelegramVoiceTranscriptionProviders().length, 0);
-});
-
-test("Voice transcription generated ids do not collide after disposal", () => {
-  const disposeFirst = registerTelegramVoiceTranscriptionProvider(() =>
-    Promise.resolve("first"),
-  );
-  registerTelegramVoiceTranscriptionProvider(() => Promise.resolve("second"));
-  disposeFirst();
-  registerTelegramVoiceTranscriptionProvider(() => Promise.resolve("third"));
-  assert.equal(getTelegramVoiceTranscriptionProviders().length, 2);
-});
+}
 
 test("Voice synthesis provider registry clear works reliably for tests", () => {
   registerTelegramVoiceSynthesisProvider(() => Promise.resolve("x"), {

@@ -197,12 +197,6 @@ export function registerTelegramOutboundHandler(
   };
 }
 
-export function hasTelegramOutboundHandler(kind: string): boolean {
-  const registry = getOrCreateOutboundHandlerRegistry();
-  const list = registry.handlers.get(kind);
-  return !!list && list.length > 0;
-}
-
 export function getTelegramOutboundProgrammaticHandlers(
   kind: string,
 ): TelegramOutboundProgrammaticHandler[] {
@@ -953,15 +947,11 @@ export function createTelegramAssistantOutputSender<
   TReplyMarkup = unknown,
 >(deps: {
   recordOwnership?: Replies.TelegramReplyOwnershipRecorder["record"];
-  sendMessage: (
-    body: TelegramSendMessageBody,
-  ) => Promise<TelegramSentMessage>;
+  sendMessage: (body: TelegramSendMessageBody) => Promise<TelegramSentMessage>;
   sendRichMessage: (
     body: TelegramSendRichMessageBody,
   ) => Promise<TelegramSentMessage>;
-  editMessage: (
-    body: TelegramEditMessageTextBody,
-  ) => Promise<unknown>;
+  editMessage: (body: TelegramEditMessageTextBody) => Promise<unknown>;
   getAssistantRenderingMode: () => "rich" | "html";
   execCommand: TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup>["execCommand"];
   getHandlers?: TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup>["getHandlers"];

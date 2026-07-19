@@ -119,32 +119,6 @@ export function isValidTelegramProfileName(name: string): boolean {
   );
 }
 
-/**
- * Resolve bot/session identity from the canonical default or named profile.
- * Shared bridge settings always remain top-level.
- */
-export function resolveTelegramActiveProfile(
-  config: TelegramConfig,
-  profileName?: string,
-): {
-  botToken?: string;
-  botUsername?: string;
-  botId?: number;
-  allowedUserId?: number;
-  lastUpdateId?: number;
-} {
-  const effectiveProfileName = profileName ?? TELEGRAM_DEFAULT_PROFILE_NAME;
-  const profile = config.profiles?.[effectiveProfileName];
-  if (!profile) return {};
-  return {
-    botToken: profile.botToken,
-    botUsername: profile.botUsername,
-    botId: profile.botId,
-    allowedUserId: profile.allowedUserId,
-    lastUpdateId: profile.lastUpdateId,
-  };
-}
-
 /** List defined profile names. */
 export function getTelegramProfileNames(config: TelegramConfig): string[] {
   return Object.keys(config.profiles ?? {}).sort();
@@ -560,10 +534,7 @@ export function createTelegramConfigStore(
         !profileName || profileName === TELEGRAM_DEFAULT_PROFILE_NAME
           ? undefined
           : profileName;
-      if (
-        normalizedProfileName &&
-        !config.profiles?.[normalizedProfileName]
-      ) {
+      if (normalizedProfileName && !config.profiles?.[normalizedProfileName]) {
         return false;
       }
       activeProfileName = normalizedProfileName;
@@ -607,9 +578,8 @@ export function createTelegramConfigStore(
       config = normalized.changed
         ? withTelegramFileTransaction(`${configPath}.transaction`, () => {
             const latestConfig = readTelegramConfigForTransaction(configPath);
-            const latestNormalized = normalizeTelegramDefaultProfileConfig(
-              latestConfig,
-            );
+            const latestNormalized =
+              normalizeTelegramDefaultProfileConfig(latestConfig);
             if (latestNormalized.changed) {
               writeTelegramConfigInTransaction(
                 agentDir,
@@ -642,7 +612,9 @@ export function createTelegramConfigStore(
               desiredConfig as Record<string, unknown>,
               latestConfig as Record<string, unknown>,
             ) as TelegramConfig;
-            writeTelegramConfigInTransaction(agentDir, configPath, merged);
+            if (!configValuesEqual(latestConfig, merged)) {
+              writeTelegramConfigInTransaction(agentDir, configPath, merged);
+            }
             return merged;
           },
         );

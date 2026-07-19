@@ -114,10 +114,6 @@ export function getSessionCompactionReason(
     : "unknown";
 }
 
-export type PiSendUserMessageOptions = NonNullable<
-  Parameters<ExtensionAPI["sendUserMessage"]>[1]
->;
-
 export interface PiExtensionApiRuntimePorts {
   sendUserMessage: ExtensionAPI["sendUserMessage"];
   exec: ExtensionAPI["exec"];

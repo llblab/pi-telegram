@@ -4,13 +4,13 @@
  */
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { runNodeEval } from "./fixtures/node-eval.ts";
 import {
   createTelegramRuntimeJsonlLog,
   getTelegramPreviousRuntimeLogPath,
@@ -145,6 +145,46 @@ test("Runtime JSONL log resets and appends session events", async () => {
   }
 });
 
+test("Runtime JSONL batching rotates between records that cross maxBytes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-log-batch-rotate-"));
+  const path = join(dir, "logs.jsonl");
+  const previousPath = join(dir, "logs._prev.jsonl");
+  try {
+    const seedLine = `${JSON.stringify({ kind: "event", message: "seed" })}\n`;
+    const firstLine = `${JSON.stringify({
+      kind: "event",
+      at: 1,
+      category: "batch",
+      message: "first",
+    })}\n`;
+    await writeFile(path, seedLine);
+    const log = createTelegramRuntimeJsonlLog({
+      path,
+      previousPath,
+      maxBytes: Buffer.byteLength(seedLine) + Buffer.byteLength(firstLine),
+    });
+
+    log.record({ at: 1, category: "batch", message: "first" });
+    log.record({ at: 2, category: "batch", message: "second" });
+    const deadline = Date.now() + 1000;
+    while (!existsSync(previousPath) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    assert.deepEqual(
+      (await readJsonl(previousPath)).map(
+        (entry) => (entry as { message?: string }).message,
+      ),
+      ["seed", "first"],
+    );
+    const current = await readJsonl(path);
+    assert.equal((current[0] as { reason?: string }).reason, "max-bytes");
+    assert.equal((current[1] as { message?: string }).message, "second");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("Runtime JSONL destructive reset commits only under exact ownership", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-log-reset-fence-"));
   const path = join(dir, "logs.jsonl");
@@ -222,28 +262,10 @@ test("Runtime JSONL contains one failed record under strict unhandled rejection 
       log.record({ at: 1, category: "failure", message: "contained" });
       await new Promise((resolve) => setTimeout(resolve, 50));
     `;
-    const child = spawn(
-      process.execPath,
-      [
-        "--unhandled-rejections=strict",
-        "--experimental-strip-types",
-        "--input-type=module",
-        "--eval",
-        source,
-      ],
-      {
-        env: { ...process.env, LOG_PATH: join(blockerPath, "logs.jsonl") },
-        stdio: ["ignore", "ignore", "pipe"],
-      },
-    );
-    const result = await new Promise<{ code: number | null; stderr: string }>(
-      (resolve, reject) => {
-        let stderr = "";
-        child.stderr.on("data", (chunk) => (stderr += String(chunk)));
-        child.on("error", reject);
-        child.on("exit", (code) => resolve({ code, stderr }));
-      },
-    );
+    const result = await runNodeEval(source, {
+      env: { LOG_PATH: join(blockerPath, "logs.jsonl") },
+      nodeArgs: ["--unhandled-rejections=strict"],
+    });
     assert.equal(result.code, 0, result.stderr);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -269,29 +291,15 @@ test("Runtime JSONL appends serialize across processes without lost lines", asyn
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     `;
-    const child = spawn(
-      process.execPath,
-      ["--experimental-strip-types", "--input-type=module", "--eval", source],
-      {
-        env: {
-          ...process.env,
-          LOG_PATH: path,
-          READY_PATH: readyPath,
-          START_PATH: startPath,
-          WORKER: worker,
-        },
-        stdio: ["ignore", "ignore", "pipe"],
+    const done = runNodeEval(source, {
+      env: {
+        LOG_PATH: path,
+        READY_PATH: readyPath,
+        START_PATH: startPath,
+        WORKER: worker,
       },
-    );
-    const done = new Promise<void>((resolve, reject) => {
-      let stderr = "";
-      child.stderr.on("data", (chunk) => (stderr += String(chunk)));
-      child.on("error", reject);
-      child.on("exit", (code) =>
-        code === 0
-          ? resolve()
-          : reject(new Error(`log child exited ${code}: ${stderr}`)),
-      );
+    }).then(({ code, stderr }) => {
+      if (code !== 0) throw new Error(`log child exited ${code}: ${stderr}`);
     });
     return { readyPath, done };
   });
@@ -306,8 +314,19 @@ test("Runtime JSONL appends serialize across processes without lost lines", asyn
     assert.equal(children.every((child) => existsSync(child.readyPath)), true);
     await writeFile(startPath, "start");
     await Promise.all(children.map((child) => child.done));
-    const lines = await readJsonl(path);
+    const lines = (await readJsonl(path)) as {
+      category?: string;
+      message?: string;
+    }[];
     assert.equal(lines.length, 50);
+    for (const worker of ["a", "b"]) {
+      assert.deepEqual(
+        lines
+          .filter((line) => line.category === worker)
+          .map((line) => line.message),
+        Array.from({ length: 25 }, (_, index) => String(index)),
+      );
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
