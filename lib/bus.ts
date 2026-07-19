@@ -1117,7 +1117,6 @@ function sendTelegramBusLocalEnvelopeOnce(
         ),
       );
     }, timeoutMs);
-    timeout.unref?.();
     socket.setEncoding("utf8");
     socket.once("connect", () => {
       socket.write(encodeTelegramBusEnvelope(options.envelope));

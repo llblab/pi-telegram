@@ -196,8 +196,7 @@ export function createTelegramBusTransportTimeoutError(
 
 export function delayTelegramBusTransportRetry(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
+    setTimeout(resolve, ms);
   });
 }
 
@@ -233,7 +232,6 @@ export function probeTelegramBusEndpoint(input: {
         ),
       });
     }, timeoutMs);
-    timeout.unref?.();
     socket.once("connect", () => settle({ ...diagnostics, reachable: true }));
     socket.once("error", (error) =>
       settle({

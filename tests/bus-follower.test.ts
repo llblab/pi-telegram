@@ -29,8 +29,10 @@ import {
   createTelegramBusFollowerRegistry,
   createTelegramBusFollowerTargetController,
   createTelegramBusLocalServer,
+  resolveTelegramBusSocketPath,
   sendTelegramBusLocalEnvelope,
 } from "../lib/bus.ts";
+import { getTelegramBusTransportKind } from "../lib/bus-transport.ts";
 import { createTelegramBusLeaderEnvelopeHandler } from "../lib/bus-leader.ts";
 import {
   createTelegramTopicTargetStore,
@@ -959,7 +961,16 @@ test("Bus follower assembly wires receiver, recovery, and registration", async (
       ),
       true,
     );
-    assert.equal(existsSync(followerSocketPath), true);
+    if (process.platform === "win32") {
+      assert.equal(
+        getTelegramBusTransportKind(
+          resolveTelegramBusSocketPath(followerSocketPath),
+        ),
+        "pipe",
+      );
+    } else {
+      assert.equal(existsSync(followerSocketPath), true);
+    }
     assert.deepEqual(registrationState.getTarget(), {
       chatId: 7,
       threadId: 42,

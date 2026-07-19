@@ -1728,8 +1728,10 @@ test("Bus leader runtime starts the local server around polling", async () => {
       "bus.ack",
     );
     assert.equal(registry.get("inst-a")?.instanceId, "inst-a");
-    unlinkSync(socketPath);
-    await waitForCondition(() => existsSync(socketPath));
+    if (process.platform !== "win32") {
+      unlinkSync(socketPath);
+      await waitForCondition(() => existsSync(socketPath));
+    }
     assert.deepEqual(events, ["poll:start"]);
     await runtime.stopPolling();
     assert.deepEqual(events, ["poll:start", "poll:stop"]);

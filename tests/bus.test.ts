@@ -166,11 +166,11 @@ test("Bus transport error classifier marks transient IPC failures retryable", ()
 
 test("Bus socket path is scoped under the agent temp directory", () => {
   assert.equal(
-    getTelegramBusSocketPath("/agent"),
+    getTelegramBusSocketPath("/agent", "linux"),
     join("/agent", "tmp", "telegram", "bus.sock"),
   );
   assert.equal(
-    getTelegramBusFollowerSocketPath("pid:123", "/agent"),
+    getTelegramBusFollowerSocketPath("pid:123", "/agent", "linux"),
     join("/agent", "tmp", "telegram", "followers", "pid_123.sock"),
   );
 });
@@ -838,25 +838,26 @@ test("Bus follower API allowlist permits scoped own-topic cleanup only", () => {
 test("Bus transport probe reports reachable and unreachable endpoints", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-probe-"));
   const socketPath = join(dir, "bus.sock");
+  const endpoint = resolveTelegramBusSocketPath(socketPath);
   const server = createTelegramBusLocalServer({
     socketPath,
     handleEnvelope: () => ({ kind: "bus.ack", requestId: "probe", ok: true }),
   });
   try {
     const missing = await probeTelegramBusEndpoint({
-      endpoint: socketPath,
+      endpoint,
       timeoutMs: 50,
     });
     assert.equal(missing.reachable, false);
-    assert.equal(missing.transport, "socket");
+    assert.equal(missing.transport, getTelegramBusTransportKind(endpoint));
     await server.start();
     const reachable = await probeTelegramBusEndpoint({
-      endpoint: socketPath,
+      endpoint,
       timeoutMs: 50,
     });
     assert.deepEqual(reachable, {
-      endpoint: socketPath,
-      transport: "socket",
+      endpoint,
+      transport: getTelegramBusTransportKind(endpoint),
       reachable: true,
     });
   } finally {
@@ -865,7 +866,7 @@ test("Bus transport probe reports reachable and unreachable endpoints", async ()
   }
 });
 
-test("Bus local server resolves the active profile endpoint on each start", async () => {
+test("Bus local server resolves the active profile endpoint on each start", { skip: process.platform === "win32" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-profile-switch-"));
   let profileName = "work";
   const getSocketPath = () =>
@@ -893,7 +894,7 @@ test("Bus local server resolves the active profile endpoint on each start", asyn
   }
 });
 
-test("Old bus server stop cannot invalidate a replacement endpoint generation", async () => {
+test("Old bus server stop cannot invalidate a replacement endpoint generation", { skip: process.platform === "win32" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-generation-"));
   const socketPath = join(dir, "bus.sock");
   const first = createTelegramBusLocalServer({
@@ -950,7 +951,7 @@ test("Old bus server stop cannot invalidate a replacement endpoint generation", 
   }
 });
 
-test("Stale bus server cannot publish over a replacement endpoint generation", async () => {
+test("Stale bus server cannot publish over a replacement endpoint generation", { skip: process.platform === "win32" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-publish-fence-"));
   const socketPath = join(dir, "bus.sock");
   let releasePublication: (() => void) | undefined;
@@ -1009,7 +1010,7 @@ test("Stale bus server cannot publish over a replacement endpoint generation", a
   }
 });
 
-test("Bus local server rebinds an externally unlinked Unix endpoint", async () => {
+test("Bus local server rebinds an externally unlinked Unix endpoint", { skip: process.platform === "win32" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-rebind-"));
   const socketPath = join(dir, "bus.sock");
   const phases: string[] = [];
