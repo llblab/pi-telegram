@@ -537,6 +537,14 @@ export function resolveTelegramBusSocketPath(
       scope: basename(endpoint),
     });
   }
+  const ownerScope = process.getuid?.() ?? "user";
+  const fallbackDir = join(tmpdir(), `pi-telegram-${ownerScope}`);
+  if (
+    dirname(endpoint) === fallbackDir &&
+    /^[0-9a-f]{16}\.sock$/u.test(basename(endpoint))
+  ) {
+    return endpoint;
+  }
   if (
     Buffer.byteLength(endpoint) <= TELEGRAM_BUS_MAX_DIRECT_UNIX_ENDPOINT_BYTES
   ) {
@@ -546,8 +554,7 @@ export function resolveTelegramBusSocketPath(
     .update(endpoint)
     .digest("hex")
     .slice(0, 16);
-  const ownerScope = process.getuid?.() ?? "user";
-  return join(tmpdir(), `pi-telegram-${ownerScope}`, `${digest}.sock`);
+  return join(fallbackDir, `${digest}.sock`);
 }
 
 export interface TelegramBusLocalServerDeps {

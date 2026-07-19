@@ -11,6 +11,7 @@ import test from "node:test";
 
 import {
   createTelegramBusFollowerRegistry,
+  resolveTelegramBusSocketPath,
   sendTelegramBusLocalEnvelope,
 } from "../lib/bus.ts";
 import {
@@ -1729,8 +1730,9 @@ test("Bus leader runtime starts the local server around polling", async () => {
     );
     assert.equal(registry.get("inst-a")?.instanceId, "inst-a");
     if (process.platform !== "win32") {
-      unlinkSync(socketPath);
-      await waitForCondition(() => existsSync(socketPath));
+      const resolvedSocketPath = resolveTelegramBusSocketPath(socketPath);
+      unlinkSync(resolvedSocketPath);
+      await waitForCondition(() => existsSync(resolvedSocketPath));
     }
     assert.deepEqual(events, ["poll:start"]);
     await runtime.stopPolling();

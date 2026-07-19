@@ -106,6 +106,10 @@ test("Bus transport boundary derives socket and pipe endpoints", () => {
   );
   assert.equal(getTelegramBusTransportKind(longMacEndpoint), "socket");
   assert.ok(Buffer.byteLength(longMacEndpoint) < 104);
+  assert.equal(
+    resolveTelegramBusSocketPath(longMacEndpoint, "darwin"),
+    longMacEndpoint,
+  );
 });
 
 test("Bus transport retry policy is operation-aware", () => {
@@ -913,18 +917,21 @@ test("Bus local server resolves the active profile endpoint on each start", { sk
     handleEnvelope: () => ({ kind: "bus.ack", requestId: "profile", ok: true }),
   });
   const workSocketPath = getSocketPath();
+  const resolvedWorkSocketPath = resolveTelegramBusSocketPath(workSocketPath);
   try {
     await server.start();
-    assert.equal(existsSync(workSocketPath), true);
+    assert.equal(existsSync(resolvedWorkSocketPath), true);
     await server.stop();
-    assert.equal(existsSync(workSocketPath), false);
+    assert.equal(existsSync(resolvedWorkSocketPath), false);
 
     profileName = "personal";
     const personalSocketPath = getSocketPath();
+    const resolvedPersonalSocketPath =
+      resolveTelegramBusSocketPath(personalSocketPath);
     await server.start();
     assert.notEqual(personalSocketPath, workSocketPath);
-    assert.equal(existsSync(personalSocketPath), true);
-    assert.equal(existsSync(workSocketPath), false);
+    assert.equal(existsSync(resolvedPersonalSocketPath), true);
+    assert.equal(existsSync(resolvedWorkSocketPath), false);
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -960,7 +967,7 @@ test("Old bus server stop cannot invalidate a replacement endpoint generation", 
     assert.equal(
       (
         await probeTelegramBusEndpoint({
-          endpoint: socketPath,
+          endpoint: resolveTelegramBusSocketPath(socketPath),
           timeoutMs: 50,
         })
       ).reachable,
@@ -1058,11 +1065,12 @@ test("Bus local server rebinds an externally unlinked Unix endpoint", { skip: pr
   });
   try {
     await server.start();
-    unlinkSync(socketPath);
-    assert.equal(existsSync(socketPath), false);
+    const resolvedSocketPath = resolveTelegramBusSocketPath(socketPath);
+    unlinkSync(resolvedSocketPath);
+    assert.equal(existsSync(resolvedSocketPath), false);
 
     assert.equal(await server.ensureEndpoint(), true);
-    assert.equal(existsSync(socketPath), true);
+    assert.equal(existsSync(resolvedSocketPath), true);
     assert.equal(await server.ensureEndpoint(), false);
     assert.deepEqual(
       phases.filter((phase) => phase.includes("endpoint")),
@@ -1071,7 +1079,7 @@ test("Bus local server rebinds an externally unlinked Unix endpoint", { skip: pr
     assert.equal(
       (
         await probeTelegramBusEndpoint({
-          endpoint: socketPath,
+          endpoint: resolvedSocketPath,
           timeoutMs: 50,
         })
       ).reachable,

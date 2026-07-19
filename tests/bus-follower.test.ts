@@ -969,7 +969,10 @@ test("Bus follower assembly wires receiver, recovery, and registration", async (
         "pipe",
       );
     } else {
-      assert.equal(existsSync(followerSocketPath), true);
+      assert.equal(
+        existsSync(resolveTelegramBusSocketPath(followerSocketPath)),
+        true,
+      );
     }
     assert.deepEqual(registrationState.getTarget(), {
       chatId: 7,
