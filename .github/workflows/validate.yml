@@ -19,6 +19,7 @@ jobs:
           - macos-latest
           - windows-latest
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -32,7 +33,11 @@ jobs:
       - name: Run typecheck
         run: npm run typecheck
       - name: Run tests
+        if: matrix.os == 'ubuntu-latest'
         run: npm test
+      - name: Run cross-platform diagnostic tests
+        if: matrix.os != 'ubuntu-latest'
+        run: node --experimental-strip-types --test --test-reporter=spec --test-concurrency=1 tests/*.test.ts
       - name: Check package contents
         run: npm run pack:check
       - name: Audit dependencies
