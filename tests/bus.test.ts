@@ -1068,7 +1068,10 @@ test("Bus local client transport events include request diagnostics", async () =
     assert.equal(events[0].phase, "client-failed");
     assert.equal(events[0].details.envelopeKind, "follower.heartbeat");
     assert.equal(events[0].details.requestId, "inst-a:events");
-    assert.equal(events[0].details.transport, "socket");
+    assert.equal(
+      events[0].details.transport,
+      getTelegramBusTransportKind(resolveTelegramBusSocketPath(socketPath)),
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1287,7 +1290,10 @@ test("Bus local IPC server reports handler failures as protocol acks", async () 
     );
     assert.equal(failure?.details.envelopeKind, "follower.heartbeat");
     assert.equal(failure?.details.requestId, "inst-a:failed-handler");
-    assert.equal(failure?.details.transport, "socket");
+    assert.equal(
+      failure?.details.transport,
+      getTelegramBusTransportKind(resolveTelegramBusSocketPath(socketPath)),
+    );
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });

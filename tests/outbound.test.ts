@@ -4,6 +4,8 @@
  */
 
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
 import { resetTransportReplyDedup } from "../lib/replies.ts";
@@ -894,12 +896,13 @@ test("Outbound artifact sender sends multiple voice replies independently", asyn
 
 test("Voice reply sender prefers configured outbound voice handlers over registered synthesis providers", async () => {
   const events: unknown[] = [];
+  const voiceTempDir = join(tmpdir(), "pi-telegram-voice-handler-test");
   const dispose = registerTelegramVoiceSynthesisProvider(async () => {
     events.push("provider-called");
     return "/tmp/provider.opus";
   });
   const sendVoiceReply = createTelegramVoiceReplySender({
-    tempDir: "/tmp/pi-telegram-voice-handler-test",
+    tempDir: voiceTempDir,
     getHandlers: () => [
       {
         type: "voice",
@@ -921,10 +924,8 @@ test("Voice reply sender prefers configured outbound voice handlers over registe
   await sendVoiceReply({ chatId: 10, replyToMessageId: 20 }, "hello");
 
   assert.equal(events.length, 1);
-  assert.match(
-    events[0] as string,
-    /^\/tmp\/pi-telegram-voice-handler-test\/.+-voice\.ogg$/,
-  );
+  assert.equal(dirname(events[0] as string), voiceTempDir);
+  assert.match(basename(events[0] as string), /^.+-voice\.ogg$/);
   dispose();
 });
 
@@ -955,9 +956,10 @@ test("Voice reply sender falls back from configured handlers to registered synth
 
 test("Voice reply sender uses configured outbound voice handlers when no provider is registered", async () => {
   const execCalls: unknown[] = [];
+  const voiceTempDir = join(tmpdir(), "pi-telegram-voice-handler-test");
   const uploads: unknown[] = [];
   const sendVoiceReply = createTelegramVoiceReplySender({
-    tempDir: "/tmp/pi-telegram-voice-handler-test",
+    tempDir: voiceTempDir,
     getHandlers: () => [
       {
         type: "voice",
@@ -996,20 +998,14 @@ test("Voice reply sender uses configured outbound voice handlers when no provide
   };
   assert.equal(firstExec.command, "tts");
   assert.equal(firstExec.stdin, "hello");
-  assert.match(
-    firstExec.args[1],
-    /^\/tmp\/pi-telegram-voice-handler-test\/.+-voice\.mp3$/,
-  );
+  assert.equal(dirname(firstExec.args[1]), voiceTempDir);
+  assert.match(basename(firstExec.args[1]), /^.+-voice\.mp3$/);
   assert.equal(secondExec.command, "ffmpeg");
   assert.equal(secondExec.stdin, "mp3-ready");
-  assert.match(
-    secondExec.args[1],
-    /^\/tmp\/pi-telegram-voice-handler-test\/.+-voice\.mp3$/,
-  );
-  assert.match(
-    secondExec.args[2],
-    /^\/tmp\/pi-telegram-voice-handler-test\/.+-voice\.ogg$/,
-  );
+  assert.equal(dirname(secondExec.args[1]), voiceTempDir);
+  assert.match(basename(secondExec.args[1]), /^.+-voice\.mp3$/);
+  assert.equal(dirname(secondExec.args[2]), voiceTempDir);
+  assert.match(basename(secondExec.args[2]), /^.+-voice\.ogg$/);
   assert.equal(uploads.length, 1);
   const upload = uploads[0] as {
     method: string;

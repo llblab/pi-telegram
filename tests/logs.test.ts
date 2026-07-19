@@ -29,19 +29,19 @@ async function readJsonl(path: string): Promise<unknown[]> {
 test("Runtime log paths preserve default compatibility and isolate named profiles", async () => {
   assert.equal(
     getTelegramRuntimeLogPath("/agent"),
-    "/agent/tmp/telegram/logs.jsonl",
+    join("/agent", "tmp", "telegram", "logs.jsonl"),
   );
   assert.equal(
     getTelegramPreviousRuntimeLogPath("/agent"),
-    "/agent/tmp/telegram/logs._prev.jsonl",
+    join("/agent", "tmp", "telegram", "logs._prev.jsonl"),
   );
   assert.equal(
     getTelegramRuntimeLogPath("/agent", "omp"),
-    "/agent/tmp/telegram/logs.omp.jsonl",
+    join("/agent", "tmp", "telegram", "logs.omp.jsonl"),
   );
   assert.equal(
     getTelegramPreviousRuntimeLogPath("/agent", "omp"),
-    "/agent/tmp/telegram/logs.omp._prev.jsonl",
+    join("/agent", "tmp", "telegram", "logs.omp._prev.jsonl"),
   );
 });
 
@@ -65,11 +65,11 @@ test("Runtime JSONL paths do not collide across profile lifecycle names", () => 
   assert.equal(paths.size, 2 + profiles.length * 2);
   assert.equal(
     getTelegramRuntimeLogPath("/agent", "previous"),
-    "/agent/tmp/telegram/logs.previous.jsonl",
+    join("/agent", "tmp", "telegram", "logs.previous.jsonl"),
   );
   assert.equal(
     getTelegramPreviousRuntimeLogPath("/agent", "previous"),
-    "/agent/tmp/telegram/logs.previous._prev.jsonl",
+    join("/agent", "tmp", "telegram", "logs.previous._prev.jsonl"),
   );
 });
 

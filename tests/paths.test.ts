@@ -66,22 +66,24 @@ await test("resolveTelegramConfigPath", () => {
 
 await test("resolveTelegramOwnersPath", () => {
   assert.ok(
-    resolveTelegramOwnersPath().endsWith("/tmp/telegram/owners.json"),
-    "owners path ends with /tmp/telegram/owners.json",
+    resolveTelegramOwnersPath().endsWith(join("tmp", "telegram", "owners.json")),
+    "owners path ends with the platform-native tmp/telegram/owners.json suffix",
   );
 });
 
 await test("resolveTelegramTempDir", () => {
   assert.ok(
-    resolveTelegramTempDir().endsWith("/tmp/telegram"),
-    "temp dir ends with /tmp/telegram",
+    resolveTelegramTempDir().endsWith(join("tmp", "telegram")),
+    "temp dir ends with the platform-native tmp/telegram suffix",
   );
 });
 
 await test("resolveTelegramRuntimeLogPath", () => {
   assert.ok(
-    resolveTelegramRuntimeLogPath().endsWith("/tmp/telegram/logs.jsonl"),
-    "runtime log path ends with logs.jsonl",
+    resolveTelegramRuntimeLogPath().endsWith(
+      join("tmp", "telegram", "logs.jsonl"),
+    ),
+    "runtime log path ends with the platform-native logs.jsonl suffix",
   );
 });
 

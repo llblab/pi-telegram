@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
@@ -323,7 +323,7 @@ test("Inbound template invocation keeps args as name declarations only", () => {
     "/work",
   );
   assert.deepEqual(invocation, {
-    command: "/work/scripts/transcribe",
+    command: resolve("/work", "scripts", "transcribe"),
     args: ["/tmp/a.ogg", "ru"],
   });
 });
@@ -338,7 +338,7 @@ test("Inbound template invocation supports inline placeholder defaults", () => {
     "/work",
   );
   assert.deepEqual(invocation, {
-    command: "/work/scripts/transcribe",
+    command: resolve("/work", "scripts", "transcribe"),
     args: ["/tmp/a.ogg", "ru", "voxtral-mini-latest"],
   });
 });
@@ -350,7 +350,7 @@ test("Inbound template handlers resolve relative commands", () => {
     "/work",
   );
   assert.deepEqual(invocation, {
-    command: "/work/scripts/transcribe",
+    command: resolve("/work", "scripts", "transcribe"),
     args: ["/tmp/a.ogg", "ru"],
   });
 });
@@ -362,7 +362,7 @@ test("Inbound template handlers append the path when no placeholder is present",
     "/work",
   );
   assert.deepEqual(invocation, {
-    command: "/work/scripts/transcribe",
+    command: resolve("/work", "scripts", "transcribe"),
     args: ["--lang", "ru", "/tmp/a.ogg"],
   });
 });
