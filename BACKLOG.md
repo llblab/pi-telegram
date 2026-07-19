@@ -12,28 +12,6 @@ Open work:
 
 Done when: native Windows evidence confirms that the measured filesystem-write reductions do not weaken singleton or leader/follower authority, recovery, diagnostics, or shutdown behavior.
 
-## P1 — Cross-Platform CI Matrix
-
-Context: Validation now targets `ubuntu-latest`, `macos-latest`, and `windows-latest` at minimum Node `22.19.0`. Typecheck, tests, and package dry-run run on every OS; audit runs once on Ubuntu; release publication remains separate. The workflow parses and all local gates pass, but the first hosted matrix run requires a push or pull request.
-
-Open work:
-
-- [ ] Verify that the first hosted matrix passes and that the Windows named-pipe roundtrip executes rather than skips, while Unix socket and atomic-publication tests remain active on Ubuntu and macOS. Document any intentional platform skip by protected boundary.
-
-Done when: hosted CI exercises the minimum supported Node across Linux, macOS, and native Windows; deterministic validation and package shape pass on each OS; and all skips remain intentional and visible.
-
-## P1 — Native Windows Threaded Mode Follow-Ups
-
-Context: Native Windows smoke on the WIP `dev` build passes for classic mode, ownership handoff, hot upgrade to Threaded Mode, leader/follower registration and delivery, and hot downgrade back to classic with follower disconnect. Observed downgrade status convergence can take around 10 seconds, which fits the current 5–15 second retry window but should remain evidence-gated if it becomes user-visible friction.
-
-Open work:
-
-- [ ] Capture text diagnostics if Windows classic restore/status convergence repeatedly exceeds the intended fallback window.
-- [ ] Add a focused regression or transport/status adjustment only if new Windows evidence shows a repeatable named-pipe, lock, heartbeat, queue, or status-convergence issue.
-- [ ] For every Windows connect/runtime crash report, classify the failing boundary (`owners.json` atomic write, named pipe, heartbeat, polling, queue, or status), ensure `logs.jsonl` captures enough redacted evidence before shutdown, and add a minimized regression when the failure can be simulated deterministically.
-
-Done when: new Windows-specific runtime issues are either fixed with targeted coverage or left out of the backlog because native smoke remains green.
-
 ## P1 — Evidence-Backed Telegram Client Follow-Ups
 
 Context: The release should avoid speculative live-test matrices. Future Telegram-client quirks should be handled only when concrete evidence or a minimized fixture exists.
