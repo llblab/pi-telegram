@@ -536,7 +536,10 @@ export function resolveTelegramBusSocketPath(
     });
   }
   if (Buffer.byteLength(endpoint) <= 96) return endpoint;
-  const digest = createHash("sha256").update(endpoint).digest("hex").slice(0, 16);
+  const digest = createHash("sha256")
+    .update(endpoint)
+    .digest("hex")
+    .slice(0, 16);
   const ownerScope = process.getuid?.() ?? "user";
   return join(tmpdir(), `pi-telegram-${ownerScope}`, `${digest}.sock`);
 }
@@ -896,7 +899,7 @@ export function createTelegramBusLocalServer(
       const endpointGeneration = randomBytes(8).toString("hex");
       const listenPath = usesWindowsPipe
         ? socketPath
-        : join(dirname(socketPath), `.pi-telegram-${endpointGeneration}.sock`);
+        : join(dirname(socketPath), `.pt-${endpointGeneration}.sock`);
       activeSocketPath = socketPath;
       activeListenPath = listenPath;
       deps.recordTransportEvent?.(

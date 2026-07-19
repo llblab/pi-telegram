@@ -872,6 +872,37 @@ test("Bus transport probe reports reachable and unreachable endpoints", async ()
   }
 });
 
+test("Bus local server roundtrips through a bounded long-path fallback", { skip: process.platform === "win32" }, async () => {
+  const socketPath = join(
+    tmpdir(),
+    "pi-telegram-very-long-endpoint-segment".repeat(4),
+    "bus.sock",
+  );
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: (envelope) => ({
+      kind: "bus.ack",
+      requestId: envelope.requestId,
+      ok: true,
+    }),
+  });
+  try {
+    await server.start();
+    const response = await sendTelegramBusLocalEnvelope({
+      socketPath,
+      envelope: {
+        kind: "follower.heartbeat",
+        requestId: "long-path",
+        instanceId: "follower-a",
+        sentAtMs: 1000,
+      },
+    });
+    assert.equal(response?.kind, "bus.ack");
+  } finally {
+    await server.stop();
+  }
+});
+
 test("Bus local server resolves the active profile endpoint on each start", { skip: process.platform === "win32" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-profile-switch-"));
   let profileName = "work";
