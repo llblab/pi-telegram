@@ -100,6 +100,12 @@ test("Bus transport boundary derives socket and pipe endpoints", () => {
     ),
     "pipe",
   );
+  const longMacEndpoint = resolveTelegramBusSocketPath(
+    `/var/folders/${"nested/".repeat(20)}bus.sock`,
+    "darwin",
+  );
+  assert.equal(getTelegramBusTransportKind(longMacEndpoint), "socket");
+  assert.ok(Buffer.byteLength(longMacEndpoint) < 104);
 });
 
 test("Bus transport retry policy is operation-aware", () => {

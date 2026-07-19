@@ -5,7 +5,7 @@
  * cross-instance forwarding helpers, and the live follower registry model.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -23,7 +23,7 @@ import {
   type Server,
   type Socket,
 } from "node:net";
-import { platform as getPlatform } from "node:os";
+import { platform as getPlatform, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 import {
@@ -528,13 +528,17 @@ export function resolveTelegramBusSocketPath(
   platform: NodeJS.Platform | string = getPlatform(),
 ): string {
   const endpoint = typeof source === "function" ? source() : source;
-  if (platform !== "win32" || isTelegramBusPipePath(endpoint)) {
-    return endpoint;
+  if (platform === "win32") {
+    if (isTelegramBusPipePath(endpoint)) return endpoint;
+    return getTelegramBusPipePath({
+      agentDir: dirname(endpoint),
+      scope: basename(endpoint),
+    });
   }
-  return getTelegramBusPipePath({
-    agentDir: dirname(endpoint),
-    scope: basename(endpoint),
-  });
+  if (Buffer.byteLength(endpoint) <= 96) return endpoint;
+  const digest = createHash("sha256").update(endpoint).digest("hex").slice(0, 16);
+  const ownerScope = process.getuid?.() ?? "user";
+  return join(tmpdir(), `pi-telegram-${ownerScope}`, `${digest}.sock`);
 }
 
 export interface TelegramBusLocalServerDeps {
