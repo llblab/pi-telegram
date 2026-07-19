@@ -2,31 +2,19 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P1 — Cross-Platform Runtime Persistence Optimization
+## P1 — Native Windows Runtime Smoke
 
-Context: `owners.json`, `state.json`, and `logs.jsonl` protect different ownership, recovery, and diagnostics boundaries. Their optimized persistence paths must preserve multiple concurrent Pi instances, classic singleton ownership, Threaded Mode leader election, exact owner/generation/epoch fencing, crash recovery, and native Windows behavior. Deterministic regressions, docs, and all local release gates pass; native Windows remains the final environment-only proof.
-
-Open work:
-
-- [ ] Run the current diff through native Windows classic and Threaded Mode smoke: connect, ownership handoff, leader/follower registration, stale recovery, live downgrade, diagnostics rotation, and shutdown cleanup. Record named-pipe and atomic-file evidence explicitly rather than treating Linux tests as cross-platform proof.
-
-Done when: native Windows evidence confirms that the measured filesystem-write reductions do not weaken singleton or leader/follower authority, recovery, diagnostics, or shutdown behavior.
-
-## P1 — Evidence-Backed Telegram Client Follow-Ups
-
-Context: The release should avoid speculative live-test matrices. Future Telegram-client quirks should be handled only when concrete evidence or a minimized fixture exists.
+Context: Deterministic ownership, persistence, recovery, process, and named-pipe coverage passes on native hosted Windows. A live Telegram client remains the only unverified platform boundary and may be exercised in a later release cycle rather than tied to a specific version.
 
 Open work:
 
-- [ ] Capture any new Telegram client or Bot API behavior that contradicts the documented Threaded Mode contract, including a live local/autonomous `…typing` observation when convenient.
-- [ ] Add a focused regression or documented client caveat only for confirmed behavior.
-- [ ] Keep one-off environment names, thread names, and operator-specific observations out of repository context unless they demonstrate a general product issue.
+- [ ] Run a current build through native Windows classic and Threaded Mode smoke: connect, ownership handoff, leader/follower registration, stale recovery, live downgrade, diagnostics rotation, and shutdown cleanup. Record concrete named-pipe, atomic-file, and Telegram-client evidence.
 
-Done when: new client quirks are either fixed with targeted coverage or documented as evidence-backed exceptions, without keeping broad manual smoke matrices in the backlog.
+Done when: native Windows live evidence confirms singleton and leader/follower authority, recovery, diagnostics, downgrade, and shutdown behavior.
 
 ## Blocked — Same-Thread Telegram `/new`
 
-Blocked: upstream Pi core API. Issue: https://github.com/earendil-works/pi/issues/5952
+Blocked: upstream Pi core API remains unavailable. Issue #5952 was auto-closed by intake policy rather than resolved: https://github.com/earendil-works/pi/issues/5952
 
 Context: Threaded Mode manual followers are separate visible Pi processes. Same-thread `/new` is a different feature: replacing the current Pi session inside the same Telegram thread. Extension-only hacks are rejected because they would desynchronize Pi lifecycle/TUI semantics.
 
