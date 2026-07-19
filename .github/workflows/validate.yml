@@ -37,7 +37,7 @@ jobs:
         run: npm test
       - name: Run cross-platform diagnostic tests
         if: matrix.os != 'ubuntu-latest'
-        run: node --experimental-strip-types --test --test-reporter=spec --test-concurrency=1 tests/*.test.ts
+        run: node --experimental-strip-types --test --test-force-exit --test-reporter=spec --test-concurrency=1 tests/*.test.ts
       - name: Check package contents
         run: npm run pack:check
       - name: Audit dependencies

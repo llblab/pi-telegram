@@ -1020,10 +1020,8 @@ test("Voice reply sender uses configured outbound voice handlers when no provide
     reply_parameters: '{"message_id":20,"allow_sending_without_reply":true}',
   });
   assert.equal(upload.fileField, "voice");
-  assert.match(
-    upload.filePath,
-    /^\/tmp\/pi-telegram-voice-handler-test\/.+-voice\.ogg$/,
-  );
+  assert.equal(dirname(upload.filePath), voiceTempDir);
+  assert.match(basename(upload.filePath), /^.+-voice\.ogg$/);
   assert.match(upload.fileName, /^.+-voice\.ogg$/);
 });
 
