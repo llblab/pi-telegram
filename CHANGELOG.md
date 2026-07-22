@@ -2,9 +2,11 @@
 
 ## Unreleased
 
-- `Typing Backpressure`: Serialized each native activity loop to one in-flight action and coalesced identical leader-side chat actions across direct and follower traffic. Telegram 429 `retry_after` now opens a shared suppression window without delayed retry fan-out or terminal-status projection, while non-rate-limit failures retain existing diagnostics. Impact: concurrent Threaded Mode activity no longer amplifies `sendChatAction` throttling into repeated `Telegram Error` states.
+## 0.24.3: Queue And Typing Reliability Hotfix
+
+- `Typing Backpressure`: Serialized each native activity loop to one in-flight action and coalesced identical leader-side chat actions across direct and follower traffic. Telegram 429 `retry_after` now opens a shared suppression window without delayed retry fan-out or terminal-status projection, while non-rate-limit retries and diagnostics remain intact. Impact: concurrent Threaded Mode activity no longer amplifies `sendChatAction` throttling into repeated `Telegram Error` states.
 - `Queue Lifecycle`: Agent-end cleanup ignores only stale-context status failures after typing teardown, and control settlement is fenced to its originating deferred-dispatch generation. Impact: real status failures still reject, while callbacks from a replaced session cannot update status or dispatch queued work through an old context.
-- `Dependency Audit`: Added a fail-closed exception through 2026-08-21 UTC for only `brace-expansion@5.0.6` (`GHSA-3jxr-9vmj-r5cp`) and `protobufjs@7.6.4` (`GHSA-j3f2-48v5-ccww`) copies fixed inside Pi's published shrinkwrap. Impact: all unknown findings, graph/path/version drift, and any still-present exception at the deadline fail validation while an upstream Pi release is pending.
+- `Dependency Audit`: Added a fail-closed exception through 2026-08-21 UTC for only `brace-expansion@5.0.6` (`GHSA-3jxr-9vmj-r5cp`) and `protobufjs@7.6.4` (`GHSA-j3f2-48v5-ccww`) copies pinned inside Pi's published shrinkwrap. Impact: all unknown findings, graph/path/version drift, and any still-present exception at the deadline fail validation while an upstream Pi release is pending.
 
 ## 0.24.2: Context Compression Hotfix
 
