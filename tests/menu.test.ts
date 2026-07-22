@@ -319,37 +319,11 @@ test("Menu runtime builds menu state from settings and model-registry ports", as
   assert.equal(reloadCount, 1);
   assert.equal(refreshCount, 1);
   assert.equal(result.state.chatId, 42);
-  assert.equal(result.state.scope, "all");
   assert.deepEqual(
     result.state.allModels.map((entry) => entry.model.id),
     ["gpt-5"],
   );
   assert.deepEqual(result.cachedInputs.availableModels, [model]);
-});
-
-test("Model menu all view preserves scoped thinking metadata for matching models", () => {
-  const modelA = createMenuModel("openai", "gpt-5", true);
-  const modelB = createMenuModel("anthropic", "claude-3", true);
-  const modelC = createMenuModel("google", "gemini-2", true);
-  const state = buildTelegramModelMenuState({
-    chatId: 42,
-    activeModel: modelA,
-    availableModels: [modelA, modelB, modelC],
-    configuredScopedModelPatterns: ["ANTHROPIC/CLAUDE-3:high"],
-  });
-
-  assert.equal(state.scope, "all");
-  assert.deepEqual(
-    state.allModels.map((entry) => ({
-      id: `${entry.model.provider}/${entry.model.id}`,
-      thinkingLevel: entry.thinkingLevel,
-    })),
-    [
-      { id: "openai/gpt-5", thinkingLevel: undefined },
-      { id: "anthropic/claude-3", thinkingLevel: "high" },
-      { id: "google/gemini-2", thinkingLevel: undefined },
-    ],
-  );
 });
 
 test("Menu helpers expose UI constants", () => {

@@ -237,7 +237,7 @@ export interface TelegramStatusBarState {
 export interface TelegramStatusRuntimeContext {
   ui: {
     theme: TelegramStatusBarTheme;
-    setStatus: (key: string, text: string | undefined) => void;
+    setStatus: (key: string, text: string) => void;
   };
 }
 
@@ -566,8 +566,14 @@ export function createTelegramStatusRuntime<
 >(deps: TelegramStatusRuntimeDeps<TContext>): TelegramStatusRuntime<TContext> {
   const statusKey = deps.statusKey ?? "telegram";
   return {
-    updateStatus: (ctx, _error) => {
-      ctx.ui.setStatus(statusKey, undefined);
+    updateStatus: (ctx, error) => {
+      ctx.ui.setStatus(
+        statusKey,
+        buildTelegramStatusBarText(
+          ctx.ui.theme,
+          deps.getStatusBarState(ctx, error),
+        ),
+      );
     },
     getStatusLines: (options) =>
       buildTelegramBridgeStatusLines(deps.getBridgeStatusLineState(), options),

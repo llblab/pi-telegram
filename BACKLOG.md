@@ -6,7 +6,7 @@ _This backlog tracks only open release-relevant work: hotfixes, bounded maintena
 
 Deadline: 2026-08-21 UTC. The validation gate intentionally fails at `2026-08-22T00:00:00Z` if either exception remains.
 
-Context: `@earendil-works/pi-coding-agent@0.80.6` publishes its own `npm-shrinkwrap.json`, which prevents this consumer package from replacing two installed vulnerable copies. On 2026-07-22 the operator explicitly approved a bounded exception for only `brace-expansion@5.0.6` / source `1123898` / `GHSA-3jxr-9vmj-r5cp` and `protobufjs@7.6.4` / source `1123964` / `GHSA-j3f2-48v5-ccww`, plus parent findings whose complete audit graph resolves exclusively to those sources. `npm run audit` verifies the exact graph, installed paths and versions, and expiry; every unknown or changed finding fails closed.
+Context: `@earendil-works/pi-coding-agent@0.80.6` publishes its own `npm-shrinkwrap.json`, which prevents this consumer package from replacing two installed vulnerable copies. The repository temporarily permits only `brace-expansion@5.0.6` / source `1123898` / `GHSA-3jxr-9vmj-r5cp` and `protobufjs@7.6.4` / source `1123964` / `GHSA-j3f2-48v5-ccww`, plus parent findings whose complete audit graph resolves exclusively to those sources. `npm run audit` verifies the exact graph, installed paths and versions, and expiry; every unknown or changed finding fails closed.
 
 Open work:
 

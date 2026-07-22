@@ -161,7 +161,7 @@ Named profile identifiers contain only lowercase ASCII letters and digits (maxim
 
 ### Operator Menu
 
-`/start` opens the Telegram-native control panel: status, prompt-template commands, model selection, thinking level, settings, queue controls, and extension sections. It is the primary Telegram UI; reaction shortcuts are secondary queue affordances. The model picker opens on all authenticated models by default, with configured scoped models available as an optional view. Pi's terminal `telegram` status key stays clear; connection and runtime diagnostics remain available in this menu and `/telegram-status`.
+`/start` opens the Telegram-native control panel: status, prompt-template commands, model selection, thinking level, settings, queue controls, and extension sections. It is the primary Telegram UI; reaction shortcuts are secondary queue affordances.
 
 ### Queue Runtime
 
