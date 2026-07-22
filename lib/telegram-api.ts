@@ -435,6 +435,8 @@ export interface TelegramBridgeApiRuntimeDeps {
     error: unknown,
     details?: Record<string, unknown>,
   ) => void;
+  now?: () => number;
+  chatActionMinIntervalMs?: number;
 }
 
 export interface TelegramBridgeApiRuntime {
@@ -1321,11 +1323,89 @@ export function createDefaultTelegramBridgeApiRuntime(deps: {
 export function createTelegramBridgeApiRuntime(
   deps: TelegramBridgeApiRuntimeDeps,
 ): TelegramBridgeApiRuntime {
+  const now = deps.now ?? Date.now;
+  const chatActionMinIntervalMs = Math.max(
+    0,
+    deps.chatActionMinIntervalMs ?? 2_000,
+  );
+  const chatActionGates = new Map<
+    string,
+    { inFlight?: Promise<unknown>; notBeforeMs: number }
+  >();
+  const getChatActionKey = (
+    method: string,
+    body: Record<string, unknown>,
+  ): string | undefined => {
+    if (method !== "sendChatAction") return undefined;
+    const chatId = body.chat_id;
+    const action = body.action;
+    if (
+      (typeof chatId !== "number" && typeof chatId !== "string") ||
+      typeof action !== "string"
+    ) {
+      return undefined;
+    }
+    const threadId = body.message_thread_id;
+    return `${String(chatId)}:${
+      typeof threadId === "number" || typeof threadId === "string"
+        ? String(threadId)
+        : "all"
+    }:${action}`;
+  };
   const callRecorded = async <TResponse>(
     method: string,
     body: Record<string, unknown>,
     options?: TelegramApiCallOptions,
   ): Promise<TResponse> => {
+    const chatActionKey = getChatActionKey(method, body);
+    if (chatActionKey) {
+      const gate = chatActionGates.get(chatActionKey) ?? { notBeforeMs: 0 };
+      chatActionGates.set(chatActionKey, gate);
+      if (gate.inFlight) return (await gate.inFlight) as TResponse;
+      if (now() < gate.notBeforeMs) return true as TResponse;
+      let request: Promise<TResponse>;
+      request = Promise.resolve()
+        .then(() =>
+          deps.client.call<TResponse>(method, body, {
+            ...options,
+            maxAttempts: 1,
+          }),
+        )
+        .then((result) => {
+          gate.notBeforeMs = now() + chatActionMinIntervalMs;
+          return result;
+        })
+        .catch((error: unknown) => {
+          if (error instanceof TelegramApiHttpError && error.status === 429) {
+            const retryAfterMs = Math.max(
+              chatActionMinIntervalMs,
+              (error.retryAfterSeconds ?? 0) * 1_000,
+            );
+            gate.notBeforeMs = now() + retryAfterMs;
+            deps.recordRuntimeEvent(
+              "api",
+              error,
+              withTelegramTransportDiagnostics(error, {
+                method,
+                rateLimited: true,
+                retryAfterMs,
+              }),
+            );
+            return true as TResponse;
+          }
+          deps.recordRuntimeEvent(
+            "api",
+            error,
+            withTelegramTransportDiagnostics(error, { method }),
+          );
+          throw error;
+        })
+        .finally(() => {
+          if (gate.inFlight === request) gate.inFlight = undefined;
+        });
+      gate.inFlight = request;
+      return request;
+    }
     try {
       return await deps.client.call<TResponse>(method, body, options);
     } catch (error) {

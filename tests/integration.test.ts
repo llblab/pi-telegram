@@ -501,6 +501,7 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
     const dispatchedContent = await dispatched;
+    await flushMicrotasks();
     assert.equal(sentMessages.length, 1);
     assert.equal(Array.isArray(dispatchedContent), true);
     assert.equal(apiCalls.includes("sendMessage"), true);
