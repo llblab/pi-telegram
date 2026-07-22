@@ -333,6 +333,7 @@ interface TelegramApiResponse<T> {
 export interface TelegramApiCallOptions {
   signal?: AbortSignal;
   maxAttempts?: number;
+  retryRateLimit?: boolean;
   retrySafety?: "safe" | "non-idempotent";
   retryBaseDelayMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -437,6 +438,7 @@ export interface TelegramBridgeApiRuntimeDeps {
   ) => void;
   now?: () => number;
   chatActionMinIntervalMs?: number;
+  chatActionMaxGates?: number;
 }
 
 export interface TelegramBridgeApiRuntime {
@@ -997,7 +999,13 @@ async function callTelegramWithRetry<TResponse>(
         ),
       );
     } catch (error) {
-      const retryable = isRetryableTelegramApiError(error);
+      const retryable =
+      isRetryableTelegramApiError(error) &&
+      !(
+        options?.retryRateLimit === false &&
+        error instanceof TelegramApiHttpError &&
+        error.status === 429
+      );
       if (!retrySafe) {
         if (error instanceof TelegramApiHttpError && error.status === 429) {
           if (attempt >= maxAttempts - 1) throw error;
@@ -1328,6 +1336,7 @@ export function createTelegramBridgeApiRuntime(
     0,
     deps.chatActionMinIntervalMs ?? 2_000,
   );
+  const chatActionMaxGates = Math.max(1, deps.chatActionMaxGates ?? 256);
   const chatActionGates = new Map<
     string,
     { inFlight?: Promise<unknown>; notBeforeMs: number }
@@ -1359,8 +1368,18 @@ export function createTelegramBridgeApiRuntime(
   ): Promise<TResponse> => {
     const chatActionKey = getChatActionKey(method, body);
     if (chatActionKey) {
-      const gate = chatActionGates.get(chatActionKey) ?? { notBeforeMs: 0 };
-      chatActionGates.set(chatActionKey, gate);
+      const nowMs = now();
+      for (const [key, candidate] of chatActionGates) {
+        if (!candidate.inFlight && nowMs >= candidate.notBeforeMs) {
+          chatActionGates.delete(key);
+        }
+      }
+      let gate = chatActionGates.get(chatActionKey);
+      if (!gate) {
+        if (chatActionGates.size >= chatActionMaxGates) return true as TResponse;
+        gate = { notBeforeMs: 0 };
+        chatActionGates.set(chatActionKey, gate);
+      }
       if (gate.inFlight) return (await gate.inFlight) as TResponse;
       if (now() < gate.notBeforeMs) return true as TResponse;
       let request: Promise<TResponse>;
@@ -1368,7 +1387,7 @@ export function createTelegramBridgeApiRuntime(
         .then(() =>
           deps.client.call<TResponse>(method, body, {
             ...options,
-            maxAttempts: 1,
+            retryRateLimit: false,
           }),
         )
         .then((result) => {

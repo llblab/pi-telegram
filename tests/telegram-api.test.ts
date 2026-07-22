@@ -256,7 +256,7 @@ test("Telegram bridge API runtime coalesces and spaces identical chat actions", 
   assert.equal(calls, 1);
   releaseFirst(true);
   assert.deepEqual(await Promise.all([first, joined]), [true, true]);
-  assert.deepEqual(callOptions, [{ maxAttempts: 1 }]);
+  assert.deepEqual(callOptions, [{ retryRateLimit: false }]);
 
   nowMs = 2999;
   assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
@@ -264,6 +264,43 @@ test("Telegram bridge API runtime coalesces and spaces identical chat actions", 
   nowMs = 3000;
   assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
   assert.equal(calls, 2);
+});
+
+test("Telegram bridge API runtime bounds active chat-action gates", async () => {
+  let nowMs = 1000;
+  const calls: string[] = [];
+  const runtime = createTelegramBridgeApiRuntime({
+    client: createApiRuntimeClient({
+      call: async <TResponse>(
+        _method: string,
+        body: Record<string, unknown>,
+      ) => {
+        calls.push(String(body.chat_id));
+        return true as TResponse;
+      },
+    }),
+    tempDir: "/tmp",
+    maxFileSizeBytes: 1,
+    tempFileMaxAgeMs: 1,
+    recordRuntimeEvent: () => {},
+    now: () => nowMs,
+    chatActionMinIntervalMs: 2000,
+    chatActionMaxGates: 2,
+  });
+  const send = (chatId: number) =>
+    runtime.call<boolean>("sendChatAction", {
+      chat_id: chatId,
+      action: "typing",
+    });
+
+  await send(1);
+  await send(2);
+  assert.equal(await send(3), true);
+  assert.deepEqual(calls, ["1", "2"]);
+
+  nowMs = 3000;
+  assert.equal(await send(3), true);
+  assert.deepEqual(calls, ["1", "2", "3"]);
 });
 
 test("Telegram bridge API runtime shares retry-after suppression for chat actions", async () => {
@@ -309,6 +346,37 @@ test("Telegram bridge API runtime shares retry-after suppression for chat action
     assert.equal(calls, 1);
     nowMs = 4000;
     assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
+    assert.equal(calls, 2);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("Telegram bridge API runtime preserves transient 5xx chat-action retries", async () => {
+  let calls = 0;
+  const restoreFetch = setApiTestFetch(async () => {
+    calls += 1;
+    return calls === 1
+      ? createApiErrorResponse(500, "Server Error")
+      : createApiJsonResponse(true);
+  });
+  try {
+    const runtime = createTelegramBridgeApiRuntime({
+      client: createTelegramApiClient(() => "123:abc"),
+      tempDir: "/tmp",
+      maxFileSizeBytes: 1,
+      tempFileMaxAgeMs: 1,
+      recordRuntimeEvent: () => {},
+    });
+
+    assert.equal(
+      await runtime.call<boolean>(
+        "sendChatAction",
+        { chat_id: 7, action: "typing" },
+        { retryBaseDelayMs: 0, sleep: async () => {} },
+      ),
+      true,
+    );
     assert.equal(calls, 2);
   } finally {
     restoreFetch();
