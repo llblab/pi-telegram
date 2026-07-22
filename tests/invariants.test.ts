@@ -146,6 +146,7 @@ test("Domain test filenames mirror their owning lib domain", () => {
       .map((name) => name.replace(/\.ts$/, "")),
   );
   const nonLibTestDomains = new Set([
+    "dependency-audit",
     "index",
     "integration",
     "invariants",

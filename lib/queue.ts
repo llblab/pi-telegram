@@ -1258,20 +1258,27 @@ export async function handleTelegramAgentEndRuntime<
   const isDeliveryActive = (): boolean =>
     deps.isSessionActive?.() !== false &&
     (!turn || deps.isTurnTransportActive?.(turn) !== false);
+  const updateStatusIgnoringStaleContext = (): void => {
+    try {
+      deps.updateStatus();
+    } catch (error) {
+      if (!isTelegramStaleContextError(error)) throw error;
+    }
+  };
   if (!isDeliveryActive()) {
     deps.resetRuntimeState();
-    deps.updateStatus();
+    updateStatusIgnoringStaleContext();
     deps.dispatchNextQueuedTelegramTurn();
     return;
   }
   deps.resetRuntimeState();
   await deps.waitForTypingIdle?.();
   if (!isDeliveryActive()) {
-    deps.updateStatus();
+    updateStatusIgnoringStaleContext();
     deps.dispatchNextQueuedTelegramTurn();
     return;
   }
-  deps.updateStatus();
+  updateStatusIgnoringStaleContext();
   const endPlan = buildTelegramAgentEndPlan({
     hasTurn: !!turn,
     stopReason: assistant.stopReason,
@@ -2117,6 +2124,8 @@ export interface TelegramDeferredQueueDispatchRuntime<TContext = unknown> {
   bind: (ctx: TContext) => void;
   unbind: () => void;
   isBound: () => boolean;
+  getGeneration: () => number;
+  isGenerationActive: (generation: number) => boolean;
   request: (dispatchNextQueuedTelegramTurn: (ctx: TContext) => void) => void;
 }
 
@@ -2149,6 +2158,9 @@ export function createTelegramDeferredQueueDispatchRuntime<TContext = unknown>(
       clearTimers();
     },
     isBound: () => boundContext !== undefined,
+    getGeneration: () => generation,
+    isGenerationActive: (expectedGeneration) =>
+      boundContext !== undefined && generation === expectedGeneration,
     request: (dispatchNextQueuedTelegramTurn) => {
       if (boundContext === undefined) return;
       const scheduledGeneration = generation;
@@ -2265,6 +2277,8 @@ export interface TelegramQueueDispatchControllerDeps<
   setQueuedItems: (items: TelegramQueueItem<TContext>[]) => void;
   canDispatch: (ctx: TContext) => boolean;
   hasDispatchContext?: () => boolean;
+  getDispatchGeneration?: () => number;
+  isDispatchGenerationActive?: (generation: number) => boolean;
   updateStatus: (ctx: TContext, error?: string) => void;
   sendTextReply: TelegramControlRuntimeDeps<TContext>["sendTextReply"];
   onPromptDispatchStart: (ctx: TContext, chatId: number) => void;
@@ -2318,6 +2332,8 @@ export function createTelegramQueueDispatchRuntime<TContext = unknown>(
       hasPendingMessages: deps.hasPendingMessages,
     }),
     hasDispatchContext: deps.hasDispatchContext,
+    getDispatchGeneration: deps.getDispatchGeneration,
+    isDispatchGenerationActive: deps.isDispatchGenerationActive,
     updateStatus: deps.updateStatus,
     sendTextReply: deps.sendTextReply,
     onPromptDispatchStart: deps.onPromptDispatchStart,
@@ -2363,6 +2379,7 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
       executeTelegramQueueDispatchPlan(dispatchPlan, {
         executeControlItem: (item) => {
           controlDispatchPending = true;
+          const dispatchGeneration = deps.getDispatchGeneration?.();
           deps.updateStatus(ctx);
           void executeTelegramControlItemRuntime(item, {
             ctx,
@@ -2371,6 +2388,13 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
             onSettled: () => {
               controlDispatchPending = false;
               if (deps.hasDispatchContext && !deps.hasDispatchContext()) return;
+              if (
+                dispatchGeneration !== undefined &&
+                deps.isDispatchGenerationActive &&
+                !deps.isDispatchGenerationActive(dispatchGeneration)
+              ) {
+                return;
+              }
               deps.updateStatus(ctx);
               controller.dispatchNext(ctx);
             },
