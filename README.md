@@ -278,6 +278,8 @@ Full validation:
 npm run validate
 ```
 
+`npm run audit` executes raw npm audit and then applies a fail-closed temporary policy for two findings pinned inside Pi's published shrinkwrap: `brace-expansion@5.0.6` (`GHSA-3jxr-9vmj-r5cp`) and `protobufjs@7.6.4` (`GHSA-j3f2-48v5-ccww`). It verifies exact advisory sources, graph, installed paths/versions, and rejects every other finding. The exception expires after 2026-08-21 UTC; see [BACKLOG.md](./BACKLOG.md).
+
 Project context:
 
 - [AGENTS.md](./AGENTS.md) — engineering and runtime conventions.

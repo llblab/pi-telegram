@@ -15,7 +15,11 @@ import * as BusApi from "../lib/bus-api.ts";
 import * as BusLeader from "../lib/bus-leader.ts";
 import * as Bus from "../lib/bus.ts";
 import * as Delivery from "../lib/delivery.ts";
-import type { TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
+import {
+  createTelegramBridgeApiRuntime,
+  type TelegramApiClient,
+  type TelegramBridgeApiRuntime,
+} from "../lib/telegram-api.ts";
 
 type RuntimeTestHandler = (context: TestContext) => void | Promise<void>;
 type RuntimeTelegramExtension = (typeof import("../index.ts"))["default"];
@@ -439,6 +443,42 @@ test("Follower aggregate delivery crosses the authorized leader transport", asyn
   ]);
 });
 
+test("Leader transport coalesces matching direct and follower chat actions", async () => {
+  let calls = 0;
+  let releaseAction: (value: boolean) => void = () => {};
+  const pendingAction = new Promise<boolean>((resolve) => {
+    releaseAction = resolve;
+  });
+  const directRuntime = createTelegramBridgeApiRuntime({
+    client: {
+      call: async <TResponse>() => {
+        calls += 1;
+        return (await pendingAction) as TResponse;
+      },
+      callMultipart: async <TResponse>() => true as TResponse,
+      downloadFile: async () => "/tmp/file",
+      answerCallbackQuery: async () => {},
+    } satisfies TelegramApiClient,
+    tempDir: "/tmp",
+    maxFileSizeBytes: 1,
+    tempFileMaxAgeMs: 1,
+    recordRuntimeEvent: () => {},
+  });
+  const leaderProxy = BusLeader.createTelegramBusLeaderApiProxy({
+    call: directRuntime.call,
+    callMultipart: directRuntime.callMultipart,
+    downloadFile: directRuntime.downloadFile,
+  });
+  const body = { chat_id: 77, action: "typing" };
+
+  const direct = directRuntime.call<boolean>("sendChatAction", body);
+  const follower = leaderProxy("call", ["sendChatAction", body]);
+  await flushMicrotasks();
+  assert.equal(calls, 1);
+  releaseAction(true);
+  assert.deepEqual(await Promise.all([direct, follower]), [true, true]);
+});
+
 test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn into pi", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
@@ -501,6 +541,7 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
     const dispatchedContent = await dispatched;
+    await flushMicrotasks();
     assert.equal(sentMessages.length, 1);
     assert.equal(Array.isArray(dispatchedContent), true);
     assert.equal(apiCalls.includes("sendMessage"), true);
