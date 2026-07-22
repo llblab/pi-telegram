@@ -2526,7 +2526,7 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
           callback_query: {
             id: "cb-idle-1",
             from: { id: 77, is_bot: false, first_name: "Test" },
-            data: "model:pick:0",
+            data: "model:pick:1",
             message: {
               message_id: 100,
               chat: { id: 99, type: "private" },

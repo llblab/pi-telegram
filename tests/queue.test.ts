@@ -2182,6 +2182,91 @@ test("Agent end uses rawFinalText when plannedReply is undefined", async () => {
   assert.ok(events.some((e) => e.includes("replyToPrompt=true")));
 });
 
+test("Agent end runtime ignores stale status after typing cleanup", async () => {
+  const events: string[] = [];
+  await handleTelegramAgentEndRuntime({
+    turn: undefined,
+    assistant: {},
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    waitForTypingIdle: async () => {
+      events.push("typing-idle");
+    },
+    updateStatus: () => {
+      throw new Error("This extension ctx is stale after session replacement");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => true,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+  });
+
+  assert.deepEqual(events, ["reset", "typing-idle", "dispatch"]);
+});
+
+test("Agent end runtime ignores stale status when session deactivates during typing cleanup", async () => {
+  const events: string[] = [];
+  let sessionActive = true;
+  await handleTelegramAgentEndRuntime({
+    turn: undefined,
+    assistant: {},
+    foldQueuedPromptsIntoHistory: false,
+    isSessionActive: () => sessionActive,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    waitForTypingIdle: async () => {
+      events.push("typing-idle");
+      sessionActive = false;
+    },
+    updateStatus: () => {
+      events.push("status");
+      throw new Error("This extension ctx is stale after session replacement");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => true,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+  });
+
+  assert.deepEqual(events, ["reset", "typing-idle", "status", "dispatch"]);
+});
+
+test("Agent end runtime rejects non-stale status after typing cleanup", async () => {
+  await assert.rejects(
+    handleTelegramAgentEndRuntime({
+      turn: undefined,
+      assistant: {},
+      foldQueuedPromptsIntoHistory: false,
+      resetRuntimeState: () => {},
+      waitForTypingIdle: async () => {},
+      updateStatus: () => {
+        throw new Error("status update broke");
+      },
+      dispatchNextQueuedTelegramTurn: () => {},
+      clearPreview: async () => {},
+      setPreviewPendingText: () => {},
+      finalizeMarkdownPreview: async () => true,
+      sendMarkdownReply: async () => {},
+      sendTextReply: async () => {},
+      sendQueuedAttachments: async () => {},
+    }),
+    /status update broke/,
+  );
+});
+
 test("Agent end hook binds assistant extraction and runtime ports", async () => {
   const events: string[] = [];
   const turn: PendingTelegramTurn = createQueueTestPromptTurn();
@@ -3849,6 +3934,66 @@ test("Queue dispatch controller does not resume prompts after shutdown clears co
     "control:start",
     "control:end",
   ]);
+});
+
+test("Queue dispatch controller fences old control settlement after session replacement", async () => {
+  const events: string[] = [];
+  let releaseControl: () => void = () => {};
+  const controlSettled = new Promise<void>((resolve) => {
+    releaseControl = resolve;
+  });
+  let queuedItems: TelegramQueueItem<string>[] = [
+    createQueueTestControlItem<string>({
+      execute: async (ctx) => {
+        events.push(`control:start:${ctx}`);
+        await controlSettled;
+        events.push("control:end");
+      },
+    }),
+  ];
+  const deferredDispatch = createTelegramDeferredQueueDispatchRuntime<string>();
+  deferredDispatch.bind("old");
+  const controller = createTelegramQueueDispatchController<string>({
+    hasDispatchContext: deferredDispatch.isBound,
+    getDispatchGeneration: deferredDispatch.getGeneration,
+    isDispatchGenerationActive: deferredDispatch.isGenerationActive,
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => {
+      queuedItems = items;
+      events.push(`items:${items.length}`);
+    },
+    canDispatch: () => true,
+    updateStatus: (ctx) => {
+      events.push(`status:${ctx}`);
+    },
+    sendTextReply: async () => undefined,
+    onPromptDispatchStart: (ctx, chatId) => {
+      events.push(`start:${ctx}:${chatId}`);
+    },
+    sendUserMessage: () => {
+      events.push("send");
+    },
+    onPromptDispatchFailure: () => {
+      events.push("unexpected:failure");
+    },
+  });
+
+  controller.dispatchNext("old");
+  deferredDispatch.unbind();
+  deferredDispatch.bind("new");
+  queuedItems = [createQueueTestPromptTurn({ chatId: 3 })];
+  releaseControl();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(events, [
+    "items:0",
+    "status:old",
+    "control:start:old",
+    "control:end",
+  ]);
+
+  controller.dispatchNext("new");
+  assert.deepEqual(events.slice(-3), ["items:1", "start:new:3", "send"]);
 });
 
 test("Session runtime helper resets session start state", () => {

@@ -2,6 +2,18 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
+## P0 — Expiring Pi Shrinkwrap Audit Exception
+
+Deadline: 2026-08-21 UTC. The validation gate intentionally fails at `2026-08-22T00:00:00Z` if either exception remains.
+
+Context: `@earendil-works/pi-coding-agent@0.80.6` publishes its own `npm-shrinkwrap.json`, which prevents this consumer package from replacing two installed vulnerable copies. On 2026-07-22 the operator explicitly approved a bounded exception for only `brace-expansion@5.0.6` / source `1123898` / `GHSA-3jxr-9vmj-r5cp` and `protobufjs@7.6.4` / source `1123964` / `GHSA-j3f2-48v5-ccww`, plus parent findings whose complete audit graph resolves exclusively to those sources. `npm run audit` verifies the exact graph, installed paths and versions, and expiry; every unknown or changed finding fails closed.
+
+Open work:
+
+- [ ] Upgrade to a Pi release whose published shrinkwrap installs `brace-expansion>=5.0.7` and `protobufjs>=7.6.5`, remove the exception policy, and restore a zero-finding raw `npm audit` before the deadline.
+
+Done when: a clean `npm ci` followed by raw `npm audit` reports zero vulnerabilities and the expiring policy/overrides are removed.
+
 ## P1 — Native Windows Runtime Smoke
 
 Context: Deterministic ownership, persistence, recovery, process, and named-pipe coverage passes on native hosted Windows. A live Telegram client remains the only unverified platform boundary and may be exercised in a later release cycle rather than tied to a specific version.

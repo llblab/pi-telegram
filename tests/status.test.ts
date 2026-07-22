@@ -364,7 +364,7 @@ test("Status runtime updates the status bar and exposes bridge lines", () => {
       theme: {
         fg: (token: string, text: string) => `<${token}>${text}</${token}>`,
       },
-      setStatus: (key: string, text: string) => {
+      setStatus: (key: string, text: string | undefined) => {
         events.push(`${key}:${text}`);
       },
     },
@@ -394,10 +394,7 @@ test("Status runtime updates the status bar and exposes bridge lines", () => {
     }),
   });
   runtime.updateStatus(ctx, "demo error");
-  assert.equal(
-    events[0],
-    "telegram:<accent>telegram</accent> <error>error</error>",
-  );
+  assert.equal(events[0], "telegram:undefined");
   assert.deepEqual(runtime.getStatusLines().slice(0, 3), [
     "connection:",
     "- bot: @demo_bot",
@@ -549,15 +546,12 @@ test("Bridge status runtime stays active while tools run after queue changes", (
       theme: {
         fg: (token: string, text: string) => `<${token}>${text}</${token}>`,
       },
-      setStatus: (key: string, text: string) => {
+      setStatus: (key: string, text: string | undefined) => {
         events.push(`${key}:${text}`);
       },
     },
   });
-  assert.equal(
-    events[0],
-    "telegram:<accent>telegram</accent> <warning>active</warning>",
-  );
+  assert.equal(events[0], "telegram:undefined");
 });
 
 test("Bridge status runtime builds status state from live ports", () => {
@@ -589,15 +583,12 @@ test("Bridge status runtime builds status state from live ports", () => {
       theme: {
         fg: (token: string, text: string) => `<${token}>${text}</${token}>`,
       },
-      setStatus: (key: string, text: string) => {
+      setStatus: (key: string, text: string | undefined) => {
         events.push(`${key}:${text}`);
       },
     },
   });
-  assert.equal(
-    events[0],
-    "telegram:<accent>telegram</accent> <warning>active</warning><success> +1</success>",
-  );
+  assert.equal(events[0], "telegram:undefined");
   assert.deepEqual(runtime.getStatusLines(), [
     "connection:",
     "- bot: @demo_bot",

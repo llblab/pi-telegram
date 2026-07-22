@@ -161,7 +161,7 @@ Named profile identifiers contain only lowercase ASCII letters and digits (maxim
 
 ### Operator Menu
 
-`/start` opens the Telegram-native control panel: status, prompt-template commands, model selection, thinking level, settings, queue controls, and extension sections. It is the primary Telegram UI; reaction shortcuts are secondary queue affordances.
+`/start` opens the Telegram-native control panel: status, prompt-template commands, model selection, thinking level, settings, queue controls, and extension sections. It is the primary Telegram UI; reaction shortcuts are secondary queue affordances. The model picker opens on all authenticated models by default, with configured scoped models available as an optional view. Pi's terminal `telegram` status key stays clear; connection and runtime diagnostics remain available in this menu and `/telegram-status`.
 
 ### Queue Runtime
 
@@ -277,6 +277,8 @@ Full validation:
 ```bash
 npm run validate
 ```
+
+`npm run audit` executes raw npm audit and then applies a fail-closed temporary policy for two findings pinned inside Pi's published shrinkwrap: `brace-expansion@5.0.6` (`GHSA-3jxr-9vmj-r5cp`) and `protobufjs@7.6.4` (`GHSA-j3f2-48v5-ccww`). It verifies exact advisory sources, graph, installed paths/versions, and rejects every other finding. The exception expires after 2026-08-21 UTC; see [BACKLOG.md](./BACKLOG.md).
 
 Project context:
 

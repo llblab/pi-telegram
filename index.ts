@@ -502,6 +502,9 @@ export default function (pi: Pi.ExtensionAPI) {
       isIdle,
       hasPendingMessages,
       hasDispatchContext: deferredQueueDispatchRuntime.isBound,
+      getDispatchGeneration: deferredQueueDispatchRuntime.getGeneration,
+      isDispatchGenerationActive:
+        deferredQueueDispatchRuntime.isGenerationActive,
       isQueueItemTransportActive(item) {
         return telegramTransportStampRuntime.isActive(item.transportStamp);
       },
