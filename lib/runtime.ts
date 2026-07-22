@@ -455,7 +455,12 @@ export function startTelegramTypingLoop(
   state.typingLoopKey = nextKey;
   const sendTyping = (): void => {
     const activeDeps = state.typingLoopDeps;
-    if (!activeDeps || activeDeps.chatId === undefined || activeDeps.chatId === 0)
+    if (
+      !activeDeps ||
+      activeDeps.chatId === undefined ||
+      activeDeps.chatId === 0 ||
+      state.typingInFlight
+    )
       return;
     const targetChatId = activeDeps.chatId;
     const threadParams = getTelegramTypingLoopThreadParams(activeDeps.target);

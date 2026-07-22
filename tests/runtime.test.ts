@@ -428,6 +428,42 @@ test("Typing loop starter sends one thread action and one aggregate action", asy
   assert.equal(runtime.typing.stop(), true);
 });
 
+test("Typing loop skips interval ticks while the previous action is in flight", async (ctx) => {
+  ctx.mock.timers.enable({ apis: ["setInterval"] });
+  const state = Runtime.createTelegramBridgeRuntimeState();
+  const runtime = Runtime.createTelegramBridgeRuntime(state);
+  let releaseAction: () => void = () => {};
+  const pendingAction = new Promise<void>((resolve) => {
+    releaseAction = resolve;
+  });
+  let calls = 0;
+  const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
+    typing: runtime.typing,
+    getDefaultChatId: () => 7,
+    sendTypingAction: async () => {
+      calls += 1;
+      await pendingAction;
+    },
+    updateStatus: () => {},
+    intervalMs: 1000,
+  });
+
+  startTypingLoop({ id: "ctx" });
+  await flushMicrotasks();
+  assert.equal(calls, 1);
+  ctx.mock.timers.tick(3000);
+  await flushMicrotasks();
+  assert.equal(calls, 1);
+
+  releaseAction();
+  await flushMicrotasks();
+  ctx.mock.timers.tick(1000);
+  await flushMicrotasks();
+  assert.equal(calls, 2);
+  assert.equal(runtime.typing.stop(), true);
+  ctx.mock.timers.reset();
+});
+
 test("Typing loop starter binds default chat and reports failures", async () => {
   const state = Runtime.createTelegramBridgeRuntimeState();
   const runtime = Runtime.createTelegramBridgeRuntime(state);

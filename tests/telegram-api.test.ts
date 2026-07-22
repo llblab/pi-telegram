@@ -36,6 +36,7 @@ import {
   setTelegramApiHttpsFetchForTesting,
   prepareTelegramTempDir,
   TELEGRAM_FILE_MAX_BYTES,
+  type TelegramApiCallOptions,
   type TelegramApiClient,
   type TelegramInputRichMessage,
 } from "../lib/telegram-api.ts";
@@ -218,6 +219,195 @@ test("Telegram bridge API runtime includes thread target on chat actions", async
       body: { chat_id: 7, action: "upload_document", message_thread_id: 42 },
     },
   ]);
+});
+
+test("Telegram bridge API runtime coalesces and spaces identical chat actions", async () => {
+  let nowMs = 1000;
+  let releaseFirst: (value: boolean) => void = () => {};
+  const firstResult = new Promise<boolean>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const callOptions: Array<{ maxAttempts?: number } | undefined> = [];
+  let calls = 0;
+  const runtime = createTelegramBridgeApiRuntime({
+    client: createApiRuntimeClient({
+      call: async <TResponse>(
+        _method: string,
+        _body: Record<string, unknown>,
+        options?: TelegramApiCallOptions,
+      ) => {
+        calls += 1;
+        callOptions.push(options);
+        return (calls === 1 ? await firstResult : true) as TResponse;
+      },
+    }),
+    tempDir: "/tmp",
+    maxFileSizeBytes: 1,
+    tempFileMaxAgeMs: 1,
+    recordRuntimeEvent: () => {},
+    now: () => nowMs,
+    chatActionMinIntervalMs: 2000,
+  });
+  const body = { chat_id: 7, action: "typing" };
+
+  const first = runtime.call<boolean>("sendChatAction", body);
+  const joined = runtime.call<boolean>("sendChatAction", body);
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  releaseFirst(true);
+  assert.deepEqual(await Promise.all([first, joined]), [true, true]);
+  assert.deepEqual(callOptions, [{ retryRateLimit: false }]);
+
+  nowMs = 2999;
+  assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
+  assert.equal(calls, 1);
+  nowMs = 3000;
+  assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
+  assert.equal(calls, 2);
+});
+
+test("Telegram bridge API runtime bounds active chat-action gates", async () => {
+  let nowMs = 1000;
+  const calls: string[] = [];
+  const runtime = createTelegramBridgeApiRuntime({
+    client: createApiRuntimeClient({
+      call: async <TResponse>(
+        _method: string,
+        body: Record<string, unknown>,
+      ) => {
+        calls.push(String(body.chat_id));
+        return true as TResponse;
+      },
+    }),
+    tempDir: "/tmp",
+    maxFileSizeBytes: 1,
+    tempFileMaxAgeMs: 1,
+    recordRuntimeEvent: () => {},
+    now: () => nowMs,
+    chatActionMinIntervalMs: 2000,
+    chatActionMaxGates: 2,
+  });
+  const send = (chatId: number) =>
+    runtime.call<boolean>("sendChatAction", {
+      chat_id: chatId,
+      action: "typing",
+    });
+
+  await send(1);
+  await send(2);
+  assert.equal(await send(3), true);
+  assert.deepEqual(calls, ["1", "2"]);
+
+  nowMs = 3000;
+  assert.equal(await send(3), true);
+  assert.deepEqual(calls, ["1", "2", "3"]);
+});
+
+test("Telegram bridge API runtime shares retry-after suppression for chat actions", async () => {
+  let nowMs = 1000;
+  let calls = 0;
+  const events: Array<Record<string, unknown>> = [];
+  const restoreFetch = setApiTestFetch(async () => {
+    calls += 1;
+    return calls === 1
+      ? createApiErrorResponse(
+          429,
+          "Too Many Requests: retry after 3",
+          new Headers({ "retry-after": "3" }),
+        )
+      : createApiJsonResponse(true);
+  });
+  try {
+    const runtime = createTelegramBridgeApiRuntime({
+      client: createTelegramApiClient(() => "123:abc"),
+      tempDir: "/tmp",
+      maxFileSizeBytes: 1,
+      tempFileMaxAgeMs: 1,
+      recordRuntimeEvent: (_kind, _error, details) => {
+        events.push(details ?? {});
+      },
+      now: () => nowMs,
+      chatActionMinIntervalMs: 2000,
+    });
+    const body = { chat_id: 7, action: "typing" };
+
+    assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
+    assert.equal(calls, 1);
+    assert.deepEqual(events, [
+      {
+        method: "sendChatAction",
+        rateLimited: true,
+        retryAfterMs: 3000,
+      },
+    ]);
+
+    nowMs = 3999;
+    assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
+    assert.equal(calls, 1);
+    nowMs = 4000;
+    assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
+    assert.equal(calls, 2);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("Telegram bridge API runtime preserves transient 5xx chat-action retries", async () => {
+  let calls = 0;
+  const restoreFetch = setApiTestFetch(async () => {
+    calls += 1;
+    return calls === 1
+      ? createApiErrorResponse(500, "Server Error")
+      : createApiJsonResponse(true);
+  });
+  try {
+    const runtime = createTelegramBridgeApiRuntime({
+      client: createTelegramApiClient(() => "123:abc"),
+      tempDir: "/tmp",
+      maxFileSizeBytes: 1,
+      tempFileMaxAgeMs: 1,
+      recordRuntimeEvent: () => {},
+    });
+
+    assert.equal(
+      await runtime.call<boolean>(
+        "sendChatAction",
+        { chat_id: 7, action: "typing" },
+        { retryBaseDelayMs: 0, sleep: async () => {} },
+      ),
+      true,
+    );
+    assert.equal(calls, 2);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("Telegram bridge API runtime still rejects non-rate-limit chat-action failures", async () => {
+  const events: string[] = [];
+  const runtime = createTelegramBridgeApiRuntime({
+    client: createApiRuntimeClient({
+      call: async () => {
+        throw new Error("chat action failed");
+      },
+    }),
+    tempDir: "/tmp",
+    maxFileSizeBytes: 1,
+    tempFileMaxAgeMs: 1,
+    recordRuntimeEvent: (kind, error) => {
+      events.push(`${kind}:${error instanceof Error ? error.message : error}`);
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      runtime.call<boolean>("sendChatAction", {
+        chat_id: 7,
+        action: "typing",
+      }),
+    /chat action failed/,
+  );
+  assert.deepEqual(events, ["api:chat action failed"]);
 });
 
 test("Telegram native Markdown draft sender disables automatic entity detection", async () => {
