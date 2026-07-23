@@ -2,18 +2,6 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — `0.24.4` Disconnect Model-Context Availability Hotfix
-
-Context: Issue #146 proves that a successfully disconnected instance still exposes `telegram_attach`, `telegram_message`, and `telegram_help`, their active-tool prompt metadata, and a system-prompt claim that Telegram remains available. Execute-time transport guards reject later local/TUI delivery, so the model receives stale capabilities and spends context on an unavailable bridge.
-
-Open work:
-
-- [ ] Reconcile pi-telegram's model-context tools and local system-prompt suffix against effective direct-owner or registered-follower authority, preserve the operator's prior pi-telegram active-tool subset and every non-pi-telegram tool, and restore only that subset after authority recovery.
-- [ ] Give temporary command threads the same forward and replace/restore controls as other unbound threads. Successful forward must delete the chooser and temporary thread; successful restore must delete the chooser, rebind the temporary thread, and delete only the replaced old thread.
-- [ ] Treat graceful Pi instance quit as an unconfirmed automatic `/telegram-disconnect` by default: delete the current Threaded Mode tab and release authority without prompting, expose a compact Settings/config toggle to preserve restart hints, and retain manual command confirmation plus same-process `reload`, `new`, `resume`, and `fork` handoff semantics.
-
-Done when: deterministic regressions cover initial disconnected state, successful and failed disconnect, connect/recovery, direct ownership and follower registration loss, session reload, user-disabled Telegram tools, next-request prompt metadata, preservation of foreign tools, unchanged execute-time fencing, complete temporary-command-thread controls, distinct forward-delete versus restore-rebind cleanup, graceful quit teardown, and non-quit session replacement preservation.
-
 ## P0 — Expiring Pi Shrinkwrap Audit Exception
 
 Deadline: 2026-08-21 UTC. The validation gate intentionally fails at `2026-08-22T00:00:00Z` if either exception remains.
