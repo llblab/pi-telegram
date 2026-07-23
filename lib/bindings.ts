@@ -295,10 +295,9 @@ interface TelegramLifecycleBindingDeps {
   >;
   promptDispatchRuntime: Runtime.TelegramPromptDispatchRuntime<Pi.ExtensionContext>;
   deferredQueueDispatchRuntime: Queue.TelegramDeferredQueueDispatchRuntime<Pi.ExtensionContext>;
-  lockOwnershipGuard: Pick<
-    Locks.TelegramLockOwnershipGuard<Pi.ExtensionContext>,
-    "ownsContext"
-  >;
+  modelContextAvailabilityRuntime: Prompts.TelegramModelContextAvailabilityRuntime;
+  disconnectOnQuit?: () => Promise<unknown>;
+  resolveAutomaticThreadCleanupEnabled?: () => boolean | Promise<boolean>;
   buttonActionStore: OutboundHandlers.TelegramButtonActionStore;
   callMultipart: OutboundHandlers.TelegramVoiceReplySenderDeps["sendMultipart"];
   sendChatAction: NonNullable<
@@ -338,7 +337,6 @@ interface TelegramLifecycleBindingDeps {
     Keyboard.TelegramInlineKeyboardMarkup
   >["finalizeMarkdownPreview"];
   proactivePushTargetGetter: () => Queue.TelegramQueueTarget | undefined;
-  isProactivePushEnabled: () => boolean;
   getAssistantRenderingMode: () => "rich" | "html";
   recordMessageOwnership?: (input: {
     chatId: number;
@@ -367,7 +365,9 @@ export function registerTelegramLifecycleRuntimeHooks({
   previewRuntime,
   promptDispatchRuntime,
   deferredQueueDispatchRuntime,
-  lockOwnershipGuard,
+  modelContextAvailabilityRuntime,
+  disconnectOnQuit,
+  resolveAutomaticThreadCleanupEnabled,
   buttonActionStore,
   callMultipart,
   sendChatAction,
@@ -380,7 +380,6 @@ export function registerTelegramLifecycleRuntimeHooks({
   sendGuestReply,
   finalizeMarkdownPreview,
   proactivePushTargetGetter,
-  isProactivePushEnabled,
   getAssistantRenderingMode,
   recordMessageOwnership,
   canSendAgentActivity,
@@ -629,6 +628,7 @@ export function registerTelegramLifecycleRuntimeHooks({
       previewRuntime.invalidate();
       assistantOutputRuntime.start();
       activityRuntime.onSessionStart?.();
+      modelContextAvailabilityRuntime.reconcile();
       await sessionLifecycleRuntime.onSessionStart(event, ctx);
     },
     async onSessionShutdown(event, ctx) {
@@ -637,6 +637,17 @@ export function registerTelegramLifecycleRuntimeHooks({
       activityRuntime.onSessionShutdown();
       assistantOutputRuntime.stop();
       compactionObserver.onSessionShutdown();
+      if (event.reason === "quit" && disconnectOnQuit) {
+        try {
+          const automaticCleanupEnabled =
+            (await resolveAutomaticThreadCleanupEnabled?.()) ?? true;
+          if (automaticCleanupEnabled) await disconnectOnQuit();
+        } catch (error) {
+          recordRuntimeEvent("session", error, {
+            phase: "automatic-disconnect-on-quit",
+          });
+        }
+      }
       await sessionLifecycleRuntime.onSessionShutdown(event, ctx);
     },
     onSessionBeforeCompact(event, ctx) {
@@ -704,11 +715,11 @@ export function registerTelegramLifecycleRuntimeHooks({
       if (!isSessionContextActive(ctx)) return;
       await agentLifecycleHooks.onAgentSettled(event, ctx);
       activityRuntime.onAgentSettled();
+      modelContextAvailabilityRuntime.reconcile();
     },
     onBeforeAgentStart: Prompts.createTelegramProactiveBeforeAgentStartHook({
-      isConfigured: configStore.hasBotToken,
-      isProactivePushEnabled,
-      isCurrentOwner: lockOwnershipGuard.ownsContext,
+      reconcileAvailability: modelContextAvailabilityRuntime.reconcile,
+      isAvailable: canSendAgentActivity,
     }),
   });
 }

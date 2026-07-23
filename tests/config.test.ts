@@ -650,12 +650,20 @@ test("Telegram settings setters reload before scoped writes to preserve shared c
   await secondStore.load();
 
   const setVoiceMode = createTelegramVoiceReplyModeSetter(firstStore);
+  const staleReaderControls = createTelegramConfigControls(firstStore);
   const controls = createTelegramConfigControls(secondStore);
+  assert.equal(controls.isAutomaticThreadCleanupEnabled(), true);
 
   await setVoiceMode("mirror");
   await controls.setProactivePushEnabled(true);
   await controls.setDraftPreviewsEnabled(true);
   await controls.setAssistantRenderingMode("html");
+  await controls.setAutomaticThreadCleanupEnabled(false);
+  assert.equal(staleReaderControls.isAutomaticThreadCleanupEnabled(), true);
+  assert.equal(
+    await staleReaderControls.resolveAutomaticThreadCleanupEnabled(),
+    false,
+  );
 
   assert.deepEqual(await readTelegramConfig(configPath), {
     profiles: { default: { botToken: "123:abc" } },
@@ -665,9 +673,33 @@ test("Telegram settings setters reload before scoped writes to preserve shared c
       proactivePush: true,
     },
     voice: { replyMode: "mirror" },
+    threads: { automaticCleanup: false },
   });
   assert.equal(controls.getAssistantRenderingMode(), "html");
+  assert.equal(controls.isAutomaticThreadCleanupEnabled(), false);
   assert.deepEqual(secondStore.get().voice, { replyMode: "mirror" });
+});
+
+test("Automatic thread cleanup fails closed after invalid shared config recovery", async () => {
+  const agentDir = await mkdtemp(
+    join(tmpdir(), "pi-telegram-invalid-cleanup-setting-"),
+  );
+  const configPath = join(agentDir, "telegram.json");
+  await writeTelegramConfig(agentDir, configPath, {
+    profiles: { default: { botToken: "123:abc" } },
+    threads: { automaticCleanup: false },
+  });
+  const store = createTelegramConfigStore({ agentDir, configPath });
+  await store.load();
+  const controls = createTelegramConfigControls(store);
+  await writeFile(configPath, "{invalid", "utf8");
+
+  await assert.rejects(
+    controls.resolveAutomaticThreadCleanupEnabled(),
+    /unavailable after invalid Telegram config recovery/,
+  );
+  assert.equal(store.didLastLoadRecoverInvalidConfig(), true);
+  assert.equal(controls.isAutomaticThreadCleanupEnabled(), false);
 });
 
 test("Polling offset persistence cannot erase settings written after poll start", async () => {

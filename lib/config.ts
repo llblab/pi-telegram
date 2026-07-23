@@ -87,6 +87,10 @@ export interface TelegramConfig {
     sendTranscript?: boolean;
   };
   time?: TelegramTimeConfig;
+  threads?: {
+    /** Delete this instance's bound Telegram thread on graceful Pi quit. */
+    automaticCleanup?: boolean;
+  };
   /** Canonical bot/session profiles, including profiles.default. */
   profiles?: Record<string, TelegramBotProfile>;
 }
@@ -140,6 +144,7 @@ export interface TelegramConfigStore {
   getOutboundHandlers: () => TelegramOutboundHandlerConfig[] | undefined;
   setAllowedUserId: (userId: number) => void;
   load: () => Promise<void>;
+  didLastLoadRecoverInvalidConfig: () => boolean;
   persist: (config?: TelegramConfig) => Promise<void>;
 }
 
@@ -188,6 +193,7 @@ type TelegramMutableConfigStore = Pick<
   "get" | "set" | "persist"
 > & {
   load?: () => Promise<void>;
+  didLastLoadRecoverInvalidConfig?: () => boolean;
 };
 
 function isEmptyTelegramConfig(config: TelegramConfig): boolean {
@@ -498,6 +504,7 @@ export function createTelegramConfigStore(
   let mutationVersion = 0;
   let persistQueue: Promise<void> = Promise.resolve();
   let activeProfileName: string | undefined;
+  let lastLoadRecoveredInvalidConfig = false;
   const agentDir = options.agentDir ?? resolveAgentDir();
   const configPath = options.configPath ?? getConfigPath();
   const getEffectiveConfig = () =>
@@ -556,8 +563,10 @@ export function createTelegramConfigStore(
       setEffectiveConfig(nextConfig);
     },
     load: async () => {
+      lastLoadRecoveredInvalidConfig = false;
       const loadedConfig = await readTelegramConfig(configPath, {
         onInvalidConfig: (recovery) => {
+          lastLoadRecoveredInvalidConfig = true;
           options.recordRuntimeEvent?.("config", recovery.error, {
             phase: "load",
             configPath: recovery.configPath,
@@ -593,6 +602,7 @@ export function createTelegramConfigStore(
       persistedConfig = cloneTelegramConfig(config);
       mutationVersion += 1;
     },
+    didLastLoadRecoverInvalidConfig: () => lastLoadRecoveredInvalidConfig,
     persist: (nextConfig = getEffectiveConfig()) => {
       const profileName = activeProfileName;
       const desiredConfig = storeTelegramEffectiveConfig(
@@ -862,6 +872,41 @@ export function createTelegramProactivePushTargetGetter(deps: {
   };
 }
 
+export function createTelegramAutomaticThreadCleanupChecker(
+  configStore: Pick<TelegramConfigStore, "get">,
+): () => boolean {
+  return () => configStore.get().threads?.automaticCleanup ?? true;
+}
+
+export function createTelegramAutomaticThreadCleanupResolver(
+  configStore: TelegramMutableConfigStore,
+): () => Promise<boolean> {
+  return async () => {
+    await loadLatestTelegramConfig(configStore);
+    if (configStore.didLastLoadRecoverInvalidConfig?.()) {
+      throw new Error(
+        "Automatic thread cleanup setting is unavailable after invalid Telegram config recovery.",
+      );
+    }
+    return createTelegramAutomaticThreadCleanupChecker(configStore)();
+  };
+}
+
+export function createTelegramAutomaticThreadCleanupSetter(
+  configStore: TelegramMutableConfigStore,
+): (enabled: boolean) => Promise<void> {
+  return async (enabled) => {
+    await loadLatestTelegramConfig(configStore);
+    const current = configStore.get();
+    const config = {
+      ...current,
+      threads: { ...current.threads, automaticCleanup: enabled },
+    };
+    configStore.set(config);
+    await configStore.persist(config);
+  };
+}
+
 export function createTelegramConfigControls(
   configStore: TelegramMutableConfigStore,
 ) {
@@ -880,6 +925,12 @@ export function createTelegramConfigControls(
     setVoiceReplyMode: createTelegramVoiceReplyModeSetter(configStore),
     getTimeInjectionMode: createTelegramTimeInjectionModeGetter(configStore),
     setTimeInjectionMode: createTelegramTimeInjectionModeSetter(configStore),
+    isAutomaticThreadCleanupEnabled:
+      createTelegramAutomaticThreadCleanupChecker(configStore),
+    resolveAutomaticThreadCleanupEnabled:
+      createTelegramAutomaticThreadCleanupResolver(configStore),
+    setAutomaticThreadCleanupEnabled:
+      createTelegramAutomaticThreadCleanupSetter(configStore),
   };
 }
 

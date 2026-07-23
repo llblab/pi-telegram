@@ -120,6 +120,8 @@ export interface PiExtensionApiRuntimePorts {
   getCommands: ExtensionAPI["getCommands"];
   getThinkingLevel: ExtensionAPI["getThinkingLevel"];
   setThinkingLevel: ExtensionAPI["setThinkingLevel"];
+  getActiveTools: ExtensionAPI["getActiveTools"];
+  setActiveTools: ExtensionAPI["setActiveTools"];
   setModel: ExtensionAPI["setModel"];
 }
 
@@ -131,6 +133,8 @@ export function createExtensionApiRuntimePorts(
     | "getCommands"
     | "getThinkingLevel"
     | "setThinkingLevel"
+    | "getActiveTools"
+    | "setActiveTools"
     | "setModel"
   >,
 ): PiExtensionApiRuntimePorts {
@@ -141,6 +145,8 @@ export function createExtensionApiRuntimePorts(
     getCommands: () => api.getCommands(),
     getThinkingLevel: () => api.getThinkingLevel(),
     setThinkingLevel: (level) => api.setThinkingLevel(level),
+    getActiveTools: () => api.getActiveTools(),
+    setActiveTools: (names) => api.setActiveTools(names),
     setModel: (model) => api.setModel(model),
   };
 }

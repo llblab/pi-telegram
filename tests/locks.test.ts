@@ -1959,6 +1959,7 @@ test("Locked polling runtime rolls back ownership when startup fails", async () 
   const temp = createTempLockPath();
   try {
     const events: string[] = [];
+    let availabilityChanges = 0;
     const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
     const runtime = createTelegramLockedPollingRuntime({
       lock,
@@ -1969,12 +1970,16 @@ test("Locked polling runtime rolls back ownership when startup fails", async () 
       stopPolling: async () => {
         events.push("stop");
       },
+      onTransportAvailabilityChanged: () => {
+        availabilityChanges += 1;
+      },
       updateStatus: () => undefined,
     });
 
     await assert.rejects(runtime.start({ cwd: "/repo" }), /startup failed/);
     assert.deepEqual(readLocks(temp.path), {});
     assert.deepEqual(events, ["stop"]);
+    assert.equal(availabilityChanges, 1);
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
@@ -2211,6 +2216,7 @@ test("Locked polling runtime stops after ownership loss without live context", a
       phase: unknown;
       message: string;
     }[] = [];
+    let availabilityChanges = 0;
     const ctx = { cwd: "/repo" };
     const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
     const runtime = createTelegramLockedPollingRuntime({
@@ -2226,6 +2232,9 @@ test("Locked polling runtime stops after ownership loss without live context", a
       updateStatus: () => {
         events.push("status");
       },
+      onTransportAvailabilityChanged: () => {
+        availabilityChanges += 1;
+      },
       recordRuntimeEvent: (category, error, details) => {
         runtimeEvents.push({
           category,
@@ -2238,6 +2247,7 @@ test("Locked polling runtime stops after ownership loss without live context", a
     writeFileSync(temp.path, JSON.stringify({}));
     await waitForCondition(() => events.includes("stop"));
     assert.deepEqual(events, ["start", "status", "stop"]);
+    assert.equal(availabilityChanges, 2);
     assert.deepEqual(runtimeEvents, []);
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
