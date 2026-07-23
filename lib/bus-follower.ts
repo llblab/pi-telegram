@@ -138,6 +138,17 @@ export interface TelegramBusFollowerSessionRefreshHookDeps<TContext> {
   ) => void;
 }
 
+export type TelegramBusFollowerControlLifecyclePhase = "electing";
+
+export interface TelegramBusFollowerControlState {
+  getActiveAuthSecret: () => string | undefined;
+  setActiveAuthSecret: (secret: string | undefined) => void;
+  getLifecyclePhase: () => TelegramBusFollowerControlLifecyclePhase | undefined;
+  setLifecyclePhase: (
+    phase: TelegramBusFollowerControlLifecyclePhase | undefined,
+  ) => void;
+}
+
 export interface TelegramBusFollowerRegistrationState {
   isRegistered: () => boolean;
   getTarget: () => TelegramTarget | undefined;
@@ -838,6 +849,21 @@ export function createTelegramBusFollowerSessionRefreshHook<TContext>(
       "Telegram follower session context refreshed",
       { phase: "follower-session-refresh" },
     );
+  };
+}
+
+export function createTelegramBusFollowerControlState(): TelegramBusFollowerControlState {
+  let activeAuthSecret: string | undefined;
+  let lifecyclePhase: TelegramBusFollowerControlLifecyclePhase | undefined;
+  return {
+    getActiveAuthSecret: () => activeAuthSecret,
+    setActiveAuthSecret(secret) {
+      activeAuthSecret = secret;
+    },
+    getLifecyclePhase: () => lifecyclePhase,
+    setLifecyclePhase(phase) {
+      lifecyclePhase = phase;
+    },
   };
 }
 

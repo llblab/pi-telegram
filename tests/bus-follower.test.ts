@@ -11,6 +11,7 @@ import test from "node:test";
 
 import {
   createTelegramBusFollowerApiCaller,
+  createTelegramBusFollowerControlState,
   createTelegramBusFollowerHeartbeatRecoveryHandler,
   createTelegramBusFollowerRegistrationRuntime,
   createTelegramBusFollowerPromotionHandler,
@@ -52,6 +53,22 @@ async function waitForCondition(
   }
   assert.fail("Timed out waiting for condition");
 }
+
+test("Follower control state owns active auth and transient lifecycle projection", () => {
+  const state = createTelegramBusFollowerControlState();
+  assert.equal(state.getActiveAuthSecret(), undefined);
+  assert.equal(state.getLifecyclePhase(), undefined);
+
+  state.setActiveAuthSecret("secret");
+  state.setLifecyclePhase("electing");
+  assert.equal(state.getActiveAuthSecret(), "secret");
+  assert.equal(state.getLifecyclePhase(), "electing");
+
+  state.setActiveAuthSecret(undefined);
+  state.setLifecyclePhase(undefined);
+  assert.equal(state.getActiveAuthSecret(), undefined);
+  assert.equal(state.getLifecyclePhase(), undefined);
+});
 
 test("Bus follower route handlers adapt forwarded envelopes", async () => {
   const events: string[] = [];

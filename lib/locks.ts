@@ -176,6 +176,42 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(buffer), 0, 0, ms);
 }
 
+export interface TelegramRenameRetryOptions {
+  rename?: typeof renameSync;
+  attempts?: number;
+  retryDelayMs?: number;
+}
+
+/** Rename one Telegram runtime artifact with bounded Windows sharing retries. */
+export function renameTelegramPathWithRetry(
+  sourcePath: string,
+  destinationPath: string,
+  options: TelegramRenameRetryOptions = {},
+): boolean {
+  const rename = options.rename ?? renameSync;
+  const attempts = Math.max(
+    1,
+    options.attempts ?? TELEGRAM_LOCK_WRITE_RETRY_ATTEMPTS,
+  );
+  const retryDelayMs = Math.max(
+    0,
+    options.retryDelayMs ?? TELEGRAM_LOCK_WRITE_RETRY_DELAY_MS,
+  );
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      rename(sourcePath, destinationPath);
+      return true;
+    } catch (error) {
+      if ((error as { code?: unknown })?.code === "ENOENT") return false;
+      if (!isRetryableLockWriteError(error) || attempt === attempts - 1) {
+        throw error;
+      }
+      sleepSync(retryDelayMs * (attempt + 1));
+    }
+  }
+  return false;
+}
+
 interface TelegramLockTransactionOwner {
   pid: number;
   acquiredAtMs: number;
@@ -307,29 +343,11 @@ function releaseLockTransactionGuard(
     );
   }
   const releasedPath = `${path}.released.${randomUUID()}`;
-  for (
-    let attempt = 0;
-    attempt < TELEGRAM_LOCK_WRITE_RETRY_ATTEMPTS;
-    attempt += 1
-  ) {
-    try {
-      renameSync(path, releasedPath);
-      try {
-        removeLockTransactionGuard(releasedPath);
-      } catch {
-        /* released debris cannot retain transaction authority */
-      }
-      return;
-    } catch (error) {
-      if ((error as { code?: unknown })?.code === "ENOENT") return;
-      if (
-        !isRetryableLockWriteError(error) ||
-        attempt === TELEGRAM_LOCK_WRITE_RETRY_ATTEMPTS - 1
-      ) {
-        throw error;
-      }
-      sleepSync(TELEGRAM_LOCK_WRITE_RETRY_DELAY_MS * (attempt + 1));
-    }
+  if (!renameTelegramPathWithRetry(path, releasedPath)) return;
+  try {
+    removeLockTransactionGuard(releasedPath);
+  } catch {
+    /* released debris cannot retain transaction authority */
   }
 }
 
@@ -411,28 +429,8 @@ function reclaimAbandonedDirectoryGuard(
     throw error;
   }
 
-  const renameWithRetry = (fromPath: string, toPath: string): boolean => {
-    for (
-      let attempt = 0;
-      attempt < TELEGRAM_LOCK_WRITE_RETRY_ATTEMPTS;
-      attempt += 1
-    ) {
-      try {
-        renameRecovery(fromPath, toPath);
-        return true;
-      } catch (error) {
-        if ((error as { code?: unknown })?.code === "ENOENT") return false;
-        if (
-          !isRetryableLockWriteError(error) ||
-          attempt === TELEGRAM_LOCK_WRITE_RETRY_ATTEMPTS - 1
-        ) {
-          throw error;
-        }
-        sleepSync(TELEGRAM_LOCK_WRITE_RETRY_DELAY_MS * (attempt + 1));
-      }
-    }
-    return false;
-  };
+  const renameWithRetry = (fromPath: string, toPath: string): boolean =>
+    renameTelegramPathWithRetry(fromPath, toPath, { rename: renameRecovery });
 
   activeReclaims.add(reclaimGeneration);
   const stalePath = `${path}.stale.${process.pid}.${randomUUID()}`;
