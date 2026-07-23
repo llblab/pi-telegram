@@ -270,6 +270,7 @@ type RuntimeHarnessCommand = {
 };
 type RuntimePiHarnessOptions = {
   sendUserMessage?: (content: RuntimeHarnessMessage) => void;
+  activeTools?: string[];
   getThinkingLevel?: () => string;
   setModel?: (model: { provider: string; id: string }) => Promise<boolean>;
   setThinkingLevel?: (level: string) => void;
@@ -279,6 +280,7 @@ type RuntimePiHarnessOptions = {
 function createRuntimePiHarness(options: RuntimePiHarnessOptions = {}) {
   const handlers = new Map<string, RuntimeHarnessHandler>();
   const commands = new Map<string, RuntimeHarnessCommand>();
+  let activeTools = [...(options.activeTools ?? ["read", "foreign_tool"])];
   const pi = {
     on: (event: string, handler: RuntimeHarnessHandler) => {
       handlers.set(event, handler);
@@ -286,7 +288,13 @@ function createRuntimePiHarness(options: RuntimePiHarnessOptions = {}) {
     registerCommand: (name: string, definition: RuntimeHarnessCommand) => {
       commands.set(name, definition);
     },
-    registerTool: () => {},
+    registerTool: (definition: { name: string }) => {
+      if (!activeTools.includes(definition.name)) activeTools.push(definition.name);
+    },
+    getActiveTools: () => [...activeTools],
+    setActiveTools: (names: string[]) => {
+      activeTools = [...names];
+    },
     sendUserMessage: options.sendUserMessage ?? (() => {}),
     getCommands: options.getCommands ?? (() => []),
     getThinkingLevel: options.getThinkingLevel ?? (() => "medium"),
@@ -295,7 +303,12 @@ function createRuntimePiHarness(options: RuntimePiHarnessOptions = {}) {
       ? { setThinkingLevel: options.setThinkingLevel }
       : {}),
   };
-  return { handlers, commands, pi: pi as never };
+  return {
+    handlers,
+    commands,
+    pi: pi as never,
+    getActiveTools: () => [...activeTools],
+  };
 }
 
 test("Public activity delivery reaches the classic instance without blocking agent start", async () => {
@@ -902,7 +915,7 @@ test("Extension runtime keeps local queue progress but fences delivery after own
 test("Extension runtime keeps proactive local result disabled even with Telegram lock ownership", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentBodies: Array<Record<string, unknown>> = [];
-  const { handlers, commands, pi } = createRuntimePiHarness();
+  const { handlers, commands, pi, getActiveTools } = createRuntimePiHarness();
   const restoreFetch = setRuntimeTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
@@ -930,7 +943,15 @@ test("Extension runtime keeps proactive local result disabled even with Telegram
       cwd: "/repo/proactive-disabled-owner",
     });
     await handlers.get("session_start")?.({}, ctx);
+    assert.deepEqual(getActiveTools(), ["read", "foreign_tool"]);
     await commands.get("telegram-connect")?.handler("", ctx);
+    assert.deepEqual(getActiveTools(), [
+      "read",
+      "foreign_tool",
+      "telegram_attach",
+      "telegram_message",
+      "telegram_help",
+    ]);
     await flushMicrotasks(20);
     await handlers.get("agent_end")?.(
       {
@@ -945,6 +966,14 @@ test("Extension runtime keeps proactive local result disabled even with Telegram
     );
     assert.deepEqual(sentBodies, []);
     await commands.get("telegram-disconnect")?.handler("", ctx);
+    assert.deepEqual(getActiveTools(), ["read", "foreign_tool"]);
+    assert.deepEqual(
+      await handlers.get("before_agent_start")?.(
+        { prompt: "local after disconnect", systemPrompt: "base" },
+        ctx,
+      ),
+      { systemPrompt: "base" },
+    );
     await handlers.get("session_shutdown")?.({}, ctx);
   } finally {
     restoreFetch();

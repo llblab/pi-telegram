@@ -286,6 +286,8 @@ test("Child process sharing the agent dir does not poll while parent owns Telegr
       on: (event, handler) => handlers.set(event, handler),
       registerCommand: () => {},
       registerTool: () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
       sendUserMessage: () => {},
       getCommands: () => [],
       getThinkingLevel: () => "medium",
@@ -352,6 +354,8 @@ test("Child process sharing the agent dir does not poll while parent owns Telegr
         on: (event, handler) => handlers.set(event, handler),
         registerCommand: () => {},
         registerTool: () => {},
+        getActiveTools: () => [],
+        setActiveTools: () => {},
         sendUserMessage: () => {},
         getCommands: () => [],
         getThinkingLevel: () => "medium",
@@ -439,10 +443,18 @@ test("Direct Telegram tools refuse delivery from a non-owner process", async () 
       };
       const handlers = new Map();
       const tools = new Map();
+      let activeTools = ["read"];
       const pi = {
         on: (event, handler) => handlers.set(event, handler),
         registerCommand: () => {},
-        registerTool: (definition) => tools.set(definition.name, definition),
+        registerTool: (definition) => {
+          tools.set(definition.name, definition);
+          activeTools.push(definition.name);
+        },
+        getActiveTools: () => [...activeTools],
+        setActiveTools: (names) => {
+          activeTools = [...names];
+        },
         sendUserMessage: () => {},
         getCommands: () => [],
         getThinkingLevel: () => "medium",
@@ -639,6 +651,8 @@ test("Extension session shutdown without active lock lets process exit", async (
       on: (event, handler) => handlers.set(event, handler),
       registerCommand: () => {},
       registerTool: () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
       sendUserMessage: () => {},
       getCommands: () => [],
       getThinkingLevel: () => "medium",
@@ -709,10 +723,17 @@ test("Extension session shutdown lets an active polling owner process exit", asy
     };
 
     const handlers = new Map();
+    let activeTools = ["read"];
     const pi = {
       on: (event, handler) => handlers.set(event, handler),
       registerCommand: () => {},
-      registerTool: () => {},
+      registerTool: (definition) => {
+        if (!activeTools.includes(definition.name)) activeTools.push(definition.name);
+      },
+      getActiveTools: () => [...activeTools],
+      setActiveTools: (names) => {
+        activeTools = [...names];
+      },
       sendUserMessage: () => {},
       getCommands: () => [],
       getThinkingLevel: () => "medium",

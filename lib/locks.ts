@@ -1139,6 +1139,7 @@ export interface TelegramLockedPollingRuntimeDeps<
     owner: TelegramLockEntry,
   ) => boolean | undefined | Promise<boolean | undefined>;
   stopFollowerRegistration?: () => void;
+  onTransportAvailabilityChanged?: () => void;
   updateStatus: (ctx: TContext) => void;
   recordRuntimeEvent?: (
     category: string,
@@ -1189,6 +1190,7 @@ export function createTelegramLockedPollingRuntime<
   const stopAfterOwnershipLoss = () => {
     if (ownershipStop) return;
     stopOwnershipWatcher();
+    deps.onTransportAvailabilityChanged?.();
     ownershipStop = deps
       .stopPolling()
       .catch((error) =>
@@ -1242,12 +1244,14 @@ export function createTelegramLockedPollingRuntime<
         });
       }
       deps.lock.release();
+      deps.onTransportAvailabilityChanged?.();
       throw error;
     }
     if (deps.lock.owns(ctx)) return true;
     stopOwnershipWatcher();
     if (ownershipStop) await ownershipStop;
     await deps.stopPolling();
+    deps.onTransportAvailabilityChanged?.();
     return false;
   };
   const canStartPolling = (ctx: TContext): boolean =>
@@ -1337,6 +1341,7 @@ export function createTelegramLockedPollingRuntime<
           message: "Telegram leadership changed during polling startup.",
         };
       }
+      deps.onTransportAvailabilityChanged?.();
       deps.updateStatus(ctx);
       const staleSuffix = acquired.replacedStale ? " Replaced stale lock." : "";
       return { ok: true, message: `Telegram bridge connected.${staleSuffix}` };
@@ -1344,6 +1349,7 @@ export function createTelegramLockedPollingRuntime<
     stop: async () => {
       await suspendPolling();
       const state = deps.lock.release();
+      deps.onTransportAvailabilityChanged?.();
       if (state.kind === "active-elsewhere") {
         return `Telegram bridge is active in another Pi instance (${formatTelegramLockEntry(state.lock)}).`;
       }
@@ -1391,6 +1397,7 @@ export function createTelegramLockedPollingRuntime<
         if (generation !== sessionAutoStartGeneration) return;
         if (!(await runOwnedPollingStart(ctx, {}))) return;
         if (generation !== sessionAutoStartGeneration) return;
+        deps.onTransportAvailabilityChanged?.();
         deps.updateStatus(ctx);
         deps.recordRuntimeEvent?.("lock", "Telegram auto-start completed", {
           phase: "auto-start-complete",

@@ -30,6 +30,7 @@ import * as Paths from "./lib/paths.ts";
 import * as Pi from "./lib/pi.ts";
 import * as Polling from "./lib/polling.ts";
 import * as Preview from "./lib/preview.ts";
+import * as Prompts from "./lib/prompts.ts";
 import * as PromptTemplates from "./lib/prompt-templates.ts";
 import * as Queue from "./lib/queue.ts";
 import * as Replies from "./lib/replies.ts";
@@ -53,9 +54,11 @@ type ActivePiModel = NonNullable<Pi.ExtensionContext["model"]>;
 export default function (pi: Pi.ExtensionAPI) {
   const piRuntime = Pi.createExtensionApiRuntimePorts(pi);
   const {
+    getActiveTools,
     getCommands,
     getThinkingLevel,
     sendUserMessage,
+    setActiveTools,
     setModel,
     setThinkingLevel,
   } = piRuntime;
@@ -85,8 +88,15 @@ export default function (pi: Pi.ExtensionAPI) {
   let telegramBusLifecycleOverridePhase:
     Status.TelegramBridgeBusLifecyclePhase | undefined;
   const telegramBusFollowerRegistry = Bus.createTelegramBusFollowerRegistry();
+  let modelContextAvailabilityRuntime:
+    | Prompts.TelegramModelContextAvailabilityRuntime
+    | undefined;
   const telegramBusFollowerRegistrationState =
-    BusFollower.createTelegramBusFollowerRegistrationState();
+    BusFollower.createTelegramBusFollowerRegistrationState({
+      onAvailabilityChanged() {
+        modelContextAvailabilityRuntime?.reconcile();
+      },
+    });
   const telegramBusLeaderState =
     Threads.createTelegramLeaderThreadStateRuntime();
   const telegramThreadCapabilityState =
@@ -153,6 +163,21 @@ export default function (pi: Pi.ExtensionAPI) {
     Locks.createTelegramDirectDeliveryOwnershipChecker({
       lock: lockRuntime,
       contextStore: telegramSessionContextStore,
+    });
+  modelContextAvailabilityRuntime =
+    Prompts.createTelegramModelContextAvailabilityRuntime({
+      getActiveTools,
+      setActiveTools,
+      isAvailable() {
+        return (
+          ownsTelegramDirectDelivery() ||
+          telegramBusFollowerRegistrationState.isRegistered()
+        );
+      },
+      canReconcile() {
+        const ctx = telegramSessionContextStore.get();
+        return !ctx || Pi.isExtensionContextIdle(ctx);
+      },
     });
   const activeTurnRuntime = Queue.createTelegramActiveTurnStore();
   const proactivePushTargetGetter =
@@ -619,6 +644,7 @@ export default function (pi: Pi.ExtensionAPI) {
   });
   const settingsMenuRuntime = MenuSettings.createTelegramSettingsMenuRuntime(
     {
+      reloadConfig: configStore.load,
       getModelMenuState: getQueueMenuState,
       getStoredModelMenuState: modelMenuRuntime.getState,
       storeModelMenuState: modelMenuRuntime.storeState,
@@ -935,6 +961,8 @@ export default function (pi: Pi.ExtensionAPI) {
     registerFollowerWithOwner:
       threadAwarePollingPorts.registerFollowerWithOwner,
     stopFollowerRegistration: threadAwarePollingPorts.stopFollowerRegistration,
+    onTransportAvailabilityChanged:
+      modelContextAvailabilityRuntime.reconcile,
     updateStatus,
     recordRuntimeEvent,
   });
@@ -1021,7 +1049,10 @@ export default function (pi: Pi.ExtensionAPI) {
       if (!record?.target.threadId) return undefined;
       return record.threadName ?? "current Telegram thread";
     },
-    onTransportChanged: deliveryLifecycleRuntime.onSessionStart,
+    onTransportChanged() {
+      deliveryLifecycleRuntime.onSessionStart();
+      modelContextAvailabilityRuntime.reconcile();
+    },
     getStatusLines,
     buttonActionStore,
     sendMarkdownReply,
@@ -1058,7 +1089,10 @@ export default function (pi: Pi.ExtensionAPI) {
     previewRuntime,
     promptDispatchRuntime,
     deferredQueueDispatchRuntime,
-    lockOwnershipGuard,
+    modelContextAvailabilityRuntime,
+    disconnectOnQuit: disconnectTelegramAndDeleteCurrentThread,
+    resolveAutomaticThreadCleanupEnabled:
+      configControls.resolveAutomaticThreadCleanupEnabled,
     buttonActionStore,
     callMultipart,
     sendChatAction,
@@ -1071,7 +1105,6 @@ export default function (pi: Pi.ExtensionAPI) {
     sendGuestReply,
     finalizeMarkdownPreview,
     proactivePushTargetGetter,
-    isProactivePushEnabled: configControls.isProactivePushEnabled,
     getAssistantRenderingMode: configControls.getAssistantRenderingMode,
     recordMessageOwnership: messageOwnershipRuntime.recordLocal,
     canSendAgentActivity(ctx) {

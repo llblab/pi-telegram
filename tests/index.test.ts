@@ -27,12 +27,19 @@ function createIndexApiHarness() {
   const tools = new Map<string, RegisteredIndexTool>();
   const commands = new Map<string, RegisteredIndexCommand>();
   const handlers = new Map<string, RegisteredIndexHandler>();
+  let activeTools: string[] = [];
   const api = {
     on: (event: string, handler: RegisteredIndexHandler) => {
       handlers.set(event, handler);
     },
     registerTool: (definition: RegisteredIndexTool) => {
-      if (definition.name) tools.set(definition.name, definition);
+      if (!definition.name) return;
+      tools.set(definition.name, definition);
+      activeTools.push(definition.name);
+    },
+    getActiveTools: () => [...activeTools],
+    setActiveTools: (names: string[]) => {
+      activeTools = [...names];
     },
     registerCommand: (name: string, definition: RegisteredIndexCommand) => {
       commands.set(name, definition);
