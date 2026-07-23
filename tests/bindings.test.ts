@@ -344,8 +344,10 @@ test("Named profile setup cancellation preserves the active runtime", async () =
   assert.deepEqual(notifications, []);
 });
 
-test("Lifecycle binding delegates shutdown to composed session runtime", async () => {
+test("Lifecycle binding disconnects only graceful quit and preserves cleanup after failure", async () => {
   const events: string[] = [];
+  let disconnectFails = false;
+  let automaticCleanupEnabled = true;
   const harness = createBindingApiHarness();
   const deps = {
     pi: harness.api,
@@ -419,7 +421,13 @@ test("Lifecycle binding delegates shutdown to composed session runtime", async (
       startTypingLoop: () => events.push("typing:start"),
     },
     deferredQueueDispatchRuntime: { request: () => {} },
-    lockOwnershipGuard: { ownsContext: () => false },
+    modelContextAvailabilityRuntime: { reconcile: () => {} },
+    disconnectOnQuit: async () => {
+      events.push("disconnect-on-quit");
+      if (disconnectFails) throw new Error("cleanup unavailable");
+    },
+    resolveAutomaticThreadCleanupEnabled: async () =>
+      automaticCleanupEnabled,
     buttonActionStore: { register: () => "button-action" },
     callMultipart: async () => ({ ok: true }),
     sendChatAction: async () => ({ ok: true }),
@@ -435,7 +443,13 @@ test("Lifecycle binding delegates shutdown to composed session runtime", async (
     isProactivePushEnabled: () => false,
     canSendAgentActivity: () => false,
     updateStatus: () => {},
-    recordRuntimeEvent: () => {},
+    recordRuntimeEvent: (
+      _category: string,
+      _error: unknown,
+      details?: { phase?: string },
+    ) => {
+      if (details?.phase) events.push(`runtime:${details.phase}`);
+    },
   } as unknown as Parameters<typeof registerTelegramLifecycleRuntimeHooks>[0];
 
   registerTelegramLifecycleRuntimeHooks(deps);
@@ -443,12 +457,38 @@ test("Lifecycle binding delegates shutdown to composed session runtime", async (
     { type: "session_before_compact" },
     {} as ExtensionContext,
   );
-  await getRequiredBindingHandler(harness.handlers, "session_shutdown")(
-    {},
+  const shutdown = getRequiredBindingHandler(
+    harness.handlers,
+    "session_shutdown",
+  );
+  await shutdown(
+    { type: "session_shutdown", reason: "reload" },
+    {} as ExtensionContext,
+  );
+  await shutdown(
+    { type: "session_shutdown", reason: "quit" },
+    {} as ExtensionContext,
+  );
+  disconnectFails = true;
+  await shutdown(
+    { type: "session_shutdown", reason: "quit" },
+    {} as ExtensionContext,
+  );
+  automaticCleanupEnabled = false;
+  await shutdown(
+    { type: "session_shutdown", reason: "quit" },
     {} as ExtensionContext,
   );
 
-  assert.deepEqual(events, ["composed-shutdown"]);
+  assert.deepEqual(events, [
+    "composed-shutdown",
+    "disconnect-on-quit",
+    "composed-shutdown",
+    "disconnect-on-quit",
+    "runtime:automatic-disconnect-on-quit",
+    "composed-shutdown",
+    "composed-shutdown",
+  ]);
 });
 
 test("Lifecycle binding routes native typing, previews, and normalized activity", async () => {
@@ -532,7 +572,7 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
         ),
     },
     deferredQueueDispatchRuntime: { request: () => {} },
-    lockOwnershipGuard: { ownsContext: () => false },
+    modelContextAvailabilityRuntime: { reconcile: () => {} },
     buttonActionStore: { register: () => "button-action" },
     callMultipart: async () => ({ ok: true }),
     sendChatAction: async () => ({ ok: true }),

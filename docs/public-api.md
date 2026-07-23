@@ -41,7 +41,7 @@ Stable commands inside Pi:
 
 - `/telegram-setup` — configure/update the bot token.
 - `/telegram-connect` — start polling here and acquire external Telegram control ownership. Accepted queue/reply state stays local if ownership later moves elsewhere.
-- `/telegram-disconnect` — stop polling and release ownership without deleting or silencing accepted local queue state. In Threaded Mode it first asks for confirmation, then deletes this instance's current Telegram thread; a follower waits for its active leader to confirm generation-fenced cleanup before stopping.
+- `/telegram-disconnect` — after destructive confirmation, stop polling and release ownership without deleting or silencing accepted local queue state. In Threaded Mode it deletes this instance's current Telegram thread; a follower waits for its active leader to confirm generation-fenced cleanup before stopping. Graceful Pi `quit` performs the same teardown without prompting, while `reload`, `new`, `resume`, and `fork` preserve same-process handoff.
 - `/telegram-status` — show connection, polling, execution, queue, and recent event diagnostics.
 
 ### Telegram commands
@@ -63,7 +63,7 @@ This command surface is a mobile companion subset, not a raw terminal-command br
 
 - `telegram_attach(paths, chat_id?, thread_id?, caption?)` is the stable artifact delivery tool for generated files. During Telegram turns it queues files for the active reply; with `assistant.rendering: "rich"`, exactly one PNG/JPEG, MP4, or MP3 artifact plus non-empty final Markdown can become one reply-anchored Rich Message. HTML mode, multiple/unsupported files, Guest Mode, and voice outputs retain their established paths. Outside Telegram turns the tool sends files directly to the paired/default chat, the registered follower's assigned thread, or an explicit `chat_id` plus optional `thread_id` when this Pi instance owns `/telegram-connect` or is registered with the multi-instance bus.
 - `telegram_message(text, chat_id?, thread_id?)` sends a direct Telegram Markdown message from local/TUI-initiated work when this Pi instance owns `/telegram-connect` or is registered with the multi-instance bus. Top-level `telegram_button` comments inside `text` are parsed with the same planner used for normal replies and attached to that message; buttons are never standalone Telegram messages.
-- `telegram_help()` returns detailed agent-facing guidance for pi-telegram delivery actions, Threaded Mode, formatting, and debugging. The regular prompt only points agents at this tool instead of repeating the full guidance on every turn.
+- `telegram_help()` returns detailed agent-facing guidance for pi-telegram delivery actions, Threaded Mode, formatting, and debugging. The regular prompt only points agents at this tool instead of repeating the full guidance on every turn. `telegram_attach`, `telegram_message`, and `telegram_help` remain registered but are model-active only while this instance owns direct transport or holds a live follower registration; disconnect/loss suppresses their schemas and prompt metadata, and recovery restores only the operator's previously active pi-telegram subset.
 - `telegram_voice` hidden comments request Telegram-native voice delivery.
 - `telegram_button` hidden comments create inline buttons whose taps enqueue prompts. Use top-level column-zero comments outside code, quotes, lists, and indented examples; do not emit JSON button specs or standalone button actions.
 
@@ -104,15 +104,19 @@ interface TelegramConfig {
     injectionMode?: "hidden" | "always" | "interval";
     interval?: number;
   };
+  threads?: {
+    automaticCleanup?: boolean;
+  };
 }
 ```
 
-Bot/session identity always persists under `profiles.<name>`. The ordinary setup path uses `profiles.default`; `/telegram-setup default` and `/telegram-connect default` are exact aliases for the bare commands. Named profiles use the same shape. Shared handlers plus `assistant`, `voice`, and `time` remain top-level. On the first `0.24.0` load, unambiguous legacy root identity moves atomically into `profiles.default`; identical duplicates collapse, complementary fields merge, and conflicting values fail closed without modifying the file.
+Bot/session identity always persists under `profiles.<name>`. The ordinary setup path uses `profiles.default`; `/telegram-setup default` and `/telegram-connect default` are exact aliases for the bare commands. Named profiles use the same shape. Shared handlers plus `assistant`, `voice`, `time`, and `threads` remain top-level. On the first `0.24.0` load, unambiguous legacy root identity moves atomically into `profiles.default`; identical duplicates collapse, complementary fields merge, and conflicting values fail closed without modifying the file.
 
 The file is global across Pi instances. Cooperating instances serialize recursive delta merges through `telegram.json.transaction`, preserve unrelated global/profile changes from newer disk snapshots, and merge `lastUpdateId` monotonically. A semantically unchanged merge adopts the latest disk state in memory without replacing the file; later commits win when two deltas intentionally change the same leaf. For manual edits, stop or idle the connected instances, publish a complete valid file atomically, and let them reload. A non-transactional editor racing Pi persistence has no same-leaf conflict guarantee.
 
 Hidden/default semantics are represented by absence:
 
+- `threads.automaticCleanup` defaults to `true`; graceful Pi quit deletes the instance's bound Threaded Mode tab without prompting. Set it to `false`, or use `🧹 Auto thread cleanup` in Telegram Settings, to preserve the tab as a restart hint. Settings views and graceful quit reload shared config before evaluating this switch, so another live Pi instance's update takes effect without restarting. Invalid-config recovery makes the quit-time setting unresolved and therefore skips destructive automatic cleanup. Manual `/telegram-disconnect` keeps its confirmation and teardown behavior regardless of this setting.
 - `assistant.proactivePush` defaults to `true`; omit it to keep projection enabled, or set it explicitly to `false` to disable it. When enabled, each completed public assistant text block from local or autonomous work is projected to the authorized Telegram target once and in source order. This includes visible intermediate commentary/checkpoints and the final block. It excludes token deltas, hidden reasoning, tool calls/arguments/results, Telegram-owned turns, empty blocks, and stale authority. Projection uses the configured Rich or HTML assistant renderer and binds admitted work to the exact target, profile/token transport generation, direct leader epoch or follower registration generation, and session generation. The old top-level `proactivePush` key is ignored; move the setting manually under `assistant`.
 - Voice Reply `hidden`: no `voice.replyMode` key is persisted; legacy `manual` resolves to this silent default. `mirror` adds `[voice] delivery: automatic voice` only to voice/audio-input turns, while `always` adds the same effective line to every Telegram turn.
 - Agent activity status is not configurable in this release. Telegram uses native `sendChatAction(typing)` / product `...active` status as the only automatic in-chat work signal before the final reply.

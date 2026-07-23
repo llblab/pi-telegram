@@ -990,7 +990,11 @@ test("Bus follower registration state tracks successful registration and stop", 
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-follower-state-"));
   const socketPath = join(dir, "bus.sock");
   const registry = createTelegramBusFollowerRegistry();
-  const state = createTelegramBusFollowerRegistrationState();
+  const availability: boolean[] = [];
+  let state: ReturnType<typeof createTelegramBusFollowerRegistrationState>;
+  state = createTelegramBusFollowerRegistrationState({
+    onAvailabilityChanged: () => availability.push(state.isRegistered()),
+  });
   const server = createTelegramBusLocalServer({
     socketPath,
     handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
@@ -1031,6 +1035,7 @@ test("Bus follower registration state tracks successful registration and stop", 
     assert.equal(state.getTarget(), undefined);
     assert.equal(state.getSlot(), undefined);
     assert.equal(state.getThreadName(), undefined);
+    assert.deepEqual(availability, [true, false]);
   } finally {
     follower.stop();
     await server.stop();

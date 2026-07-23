@@ -164,33 +164,9 @@ function escapeHtml(text: string): string {
     .replace(/>/g, "&gt;");
 }
 
-interface TelegramAllTabPendingCommand {
-  command: Commands.ParsedTelegramCommand;
-  text: string;
-  createdAtMs: number;
-}
-
-const TELEGRAM_ALL_TAB_MENU_CALLBACK_PREFIX = "allmenu:";
 const TELEGRAM_UNBOUND_REROUTE_CALLBACK_PREFIX = "reroute:";
 const TELEGRAM_UNBOUND_REROUTE_RESTORE_MENU_CALLBACK_PREFIX = "rerouterestore:";
 const TELEGRAM_UNBOUND_REROUTE_NEW_SLOT_CALLBACK_PREFIX = "reroutenew:";
-
-function formatTelegramAllTabMenuCallbackData(
-  commandId: string,
-  threadId: number,
-): string {
-  return `${TELEGRAM_ALL_TAB_MENU_CALLBACK_PREFIX}${commandId}:${threadId}`;
-}
-
-function parseTelegramAllTabMenuCallbackData(
-  data: string | undefined,
-): { commandId: string; threadId: number } | undefined {
-  const match = data?.match(/^allmenu:([a-z0-9]+):(\d+)$/);
-  const commandId = match?.[1];
-  const threadId = Number(match?.[2]);
-  if (!commandId || !Number.isSafeInteger(threadId)) return undefined;
-  return { commandId, threadId };
-}
 
 function formatTelegramUnboundRerouteCallbackData(
   rerouteId: string,
@@ -289,22 +265,6 @@ function getTelegramRoutableThreadRecords(
       record.status === "active" &&
       isTelegramLiveThreadTarget(record, liveTargets),
   );
-}
-
-function buildTelegramAllTabMenuChooserMarkup(
-  commandId: string,
-  records: readonly Threads.TelegramTopicTargetRecord[],
-): Menu.TelegramReplyMarkup {
-  const rows = records.map((record) => [
-    {
-      text: getTelegramRouteThreadButtonLabel(record),
-      callback_data: formatTelegramAllTabMenuCallbackData(
-        commandId,
-        record.target.threadId,
-      ),
-    },
-  ]);
-  return { inline_keyboard: rows };
 }
 
 function formatTelegramAllTabMenuChooserText(command: string): string {
@@ -695,7 +655,7 @@ export interface TelegramInboundRouteRuntimeDeps<
 }
 
 const TELEGRAM_OWNED_CALLBACK_PREFIXES = [
-  TELEGRAM_ALL_TAB_MENU_CALLBACK_PREFIX,
+  "allmenu:",
   TELEGRAM_UNBOUND_REROUTE_CALLBACK_PREFIX,
   "compact:",
   "menu:",
@@ -732,14 +692,36 @@ export function createTelegramInboundRouteRuntime<
     TModel
   >,
 ): Updates.TelegramUpdateRuntimeController<TContext, TUpdate> {
-  const pendingUnboundReroutes = new Map<
-    string,
-    { messages: TMessage[]; createdAtMs: number }
-  >();
-  const pendingAllTabCommands = new Map<string, TelegramAllTabPendingCommand>();
+  type PendingRerouteCleanup =
+    | {
+        kind: "unbound";
+        target: { chatId: number; threadId: number };
+        messageId?: number;
+      }
+    | {
+        kind: "previous-leader";
+        target: { chatId: number; threadId: number };
+      }
+    | {
+        kind: "replaced-follower";
+        target: { chatId: number; threadId: number };
+        instanceId?: string;
+      };
+  type PendingUnboundReroute = {
+    messages: TMessage[];
+    createdAtMs: number;
+    dispatchKind: "prompt" | "command";
+    cleanup?: PendingRerouteCleanup;
+    foreignRetry?: {
+      instanceId: string;
+      threadId: number;
+      cleanup: PendingRerouteCleanup;
+    };
+    finalizeMessage?: string;
+  };
+  const pendingUnboundReroutes = new Map<string, PendingUnboundReroute>();
   const guidedUnboundTopicKeys = new Set<string>();
   let nextUnboundRerouteId = 0;
-  let nextAllTabCommandId = 0;
   const requestDispatchNextQueuedTelegramTurn = (ctx: TContext): void => {
     deps.dispatchNextQueuedTelegramTurn(ctx);
     if (
@@ -764,11 +746,18 @@ export function createTelegramInboundRouteRuntime<
       pendingUnboundReroutes.delete(oldest);
     }
   };
-  const storePendingUnboundReroute = (messages: TMessage[]): string => {
+  const storePendingUnboundReroute = (
+    messages: TMessage[],
+    dispatchKind: "prompt" | "command" = "prompt",
+  ): string => {
     prunePendingUnboundReroutes();
     nextUnboundRerouteId += 1;
     const id = nextUnboundRerouteId.toString(36);
-    pendingUnboundReroutes.set(id, { messages, createdAtMs: Date.now() });
+    pendingUnboundReroutes.set(id, {
+      messages,
+      createdAtMs: Date.now(),
+      dispatchKind,
+    });
     return id;
   };
   const pendingUnboundRerouteMediaGroups = new Map<
@@ -778,39 +767,6 @@ export function createTelegramInboundRouteRuntime<
       timer: ReturnType<typeof setTimeout>;
     }
   >();
-  const prunePendingAllTabCommands = () => {
-    const nowMs = Date.now();
-    for (const [id, entry] of pendingAllTabCommands) {
-      if (nowMs - entry.createdAtMs > 30 * 60_000) {
-        pendingAllTabCommands.delete(id);
-      }
-    }
-    while (pendingAllTabCommands.size > 100) {
-      const oldest = pendingAllTabCommands.keys().next().value;
-      if (!oldest) break;
-      pendingAllTabCommands.delete(oldest);
-    }
-  };
-  const storePendingAllTabCommand = (
-    command: Commands.ParsedTelegramCommand,
-    text: string,
-  ): string => {
-    prunePendingAllTabCommands();
-    const bareCommandText = `/${command.name}`;
-    const id = text.trim() === bareCommandText ? command.name : undefined;
-    if (id) {
-      pendingAllTabCommands.set(id, { command, text, createdAtMs: Date.now() });
-      return id;
-    }
-    nextAllTabCommandId += 1;
-    const generatedId = nextAllTabCommandId.toString(36);
-    pendingAllTabCommands.set(generatedId, {
-      command,
-      text,
-      createdAtMs: Date.now(),
-    });
-    return generatedId;
-  };
   const menuCallbackHandler = Menu.createTelegramMenuCallbackHandlerForContext<
     TCallbackQuery,
     TContext,
@@ -889,9 +845,9 @@ export function createTelegramInboundRouteRuntime<
   };
   const applyThreadCleanupPlan = async (
     plan: ThreadReconciler.ThreadReconciliationPlan,
-  ): Promise<void> => {
+  ): Promise<boolean> => {
     deps.recordThreadReconciliationPlan?.(plan);
-    await ThreadReconciler.applyThreadReconciliationPlan(plan, {
+    const result = await ThreadReconciler.applyThreadReconciliationPlan(plan, {
       callApi: deps.callApi,
       markStaleByTarget: (staleTarget, syncStatus, lastSyncError) =>
         deps.threadStore?.markStaleByTarget(
@@ -905,10 +861,11 @@ export function createTelegramInboundRouteRuntime<
       getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
       recordRuntimeEvent: deps.recordRuntimeEvent,
     });
+    return (result.incompleteActions?.length ?? 0) === 0;
   };
   const dismissRerouteChooserMessage = async (
     query: TCallbackQuery,
-  ): Promise<void> => {
+  ): Promise<boolean> => {
     const chatId = query.message?.chat?.id;
     const messageId = query.message?.message_id;
     if (
@@ -916,10 +873,11 @@ export function createTelegramInboundRouteRuntime<
       typeof messageId !== "number" ||
       !deps.deleteMessage
     ) {
-      return;
+      return false;
     }
     try {
       await deps.deleteMessage(chatId, messageId);
+      return true;
     } catch (error) {
       deps.recordRuntimeEvent?.("telegram", error, {
         phase: "reroute-chooser-delete",
@@ -927,13 +885,14 @@ export function createTelegramInboundRouteRuntime<
         messageId,
         threadId: query.message?.message_thread_id,
       });
+      return false;
     }
   };
   const closeReroutedUnboundTopic = async (
     target: { chatId: number; threadId: number } | undefined,
     messageId: number | undefined,
-  ): Promise<void> => {
-    if (!target || !deps.threadStore) return;
+  ): Promise<boolean> => {
+    if (!target || !deps.threadStore) return true;
     const nowMs = Date.now();
     const currentLeaderEpoch = deps.getCurrentLeaderEpoch?.();
     const plan = ThreadReconciler.planThreadReconciliation({
@@ -954,14 +913,14 @@ export function createTelegramInboundRouteRuntime<
         },
       ],
     });
-    await applyThreadCleanupPlan(plan);
+    return applyThreadCleanupPlan(plan);
   };
   const closePreviousLeaderThread = async (
     target: { chatId: number; threadId: number } | undefined,
-  ): Promise<void> => {
-    if (!target || !deps.threadStore) return;
+  ): Promise<boolean> => {
+    if (!target || !deps.threadStore) return true;
     const currentLeaderEpoch = deps.getCurrentLeaderEpoch?.();
-    await applyThreadCleanupPlan({
+    return applyThreadCleanupPlan({
       actions: [
         {
           kind: "close-delete-previous-leader-topic",
@@ -978,10 +937,10 @@ export function createTelegramInboundRouteRuntime<
   const closeReplacedFollowerThread = async (
     target: { chatId: number; threadId: number } | undefined,
     instanceId: string | undefined,
-  ): Promise<void> => {
-    if (!target || !deps.threadStore) return;
+  ): Promise<boolean> => {
+    if (!target || !deps.threadStore) return true;
     const currentLeaderEpoch = deps.getCurrentLeaderEpoch?.();
-    await applyThreadCleanupPlan({
+    return applyThreadCleanupPlan({
       actions: [
         {
           kind: "close-delete-replaced-follower-topic",
@@ -994,6 +953,82 @@ export function createTelegramInboundRouteRuntime<
         },
       ],
     });
+  };
+  const retryPendingRerouteCleanup = async (
+    cleanup: PendingRerouteCleanup,
+  ): Promise<boolean> => {
+    if (cleanup.kind === "unbound") {
+      return closeReroutedUnboundTopic(cleanup.target, cleanup.messageId);
+    }
+    if (cleanup.kind === "previous-leader") {
+      return closePreviousLeaderThread(cleanup.target);
+    }
+    return closeReplacedFollowerThread(cleanup.target, cleanup.instanceId);
+  };
+  let dispatchReroutedCommandMessages:
+    | ((messages: TMessage[], ctx: TContext) => Promise<void>)
+    | undefined;
+  const dispatchPendingRerouteMessages = async (
+    pending: { dispatchKind: "prompt" | "command" },
+    messages: TMessage[],
+    ctx: TContext,
+  ): Promise<void> => {
+    if (pending.dispatchKind === "command" && dispatchReroutedCommandMessages) {
+      await dispatchReroutedCommandMessages(messages, ctx);
+      return;
+    }
+    await promptEnqueue(messages, ctx);
+  };
+  const finalizePendingReroute = async (
+    rerouteId: string,
+    pending: PendingUnboundReroute,
+    query: TCallbackQuery,
+    successMessage: string,
+  ): Promise<void> => {
+    const dismissed = await dismissRerouteChooserMessage(query);
+    if (dismissed) {
+      pendingUnboundReroutes.delete(rerouteId);
+      await deps.answerCallbackQuery(query.id, successMessage);
+      return;
+    }
+    pending.finalizeMessage = successMessage;
+    await deps.answerCallbackQuery(
+      query.id,
+      `${successMessage} Chooser cleanup is still pending. Try again.`,
+    );
+  };
+  const forwardPendingRerouteMessages = async (
+    pending: PendingUnboundReroute,
+    instanceId: string,
+    threadId: number,
+    ctx: TContext,
+  ): Promise<boolean> => {
+    const forwardMessage = deps.foreignOwnedUpdateForwarder?.forwardMessage;
+    if (!forwardMessage) return false;
+    const messages = cloneTelegramMessagesForThread(pending.messages, threadId);
+    const outcomes = await Promise.allSettled(
+      messages.map((message) =>
+        forwardMessage({
+          message,
+          ownership: { instanceId },
+          ctx,
+        }),
+      ),
+    );
+    pending.messages = pending.messages.filter((_, index) => {
+      const outcome = outcomes[index];
+      if (outcome?.status === "fulfilled" && outcome.value) return false;
+      if (outcome?.status === "rejected") {
+        deps.recordRuntimeEvent?.("bus", outcome.reason, {
+          phase: "reroute-foreign-forward",
+          instanceId,
+          threadId,
+          messageIndex: index,
+        });
+      }
+      return true;
+    });
+    return pending.messages.length === 0;
   };
   const handleUnboundRerouteRestoreMenuCallback = async (
     query: TCallbackQuery,
@@ -1062,6 +1097,51 @@ export function createTelegramInboundRouteRuntime<
       return true;
     }
     await deps.threadStore.load();
+    if (pending.finalizeMessage) {
+      await finalizePendingReroute(
+        parsed.rerouteId,
+        pending,
+        query,
+        pending.finalizeMessage,
+      );
+      return true;
+    }
+    if (pending.foreignRetry) {
+      const retry = pending.foreignRetry;
+      const allForwarded = await forwardPendingRerouteMessages(
+        pending,
+        retry.instanceId,
+        retry.threadId,
+        ctx,
+      );
+      if (!allForwarded) {
+        await deps.answerCallbackQuery(
+          query.id,
+          "Target thread is unavailable; retrying will send only remaining messages.",
+        );
+        return true;
+      }
+      pending.foreignRetry = undefined;
+      if (retry.cleanup) pending.cleanup = retry.cleanup;
+    }
+    if (pending.cleanup) {
+      const cleanupComplete = await retryPendingRerouteCleanup(pending.cleanup);
+      if (!cleanupComplete) {
+        await deps.answerCallbackQuery(
+          query.id,
+          "Message routed, but thread cleanup is still pending. Try again.",
+        );
+        return true;
+      }
+      pending.cleanup = undefined;
+      await finalizePendingReroute(
+        parsed.rerouteId,
+        pending,
+        query,
+        "Thread cleanup completed.",
+      );
+      return true;
+    }
     const record = getTelegramRoutableThreadRecords(
       deps.threadStore.list(),
       deps.getLiveThreadTargets?.(),
@@ -1150,27 +1230,43 @@ export function createTelegramInboundRouteRuntime<
           });
         }
       }
-      await closeReplacedFollowerThread(record.target, record.instanceId);
-      const forwarded = await Promise.all(
-        cloneTelegramMessagesForThread(
-          pending.messages,
-          sourceTarget.threadId,
-        ).map((message) =>
-          deps.foreignOwnedUpdateForwarder!.forwardMessage!({
-            message,
-            ownership: { instanceId: record.instanceId! },
-            ctx,
-          }),
-        ),
+      const cleanup: PendingRerouteCleanup = {
+        kind: "replaced-follower",
+        target: record.target,
+        instanceId: record.instanceId,
+      };
+      const allForwarded = await forwardPendingRerouteMessages(
+        pending,
+        record.instanceId!,
+        sourceTarget.threadId,
+        ctx,
       );
-      const allForwarded = forwarded.every(Boolean);
-      if (allForwarded) {
-        pendingUnboundReroutes.delete(parsed.rerouteId);
-        await dismissRerouteChooserMessage(query);
+      if (!allForwarded) {
+        pending.foreignRetry = {
+          instanceId: record.instanceId!,
+          threadId: sourceTarget.threadId,
+          cleanup,
+        };
+        await deps.answerCallbackQuery(
+          query.id,
+          "Thread restored; retrying will send only remaining messages before old-thread cleanup.",
+        );
+        return true;
       }
-      await deps.answerCallbackQuery(
-        query.id,
-        allForwarded ? "Message routed." : "Target thread is unavailable.",
+      const cleanupComplete = await retryPendingRerouteCleanup(cleanup);
+      if (!cleanupComplete) {
+        pending.cleanup = cleanup;
+        await deps.answerCallbackQuery(
+          query.id,
+          "Thread restored, but old-thread cleanup is still pending. Try again.",
+        );
+        return true;
+      }
+      await finalizePendingReroute(
+        parsed.rerouteId,
+        pending,
+        query,
+        "Message routed.",
       );
       return true;
     }
@@ -1186,49 +1282,64 @@ export function createTelegramInboundRouteRuntime<
         );
         return true;
       }
-      const forwarded = await Promise.all(
-        reroutedMessages.map((message) =>
-          deps.foreignOwnedUpdateForwarder!.forwardMessage!({
-            message,
-            ownership: { instanceId: record.instanceId! },
-            ctx,
-          }),
-        ),
+      const allForwarded = await forwardPendingRerouteMessages(
+        pending,
+        record.instanceId,
+        parsed.threadId,
+        ctx,
       );
-      const allForwarded = forwarded.every(Boolean);
-      if (allForwarded) {
-        pendingUnboundReroutes.delete(parsed.rerouteId);
-        await dismissRerouteChooserMessage(query);
-        await closeReroutedUnboundTopic(sourceTarget, sourceMessageId);
+      if (!allForwarded) {
+        await deps.answerCallbackQuery(
+          query.id,
+          "Target thread is unavailable; retrying will send only remaining messages.",
+        );
+        return true;
       }
-      await deps.answerCallbackQuery(
-        query.id,
-        allForwarded ? "Message routed." : "Target thread is unavailable.",
+      const cleanupComplete = await closeReroutedUnboundTopic(
+        sourceTarget,
+        sourceMessageId,
+      );
+      if (!cleanupComplete && sourceTarget) {
+        pending.cleanup = {
+          kind: "unbound",
+          target: sourceTarget,
+          ...(typeof sourceMessageId === "number"
+            ? { messageId: sourceMessageId }
+            : {}),
+        };
+        await deps.answerCallbackQuery(
+          query.id,
+          "Message routed, but thread cleanup is still pending. Try again.",
+        );
+        return true;
+      }
+      await finalizePendingReroute(
+        parsed.rerouteId,
+        pending,
+        query,
+        "Message routed.",
       );
       return true;
     }
     if (
       sourceTarget &&
       isCurrentLeaderRecord &&
-      (parsed.useNewSlot || typeof record.rerouteConfirmedAtMs !== "number") &&
+      parsed.useNewSlot &&
       (record.target.chatId !== sourceTarget.chatId ||
         record.target.threadId !== sourceTarget.threadId)
     ) {
       deps.threadStore.markStaleByTarget(
         record.target,
         "deleted",
-        parsed.useNewSlot
-          ? "Current leader thread was replaced by a new-slot reroute source."
-          : "Current leader thread was replaced by reroute source.",
+        "Current leader thread was replaced by a new-slot reroute source.",
       );
-      const slot = parsed.useNewSlot
-        ? (deps.threadStore.allocateSlot(
-            leaderProfileKey ?? record.profileKey,
-            getNextTelegramSlotPreference(record.slot),
-          ) ??
-          record.slot ??
-          "?")
-        : (record.slot ?? "?");
+      const slot =
+        deps.threadStore.allocateSlot(
+          leaderProfileKey ?? record.profileKey,
+          getNextTelegramSlotPreference(record.slot),
+        ) ??
+        record.slot ??
+        "?";
       const nowMs = Date.now();
       const threadName = getRestoredThreadName(record, slot);
       deps.threadStore.upsert({
@@ -1239,9 +1350,7 @@ export function createTelegramInboundRouteRuntime<
         threadName,
         instanceId: currentInstanceId,
         slot,
-        lastReconcileAction: parsed.useNewSlot
-          ? "reroute-new-slot"
-          : "reroute-reclaim",
+        lastReconcileAction: "reroute-new-slot",
         rerouteConfirmedAtMs: nowMs,
       });
       await deps.threadStore.persist();
@@ -1272,110 +1381,58 @@ export function createTelegramInboundRouteRuntime<
           slot,
         },
       );
-      if (parsed.useNewSlot) {
-        await closePreviousLeaderThread(record.target);
-      }
-      await promptEnqueue(
+      await dispatchPendingRerouteMessages(
+        pending,
         cloneTelegramMessagesForThread(pending.messages, sourceTarget.threadId),
         ctx,
       );
-      pendingUnboundReroutes.delete(parsed.rerouteId);
-      await dismissRerouteChooserMessage(query);
-      await deps.answerCallbackQuery(query.id, "Message routed.");
-      return true;
-    }
-    await promptEnqueue(reroutedMessages, ctx);
-    pendingUnboundReroutes.delete(parsed.rerouteId);
-    await dismissRerouteChooserMessage(query);
-    await closeReroutedUnboundTopic(sourceTarget, sourceMessageId);
-    await deps.answerCallbackQuery(query.id, "Message routed.");
-    return true;
-  };
-  let dispatchAllTabCommandToTarget:
-    | ((
-        commandText: string,
-        query: TCallbackQuery,
-        threadId: number,
-        ctx: TContext,
-      ) => Promise<void>)
-    | undefined;
-  const handleAllTabMenuCallback = async (
-    query: TCallbackQuery,
-    ctx: TContext,
-  ): Promise<boolean> => {
-    const parsed = parseTelegramAllTabMenuCallbackData(query.data);
-    if (!parsed) return false;
-    const chatId = query.message?.chat?.id;
-    const pending = pendingAllTabCommands.get(parsed.commandId);
-    if (typeof chatId !== "number" || !deps.threadStore || !pending) {
-      await deps.answerCallbackQuery(query.id, "Thread menu expired.");
-      return true;
-    }
-    await deps.threadStore.load();
-    const record = getTelegramRoutableThreadRecords(
-      deps.threadStore.list(),
-      deps.getLiveThreadTargets?.(),
-    ).find(
-      (candidate) =>
-        candidate.target.chatId === chatId &&
-        candidate.target.threadId === parsed.threadId,
-    );
-    if (!record) {
-      await deps.answerCallbackQuery(query.id, "Thread is not active yet.");
-      return true;
-    }
-    const currentInstanceId = deps.getCurrentInstanceId?.();
-    const leaderProfileKey = getLeaderTopicProfileKey(ctx, currentInstanceId);
-    const isCurrentLeaderRecord = isCurrentLeaderTopicRecord(
-      record,
-      leaderProfileKey,
-      currentInstanceId,
-    );
-    if (
-      record.instanceId &&
-      record.instanceId !== currentInstanceId &&
-      !isCurrentLeaderRecord
-    ) {
-      if (!deps.foreignOwnedUpdateForwarder?.forwardMessage) {
+      pending.messages = [];
+      const cleanupComplete = await closePreviousLeaderThread(record.target);
+      if (!cleanupComplete) {
+        pending.cleanup = {
+          kind: "previous-leader",
+          target: record.target,
+        };
         await deps.answerCallbackQuery(
           query.id,
-          "Open that thread and run /start there.",
+          "Thread restored, but old-thread cleanup is still pending. Try again.",
         );
         return true;
       }
-      const forwarded = await deps.foreignOwnedUpdateForwarder.forwardMessage({
-        message: {
-          ...(query.message ?? {}),
-          message_id: query.message?.message_id ?? 0,
-          chat: { id: chatId, type: "private" },
-          from: query.from,
-          message_thread_id: parsed.threadId,
-          text: pending.text,
-        } as TMessage,
-        ownership: { instanceId: record.instanceId },
-        ctx,
-      });
-      if (forwarded) pendingAllTabCommands.delete(parsed.commandId);
-      await deps.answerCallbackQuery(
-        query.id,
-        forwarded
-          ? "Opening in target thread."
-          : "Target thread is unavailable.",
+      await finalizePendingReroute(
+        parsed.rerouteId,
+        pending,
+        query,
+        "Message routed.",
       );
       return true;
     }
-    if (!dispatchAllTabCommandToTarget) {
-      await deps.answerCallbackQuery(query.id, "Thread menu expired.");
+    await dispatchPendingRerouteMessages(pending, reroutedMessages, ctx);
+    pending.messages = [];
+    const cleanupComplete = await closeReroutedUnboundTopic(
+      sourceTarget,
+      sourceMessageId,
+    );
+    if (!cleanupComplete && sourceTarget) {
+      pending.cleanup = {
+        kind: "unbound",
+        target: sourceTarget,
+        ...(typeof sourceMessageId === "number"
+          ? { messageId: sourceMessageId }
+          : {}),
+      };
+      await deps.answerCallbackQuery(
+        query.id,
+        "Message routed, but thread cleanup is still pending. Try again.",
+      );
       return true;
     }
-    await dispatchAllTabCommandToTarget(
-      pending.text,
+    await finalizePendingReroute(
+      parsed.rerouteId,
+      pending,
       query,
-      parsed.threadId,
-      ctx,
+      "Message routed.",
     );
-    pendingAllTabCommands.delete(parsed.commandId);
-    await deps.answerCallbackQuery(query.id, "Opening in target thread.");
     return true;
   };
   const callbackHandler = async (
@@ -1384,7 +1441,6 @@ export function createTelegramInboundRouteRuntime<
   ): Promise<void> => {
     if (await handleUnboundRerouteRestoreMenuCallback(query, ctx)) return;
     if (await handleUnboundRerouteCallback(query, ctx)) return;
-    if (await handleAllTabMenuCallback(query, ctx)) return;
     if (deps.buttonActionStore) {
       const handled = await OutboundHandlers.handleTelegramButtonCallbackQuery(
         query,
@@ -1769,10 +1825,15 @@ export function createTelegramInboundRouteRuntime<
       deps.getLiveThreadTargets?.(),
     );
     if (activeRecords.length === 0) return false;
-    const commandId = storePendingAllTabCommand(command, commandText);
+    const commandMessage = {
+      ...message,
+      text: commandText,
+      caption: undefined,
+    } as TMessage;
+    const rerouteId = storePendingUnboundReroute([commandMessage], "command");
     const text = formatTelegramAllTabMenuChooserText(command.name);
-    const replyMarkup = buildTelegramAllTabMenuChooserMarkup(
-      commandId,
+    const replyMarkup = buildTelegramUnboundRerouteChooserMarkup(
+      rerouteId,
       activeRecords,
     );
     if (deps.sendInteractiveMessage) {
@@ -1877,24 +1938,8 @@ export function createTelegramInboundRouteRuntime<
       ({ ...message, text, caption: undefined }) as TMessage,
     enqueueTurn: promptEnqueue,
   });
-  dispatchAllTabCommandToTarget = async (commandText, query, threadId, ctx) => {
-    const chatId = query.message?.chat?.id;
-    if (typeof chatId !== "number") return;
-    await commandOrPrompt.dispatchMessages(
-      [
-        {
-          ...(query.message ?? {}),
-          message_id: 0,
-          chat: { id: chatId, type: "private" },
-          from: query.from,
-          message_thread_id: threadId,
-          text: commandText,
-          caption: undefined,
-        } as TMessage,
-      ],
-      ctx,
-    );
-  };
+  dispatchReroutedCommandMessages = (messages, ctx) =>
+    commandOrPrompt.dispatchMessages(messages, ctx);
   const mediaDispatch = Media.createTelegramMediaGroupDispatchRuntime<
     TMessage,
     TContext

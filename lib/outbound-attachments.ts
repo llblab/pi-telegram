@@ -11,6 +11,12 @@ import { Type } from "@sinclair/typebox";
 
 import type { ExtensionAPI } from "./pi.ts";
 import {
+  TELEGRAM_ATTACH_PROMPT_GUIDELINES,
+  TELEGRAM_ATTACH_PROMPT_SNIPPET,
+  TELEGRAM_MESSAGE_PROMPT_GUIDELINES,
+  TELEGRAM_MESSAGE_PROMPT_SNIPPET,
+} from "./prompts.ts";
+import {
   buildTelegramMultipartReplyParameters,
   normalizeTelegramNativeMarkdown,
 } from "./replies.ts";
@@ -432,13 +438,8 @@ export function registerTelegramOutboundAttachmentTool(
     label: "Telegram Attach",
     description:
       "Queue one or more local files for the active Telegram reply, or send them immediately to Telegram when no Telegram turn is active.",
-    promptSnippet:
-      "Queue files for the active Telegram reply; outside Telegram turns, send files directly to Telegram.",
-    promptGuidelines: [
-      "When handling a [telegram] message and the user asked for a file or generated artifact, call telegram_attach with the local path instead of only mentioning the path in text.",
-      "When a local/TUI user explicitly asks to send a generated file to Telegram, telegram_attach can deliver it to the paired/default Telegram chat even without an active Telegram turn.",
-      "For an explicit thread target, provide chat_id plus thread_id; registered multi-instance followers default to their assigned thread target.",
-    ],
+    promptSnippet: TELEGRAM_ATTACH_PROMPT_SNIPPET,
+    promptGuidelines: [...TELEGRAM_ATTACH_PROMPT_GUIDELINES],
     parameters: Type.Object({
       paths: Type.Array(
         Type.String({ description: "Local file path to attach" }),
@@ -499,14 +500,8 @@ export function registerTelegramOutboundMessageTool(
     label: "Telegram Message",
     description:
       "Send a Markdown text message directly to the paired/default Telegram chat or an explicit chat_id. Hidden telegram_button comments in the text become attached inline prompt buttons.",
-    promptSnippet:
-      "Send direct Telegram Markdown text when the user explicitly asks for Telegram delivery outside the normal reply flow.",
-    promptGuidelines: [
-      "Use telegram_message only when the user explicitly asks to send a message to Telegram from the local/TUI side, or names a concrete Telegram delivery target.",
-      "For an explicit thread target, provide chat_id plus thread_id; registered multi-instance followers default to their assigned thread target.",
-      "Add buttons by embedding the same top-level telegram_button HTML comments used in normal Telegram replies; Telegram does not support standalone buttons.",
-      "Do not use this tool for ordinary Telegram-originated replies; answer normally so the bridge can deliver the active turn reply.",
-    ],
+    promptSnippet: TELEGRAM_MESSAGE_PROMPT_SNIPPET,
+    promptGuidelines: [...TELEGRAM_MESSAGE_PROMPT_GUIDELINES],
     parameters: Type.Object({
       text: Type.String({ description: "Message text to send" }),
       chat_id: Type.Optional(

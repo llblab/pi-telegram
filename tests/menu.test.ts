@@ -2208,7 +2208,7 @@ test("Section callback actions preserve callback thread target", async () => {
 test("Settings menu labels proactive push with state text", () => {
   assert.deepEqual(
     buildTelegramSettingsMenuReplyMarkup(true, false, "hidden", "hidden")
-      .inline_keyboard[5],
+      .inline_keyboard[6],
     [
       {
         text: "📌 Proactive push: on",
@@ -2218,7 +2218,7 @@ test("Settings menu labels proactive push with state text", () => {
   );
   assert.deepEqual(
     buildTelegramSettingsMenuReplyMarkup(false, false, "hidden", "hidden")
-      .inline_keyboard[5],
+      .inline_keyboard[6],
     [
       {
         text: "📌 Proactive push: off",
@@ -2231,7 +2231,7 @@ test("Settings menu labels proactive push with state text", () => {
 test("Settings menu exposes time injection mode selection", () => {
   assert.deepEqual(
     buildTelegramSettingsMenuReplyMarkup(false, false, "hidden", "hidden")
-      .inline_keyboard[2],
+      .inline_keyboard[3],
     [
       {
         text: "🕒 Time injection: hidden",
@@ -2241,7 +2241,7 @@ test("Settings menu exposes time injection mode selection", () => {
   );
   assert.deepEqual(
     buildTelegramSettingsMenuReplyMarkup(false, false, "hidden", "interval")
-      .inline_keyboard[2],
+      .inline_keyboard[3],
     [
       {
         text: "🕒 Time injection: interval",
@@ -2286,7 +2286,7 @@ test("Settings menu marks voice mode selection with model-style dot", () => {
       "hidden",
       undefined,
       false,
-    ).inline_keyboard[1],
+    ).inline_keyboard[2],
     [
       {
         text: "👄 Voice reply: hidden",
@@ -2296,7 +2296,7 @@ test("Settings menu marks voice mode selection with model-style dot", () => {
   );
   assert.deepEqual(
     buildTelegramSettingsMenuReplyMarkup(false, false, "always", "hidden")
-      .inline_keyboard[1],
+      .inline_keyboard[2],
     [
       {
         text: "👄 Voice reply: always",
@@ -2340,6 +2340,7 @@ test("Settings menu rehydrates expired state before persisting and rendering voi
     getTimeInjectionMode: () => "hidden",
     getVoiceReplyMode: () => mode ?? "hidden",
     isVoiceReplyModeConfigured: () => configured,
+    isAutomaticThreadCleanupEnabled: () => true,
     setProactivePushEnabled: async () => {},
     setDraftPreviewsEnabled: async () => {},
     setAssistantRenderingMode: async () => {},
@@ -2349,6 +2350,7 @@ test("Settings menu rehydrates expired state before persisting and rendering voi
       events.push(`set:${nextMode}`);
     },
     setTimeInjectionMode: async () => {},
+    setAutomaticThreadCleanupEnabled: async () => {},
   });
 
   assert.equal(

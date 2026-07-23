@@ -376,6 +376,12 @@ interface RouteHarnessOptions {
     TestContext,
     TestModel
   >["callApi"];
+  deleteMessage?: Routing.TelegramInboundRouteRuntimeDeps<
+    TestMessage,
+    TestCallbackQuery,
+    TestContext,
+    TestModel
+  >["deleteMessage"];
   replaceFollowerThreadTarget?: Routing.TelegramInboundRouteRuntimeDeps<
     TestMessage,
     TestCallbackQuery,
@@ -514,9 +520,11 @@ function createRouteHarness(options: RouteHarnessOptions = {}) {
       }
       return undefined;
     },
-    deleteMessage: async (chatId, messageId) => {
-      events.push(`delete-message:${chatId}:${messageId}`);
-    },
+    deleteMessage:
+      options.deleteMessage ??
+      (async (chatId, messageId) => {
+        events.push(`delete-message:${chatId}:${messageId}`);
+      }),
     setMyCommands: async () => undefined,
     getCommands: options.getCommands ?? (() => []),
     downloadFile: async (_fileId, fileName) => `/tmp/${fileName}`,
@@ -1359,10 +1367,12 @@ test("Routing runtime treats All menu commands as threaded target chooser", asyn
     assert.match(markups[0] ?? "", /"text":"↪️ Axial"/);
     assert.match(markups[0] ?? "", /"text":"↪️ Coral"/);
     assert.doesNotMatch(markups[0] ?? "", /"text":"A Axial"/);
-    assert.match(markups[0] ?? "", /allmenu:start:42/);
-    assert.match(markups[0] ?? "", /allmenu:start:44/);
-    assert.match(markups[1] ?? "", /allmenu:status:42/);
-    assert.doesNotMatch(markups.join("\n"), /allmenu:start:43/);
+    assert.match(markups[0] ?? "", /reroute:1:42/);
+    assert.match(markups[0] ?? "", /reroute:1:44/);
+    assert.match(markups[0] ?? "", /rerouterestore:1/);
+    assert.match(markups[1] ?? "", /reroute:2:42/);
+    assert.match(markups[1] ?? "", /rerouterestore:2/);
+    assert.doesNotMatch(markups.join("\n"), /reroute:[12]:43/);
     const options = events.filter((event) =>
       event.startsWith("interactive-options:"),
     );
@@ -1416,8 +1426,9 @@ test("Routing runtime filters All chooser buttons to live routable thread target
       { cwd: "/repo" },
     );
     const markup = events.find((event) => event.startsWith("markup:"));
-    assert.match(markup ?? "", /allmenu:start:42/);
-    assert.doesNotMatch(markup ?? "", /allmenu:start:99/);
+    assert.match(markup ?? "", /reroute:1:42/);
+    assert.match(markup ?? "", /rerouterestore:1/);
+    assert.doesNotMatch(markup ?? "", /reroute:1:99/);
     assert.doesNotMatch(markup ?? "", /Zombie/);
 
     await routeRuntime.handleUpdate(
@@ -1429,7 +1440,7 @@ test("Routing runtime filters All chooser buttons to live routable thread target
             message_id: 99,
             chat: { id: 100, type: "private" },
           },
-          data: "allmenu:start:99",
+          data: "reroute:1:99",
         },
       },
       { cwd: "/repo" },
@@ -1493,8 +1504,10 @@ test("Routing runtime treats extension and prompt-template commands as All choos
         /You used <code>\/fix_tests<\/code>/,
       );
       const markups = events.filter((event) => event.startsWith("markup:"));
-      assert.match(markups[0] ?? "", /allmenu:review:42/);
-      assert.match(markups[1] ?? "", /allmenu:fix_tests:42/);
+      assert.match(markups[0] ?? "", /reroute:1:42/);
+      assert.match(markups[0] ?? "", /rerouterestore:1/);
+      assert.match(markups[1] ?? "", /reroute:2:42/);
+      assert.match(markups[1] ?? "", /rerouterestore:2/);
     } finally {
       dispose();
     }
@@ -1569,14 +1582,20 @@ test("Routing runtime opens selected All menu command in the target thread", asy
       threadName: "Axial",
     });
     await threadStore.persist();
+    const apiCalls: Array<{ method: string; body: Record<string, unknown> }> = [];
     const { events, routeRuntime } = createRouteHarness({
       threadStore,
+      callApi: async (method, body) => {
+        apiCalls.push({ method, body });
+        return {} as never;
+      },
     });
 
     await routeRuntime.handleUpdate(
       {
         message: {
           message_id: 12,
+          message_thread_id: 55,
           chat: { id: 100, type: "private" },
           from: { id: 7, is_bot: false },
           text: "/start",
@@ -1591,21 +1610,128 @@ test("Routing runtime opens selected All menu command in the target thread", asy
           from: { id: 7, is_bot: false },
           message: {
             message_id: 99,
+            message_thread_id: 55,
             chat: { id: 100, type: "private" },
           },
-          data: "allmenu:start:42",
+          data: "reroute:1:42",
         },
       },
       { cwd: "/repo" },
     );
 
     assert.equal(events.includes("status-menu"), true);
+    assert.equal(events.includes("delete-message:100:99"), true);
+    assert.equal(
+      apiCalls.some(
+        (call) =>
+          call.method === "deleteForumTopic" &&
+          call.body.message_thread_id === 55,
+      ),
+      true,
+    );
   });
 });
 
-test("Routing runtime preserves later unbound threads and offers reroute", async () => {
+test("Routing runtime restores a temporary command thread and deletes only its chooser", async () => {
+  await withTopicStore(async (threadStore) => {
+    threadStore.upsert({
+      profileKey: "cwd:/repo",
+      owner: { kind: "leader", cwd: "/repo", instanceId: "leader-a" },
+      target: { chatId: 100, threadId: 42 },
+      status: "active",
+      createdAtMs: 1000,
+      updatedAtMs: 1000,
+      instanceId: "leader-a",
+      slot: "A",
+      threadName: "Axial",
+      rerouteConfirmedAtMs: 1000,
+    });
+    await threadStore.persist();
+    const apiCalls: Array<{ method: string; body: Record<string, unknown> }> = [];
+    const { events, routeRuntime } = createRouteHarness({
+      threadStore,
+      callApi: async (method, body) => {
+        apiCalls.push({ method, body });
+        return {} as never;
+      },
+    });
+    const callbackMessage: TestMessage = {
+      message_id: 99,
+      message_thread_id: 55,
+      chat: { id: 100, type: "private" },
+    };
+
+    await routeRuntime.handleUpdate(
+      {
+        message: {
+          message_id: 12,
+          message_thread_id: 55,
+          chat: { id: 100, type: "private" },
+          from: { id: 7, is_bot: false },
+          text: "/start",
+        },
+      },
+      { cwd: "/repo" },
+    );
+    await routeRuntime.handleUpdate(
+      {
+        callback_query: {
+          id: "restore-menu",
+          from: { id: 7, is_bot: false },
+          message: callbackMessage,
+          data: "rerouterestore:1",
+        },
+      },
+      { cwd: "/repo" },
+    );
+    assert.equal(
+      events.some((event) => event.includes("Replace/restore Telegram thread")),
+      true,
+    );
+    assert.equal(
+      events.some((event) => event.includes("reroutenew:1:42")),
+      true,
+    );
+
+    await routeRuntime.handleUpdate(
+      {
+        callback_query: {
+          id: "restore-target",
+          from: { id: 7, is_bot: false },
+          message: callbackMessage,
+          data: "reroutenew:1:42",
+        },
+      },
+      { cwd: "/repo" },
+    );
+
+    assert.equal(events.includes("status-menu"), true);
+    assert.equal(events.includes("delete-message:100:99"), true);
+    assert.equal(threadStore.getByProfileKey("cwd:/repo")?.target.threadId, 55);
+    assert.equal(
+      apiCalls.some(
+        (call) =>
+          call.method === "deleteForumTopic" &&
+          call.body.message_thread_id === 55,
+      ),
+      false,
+    );
+    assert.equal(
+      apiCalls.some(
+        (call) =>
+          call.method === "deleteForumTopic" &&
+          call.body.message_thread_id === 42,
+      ),
+      true,
+    );
+  });
+});
+
+test("Routing runtime retries stale-epoch and chooser cleanup without redispatch", async () => {
   await withTopicStore(async (threadStore) => {
     const apiCalls: unknown[] = [];
+    let epochReads = 0;
+    let chooserDeleteAttempts = 0;
     threadStore.upsert({
       profileKey: "cwd:/repo",
       target: { chatId: 100, threadId: 7 },
@@ -1618,9 +1744,19 @@ test("Routing runtime preserves later unbound threads and offers reroute", async
     await threadStore.persist();
     const { events, routeRuntime, telegramQueueStore } = createRouteHarness({
       threadStore,
+      getCurrentLeaderEpoch: () => {
+        epochReads += 1;
+        return epochReads === 1 ? 1 : 2;
+      },
       callApi: async (method, body) => {
         apiCalls.push({ method, body });
         return {} as never;
+      },
+      deleteMessage: async () => {
+        chooserDeleteAttempts += 1;
+        if (chooserDeleteAttempts === 1) {
+          throw new Error("temporary chooser deletion failure");
+        }
       },
     });
 
@@ -1660,24 +1796,75 @@ test("Routing runtime preserves later unbound threads and offers reroute", async
     );
 
     const record = threadStore.getByProfileKey("cwd:/repo");
-    assert.deepEqual(record?.target, { chatId: 100, threadId: 42 });
+    assert.deepEqual(record?.target, { chatId: 100, threadId: 7 });
     const queued = telegramQueueStore.getQueuedItems()[0];
     assert.equal(queued?.kind, "prompt");
+    assert.deepEqual(queued?.target, { chatId: 100, threadId: 7 });
     assert.equal(
       queued?.kind === "prompt" && queued.content[0]?.type === "text"
         ? queued.content[0].text
         : "",
       "[telegram|thread:Anchor] hello",
     );
-    assert.equal(events.includes("delete-message:100:99"), true);
+    assert.equal(events.includes("delete-message:100:99"), false);
+    assert.equal(
+      events.includes(
+        "answer:Message routed, but thread cleanup is still pending. Try again.",
+      ),
+      true,
+    );
+
+    await routeRuntime.handleUpdate(
+      {
+        callback_query: {
+          id: "reroute-cleanup-retry",
+          from: { id: 7, is_bot: false },
+          message: {
+            message_id: 99,
+            message_thread_id: 42,
+            chat: { id: 100, type: "private" },
+          },
+          data: "reroute:1:7",
+        },
+      },
+      { cwd: "/repo" },
+    );
+
+    assert.equal(telegramQueueStore.getQueuedItems().length, 1);
+    assert.equal(chooserDeleteAttempts, 1);
+    assert.match(events.join("\n"), /Chooser cleanup is still pending/);
+
+    await routeRuntime.handleUpdate(
+      {
+        callback_query: {
+          id: "reroute-chooser-cleanup-retry",
+          from: { id: 7, is_bot: false },
+          message: {
+            message_id: 99,
+            message_thread_id: 42,
+            chat: { id: 100, type: "private" },
+          },
+          data: "reroute:1:7",
+        },
+      },
+      { cwd: "/repo" },
+    );
+
+    assert.equal(telegramQueueStore.getQueuedItems().length, 1);
+    assert.equal(chooserDeleteAttempts, 2);
+    assert.equal(events.includes("answer:Thread cleanup completed."), true);
     assert.deepEqual(apiCalls, [
       {
         method: "sendChatAction",
         body: { chat_id: 100, message_thread_id: 7, action: "typing" },
       },
       {
-        method: "editForumTopic",
-        body: { chat_id: 100, message_thread_id: 42, name: "Anchor" },
+        method: "closeForumTopic",
+        body: { chat_id: 100, message_thread_id: 42 },
+      },
+      {
+        method: "deleteForumTopic",
+        body: { chat_id: 100, message_thread_id: 42 },
       },
     ]);
   });
@@ -1753,10 +1940,11 @@ test("Routing runtime answers stale reroute target callbacks gracefully", async 
   });
 });
 
-test("Routing runtime forwards media-group reroutes to foreign follower targets", async () => {
+test("Routing runtime retries only failed foreign media-group messages", async () => {
   await withTopicStore(async (threadStore) => {
     const forwardedMessages: TestMessage[] = [];
     const apiCalls: unknown[] = [];
+    let photoBFailed = false;
     threadStore.upsert({
       profileKey: "cwd:/repo",
       owner: { kind: "leader", cwd: "/repo", instanceId: "leader-a" },
@@ -1793,6 +1981,10 @@ test("Routing runtime forwards media-group reroutes to foreign follower targets"
       foreignOwnedUpdateForwarder: {
         forwardMessage: ({ message }) => {
           forwardedMessages.push(message);
+          if (message.photo?.[0]?.file_id === "photo-b" && !photoBFailed) {
+            photoBFailed = true;
+            return false;
+          }
           return true;
         },
       },
@@ -1860,6 +2052,28 @@ test("Routing runtime forwards media-group reroutes to foreign follower targets"
     );
 
     assert.equal(telegramQueueStore.getQueuedItems().length, 0);
+    assert.equal(events.includes("delete-message:100:99"), false);
+    assert.match(
+      events.join("\n"),
+      /retrying will send only remaining messages/,
+    );
+
+    await routeRuntime.handleUpdate(
+      {
+        callback_query: {
+          id: "reroute-retry-cb",
+          from: { id: 7, is_bot: false },
+          message: {
+            message_id: 99,
+            message_thread_id: 42,
+            chat: { id: 100, type: "private" },
+          },
+          data: "reroute:1:8",
+        },
+      },
+      { cwd: "/repo" },
+    );
+
     assert.deepEqual(
       forwardedMessages.map((message) => ({
         messageId: message.message_id,
@@ -1868,6 +2082,7 @@ test("Routing runtime forwards media-group reroutes to foreign follower targets"
       })),
       [
         { messageId: 0, threadId: 8, photoId: "photo-a" },
+        { messageId: 0, threadId: 8, photoId: "photo-b" },
         { messageId: 0, threadId: 8, photoId: "photo-b" },
       ],
     );
@@ -2120,9 +2335,11 @@ test("Routing runtime blocks follower thread restore until bus replacement exist
   });
 });
 
-test("Routing runtime restores follower thread through bus replacement", async () => {
+test("Routing runtime retries failed follower restore delivery before cleanup", async () => {
   await withTopicStore(async (threadStore) => {
     const apiCalls: unknown[] = [];
+    let deleteAttempts = 0;
+    let forwardAttempts = 0;
     const replacements: unknown[] = [];
     const forwardedMessages: TestMessage[] = [];
     threadStore.upsert({
@@ -2156,6 +2373,9 @@ test("Routing runtime restores follower thread through bus replacement", async (
       ],
       callApi: async (method, body) => {
         apiCalls.push({ method, body });
+        if (method === "deleteForumTopic" && deleteAttempts++ === 0) {
+          throw new Error("temporary follower cleanup failure");
+        }
         return {} as never;
       },
       replaceFollowerThreadTarget: async (input) => {
@@ -2165,7 +2385,8 @@ test("Routing runtime restores follower thread through bus replacement", async (
       foreignOwnedUpdateForwarder: {
         forwardMessage: ({ message }) => {
           forwardedMessages.push(message);
-          return true;
+          forwardAttempts += 1;
+          return forwardAttempts > 1;
         },
       },
     });
@@ -2190,6 +2411,48 @@ test("Routing runtime restores follower thread through bus replacement", async (
       {
         callback_query: {
           id: "restore-follower-cb",
+          from: { id: 7, is_bot: false },
+          message: {
+            message_id: 99,
+            message_thread_id: 42,
+            chat: { id: 100, type: "private" },
+          },
+          data: "reroutenew:1:8",
+        },
+      },
+      { cwd: "/repo" },
+    );
+
+    assert.equal(events.includes("delete-message:100:99"), false);
+    assert.match(
+      events.join("\n"),
+      /answer:Thread restored; retrying will send only remaining messages before old-thread cleanup\./,
+    );
+
+    await routeRuntime.handleUpdate(
+      {
+        callback_query: {
+          id: "restore-follower-cleanup-retry",
+          from: { id: 7, is_bot: false },
+          message: {
+            message_id: 99,
+            message_thread_id: 42,
+            chat: { id: 100, type: "private" },
+          },
+          data: "reroutenew:1:8",
+        },
+      },
+      { cwd: "/repo" },
+    );
+    assert.match(
+      events.join("\n"),
+      /answer:Message routed, but thread cleanup is still pending\. Try again\./,
+    );
+
+    await routeRuntime.handleUpdate(
+      {
+        callback_query: {
+          id: "restore-follower-cleanup-retry-2",
           from: { id: 7, is_bot: false },
           message: {
             message_id: 99,
@@ -2229,7 +2492,10 @@ test("Routing runtime restores follower thread through bus replacement", async (
         threadId: message.message_thread_id,
         text: message.text,
       })),
-      [{ threadId: 42, text: "hello" }],
+      [
+        { threadId: 42, text: "hello" },
+        { threadId: 42, text: "hello" },
+      ],
     );
     assert.deepEqual(apiCalls, [
       {
@@ -2248,8 +2514,18 @@ test("Routing runtime restores follower thread through bus replacement", async (
         method: "deleteForumTopic",
         body: { chat_id: 100, message_thread_id: 8 },
       },
+      {
+        method: "closeForumTopic",
+        body: { chat_id: 100, message_thread_id: 8 },
+      },
+      {
+        method: "deleteForumTopic",
+        body: { chat_id: 100, message_thread_id: 8 },
+      },
     ]);
-    assert.match(events.join("\n"), /answer:Message routed\./);
+    assert.match(events.join("\n"), /answer:Thread cleanup completed\./);
+    assert.equal(events.includes("delete-message:100:99"), true);
+    assert.equal(forwardedMessages.length, 2);
   });
 });
 
@@ -2351,7 +2627,7 @@ test("Routing runtime assigns internal baked name when reclaiming unnamed stale 
   });
 });
 
-test("Routing runtime reclaims reroute source when selected stale leader target has prior instance id", async () => {
+test("Routing runtime forwards without rebinding a selected leader identity from a prior runtime", async () => {
   await withTopicStore(async (threadStore) => {
     const apiCalls: unknown[] = [];
     threadStore.upsert({
@@ -2399,16 +2675,16 @@ test("Routing runtime reclaims reroute source when selected stale leader target 
     );
 
     const record = threadStore.getByProfileKey("cwd:/repo");
-    assert.deepEqual(record?.target, { chatId: 100, threadId: 42 });
+    assert.deepEqual(record?.target, { chatId: 100, threadId: 7 });
     assert.equal(record?.threadName, "Axial");
     const queued = telegramQueueStore.getQueuedItems()[0];
     assert.equal(queued?.kind, "prompt");
-    assert.deepEqual(queued?.target, { chatId: 100, threadId: 42 });
+    assert.deepEqual(queued?.target, { chatId: 100, threadId: 7 });
     assert.equal(
       queued?.kind === "prompt" && queued.content[0]?.type === "text"
         ? queued.content[0].text
         : "",
-      "[telegram|thread:Axial] hello",
+      "[telegram] hello",
     );
     assert.deepEqual(apiCalls, [
       {
@@ -2416,12 +2692,15 @@ test("Routing runtime reclaims reroute source when selected stale leader target 
         body: { chat_id: 100, message_thread_id: 7, action: "typing" },
       },
       {
-        method: "editForumTopic",
-        body: { chat_id: 100, message_thread_id: 42, name: "Axial" },
+        method: "closeForumTopic",
+        body: { chat_id: 100, message_thread_id: 42 },
+      },
+      {
+        method: "deleteForumTopic",
+        body: { chat_id: 100, message_thread_id: 42 },
       },
     ]);
-    assert.equal(events.some((event) => event.includes("closeForumTopic")), false);
-    assert.equal(events.some((event) => event.includes("deleteForumTopic")), false);
+    assert.equal(events.includes("delete-message:100:99"), true);
   });
 });
 
@@ -2511,7 +2790,8 @@ test("Routing runtime keeps known-command unbound threads open with chooser", as
     );
     const markup = events.find((event) => event.startsWith("markup:"));
     assert.match(markup ?? "", /"text":"↪️ Axial"/);
-    assert.match(markup ?? "", /allmenu:status:7/);
+    assert.match(markup ?? "", /reroute:1:7/);
+    assert.match(markup ?? "", /rerouterestore:1/);
     assert.deepEqual(apiCalls, []);
   });
 });

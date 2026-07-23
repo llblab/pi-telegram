@@ -841,7 +841,9 @@ export function createTelegramBusFollowerSessionRefreshHook<TContext>(
   };
 }
 
-export function createTelegramBusFollowerRegistrationState(): TelegramBusFollowerRegistrationState {
+export function createTelegramBusFollowerRegistrationState(
+  options: { onAvailabilityChanged?: () => void } = {},
+): TelegramBusFollowerRegistrationState {
   let registered = false;
   let target: TelegramTarget | undefined;
   let slot: string | undefined;
@@ -861,11 +863,13 @@ export function createTelegramBusFollowerRegistrationState(): TelegramBusFollowe
       ).sort();
     },
     setRegistered: (next, nextTarget, metadata) => {
+      const availabilityChanged = registered !== next;
       registered = next;
       target = next ? (nextTarget ? { ...nextTarget } : undefined) : undefined;
       slot = next ? metadata?.slot : undefined;
       threadName = next ? metadata?.threadName : undefined;
       generation = next ? metadata?.generation : undefined;
+      if (availabilityChanged) options.onAvailabilityChanged?.();
     },
   };
 }

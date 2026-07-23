@@ -10,6 +10,8 @@ It is a **runtime adapter**, not a remote terminal. Start or supervise work in t
 
 Proactive push is enabled by default. `assistant.proactivePush` projects every completed public assistant text block from local or autonomous work—including visible checkpoints and the final answer—to the authorized Telegram target once and in order; set it explicitly to `false` to disable projection. It never mirrors local prompts, hidden reasoning, tool traffic, token deltas, Telegram-owned turns, or stale-generation work. See [Outbound](docs/outbound.md#proactive-public-output) and the [configuration reference](docs/public-api.md#configuration-api).
 
+Automatic thread cleanup is enabled by default. Graceful Pi quit deletes that instance's Threaded Mode tab; use `🧹 Auto thread cleanup` in Telegram Settings or set `threads.automaticCleanup` to `false` to preserve the tab as a restart hint. This option never changes manual `/telegram-disconnect`, which still asks for confirmation and deletes the tab.
+
 This repository is an actively maintained fork of [`badlogic/pi-telegram`](https://github.com/badlogic/pi-telegram). It started from upstream commit [`cb34008`](https://github.com/badlogic/pi-telegram/commit/cb34008460b6c1ca036d92322f69d87f626be0fc) and has since diverged substantially.
 
 ## Install
@@ -108,7 +110,7 @@ The first Telegram user to message the bot becomes the allowed owner. Other user
 | Buttons | Turn top-level `telegram_button` comments into inline buttons. | Assistant-authored choices become native Telegram interactions. |
 | Callback routing | Route known callbacks to the owner extension and unknown callbacks back into Pi. | Companion extensions can build UI without polling Telegram themselves. |
 | Threaded Mode | Run one leader plus visible follower Pi instances through named private-chat threads. | One bot can host a local multi-instance Pi organism without hidden process spawning. |
-| Reroute and restore | Preserve unknown threads and offer explicit target choices. | Telegram client state can be repaired without silently deleting or hijacking prompts. |
+| Reroute and restore | Give unknown and command-created temporary threads explicit forward and replace/restore choices. | Forward removes the temporary tab; restore rebinds it and removes only the replaced old tab, so Telegram client state repairs without orphan controls. |
 | Extension sections | Add menu sections, commands, status rows, settings, callbacks, and delivery helpers from companion extensions. | `pi-telegram` becomes a platform surface for other Pi extensions. |
 | Runtime diagnostics | Use `/telegram-status` and recent runtime events for connection, role, queue, transport, and failure evidence. | Debugging lives in the operator surface instead of hidden logs only. |
 | Safety and ownership | Pair one owner, lock transport, scope targets, and reject fake terminal behavior. | Remote access remains explicit, bounded, and understandable. |
@@ -152,7 +154,7 @@ Run these inside Pi.
 | `/telegram-setup <profile>` | Save or update a named-profile bot token |
 | `/telegram-connect` / `/telegram-connect default` | Activate `profiles.default` and acquire its transport ownership |
 | `/telegram-connect <profile>` | Activate a named profile and acquire its transport ownership |
-| `/telegram-disconnect` | Stop polling and release ownership; in Threaded Mode, confirm deletion of this instance's current Telegram thread |
+| `/telegram-disconnect` | Confirm, then stop polling, release ownership, and delete this instance's Threaded Mode tab; graceful Pi quit does the same without prompting when automatic cleanup is enabled |
 | `/telegram-status` | Inspect connection, mode, queue, transport, and recent diagnostics |
 
 Named profile identifiers contain only lowercase ASCII letters and digits (maximum 32 characters); `default`, `main`, and `active` remain reserved.
@@ -212,7 +214,7 @@ Most controls live in Pi commands or the Telegram menu. Environment variables re
 | Inbound file limit | `PI_TELEGRAM_INBOUND_FILE_MAX_BYTES`, `TELEGRAM_MAX_FILE_SIZE_BYTES` |
 | Outbound attachment limit | `PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES`, `TELEGRAM_MAX_ATTACHMENT_SIZE_BYTES` |
 
-Defaults are chosen for ordinary private-bot use: saved config in `~/.pi/agent`, inbound temp files in `~/.pi/agent/tmp/telegram`, `assistant: { rendering: "rich", draftPreviews: false }` for assistant answer output, and native Telegram active status for long-running turns.
+Defaults are chosen for ordinary private-bot use: saved config in `~/.pi/agent`, inbound temp files in `~/.pi/agent/tmp/telegram`, `assistant: { rendering: "rich", draftPreviews: false }` for assistant answer output, `threads.automaticCleanup: true` for graceful Threaded Mode teardown, and native Telegram active status for long-running turns.
 
 ## Extension Platform
 
@@ -243,7 +245,7 @@ Stable public entrypoints are documented in [Public API](./docs/public-api.md), 
 
 Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, but it cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs for those operations.
 
-A Telegram prompt is a normal model turn in the active Pi session and therefore inherits that session's active post-compaction context; the bridge does not make token cost proportional only to the new mobile message. Current releases keep per-turn guidance small and transient, with detailed bridge instructions available on demand through `telegram_help` instead of persisted in every user turn. Pi session JSONL contains model history; profile-scoped pi-telegram `logs*.jsonl` contains redacted operational events and is never model context.
+A Telegram prompt is a normal model turn in the active Pi session and therefore inherits that session's active post-compaction context; the bridge does not make token cost proportional only to the new mobile message. Current releases keep per-turn guidance small and transient, with detailed bridge instructions available on demand through `telegram_help` instead of persisted in every user turn. Disconnecting removes pi-telegram's model tools and prompt guidance from later requests until direct ownership or follower registration returns, without changing other active Pi tools. Pi session JSONL contains model history; profile-scoped pi-telegram `logs*.jsonl` contains redacted operational events and is never model context.
 
 ## Documentation Map
 
