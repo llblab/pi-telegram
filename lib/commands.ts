@@ -297,6 +297,11 @@ export interface TelegramBridgeCommandStartPollingResult {
   owner?: string;
 }
 
+export type TelegramPollingStartRecoveryResult =
+  | { kind: "unhandled" }
+  | { kind: "retry"; message: string }
+  | { kind: "blocked"; message: string };
+
 export interface TelegramBridgeCommandRegistrationDeps {
   promptForConfig: (ctx: ExtensionCommandContext, profileName?: string) => Promise<void>;
   getStatusLines: (options?: TelegramBridgeStatusLineOptions) => string[];
@@ -310,6 +315,9 @@ export interface TelegramBridgeCommandRegistrationDeps {
     | Promise<void | TelegramBridgeCommandStartPollingResult>
     | TelegramBridgeCommandStartPollingResult;
   stopPolling: () => Promise<void | string>;
+  recoverPollingStart?: (
+    error: unknown,
+  ) => Promise<TelegramPollingStartRecoveryResult>;
   getDisconnectThreadName?: () => string | undefined;
   updateStatus: (ctx: ExtensionCommandContext) => void;
   getProfileNames?: () => string[];
@@ -390,7 +398,41 @@ export function registerTelegramBridgeCommands(
         await deps.promptForConfig(ctx, profileName);
         return;
       }
-      let result = await deps.startPolling(ctx, {
+      let recoveryUsed = false;
+      const startWithRecovery = async (
+        options: TelegramBridgeCommandStartPollingOptions,
+      ): Promise<void | TelegramBridgeCommandStartPollingResult> => {
+        try {
+          return await deps.startPolling(ctx, options);
+        } catch (error) {
+          if (!deps.recoverPollingStart || recoveryUsed) throw error;
+          const recovery = await deps.recoverPollingStart(error);
+          if (recovery.kind === "unhandled") throw error;
+          if (recovery.kind === "blocked") {
+            return { ok: false, message: recovery.message };
+          }
+          recoveryUsed = true;
+          try {
+            const retry = await deps.startPolling(ctx, options);
+            if (!retry) {
+              return { ok: true, message: recovery.message };
+            }
+            return {
+              ...retry,
+              message: retry.ok
+                ? `${recovery.message} ${retry.message ?? "Telegram bridge connected."}`
+                : retry.message,
+            };
+          } catch {
+            return {
+              ok: false,
+              message:
+                "Telegram temporary state was recovered, but the bridge could not restart. Restart this Pi instance and run /telegram-connect again.",
+            };
+          }
+        }
+      };
+      let result = await startWithRecovery({
         forceFreshLeaderThread: true,
       });
       if (result && !result.ok && result.canTakeover) {
@@ -403,7 +445,7 @@ export function registerTelegramBridgeCommands(
           deps.updateStatus(ctx);
           return;
         }
-        result = await deps.startPolling(ctx, {
+        result = await startWithRecovery({
           force: true,
           forceFreshLeaderThread: true,
         });

@@ -57,6 +57,8 @@ Paste the bot token. If `~/.pi/agent/telegram.json` already contains a saved tok
 
 The connected Pi instance owns Telegram polling. Use `/telegram-connect <name>` to activate a named profile. Each profile is a parallel bot runtime with isolated polling, diagnostics, Threaded Mode state, and local bus transport; the `default` profile keeps unsuffixed runtime paths. In classic mode each profile uses a singleton lock. When Telegram private-chat Threaded Mode is available, one live instance becomes the profile's leader and later visible Pi instances register as followers.
 
+After an unclean computer shutdown, `/telegram-connect` detects truncated or structurally invalid temporary ownership/routing files, quarantines only the damaged files under `tmp/telegram/recovery/`, and retries once. Saved `telegram.json` configuration and runtime diagnostics remain intact. Recovery never replaces a verifiable live owner; if safe automatic recovery cannot complete, the command gives one explicit Pi-restart instruction instead of requiring deletion of the whole `tmp/` directory.
+
 ### 4. Pair your Telegram account
 
 Open the bot DM and send:

@@ -33,6 +33,7 @@ import * as Preview from "./lib/preview.ts";
 import * as Prompts from "./lib/prompts.ts";
 import * as PromptTemplates from "./lib/prompt-templates.ts";
 import * as Queue from "./lib/queue.ts";
+import * as Recovery from "./lib/recovery.ts";
 import * as Replies from "./lib/replies.ts";
 import * as Routing from "./lib/routing.ts";
 import * as Runtime from "./lib/runtime.ts";
@@ -84,10 +85,11 @@ export default function (pi: Pi.ExtensionAPI) {
       manualFollowerOwnerId: telegramManualFollowerOwnerId,
     });
   const telegramBusAuthSecret = Bus.createTelegramBusAuthSecret();
-  let telegramActiveBusAuthSecret: string | undefined;
-  let telegramBusLifecycleOverridePhase:
-    Status.TelegramBridgeBusLifecyclePhase | undefined;
+  const telegramBusFollowerControlState =
+    BusFollower.createTelegramBusFollowerControlState();
   const telegramBusFollowerRegistry = Bus.createTelegramBusFollowerRegistry();
+  // Late-bound composition port breaks the follower-availability callback cycle;
+  // the mutable availability policy itself remains owned by prompts.
   let modelContextAvailabilityRuntime:
     | Prompts.TelegramModelContextAvailabilityRuntime
     | undefined;
@@ -318,9 +320,7 @@ export default function (pi: Pi.ExtensionAPI) {
     getRecentRuntimeEvents: runtimeEvents.getEvents,
     getRuntimeLockState: lockRuntime.getStatusLabel,
     ...threadStatusProjectionRuntime,
-    getBusLifecyclePhase() {
-      return telegramBusLifecycleOverridePhase;
-    },
+    getBusLifecyclePhase: telegramBusFollowerControlState.getLifecyclePhase,
     getBotThreadMode() {
       return threadStore.getBotState();
     },
@@ -363,9 +363,7 @@ export default function (pi: Pi.ExtensionAPI) {
     >({
       socketPath: getTelegramBusSocketPath,
       instanceId: telegramInstanceId,
-      getApiAuthSecret() {
-        return telegramActiveBusAuthSecret;
-      },
+      getApiAuthSecret: telegramBusFollowerControlState.getActiveAuthSecret,
       getForwardingAuthSecret() {
         return telegramBusAuthSecret;
       },
@@ -800,9 +798,7 @@ export default function (pi: Pi.ExtensionAPI) {
         socketPath: getTelegramBusFollowerSocketPath,
         instanceId: telegramInstanceId,
         getContext: telegramSessionContextStore.get,
-        getAuthSecret() {
-          return telegramActiveBusAuthSecret;
-        },
+        getAuthSecret: telegramBusFollowerControlState.getActiveAuthSecret,
         ...forwardedRouteHandlers,
         prepareForwardedMessage: textGroupRuntime.prepareForwardedMessage,
         recordRuntimeEvent,
@@ -821,9 +817,7 @@ export default function (pi: Pi.ExtensionAPI) {
       recovery: {
         registrationState: telegramBusFollowerRegistrationState,
         getLeaderState: lockRuntime.getState,
-        setLifecyclePhase(phase) {
-          telegramBusLifecycleOverridePhase = phase;
-        },
+        setLifecyclePhase: telegramBusFollowerControlState.setLifecyclePhase,
         updateStatus,
         promoteToLeader: promoteTelegramBusFollowerToLeader,
         getActiveContext: telegramSessionContextStore.get,
@@ -839,9 +833,8 @@ export default function (pi: Pi.ExtensionAPI) {
         getLeaderAuthSecret(owner) {
           return owner.busSecret;
         },
-        setActiveAuthSecret(secret) {
-          telegramActiveBusAuthSecret = secret;
-        },
+        setActiveAuthSecret:
+          telegramBusFollowerControlState.setActiveAuthSecret,
         getProfileKey: getTelegramManualFollowerProfileKey,
         recordRuntimeEvent,
       },
@@ -1044,6 +1037,21 @@ export default function (pi: Pi.ExtensionAPI) {
     activeTurnRuntime,
     lockedPollingRuntime,
     stopPolling: disconnectTelegramAndDeleteCurrentThread,
+    recoverPollingStart:
+      Recovery.createTelegramPollingStartRecoveryHandler({
+        getOwnersPath: Paths.resolveTelegramOwnersPath,
+        getStatePaths() {
+          return [
+            Threads.getTelegramTopicTargetsPath(
+              undefined,
+              configStore.getActiveProfileName(),
+            ),
+          ];
+        },
+        suspendPolling: lockedPollingRuntime.suspend,
+        releaseOwnership: lockRuntime.release,
+        recordRuntimeEvent,
+      }),
     getDisconnectThreadName() {
       const record = findCurrentThreadRecord();
       if (!record?.target.threadId) return undefined;

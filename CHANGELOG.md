@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `Unclean-Shutdown Recovery`: `/telegram-connect` now classifies truncated temporary ownership/routing snapshots and unverifiable ownership transaction debris, quarantines only damaged disposable artifacts when no verifiable live owner protects them, and retries startup exactly once. Recovery serializes cross-process contenders, revalidates under ownership fencing, treats eight-second stale heartbeats as replaceable despite PID reuse, preserves `telegram.json` and diagnostics, and converts blocked or repeated failure into one explicit Pi-restart instruction. Impact: abrupt host shutdown no longer leaves the bridge trapped behind raw JSON/transaction errors or requires deleting the whole agent `tmp/` directory.
+- `Composition Root Cooling`: Moved follower active-auth and transient-election mutable state from `index.ts` into a cohesive `bus-follower` control runtime while leaving direct one-to-one runtime wiring in the composition root. Impact: follower control state now has one testable owner without introducing a wrapper whose only purpose is line-count reduction.
+
 ## 0.24.4: Context And Thread Lifecycle Hotfix
 
 - `Disconnect Context Availability`: Reconciled `telegram_attach`, `telegram_message`, `telegram_help`, their active-tool prompt metadata, and the compact bridge suffix against effective direct-owner or registered-follower authority. Successful disconnect or authority loss removes only pi-telegram surfaces for subsequent requests; reconnect/recovery restores only the operator's previously active pi-telegram subset across same-process reload, while execute-time transport guards remain. Impact: disconnected sessions stop spending context on unavailable Telegram capabilities or inviting calls that must fail.

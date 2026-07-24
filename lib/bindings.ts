@@ -99,6 +99,7 @@ interface TelegramCommandsAndToolsBindingDeps {
   activeTurnRuntime: Queue.TelegramActiveTurnStore<Queue.PendingTelegramTurn>;
   lockedPollingRuntime: Locks.TelegramLockedPollingRuntime<Pi.ExtensionContext>;
   stopPolling?: () => Promise<void | string>;
+  recoverPollingStart?: Commands.TelegramBridgeCommandRegistrationDeps["recoverPollingStart"];
   getDisconnectThreadName?: () => string | undefined;
   onTransportChanged?: () => Promise<void> | void;
   getStatusLines: (
@@ -127,6 +128,7 @@ export function registerTelegramCommandsAndTools({
   activeTurnRuntime,
   lockedPollingRuntime,
   stopPolling,
+  recoverPollingStart,
   getDisconnectThreadName,
   onTransportChanged,
   getStatusLines,
@@ -234,8 +236,16 @@ export function registerTelegramCommandsAndTools({
     getStatusLines,
     reloadConfig: configStore.load,
     hasBotToken: configStore.hasBotToken,
-    startPolling: lockedPollingRuntime.start,
+    startPolling: async (ctx, options) => {
+      try {
+        return await lockedPollingRuntime.start(ctx, options);
+      } catch (error) {
+        recordRuntimeEvent("recovery", error, { phase: "polling-start" });
+        throw error;
+      }
+    },
     stopPolling: stopPolling ?? lockedPollingRuntime.stop,
+    recoverPollingStart,
     getDisconnectThreadName,
     updateStatus,
     getProfileNames: () =>
