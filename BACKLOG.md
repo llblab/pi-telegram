@@ -2,16 +2,6 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — `0.24.5` Unclean-Shutdown Runtime Recovery Hotfix
-
-Context: A sudden computer power loss can leave pi-telegram's disposable `tmp/telegram` authority or routing artifacts truncated or structurally unverifiable. Current `/telegram-connect` behavior exposes raw JSON errors or transaction timeouts and remains blocked until the operator manually deletes `tmp/`. Deterministic probes reproduce three distinct failures: truncated `owners.json`, truncated `state.json`, and an unverifiable `owners.json.transaction` guard. A non-mutating recovery classifier now distinguishes recoverable corruption from corruption protected by a verifiable live owner or transaction holder. A serialized recovery primitive revalidates under the ownership transaction, quarantines only classifier-approved temporary artifacts, and preserves configuration and diagnostics. `/telegram-connect` now classifies failed startup, stops local polling before recovery, retries exactly once after a successful reset, preserves unrelated errors, and converts blocked or failed recovery into one explicit restart instruction. Stale eight-second owner heartbeats do not block recovery merely because the operating system reused a PID. Cross-process regressions now prove one-writer recovery for combined malformed owners/state/guard debris, and failed quarantine creation leaves corruption retryable. The composition handler has a dedicated domain seam, and an end-to-end command regression proves actual filesystem reset, preserved config, one reconnect attempt, and a clean subsequent connect. A bounded composition-root audit moved follower active-auth and transient-election state into its owning domain while retaining direct runtime wiring and the intentional late-bound availability port in `index.ts`. Runtime liveness takes priority over preserving disposable session/thread observations, while durable `telegram.json` configuration and proof of a live competing owner remain protected.
-
-Open work:
-
-- [ ] Complete the Ubuntu/macOS/Windows CI and guarded `dev → main` patch release flow.
-
-Done when: after recoverable power-loss debris, one `/telegram-connect` either reconnects from a clean temporary runtime state or reports one explicit restart instruction; it never loops, deletes durable config, races a proven live owner, or requires broad manual `tmp/` deletion. Hosted Ubuntu/macOS/Windows validation and release verification pass.
-
 ## P0 — Expiring Pi Shrinkwrap Audit Exception
 
 Deadline: 2026-08-21 UTC. The validation gate intentionally fails at `2026-08-22T00:00:00Z` if either exception remains.
