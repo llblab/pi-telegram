@@ -4,6 +4,15 @@
  */
 
 import assert from "node:assert/strict";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -41,6 +50,7 @@ import {
   TELEGRAM_COMMAND_EMOJI,
   TELEGRAM_RESERVED_COMMAND_NAMES,
 } from "../lib/commands.ts";
+import { createTelegramPollingStartRecoveryHandler } from "../lib/recovery.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "../lib/pi.ts";
 
 type RegisteredBridgeCommand = {
@@ -420,6 +430,210 @@ test("Command helpers keep failed disconnects actionable and retryable", async (
   assert.match(notifications[0] ?? "", /Keep this Pi session open/);
   assert.match(notifications[0] ?? "", /telegram-status --debug/);
   assert.match(notifications[0] ?? "", /retry \/telegram-disconnect/);
+});
+
+test("Connect recovers disposable runtime corruption and retries exactly once", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const notifications: string[] = [];
+  let starts = 0;
+  let recoveries = 0;
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => undefined,
+    getStatusLines: () => [],
+    reloadConfig: async () => undefined,
+    hasBotToken: () => true,
+    startPolling: async () => {
+      starts += 1;
+      if (starts === 1) throw new SyntaxError("truncated owners.json");
+      return { ok: true, message: "Telegram bridge connected." };
+    },
+    stopPolling: async () => undefined,
+    recoverPollingStart: async () => {
+      recoveries += 1;
+      return {
+        kind: "retry",
+        message: "Telegram temporary state was reset.",
+      };
+    },
+    updateStatus: () => undefined,
+  });
+  const ctx = createBridgeCommandContext((message) => {
+    notifications.push(message);
+  });
+
+  await getRequiredCommand(harness.commands, "telegram-connect").handler(
+    "",
+    ctx,
+  );
+
+  assert.equal(starts, 2);
+  assert.equal(recoveries, 1);
+  assert.deepEqual(notifications, [
+    "Telegram temporary state was reset. Telegram bridge connected.",
+  ]);
+});
+
+test("Connect performs filesystem recovery before its one reconnect attempt", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-connect-recovery-"));
+  try {
+    const ownersPath = join(dir, "owners.json");
+    const statePath = join(dir, "state.json");
+    const configPath = join(dir, "telegram.json");
+    writeFileSync(ownersPath, "{truncated");
+    writeFileSync(statePath, "{truncated");
+    writeFileSync(configPath, JSON.stringify({ botToken: "preserved" }));
+    const harness = createCommandRegistrationApiHarness();
+    const notifications: string[] = [];
+    let starts = 0;
+    let stops = 0;
+    registerTelegramBridgeCommands(harness.api, {
+      promptForConfig: async () => undefined,
+      getStatusLines: () => [],
+      reloadConfig: async () => undefined,
+      hasBotToken: () => true,
+      startPolling: async () => {
+        starts += 1;
+        if (existsSync(ownersPath)) {
+          JSON.parse(readFileSync(ownersPath, "utf8"));
+        }
+        if (existsSync(statePath)) JSON.parse(readFileSync(statePath, "utf8"));
+        return { ok: true, message: "Telegram bridge connected." };
+      },
+      stopPolling: async () => undefined,
+      recoverPollingStart: createTelegramPollingStartRecoveryHandler({
+        getOwnersPath: () => ownersPath,
+        getStatePaths: () => [statePath],
+        suspendPolling: async () => {
+          stops += 1;
+        },
+      }),
+      updateStatus: () => undefined,
+    });
+    const ctx = createBridgeCommandContext((message) => {
+      notifications.push(message);
+    });
+
+    await getRequiredCommand(harness.commands, "telegram-connect").handler(
+      "",
+      ctx,
+    );
+
+    assert.equal(starts, 2);
+    assert.equal(stops, 1);
+    assert.equal(existsSync(ownersPath), false);
+    assert.equal(existsSync(statePath), false);
+    assert.equal(
+      readFileSync(configPath, "utf8"),
+      JSON.stringify({ botToken: "preserved" }),
+    );
+    assert.equal(notifications.length, 1);
+    assert.match(notifications[0] ?? "", /unclean shutdown/);
+    assert.match(notifications[0] ?? "", /bridge connected/);
+
+    await getRequiredCommand(harness.commands, "telegram-connect").handler(
+      "",
+      ctx,
+    );
+    assert.equal(starts, 3);
+    assert.equal(stops, 1);
+    assert.equal(notifications[1], "Telegram bridge connected.");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Connect converts a failed post-recovery retry into one restart instruction", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const notifications: string[] = [];
+  let starts = 0;
+  let recoveries = 0;
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => undefined,
+    getStatusLines: () => [],
+    reloadConfig: async () => undefined,
+    hasBotToken: () => true,
+    startPolling: async () => {
+      starts += 1;
+      throw new Error(`startup failure ${starts}`);
+    },
+    stopPolling: async () => undefined,
+    recoverPollingStart: async () => {
+      recoveries += 1;
+      return { kind: "retry", message: "Recovered." };
+    },
+    updateStatus: () => undefined,
+  });
+  const ctx = createBridgeCommandContext((message) => {
+    notifications.push(message);
+  });
+
+  await getRequiredCommand(harness.commands, "telegram-connect").handler(
+    "",
+    ctx,
+  );
+
+  assert.equal(starts, 2);
+  assert.equal(recoveries, 1);
+  assert.equal(notifications.length, 1);
+  assert.match(notifications[0] ?? "", /Restart this Pi instance/);
+});
+
+test("Connect preserves unrelated startup errors outside the recovery classifier", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => undefined,
+    getStatusLines: () => [],
+    reloadConfig: async () => undefined,
+    hasBotToken: () => true,
+    startPolling: async () => {
+      throw new Error("network unavailable");
+    },
+    stopPolling: async () => undefined,
+    recoverPollingStart: async () => ({ kind: "unhandled" }),
+    updateStatus: () => undefined,
+  });
+
+  await assert.rejects(
+    async () =>
+      getRequiredCommand(harness.commands, "telegram-connect").handler(
+        "",
+        createBridgeCommandContext(),
+      ),
+    /network unavailable/,
+  );
+});
+
+test("Connect reports live-owner recovery blockers without retrying", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const notifications: string[] = [];
+  let starts = 0;
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => undefined,
+    getStatusLines: () => [],
+    reloadConfig: async () => undefined,
+    hasBotToken: () => true,
+    startPolling: async () => {
+      starts += 1;
+      throw new SyntaxError("truncated state.json");
+    },
+    stopPolling: async () => undefined,
+    recoverPollingStart: async () => ({
+      kind: "blocked",
+      message: "Restart owner process 42.",
+    }),
+    updateStatus: () => undefined,
+  });
+  const ctx = createBridgeCommandContext((message) => {
+    notifications.push(message);
+  });
+
+  await getRequiredCommand(harness.commands, "telegram-connect").handler(
+    "",
+    ctx,
+  );
+
+  assert.equal(starts, 1);
+  assert.deepEqual(notifications, ["Restart owner process 42."]);
 });
 
 test("Command helpers move pi polling ownership after confirmation", async () => {
