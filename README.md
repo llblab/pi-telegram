@@ -10,8 +10,6 @@ It is a **runtime adapter**, not a remote terminal. Start or supervise work in t
 
 Proactive push is enabled by default. `assistant.proactivePush` projects every completed public assistant text block from local or autonomous work—including visible checkpoints and the final answer—to the authorized Telegram target once and in order; set it explicitly to `false` to disable projection. It never mirrors local prompts, hidden reasoning, tool traffic, token deltas, Telegram-owned turns, or stale-generation work. See [Outbound](docs/outbound.md#proactive-public-output) and the [configuration reference](docs/public-api.md#configuration-api).
 
-Automatic thread cleanup is enabled by default. Graceful Pi quit deletes that instance's Threaded Mode tab; use `🧹 Auto thread cleanup` in Telegram Settings or set `threads.automaticCleanup` to `false` to preserve the tab as a restart hint. This option never changes manual `/telegram-disconnect`, which still asks for confirmation and deletes the tab.
-
 This repository is an actively maintained fork of [`badlogic/pi-telegram`](https://github.com/badlogic/pi-telegram). It started from upstream commit [`cb34008`](https://github.com/badlogic/pi-telegram/commit/cb34008460b6c1ca036d92322f69d87f626be0fc) and has since diverged substantially.
 
 ## Install
@@ -216,7 +214,7 @@ Most controls live in Pi commands or the Telegram menu. Environment variables re
 | Inbound file limit | `PI_TELEGRAM_INBOUND_FILE_MAX_BYTES`, `TELEGRAM_MAX_FILE_SIZE_BYTES` |
 | Outbound attachment limit | `PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES`, `TELEGRAM_MAX_ATTACHMENT_SIZE_BYTES` |
 
-Defaults are chosen for ordinary private-bot use: saved config in `~/.pi/agent`, inbound temp files in `~/.pi/agent/tmp/telegram`, `assistant: { rendering: "rich", draftPreviews: false }` for assistant answer output, `threads.automaticCleanup: true` for graceful Threaded Mode teardown, and native Telegram active status for long-running turns.
+Defaults are chosen for ordinary private-bot use: saved config in `~/.pi/agent`, inbound temp files in `~/.pi/agent/tmp/telegram`, `assistant: { rendering: "rich", draftPreviews: false }` for assistant answer output, and native Telegram active status for long-running turns.
 
 ## Extension Platform
 
