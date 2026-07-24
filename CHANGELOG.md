@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.24.6: README Positioning Hotfix
+
+- `README Positioning`: Removed duplicated automatic thread-cleanup detail from the opening and defaults summary while retaining the canonical behavior in the lifecycle controls and configuration documentation. Impact: the package entrypoint stays focused on the companion runtime model without changing graceful-quit behavior or its configurable cleanup policy.
+
 ## 0.24.5: Unclean-Shutdown Recovery Hotfix
 
 - `Unclean-Shutdown Recovery`: `/telegram-connect` now classifies truncated temporary ownership/routing snapshots and unverifiable ownership transaction debris, quarantines only damaged disposable artifacts when no verifiable live owner protects them, and retries startup exactly once. Recovery serializes cross-process contenders, revalidates under ownership fencing, treats eight-second stale heartbeats as replaceable despite PID reuse, preserves `telegram.json` and diagnostics, and converts blocked or repeated failure into one explicit Pi-restart instruction. Impact: abrupt host shutdown no longer leaves the bridge trapped behind raw JSON/transaction errors or requires deleting the whole agent `tmp/` directory.
