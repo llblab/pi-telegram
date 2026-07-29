@@ -2,7 +2,19 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — Update Omission Label Hotfix
+## P0 — Scoped Model Thinking Label Hotfix
+
+Context: scoped model buttons still separate their optional thinking level with a middle dot. Parentheses match the quieter subordinate-metadata convention now used by Activity update omission labels.
+
+Open work:
+
+- [x] Render scoped model buttons as `provider/model (level)` when a thinking level is attached.
+- [x] Update focused regression, changelog, and package metadata.
+- [ ] Publish and verify GitHub/npm release evidence for `0.26.5`.
+
+Done when: optional thinking metadata uses parentheses consistently, validation passes, and the hotfix is published.
+
+## P1 — Update Omission Label Release
 
 Context: the retained-update summary currently separates its dropped-count suffix with a middle dot. Parentheses communicate subordinate metadata more quietly and avoid an unnecessary visual separator.
 

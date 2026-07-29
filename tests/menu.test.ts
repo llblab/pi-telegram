@@ -2057,9 +2057,9 @@ test("Menu helpers build model, thinking, and status UI payloads", () => {
     allModels: [{ model: modelB }],
   });
   assert.deepEqual(getModelMenuItems(state), state.scopedModels);
-  assert.match(
+  assert.equal(
     formatScopedModelButtonText(state.scopedModels[0], modelA),
-    /^🟢 /,
+    "🟢 openai/gpt-5 (high)",
   );
   const modelMarkup = buildModelMenuReplyMarkup(state, modelA, 6);
   state.mode = "model-detail";

@@ -641,7 +641,7 @@ test("buildTelegramSettingsMenuReplyMarkup injects extension settings rows", asy
   registry.register(
     stubSection("@test/a", "A", {
       settings: {
-        label: "🔧 Core · Beta",
+        label: "🔧 Core (Beta)",
         order: 2,
         open: async () => ({ text: "A settings" }),
       },
@@ -650,7 +650,7 @@ test("buildTelegramSettingsMenuReplyMarkup injects extension settings rows", asy
   registry.register(
     stubSection("@test/b", "B", {
       settings: {
-        label: "🧪 Core · Alpha",
+        label: "🧪 Core (Alpha)",
         order: 1,
         open: async () => ({ text: "B settings" }),
       },
@@ -678,8 +678,8 @@ test("buildTelegramSettingsMenuReplyMarkup injects extension settings rows", asy
       "📌 Proactive push: off",
       "🕒 Time injection: hidden",
       "🧹 Thread cleanup: on",
-      "🧪 Core · Alpha",
-      "🔧 Core · Beta",
+      "🧪 Core (Alpha)",
+      "🔧 Core (Beta)",
     ],
   );
   assert.ok(rows[8][0].callback_data.startsWith("section:"));

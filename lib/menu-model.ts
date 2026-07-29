@@ -355,7 +355,7 @@ export function formatScopedModelButtonText<
 ): string {
   let label = `${modelsMatch(entry.model, currentModel) ? "🟢 " : ""}${entry.model.provider}/${entry.model.id}`;
   if (entry.thinkingLevel) {
-    label += ` · ${entry.thinkingLevel}`;
+    label += ` (${entry.thinkingLevel})`;
   }
   return truncateTelegramButtonLabel(label);
 }

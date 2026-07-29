@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.5: Quieter Scoped Model Labels
+
+- `Model Microcopy`: Replaced the middle-dot separator in scoped model buttons with parentheses, rendering optional thinking metadata as `provider/model (level)`. Impact: model identity stays primary while its attached thinking level reads as subordinate metadata consistently with Activity omission labels.
+
 ## 0.26.4: Quieter Update Omission Labels
 
 - `Tool Microcopy`: Replaced the middle-dot suffix in retained update summaries with ordinary parentheses: `Update N (K earlier omitted)`. Impact: dropped-update evidence remains explicit while reading as subordinate metadata instead of another visual segment.
