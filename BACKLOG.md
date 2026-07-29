@@ -2,30 +2,16 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — Rich Tool Activity And Discoverable Defaults Release
-
-Context: Thinking keeps its current persistent HTML expandable quote. Tool activity moves to native Rich Messages so arguments, retained updates, and result/error evidence become separate collapsed details containing compact JSON code blocks. New installations should discover context and activity features through `assistant.timeInjection: "interval"` and `assistant.activity: "verbose"` defaults without migrating explicit existing settings.
-
-Open work:
-
-- [x] Render completed tool batches through `sendRichMessage` / `editMessageText.rich_message` with one sentence-case tool header followed by separate closed `Arguments`, `Update N`, and `Result`/`Error` details containing `json` pre blocks.
-- [x] Preserve tool ordering, coalescing, redaction, truncation, dropped-update evidence, transport/authority fencing, message bounds, final-answer ordering, and commit-unknown no-replay behavior; use the existing HTML representation only for a known-safe Rich capability rejection.
-- [x] Change absent Activity mode to `verbose` and absent time injection mode to `interval` with the existing one-hour interval fallback; preserve every explicit stored value without migration.
-- [x] Update tests, README, technical docs, durable project rules, changelog, and package metadata for the final behavior.
-- [ ] Publish and verify GitHub/npm release evidence for `0.26.0`.
-- [ ] Live-smoke Rich tool details on Telegram mobile and Desktop in classic and Threaded Mode, including multi-tool batches, updates, truncation, failures, follower transport, and final-answer ordering.
-
-Done when: native Rich tool activity is compact and logically segmented, explicit settings remain authoritative, new defaults are discoverable, automated validation passes, live clients confirm the rendering/routing contract, and the release is published through the repository release flow.
-
 ## P1 — Configurable Activity Live Smoke
 
-Context: configurable activity offers quiet, thinking-only, tools-only, and verbose modes. Thinking uses persistent collapsed ordinary HTML instead of draft-only Rich Thinking blocks; completed tools use native Rich details with JSON code blocks.
+Context: `0.26.0` shipped configurable quiet, thinking-only, tools-only, and verbose modes with absent-config `verbose` plus interval time-injection defaults. Thinking uses persistent collapsed ordinary HTML; completed tools use native Rich details with separate JSON code blocks.
 
 Open work:
 
-- [ ] Live-smoke all four modes in classic and Threaded Mode on Telegram mobile and Desktop, including progressive thinking edits, multiple sequential tools, oversized output rollover, cancellation during thinking, tool failure, session replacement, follower transport, and final-answer ordering.
+- [ ] Live-smoke all four modes in classic and Threaded Mode on Telegram mobile and Desktop, including progressive thinking edits, separate Arguments/Update/Result/Error tool details, multiple sequential tools, oversized output rollover, cancellation during thinking, tool failure and known-safe HTML fallback, session replacement, follower transport, and final-answer ordering.
+- [ ] From omitted settings, verify `verbose` Activity and one-hour interval time injection activate without persistence or migration; then verify explicit quiet/hidden and single-class settings remain authoritative across live instances.
 
-Done when: live mobile and Desktop clients confirm the intended mode isolation, persistent disclosures, routing, rollover, cancellation, failure, and final-answer ordering behavior in classic and Threaded Mode.
+Done when: live mobile and Desktop clients confirm mode/default isolation, persistent thinking, structured Rich tool disclosures, routing, rollover, cancellation, failure/fallback, explicit overrides, and final-answer ordering in classic and Threaded Mode.
 
 ## P1 — Native Windows Runtime Smoke
 
