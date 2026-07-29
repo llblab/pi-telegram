@@ -46,7 +46,6 @@ function createHarness(
     refreshedMode?: ActivityMode;
     refreshError?: Error;
     richSendError?: Error;
-    thinkingLevel?: string;
   } = {},
 ) {
   let mode = options.mode ?? "verbose";
@@ -60,7 +59,6 @@ function createHarness(
       if (options.refreshError) throw options.refreshError;
       if (options.refreshedMode) mode = options.refreshedMode;
     },
-    getThinkingLevel: () => options.thinkingLevel ?? "high",
     resolveTarget: (activity) => activity.target,
     captureAuthority: () => authority,
     isAuthorityActive: (captured) => captured === authority,
@@ -127,36 +125,38 @@ test("tool Rich activity separates arguments, updates, and result details", () =
   assert.equal(rich.skip_entity_detection, true);
   assert.deepEqual(rich.blocks, [
     {
-      type: "paragraph",
-      text: [
+      type: "details",
+      summary: [
         { type: "bold", text: "🛠  Bash:" },
         " ",
         { type: "code", text: "done" },
       ],
-    },
-    {
-      type: "details",
-      summary: { type: "bold", text: "Arguments" },
       blocks: [
         {
-          type: "pre",
-          text: '{\n  "command": "npm test"\n}',
-          language: "json",
+          type: "details",
+          summary: { type: "bold", text: "Arguments" },
+          blocks: [
+            {
+              type: "pre",
+              text: '{\n  "command": "npm test"\n}',
+              language: "json",
+            },
+          ],
         },
-      ],
-    },
-    {
-      type: "details",
-      summary: { type: "bold", text: "Update 3 · 2 earlier omitted" },
-      blocks: [
-        { type: "pre", text: '{\n  "line": 1\n}', language: "json" },
-      ],
-    },
-    {
-      type: "details",
-      summary: { type: "bold", text: "Result" },
-      blocks: [
-        { type: "pre", text: '{\n  "ok": true\n}', language: "json" },
+        {
+          type: "details",
+          summary: { type: "bold", text: "Update 3 · 2 earlier omitted" },
+          blocks: [
+            { type: "pre", text: '{\n  "line": 1\n}', language: "json" },
+          ],
+        },
+        {
+          type: "details",
+          summary: { type: "bold", text: "Result" },
+          blocks: [
+            { type: "pre", text: '{\n  "ok": true\n}', language: "json" },
+          ],
+        },
       ],
     },
   ]);
@@ -269,12 +269,11 @@ test("reasoning uses a persistent target-bound expandable HTML message", async (
   });
   assert.match(
     harness.sends[0]?.text ?? "",
-    /^<b>🧠&#160; Thinking:<\/b> <code>high<\/code>/,
+    /^<blockquote expandable>/,
   );
-  assert.match(harness.sends[0]?.text ?? "", /<blockquote expandable>/);
+  assert.doesNotMatch(harness.sends[0]?.text ?? "", /Thinking:|🧠/);
   assert.equal(harness.edits.length, 1);
-  assert.match(harness.edits[0]?.text ?? "", /<code>high<\/code>/);
-  assert.doesNotMatch(harness.edits[0]?.text ?? "", /<code>done<\/code>/);
+  assert.doesNotMatch(harness.edits[0]?.text ?? "", /Thinking:|🧠|<code>/);
   assert.match(harness.edits[0]?.text ?? "", /Checking <b>state<\/b>/);
   assert.equal(harness.edits[0]?.parse_mode, "HTML");
   assert.deepEqual(harness.edits[0]?.link_preview_options, {
@@ -297,7 +296,7 @@ test("agent end leaves an already current thinking message unchanged", async () 
   await harness.runtime.waitForIdle();
   assert.equal(harness.sends.length, 1);
   assert.equal(harness.edits.length, 0);
-  assert.match(harness.sends[0]?.text ?? "", /<code>high<\/code>/);
+  assert.match(harness.sends[0]?.text ?? "", /^<blockquote expandable>/);
 });
 
 test("agent start refreshes file-backed mode before activity isolation", async () => {
@@ -321,7 +320,8 @@ test("agent start refreshes file-backed mode before activity isolation", async (
   );
   await harness.runtime.waitForIdle();
   const text = harness.sends.map((body) => body.text).join("\n");
-  assert.equal(text.includes("🧠"), true);
+  assert.equal(text.includes("<blockquote expandable>"), true);
+  assert.equal(text.includes("Thinking:"), false);
   assert.equal(text.includes("🛠"), false);
 });
 
@@ -367,7 +367,10 @@ test("thinking and tools modes isolate their activity classes", async () => {
     await harness.runtime.waitForIdle();
     const thinkingText = harness.sends.map((body) => body.text).join("\n");
     const toolText = JSON.stringify(harness.richSends);
-    assert.equal(thinkingText.includes("🧠"), mode === "thinking");
+    assert.equal(
+      thinkingText.includes("<blockquote expandable>"),
+      mode === "thinking",
+    );
     assert.equal(toolText.includes("🛠"), mode === "tools");
   }
 });
@@ -375,9 +378,9 @@ test("thinking and tools modes isolate their activity classes", async () => {
 test("reasoning evidence renders inline HTML inside an expandable quote", () => {
   const html = renderTelegramThinkingActivityHtml(
     "**Reviewing data models**\na < b\n<https://example.com>",
-    "xhigh",
   );
-  assert.match(html, /^<b>🧠&#160; Thinking:<\/b> <code>xhigh<\/code>/);
+  assert.match(html, /^<blockquote expandable>/);
+  assert.doesNotMatch(html, /Thinking:|🧠/);
   assert.match(
     html,
     /<blockquote expandable><b>Reviewing data models<\/b>\na &lt; b/,
@@ -630,12 +633,13 @@ test("reset drops accepted events that have not started processing", async () =>
   const richSends: TelegramSendRichMessageBody[] = [];
   const runtime = createTelegramActivityVerbosityRuntime({
     getActivityMode: () => "verbose",
-    getThinkingLevel: () => "high",
     resolveTarget: (activity) => activity.target,
     captureAuthority: () => 1,
     isAuthorityActive: () => true,
     async sendMessage(body) {
-      if (body.text.includes("🧠")) await reasoningBlocked;
+      if (body.text.includes("<blockquote expandable>")) {
+        await reasoningBlocked;
+      }
       sends.push(body);
       return { message_id: 1 };
     },

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.26.1: Compact Activity Trees
+
+- `Thinking Density`: Removed the standalone `🧠  Thinking: <level>` line from provider-exposed thinking so each message consists only of its recognizable expandable HTML quote. Impact: persistent reasoning saves one chat row without changing its bounded, redacted, progressively edited evidence.
+- `Tool Density`: Moved each `🛠  <Tool>: <status>` label into a closed native Rich root details node whose children are the existing closed `Arguments`, retained `Update N`, and `Result`/`Error` JSON details. Impact: every collapsed tool costs one row, while opening it reveals the same logically separated evidence tree.
+- `Safety`: Preserved multi-tool coalescing, message bounds, redaction, truncation, ordering, target/transport fencing, known-safe HTML fallback, and no replay after ambiguous sends. Impact: the denser presentation changes layout rather than delivery guarantees.
+
 ## 0.26.0: Rich Tool Activity
 
 - `Tool Presentation`: Moved completed tool batches from one ordinary HTML expandable quote to native Rich Messages. Each sentence-case tool header now precedes separate closed `Arguments`, retained `Update N`, and `Result`/`Error` details containing compact JSON code blocks; dropped-update counts remain visible in the first retained update summary. Thinking keeps its distinct persistent HTML expandable quote. Impact: technical history becomes easier to scan, tool phases no longer compete inside one large JSON disclosure, and thinking remains optimized for prose.

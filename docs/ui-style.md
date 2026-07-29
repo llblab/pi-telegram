@@ -34,8 +34,8 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `🕒` | Time injection / wall-clock context | Time injection settings row and detail card | Clock-face marker with hands; not a generic duration/progress marker. |
 | `📌` | Proactive push / pinned behavior | Proactive push settings row and detail card | Not generic active/selected state. |
 | `🔬` | Activity / technical detail | Activity settings row and detail card | Chooses quiet, thinking, tools, or verbose bridge activity; not a generic diagnostics marker. |
-| `🧠` | Model thinking activity | Collapsed persistent thinking disclosure summaries | One marker per thinking message; header text reports the current thinking level such as `high`. |
-| `🛠` | Executed tool activity | Native Rich tool headers above closed Arguments/Update/Result/Error details | One marker per tool header; tool result state remains text (`done`/`failed`). |
+| `🧠` | Model thinking controls | Thinking menus and status rows | Thinking activity quotes omit this icon and their header entirely to minimize chat height. |
+| `🛠` | Executed tool activity | Native Rich root details containing closed Arguments/Update/Result/Error child details | One marker per collapsed tool root; tool result state remains text (`done`/`failed`). |
 | `📎` | Attachment | Attachment summaries, queue rows for attachment-only turns | Not for thread binding. |
 
 ### Command And Control Actions

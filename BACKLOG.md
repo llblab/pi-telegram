@@ -2,13 +2,27 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
+## P0 — Compact Activity Tree Hotfix
+
+Context: `0.26.0` proved the Rich tool-details direction but retained one standalone line for every thinking header and every tool header. The compact default removes the thinking header entirely and makes each tool call itself the closed root details node containing nested Arguments/Update/Result/Error details.
+
+Open work:
+
+- [x] Render thinking as only its existing HTML expandable quote, without a separate `Thinking: <level>` line.
+- [x] Render each Rich tool as one closed root details summary `🛠  <Tool>: <status>` whose children are the existing closed JSON evidence details; preserve multi-tool coalescing, fallback, bounds, redaction, ordering, and fencing.
+- [x] Update regressions, README/docs, durable UI rules, changelog, and package metadata.
+- [ ] Publish and verify GitHub/npm release evidence for `0.26.1`.
+- [ ] Live-smoke compact thinking and nested tool trees on Telegram mobile/Desktop in classic and Threaded Mode.
+
+Done when: thinking costs no standalone header row, each collapsed tool costs one root row, expanding a tool reveals only logical evidence nodes, automated validation passes, live clients confirm nested disclosure behavior, and the hotfix is published.
+
 ## P1 — Configurable Activity Live Smoke
 
 Context: `0.26.0` shipped configurable quiet, thinking-only, tools-only, and verbose modes with absent-config `verbose` plus interval time-injection defaults. Thinking uses persistent collapsed ordinary HTML; completed tools use native Rich details with separate JSON code blocks.
 
 Open work:
 
-- [ ] Live-smoke all four modes in classic and Threaded Mode on Telegram mobile and Desktop, including progressive thinking edits, separate Arguments/Update/Result/Error tool details, multiple sequential tools, oversized output rollover, cancellation during thinking, tool failure and known-safe HTML fallback, session replacement, follower transport, and final-answer ordering.
+- [ ] Live-smoke all four modes in classic and Threaded Mode on Telegram mobile and Desktop, including progressive headerless thinking edits, collapsed tool roots with nested Arguments/Update/Result/Error details, multiple sequential tools, oversized output rollover, cancellation during thinking, tool failure and known-safe HTML fallback, session replacement, follower transport, and final-answer ordering.
 - [ ] From omitted settings, verify `verbose` Activity and one-hour interval time injection activate without persistence or migration; then verify explicit quiet/hidden and single-class settings remain authoritative across live instances.
 
 Done when: live mobile and Desktop clients confirm mode/default isolation, persistent thinking, structured Rich tool disclosures, routing, rollover, cancellation, failure/fallback, explicit overrides, and final-answer ordering in classic and Threaded Mode.

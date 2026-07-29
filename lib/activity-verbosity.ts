@@ -20,7 +20,6 @@ import type {
 import type { TelegramTarget } from "./target.ts";
 
 export const TELEGRAM_TOOL_ACTIVITY_ICON = "🛠";
-export const TELEGRAM_THINKING_ACTIVITY_ICON = "🧠";
 export const TELEGRAM_ACTIVITY_DETAIL_MAX_CHARS = 1_200;
 export const TELEGRAM_ACTIVITY_MESSAGE_MAX_CHARS = 3_900;
 export const TELEGRAM_ACTIVITY_MESSAGE_MAX_TOOLS = 6;
@@ -213,24 +212,15 @@ function createToolActivityDetail(
   };
 }
 
-function renderToolActivityRichBlocks(tool: ToolActivity): TelegramInputRichBlock[] {
+function renderToolActivityRichBlocks(
+  tool: ToolActivity,
+): TelegramInputRichBlock[] {
   const status = tool.complete
     ? tool.isError
       ? "failed"
       : "done"
     : "running";
-  const blocks: TelegramInputRichBlock[] = [
-    {
-      type: "paragraph",
-      text: [
-        {
-          type: "bold",
-          text: `${TELEGRAM_TOOL_ACTIVITY_ICON}  ${capitalizeActivityLabel(tool.name)}:`,
-        },
-        " ",
-        { type: "code", text: status },
-      ],
-    },
+  const evidenceBlocks: TelegramInputRichBlock[] = [
     createToolActivityDetail("Arguments", tool.args),
   ];
   tool.updates.forEach((update, index) => {
@@ -239,14 +229,29 @@ function renderToolActivityRichBlocks(tool: ToolActivity): TelegramInputRichBloc
       index === 0 && tool.droppedUpdates > 0
         ? ` · ${tool.droppedUpdates} earlier omitted`
         : "";
-    blocks.push(createToolActivityDetail(`Update ${number}${omitted}`, update));
+    evidenceBlocks.push(
+      createToolActivityDetail(`Update ${number}${omitted}`, update),
+    );
   });
   if (tool.complete && tool.result !== undefined) {
-    blocks.push(
+    evidenceBlocks.push(
       createToolActivityDetail(tool.isError ? "Error" : "Result", tool.result),
     );
   }
-  return blocks;
+  return [
+    {
+      type: "details",
+      summary: [
+        {
+          type: "bold",
+          text: `${TELEGRAM_TOOL_ACTIVITY_ICON}  ${capitalizeActivityLabel(tool.name)}:`,
+        },
+        " ",
+        { type: "code", text: status },
+      ],
+      blocks: evidenceBlocks,
+    },
+  ];
 }
 
 export function renderTelegramToolActivityRichMessage(
@@ -266,14 +271,8 @@ function isKnownSafeRichActivityRejection(error: unknown): boolean {
   return error instanceof Error && /HTTP 400: Bad Request:/i.test(error.message);
 }
 
-export function renderTelegramThinkingActivityHtml(
-  text: string,
-  thinkingLevel: string,
-): string {
-  return [
-    `<b>${TELEGRAM_THINKING_ACTIVITY_ICON}&#160; Thinking:</b> <code>${escapeHtml(thinkingLevel)}</code>`,
-    `<blockquote expandable>${renderThinkingActivityEvidenceHtml(text)}</blockquote>`,
-  ].join("\n");
+export function renderTelegramThinkingActivityHtml(text: string): string {
+  return `<blockquote expandable>${renderThinkingActivityEvidenceHtml(text)}</blockquote>`;
 }
 
 export interface TelegramActivityVerbosityRuntime {
@@ -286,7 +285,6 @@ export interface TelegramActivityVerbosityRuntime {
 export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
   getActivityMode: () => "quiet" | "thinking" | "tools" | "verbose";
   refreshActivityMode?: () => Promise<void>;
-  getThinkingLevel: () => string;
   resolveTarget: (event: TelegramActivityEvent) => TelegramTarget | undefined;
   captureAuthority: () => TAuthority;
   isAuthorityActive: (authority: TAuthority) => boolean;
@@ -375,7 +373,7 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
           ? `… [${omitted} earlier chars omitted]\n${retained}`
           : retained,
       );
-      body = renderTelegramThinkingActivityHtml(text, deps.getThinkingLevel());
+      body = renderTelegramThinkingActivityHtml(text);
       if (body.length <= TELEGRAM_ACTIVITY_MESSAGE_MAX_CHARS) break;
       retained = retained.slice(-Math.max(1, Math.floor(retained.length * 0.75)));
     } while (retained.length > 1);
