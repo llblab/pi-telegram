@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.26.3: One-Tap Tool Arguments
+
+- `Tool Inspection`: Marked the nested `Arguments` details node open by default while leaving each tool root, retained update, and result/error node collapsed. Impact: one tap on a tool root immediately reveals what the tool received, eliminating a redundant second disclosure action without expanding secondary evidence.
+- `Test Housekeeping`: Removed redundant negative guards against historical activity icons and headers while retaining positive structure, routing, ordering, redaction, and fallback assertions. Impact: the suite expresses current contracts instead of preserving implementation archaeology.
+
 ## 0.26.2: Iconless Tool Roots
 
 - `Tool Density`: Removed the repeated `🛠` emoji from Rich tool root summaries and the known-safe HTML fallback. Native disclosure chevrons, bold sentence-case tool names, and monospaced statuses already distinguish the rows. Impact: consecutive tool calls form a quieter, more regular tree that visually matches headerless thinking while retaining the full nested evidence structure.

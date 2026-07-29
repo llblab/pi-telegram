@@ -203,11 +203,13 @@ export function renderTelegramToolActivityHtml(
 function createToolActivityDetail(
   summary: string,
   text: string,
+  isOpen = false,
 ): TelegramInputRichBlock {
   return {
     type: "details",
     summary: { type: "bold", text: summary },
     blocks: [{ type: "pre", text, language: "json" }],
+    ...(isOpen ? { is_open: true as const } : {}),
   };
 }
 
@@ -220,7 +222,7 @@ function renderToolActivityRichBlocks(
       : "done"
     : "running";
   const evidenceBlocks: TelegramInputRichBlock[] = [
-    createToolActivityDetail("Arguments", tool.args),
+    createToolActivityDetail("Arguments", tool.args, true),
   ];
   tool.updates.forEach((update, index) => {
     const number = tool.droppedUpdates + index + 1;

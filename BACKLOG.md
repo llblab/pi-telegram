@@ -2,7 +2,20 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — Iconless Tool Root Hotfix
+## P0 — Open Arguments Hotfix
+
+Context: opening a tool root currently reveals another closed Arguments disclosure, forcing a second tap before the most useful invocation evidence becomes visible. Telegram Rich details support `is_open`, so only the first Arguments child can open with its parent while updates and results remain collapsed.
+
+Open work:
+
+- [x] Mark each Arguments child details node open by default without opening the tool root or later evidence nodes.
+- [x] Update focused regressions, documentation, durable UI rules, changelog, and package metadata.
+- [ ] Publish and verify GitHub/npm release evidence for `0.26.3`.
+- [ ] Live-smoke the one-tap tool inspection path on Telegram mobile/Desktop.
+
+Done when: one tap on a collapsed tool root reveals its arguments immediately, secondary evidence remains compact, automated validation passes, live clients confirm the disclosure state, and the hotfix is published.
+
+## P1 — Iconless Tool Root Live Smoke
 
 Context: native Rich details already supply a chevron, bold tool name, and monospaced status. Repeating `🛠` on every coalesced root adds visual noise and no longer matches the headerless thinking surface.
 

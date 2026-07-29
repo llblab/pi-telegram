@@ -142,6 +142,7 @@ test("tool Rich activity separates arguments, updates, and result details", () =
               language: "json",
             },
           ],
+          is_open: true,
         },
         {
           type: "details",
