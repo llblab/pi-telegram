@@ -10,7 +10,7 @@ Open work:
 
 - [x] Render the first retained update as `Update N (K earlier omitted)` when earlier updates were dropped.
 - [x] Update focused regression, changelog, and package metadata.
-- [ ] Publish and verify GitHub/npm release evidence for `0.26.4`.
+- [x] Publish and verify GitHub/npm release evidence for `0.26.4`.
 
 Done when: omission metadata uses ordinary parentheses, validation passes, and the hotfix is published.
 
