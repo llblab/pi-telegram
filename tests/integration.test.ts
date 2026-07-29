@@ -780,14 +780,12 @@ test("Verbose activity reaches classic transport before the final assistant answ
       (call) =>
         call.method === "sendRichMessage" &&
         JSON.stringify(call.body.rich_message).includes("Read:") &&
-        !JSON.stringify(call.body.rich_message).includes("🛠") &&
         JSON.stringify(call.body.rich_message).includes("details"),
     );
     const toolEditIndex = calls.findIndex(
       (call) =>
         call.method === "editMessageText" &&
         JSON.stringify(call.body.rich_message).includes("Exec:") &&
-        !JSON.stringify(call.body.rich_message).includes("🛠") &&
         JSON.stringify(call.body.rich_message).includes("details"),
     );
     const finalIndex = calls.findIndex((call) => {

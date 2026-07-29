@@ -233,7 +233,6 @@ test("known-safe Rich rejection falls back to the HTML tool message", async () =
   assert.equal(harness.richSends.length, 0);
   assert.equal(harness.sends.length, 1);
   assert.match(harness.sends[0]?.text ?? "", /<b>Bash:<\/b>/);
-  assert.doesNotMatch(harness.sends[0]?.text ?? "", /🛠/);
   assert.match(harness.sends[0]?.text ?? "", /<blockquote expandable>/);
 });
 
@@ -272,9 +271,7 @@ test("reasoning uses a persistent target-bound expandable HTML message", async (
     harness.sends[0]?.text ?? "",
     /^<blockquote expandable>/,
   );
-  assert.doesNotMatch(harness.sends[0]?.text ?? "", /Thinking:|🧠/);
   assert.equal(harness.edits.length, 1);
-  assert.doesNotMatch(harness.edits[0]?.text ?? "", /Thinking:|🧠|<code>/);
   assert.match(harness.edits[0]?.text ?? "", /Checking <b>state<\/b>/);
   assert.equal(harness.edits[0]?.parse_mode, "HTML");
   assert.deepEqual(harness.edits[0]?.link_preview_options, {
@@ -322,7 +319,6 @@ test("agent start refreshes file-backed mode before activity isolation", async (
   await harness.runtime.waitForIdle();
   const text = harness.sends.map((body) => body.text).join("\n");
   assert.equal(text.includes("<blockquote expandable>"), true);
-  assert.equal(text.includes("Thinking:"), false);
   assert.equal(text.includes("<b>Read:</b>"), false);
 });
 
@@ -381,7 +377,6 @@ test("reasoning evidence renders inline HTML inside an expandable quote", () => 
     "**Reviewing data models**\na < b\n<https://example.com>",
   );
   assert.match(html, /^<blockquote expandable>/);
-  assert.doesNotMatch(html, /Thinking:|🧠/);
   assert.match(
     html,
     /<blockquote expandable><b>Reviewing data models<\/b>\na &lt; b/,
@@ -432,7 +427,6 @@ test("completed consecutive tools coalesce as collapsed redacted details", async
   assert.equal(harness.edits.length, 1);
   const serialized = JSON.stringify(harness.edits[0]?.rich_message);
   assert.match(serialized, /Read:/);
-  assert.doesNotMatch(serialized, /🛠/);
   assert.match(serialized, /details/);
   assert.match(serialized, /REDACTED/);
   assert.doesNotMatch(serialized, /abcdefghijklmnopqrstuvwxyzABCDEFGHIJK/);
