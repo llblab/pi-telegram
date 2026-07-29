@@ -10,7 +10,7 @@ Open work:
 
 - [x] Remove the tool emoji from Rich root summaries while retaining `<Tool>: <status>`, nesting, fallback safety, and all delivery guarantees.
 - [x] Update regressions, documentation, durable UI rules, changelog, and package metadata.
-- [ ] Publish and verify GitHub/npm release evidence for `0.26.2`.
+- [x] Publish and verify GitHub/npm release evidence for `0.26.2`.
 - [ ] Live-smoke multiple consecutive iconless tool roots on Telegram mobile/Desktop.
 
 Done when: the native chevron alone identifies each collapsed tool root, automated validation passes, live clients confirm scanability, and the hotfix is published.
