@@ -10,7 +10,7 @@ Open work:
 
 - [x] Mark each Arguments child details node open by default without opening the tool root or later evidence nodes.
 - [x] Update focused regressions, documentation, durable UI rules, changelog, and package metadata.
-- [ ] Publish and verify GitHub/npm release evidence for `0.26.3`.
+- [x] Publish and verify GitHub/npm release evidence for `0.26.3`.
 - [ ] Live-smoke the one-tap tool inspection path on Telegram mobile/Desktop.
 
 Done when: one tap on a collapsed tool root reveals its arguments immediately, secondary evidence remains compact, automated validation passes, live clients confirm the disclosure state, and the hotfix is published.
