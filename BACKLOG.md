@@ -9,7 +9,7 @@ Context: a Windows process-lock regression reached its expected `parent:getUpdat
 Open work:
 
 - [x] Reapply the predicate after the final file read before reporting a timeout.
-- [ ] Validate the process-lock regression across hosted platforms and publish `0.26.6`.
+- [x] Validate the process-lock regression across hosted platforms and publish `0.26.6`.
 
 Done when: deadline-edge marker arrival succeeds, genuine missing markers still fail with evidence, and CI passes on Linux, macOS, and Windows.
 
