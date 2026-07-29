@@ -10,7 +10,7 @@ Open work:
 
 - [x] Render scoped model buttons as `provider/model (level)` when a thinking level is attached.
 - [x] Update focused regression, changelog, and package metadata.
-- [ ] Publish and verify GitHub/npm release evidence for `0.26.5`.
+- [x] Publish and verify GitHub/npm release evidence for `0.26.5`.
 
 Done when: optional thinking metadata uses parentheses consistently, validation passes, and the hotfix is published.
 
