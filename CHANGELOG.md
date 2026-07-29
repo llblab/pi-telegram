@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.6: Windows Poll-Wait Boundary Fix
+
+- `Windows CI`: Reapplied the wait predicate to the final marker-file read before reporting a timeout. Impact: process-lock regressions no longer fail when Windows exposes the expected marker exactly at the polling deadline, while genuinely missing evidence still produces the same diagnostic failure.
+
 ## 0.26.5: Quieter Scoped Model Labels
 
 - `Model Microcopy`: Replaced the middle-dot separator in scoped model buttons with parentheses, rendering optional thinking metadata as `provider/model (level)`. Impact: model identity stays primary while its attached thinking level reads as subordinate metadata consistently with Activity omission labels.

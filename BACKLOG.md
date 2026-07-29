@@ -2,7 +2,18 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — Scoped Model Thinking Label Hotfix
+## P0 — Windows Poll-Wait Boundary Hotfix
+
+Context: a Windows process-lock regression reached its expected `parent:getUpdates` marker at the polling deadline, but the shared wait helper failed immediately after its final read without applying the predicate to that last value. This produces a false timeout despite successful behavior.
+
+Open work:
+
+- [x] Reapply the predicate after the final file read before reporting a timeout.
+- [ ] Validate the process-lock regression across hosted platforms and publish `0.26.6`.
+
+Done when: deadline-edge marker arrival succeeds, genuine missing markers still fail with evidence, and CI passes on Linux, macOS, and Windows.
+
+## P1 — Scoped Model Thinking Label Release
 
 Context: scoped model buttons still separate their optional thinking level with a middle dot. Parentheses match the quieter subordinate-metadata convention now used by Activity update omission labels.
 

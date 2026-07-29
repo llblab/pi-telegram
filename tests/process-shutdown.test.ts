@@ -79,6 +79,7 @@ async function waitForFileText(
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   const text = await readFile(path, "utf8").catch(() => "");
+  if (predicate(text)) return text;
   assert.fail(`Timed out waiting for ${path}. Current text: ${text}`);
 }
 
