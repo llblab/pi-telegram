@@ -2,7 +2,19 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — Open Arguments Hotfix
+## P0 — Update Omission Label Hotfix
+
+Context: the retained-update summary currently separates its dropped-count suffix with a middle dot. Parentheses communicate subordinate metadata more quietly and avoid an unnecessary visual separator.
+
+Open work:
+
+- [x] Render the first retained update as `Update N (K earlier omitted)` when earlier updates were dropped.
+- [x] Update focused regression, changelog, and package metadata.
+- [ ] Publish and verify GitHub/npm release evidence for `0.26.4`.
+
+Done when: omission metadata uses ordinary parentheses, validation passes, and the hotfix is published.
+
+## P1 — Open Arguments Live Smoke
 
 Context: opening a tool root currently reveals another closed Arguments disclosure, forcing a second tap before the most useful invocation evidence becomes visible. Telegram Rich details support `is_open`, so only the first Arguments child can open with its parent while updates and results remain collapsed.
 

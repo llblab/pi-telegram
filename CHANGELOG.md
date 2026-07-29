@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.4: Quieter Update Omission Labels
+
+- `Tool Microcopy`: Replaced the middle-dot suffix in retained update summaries with ordinary parentheses: `Update N (K earlier omitted)`. Impact: dropped-update evidence remains explicit while reading as subordinate metadata instead of another visual segment.
+
 ## 0.26.3: One-Tap Tool Arguments
 
 - `Tool Inspection`: Marked the nested `Arguments` details node open by default while leaving each tool root, retained update, and result/error node collapsed. Impact: one tap on a tool root immediately reveals what the tool received, eliminating a redundant second disclosure action without expanding secondary evidence.

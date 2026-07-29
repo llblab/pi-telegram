@@ -228,7 +228,7 @@ function renderToolActivityRichBlocks(
     const number = tool.droppedUpdates + index + 1;
     const omitted =
       index === 0 && tool.droppedUpdates > 0
-        ? ` · ${tool.droppedUpdates} earlier omitted`
+        ? ` (${tool.droppedUpdates} earlier omitted)`
         : "";
     evidenceBlocks.push(
       createToolActivityDetail(`Update ${number}${omitted}`, update),
