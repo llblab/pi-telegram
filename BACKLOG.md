@@ -2,14 +2,27 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — Compact Activity Tree Hotfix
+## P0 — Iconless Tool Root Hotfix
+
+Context: native Rich details already supply a chevron, bold tool name, and monospaced status. Repeating `🛠` on every coalesced root adds visual noise and no longer matches the headerless thinking surface.
+
+Open work:
+
+- [x] Remove the tool emoji from Rich root summaries while retaining `<Tool>: <status>`, nesting, fallback safety, and all delivery guarantees.
+- [x] Update regressions, documentation, durable UI rules, changelog, and package metadata.
+- [ ] Publish and verify GitHub/npm release evidence for `0.26.2`.
+- [ ] Live-smoke multiple consecutive iconless tool roots on Telegram mobile/Desktop.
+
+Done when: the native chevron alone identifies each collapsed tool root, automated validation passes, live clients confirm scanability, and the hotfix is published.
+
+## P1 — Compact Activity Tree Live Smoke
 
 Context: `0.26.0` proved the Rich tool-details direction but retained one standalone line for every thinking header and every tool header. The compact default removes the thinking header entirely and makes each tool call itself the closed root details node containing nested Arguments/Update/Result/Error details.
 
 Open work:
 
 - [x] Render thinking as only its existing HTML expandable quote, without a separate `Thinking: <level>` line.
-- [x] Render each Rich tool as one closed root details summary `🛠  <Tool>: <status>` whose children are the existing closed JSON evidence details; preserve multi-tool coalescing, fallback, bounds, redaction, ordering, and fencing.
+- [x] Render each Rich tool as one closed root details summary `<Tool>: <status>` whose children are the existing closed JSON evidence details; preserve multi-tool coalescing, fallback, bounds, redaction, ordering, and fencing.
 - [x] Update regressions, README/docs, durable UI rules, changelog, and package metadata.
 - [x] Publish and verify GitHub/npm release evidence for `0.26.1`.
 - [ ] Live-smoke compact thinking and nested tool trees on Telegram mobile/Desktop in classic and Threaded Mode.

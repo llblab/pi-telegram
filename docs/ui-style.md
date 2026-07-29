@@ -35,7 +35,6 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `📌` | Proactive push / pinned behavior | Proactive push settings row and detail card | Not generic active/selected state. |
 | `🔬` | Activity / technical detail | Activity settings row and detail card | Chooses quiet, thinking, tools, or verbose bridge activity; not a generic diagnostics marker. |
 | `🧠` | Model thinking controls | Thinking menus and status rows | Thinking activity quotes omit this icon and their header entirely to minimize chat height. |
-| `🛠` | Executed tool activity | Native Rich root details containing closed Arguments/Update/Result/Error child details | One marker per collapsed tool root; tool result state remains text (`done`/`failed`). |
 | `📎` | Attachment | Attachment summaries, queue rows for attachment-only turns | Not for thread binding. |
 
 ### Command And Control Actions

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.26.2: Iconless Tool Roots
+
+- `Tool Density`: Removed the repeated `🛠` emoji from Rich tool root summaries and the known-safe HTML fallback. Native disclosure chevrons, bold sentence-case tool names, and monospaced statuses already distinguish the rows. Impact: consecutive tool calls form a quieter, more regular tree that visually matches headerless thinking while retaining the full nested evidence structure.
+- `Compatibility`: Preserved Arguments/Update/Result/Error nesting, multi-tool coalescing, bounds, redaction, truncation, ordering, authority fencing, fallback, and ambiguous-send no-replay behavior. Impact: only the redundant marker disappears; transport and evidence guarantees remain unchanged.
+
 ## 0.26.1: Compact Activity Trees
 
 - `Thinking Density`: Removed the standalone `🧠  Thinking: <level>` line from provider-exposed thinking so each message consists only of its recognizable expandable HTML quote. Impact: persistent reasoning saves one chat row without changing its bounded, redacted, progressively edited evidence.

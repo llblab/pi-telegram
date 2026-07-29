@@ -127,7 +127,7 @@ test("tool Rich activity separates arguments, updates, and result details", () =
     {
       type: "details",
       summary: [
-        { type: "bold", text: "🛠  Bash:" },
+        { type: "bold", text: "Bash:" },
         " ",
         { type: "code", text: "done" },
       ],
@@ -178,7 +178,7 @@ test("tool evidence renders as ordinary expandable HTML fallback", () => {
 
   assert.match(
     html,
-    /^<b>🛠&#160; Exec&lt;script&gt;:<\/b> <code>done<\/code>/,
+    /^<b>Exec&lt;script&gt;:<\/b> <code>done<\/code>/,
   );
   assert.match(html, /<blockquote expandable>/);
   assert.match(html, /"arguments": \{\n  "command"/);
@@ -232,7 +232,8 @@ test("known-safe Rich rejection falls back to the HTML tool message", async () =
   await harness.runtime.waitForIdle();
   assert.equal(harness.richSends.length, 0);
   assert.equal(harness.sends.length, 1);
-  assert.match(harness.sends[0]?.text ?? "", /🛠/);
+  assert.match(harness.sends[0]?.text ?? "", /<b>Bash:<\/b>/);
+  assert.doesNotMatch(harness.sends[0]?.text ?? "", /🛠/);
   assert.match(harness.sends[0]?.text ?? "", /<blockquote expandable>/);
 });
 
@@ -322,7 +323,7 @@ test("agent start refreshes file-backed mode before activity isolation", async (
   const text = harness.sends.map((body) => body.text).join("\n");
   assert.equal(text.includes("<blockquote expandable>"), true);
   assert.equal(text.includes("Thinking:"), false);
-  assert.equal(text.includes("🛠"), false);
+  assert.equal(text.includes("<b>Read:</b>"), false);
 });
 
 test("activity fails closed when file-backed mode refresh fails", async () => {
@@ -371,7 +372,7 @@ test("thinking and tools modes isolate their activity classes", async () => {
       thinkingText.includes("<blockquote expandable>"),
       mode === "thinking",
     );
-    assert.equal(toolText.includes("🛠"), mode === "tools");
+    assert.equal(toolText.includes("Read:"), mode === "tools");
   }
 });
 
@@ -430,7 +431,8 @@ test("completed consecutive tools coalesce as collapsed redacted details", async
   assert.equal(harness.richSends.length, 1);
   assert.equal(harness.edits.length, 1);
   const serialized = JSON.stringify(harness.edits[0]?.rich_message);
-  assert.match(serialized, /🛠/);
+  assert.match(serialized, /Read:/);
+  assert.doesNotMatch(serialized, /🛠/);
   assert.match(serialized, /details/);
   assert.match(serialized, /REDACTED/);
   assert.doesNotMatch(serialized, /abcdefghijklmnopqrstuvwxyzABCDEFGHIJK/);

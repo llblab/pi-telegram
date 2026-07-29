@@ -19,7 +19,6 @@ import type {
 } from "./telegram-api.ts";
 import type { TelegramTarget } from "./target.ts";
 
-export const TELEGRAM_TOOL_ACTIVITY_ICON = "🛠";
 export const TELEGRAM_ACTIVITY_DETAIL_MAX_CHARS = 1_200;
 export const TELEGRAM_ACTIVITY_MESSAGE_MAX_CHARS = 3_900;
 export const TELEGRAM_ACTIVITY_MESSAGE_MAX_TOOLS = 6;
@@ -190,7 +189,7 @@ function renderToolActivityHtml(tool: ToolActivity): string {
       : "done"
     : "running";
   return [
-    `<b>${TELEGRAM_TOOL_ACTIVITY_ICON}&#160; ${escapeHtml(capitalizeActivityLabel(tool.name))}:</b> <code>${status}</code>`,
+    `<b>${escapeHtml(capitalizeActivityLabel(tool.name))}:</b> <code>${status}</code>`,
     `<blockquote expandable>${escapeActivityEvidenceHtml(evidence.join("\n\n"))}</blockquote>`,
   ].join("\n");
 }
@@ -244,7 +243,7 @@ function renderToolActivityRichBlocks(
       summary: [
         {
           type: "bold",
-          text: `${TELEGRAM_TOOL_ACTIVITY_ICON}  ${capitalizeActivityLabel(tool.name)}:`,
+          text: `${capitalizeActivityLabel(tool.name)}:`,
         },
         " ",
         { type: "code", text: status },
