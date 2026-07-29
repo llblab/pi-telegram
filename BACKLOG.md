@@ -11,7 +11,7 @@ Open work:
 - [x] Render thinking as only its existing HTML expandable quote, without a separate `Thinking: <level>` line.
 - [x] Render each Rich tool as one closed root details summary `🛠  <Tool>: <status>` whose children are the existing closed JSON evidence details; preserve multi-tool coalescing, fallback, bounds, redaction, ordering, and fencing.
 - [x] Update regressions, README/docs, durable UI rules, changelog, and package metadata.
-- [ ] Publish and verify GitHub/npm release evidence for `0.26.1`.
+- [x] Publish and verify GitHub/npm release evidence for `0.26.1`.
 - [ ] Live-smoke compact thinking and nested tool trees on Telegram mobile/Desktop in classic and Threaded Mode.
 
 Done when: thinking costs no standalone header row, each collapsed tool costs one root row, expanding a tool reveals only logical evidence nodes, automated validation passes, live clients confirm nested disclosure behavior, and the hotfix is published.
