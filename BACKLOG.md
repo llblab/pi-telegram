@@ -9,7 +9,7 @@ Context: the process-lock regression can start a full Pi child more slowly than 
 Open work:
 
 - [x] Give the cold-start readiness marker and parent watchdog a Windows-safe bounded budget without weakening the no-child-poll assertion.
-- [ ] Validate the focused process test and full suite across hosted platforms; publish and verify `0.26.8`.
+- [x] Validate the focused process test and full suite across hosted platforms; publish and verify `0.26.8`.
 
 Done when: slow Windows startup reaches the same lock assertion deterministically, genuine hangs remain bounded and diagnostic, and CI passes on Linux, macOS, and Windows.
 
