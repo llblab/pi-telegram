@@ -2,7 +2,18 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — macOS Follower Reload Identity Hotfix
+## P0 — Windows Process-Startup Timing Hotfix
+
+Context: the process-lock regression can start a full Pi child more slowly than the three-second marker deadline on hosted Windows. Unlike the previous boundary case, the empty final marker proves the parent had not completed extension startup yet; runtime lock behavior was never reached.
+
+Open work:
+
+- [x] Give the cold-start readiness marker and parent watchdog a Windows-safe bounded budget without weakening the no-child-poll assertion.
+- [ ] Validate the focused process test and full suite across hosted platforms; publish and verify `0.26.8`.
+
+Done when: slow Windows startup reaches the same lock assertion deterministically, genuine hangs remain bounded and diagnostic, and CI passes on Linux, macOS, and Windows.
+
+## P1 — macOS Follower Reload Identity Release
 
 Context: macOS lacks Linux `/proc` start ticks, so a follower previously received a generation-based profile identity on each extension reload. Initial registration could also race ahead of session refresh before the old target was restored, causing a duplicate Telegram thread.
 

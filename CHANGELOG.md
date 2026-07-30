@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.8: Windows Process-Startup Timing
+
+- `Windows CI`: Expanded only the full-Pi child readiness budget from three to ten seconds and aligned its parent watchdog at fifteen seconds. Impact: slow hosted-Windows cold starts reach the actual shared-lock assertion instead of failing before extension startup, while genuine hangs remain bounded and the test still rejects every child `getUpdates` call.
+
 ## 0.26.7: macOS Follower Reload Identity
 
 - `macOS Identity`: Derived manual-follower process-birth identity from the parent process start time on Darwin while preserving Linux `/proc` start ticks and the generation fallback. Impact: extension reloads in one macOS Pi process retain a stable durable profile instead of looking like new followers.

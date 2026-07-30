@@ -314,7 +314,7 @@ test("Child process sharing the agent dir does not poll while parent owns Telegr
       await handlers.get("session_shutdown")?.({}, ctx);
       process.exit(0);
     }, 20);
-    setTimeout(() => process.exit(2), 5000).unref?.();
+    setTimeout(() => process.exit(2), 15_000).unref?.();
   `;
   const parent = spawn(
     process.execPath,
@@ -339,8 +339,10 @@ test("Child process sharing the agent dir does not poll while parent owns Telegr
     parent.on("exit", (code) => resolve({ code }));
   });
   try {
-    await waitForFileText(markerPath, (text) =>
-      text.includes("parent:getUpdates"),
+    await waitForFileText(
+      markerPath,
+      (text) => text.includes("parent:getUpdates"),
+      10_000,
     );
     const childScript = `
       import { appendFileSync } from "node:fs";
