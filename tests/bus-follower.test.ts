@@ -24,6 +24,7 @@ import {
   createTelegramBusForwardedUpdateReceiverRuntime,
   createTelegramManualFollowerProfileKeyResolver,
   getTelegramFollowerSessionHandoff,
+  getTelegramFollowerSessionHandoffRegistrationOptions,
   setTelegramFollowerSessionHandoff,
 } from "../lib/bus-follower.ts";
 import {
@@ -1618,6 +1619,25 @@ test("Bus follower API caller classifies non-idempotent acknowledgement loss as 
   }
 });
 
+test("Bus follower initial registration consumes a pending session handoff", () => {
+  setTelegramFollowerSessionHandoff({
+    pid: process.pid,
+    instanceId: "old-inst",
+    createdAtMs: Date.now(),
+    target: { chatId: 1, threadId: 2 },
+    slot: "B",
+    threadName: "Beryl",
+  });
+  try {
+    assert.deepEqual(getTelegramFollowerSessionHandoffRegistrationOptions(), {
+      target: { chatId: 1, threadId: 2 },
+      previousInstanceId: "old-inst",
+    });
+  } finally {
+    setTelegramFollowerSessionHandoff(undefined);
+  }
+});
+
 test("Bus follower session replacement preserves a same-process handoff", async () => {
   const registrationState = createTelegramBusFollowerRegistrationState();
   registrationState.setRegistered(
@@ -1762,7 +1782,10 @@ test("Bus follower session refresh re-registers with the handed-off target", asy
     {
       ctx: { cwd: "/repo" },
       leader: { pid: 20, busSocketPath: "/tmp/leader.sock" },
-      options: { target: { chatId: 1, threadId: 2 } },
+      options: {
+        target: { chatId: 1, threadId: 2 },
+        previousInstanceId: "old-inst",
+      },
     },
   ]);
   assert.equal(registrationState.isRegistered(), true);

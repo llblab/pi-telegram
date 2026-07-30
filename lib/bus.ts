@@ -5,6 +5,7 @@
  * cross-instance forwarding helpers, and the live follower registry model.
  */
 
+import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -51,22 +52,59 @@ export interface TelegramBusProcessRuntime {
   getFollowerSocketPath: () => string;
 }
 
+export interface TelegramProcessBirthIdentityOptions {
+  platform?: NodeJS.Platform;
+  readProcStat?: (pid: number) => string;
+  readDarwinProcessStart?: (pid: number) => string;
+}
+
+function readDarwinProcessStart(pid: number): string {
+  return execFileSync(
+    "/bin/ps",
+    ["-o", "lstart=", "-p", String(pid)],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    },
+  ).trim();
+}
+
 export function getTelegramProcessBirthIdentity(
   pid: number,
   fallbackGeneration: number | string,
+  options: TelegramProcessBirthIdentityOptions = {},
 ): string {
   if (pid > 0) {
-    try {
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const closeParen = stat.lastIndexOf(")");
-      const fields = stat
-        .slice(closeParen + 2)
-        .trim()
-        .split(/\s+/u);
-      const startTicks = fields[19];
-      if (startTicks) return `${pid}:start:${startTicks}`;
-    } catch {
-      /* non-Linux or inaccessible process metadata */
+    const platform = options.platform ?? getPlatform();
+    if (platform === "linux") {
+      try {
+        const stat = (options.readProcStat ?? ((targetPid) =>
+          readFileSync(`/proc/${targetPid}/stat`, "utf8")))(pid);
+        const closeParen = stat.lastIndexOf(")");
+        const fields = stat
+          .slice(closeParen + 2)
+          .trim()
+          .split(/\s+/u);
+        const startTicks = fields[19];
+        if (startTicks) return `${pid}:start:${startTicks}`;
+      } catch {
+        /* inaccessible process metadata */
+      }
+    } else if (platform === "darwin") {
+      try {
+        const startedAt = (
+          options.readDarwinProcessStart ?? readDarwinProcessStart
+        )(pid);
+        if (startedAt) {
+          const fingerprint = createHash("sha256")
+            .update(startedAt)
+            .digest("hex")
+            .slice(0, 16);
+          return `${pid}:start:${fingerprint}`;
+        }
+      } catch {
+        /* inaccessible process metadata */
+      }
     }
   }
   return `${pid}:generation:${fallbackGeneration}`;
@@ -145,6 +183,7 @@ export function getTelegramBusFollowerSocketPath(
 
 export interface TelegramBusInstanceRegistration {
   instanceId: string;
+  previousInstanceId?: string;
   profileKey?: string;
   threadName?: string;
   slot?: string;
@@ -1561,6 +1600,9 @@ function parseRegistration(
     instanceId: value.instanceId,
     connectedAtMs: value.connectedAtMs,
   };
+  if (typeof value.previousInstanceId === "string") {
+    registration.previousInstanceId = value.previousInstanceId;
+  }
   if (typeof value.profileKey === "string")
     registration.profileKey = value.profileKey;
   if (typeof value.threadName === "string")

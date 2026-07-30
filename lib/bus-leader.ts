@@ -366,13 +366,22 @@ export function createTelegramBusFollowerTargetProvisioner(
       registration.profileKey ?? `manual:${registration.instanceId}`;
     const requestedTarget = registration.target;
     const reconnectRecord = recordsBeforeProvision.find((record) => {
+      const matchesRequestedTarget =
+        !requestedTarget ||
+        (record.target.chatId === requestedTarget.chatId &&
+          record.target.threadId === requestedTarget.threadId);
+      const matchesCurrentIdentity =
+        record.instanceId === registration.instanceId ||
+        record.profileKey === followerProfileKey;
+      const matchesSessionHandoff =
+        !!requestedTarget &&
+        !!registration.previousInstanceId &&
+        record.instanceId === registration.previousInstanceId &&
+        matchesRequestedTarget;
       return (
         record.owner?.kind === "manual-follower" &&
-        (record.instanceId === registration.instanceId ||
-          record.profileKey === followerProfileKey) &&
-        (!requestedTarget ||
-          (record.target.chatId === requestedTarget.chatId &&
-            record.target.threadId === requestedTarget.threadId))
+        ((matchesCurrentIdentity && matchesRequestedTarget) ||
+          matchesSessionHandoff)
       );
     });
     const followerOwner =
@@ -539,6 +548,14 @@ export function createTelegramBusFollowerTargetProvisioner(
             const nowMs = getNowMs();
             const transferredRecord = deps.topicTargetStore.upsert({
               ...reconnectRecord,
+              profileKey: followerProfileKey,
+              owner:
+                followerOwner.kind === "manual-follower"
+                  ? followerOwner
+                  : {
+                      kind: "manual-follower",
+                      instanceId: registration.instanceId,
+                    },
               instanceId: registration.instanceId,
               updatedAtMs: nowMs,
               lastSyncObservedAtMs: nowMs,

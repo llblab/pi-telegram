@@ -36,6 +36,7 @@ import {
   getTelegramBusFollowerSocketPath,
   getTelegramBusSocketPath,
   getTelegramFollowerTargetOwnership,
+  getTelegramProcessBirthIdentity,
   isTelegramFollowerApiCallAllowed,
   markTelegramBusAggregateDelivery,
   parseTelegramBusEnvelope,
@@ -53,6 +54,48 @@ test("Current bus process runtime owns process identity defaults", () => {
   });
   assert.equal(runtime.instanceId, "42:1000");
   assert.match(runtime.manualFollowerOwnerId, /^7:/u);
+});
+
+test("Darwin process birth identity survives extension generations", () => {
+  const options = {
+    platform: "darwin" as const,
+    readDarwinProcessStart: () => "Wed Jul 29 16:19:07 2026",
+  };
+  const first = getTelegramProcessBirthIdentity(75433, 1000, options);
+  const reloaded = getTelegramProcessBirthIdentity(75433, 2000, options);
+
+  assert.equal(reloaded, first);
+  assert.match(first, /^75433:start:[a-f0-9]{16}$/u);
+});
+
+test(
+  "Current Darwin process birth identity survives extension generations",
+  { skip: process.platform !== "darwin" },
+  () => {
+    const first = getTelegramProcessBirthIdentity(process.pid, 1000);
+    const reloaded = getTelegramProcessBirthIdentity(process.pid, 2000);
+
+    assert.equal(reloaded, first);
+    assert.match(first, new RegExp(`^${process.pid}:start:[a-f0-9]{16}$`, "u"));
+  },
+);
+
+test("Process birth identity preserves Linux start ticks and fallback", () => {
+  const stat = `(worker name) S ${Array(18).fill("0").join(" ")} 12345`;
+  assert.equal(
+    getTelegramProcessBirthIdentity(42, 1000, {
+      platform: "linux",
+      readProcStat: () => stat,
+    }),
+    "42:start:12345",
+  );
+  assert.equal(
+    getTelegramProcessBirthIdentity(42, 1000, {
+      platform: "darwin",
+      readDarwinProcessStart: () => "",
+    }),
+    "42:generation:1000",
+  );
 });
 
 test("Bus process runtime resolves live profile endpoints", () => {

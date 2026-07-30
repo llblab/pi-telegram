@@ -88,6 +88,68 @@ test("Bus leader preserves a binding through follower reload handoff", async () 
   }
 });
 
+test("Bus leader migrates a reloaded follower from generation to stable identity", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-identity-migration-"));
+  const store = createTelegramTopicTargetStore({
+    path: join(dir, "state.json"),
+    getNowMs: () => 1000,
+  });
+  store.upsert({
+    profileKey: "manual:75433:generation:1000",
+    owner: {
+      kind: "manual-follower",
+      instanceId: "75433:generation:1000",
+    },
+    target: { chatId: 7, threadId: 42 },
+    status: "active",
+    createdAtMs: 900,
+    updatedAtMs: 950,
+    instanceId: "follower-old",
+    slot: "C",
+    threadName: "Cedar",
+  });
+  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+  let syncState = {};
+  const provision = createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7,
+    topicTargetStore: store,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      calls.push({ method, body });
+      return { ok: true } as TResponse;
+    },
+    getNowMs: () => 1001,
+    getSyncState: () => syncState,
+    setSyncState: (state) => {
+      syncState = state;
+    },
+    recordRuntimeEvent() {},
+  });
+  try {
+    assert.deepEqual(
+      await provision({
+        instanceId: "follower-new",
+        previousInstanceId: "follower-old",
+        profileKey: "manual:75433:start:stable",
+        target: { chatId: 7, threadId: 42 },
+        connectedAtMs: 1001,
+      }),
+      { chatId: 7, threadId: 42, slot: "C", threadName: "Cedar" },
+    );
+    assert.deepEqual(calls.map((call) => call.method), ["sendMessage"]);
+    assert.equal(store.list().length, 1);
+    assert.equal(
+      store.getByProfileKey("manual:75433:start:stable")?.instanceId,
+      "follower-new",
+    );
+    assert.equal(
+      store.getByProfileKey("manual:75433:generation:1000"),
+      undefined,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Bus leader API proxy forwards supported methods and recovers stale targets", async () => {
   const calls: unknown[] = [];
   const recovered: unknown[] = [];
