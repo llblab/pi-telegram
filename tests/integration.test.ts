@@ -515,7 +515,7 @@ test("Graceful follower disconnect persists intent and deletes through its live 
     createRequestId: () => `follower-a:${++requestSequence}`,
     getLeaderAuthSecret: (leader) => leader.busSecret,
     getNowMs: () => 2000,
-    registrationTimeoutMs: 500,
+    registrationTimeoutMs: 5_000,
   });
   try {
     await server.start();

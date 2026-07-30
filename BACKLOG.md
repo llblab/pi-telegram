@@ -2,7 +2,18 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — Windows Filesystem And Timer Resilience Hotfix
+## P0 — Windows Graceful Disconnect Test Budget
+
+Context: the graceful follower-disconnect integration overrides the production 30-second bus budget with 500 milliseconds even though the path persists cleanup intent, performs close/delete operations, updates binding state, and returns an authenticated response. A loaded Windows runner exceeded that artificial deadline while the same focused path completes promptly under normal scheduling.
+
+Open work:
+
+- [x] Give this integration-only bus round trip a realistic bounded timeout without changing production transport defaults, retries, cleanup ordering, or assertions.
+- [ ] Validate repeatedly and across hosted platforms before publishing `0.26.10`.
+
+Done when: slow Windows scheduling can complete the real graceful cleanup path, genuine hangs remain bounded, exact cleanup evidence stays asserted, and Linux/macOS/Windows CI passes.
+
+## P1 — Windows Filesystem And Timer Resilience Release
 
 Context: hosted Windows exposed two independent assumptions: atomic config replacement can transiently fail with `EPERM` while another system component holds the destination, and a five-millisecond ownership-refresh interval may not receive CPU within a 250-millisecond test deadline under runner load.
 

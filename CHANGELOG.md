@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.10: Windows Graceful Disconnect Test Budget
+
+- `Windows CI`: Expanded only the graceful follower-disconnect integration's bus-response budget from 500 milliseconds to five seconds. Impact: loaded Windows runners can complete persisted cleanup intent, close/delete operations, binding mutation, and the authenticated response without changing the production 30-second transport default, retry policy, cleanup ordering, or exact assertions.
+
 ## 0.26.9: Windows Filesystem And Timer Resilience
 
 - `Config Persistence`: Retried bounded transient `EPERM`, `EACCES`, and `EBUSY` failures when atomically replacing `telegram.json` inside its existing cross-process transaction, cleaning the unique temp file on terminal failure. Impact: Windows antivirus/indexing contention no longer aborts otherwise serialized concurrent profile updates, while the live config is never deleted or rewritten non-atomically.
