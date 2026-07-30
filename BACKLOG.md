@@ -12,7 +12,7 @@ Open work:
 - [x] Carry a fresh previous runtime identity and exact target through initial follower registration, migrate the old binding after a visibility probe, and consume the handoff only after acknowledgement.
 - [x] Replace the helper-only regression with a runtime-level registration test covering failed-attempt retention, envelope evidence, acknowledgement, and handoff consumption.
 - [x] Update durable context, multi-instance documentation, changelog, and package metadata.
-- [ ] Validate on Linux, macOS, and Windows; publish and verify `0.26.7`.
+- [x] Validate on Linux, macOS, and Windows; publish and verify `0.26.7`.
 
 Done when: same-process follower reload preserves one thread and binding, the race is covered at the runtime boundary, all hosted platforms pass, and the hotfix is published.
 
