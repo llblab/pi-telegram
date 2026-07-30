@@ -2,7 +2,19 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — Windows Process-Startup Timing Hotfix
+## P0 — Windows Filesystem And Timer Resilience Hotfix
+
+Context: hosted Windows exposed two independent assumptions: atomic config replacement can transiently fail with `EPERM` while another system component holds the destination, and a five-millisecond ownership-refresh interval may not receive CPU within a 250-millisecond test deadline under runner load.
+
+Open work:
+
+- [x] Retry only transient Windows config-replacement errors within the existing file transaction, preserving atomic temp-file rename and bounded failure.
+- [x] Recheck the ownership predicate at the polling boundary and give that interval regression a realistic bounded scheduling budget without changing runtime cadence or assertions.
+- [ ] Validate focused regressions and the full suite across hosted platforms; publish and verify `0.26.9`.
+
+Done when: concurrent config transactions survive transient destination contention, slow timer scheduling still reaches the ownership assertion, genuine failures remain bounded and diagnostic, and Linux/macOS/Windows CI passes.
+
+## P1 — Windows Process-Startup Timing Release
 
 Context: the process-lock regression can start a full Pi child more slowly than the three-second marker deadline on hosted Windows. Unlike the previous boundary case, the empty final marker proves the parent had not completed extension startup yet; runtime lock behavior was never reached.
 

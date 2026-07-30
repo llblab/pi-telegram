@@ -47,6 +47,7 @@ async function waitForCondition(
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+  if (predicate()) return;
   assert.fail("Timed out waiting for condition");
 }
 
@@ -1846,6 +1847,7 @@ test("Locked polling runtime refreshes ownership during slow startup", async () 
       () =>
         (readLocks(temp.path)[TELEGRAM_LOCK_KEY] as { heartbeatMs?: number })
           ?.heartbeatMs === 2000,
+      2_000,
     );
     releaseStart?.();
     assert.equal((await started).ok, true);

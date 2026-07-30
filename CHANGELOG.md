@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.26.9: Windows Filesystem And Timer Resilience
+
+- `Config Persistence`: Retried bounded transient `EPERM`, `EACCES`, and `EBUSY` failures when atomically replacing `telegram.json` inside its existing cross-process transaction, cleaning the unique temp file on terminal failure. Impact: Windows antivirus/indexing contention no longer aborts otherwise serialized concurrent profile updates, while the live config is never deleted or rewritten non-atomically.
+- `Ownership Regression`: Rechecked the ownership predicate at the polling boundary and expanded only the five-millisecond interval test's scheduling budget from 250 milliseconds to two seconds. Impact: loaded Windows runners can exercise the real heartbeat-refresh assertion without changing runtime cadence or weakening the exact ownership evidence.
+
 ## 0.26.8: Windows Process-Startup Timing
 
 - `Windows CI`: Expanded only the full-Pi child readiness budget from three to ten seconds and aligned its parent watchdog at fifteen seconds. Impact: slow hosted-Windows cold starts reach the actual shared-lock assertion instead of failing before extension startup, while genuine hangs remain bounded and the test still rejects every child `getUpdates` call.

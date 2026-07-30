@@ -12,6 +12,7 @@ import {
   readFileSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
@@ -27,6 +28,35 @@ import type { TelegramInboundHandlerConfig } from "./inbound.ts";
 import { withTelegramFileTransaction } from "./locks.ts";
 
 const CONFIG_RUNTIME_KEY = "__piTelegramConfigRuntime__";
+const CONFIG_REPLACE_RETRY_ATTEMPTS = 5;
+const CONFIG_REPLACE_RETRY_DELAY_MS = 25;
+
+function isRetryableConfigReplaceError(error: unknown): boolean {
+  const code = (error as { code?: unknown })?.code;
+  return code === "EPERM" || code === "EACCES" || code === "EBUSY";
+}
+
+function sleepConfigReplaceRetry(ms: number): void {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function replaceTelegramConfigFile(tempPath: string, configPath: string): void {
+  for (let attempt = 0; attempt < CONFIG_REPLACE_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      renameSync(tempPath, configPath);
+      return;
+    } catch (error) {
+      if (
+        !isRetryableConfigReplaceError(error) ||
+        attempt === CONFIG_REPLACE_RETRY_ATTEMPTS - 1
+      ) {
+        throw error;
+      }
+      sleepConfigReplaceRetry(CONFIG_REPLACE_RETRY_DELAY_MS * (attempt + 1));
+    }
+  }
+}
 
 function getConfigPath(): string {
   return resolveTelegramConfigPath();
@@ -374,8 +404,16 @@ function writeTelegramConfigInTransaction(
     mode: 0o600,
   });
   chmodSync(tempConfigPath, 0o600);
-  renameSync(tempConfigPath, configPath);
-  chmodSync(configPath, 0o600);
+  try {
+    replaceTelegramConfigFile(tempConfigPath, configPath);
+    chmodSync(configPath, 0o600);
+  } finally {
+    try {
+      unlinkSync(tempConfigPath);
+    } catch {
+      /* rename consumed the temp file or cleanup is best effort */
+    }
+  }
 }
 
 export function getTelegramProfileFields(
