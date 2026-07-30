@@ -10,7 +10,7 @@ Open work:
 
 - [x] Retry only transient Windows config-replacement errors within the existing file transaction, preserving atomic temp-file rename and bounded failure.
 - [x] Recheck the ownership predicate at the polling boundary and give that interval regression a realistic bounded scheduling budget without changing runtime cadence or assertions.
-- [ ] Validate focused regressions and the full suite across hosted platforms; publish and verify `0.26.9`.
+- [x] Validate focused regressions and the full suite across hosted platforms; publish and verify `0.26.9`.
 
 Done when: concurrent config transactions survive transient destination contention, slow timer scheduling still reaches the ownership assertion, genuine failures remain bounded and diagnostic, and Linux/macOS/Windows CI passes.
 
