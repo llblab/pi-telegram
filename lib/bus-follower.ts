@@ -91,17 +91,6 @@ export function isTelegramFollowerSessionHandoffFresh(
   return handoff.pid === pid && nowMs - handoff.createdAtMs <= ttlMs;
 }
 
-export function getTelegramFollowerSessionHandoffRegistrationOptions():
-  | { target: TelegramTarget; previousInstanceId: string }
-  | undefined {
-  const handoff = getTelegramFollowerSessionHandoff();
-  if (!isTelegramFollowerSessionHandoffFresh(handoff)) return undefined;
-  return {
-    target: handoff.target,
-    previousInstanceId: handoff.instanceId,
-  };
-}
-
 export interface TelegramBusFollowerRegistrationRuntime<TContext> {
   registerWithLeader: (
     ctx: TContext,
@@ -1254,9 +1243,17 @@ export function createTelegramBusFollowerRegistrationRuntime<
   };
   return {
     registerWithLeader: async (ctx, leader, options) => {
-      const pendingHandoffOptions = options
+      const pendingHandoff = options
         ? undefined
-        : getTelegramFollowerSessionHandoffRegistrationOptions();
+        : getTelegramFollowerSessionHandoff();
+      const pendingHandoffOptions = isTelegramFollowerSessionHandoffFresh(
+        pendingHandoff,
+      )
+        ? {
+            target: pendingHandoff.target,
+            previousInstanceId: pendingHandoff.instanceId,
+          }
+        : undefined;
       const registrationOptions = options ?? pendingHandoffOptions;
       const leaderSocketPath =
         leader.busSocketPath ??

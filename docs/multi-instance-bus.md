@@ -207,7 +207,7 @@ Current portability audit:
 - Ownership/config/state/temp files: path construction uses `path.join`/`path.resolve` under the Pi agent directory. File permission calls remain best-effort private-mode hardening; native Windows may emulate POSIX modes, so broad Windows ACL auditing is outside this extension's current local-bus baseline.
 - Process liveness: lock ownership uses `process.kill(pid, 0)`, which Node supports on Windows for existence checks. Cross-user permission failures are treated as alive, matching Unix semantics.
 - Shell/provider commands: outbound handler command templates remain operator-configured and platform-dependent; Threaded Mode bus portability does not guarantee every configured STT/TTS/shell provider is Windows-native.
-- Manual follower identity: process ids are used as local liveness/profile hints only, not cross-machine identifiers.
+- Manual follower identity: process ids are local liveness hints, paired with OS process-birth metadata where available rather than treated as cross-machine identifiers. Linux uses `/proc` start ticks and macOS uses the parent process start time; inaccessible metadata falls back to the extension generation. A fresh authenticated session handoff carries the previous runtime identity and exact target through initial registration, allowing fallback identities to migrate without provisioning another thread.
 
 Remaining risk is live native Windows behavior: named-pipe creation/connect timing, antivirus/firewall/ACL interference, and provider command availability need operator smoke evidence.
 

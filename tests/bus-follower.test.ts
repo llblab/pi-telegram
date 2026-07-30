@@ -24,7 +24,6 @@ import {
   createTelegramBusForwardedUpdateReceiverRuntime,
   createTelegramManualFollowerProfileKeyResolver,
   getTelegramFollowerSessionHandoff,
-  getTelegramFollowerSessionHandoffRegistrationOptions,
   setTelegramFollowerSessionHandoff,
 } from "../lib/bus-follower.ts";
 import {
@@ -1619,7 +1618,33 @@ test("Bus follower API caller classifies non-idempotent acknowledgement loss as 
   }
 });
 
-test("Bus follower initial registration consumes a pending session handoff", () => {
+test("Bus follower initial registration consumes a pending session handoff after acknowledgement", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-handoff-"));
+  const socketPath = join(dir, "bus.sock");
+  const registrations: Array<{
+    target: unknown;
+    previousInstanceId: string | undefined;
+  }> = [];
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
+      followerRegistry: createTelegramBusFollowerRegistry(),
+      provisionFollowerTarget(registration) {
+        registrations.push({
+          target: registration.target,
+          previousInstanceId: registration.previousInstanceId,
+        });
+        return { chatId: 1, threadId: 2, slot: "B", threadName: "Beryl" };
+      },
+    }),
+  });
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    instanceId: "new-inst",
+    createRequestId: () => "new-inst:1",
+    registrationRetryAttempts: 1,
+    registrationTimeoutMs: 50,
+    registrationState: createTelegramBusFollowerRegistrationState(),
+  });
   setTelegramFollowerSessionHandoff({
     pid: process.pid,
     instanceId: "old-inst",
@@ -1629,12 +1654,34 @@ test("Bus follower initial registration consumes a pending session handoff", () 
     threadName: "Beryl",
   });
   try {
-    assert.deepEqual(getTelegramFollowerSessionHandoffRegistrationOptions(), {
-      target: { chatId: 1, threadId: 2 },
-      previousInstanceId: "old-inst",
-    });
+    await assert.rejects(() =>
+      follower.registerWithLeader(
+        { cwd: "/repo" },
+        { busSocketPath: socketPath },
+      ),
+    );
+    assert.equal(getTelegramFollowerSessionHandoff()?.instanceId, "old-inst");
+
+    await server.start();
+    assert.equal(
+      await follower.registerWithLeader(
+        { cwd: "/repo" },
+        { busSocketPath: socketPath },
+      ),
+      true,
+    );
+    assert.deepEqual(registrations, [
+      {
+        target: { chatId: 1, threadId: 2 },
+        previousInstanceId: "old-inst",
+      },
+    ]);
+    assert.equal(getTelegramFollowerSessionHandoff(), undefined);
   } finally {
+    follower.stop();
     setTelegramFollowerSessionHandoff(undefined);
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

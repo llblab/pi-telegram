@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.26.7: macOS Follower Reload Identity
+
+- `macOS Identity`: Derived manual-follower process-birth identity from the parent process start time on Darwin while preserving Linux `/proc` start ticks and the generation fallback. Impact: extension reloads in one macOS Pi process retain a stable durable profile instead of looking like new followers.
+- `Follower Handoff`: Carried the previous runtime identity and exact target through initial registration, then migrated the existing binding to the current profile identity after the required visibility probe. The handoff remains available after failed registration and clears only after acknowledgement. Impact: initial registration can no longer race session refresh into provisioning a duplicate Telegram thread.
+- `Regression Depth`: Replaced the helper-only handoff check with a runtime-level registration regression covering failed-attempt retention, serialized envelope evidence, successful acknowledgement, and handoff consumption. Impact: the test now exercises the race-fixing boundary rather than its projection helper.
+
 ## 0.26.6: Windows Poll-Wait Boundary Fix
 
 - `Windows CI`: Reapplied the wait predicate to the final marker-file read before reporting a timeout. Impact: process-lock regressions no longer fail when Windows exposes the expected marker exactly at the polling deadline, while genuinely missing evidence still produces the same diagnostic failure.

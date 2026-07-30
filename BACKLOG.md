@@ -2,7 +2,21 @@
 
 _This backlog tracks only open release-relevant work: hotfixes, bounded maintenance, live runtime verification, evidence-gated Telegram client follow-ups, and upstream Pi API blockers. Completed outcomes and validation evidence belong in `CHANGELOG.md`, not in this queue._
 
-## P0 — Windows Poll-Wait Boundary Hotfix
+## P0 — macOS Follower Reload Identity Hotfix
+
+Context: macOS lacks Linux `/proc` start ticks, so a follower previously received a generation-based profile identity on each extension reload. Initial registration could also race ahead of session refresh before the old target was restored, causing a duplicate Telegram thread.
+
+Open work:
+
+- [x] Derive stable Darwin process-birth identity from `/bin/ps` while preserving Linux start ticks and generation fallback.
+- [x] Carry a fresh previous runtime identity and exact target through initial follower registration, migrate the old binding after a visibility probe, and consume the handoff only after acknowledgement.
+- [x] Replace the helper-only regression with a runtime-level registration test covering failed-attempt retention, envelope evidence, acknowledgement, and handoff consumption.
+- [x] Update durable context, multi-instance documentation, changelog, and package metadata.
+- [ ] Validate on Linux, macOS, and Windows; publish and verify `0.26.7`.
+
+Done when: same-process follower reload preserves one thread and binding, the race is covered at the runtime boundary, all hosted platforms pass, and the hotfix is published.
+
+## P1 — Windows Poll-Wait Boundary Release
 
 Context: a Windows process-lock regression reached its expected `parent:getUpdates` marker at the polling deadline, but the shared wait helper failed immediately after its final read without applying the predicate to that last value. This produces a false timeout despite successful behavior.
 
