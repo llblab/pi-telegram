@@ -20,10 +20,68 @@ import {
   buildTelegramSettingsMenuReplyMarkup,
   buildTelegramSettingsMenuText,
   buildTimeInjectionModeSettingsReplyMarkup,
+  buildTimeInjectionModeSettingsText,
   buildVoiceReplyModeSettingsReplyMarkup,
+  buildVoiceReplyModeSettingsText,
   createTelegramSettingsMenuRuntime,
   handleTelegramSettingsMenuCallbackAction,
 } from "../lib/menu-settings.ts";
+
+function getSettingsDescriptionOrder(text: string): string[] {
+  return Array.from(
+    text.matchAll(/<code>-<\/code> <code>([^<]+)<\/code>/gu),
+    (match) => match[1]!,
+  );
+}
+
+function getSettingsControlOrder(markup: {
+  inline_keyboard: Array<Array<{ callback_data: string }>>;
+}): string[] {
+  return markup.inline_keyboard
+    .slice(1)
+    .flat()
+    .map((button) => button.callback_data.split(":").at(-1)!);
+}
+
+test("Settings descriptions follow visible control order", () => {
+  const surfaces = [
+    [
+      buildAutomaticThreadCleanupSettingsText(true),
+      buildAutomaticThreadCleanupSettingsReplyMarkup(true),
+    ],
+    [
+      buildProactivePushSettingsText(true),
+      buildProactivePushSettingsReplyMarkup(true),
+    ],
+    [
+      buildDraftPreviewsSettingsText(false),
+      buildDraftPreviewsSettingsReplyMarkup(false),
+    ],
+    [
+      buildAssistantRenderingSettingsText("rich"),
+      buildAssistantRenderingSettingsReplyMarkup("rich"),
+    ],
+    [
+      buildActivityVerbositySettingsText("verbose"),
+      buildActivityVerbositySettingsReplyMarkup("verbose"),
+    ],
+    [
+      buildVoiceReplyModeSettingsText("hidden"),
+      buildVoiceReplyModeSettingsReplyMarkup("hidden"),
+    ],
+    [
+      buildTimeInjectionModeSettingsText("interval"),
+      buildTimeInjectionModeSettingsReplyMarkup("interval"),
+    ],
+  ] as const;
+
+  for (const [text, markup] of surfaces) {
+    assert.deepEqual(
+      getSettingsDescriptionOrder(text),
+      getSettingsControlOrder(markup),
+    );
+  }
+});
 
 test("Settings menu text and reply markup expose built-in controls", () => {
   assert.equal(buildTelegramSettingsMenuText(), "<b>⚙️ Settings:</b>");
@@ -82,10 +140,6 @@ test("Settings detail markups show active values", () => {
   assert.match(proactiveText, /<code>off<\/code>:/);
   assert.match(proactiveText, /<code>on<\/code> \(default\):/);
   assert.match(proactiveText, /visible checkpoints and the final answer/);
-  assert.ok(
-    proactiveText.indexOf("<code>on</code> (default):") <
-      proactiveText.indexOf("<code>off</code>:"),
-  );
   assert.match(buildDraftPreviewsSettingsText(false), /<code>off<\/code>/);
   assert.equal(
     buildDraftPreviewsSettingsReplyMarkup(true).inline_keyboard[1]?.[0]?.text,

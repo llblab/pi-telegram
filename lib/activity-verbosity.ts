@@ -166,8 +166,13 @@ function renderThinkingActivityEvidenceHtml(text: string): string {
   });
 }
 
-function capitalizeActivityLabel(label: string): string {
-  return label.length > 0 ? `${label[0]!.toUpperCase()}${label.slice(1)}` : label;
+function formatToolActivityLabel(label: string): string {
+  if (label.length === 0) return label;
+  const repeatedPrefix = label.match(/^([a-z])\1*/iu)?.[0] ?? "";
+  if (repeatedPrefix.length === 2 || repeatedPrefix.length === 3) {
+    return `${repeatedPrefix.toUpperCase()}${label.slice(repeatedPrefix.length)}`;
+  }
+  return `${label[0]!.toUpperCase()}${label.slice(1)}`;
 }
 
 function renderToolActivityHtml(tool: ToolActivity): string {
@@ -189,7 +194,7 @@ function renderToolActivityHtml(tool: ToolActivity): string {
       : "done"
     : "running";
   return [
-    `<b>${escapeHtml(capitalizeActivityLabel(tool.name))}:</b> <code>${status}</code>`,
+    `<b>${escapeHtml(formatToolActivityLabel(tool.name))}:</b> <code>${status}</code>`,
     `<blockquote expandable>${escapeActivityEvidenceHtml(evidence.join("\n\n"))}</blockquote>`,
   ].join("\n");
 }
@@ -207,7 +212,7 @@ function createToolActivityDetail(
 ): TelegramInputRichBlock {
   return {
     type: "details",
-    summary: { type: "bold", text: summary },
+    summary,
     blocks: [{ type: "pre", text, language: "json" }],
     ...(isOpen ? { is_open: true as const } : {}),
   };
@@ -222,7 +227,7 @@ function renderToolActivityRichBlocks(
       : "done"
     : "running";
   const evidenceBlocks: TelegramInputRichBlock[] = [
-    createToolActivityDetail("Arguments", tool.args, true),
+    createToolActivityDetail("arguments", tool.args, true),
   ];
   tool.updates.forEach((update, index) => {
     const number = tool.droppedUpdates + index + 1;
@@ -231,12 +236,12 @@ function renderToolActivityRichBlocks(
         ? ` (${tool.droppedUpdates} earlier omitted)`
         : "";
     evidenceBlocks.push(
-      createToolActivityDetail(`Update ${number}${omitted}`, update),
+      createToolActivityDetail(`update ${number}${omitted}`, update),
     );
   });
   if (tool.complete && tool.result !== undefined) {
     evidenceBlocks.push(
-      createToolActivityDetail(tool.isError ? "Error" : "Result", tool.result),
+      createToolActivityDetail(tool.isError ? "error" : "result", tool.result),
     );
   }
   return [
@@ -245,7 +250,7 @@ function renderToolActivityRichBlocks(
       summary: [
         {
           type: "bold",
-          text: `${capitalizeActivityLabel(tool.name)}:`,
+          text: `${formatToolActivityLabel(tool.name)}:`,
         },
         " ",
         { type: "code", text: status },

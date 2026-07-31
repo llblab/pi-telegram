@@ -134,7 +134,7 @@ test("tool Rich activity separates arguments, updates, and result details", () =
       blocks: [
         {
           type: "details",
-          summary: { type: "bold", text: "Arguments" },
+          summary: "arguments",
           blocks: [
             {
               type: "pre",
@@ -146,14 +146,14 @@ test("tool Rich activity separates arguments, updates, and result details", () =
         },
         {
           type: "details",
-          summary: { type: "bold", text: "Update 3 (2 earlier omitted)" },
+          summary: "update 3 (2 earlier omitted)",
           blocks: [
             { type: "pre", text: '{\n  "line": 1\n}', language: "json" },
           ],
         },
         {
           type: "details",
-          summary: { type: "bold", text: "Result" },
+          summary: "result",
           blocks: [
             { type: "pre", text: '{\n  "ok": true\n}', language: "json" },
           ],
@@ -161,6 +161,33 @@ test("tool Rich activity separates arguments, updates, and result details", () =
       ],
     },
   ]);
+});
+
+test("tool root labels preserve two- and three-letter repeated prefixes", () => {
+  const rich = renderTelegramToolActivityRichMessage(
+    ["ffgrep", "fffind", "bash"].map((name, index) => ({
+      id: `tool-${index}`,
+      name,
+      args: "{}",
+      updates: [],
+      droppedUpdates: 0,
+      result: '"ok"',
+      isError: false,
+      complete: true,
+    })),
+  );
+  assert.deepEqual(
+    rich.blocks?.map((block) =>
+      block.type === "details" && Array.isArray(block.summary)
+        ? block.summary[0]
+        : undefined,
+    ),
+    [
+      { type: "bold", text: "FFgrep:" },
+      { type: "bold", text: "FFFind:" },
+      { type: "bold", text: "Bash:" },
+    ],
+  );
 });
 
 test("tool evidence renders as ordinary expandable HTML fallback", () => {
@@ -471,11 +498,11 @@ test("tool Rich details keep compact arrays of objects", async () => {
   await harness.runtime.waitForIdle();
 
   const rich = JSON.stringify(harness.richSends[0]?.rich_message);
-  assert.match(rich, /Arguments/);
-  assert.match(rich, /Update 1/);
-  assert.match(rich, /Result/);
+  assert.match(rich, /arguments/);
+  assert.match(rich, /update 1/);
+  assert.match(rich, /result/);
   assert.match(rich, /\\"content\\":\s*\[/);
-  assert.match(rich, /\\"result\\"|Result/);
+  assert.match(rich, /\\"result\\"|result/);
 });
 
 test("assistant boundaries, capacity, and authority replacement fence batches", async () => {

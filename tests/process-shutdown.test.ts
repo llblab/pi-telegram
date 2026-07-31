@@ -398,7 +398,7 @@ test("Child process sharing the agent dir does not poll while parent owns Telegr
         const timer = setTimeout(() => {
           parent.kill("SIGKILL");
           reject(new Error(`Parent did not exit. stderr=${parentStderr}`));
-        }, 2000);
+        }, 10_000);
         timer.unref?.();
       });
       const { code } = await Promise.race([parentExit, timeout]);

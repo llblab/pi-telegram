@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.26.11: Compact Tool Hierarchy And Ordered Settings Copy
+
+- `Tool Evidence Hierarchy`: Restyled nested Rich evidence summaries as plain lowercase labels (`arguments`, `update`, `result`, `error`) without icons, list markers, or heading emphasis. Arguments still open with the root and secondary evidence remains collapsed. Impact: child nodes read as quote-free outer JSON keys without adding message height or changing evidence behavior.
+- `Tool Root Labels`: Preserved a leading run of two or three repeated ASCII letters as uppercase while retaining ordinary sentence casing elsewhere (`ffgrep` → `FFgrep`, `fffind` → `FFFind`, `bash` → `Bash`). Impact: recognizable tool prefixes survive compact root formatting without introducing per-tool aliases.
+- `Settings Copy Order`: Ordered every Settings value description by its visible controls rather than placing the default first; Draft previews now describes `on` before `off (default)`. Added parity coverage across all built-in Settings details. Impact: explanatory copy and chooser controls scan in the same direction while default metadata remains truthful in place.
+- `Windows Release Gates`: Rechecked the generic integration predicate at its deadline, gave only queued model-menu completion a five-second budget, and allowed the full-Pi parent fixture ten seconds for graceful shutdown. Impact: loaded Windows runners can complete the asserted event-loop and process-cleanup paths while genuine hangs, exit failures, and child polling remain bounded failures.
+
 ## 0.26.10: Windows Graceful Disconnect Test Budget
 
 - `Windows CI`: Expanded only the graceful follower-disconnect integration's bus-response budget from 500 milliseconds to five seconds. Impact: loaded Windows runners can complete persisted cleanup intent, close/delete operations, binding mutation, and the authenticated response without changing the production 30-second transport default, retry policy, cleanup ordering, or exact assertions.

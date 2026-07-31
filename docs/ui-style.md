@@ -207,6 +207,7 @@ Rules:
 - Start with a bold heading or, for dialogs, a bold question.
 - Setting detail cards may include an emoji in the heading, then a colon and the current value in `<code>`.
 - Explain what the setting does and what the options mean only as much as needed.
+- Order setting value descriptions exactly like the chooser: rows top-to-bottom and values in a shared row left-to-right. Keep `(default)` on the actual default wherever it falls; default status never changes order.
 - Keep descriptions short and clear.
 
 Examples:

@@ -180,7 +180,7 @@ Pi provider events use `thinking_*`; the public product term is `reasoning`. The
 
 Tool activity uses Pi's executed-tool lifecycle (`tool_execution_start/update/end`), not provider `toolcall_*` payloads. Provider tool-call boundaries are used only to classify preceding assistant prose. This prevents duplicate tool rows and reports actual execution results.
 
-`args`, `update`, and `result` may contain paths, source text, command output, or other sensitive data. They are available to trusted local extension code but must not be rendered wholesale by default. Core `quiet` mode renders none of them. Visible tool modes redact known secret shapes, truncate every evidence field, and place completed tool evidence in native Rich Messages with an open-by-default Arguments child plus closed Update/Result/Error details containing JSON pre blocks.
+`args`, `update`, and `result` may contain paths, source text, command output, or other sensitive data. They are available to trusted local extension code but must not be rendered wholesale by default. Core `quiet` mode renders none of them. Visible tool modes redact known secret shapes, truncate every evidence field, and place completed tool evidence in native Rich Messages with an open-by-default `arguments` child plus closed `update`/`result`/`error` details; child summaries use plain lowercase labels without list markers, like quote-free outer JSON keys, while their evidence remains in JSON pre blocks.
 
 ## Delivery Context
 

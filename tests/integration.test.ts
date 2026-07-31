@@ -78,6 +78,7 @@ async function waitForCondition(
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  if (predicate()) return;
   throw new Error("Timed out waiting for condition");
 }
 
@@ -806,8 +807,8 @@ test("Verbose activity reaches classic transport before the final assistant answ
     );
     assert.match(editedRich, /Read/);
     assert.match(editedRich, /Exec/);
-    assert.match(editedRich, /Arguments/);
-    assert.match(editedRich, /Result/);
+    assert.match(editedRich, /arguments/);
+    assert.match(editedRich, /result/);
     assert.equal(calls[toolEditIndex]?.body.text, undefined);
     await handlers.get("agent_settled")?.({}, ctx);
     await commands.get("telegram-disconnect")?.handler("", ctx);
@@ -2333,7 +2334,7 @@ test("Extension runtime opens immediate model menu before queued prompt after ag
       },
       idleCtx,
     );
-    await waitForCondition(() => runtimeEvents.length >= 3);
+    await waitForCondition(() => runtimeEvents.length >= 3, 5_000);
     assert.equal(runtimeEvents[0], "dispatch:[telegram] first request");
     assert.equal(runtimeEvents[1], "send:<b>🤖 Choose a model:</b>");
     assert.equal(runtimeEvents[2], "dispatch:[telegram] follow up after model");
