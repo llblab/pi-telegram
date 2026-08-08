@@ -504,6 +504,23 @@ test("Direct Telegram tools require local polling lock ownership", async () => {
   });
 });
 
+test("Direct Telegram message is rejected while an active turn owns reply delivery", async () => {
+  await assert.rejects(
+    () =>
+      sendTelegramOutboundMessage({
+        text: "hello",
+        getDefaultChatId: () => 7,
+        canSendDirect: () => false,
+        planMessage: (markdown) => ({ markdown }),
+        sendMarkdownMessage: async () => 9,
+      }),
+    {
+      message:
+        /requires this Pi instance to own \/telegram-connect or be registered/,
+    },
+  );
+});
+
 async function toolsMessageWithoutOwnership(): Promise<unknown> {
   let tool: RegisteredAnyTool | undefined;
   const api = {

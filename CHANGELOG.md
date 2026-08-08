@@ -2,6 +2,7 @@
 
 ## 0.27.0: Telegram Commentary Delivery
 
+- `Direct Delivery Guard`: Direct `telegram_message` delivery is rejected while a Telegram-originated turn is active, leaving the bridge's normal final-reply path as the sole response channel. Impact: a model tool call can no longer send the same answer once directly and once again as the active-turn final reply, while local/TUI direct delivery remains available.
 - `Telegram Commentary`: Completed intermediate assistant text segments from Telegram-originated turns now arrive once as independent messages on the immutable originating target before the existing final reply. The path remains active independently of local/autonomous Proactive Push, preserves normalized segment order, rendering, authority fencing, and no-replay behavior, and leaves final/terminal settlement with the established active-turn delivery pipeline. Impact: visible checkpoints and other standalone commentary no longer disappear between thinking/tool activity and the final answer in classic or Threaded Mode.
 - `Delivery Ordering`: Active-turn final delivery now waits for both admitted technical activity and assistant commentary inside its existing extension-owned background task. Impact: commentary cannot be overtaken by the final result, while Pi lifecycle completion remains non-blocking and stale session/transport generations still fail closed.
 

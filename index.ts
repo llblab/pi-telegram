@@ -1095,6 +1095,9 @@ export default function (pi: Pi.ExtensionAPI) {
     getDefaultChatId: proactivePushChatIdGetter,
     getDefaultTarget: proactivePushTargetGetter,
     canSendDirect() {
+      // Active Telegram turns already have a normal reply path. Prevent direct
+      // tools from sending a second message before the bridge delivers it.
+      if (activeTurnRuntime.has()) return false;
       return (
         ownsTelegramDirectDelivery() ||
         telegramBusFollowerRegistrationState.isRegistered()
