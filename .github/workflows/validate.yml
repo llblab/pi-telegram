@@ -45,8 +45,8 @@ jobs:
         timeout-minutes: 2
         run: >-
           node --experimental-strip-types --test --test-reporter=spec
-          --test-name-pattern="Windows cmd wrappers"
-          tests/command-templates.test.ts
+          --test-name-pattern="Windows cmd"
+          tests/command-templates.test.ts tests/outbound-voice.test.ts
       - name: Run tests
         run: npm test
       - name: Check package contents
