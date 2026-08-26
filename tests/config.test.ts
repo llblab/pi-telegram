@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import {
   mkdir,
   mkdtemp,
@@ -16,6 +17,8 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import test from "node:test";
 
 import type { TelegramConfig } from "../lib/config.ts";
@@ -41,6 +44,8 @@ import {
   writeTelegramConfig,
 } from "../lib/config.ts";
 import { createTelegramSettingsMenuRuntime } from "../lib/menu-settings.ts";
+
+const execFileAsync = promisify(execFile);
 
 function legacyConfig(value: Record<string, unknown>): TelegramConfig {
   return value as TelegramConfig;
@@ -132,6 +137,55 @@ test("activity defaults absent config to verbose, fails invalid values closed, a
   const persisted = JSON.parse(await readFile(configPath, "utf8"));
   assert.equal(persisted.assistant.activity, "verbose");
   assert.equal(persisted.assistant.activityVerbosity, undefined);
+});
+
+test("Concurrent config processes preserve independent settings mutations", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-config-processes-"));
+  const configPath = join(agentDir, "telegram.json");
+  await writeFile(
+    configPath,
+    `${JSON.stringify({ assistant: { activity: "verbose", timeInjection: "interval" } })}\n`,
+    "utf8",
+  );
+  const moduleUrl = pathToFileURL(
+    join(process.cwd(), "lib", "config.ts"),
+  ).href;
+  const script = `
+    import { createTelegramConfigControls, createTelegramConfigStore } from ${JSON.stringify(moduleUrl)};
+    const store = createTelegramConfigStore({
+      agentDir: process.env.TEST_AGENT_DIR,
+      configPath: process.env.TEST_CONFIG_PATH,
+    });
+    await store.load();
+    const controls = createTelegramConfigControls(store);
+    if (process.env.TEST_MUTATION === "activity") {
+      await controls.setActivityVerbosity("quiet");
+    } else {
+      await controls.setTimeInjectionMode("always");
+    }
+  `;
+  const runMutation = (mutation: "activity" | "time") =>
+    execFileAsync(
+      process.execPath,
+      ["--experimental-strip-types", "--input-type=module", "--eval", script],
+      {
+        env: {
+          ...process.env,
+          TEST_AGENT_DIR: agentDir,
+          TEST_CONFIG_PATH: configPath,
+          TEST_MUTATION: mutation,
+        },
+        timeout: 10_000,
+      },
+    );
+  try {
+    await Promise.all([runMutation("activity"), runMutation("time")]);
+    const persisted = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(persisted.assistant.activity, "quiet");
+    assert.equal(persisted.assistant.timeInjection, "always");
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
 });
 
 test("Telegram config reads valid atomic snapshots without acquiring the transaction guard", async () => {
