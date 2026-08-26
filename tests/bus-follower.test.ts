@@ -2264,10 +2264,12 @@ test("Bus follower queue handoff client requires an exact staged acknowledgement
   }
 });
 
-test("Bus follower API caller sends method calls and returns leader results", async () => {
+test("Bus follower API caller sends method and multipart voice calls over local transport", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-api-caller-"));
   const socketPath = join(dir, "bus.sock");
+  const voicePath = join(dir, "voice output.ogg");
   const received: unknown[] = [];
+  let requestSequence = 0;
   const server = createTelegramBusLocalServer({
     socketPath,
     handleEnvelope: (envelope) => {
@@ -2283,7 +2285,7 @@ test("Bus follower API caller sends method calls and returns leader results", as
   const callApi = createTelegramBusFollowerApiCaller({
     socketPath,
     instanceId: "inst-a",
-    createRequestId: () => "inst-a:1",
+    createRequestId: () => `inst-a:${++requestSequence}`,
     getRegistrationGeneration: () => "generation-a",
     getNowMs: () => 7000,
   });
@@ -2292,6 +2294,16 @@ test("Bus follower API caller sends method calls and returns leader results", as
     assert.deepEqual(await callApi("sendRichMessage", [{ chat_id: 1 }]), {
       message_id: 55,
     });
+    assert.deepEqual(
+      await callApi("callMultipart", [
+        "sendVoice",
+        { chat_id: "7", message_thread_id: "42" },
+        "voice",
+        voicePath,
+        "voice output.ogg",
+      ]),
+      { message_id: 55 },
+    );
     assert.deepEqual(received, [
       {
         kind: "follower.callApi",
@@ -2300,6 +2312,21 @@ test("Bus follower API caller sends method calls and returns leader results", as
         registrationGeneration: "generation-a",
         method: "sendRichMessage",
         args: [{ chat_id: 1 }],
+        sentAtMs: 7000,
+      },
+      {
+        kind: "follower.callApi",
+        requestId: "inst-a:2",
+        instanceId: "inst-a",
+        registrationGeneration: "generation-a",
+        method: "callMultipart",
+        args: [
+          "sendVoice",
+          { chat_id: "7", message_thread_id: "42" },
+          "voice",
+          voicePath,
+          "voice output.ogg",
+        ],
         sentAtMs: 7000,
       },
     ]);
