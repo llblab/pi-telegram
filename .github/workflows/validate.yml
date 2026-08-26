@@ -45,9 +45,9 @@ jobs:
         timeout-minutes: 2
         run: >-
           node --experimental-strip-types --test --test-reporter=spec
-          --test-name-pattern="Windows cmd|multipart voice calls"
+          --test-name-pattern="Windows cmd|multipart voice calls|scoped follower API calls"
           tests/command-templates.test.ts tests/outbound-voice.test.ts
-          tests/bus-follower.test.ts
+          tests/bus-follower.test.ts tests/bus-leader.test.ts
       - name: Run tests
         run: npm test
       - name: Check package contents

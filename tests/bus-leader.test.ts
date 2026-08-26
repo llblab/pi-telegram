@@ -2314,10 +2314,12 @@ test("Bus leader authorizes scoped follower API calls", async () => {
       const body = args[1] as Record<string, unknown> | undefined;
       return (
         follower.target?.chatId === 100 &&
-        method === "call" &&
-        args[0] === "sendMessage" &&
         body?.chat_id === 100 &&
-        body?.message_thread_id === 42
+        body?.message_thread_id === 42 &&
+        (
+          (method === "call" && args[0] === "sendMessage") ||
+          (method === "callMultipart" && args[0] === "sendVoice")
+        )
       );
     },
     callApi(method, args) {
@@ -2346,6 +2348,29 @@ test("Bus leader authorizes scoped follower API calls", async () => {
   assert.deepEqual(
     await handleEnvelope({
       kind: "follower.callApi",
+      requestId: "inst-a:voice",
+      instanceId: "inst-a",
+      registrationGeneration: "generation-a",
+      method: "callMultipart",
+      args: [
+        "sendVoice",
+        { chat_id: 100, message_thread_id: 42 },
+        "voice",
+        "C:\\Temp\\voice output.ogg",
+        "voice output.ogg",
+      ],
+      sentAtMs: 2500,
+    }),
+    {
+      kind: "bus.ack",
+      requestId: "inst-a:voice",
+      ok: true,
+      result: { ok: true },
+    },
+  );
+  assert.deepEqual(
+    await handleEnvelope({
+      kind: "follower.callApi",
       requestId: "inst-a:denied",
       instanceId: "inst-a",
       registrationGeneration: "generation-a",
@@ -2364,6 +2389,16 @@ test("Bus leader authorizes scoped follower API calls", async () => {
     {
       method: "call",
       args: ["sendMessage", { chat_id: 100, message_thread_id: 42 }],
+    },
+    {
+      method: "callMultipart",
+      args: [
+        "sendVoice",
+        { chat_id: 100, message_thread_id: 42 },
+        "voice",
+        "C:\\Temp\\voice output.ogg",
+        "voice output.ogg",
+      ],
     },
   ]);
 });
