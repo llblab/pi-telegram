@@ -43,6 +43,7 @@ test(
       output: "ogg",
     }];
     const uploads: Array<{ filePath: string; content: string }> = [];
+    const diagnostics: string[] = [];
     const sendVoice = createTelegramVoiceReplySender(
       {
         execCommand: execCommandTemplate,
@@ -53,6 +54,11 @@ test(
             filePath,
             content: await readFile(filePath, "utf8"),
           });
+        },
+        recordRuntimeEvent: (_category, error, details) => {
+          diagnostics.push(
+            `${String(details?.phase)}:${error instanceof Error ? error.message : String(error)}`,
+          );
         },
       },
       {
@@ -66,7 +72,14 @@ test(
       },
     );
     try {
-      await sendVoice({ chatId: 1, replyToMessageId: 2 }, "hello from Windows");
+      await sendVoice(
+        { chatId: 1, replyToMessageId: 2 },
+        "hello from Windows",
+      ).catch((error) => {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}; diagnostics=${JSON.stringify(diagnostics)}`,
+        );
+      });
       assert.equal(uploads.length, 1);
       assert.match(uploads[0]?.filePath ?? "", /-voice\.ogg$/u);
       assert.equal(uploads[0]?.content, "OggS\r\n");
