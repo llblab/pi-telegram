@@ -1618,6 +1618,19 @@ export function createTelegramBusLocalServer(
           await delayTelegramBusTransportRetry(25);
         }
       }
+      if (usesWindowsPipe) {
+        await deps.beforeEndpointPublication?.();
+        const committed = deps.commitEndpointPublication
+          ? deps.commitEndpointPublication(() => {})
+          : true;
+        if (!committed) {
+          activeSocketPath = undefined;
+          activeListenPath = undefined;
+          throw new Error(
+            "Telegram bus endpoint publication lost transport ownership.",
+          );
+        }
+      }
       server = createServer((socket) => {
         sockets.add(socket);
         let buffer = "";
