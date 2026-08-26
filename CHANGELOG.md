@@ -2,6 +2,13 @@
 
 > Each release keeps at most 8 outcome records of at most 512 characters.
 
+## 0.39.3: Windows IPC And Outbound Voice Hotfix
+
+- `Windows IPC Replacement`: Replaces an older same-process Named Pipe server before a new session generation listens on the stable endpoint, preventing `EADDRINUSE` during reload while keeping a late stop from invalidating its successor.
+- `Windows IPC Fencing`: Applies the ownership commit fence before publishing a Named Pipe, so a stale generation that loses authority cannot expose an endpoint or block its replacement.
+- `Windows Voice Commands`: Executes trusted `.cmd` and `.bat` outbound-handler wrappers through escaped `%ComSpec%` adaptation while preserving direct shell-free execution for native executables, bounded process controls, npm command-shim argument isolation, and paths containing spaces.
+- `Windows Template Paths`: Preserves backslashes in quoted and unquoted Windows executable and artifact paths without breaking intentional escaped whitespace or quotes, allowing configured TTS handlers to produce and upload OGG/Opus voice replies through direct and follower transport.
+
 ## 0.39.2: Deleted Thread Receipt Hotfix
 
 - `Deleted Thread Receipt`: Terminally settles the currently executing durable update when Telegram returns exact HTTP 400 stale/deleted-thread evidence for its `{chatId, threadId}`, including leader-first shared-store invalidation followed by follower settlement. Transient, ambiguous, unrelated, and stale-looking HTTP 5xx failures retain indefinite retry authority; persisted follower records remain restart hints rather than speculative live registrations.
