@@ -950,6 +950,18 @@ export interface TelegramBusLocalServer {
   ensureEndpoint: () => Promise<boolean>;
 }
 
+const TELEGRAM_ACTIVE_LOCAL_SERVERS = Symbol.for(
+  "@llblab/pi-telegram/active-local-servers",
+);
+type TelegramBusServerGlobal = typeof globalThis & {
+  [TELEGRAM_ACTIVE_LOCAL_SERVERS]?: Map<string, TelegramBusLocalServer>;
+};
+
+function getActiveTelegramBusLocalServers(): Map<string, TelegramBusLocalServer> {
+  const root = globalThis as TelegramBusServerGlobal;
+  return (root[TELEGRAM_ACTIVE_LOCAL_SERVERS] ??= new Map());
+}
+
 export type TelegramBusSocketPathSource = string | (() => string);
 
 const TELEGRAM_BUS_MAX_DIRECT_UNIX_ENDPOINT_BYTES = 80;
@@ -1563,6 +1575,11 @@ export function createTelegramBusLocalServer(
     start: async () => {
       if (server) return;
       const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
+      const activeServers = getActiveTelegramBusLocalServers();
+      const replacedServer = activeServers.get(socketPath);
+      if (replacedServer && replacedServer !== runtime) {
+        await replacedServer.stop();
+      }
       const usesWindowsPipe = isTelegramBusPipePath(socketPath);
       const endpointGeneration = randomBytes(8).toString("hex");
       const listenPath = usesWindowsPipe
@@ -1634,6 +1651,7 @@ export function createTelegramBusLocalServer(
           server?.once("error", reject);
           server?.listen(listenPath, resolve);
         });
+        activeServers.set(socketPath, runtime);
         deps.recordTransportEvent?.(
           "server-started",
           getTelegramBusEndpointDiagnostics(socketPath),
@@ -1674,6 +1692,9 @@ export function createTelegramBusLocalServer(
           server = undefined;
           activeSocketPath = undefined;
           activeListenPath = undefined;
+          if (activeServers.get(socketPath) === runtime) {
+            activeServers.delete(socketPath);
+          }
           if (failedServer) {
             await new Promise<void>((resolve) =>
               failedServer.close(() => resolve()),
@@ -1689,6 +1710,12 @@ export function createTelegramBusLocalServer(
       const activeServer = server;
       const socketPath = activeSocketPath;
       const listenPath = activeListenPath;
+      if (
+        socketPath &&
+        getActiveTelegramBusLocalServers().get(socketPath) === runtime
+      ) {
+        getActiveTelegramBusLocalServers().delete(socketPath);
+      }
       server = undefined;
       activeSocketPath = undefined;
       activeListenPath = undefined;
