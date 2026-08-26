@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -284,12 +284,20 @@ test(
   { skip: process.platform !== "win32" },
   async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-telegram-command-cmd-"));
-    const scriptPath = join(dir, "voice-writer.cmd");
+    const binDir = join(dir, "node_modules", ".bin");
+    await mkdir(binDir, { recursive: true });
+    const scriptPath = join(binDir, "voice-writer.cmd");
+    const writerPath = join(dir, "voice-writer.mjs");
     const outputPath = join(dir, "voice output.ogg");
     const injectedPath = join(dir, "injected.txt");
     await writeFile(
+      writerPath,
+      'import { writeFileSync } from "node:fs"; writeFileSync(process.argv[2], `${process.argv[3]}\\r\\n`);\n',
+      "utf8",
+    );
+    await writeFile(
       scriptPath,
-      "@echo off\r\n>\"%~1\" echo %~2\r\n",
+      `@echo off\r\n@\"${process.execPath}\" \"${writerPath}\" %*\r\n`,
       "utf8",
     );
     try {
