@@ -1348,11 +1348,11 @@ test("Bus local server roundtrips through a bounded long-path fallback", { skip:
   }
 });
 
-test("Bus local server resolves the active profile endpoint on each start", { skip: process.platform === "win32" }, async () => {
+test("Bus local server resolves the active profile endpoint on each start", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-profile-switch-"));
   let profileName = "work";
   const getSocketPath = () =>
-    getTelegramBusSocketPath(dir, "linux", profileName);
+    getTelegramBusSocketPath(dir, process.platform, profileName);
   const server = createTelegramBusLocalServer({
     socketPath: getSocketPath,
     handleEnvelope: () => ({ kind: "bus.ack", requestId: "profile", ok: true }),
@@ -1361,9 +1361,15 @@ test("Bus local server resolves the active profile endpoint on each start", { sk
   const resolvedWorkSocketPath = resolveTelegramBusSocketPath(workSocketPath);
   try {
     await server.start();
-    assert.equal(existsSync(resolvedWorkSocketPath), true);
+    assert.equal(
+      (await probeTelegramBusEndpoint({ endpoint: resolvedWorkSocketPath })).reachable,
+      true,
+    );
     await server.stop();
-    assert.equal(existsSync(resolvedWorkSocketPath), false);
+    assert.equal(
+      (await probeTelegramBusEndpoint({ endpoint: resolvedWorkSocketPath })).reachable,
+      false,
+    );
 
     profileName = "personal";
     const personalSocketPath = getSocketPath();
@@ -1371,15 +1377,21 @@ test("Bus local server resolves the active profile endpoint on each start", { sk
       resolveTelegramBusSocketPath(personalSocketPath);
     await server.start();
     assert.notEqual(personalSocketPath, workSocketPath);
-    assert.equal(existsSync(resolvedPersonalSocketPath), true);
-    assert.equal(existsSync(resolvedWorkSocketPath), false);
+    assert.equal(
+      (await probeTelegramBusEndpoint({ endpoint: resolvedPersonalSocketPath })).reachable,
+      true,
+    );
+    assert.equal(
+      (await probeTelegramBusEndpoint({ endpoint: resolvedWorkSocketPath })).reachable,
+      false,
+    );
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("Old bus server stop cannot invalidate a replacement endpoint generation", { skip: process.platform === "win32" }, async () => {
+test("Old bus server stop cannot invalidate a replacement endpoint generation", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-generation-"));
   const socketPath = join(dir, "bus.sock");
   const first = createTelegramBusLocalServer({
@@ -1436,7 +1448,7 @@ test("Old bus server stop cannot invalidate a replacement endpoint generation", 
   }
 });
 
-test("Stale bus server cannot publish over a replacement endpoint generation", { skip: process.platform === "win32" }, async () => {
+test("Stale bus server cannot publish over a replacement endpoint generation", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-publish-fence-"));
   const socketPath = join(dir, "bus.sock");
   let releasePublication: (() => void) | undefined;
