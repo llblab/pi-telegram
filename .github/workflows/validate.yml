@@ -38,7 +38,7 @@ jobs:
         timeout-minutes: 2
         run: >-
           node --experimental-strip-types --test --test-reporter=spec
-          --test-name-pattern="active profile endpoint|replacement endpoint generation|replacement endpoint generation"
+          --test-name-pattern="Old bus server stop cannot invalidate a replacement endpoint generation"
           tests/bus.test.ts
       - name: Run tests
         run: npm test
