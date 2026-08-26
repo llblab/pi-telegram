@@ -4,8 +4,16 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
+import { createTelegramActivityVerbosityRuntime } from "../lib/activity-verbosity.ts";
+import {
+  createTelegramConfigControls,
+  createTelegramConfigStore,
+} from "../lib/config.ts";
 import { createTelegramQueueMenuRuntime } from "../lib/menu-queue.ts";
 import {
   buildProactivePushSettingsReplyMarkup,
@@ -2461,6 +2469,103 @@ test("Settings menu rehydrates expired state before persisting and rendering voi
     "edit:1:99:true",
     "answer:Voice reply mode: mirror",
   ]);
+});
+
+test("Settings activity callback persists through the real config store while agent work remains active", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-live-activity-setting-"));
+  const configPath = join(agentDir, "telegram.json");
+  const store = createTelegramConfigStore({
+    agentDir,
+    configPath,
+    initialConfig: { assistant: { activity: "verbose" } },
+  });
+  const controls = createTelegramConfigControls(store);
+  await store.persist();
+  const activity = createTelegramActivityVerbosityRuntime({
+    getActivityMode: controls.getActivityVerbosity,
+    refreshActivityMode: controls.refreshActivityVerbosity,
+    resolveTarget: (event) => event.target,
+    captureAuthority: () => 1,
+    isAuthorityActive: (authority) => authority === 1,
+    sendMessage: async () => ({ message_id: 1 }),
+    sendRichMessage: async () => ({ message_id: 2 }),
+    editMessageText: async () => "edited",
+  });
+  activity.accept({
+    type: "agent-start",
+    activityId: "active-agent-work",
+    sequence: 1,
+    source: "telegram",
+    target: { chatId: 1 },
+    timestamp: Date.now(),
+  });
+  await activity.waitForIdle();
+  const events: string[] = [];
+  const state = {
+    chatId: 1,
+    messageId: 99,
+    mode: "settings" as const,
+    page: 0,
+    scope: "all" as const,
+    scopedModels: [],
+    allModels: [],
+  };
+  const runtime = createTelegramSettingsMenuRuntime({
+    reloadConfig: store.load,
+    getModelMenuState: async () => state,
+    getStoredModelMenuState: () => state,
+    storeModelMenuState: () => {},
+    editInteractiveMessage: async (_chatId, _messageId, text) => {
+      events.push(`edit:${text.includes("<code>quiet</code>")}`);
+    },
+    sendInteractiveMessage: async () => 99,
+    answerCallbackQuery: async (_id, text) => {
+      events.push(`answer:${text ?? ""}`);
+    },
+    isProactivePushEnabled: controls.isProactivePushEnabled,
+    areDraftPreviewsEnabled: controls.areDraftPreviewsEnabled,
+    getAssistantRenderingMode: controls.getAssistantRenderingMode,
+    getActivityVerbosity: controls.getActivityVerbosity,
+    getTimeInjectionMode: controls.getTimeInjectionMode,
+    getVoiceReplyMode: controls.getVoiceReplyMode,
+    isVoiceReplyModeConfigured: controls.isVoiceReplyModeConfigured,
+    isAutomaticThreadCleanupEnabled: controls.isAutomaticThreadCleanupEnabled,
+    setProactivePushEnabled: controls.setProactivePushEnabled,
+    setDraftPreviewsEnabled: controls.setDraftPreviewsEnabled,
+    setAssistantRenderingMode: controls.setAssistantRenderingMode,
+    setActivityVerbosity: controls.setActivityVerbosity,
+    setVoiceReplyMode: controls.setVoiceReplyMode,
+    setTimeInjectionMode: controls.setTimeInjectionMode,
+    setAutomaticThreadCleanupEnabled: controls.setAutomaticThreadCleanupEnabled,
+  });
+  try {
+    const callback = runtime.handleCallbackQuery(
+      {
+        id: "activity-callback",
+        data: "settings:set:activity-verbosity:quiet",
+        message: { message_id: 99, chat: { id: 1 } },
+      },
+      {},
+    );
+    await Promise.race([
+      callback,
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(
+          () => reject(new Error("Activity setting waited for active agent work")),
+          2_000,
+        )
+      ),
+    ]);
+    assert.equal(controls.getActivityVerbosity(), "quiet");
+    assert.deepEqual(events, ["edit:true", "answer:Activity: quiet"]);
+    assert.equal(
+      JSON.parse(await readFile(configPath, "utf8")).assistant.activity,
+      "quiet",
+    );
+  } finally {
+    activity.stop();
+    await rm(agentDir, { recursive: true, force: true });
+  }
 });
 
 test("Settings submenu headings include current values", () => {
