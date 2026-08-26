@@ -33,6 +33,13 @@ jobs:
         run: npm ci
       - name: Run typecheck
         run: npm run typecheck
+      - name: Run Windows bus lifecycle probes
+        if: matrix.os == 'windows-latest'
+        timeout-minutes: 2
+        run: >-
+          node --experimental-strip-types --test --test-reporter=spec
+          --test-name-pattern="active profile endpoint|replacement endpoint generation|replacement endpoint generation"
+          tests/bus.test.ts
       - name: Run tests
         run: npm test
       - name: Check package contents
