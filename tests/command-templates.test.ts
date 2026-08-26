@@ -286,17 +286,20 @@ test(
     const dir = await mkdtemp(join(tmpdir(), "pi-telegram-command-cmd-"));
     const scriptPath = join(dir, "voice-writer.cmd");
     const outputPath = join(dir, "voice output.ogg");
+    const injectedPath = join(dir, "injected.txt");
     await writeFile(
       scriptPath,
-      "@echo off\r\n>\"%~1\" echo OggS\r\n",
+      "@echo off\r\n>\"%~1\" echo %~2\r\n",
       "utf8",
     );
     try {
-      const result = await execCommandTemplate(scriptPath, [outputPath], {
+      const text = `voice & echo injected>\"${injectedPath}\"`;
+      const result = await execCommandTemplate(scriptPath, [outputPath, text], {
         timeout: 5_000,
       });
       assert.equal(result.code, 0, result.stderr);
-      assert.equal(await readFile(outputPath, "utf8"), "OggS\r\n");
+      assert.equal(await readFile(outputPath, "utf8"), `${text}\r\n`);
+      await assert.rejects(readFile(injectedPath, "utf8"), { code: "ENOENT" });
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
