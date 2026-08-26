@@ -26,6 +26,17 @@ test("Command templates split shell-like words without invoking a shell", () => 
   );
 });
 
+test("Command templates preserve quoted and unquoted Windows path separators", () => {
+  assert.deepEqual(
+    splitCommandTemplate('"C:\\Program Files\\Voice\\tts.cmd" "C:\\Temp\\voice output.ogg"'),
+    ["C:\\Program Files\\Voice\\tts.cmd", "C:\\Temp\\voice output.ogg"],
+  );
+  assert.deepEqual(splitCommandTemplate("C:\\Tools\\tts.exe --voice"), [
+    "C:\\Tools\\tts.exe",
+    "--voice",
+  ]);
+});
+
 test("Command templates accept shorthand string configs", () => {
   const invocation = buildCommandTemplateInvocation(
     "./tts --text {text} --lang {lang=ru}",

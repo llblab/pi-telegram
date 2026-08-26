@@ -541,7 +541,8 @@ export function splitCommandTemplate(input: string): string[] {
   let quote: "'" | '"' | undefined;
   let escaped = false;
   let active = false;
-  for (const char of input) {
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index] ?? "";
     if (escaped) {
       current += char;
       escaped = false;
@@ -549,7 +550,16 @@ export function splitCommandTemplate(input: string): string[] {
       continue;
     }
     if (char === "\\" && quote !== "'") {
-      escaped = true;
+      const next = input[index + 1];
+      const escapesNext = quote === '"'
+        ? next === '"' || next === "\\"
+        : next !== undefined &&
+          (/\s/u.test(next) || next === "'" || next === '"' || next === "\\");
+      if (escapesNext) {
+        escaped = true;
+      } else {
+        current += "\\";
+      }
       active = true;
       continue;
     }
