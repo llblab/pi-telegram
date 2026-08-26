@@ -16,6 +16,7 @@ import {
   generateTelegramVoiceReplyFile,
 } from "../lib/outbound.ts";
 import { createTelegramVoiceReplySender } from "../lib/outbound-voice.ts";
+import { resetTransportReplyDedup } from "../lib/replies.ts";
 import { createTelegramThreadTarget } from "../lib/target.ts";
 import {
   clearTelegramVoiceSynthesisProviders,
@@ -24,6 +25,7 @@ import {
 
 test.beforeEach(() => {
   clearTelegramVoiceSynthesisProviders();
+  resetTransportReplyDedup();
 });
 
 test(
@@ -73,7 +75,7 @@ test(
     );
     try {
       await sendVoice(
-        { chatId: 1, replyToMessageId: 2 },
+        { chatId: 901, replyToMessageId: 902 },
         "hello from Windows",
       ).catch((error) => {
         throw new Error(
