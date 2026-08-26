@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -266,6 +267,30 @@ test("Command templates resolve array-index placeholders and recursive defaults"
   );
   assert.deepEqual(invocation.args, ["right"]);
 });
+
+test(
+  "Command template execution supports Windows cmd wrappers without a shell template",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-telegram-command-cmd-"));
+    const scriptPath = join(dir, "voice-writer.cmd");
+    const outputPath = join(dir, "voice output.ogg");
+    await writeFile(
+      scriptPath,
+      "@echo off\r\n>\"%~1\" echo OggS\r\n",
+      "utf8",
+    );
+    try {
+      const result = await execCommandTemplate(scriptPath, [outputPath], {
+        timeout: 5_000,
+      });
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(await readFile(outputPath, "utf8"), "OggS\r\n");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("Command template execution writes stdin without invoking a shell", async () => {
   const result = await execCommandTemplate(

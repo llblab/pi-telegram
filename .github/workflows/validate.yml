@@ -40,6 +40,13 @@ jobs:
           node --experimental-strip-types --test --test-reporter=spec
           --test-name-pattern="active profile endpoint|replacement endpoint generation"
           tests/bus.test.ts
+      - name: Run Windows outbound voice executable probe
+        if: matrix.os == 'windows-latest'
+        timeout-minutes: 2
+        run: >-
+          node --experimental-strip-types --test --test-reporter=spec
+          --test-name-pattern="Windows cmd wrappers"
+          tests/command-templates.test.ts
       - name: Run tests
         run: npm test
       - name: Check package contents
