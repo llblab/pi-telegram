@@ -628,18 +628,28 @@ export function createTelegramStatusHtmlBuilder<TContext>(deps: {
     );
 }
 
+function resolveStatusBarTheme(
+  ctx: TelegramStatusRuntimeContext,
+): TelegramStatusBarTheme | undefined {
+  try {
+    const theme = ctx.ui?.theme;
+    return typeof theme?.fg === "function" ? theme : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function createTelegramStatusRuntime<
   TContext extends TelegramStatusRuntimeContext,
 >(deps: TelegramStatusRuntimeDeps<TContext>): TelegramStatusRuntime<TContext> {
   const statusKey = deps.statusKey ?? "telegram";
   return {
     updateStatus: (ctx, error) => {
+      const theme = resolveStatusBarTheme(ctx);
+      if (!theme) return;
       ctx.ui.setStatus(
         statusKey,
-        buildTelegramStatusBarText(
-          ctx.ui.theme,
-          deps.getStatusBarState(ctx, error),
-        ),
+        buildTelegramStatusBarText(theme, deps.getStatusBarState(ctx, error)),
       );
     },
     getStatusLines: (options) =>

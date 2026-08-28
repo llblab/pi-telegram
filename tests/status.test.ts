@@ -1371,3 +1371,43 @@ test("Runtime event recording redacts bot tokens and keeps a bounded ring", () =
     { at: 3, category: "three", message: "last" },
   ]);
 });
+
+test("Status runtime skips the status bar when the host theme is uninitialized", () => {
+  const events: string[] = [];
+  const ctx = {
+    ui: {
+      get theme(): never {
+        throw new Error("Theme not initialized. Call initTheme() first.");
+      },
+      setStatus: (key: string, text: string) => {
+        events.push(`${key}:${text}`);
+      },
+    },
+  };
+  const runtime = createTelegramStatusRuntime({
+    getStatusBarState: () => ({
+      hasBotToken: true,
+      pollingActive: true,
+      paired: true,
+      compactionInProgress: false,
+      processing: false,
+      queuedStatus: "",
+    }),
+    getBridgeStatusLineState: () => ({
+      botUsername: undefined,
+      allowedUserId: undefined,
+      lockState: "active here",
+      pollingActive: false,
+      lastUpdateId: undefined,
+      pendingDispatch: false,
+      compactionInProgress: false,
+      activeToolExecutions: 0,
+      pendingModelSwitch: false,
+      queuedItems: [],
+      recentRuntimeEvents: [],
+    }),
+  });
+
+  assert.doesNotThrow(() => runtime.updateStatus(ctx as never));
+  assert.deepEqual(events, []);
+});
