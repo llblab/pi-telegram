@@ -1660,6 +1660,7 @@ test("Agent end runtime resets state, finalizes replies, sends attachments, and 
     "finalize:final",
     "clear:1",
     "markdown:final",
+    "preview:",
     "attachments:1",
     "dispatch",
   ]);
@@ -1705,6 +1706,7 @@ test("Agent end runtime delivers one Rich attachment result without duplicate te
     "preview",
     "rich:final",
     "clear",
+    "preview",
     "dispatch",
   ]);
 });
@@ -1934,9 +1936,73 @@ test("Agent end runtime can schedule active-turn final delivery without blocking
     "activity-idle",
     "preview:final",
     "finalize:final",
+    "preview:",
     "attachments:1",
     "dispatch",
   ]);
+});
+
+test("Final delivery never clears a replacement preview after an awaited completion", async () => {
+  for (const mode of ["finalized", "fallback", "rich"] as const) {
+    for (const authority of ["session", "transport"] as const) {
+      let active = true;
+      let pending = "old";
+      const replace = async () => {
+        await Promise.resolve();
+        active = false;
+        pending = "replacement preview";
+      };
+      await handleTelegramAgentEndRuntime({
+        turn: createQueueTestPromptTurn(), assistant: { text: "old final" },
+        foldQueuedPromptsIntoHistory: false,
+        isSessionActive: () => authority !== "session" || active,
+        isTurnTransportActive: () => authority !== "transport" || active,
+        resetRuntimeState: () => {}, updateStatus: () => {},
+        dispatchNextQueuedTelegramTurn: () => assert.fail("Stale completion dispatched next work"),
+        setPreviewPendingText: (text) => { pending = text; },
+        clearPreview: async () => { if (mode === "rich") await replace(); },
+        sendRichAttachmentReply: async () => mode === "rich",
+        finalizeMarkdownPreview: async () => {
+          if (mode === "finalized") await replace();
+          return mode === "finalized";
+        },
+        sendMarkdownReply: async () => { await replace(); },
+        sendTextReply: async () => assert.fail("Unexpected error reply"),
+        sendQueuedAttachments: async () => assert.fail("Stale completion sent attachments"),
+      });
+      assert.equal(pending, "replacement preview", `${mode}/${authority}`);
+    }
+  }
+});
+
+test("Successful final delivery clears pending text across consecutive turns on every text path", async () => {
+  for (const mode of ["finalized", "fallback", "rich"] as const) {
+    let pending = "";
+    const delivered: string[] = [];
+    for (const text of ["first answer", "second answer"]) {
+      assert.equal(pending, "", "The next turn must not inherit a completed answer");
+      await handleTelegramAgentEndRuntime({
+        turn: createQueueTestPromptTurn(), assistant: { text },
+        foldQueuedPromptsIntoHistory: false,
+        resetRuntimeState: () => {}, updateStatus: () => {},
+        dispatchNextQueuedTelegramTurn: () => {},
+        setPreviewPendingText: (value) => { pending = value; },
+        clearPreview: async () => {},
+        sendRichAttachmentReply: async (_turn, value) => {
+          if (mode === "rich") delivered.push(value);
+          return mode === "rich";
+        },
+        finalizeMarkdownPreview: async (_chat, value) => {
+          if (mode === "finalized") delivered.push(value);
+          return mode === "finalized";
+        },
+        sendMarkdownReply: async (_chat, _reply, value) => { delivered.push(value); },
+        sendTextReply: async () => {}, sendQueuedAttachments: async () => {},
+      });
+      assert.equal(pending, "", mode);
+    }
+    assert.deepEqual(delivered, ["first answer", "second answer"], mode);
+  }
 });
 
 test("Agent end scheduled delivery stops after session generation loss", async () => {
@@ -2247,6 +2313,7 @@ test("Agent end runtime keeps queued Telegram turn delivery independent from pol
     "status",
     "preview:final",
     "finalize:1:final",
+    "preview:",
     "attachments",
     "dispatch",
   ]);
@@ -2302,8 +2369,9 @@ test("Agent end runtime plans assistant button comments for active Telegram repl
   assert.equal(events[0], "reset");
   assert.equal(events[1], "status");
   assert.equal(events[2], "preview:Choose one:");
-  assert.equal(events[4], "attachments");
-  assert.equal(events[5], "dispatch");
+  assert.equal(events[4], "preview:");
+  assert.equal(events[5], "attachments");
+  assert.equal(events[6], "dispatch");
   const finalDelivery = events[3] as {
     finalize: string;
     target?: { chatId: number; threadId?: number };
@@ -2370,6 +2438,7 @@ test("Agent end runtime passes assistant button markup to final text delivery", 
     "status",
     "preview:Answer",
     { finalize: "Answer", replyMarkup },
+    "preview:",
     "attachments",
     "dispatch",
   ]);
@@ -2435,6 +2504,7 @@ test("Agent end runtime splits assistant voice markup into text and voice delive
     "status",
     "preview:Full technical text.",
     "finalize:Full technical text.",
+    "preview:",
     "voice:Short voice summary.:ru:+20%:false",
     "attachments",
     "dispatch",
@@ -2993,6 +3063,7 @@ test("Agent end hook binds assistant extraction and runtime ports", async () => 
     "status:ctx",
     "preview:final",
     "finalize:final",
+    "preview:",
     "attachments",
   ]);
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -3002,6 +3073,7 @@ test("Agent end hook binds assistant extraction and runtime ports", async () => 
     "status:ctx",
     "preview:final",
     "finalize:final",
+    "preview:",
     "attachments",
     "dispatch:ctx",
   ]);
@@ -3279,6 +3351,7 @@ test("Agent lifecycle hooks bind start, end, and tool lifecycle ports", async ()
     "pending:done",
     "preview:clear",
     "markdown:done",
+    "pending:",
   ]);
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(events, [
@@ -3299,6 +3372,7 @@ test("Agent lifecycle hooks bind start, end, and tool lifecycle ports", async ()
     "pending:done",
     "preview:clear",
     "markdown:done",
+    "pending:",
     "dispatch:ctx",
   ]);
 });
@@ -3378,6 +3452,7 @@ test("Agent lifecycle retains retryable errors until recovery or settlement", as
     "reset",
     "preview:Recovered answer",
     "final:Recovered answer",
+    "preview:",
     "dispatch",
   ]);
 

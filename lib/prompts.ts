@@ -152,7 +152,7 @@ type TelegramBeforeAgentStartEvent = Omit<
   BeforeAgentStartEvent,
   "systemPrompt"
 > & {
-  systemPrompt: TelegramSystemPrompt;
+  systemPrompt?: TelegramSystemPrompt | null;
 };
 
 type TelegramBeforeAgentStartResult = {
@@ -165,11 +165,12 @@ type TelegramBeforeAgentStartHook = (
 
 export function buildTelegramBridgeSystemPrompt(options: {
   prompt: string;
-  systemPrompt: TelegramSystemPrompt;
+  systemPrompt?: TelegramSystemPrompt | null;
   telegramPrefix?: string;
   localSystemPromptSuffix: string;
   telegramTurnSystemPromptSuffix: string;
 }): TelegramBeforeAgentStartResult {
+  const basePrompt = options.systemPrompt ?? "";
   const telegramPrefix = options.telegramPrefix ?? TELEGRAM_PREFIX;
   const telegramHead = telegramPrefix.endsWith("]")
     ? telegramPrefix.slice(0, -1)
@@ -182,12 +183,12 @@ export function buildTelegramBridgeSystemPrompt(options: {
     ? `${options.telegramTurnSystemPromptSuffix}\n- The current user message came from Telegram.`
     : "";
   return {
-    systemPrompt: Array.isArray(options.systemPrompt)
+    systemPrompt: Array.isArray(basePrompt)
       ? [
-          ...options.systemPrompt,
+          ...basePrompt,
           options.localSystemPromptSuffix + telegramSuffix,
         ]
-      : options.systemPrompt +
+      : basePrompt +
         options.localSystemPromptSuffix +
         telegramSuffix,
   };
@@ -221,8 +222,9 @@ function stripTelegramToolMetadataFromString(systemPrompt: string): string {
 }
 
 function stripTelegramToolMetadataFromSystemPrompt(
-  systemPrompt: TelegramSystemPrompt,
+  systemPrompt: TelegramSystemPrompt | null | undefined,
 ): TelegramSystemPrompt {
+  if (!systemPrompt) return "";
   return Array.isArray(systemPrompt)
     ? systemPrompt.map(stripTelegramToolMetadataFromString)
     : stripTelegramToolMetadataFromString(systemPrompt);
