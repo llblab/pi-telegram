@@ -598,6 +598,7 @@ test("Bus follower receiver handles leader-forwarded updates and target replacem
           target: { chatId: 7, threadId: 42 },
           oldTarget: { chatId: 7, threadId: 10 },
           reason: "thread-restore",
+          registrationGeneration: "generation-b",
         },
         ctx: "ctx",
       },
@@ -1234,7 +1235,7 @@ test("Bus follower target replacement handler persists restored target", async (
   let syncState = {};
   const events: unknown[] = [];
   const registrationState = createTelegramBusFollowerRegistrationState();
-  registrationState.setRegistered(true, { chatId: 42, threadId: 10 });
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 }, { generation: "g" });
   const handler = createTelegramBusFollowerTargetReplacementHandler({
     topicTargetStore: {
       load: async () => undefined,
@@ -1284,6 +1285,7 @@ test("Bus follower target replacement handler persists restored target", async (
       target: { chatId: 42, threadId: 11 },
       oldTarget: { chatId: 42, threadId: 10 },
       reason: "thread-restore",
+      registrationGeneration: "g",
     },
     "ctx",
   );
@@ -1329,6 +1331,57 @@ test("Bus follower target replacement handler persists restored target", async (
   ]);
 });
 
+test("Follower target replacement rechecks generation and old target after store load", async () => {
+  for (const replacement of [
+    { generation: "new", target: { chatId: 42, threadId: 10 } },
+    { generation: "g", target: { chatId: 42, threadId: 12 } },
+    { generation: "g", target: { chatId: 42, threadId: 10 }, storeTarget: { chatId: 42, threadId: 12 } },
+  ]) {
+    const state = createTelegramBusFollowerRegistrationState();
+    state.setRegistered(true, { chatId: 42, threadId: 10 }, { generation: "g" });
+    const handler = createTelegramBusFollowerTargetReplacementHandler({
+      topicTargetStore: {
+        load: async () => { state.setRegistered(true, replacement.target, replacement); },
+        list: () => replacement.storeTarget ? [{
+          profileKey: "manual:f", instanceId: "f", target: replacement.storeTarget,
+          status: "active", createdAtMs: 1, updatedAtMs: 1,
+        }] : [],
+        markStaleByTarget: () => { assert.fail("stale authority mutated binding"); },
+        upsert: () => { assert.fail("stale authority upserted binding"); },
+        persist: async () => { assert.fail("stale authority persisted binding"); },
+      },
+      registrationState: state,
+      instanceId: "f", getManualFollowerProfileKey: () => "manual:f", manualFollowerOwnerId: "f",
+      getSyncState: () => ({}), setSyncState: () => assert.fail("stale sync mutation"), updateStatus: () => {},
+    });
+    await assert.rejects(async () => handler({ target: { chatId: 42, threadId: 11 }, oldTarget: { chatId: 42, threadId: 10 }, registrationGeneration: "g", reason: "thread-restore" }, "ctx"), /replacement (authority|target)/);
+    assert.deepEqual(state.getTarget(), replacement.target);
+  }
+});
+
+test("Follower restore does not acknowledge a generation replaced during persistence", async () => {
+  const state = createTelegramBusFollowerRegistrationState();
+  state.setRegistered(true, { chatId: 42, threadId: 10 }, { generation: "old" });
+  const replacement = { chatId: 42, threadId: 12 };
+  const handler = createTelegramBusFollowerTargetReplacementHandler({
+    topicTargetStore: {
+      load: async () => {},
+      list: () => [],
+      markStaleByTarget: () => true,
+      upsert: (record) => record,
+      persist: async () => { state.setRegistered(true, replacement, { generation: "new" }); },
+    },
+    registrationState: state,
+    instanceId: "f", getManualFollowerProfileKey: () => "manual:f", manualFollowerOwnerId: "f",
+    getSyncState: () => ({}),
+    setSyncState: () => assert.fail("obsolete completion changed sync state"),
+    updateStatus: () => assert.fail("obsolete completion updated status"),
+  });
+  await assert.rejects(async () => handler({ target: { chatId: 42, threadId: 11 }, oldTarget: { chatId: 42, threadId: 10 }, registrationGeneration: "old", reason: "thread-restore" }, "ctx"), /replacement authority/);
+  assert.deepEqual(state.getTarget(), replacement);
+  assert.equal(state.getGeneration(), "new");
+});
+
 test("Bus follower target replacement resolves named-profile fallback at call time", async () => {
   let activeProfileKey = "manual:default";
   const upserts: Array<{ profileKey: string }> = [];
@@ -1354,10 +1407,13 @@ test("Bus follower target replacement resolves named-profile fallback at call ti
     updateStatus: () => undefined,
   });
   activeProfileKey = "profile:work:manual-follower:owner-a";
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 }, { generation: "g" });
   await handler(
     {
       target: { chatId: 42, threadId: 11 },
+      oldTarget: { chatId: 42, threadId: 10 },
       reason: "thread-restore",
+      registrationGeneration: "g",
     },
     "ctx",
   );

@@ -1265,6 +1265,7 @@ test("Thread disconnect assembly distinguishes manual stop from restart suspensi
     instanceId: "runtime:1",
     getCurrentThreadRecord: () => undefined,
     topicTargetStore: {
+      list: () => [],
       markStaleByTarget: () => false,
       persist: async () => {},
       upsertPendingCleanup: () => {},
@@ -1308,6 +1309,7 @@ test("Manual follower disconnect delegates thread deletion to its live leader", 
       target: { chatId: 7, threadId: 42 },
     }),
     topicTargetStore: {
+      list: () => [],
       markStaleByTarget: () => false,
       upsertPendingCleanup: () => undefined,
       removePendingCleanup: () => false,
@@ -1366,6 +1368,7 @@ test("Manual leader disconnect releases transport after cleanup loses epoch", as
       persist: async () => {
         trace.push("persist");
       },
+      list: () => [],
     },
     callApi: async <TResponse>(method: string) => {
       trace.push(method);
@@ -1433,6 +1436,7 @@ test("Promoted leader deletes its inherited follower thread under owned epoch", 
       persist: async () => {
         trace.push("persist");
       },
+      list: () => [],
     },
     callApi: async <TResponse>(method: string) => {
       trace.push(method);
@@ -1499,6 +1503,7 @@ test("Promoted leader disconnect releases leadership when deletion is unconfirme
       persist: async () => {
         trace.push("persist");
       },
+      list: () => [],
     },
     callApi: async <TResponse>(method: string) => {
       trace.push(method);

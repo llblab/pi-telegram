@@ -27,6 +27,7 @@ import {
   createCurrentTelegramBusProcessRuntime,
   createTelegramBusFollowerDeliveryIdentity,
   createTelegramBusFollowerRegistry,
+  createTelegramBusFollowerThreadRestoreHandler,
   createTelegramBusProtocolIdentity,
   createTelegramBusForeignOwnedUpdateForwarder,
   createTelegramFollowerApiCallAuthorizer,
@@ -2295,6 +2296,40 @@ test("Bus follower registry resolves followers by target", () => {
     "thread",
   );
   assert.equal(registry.getByTarget({ chatId: 1, threadId: 3 }), undefined);
+});
+
+test("Follower restore rejects missing, mismatched, and same old/new targets before IPC", async () => {
+  const registry = createTelegramBusFollowerRegistry();
+  const target = { chatId: 1, threadId: 2 };
+  registry.register({ instanceId: "f", registrationGeneration: "g", target, connectedAtMs: 1 });
+  const restore = createTelegramBusFollowerThreadRestoreHandler({
+    followerRegistry: registry,
+    followerTargetController: { replaceTarget: async () => assert.fail("invalid restore reached IPC") },
+  });
+  for (const oldTarget of [undefined, { chatId: 1, threadId: 4 }, target]) {
+    assert.equal(await restore({ record: { instanceId: "f" }, target, oldTarget }), false);
+  }
+});
+
+test("Follower restore cannot overwrite registration or old target changed during ACK", async () => {
+  for (const replacement of [
+    { registrationGeneration: "new", target: { chatId: 1, threadId: 2 } },
+    { registrationGeneration: "old", target: { chatId: 1, threadId: 4 } },
+  ]) {
+    const registry = createTelegramBusFollowerRegistry();
+    const follower = { instanceId: "f", registrationGeneration: "old", target: { chatId: 1, threadId: 2 }, connectedAtMs: 1 };
+    registry.register(follower);
+    const restore = createTelegramBusFollowerThreadRestoreHandler({
+      followerRegistry: registry,
+      followerTargetController: { replaceTarget: async () => {
+        registry.register({ ...follower, ...replacement });
+        return true;
+      } },
+    });
+    assert.equal(await restore({ record: { instanceId: "f" }, target: { chatId: 1, threadId: 3 }, oldTarget: follower.target }), false);
+    assert.deepEqual(registry.get("f")?.target, replacement.target);
+    assert.equal(registry.get("f")?.registrationGeneration, replacement.registrationGeneration);
+  }
 });
 
 test("Bus follower registry replaces stale registrations by profile and target", () => {
