@@ -3279,6 +3279,32 @@ test("Admission worker completes every foreign update kind only after exact acce
   }
 });
 
+test("Conflicting queued receipts expose exact ids without settling either source", async () => {
+  const storage = createTestUpdateWorkerJournal([1, 2]);
+  const events: Array<{ category: string; details?: Record<string, unknown> }> = [];
+  const worker = createTelegramUpdateWorkerRuntime({
+    journal: storage.journal, hasAuthority: () => true,
+    executeUpdate: (update) => ({
+      kind: "queued", queueKind: "prompt", receiptId: "shared-receipt",
+      sourceUpdateIds: [update.update_id],
+    }),
+    recordRuntimeEvent: (category, _error, details) => { events.push({ category, details }); },
+  });
+  try {
+    worker.start(TEST_CONTEXT);
+    await worker.waitForDrain();
+    const event = events.find((entry) => entry.details?.phase === "queue-receipt-conflict");
+    assert.ok(event);
+    assert.equal(event.category, "inbound-worker");
+    assert.equal(event.details?.receiptId, "shared-receipt");
+    assert.deepEqual(event.details?.sourceUpdateIds, [2]);
+    assert.deepEqual(storage.getUpdateIds(), [1, 2]);
+    assert.deepEqual(storage.getRemovals(), []);
+  } finally {
+    await worker.stop();
+  }
+});
+
 test("Update worker drains one validated snapshot per bounded batch", async () => {
   const storage = createTestUpdateWorkerJournal([1, 2, 3, 4, 5]);
   const worker = createTelegramUpdateWorkerRuntime({

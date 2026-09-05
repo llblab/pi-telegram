@@ -152,7 +152,7 @@ type TelegramBeforeAgentStartEvent = Omit<
   BeforeAgentStartEvent,
   "systemPrompt"
 > & {
-  systemPrompt: TelegramSystemPrompt;
+  systemPrompt?: TelegramSystemPrompt | null;
 };
 
 type TelegramBeforeAgentStartResult = {
@@ -165,7 +165,7 @@ type TelegramBeforeAgentStartHook = (
 
 export function buildTelegramBridgeSystemPrompt(options: {
   prompt: string;
-  systemPrompt: TelegramSystemPrompt;
+  systemPrompt?: TelegramSystemPrompt | null;
   telegramPrefix?: string;
   localSystemPromptSuffix: string;
   telegramTurnSystemPromptSuffix: string;
@@ -222,7 +222,7 @@ function stripTelegramToolMetadataFromString(systemPrompt: string): string {
 }
 
 function stripTelegramToolMetadataFromSystemPrompt(
-  systemPrompt: TelegramSystemPrompt | undefined,
+  systemPrompt: TelegramSystemPrompt | null | undefined,
 ): TelegramSystemPrompt {
   if (!systemPrompt) return "";
   return Array.isArray(systemPrompt)

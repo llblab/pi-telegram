@@ -30,6 +30,27 @@ function createBeforeAgentStartEvent(
   return { prompt, systemPrompt } as BeforeAgentStartHookEvent;
 }
 
+test("Prompt hooks normalize missing and null system prompts without losing Telegram guidance", async () => {
+  for (const systemPrompt of [undefined, null]) {
+    const event = { prompt: "[telegram] hello", systemPrompt } as BeforeAgentStartHookEvent;
+    const hook = createTelegramBeforeAgentStartHook({
+      localSystemPromptSuffix: "local", telegramTurnSystemPromptSuffix: "/telegram",
+    });
+    assert.equal(hook(event).systemPrompt, "local/telegram\n- The current user message came from Telegram.");
+    for (const available of [false, true]) {
+      const proactive = createTelegramProactiveBeforeAgentStartHook({
+        baseHook: hook, isAvailable: () => available,
+      });
+      assert.deepEqual(await proactive(event, undefined), {
+        systemPrompt: available ? hook(event).systemPrompt : "",
+      });
+    }
+  }
+  assert.deepEqual(buildTelegramBridgeSystemPrompt({
+    prompt: "local", localSystemPromptSuffix: "suffix", telegramTurnSystemPromptSuffix: "telegram",
+  }), { systemPrompt: "suffix" });
+});
+
 test("Prompt helpers append context-aware system prompt suffixes", () => {
   assert.deepEqual(
     buildTelegramBridgeSystemPrompt({

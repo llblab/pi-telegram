@@ -22,6 +22,7 @@ import * as Outbound from "../lib/outbound.ts";
 import * as Queue from "../lib/queue.ts";
 import * as Runtime from "../lib/runtime.ts";
 import * as GenerativeApps from "../lib/generative-apps.ts";
+import type { TelegramQueueAdmissionItemLike } from "../lib/updates.ts";
 import type { ExtensionAPI, ExtensionContext } from "../lib/pi.ts";
 
 type RegisteredBindingHandler = (
@@ -210,6 +211,68 @@ test("Agent message tool routing selects leader or follower composition", async 
     "follower-resolve",
     "follower-route",
   ]);
+});
+
+test("Queue binding requires durable handoff for every burst item and fails closed on missing settlement", () => {
+  for (const mode of ["success", "missing", "uncompleted"] as const) {
+    const store = Queue.createTelegramQueueStore<string>();
+    const deferredDispatch = Queue.createTelegramDeferredQueueDispatchRuntime<string>();
+    deferredDispatch.bind("ctx");
+    const committed = new Set<number>();
+    const events: string[] = [];
+    let available = true;
+    const settlement = {
+      isItemReady: (item: TelegramQueueAdmissionItemLike) =>
+        !committed.has(item.admissionReceipts![0]!.sourceUpdateIds[0]!),
+      onPromptHandedOff: (item: TelegramQueueAdmissionItemLike) => {
+        const id = item.admissionReceipts![0]!.sourceUpdateIds[0]!;
+        events.push(`commit:${id}`);
+        if (mode === "success") committed.add(id);
+      },
+      onItemsDiscarded: () => {}, onControlSettled: () => {},
+    };
+    const runtime = createTelegramQueueBindingRuntime({
+      store, queue: { allocateItemOrder: () => 0 }, deferredDispatch,
+      lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => false },
+      activeTurn: { has: () => false },
+      admission: {
+        getSettlement: () => available ? settlement : undefined,
+        hasPendingQueueMutationForItem: () => false,
+      },
+      transportStamp: { isActive: () => true },
+      promptDispatch: {
+        startTypingLoop: () => {},
+        onPromptDispatchStart: () => { if (mode === "missing") available = false; },
+        onPromptDispatchFailure: () => { events.push("failed"); },
+      },
+      isIdle: () => true, hasPendingMessages: () => false, updateStatus: () => {},
+      sendTextReply: async () => undefined,
+      sendUserMessage: () => {
+        const item = store.getQueuedItems()[0]!;
+        events.push(`send:${item.queueOrder}`);
+        if (!committed.has(item.queueOrder)) events.push("uncommitted-send");
+        store.setQueuedItems(store.getQueuedItems().slice(1));
+      },
+    });
+    for (let id = 1; id <= 3; id++) {
+      runtime.mutation.append({
+        kind: "prompt", chatId: 7, replyToMessageId: id, sourceMessageIds: [id],
+        admissionReceipts: [{ queueKind: "prompt", receiptId: `receipt-${id}`, sourceUpdateIds: [id] }],
+        queueOrder: id, queueLane: "default", laneOrder: id, queuedAttachments: [],
+        content: [{ type: "text", text: `prompt-${id}` }], historyText: "", statusSummary: "prompt",
+      }, "ctx");
+    }
+    for (let index = 0; index < 3; index++) runtime.dispatchNext("ctx");
+    if (mode === "success") {
+      assert.deepEqual(events, ["commit:1", "send:1", "commit:2", "send:2", "commit:3", "send:3"]);
+      assert.equal(store.getQueuedItems().length, 0);
+    } else {
+      assert.ok(!events.some((event) => event.startsWith("send:")));
+      assert.ok(events.includes("failed"));
+      assert.equal(store.getQueuedItems().length, 3);
+      assert.equal(committed.size, 0);
+    }
+  }
 });
 
 test("Queue binding composes mutation, admission, dispatch, and watchdog ports", () => {

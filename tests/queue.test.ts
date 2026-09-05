@@ -1942,6 +1942,69 @@ test("Agent end runtime can schedule active-turn final delivery without blocking
   ]);
 });
 
+test("Final delivery never clears a replacement preview after an awaited completion", async () => {
+  for (const mode of ["finalized", "fallback", "rich"] as const) {
+    for (const authority of ["session", "transport"] as const) {
+      let active = true;
+      let pending = "old";
+      const replace = async () => {
+        await Promise.resolve();
+        active = false;
+        pending = "replacement preview";
+      };
+      await handleTelegramAgentEndRuntime({
+        turn: createQueueTestPromptTurn(), assistant: { text: "old final" },
+        foldQueuedPromptsIntoHistory: false,
+        isSessionActive: () => authority !== "session" || active,
+        isTurnTransportActive: () => authority !== "transport" || active,
+        resetRuntimeState: () => {}, updateStatus: () => {},
+        dispatchNextQueuedTelegramTurn: () => assert.fail("Stale completion dispatched next work"),
+        setPreviewPendingText: (text) => { pending = text; },
+        clearPreview: async () => { if (mode === "rich") await replace(); },
+        sendRichAttachmentReply: async () => mode === "rich",
+        finalizeMarkdownPreview: async () => {
+          if (mode === "finalized") await replace();
+          return mode === "finalized";
+        },
+        sendMarkdownReply: async () => { await replace(); },
+        sendTextReply: async () => assert.fail("Unexpected error reply"),
+        sendQueuedAttachments: async () => assert.fail("Stale completion sent attachments"),
+      });
+      assert.equal(pending, "replacement preview", `${mode}/${authority}`);
+    }
+  }
+});
+
+test("Successful final delivery clears pending text across consecutive turns on every text path", async () => {
+  for (const mode of ["finalized", "fallback", "rich"] as const) {
+    let pending = "";
+    const delivered: string[] = [];
+    for (const text of ["first answer", "second answer"]) {
+      assert.equal(pending, "", "The next turn must not inherit a completed answer");
+      await handleTelegramAgentEndRuntime({
+        turn: createQueueTestPromptTurn(), assistant: { text },
+        foldQueuedPromptsIntoHistory: false,
+        resetRuntimeState: () => {}, updateStatus: () => {},
+        dispatchNextQueuedTelegramTurn: () => {},
+        setPreviewPendingText: (value) => { pending = value; },
+        clearPreview: async () => {},
+        sendRichAttachmentReply: async (_turn, value) => {
+          if (mode === "rich") delivered.push(value);
+          return mode === "rich";
+        },
+        finalizeMarkdownPreview: async (_chat, value) => {
+          if (mode === "finalized") delivered.push(value);
+          return mode === "finalized";
+        },
+        sendMarkdownReply: async (_chat, _reply, value) => { delivered.push(value); },
+        sendTextReply: async () => {}, sendQueuedAttachments: async () => {},
+      });
+      assert.equal(pending, "", mode);
+    }
+    assert.deepEqual(delivered, ["first answer", "second answer"], mode);
+  }
+});
+
 test("Agent end scheduled delivery stops after session generation loss", async () => {
   const events: string[] = [];
   let active = true;

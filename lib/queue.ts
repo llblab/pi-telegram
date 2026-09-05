@@ -1908,6 +1908,7 @@ export async function handleTelegramAgentEndRuntime<
         if (!isDeliveryActive()) return;
         if (richAttachmentDelivered) {
           await deps.clearPreview(turn.chatId, { target: turn.target });
+          if (!isDeliveryActive()) return;
           deps.setPreviewPendingText("");
         }
       } catch (error) {
@@ -1939,6 +1940,7 @@ export async function handleTelegramAgentEndRuntime<
             { replyMarkup, target: turn.target },
           );
         }
+        if (!isDeliveryActive()) return;
         deps.setPreviewPendingText("");
       } catch (error) {
         deps.recordRuntimeEvent?.("delivery", error, {

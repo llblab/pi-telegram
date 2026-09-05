@@ -92,7 +92,7 @@ The repository uses a **Flat Domain DAG**:
 
 Pi is the primary and only officially supported host. `pi-telegram` may still accept narrow, host-neutral representation differences at its existing Pi-facing boundary when they preserve native Pi behavior and do not create a second runtime policy layer:
 
-- `prompts` preserves either Pi's plain system-prompt string or an ordered block array supplied by a compatible host, appending Telegram guidance without collapsing host-owned blocks.
+- `prompts` preserves either Pi's plain system-prompt string or an ordered block array supplied by a compatible host, appending Telegram guidance without collapsing host-owned blocks. An absent/null host system prompt is treated as empty, including the disconnected metadata-stripping path.
 - `pi` normalizes settings-manager construction that is either synchronous or asynchronous, then adapts either Pi's legacy enabled-model methods or a generic `get` / `set` settings service before model-menu reads and scoped-model persistence use it. Hosts without an explicit reload method rely on fresh asynchronous construction; durable writes still require `flush`.
 - `lifecycle` continues to require Pi's semantic `agent_settled` boundary. It does not infer terminal settlement from host-specific `agent_end`, retry, or stop events; a compatibility shim must reproduce that contract before it can safely support activity identity and unrecovered-error finalization.
 
@@ -339,7 +339,7 @@ Assistant delivery guarantees:
 - Quoted rich replies use Telegram `rich_message` blocks as the prompt-context source when available, so `[reply]` context receives rendered plain text instead of raw `InputRichMessage.markdown` fallback text. Replied media runs through the same inbound handlers and voice transcription providers as current-message media, with provenance-scoped `[outputs|from:…]` appended inside the reply block.
 - Long native Markdown replies are split only at Telegram Rich Message transport limits; oversized fenced code, display-math, and fully wrapped inline-formatting blocks are rewrapped per chunk so persisted Rich Markdown chunks remain structurally valid.
 - When Draft previews are enabled, streaming previews pass structurally closed assistant Markdown prefixes through to `sendRichMessageDraft` with ownership checks, voice suppression, and serialized flushes. Unclosed inline spans, links, fenced code, comments, and display-math blocks are held back until a safe boundary exists. Draft failures are recorded and the failing frame is skipped instead of degrading to raw plain-message previews, because partial Markdown can be invalid while the final message remains valid.
-- Preview flushes are serialized so older edits cannot race newer drafts; final delivery waits for active draft flushes and does not perform a post-final draft-clear call.
+- Preview flushes are serialized so older edits cannot race newer drafts; final delivery waits for active draft flushes and does not perform a post-final draft-clear call. Successful final text delivery clears the local pending preview text only while the captured session and transport remain active, so a late delivery or Rich-attachment cleanup cannot erase replacement preview state.
 
 UI/compat rendering guarantees:
 
