@@ -173,6 +173,15 @@ test("Generated filesystem reference preserves bounded structural navigation", a
   }
 });
 
+test("Bridge diagnosis distinguishes Pi commands from the agent file fallback", async () => {
+  const diagnosis = await readSkillReference("telegram-bridge", "diagnosis.md");
+  assert.match(diagnosis, /`\/telegram-status`/u);
+  assert.match(diagnosis, /`\/telegram-status --debug`/u);
+  assert.match(diagnosis, /not shell executables or agent tools/u);
+  assert.match(diagnosis, /read the diagnostic files directly/u);
+  assert.match(diagnosis, /state\.json.*logs\.jsonl/u);
+});
+
 test("Package metadata publishes the bundled skill root", async () => {
   const packageRoot = dirname(TELEGRAM_SKILLS_PATH);
   const manifest = JSON.parse(

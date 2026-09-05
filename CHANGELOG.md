@@ -2,6 +2,11 @@
 
 > Each release keeps at most 8 outcome records of at most 512 characters.
 
+## 0.42.3: Agent Diagnostics Hotfix
+
+- `Agent Diagnostics`: Identifies `/telegram-status` as a Pi TUI command and routes agents without command access directly to the redacted diagnostic files instead of attempting a shell executable; runtime behavior and STT fallback remain unchanged.
+- `Local Architecture Guidance`: Consolidates the repository-local Domain DAG Skill around canonical protocols and removes redundant self-validation configuration and a legacy recipe wrapper; the validator remains available, and this development-only Skill is not included in the npm package.
+
 ## 0.42.2: Telegram Comment Membrane
 
 - `Transport-Private HTML Comments`: Removes every assistant-authored `<!-- … -->` block from Telegram previews, active-turn finals, connected companion projections, direct sends, and Guest Mode regardless of Markdown position or owning extension; only recognized top-level comments activate actions, unclosed tails stay hidden, comment-only text plans send nothing, and the Pi terminal transcript remains unchanged.

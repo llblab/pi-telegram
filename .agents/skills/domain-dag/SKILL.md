@@ -1,8 +1,6 @@
 ---
 name: domain-dag
 description: Validates and guides Domain DAG architecture for domain ownership, acyclic local dependency graphs, composition roots, boundary direction, public contracts, interface-surface pressure, and shared-bucket drift. Use when auditing, refactoring, or extending modular codebases across frontend, backend, extensions, CLIs, SDKs, and service packages.
-metadata:
-  version: 1.0.16
 ---
 
 # Domain DAG
@@ -98,9 +96,9 @@ Before adding or enforcing rules, calibrate the project:
 1. Identify the shape: flat, layered, package, hexagonal, or hybrid.
 2. Find the true composition roots: app bootstrap, extension entrypoint, HTTP router, worker runner, CLI command, SDK facade, test harness.
 3. Identify the project’s public-contract mechanism: barrels, package exports, interfaces, ports, route handlers, generated clients, or documented namespaces.
-4. Run generic validation first; treat warnings as leads, not facts.
-5. Add project-local config only for constraints the project has actually earned.
-6. Keep hard errors for low-noise invariants; keep heuristics as warnings.
+4. Run [validation](#validation) with generic defaults; treat warnings as leads, not facts.
+5. Add [project-local configuration](#configuration) only where aliases, layers, or public boundaries are invisible to defaults, or a real boundary violation warrants a custom rule.
+6. Apply the [Rule-Severity Ladder](#rule-severity-ladder).
 
 ## Extraction Protocol
 
@@ -112,7 +110,7 @@ When decomposing or extending a module:
 4. Keep persistence, runtime lifecycle, routing, external effects, and screen/job orchestration in the host unless the extracted module explicitly owns that policy.
 5. Replace cross-feature or cross-use-case reuse with lower-layer contracts rather than peer imports.
 6. Run the validator and the project's normal checks.
-7. Stop when the host mainly coordinates state/effects and the next extraction would hide control flow or create a one-use wrapper.
+7. Apply the [Stop Rules](#stop-rules) before extracting further.
 
 ## Stop Rules
 
@@ -241,24 +239,10 @@ A mature Domain DAG has few hard rules and good explanations. It does not need m
 
 ## Operating Protocol
 
-1. Identify composition roots, delivery surfaces, domain roots, and support/foundation roots.
-2. Classify the project shape: flat, layered, package, hexagonal, or hybrid.
-3. Build or update the ownership map: owner, public contract, explicit exclusions.
-4. Run `scripts/validate-domain-dag.sh` with generic defaults.
-5. If aliases, layers, or public boundaries are invisible to generic validation, add project-local config.
-6. Fix hard failures before cosmetic refactors.
-7. Move misplaced types/constants/helpers/policies to their owning module.
-8. Replace broad concrete reach-through with narrow ports/contracts when dependency direction is wrong.
-9. Group wide interfaces into named contracts when the surface is stable.
-10. Add custom forbidden edges, header clauses, or surface rules only after a real boundary has been violated.
-11. Stop after the smallest behavior-preserving slice that improves the graph.
-
-## Output Policy
-
-- **Failures**: Cycles, entrypoint reach-through, invalid configured layer edges, invalid configured forbidden edges.
-- **Warnings**: Missing headers, missing configured header clauses, shared-bucket candidates, flat-root drift, configured surface pressure.
-- **Pass**: The checked graph is acyclic and configured boundary rules hold.
-- **Human-readable spacing**: In non-JSON mode, separate section banners from diagnostic lines with a blank line and separate final summaries from the diagnostic stream with a blank line. Example: `--- DOMAIN DAG VALIDATOR ---`, blank line, `[INFO] ...`; after the last `[PASS]` / `[WARN]` / `[FAIL]`, blank line, `Result: N error(s), M warning(s)`. Do not add this spacing inside `--json` output.
+1. Apply the [Calibration Protocol](#calibration-protocol).
+2. Map domain and support owners, public contracts, and explicit exclusions beneath the identified composition roots.
+3. Fix hard failures before cosmetic refactors. Use [Placement Heuristics](#placement-heuristics) for misplaced responsibilities and [Extraction Protocol](#extraction-protocol) when decomposition is warranted.
+4. Stop after the smallest behavior-preserving slice that improves the graph.
 
 ## Review Lens
 
