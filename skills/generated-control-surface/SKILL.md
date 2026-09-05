@@ -40,7 +40,9 @@ A surface is an ordered ragged sequence of rows. Each button carries:
 
 - A short, distinct label.
 - The smallest self-contained next-request prompt.
-- Optional presentation state supported by the transport.
+- Optional presentation state supported by the transport, including disabled controls when their visible unavailability helps explain current state.
+
+A disabled control is not an action: it needs no prompt or selected style and must not enqueue a prompt or invoke a bound method. Prefer a meaningful label; omit it only for an intentional blank cell in a spatial layout, never as decorative padding. Preserve its label and position when that makes a changing surface easier to understand; otherwise omit irrelevant controls. Explain non-obvious unavailability without relying on color alone. Retain at least one useful enabled action, such as refresh or navigation. Derive disabled state from the same evidence as the view; an old enabled control still requires current domain validation. Use the transport owner's disabled encoding rather than a dummy prompt or no-op callback.
 
 Prompts must name any target, operation, constraint, or freshness identity whose omission could change the action. Reuse visible context only when it remains unambiguous under delayed or reordered clicks. Never encode volatile output that should be freshly inspected.
 
@@ -57,7 +59,7 @@ Every generated human-readable action label must use `emoji + space + text`; emo
 
 For complex grids, navigation collections, or stateful repeated clicks, read [`references/layout-and-state.md`](./references/layout-and-state.md).
 
-Serialize the resulting rows with the active transport contract. This Skill owns admission and composition, not transport syntax.
+Place a control group beside the section it governs when the transport supports in-body blocks; use a footer for whole-answer actions. Placement must not change the matrix or action semantics. Serialize the resulting rows with the active transport contract. This Skill owns admission and composition, not transport syntax.
 
 ## Safety
 

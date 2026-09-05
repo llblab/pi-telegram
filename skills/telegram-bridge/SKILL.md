@@ -15,7 +15,8 @@ Use Telegram as a mobile companion to the current Pi session. Preserve the exact
 | Attach a requested file to the current turn | `telegram_attach(path)` without targeting |
 | Explicitly send from local/TUI to Telegram | `telegram_message` or `telegram_attach` |
 | Explicitly send to a different live Thread | `telegram_message(thread=...)` |
-| Add prompt buttons or explicit voice | Top-level hidden action comments |
+| Add buttons | Hidden comment for footer; `telegram_button` fence for in-body rows |
+| Add explicit voice | Top-level hidden action comment |
 | Build a repeated deterministic interaction | Follow `generative-apps` |
 
 A connected Telegram session proves capability, not user intent. Use Telegram features on Telegram-originated turns or explicit Telegram delivery requests only. Never call `telegram_message` for the current active target.
@@ -39,7 +40,7 @@ Reply in concise, phone-width Telegram Rich Markdown. Use `$...$` and `$$...$$` 
 
 ## Assistant Actions
 
-`telegram_button` and `telegram_voice` are hidden HTML comments, not tools. Emit each complete action comment at column zero, outside lists, quotes, code blocks, and indentation. Telegram removes every assistant-authored HTML comment from previews and final replies regardless of owner or Markdown position, but only recognized top-level comments activate actions; comment-only output sends no text message.
+`telegram_button` and `telegram_voice` are markup, not tools. Emit action comments at column zero outside lists, quotes, code, and indentation. Comments create footer buttons or voice artifacts. For buttons between paragraphs, use a column-zero triple-backtick `telegram_button` block. Both button wrappers accept the same singleton JSON/CML cell or mixed matrix; the wrapper determines placement. Telegram removes every assistant-authored HTML comment from previews and final replies regardless of owner or Markdown position; only recognized top-level wrappers activate actions; comment-only output sends no text message.
 
 ### Shared Encoding Rule
 
@@ -48,25 +49,35 @@ Choose the least verbose sufficient representation:
 1. Positional CML — default.
 2. JSON — only when multiline content, named fields, or escaping earns it.
 
-CML trims atom boundaries and decodes `\|`, `\}`, and `\\`. Keep one complete action in one comment.
+CML trims atom boundaries and decodes `\|`, `\}`, and `\\`. Keep each payload inside one complete wrapper.
 
 ### Prompt Buttons
 
-Every button has a self-contained prompt and an optional selection style. Use a short distinct `emoji + space + text` label when separate human-readable labeling adds meaning; established coordinates or symbolic tokens may use the prompt itself as visible text. A click creates an ordinary user request; it never grants authority or bypasses confirmation.
+Every enabled button has a self-contained prompt and an optional selection style. Use a short distinct `emoji + space + text` label when separate human-readable labeling adds meaning; established coordinates or symbolic tokens may use the prompt itself as visible text. A click creates an ordinary user request; it never grants authority or bypasses confirmation.
 
 - `{prompt}` uses the same text for label and prompt.
 - `{|prompt}` omits a separately authored label and uses the prompt as both visible text and queued prompt.
 - `{label|prompt}` separates visible label from queued prompt.
 - `{label|prompt|selected_style}` and `{|prompt|selected_style}` accept `primary`, `success`, or `danger`.
+- Fourth-position `1`/`true` disables, `0`/`false` enables; omission means enabled. JSON uses boolean `disabled`. `{|Next||1}` omits label/style; `{Next|||1}` omits prompt/style; `{|||1}` is blank (Telegram receives a non-breaking space). Prefer meaningful labels and retain a useful enabled action. Enabled CML requires a prompt. Disabled controls stay visible but have no callback, queued prompt, or bound-method invocation.
 - Top-level cells form vertical rows; one nested row groups horizontal peers.
-- Prefer one matrix comment for the complete surface.
+- Prefer one matrix per related group. Fenced blocks stay in place in Rich mode; HTML compatibility moves them to the footer. Native rows allow eight buttons. Malformed/oversized/unclosed blocks activate nothing; drafts hide them. Outer code fences and quoted/indented examples remain literal.
+- Both placements share prompt/app routing. In-body clicks acknowledge without recoloring; selected-style highlighting remains footer-only.
+
+A single in-body button (the four-backtick wrapper below makes this a literal example):
+
+````markdown
+```telegram_button
+{📖 Details|Explain this section.}
+```
+````
 
 ```html
 <!-- telegram_button [{▶️ Continue|Continue the current plan.}[{✅ Approve|Approve this.}{❌ Reject|Reject this.}]] -->
 <!-- telegram_button {"label":"💡 Explain","prompt":"Explain this.\nInclude the risks."} -->
 ```
 
-Proactively use `generated-control-surface` whenever controls can materially shorten likely feedback; once active, it must emit useful buttons rather than prose alone. That Skill owns action composition; this Skill owns Telegram serialization and delivery. If buttons form the whole reply, the bridge supplies the standard choice heading.
+Proactively use `generated-control-surface` whenever controls can materially shorten likely feedback; once active, it must emit useful buttons rather than prose alone. That Skill owns action composition; this Skill owns Telegram serialization and delivery. Footer-only replies receive the standard choice heading.
 
 ### Voice
 
@@ -113,6 +124,6 @@ Before replying:
 
 - Use the ordinary path for the current target and direct tools only for explicit other delivery.
 - Attach requested files rather than only mentioning them.
-- Keep action comments top-level, complete, and canonical: CML first, JSON when necessary.
-- Give every button a self-contained prompt; preserve confirmation for dangerous actions.
+- Keep action comments and button fences top-level, complete, and canonical: CML first, JSON when necessary; either syntax may coexist within one matrix.
+- Give every enabled button a self-contained prompt; preserve confirmation for dangerous actions.
 - Expose no secret or hidden reasoning.

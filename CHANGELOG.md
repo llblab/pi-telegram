@@ -2,6 +2,12 @@
 
 > Each release keeps at most 8 outcome records of at most 512 characters.
 
+## 0.43.0: Native Button Blocks
+
+- `In-Body Controls`: Renders standalone `telegram_button` fences as native button rows between paragraphs using the same singleton/mixed JSON/CML grammar and callback ownership as footer comments. Invalid/incomplete blocks register nothing, previews hide action payloads, literal examples remain inert, and HTML mode moves controls to the footer. In-body clicks acknowledge without recoloring; operator-confirmed current-client smoke passed; cross-client/follower checks remain pending.
+- `Bot API Reference`: Corrects the local `sendRichMessageDraft` table against Bot API 10.3 with generation-stop parameters and draft replacement semantics, updates affected Skill indexes, and checks parity of stop-control documentation across both draft methods. Runtime generation controls are unchanged.
+- `Disabled Controls`: Adds boolean JSON disabled state and the fourth CML button atom (`1`/`true` disables, `0`/`false` enables), including label-only `{Next|||1}` and blank `{|||1}` cells with no prompt or selected style. Disabled buttons stay visible without callback registration, prompt admission, or app invocation; shared keyboard types, Generative Apps, and agent Skills follow the same contract.
+
 ## 0.42.4: Thread Recovery Hotfix
 
 - `Thread Restore`: Retains validated source and chooser identity when callback messages omit thread metadata, hides Restore in threadless/All choosers and explains how to supply a destination, rejects conflicting Restore instead of forwarding to the old target, and treats confirmed already-deleted chooser cleanup as complete without redispatch.

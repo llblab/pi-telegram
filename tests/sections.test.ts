@@ -680,6 +680,6 @@ test("buildTelegramSettingsMenuReplyMarkup injects extension settings rows", asy
       "🔧 Core (Beta)",
     ],
   );
-  assert.ok(rows[7][0].callback_data.startsWith("section:"));
-  assert.ok(rows[8][0].callback_data.startsWith("section:"));
+  assert.ok(rows[7][0].callback_data?.startsWith("section:"));
+  assert.ok(rows[8][0].callback_data?.startsWith("section:"));
 });

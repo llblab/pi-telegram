@@ -2,7 +2,7 @@
 name: telegram-bot
 description: Local Telegram Bot API reference lookup for bot transport, updates, forum topics, Rich and Ephemeral Messages, Communities, media/files, callbacks, reactions, and Bot API method capability checks.
 metadata:
-  version: 1.2.0
+  version: 1.2.1
 ---
 
 # Telegram Bot API Reference Skill
@@ -45,11 +45,11 @@ Use the reference through multiple indexing dimensions. Do not rely on only one 
 - `L4491-L5019` — Callback/guest answers, bot metadata, gifts/business/story/web app/prepared inline methods.
 - `L5020-L5269` — Updating/deleting regular and ephemeral messages and reaction deletion.
 - `L5270-L5496` — Stickers.
-- `L5497-L6804` — Rich Message formatting, buttons/documents/expandable quotations, send/draft methods, `RichText*`, `RichBlock*`, and `InputRichBlock*`.
-- `L6805-L7352` — Inline mode and `InputMessageContent` variants.
-- `L7353-L7744` — Payments and stars.
-- `L7745-L7920` — Telegram Passport.
-- `L7921-L8009` — Games.
+- `L5497-L6806` — Rich Message formatting, buttons/documents/expandable quotations, send/draft methods, `RichText*`, `RichBlock*`, and `InputRichBlock*`.
+- `L6807-L7354` — Inline mode and `InputMessageContent` variants.
+- `L7355-L7746` — Payments and stars.
+- `L7747-L7922` — Telegram Passport.
+- `L7923-L8011` — Games.
 
 For exact section boundaries, run:
 
@@ -74,6 +74,7 @@ Before relying on prior knowledge, check the freshness layer when work touches n
    - Type/method definition: exact field/parameter shape.
    - Runtime route: which `Update` or method response can carry it.
 6. Treat unobserved client behavior as live-gated even when the Bot API surface is documented.
+7. When a lookup reveals a concrete reference error, verify the exact upstream method/type and changelog, then correct the local section and affected line indexes. A current changelog header alone does not prove the method tables are current; keep fixes scoped to verified discrepancies.
 
 ### Recent-surface index
 
@@ -93,7 +94,7 @@ Use these recipes when the user asks a product/runtime question rather than nami
 1. Search: `rg -n "message_thread_id|is_topic_message|ForumTopic" .agents/skills/telegram-bot/api.md`.
 2. Read `Message`: `L434-L645` (`offset: 434, limit: 212`).
 3. Read forum topic service objects at `L1362-L1405` and `ForumTopic` at `L2333`.
-4. Read relevant outbound methods: `sendMessage` at `L3282`, media sends at `L3554-L3791`, drafts/actions around `L3958`, Rich sends at `L5890-L5930`.
+4. Read relevant outbound methods: `sendMessage` at `L3282`, media sends at `L3554-L3791`, drafts/actions around `L3958`, Rich sends/drafts at `L5890-L5922`.
 5. Treat missing thread metadata on secondary update types as a reason to use stored message ownership rather than inventing fields.
 
 ### Route callbacks from inline buttons
@@ -102,6 +103,7 @@ Use these recipes when the user asks a product/runtime question rather than nami
 2. Read `CallbackQuery`: `L1847-L1871`.
 3. Read `answerCallbackQuery` at `L4491`.
 4. Cross-check whether callback `message` has enough chat/thread metadata; if not, join with local message ownership.
+5. Rich Message buttons also use `CallbackQuery.data`; do not require `message.reply_markup` as proof that a callback is valid. For in-body rows, look up `RichMessageButton` and `InputRichBlockButtons` by symbol: a native Rich row contains 1–8 buttons. Keep bridge JSON/CML wrappers and placement policy with the bridge Skill, not this API reference.
 
 ### Handle reactions safely
 
@@ -121,8 +123,8 @@ Use these recipes when the user asks a product/runtime question rather than nami
 ### Use Rich Messages and drafts
 
 1. Read Rich Message overview and formatting examples: `L5497-L5640`.
-2. Read `RichMessage`, `InputRichMessage`, media references, and send/draft methods: `L5859-L5930`.
-3. Read incoming `RichText`/`RichBlock` unions around `L5939-L6536` and outgoing `InputRichBlock*` at `L6537-L6804`.
+2. Read `RichMessage`, `InputRichMessage`, media references, and send/draft methods: `L5859-L5922`.
+3. Read incoming `RichText`/`RichBlock` unions around `L5941-L6538` and outgoing `InputRichBlock*` at `L6539-L6806`.
 4. Search for the exact primitive: `rg -n "RichMessageButton|RichTextButton|InputRichBlockButtons|InputRichBlockDocument|InputRichBlockExpandableBlockQuotation|InputRichBlockThinking|InputRichMessageMedia" .agents/skills/telegram-bot/api.md`.
 5. Mark client rendering/draft UX as live verification unless already observed.
 
@@ -160,7 +162,7 @@ Use these recipes when the user asks a product/runtime question rather than nami
 1. Read guest message fields on `Message`: `L434-L645`, then search `guest_query_id`.
 2. Read `SentGuestMessage` at `L2891`.
 3. Read `answerGuestQuery` at `L4507-L4518`.
-4. For inline mode, read `L6805-L7297` and search `InputMessageContent`.
+4. For inline mode, read `L6807-L7299` and search `InputMessageContent`.
 
 ## Cross-Cutting Field Matrix
 
@@ -170,7 +172,7 @@ Use these recipes when the user asks a product/runtime question rather than nami
 | `reply_parameters` | `ReplyParameters` `L646-L662` | Send/copy/forward methods that attach replies |
 | `reply_markup` | Keyboard markups `L1676-L1778`, `InlineKeyboardButton` / `DisabledButton` `L1779-L1846` | Send/edit methods and callback routing |
 | `rich_message` | `Message` `L434-L645`, `RichMessage` `L5859-L5867` | `sendRichMessage`, `sendRichMessageDraft`, `editMessageText` |
-| Rich outgoing blocks/media | `InputRichMessage` / `InputRichMessageMedia` `L5868-L5889`, `InputRichBlock*` `L6537-L6804` | `sendRichMessage`, `sendRichMessageDraft`, `editMessageText` |
+| Rich outgoing blocks/media | `InputRichMessage` / `InputRichMessageMedia` `L5868-L5889`, `InputRichBlock*` `L6539-L6806` | `sendRichMessage`, `sendRichMessageDraft`, `editMessageText` |
 | Ephemeral identity | `Message` around `L434`, `ReplyParameters` `L646`, `EphemeralMessageParameters` `L663` | Supported send methods, `sendRichMessage`, `editEphemeralMessage*`, `deleteEphemeralMessage` |
 | Draft stopping | `Update` `L221-L256`, `MessageGenerationStopped` `L1185-L1193` | `sendMessageDraft`, `sendRichMessageDraft` |
 | Community membership | `ChatFullInfo` `L382-L433`, service objects `L1342-L1365`, `Community` `L1880-L1889` | Added, removed, and joined observations |

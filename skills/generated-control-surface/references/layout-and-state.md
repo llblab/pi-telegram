@@ -10,7 +10,7 @@ Model the surface as ordered ragged rows, not a rectangle to fill. Infer indepen
 - A horizontal pair is earned only by genuine peers with unmistakably compact labels and no plausible wrapping or truncation.
 - Three through five columns are for short symbols, coordinates, glyphs, or codes whose position carries meaning.
 - Six through eight columns require single-glyph or similarly minimal position-bearing labels. Never exceed eight columns on a phone surface.
-- Vary row width intentionally; never pad with empty, duplicate, or no-op controls.
+- Vary row width intentionally; never pad for symmetry with empty, duplicate, or no-op controls. A blank disabled cell is appropriate only when it represents a real unavailable position in a spatial grid.
 - Preserve reading order: orientation/navigation, primary content or choices, secondary controls, then separated destructive actions.
 - Rectangular grids require genuine spatial or coordinate correspondence. Vertical continuity may justify many rows; non-spatial button walls should paginate or group.
 
@@ -32,4 +32,6 @@ Keep trivial state in conversation. Persist a small human-auditable artifact whe
 
 Evaluate repeated clicks against current state, not stale button appearance. Preserve tap-ahead when the transport queues each click independently. In source-then-destination interaction, retain the source selection without duplicating the whole surface; regenerate after a completed transition, invalid input, or evidence that the transport cannot preserve the intermediate view.
 
-Omit unavailable controls when layout does not matter. Preserve occupied or selected cells when spatial topology depends on stable coordinates.
+Omit unavailable controls when layout does not matter. Preserve occupied or selected cells when spatial topology depends on stable coordinates, using the transport's disabled state without a fabricated prompt. Keep a useful enabled navigation or inspection action.
+
+Place each control group beside the content it governs when in-body blocks are supported; keep global navigation and whole-view actions in the footer. Do not duplicate one action in both positions merely for visibility. Row topology and current-state validation stay the same across compact and named representations and across placements; renderer limits and selection feedback belong to the transport.

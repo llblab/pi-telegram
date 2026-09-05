@@ -245,7 +245,10 @@ export default function (pi: Pi.ExtensionAPI) {
     Config.createTelegramProactivePushChatIdGetter(proactivePushTargetGetter);
   const buttonActionStore = Outbound.createTelegramButtonActionStore();
   const planGenerativeAppOutput =
-    Outbound.createTelegramOutboundReplyPlanner(buttonActionStore);
+    Outbound.createTelegramOutboundReplyPlanner(
+      buttonActionStore,
+      configControls.getAssistantRenderingMode,
+    );
   const pendingModelSwitchStore =
     Model.createPendingModelSwitchStore<
       Model.ScopedTelegramModel<ActivePiModel>

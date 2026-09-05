@@ -518,7 +518,10 @@ export function registerTelegramCommandsAndTools({
   GenerativeApps.registerTelegramBindTool(pi, {
     agentDir,
     getActiveTurn: activeTurnRuntime.get,
-    planOutput: OutboundHandlers.createTelegramOutboundReplyPlanner(buttonActionStore),
+    planOutput: OutboundHandlers.createTelegramOutboundReplyPlanner(
+      buttonActionStore,
+      Config.createTelegramConfigControls(configStore).getAssistantRenderingMode,
+    ),
     sendMarkdownReply,
     recordRuntimeEvent,
   });
@@ -538,7 +541,10 @@ export function registerTelegramCommandsAndTools({
     routeAgentMessage,
     canSendDirect,
     planMessage:
-      OutboundHandlers.createTelegramOutboundReplyPlanner(buttonActionStore),
+      OutboundHandlers.createTelegramOutboundReplyPlanner(
+        buttonActionStore,
+        Config.createTelegramConfigControls(configStore).getAssistantRenderingMode,
+      ),
     sendMarkdownMessage: (chatId, markdown, options) =>
       sendMarkdownReply(chatId, undefined, markdown, options),
     recordRuntimeEvent,
@@ -854,7 +860,10 @@ export function registerTelegramLifecycleRuntimeHooks({
     });
   };
   const outboundReplyPlanner =
-    OutboundHandlers.createTelegramOutboundReplyPlanner(buttonActionStore);
+    OutboundHandlers.createTelegramOutboundReplyPlanner(
+      buttonActionStore,
+      getAssistantRenderingMode,
+    );
   const voiceReplySenderDeps = {
     execCommand: CommandTemplates.execCommandTemplate,
     sendMultipart: callMultipart,

@@ -49,7 +49,7 @@ An app name is a unique lowercase ASCII identifier accepted by the runtime's pat
 
 ## Inference-Bypass Syntax
 
-Compact Matrix Literal and full JSON buttons keep their existing `label + prompt` contract. A bound action is encoded entirely in the prompt string:
+Compact Matrix Literal and full JSON buttons keep their existing `label + prompt` contract. App output may use hidden `telegram_button` comments for footer controls or standalone triple-backtick `telegram_button` blocks between paragraphs; both singleton cells and mixed matrices retain the same generation/revision-bound routing. In-body controls acknowledge clicks without recoloring the message; HTML compatibility moves them to the footer. A bound action is encoded entirely in the prompt string:
 
 ```ebnf
 bound-action = app "::" method [ "(" json-value ")" ]
@@ -83,7 +83,7 @@ Equivalent JSON:
 ]
 ```
 
-`app` is not a button property. Both representations normalize to the same prompt string, and routing happens afterward.
+`app` is not a button property. Both representations normalize to the same prompt string, and routing happens afterward. The shared [button grammar](./compact-matrix-literal.md) also supports disabled controls: `{Call|||1}` or JSON `{"label":"Call","disabled":true}`. A disabled cell needs no method prompt or selected style; `{|||1}` is an intentional blank disabled cell. These remain visible but register no callback or bound action. App methods must still validate current state when invoked through an enabled control or another supported entrypoint; disabled presentation is not an authorization boundary.
 
 The double colon is the inference-bypass operator: it routes a generated prompt control to a registered deterministic owner before Pi queue admission. Native extension callbacks retain their existing single-colon grammar:
 
