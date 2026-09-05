@@ -21,6 +21,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   isTelegramApiCommitUnknownError,
@@ -329,7 +330,10 @@ export function createTelegramCleanupTargetProtection(
   const reservations = store.listReservations?.() ?? [];
   const provisions = store.listPendingProvisions?.() ?? [];
   const intents = store.listPendingCleanups?.() ?? [];
-  const sameSnapshot = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
+  // Persistence may reconstruct keys in another order and omit undefined
+  // optional fields; neither changes the authority represented by a snapshot.
+  const sameSnapshot = (left: unknown, right: unknown): boolean =>
+    isDeepStrictEqual(JSON.parse(JSON.stringify(left)), JSON.parse(JSON.stringify(right)));
   return (target, action) => {
     for (const record of store.list()) {
       if (!targetMatches(record.target, target)) continue;

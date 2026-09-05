@@ -80,6 +80,19 @@ test("Every destructive cleanup origin preserves a target acquired before or dur
   }
 });
 
+test("Cleanup ownership survives equivalent record reconstruction but rejects changed binding identity", () => {
+  const target = { chatId: 100, threadId: 42 };
+  const original: TelegramTopicTargetRecord = { profileKey: "leader", instanceId: "owner", target, status: "active", createdAtMs: 1, updatedAtMs: 1, lastError: undefined };
+  let records = [original];
+  const intent = { id: "cleanup", owner: "leader" as const, instanceId: "owner", runtimeGeneration: "generation", target, requestedAtMs: 2 };
+  const guard = createTelegramCleanupTargetProtection({ list: () => records, listPendingCleanups: () => [intent] }, original);
+  const action: ThreadReconciliationAction = { kind: "close-delete-graceful-shutdown-topic", reason: "graceful-shutdown", target, cleanupIntentId: intent.id, instanceId: intent.instanceId, runtimeGeneration: intent.runtimeGeneration };
+  records = [JSON.parse(JSON.stringify(Object.fromEntries(Object.entries(original).reverse()))) as TelegramTopicTargetRecord];
+  assert.equal(guard(target, action), false, "key order is not a binding replacement");
+  records = [{ ...records[0]!, instanceId: "replacement" }];
+  assert.equal(guard(target, action), true, "a replacement remains protected");
+});
+
 const nowMs = 10_000;
 
 function record(
