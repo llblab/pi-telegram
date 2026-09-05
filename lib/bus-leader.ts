@@ -135,6 +135,7 @@ export interface TelegramBusFollowerTargetProvisionerDeps {
 export interface TelegramBusFollowerDisconnectHandlerDeps {
   topicTargetStore: Pick<
     Threads.TelegramTopicTargetStore,
+    | "list"
     | "markStaleByTarget"
     | "persist"
     | "upsertPendingCleanup"
@@ -726,6 +727,7 @@ export function createTelegramBusFollowerTargetProvisioner(
               ],
             }),
             {
+              isCleanupTargetProtected: Threads.createTelegramCleanupTargetProtection(deps.topicTargetStore),
               callApi: deps.callApi,
               markStaleByTarget(target, syncStatus, lastSyncError) {
                 return deps.topicTargetStore.markStaleByTarget(
@@ -805,16 +807,21 @@ function createTelegramBusFollowerCleanupHandler(
       target: { chatId: target.chatId, threadId: target.threadId },
       requestedAtMs: (deps.getNowMs ?? Date.now)(),
     };
+    const departingRecord = deps.topicTargetStore.list().find((record) => record.instanceId === follower.instanceId &&
+      record.target.chatId === target.chatId && record.target.threadId === target.threadId);
+    const isCleanupTargetProtected = Threads.createTelegramCleanupTargetProtection(deps.topicTargetStore, departingRecord);
     deps.topicTargetStore.upsertPendingCleanup(intent);
     await deps.topicTargetStore.persist();
+    const cleanupPlan = ThreadReconciler.planThreadReconciliation({
+      nowMs: (deps.getNowMs ?? Date.now)(),
+      currentLeaderEpoch: leaderEpoch,
+      records: [],
+      pendingCleanups: [intent],
+    });
     const cleanup = await ThreadReconciler.applyThreadReconciliationPlan(
-      ThreadReconciler.planThreadReconciliation({
-        nowMs: (deps.getNowMs ?? Date.now)(),
-        currentLeaderEpoch: leaderEpoch,
-        records: [],
-        pendingCleanups: [intent],
-      }),
+      cleanupPlan,
       {
+        isCleanupTargetProtected,
         callApi: deps.callApi,
         markStaleByTarget: deps.topicTargetStore.markStaleByTarget,
         removeCleanupIntentById: deps.topicTargetStore.removePendingCleanup,
@@ -823,6 +830,7 @@ function createTelegramBusFollowerCleanupHandler(
         recordRuntimeEvent: deps.recordRuntimeEvent,
       },
     );
+    if (cleanupPlan.actions.some((action) => isCleanupTargetProtected(action.target, action))) return;
     if (cleanup.incompleteActions?.length) {
       throw new Error(
         "Telegram follower thread deletion was not confirmed; reconnect the leader to retry cleanup.",
@@ -916,6 +924,7 @@ export function createTelegramBusLeaderTargetProvisioner<TContext>(
     });
     deps.recordThreadReconciliationPlan?.(pendingCleanupPlan);
     const cleanupPorts = {
+      isCleanupTargetProtected: Threads.createTelegramCleanupTargetProtection(deps.topicTargetStore),
       callApi: deps.callApi,
       markStaleByTarget: deps.topicTargetStore.markStaleByTarget,
       removeCleanupIntentById: deps.topicTargetStore.removePendingCleanup,

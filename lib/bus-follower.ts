@@ -390,9 +390,8 @@ export interface TelegramBusFollowerTargetReplacementHandlerDeps<TContext> {
   >;
   registrationState: Pick<
     TelegramBusFollowerRegistrationState,
-    "getTarget" | "setRegistered"
-  > &
-    Partial<Pick<TelegramBusFollowerRegistrationState, "getGeneration">>;
+    "getTarget" | "setRegistered" | "getGeneration"
+  >;
   instanceId: string;
   getManualFollowerProfileKey: () => string;
   manualFollowerOwnerId: string;
@@ -471,6 +470,7 @@ export interface TelegramBusForwardedUpdateReceiverRuntimeDeps<TContext> {
       target: TelegramTarget & { threadId: number };
       oldTarget?: TelegramTarget & { threadId: number };
       reason: "thread-restore";
+      registrationGeneration: string;
     },
     ctx: TContext,
   ) => Promise<void> | void;
@@ -569,26 +569,35 @@ export function createTelegramBusFollowerTargetReplacementHandler<TContext>(
 > {
   const getNowMs = deps.getNowMs ?? Date.now;
   return async (input, ctx) => {
+    const assertCurrent = (expectedTarget = input.oldTarget): void => {
+      const target = deps.registrationState.getTarget();
+      if (!input.registrationGeneration ||
+        deps.registrationState.getGeneration() !== input.registrationGeneration ||
+        !input.oldTarget || !expectedTarget || target?.chatId !== expectedTarget.chatId ||
+        target.threadId !== expectedTarget.threadId ||
+        input.target.chatId !== input.oldTarget.chatId ||
+        input.target.threadId === input.oldTarget.threadId) {
+        throw new Error("Stale Telegram follower target replacement authority.");
+      }
+    };
+    assertCurrent();
     await deps.topicTargetStore.load();
+    assertCurrent();
     const nowMs = getNowMs();
     const currentRecord = Threads.findCurrentTelegramInstanceThreadRecord({
       records: deps.topicTargetStore.list(),
       instanceId: deps.instanceId,
-      preferredTarget: input.oldTarget ?? deps.registrationState.getTarget(),
+      preferredTarget: input.oldTarget,
     });
-    if (input.oldTarget) {
-      deps.topicTargetStore.markStaleByTarget(
-        input.oldTarget,
-        "deleted",
-        "Follower thread was replaced by thread restore.",
-      );
-    } else if (currentRecord) {
-      deps.topicTargetStore.markStaleByTarget(
-        currentRecord.target,
-        "deleted",
-        "Follower thread was replaced by thread restore.",
-      );
+    if (currentRecord && (currentRecord.target.chatId !== input.oldTarget!.chatId ||
+      currentRecord.target.threadId !== input.oldTarget!.threadId)) {
+      throw new Error("Stale Telegram follower binding replacement target.");
     }
+    deps.topicTargetStore.markStaleByTarget(
+      input.oldTarget!,
+      "deleted",
+      "Follower thread was replaced by thread restore.",
+    );
     const profileKey =
       currentRecord?.profileKey ?? deps.getManualFollowerProfileKey();
     deps.topicTargetStore.upsert({
@@ -612,15 +621,16 @@ export function createTelegramBusFollowerTargetReplacementHandler<TContext>(
     deps.registrationState.setRegistered(true, input.target, {
       slot: currentRecord?.slot,
       threadName: currentRecord?.threadName,
-      generation: deps.registrationState.getGeneration?.(),
+      generation: input.registrationGeneration,
     });
+    await deps.topicTargetStore.persist();
+    assertCurrent(input.target);
     deps.setSyncState(
       Sync.markTelegramSyncSliceFresh(deps.getSyncState(), "target-bindings", {
         nowMs,
         action: "follower-thread-restore",
       }),
     );
-    await deps.topicTargetStore.persist();
     deps.updateStatus(ctx);
     deps.recordRuntimeEvent?.(
       "bus",
@@ -1992,6 +2002,7 @@ export function createTelegramBusForwardedUpdateReceiverRuntime<TContext>(
               target: envelope.target,
               ...(envelope.oldTarget ? { oldTarget: envelope.oldTarget } : {}),
               reason: envelope.reason,
+              registrationGeneration,
             },
             ctx,
           );

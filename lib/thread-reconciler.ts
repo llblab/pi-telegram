@@ -202,6 +202,7 @@ export interface ThreadReconciliationApplyResult {
 }
 
 export interface ThreadReconciliationApplyPorts {
+  isCleanupTargetProtected?: (target: ThreadTarget, action: ThreadReconciliationAction) => boolean;
   callApi?: <TResponse>(
     method: string,
     body: Record<string, unknown>,
@@ -576,6 +577,7 @@ export async function applyThreadReconciliationPlan(
         incompleteActions.push(action);
         continue;
       }
+      if (ports.isCleanupTargetProtected?.(action.target, action)) continue;
       let closeConfirmed = false;
       try {
         await ports.callApi("closeForumTopic", {
@@ -598,6 +600,7 @@ export async function applyThreadReconciliationPlan(
         incompleteActions.push(action);
         continue;
       }
+      if (ports.isCleanupTargetProtected?.(action.target, action)) continue;
       const changed =
         ports.markStaleByTarget?.(action.target, "closed") ?? false;
       if (changed) persistFences.push(action);
@@ -632,7 +635,12 @@ export async function applyThreadReconciliationPlan(
         continue;
       }
       let deleteConfirmed = false;
+      let superseded = false;
       for (const method of ["closeForumTopic", "deleteForumTopic"]) {
+        if (ports.isCleanupTargetProtected?.(action.target, action)) {
+          superseded = true;
+          break;
+        }
         if (shouldSkipForStaleLeaderEpoch(action, ports)) break;
         try {
           await ports.callApi(method, {
@@ -658,6 +666,15 @@ export async function applyThreadReconciliationPlan(
       }
       if (shouldSkipForStaleLeaderEpoch(action, ports)) {
         incompleteActions.push(action);
+        continue;
+      }
+      if (superseded || ports.isCleanupTargetProtected?.(action.target, action)) {
+        ports.recordRuntimeEvent?.("telegram", "Cancelled cleanup of a protected Telegram target", {
+          phase: "thread-reconciler-cleanup-target-reused",
+          action: action.kind,
+          chatId: action.target.chatId,
+          threadId: action.target.threadId,
+        });
         continue;
       }
       if (!deleteConfirmed) {

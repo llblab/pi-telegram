@@ -2,6 +2,12 @@
 
 > Each release keeps at most 8 outcome records of at most 512 characters.
 
+## 0.42.4: Thread Recovery Hotfix
+
+- `Thread Restore`: Retains validated source and chooser identity when callback messages omit thread metadata, hides Restore in threadless/All choosers and explains how to supply a destination, rejects conflicting Restore instead of forwarding to the old target, and treats confirmed already-deleted chooser cleanup as complete without redispatch.
+- `Target Safety`: Rechecks cleanup ownership before close/delete and local retirement across restore, disconnect, and provisioning paths; a rebound target is not deleted, invalidated, or reserved by obsolete cleanup. Follower restore rechecks registration generation and expected target after IPC, store-load, and persistence waits.
+- `Stale Delivery`: Direct replies, menus, activity, edits, and multipart sends capture exact stale-target authority; guarded invalidation rechecks generation, profile, binding, and snapshot revision at the synchronous durable commit without replaying failed sends or redirecting accepted work.
+
 ## 0.42.3: Agent Diagnostics Hotfix
 
 - `Agent Diagnostics`: Identifies `/telegram-status` as a Pi TUI command and routes agents without command access directly to the redacted diagnostic files instead of attempting a shell executable; runtime behavior and STT fallback remain unchanged.

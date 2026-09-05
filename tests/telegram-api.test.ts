@@ -70,6 +70,26 @@ function createApiErrorResponse(
   } as Response;
 }
 
+test("Message deletion accepts only typed exact HTTP 400 already-absent evidence", async () => {
+  for (const [status, description, succeeds] of [
+    [400, "Bad Request: message to delete not found", true],
+    [403, "Bad Request: message to delete not found", false],
+    [400, "Bad Request: message can't be deleted", false],
+  ] as const) {
+    const restoreFetch = setApiTestFetch(async () => createApiErrorResponse(status, description));
+    try {
+      const runtime = createDefaultTelegramBridgeApiRuntime({
+        getBotToken: () => "test-token",
+        recordRuntimeEvent: () => {},
+      });
+      if (succeeds) await runtime.deleteMessage(100, 99);
+      else await assert.rejects(runtime.deleteMessage(100, 99));
+    } finally {
+      restoreFetch();
+    }
+  }
+});
+
 function createMalformedApiTextResponse(text: string): Response {
   return {
     ok: true,

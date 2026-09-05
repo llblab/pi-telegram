@@ -400,6 +400,15 @@ export default function (pi: Pi.ExtensionAPI) {
     TelegramApi.createDefaultTelegramBridgeApiRuntime({
       getBotToken: configStore.getBotToken,
       recordRuntimeEvent,
+      captureRequestErrorHandler(body) {
+        return Sync.captureTelegramStaleTargetRequestRecovery(body, {
+          ...staleTopicApiErrorRecoveryDeps,
+          getCurrentLeaderEpoch,
+          getSessionGeneration: telegramSessionContextStore.getGeneration,
+          getProfileName: configStore.getActiveProfileName,
+          onRecovered: runtimeDiagnostics.scheduleSnapshotPersist,
+        });
+      },
     });
   const telegramBusFollowerClients =
     BusFollower.createTelegramBusFollowerClientRuntime<

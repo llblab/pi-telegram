@@ -48,6 +48,51 @@ import {
   TelegramApiCommitUnknownError,
 } from "../lib/telegram-api.ts";
 
+test("Stale-target invalidation fences the durable commit and preserves a replacement binding", async () => {
+  for (const race of ["none", "generation", "binding", "ownership"] as const) {
+    const root = await mkdtemp(join(tmpdir(), "telegram-invalidation-"));
+    const path = join(root, "state.json");
+    let generation = 1;
+    let atCommit: (() => void) | undefined;
+    let owns = true;
+    const target = { chatId: 100, threadId: 42 };
+    const record = { profileKey: "cwd:/repo", owner: { kind: "leader" as const, cwd: "/repo", instanceId: "a" }, instanceId: "a", target, status: "active" as const, createdAtMs: 1, updatedAtMs: 1 };
+    const store = createTelegramTopicTargetStore({
+      path,
+      commitPersist: (commit) => {
+        atCommit?.();
+        if (!owns) return false;
+        commit();
+        return true;
+      },
+    });
+    try {
+      store.upsert(record);
+      await store.persist();
+      atCommit = () => {
+        assert.equal(store.list()[0]?.instanceId, "a", "invalidation must not publish before commit");
+        if (race === "generation") generation++;
+        if (race === "binding") store.upsert({ ...record, instanceId: "b", owner: { ...record.owner, instanceId: "b" }, updatedAtMs: 2 });
+        if (race === "ownership") owns = false;
+      };
+      const applied = await store.invalidateTarget(target, () => generation === 1 && store.list()[0]?.instanceId === "a", "confirmed stale target");
+      assert.equal(applied, race === "none");
+      const disk = JSON.parse(await readFile(path, "utf8"));
+      assert.equal(disk.threads.length, race === "none" ? 0 : 1);
+      assert.equal(store.list().length, race === "none" ? 0 : 1);
+      assert.equal(store.listSyncObservations().some((entry) => entry.syncStatus === "deleted"), race === "none");
+      if (race === "binding") {
+        assert.equal(store.list()[0]?.instanceId, "b");
+        atCommit = undefined;
+        await store.persist();
+        assert.equal(JSON.parse(await readFile(path, "utf8")).threads[0]?.instanceId, "b");
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("Thread owner keys isolate named Telegram profiles without changing default keys", () => {
   assert.equal(
     getTelegramThreadOwnerKey({
@@ -2807,6 +2852,32 @@ test("Own bus topic provisioner assigns a leader topic through the common provis
     );
   } finally {
     await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("Previous-leader cleanup cannot invalidate or reserve a target rebound during close", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "telegram-rebound-leader-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+  const old = { profileKey: "leader:old", owner: { kind: "leader" as const, instanceId: "old" }, target: { chatId: 7, threadId: 10 }, instanceId: "old", status: "active" as const, createdAtMs: 1, updatedAtMs: 1, slot: "A" };
+  const calls: string[] = [];
+  try {
+    store.upsert(old);
+    store.upsert({ profileKey: "manual:new", owner: { kind: "manual-follower", instanceId: "new" }, target: { chatId: 7, threadId: 12 }, instanceId: "new", status: "active", createdAtMs: 1, updatedAtMs: 1, slot: "C" });
+    await store.persist();
+    await provisionOwnBusTopic({
+      getAllowedUserId: () => 7, instanceId: "new", cwd: "/repo", store,
+      callApi: async <T>(method: string) => {
+        calls.push(method);
+        if (method === "closeForumTopic") store.upsert({ ...old, instanceId: "replacement", updatedAtMs: 2 });
+        return { message_thread_id: 99 } as T;
+      },
+      recordEvent: () => {},
+    });
+    assert.deepEqual(calls, ["closeForumTopic"]);
+    assert.equal(store.list().find((record) => record.target.threadId === 10)?.instanceId, "replacement");
+    assert.equal(store.listReservations().some((record) => record.target.threadId === 10), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

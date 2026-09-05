@@ -1450,18 +1450,25 @@ export function createTelegramBusFollowerThreadRestoreHandler(
   return async ({ record, target, oldTarget }) => {
     if (!record.instanceId) return false;
     const follower = deps.followerRegistry.get(record.instanceId);
-    if (!follower) return false;
+    if (!follower?.registrationGeneration || !oldTarget ||
+      follower.target?.chatId !== oldTarget.chatId ||
+      follower.target.threadId !== oldTarget.threadId ||
+      target.chatId !== oldTarget.chatId || target.threadId === oldTarget.threadId) return false;
     const replaced = await deps.followerTargetController.replaceTarget({
       follower,
       target,
       oldTarget,
       reason: "thread-restore",
     });
-    if (!replaced) return false;
+    const current = deps.followerRegistry.get(record.instanceId);
+    if (!replaced || !current ||
+      current.registrationGeneration !== follower.registrationGeneration ||
+      current.target?.chatId !== oldTarget.chatId ||
+      current.target.threadId !== oldTarget.threadId) return false;
     deps.followerRegistry.register({
-      ...follower,
+      ...current,
       target,
-      connectedAtMs: follower.connectedAtMs,
+      connectedAtMs: current.connectedAtMs,
     });
     deps.onRestored?.();
     return true;

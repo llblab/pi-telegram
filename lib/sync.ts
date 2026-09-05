@@ -4,10 +4,11 @@
  * Owns pure contracts for deciding when local Telegram mirror state should be refreshed without querying Telegram on every action
  */
 
-import { getTelegramApiErrorRequestTarget } from "./telegram-api.ts";
+import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError } from "./telegram-api.ts";
 import { getTelegramTargetKey, type TelegramTarget } from "./target.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import {
+  createTelegramCleanupTargetProtection,
   getTelegramTargetFromApiBody,
   isTelegramTopicTargetStaleError,
   provisionOwnBusTopic,
@@ -121,6 +122,7 @@ export interface TelegramManualThreadDisconnectDeps<TSyncState> {
     | undefined;
   topicTargetStore: Pick<
     TelegramTopicTargetStore,
+    | "list"
     | "markStaleByTarget"
     | "persist"
     | "upsertPendingCleanup"
@@ -247,16 +249,21 @@ export function createTelegramManualThreadDisconnectHandler<
           target,
           requestedAtMs: (deps.getNowMs ?? Date.now)(),
         };
+        const departingRecord = deps.topicTargetStore.list().find((record) => record.instanceId === currentRecord.instanceId &&
+          record.target.chatId === target.chatId && record.target.threadId === target.threadId);
+        const isCleanupTargetProtected = createTelegramCleanupTargetProtection(deps.topicTargetStore, departingRecord);
         deps.topicTargetStore.upsertPendingCleanup(intent);
         await deps.topicTargetStore.persist();
+        const cleanupPlan = ThreadReconciler.planThreadReconciliation({
+          nowMs: (deps.getNowMs ?? Date.now)(),
+          currentLeaderEpoch: leaderEpoch,
+          records: [],
+          pendingCleanups: [intent],
+        });
         const cleanup = await ThreadReconciler.applyThreadReconciliationPlan(
-          ThreadReconciler.planThreadReconciliation({
-            nowMs: (deps.getNowMs ?? Date.now)(),
-            currentLeaderEpoch: leaderEpoch,
-            records: [],
-            pendingCleanups: [intent],
-          }),
+          cleanupPlan,
           {
+            isCleanupTargetProtected,
             callApi(method, body) {
               return deps.callApi(method, body);
             },
@@ -277,6 +284,9 @@ export function createTelegramManualThreadDisconnectHandler<
             recordRuntimeEvent: deps.recordRuntimeEvent,
           },
         );
+        if (cleanupPlan.actions.some((action) => isCleanupTargetProtected(action.target, action))) {
+          return "Thread disconnect superseded by a new binding.";
+        }
         cleanupPending = Boolean(cleanup.incompleteActions?.length);
       }
       const leaderTarget = deps.getLeaderTarget();
@@ -404,7 +414,7 @@ export interface TelegramStaleTopicApiErrorRecoveryDeps<TSyncState> {
   topicTargetStore: Pick<
     TelegramTopicTargetStore,
     "load" | "markStaleByTarget" | "persist"
-  >;
+  > & Partial<Pick<TelegramTopicTargetStore, "invalidateTarget">>;
   getSyncState: () => TSyncState;
   setSyncState: (state: TSyncState) => void;
   recordEvent: (
@@ -413,6 +423,46 @@ export interface TelegramStaleTopicApiErrorRecoveryDeps<TSyncState> {
     details?: Record<string, unknown>,
   ) => void;
   getNowMs?: () => number;
+  isCurrent?: () => boolean;
+  isAuthorityCurrent?: () => boolean;
+}
+
+export function captureTelegramStaleTargetRequestRecovery<TSyncState extends TelegramSyncState>(
+  body: Record<string, unknown>,
+  deps: TelegramStaleTopicApiErrorRecoveryDeps<TSyncState> & {
+    topicTargetStore: Pick<TelegramTopicTargetStore, "load" | "list" | "markStaleByTarget" | "persist" | "invalidateTarget">;
+    getCurrentLeaderEpoch: () => number | string | undefined;
+    getSessionGeneration: () => number;
+    getProfileName: () => string | undefined;
+    onRecovered: () => void;
+  },
+): ((error: unknown) => Promise<void>) | undefined {
+  const target = getTelegramTargetFromApiBody(body);
+  const epoch = deps.getCurrentLeaderEpoch();
+  if (!target || epoch === undefined) return undefined;
+  const key = getTelegramTargetKey(target);
+  const record = deps.topicTargetStore.list().find((candidate) => getTelegramTargetKey(candidate.target) === key);
+  if (!record) return undefined;
+  const generation = deps.getSessionGeneration();
+  const profile = deps.getProfileName();
+  const isAuthorityCurrent = (): boolean => deps.getCurrentLeaderEpoch() === epoch &&
+    deps.getSessionGeneration() === generation && deps.getProfileName() === profile;
+  const isCurrent = (): boolean => {
+    const current = deps.topicTargetStore.list().find((candidate) => getTelegramTargetKey(candidate.target) === key);
+    return isAuthorityCurrent() &&
+      current?.instanceId === record.instanceId && current?.profileKey === record.profileKey &&
+      current?.updatedAtMs === record.updatedAtMs && current?.createdAtMs === record.createdAtMs;
+  };
+  return async (error) => {
+    const requestTarget = getTelegramApiErrorRequestTarget(error);
+    if (!isTelegramStaleTargetHttpError(error) || !requestTarget ||
+      getTelegramTargetKey(requestTarget) !== key || !isCurrent()) return;
+    if (await recoverStaleTelegramTopicApiError(
+      { chat_id: target.chatId, message_thread_id: target.threadId }, error, { ...deps, isCurrent, isAuthorityCurrent },
+    )) {
+      deps.onRecovered();
+    }
+  };
 }
 
 export function createTelegramStaleTopicApiErrorRecoveryRuntime<
@@ -448,12 +498,16 @@ export async function recoverStaleTelegramTopicApiError<
   deps: TelegramStaleTopicApiErrorRecoveryDeps<TSyncState>,
 ): Promise<boolean> {
   const target = getTelegramTargetFromApiBody(apiBody);
-  if (!target || !isTelegramTopicTargetStaleError(error)) return false;
-  await deps.topicTargetStore.load();
-  if (
-    !deps.topicTargetStore.markStaleByTarget(target, "deleted", String(error))
-  ) {
-    return false;
+  if (!target || !isTelegramTopicTargetStaleError(error) || deps.isCurrent?.() === false) return false;
+  if (deps.isCurrent) {
+    if (!deps.topicTargetStore.invalidateTarget || !await deps.topicTargetStore.invalidateTarget(
+      target, deps.isCurrent, String(error),
+    )) return false;
+    if (deps.isAuthorityCurrent?.() === false) return false;
+  } else {
+    await deps.topicTargetStore.load();
+    if (!deps.topicTargetStore.markStaleByTarget(target, "deleted", String(error))) return false;
+    await deps.topicTargetStore.persist();
   }
   const nowMs = (deps.getNowMs ?? Date.now)();
   let state = markTelegramSyncSliceSuspect(deps.getSyncState(), "topic-state", {
@@ -466,8 +520,12 @@ export async function recoverStaleTelegramTopicApiError<
     reason: "stale-api-error",
     action: "topic-target-stale",
   }) as TSyncState;
+  state = markTelegramSyncSliceSuspect(state, "target-bindings", {
+    nowMs,
+    reason: "stale-api-error",
+    action: "topic-target-stale",
+  }) as TSyncState;
   deps.setSyncState(state);
-  await deps.topicTargetStore.persist();
   deps.recordEvent("bus", error, {
     phase: "topic-target-stale",
     chatId: target.chatId,
@@ -606,6 +664,7 @@ export async function ensureTelegramLeaderThreadBinding(
   });
   deps.recordThreadReconciliationPlan?.(replacementPlan);
   await ThreadReconciler.applyThreadReconciliationPlan(replacementPlan, {
+    isCleanupTargetProtected: createTelegramCleanupTargetProtection(deps.topicTargetStore),
     callApi: deps.callApi,
     markStaleByTarget: (target, syncStatus, lastSyncError) =>
       deps.topicTargetStore.markStaleByTarget(

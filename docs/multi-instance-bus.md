@@ -272,7 +272,7 @@ Non-goal: group detection is not the control-plane model for this extension. Thr
 
 Remaining live-verification points:
 
-- Whether callback query messages always carry `message_thread_id` in private bot threads, or whether generated button callbacks must rely on stored message id -> target ownership.
+- Callback query messages can be `InaccessibleMessage` without `message_thread_id`; reroute controls use stored source/chooser identity, and ordinary generated buttons retain their message-ownership routing. Client-visible Restore and cleanup still require live smoke evidence.
 - Whether message-reaction updates carry thread identity in the current Bot API shape. The reference exposes chat id and message id for reactions, so routing may need stored message ownership.
 - Live client evidence now covers the probe-confirmed single-artifact multipart Rich final through both direct leader and registered follower transport: an assigned follower Telegram turn produced one reply-anchored PNG plus final text without a duplicate upload or notice. Deterministic bus tests additionally cover target-scoped multipart authorization, envelope preservation, and replacement-generation fencing.
 
@@ -412,11 +412,23 @@ All files containing routing, chat ids, thread ids, or process details use priva
 - Destructive follower thread teardown belongs to confirmed `/telegram-disconnect`, graceful Pi quit, or confirmed reconciliation actions, not generic heartbeat pruning. Manual disconnect retains its destructive confirmation and clears restart ownership; quit deletes the tab without prompting when Thread cleanup is enabled (default) but preserves the owner slot independently so a same-directory restart can reclaim leadership. Confirmed leader/follower teardown first persists an exact target/runtime-generation cleanup intent. The active leader attempts deletion under its current epoch; interruption preserves the intent so that leader or a successor can replay it under current authority, and confirmed deletion removes the binding plus intent in the same persisted state transition. If the graceful request is missed, stale heartbeat plus OS-confirmed absence of the exact registered PID may authorize the same cleanup while enabled; this action serializes ahead of replacement registration. Disabled cleanup, silence, heartbeat expiry alone, IPC/auth failure, and live or unknown process liveness remain non-destructive. Incomplete cleanup preserves durable intent for retry. A promoted leader uses its current owned leader epoch even when the inherited record still carries a historical `manual-follower` owner label.
 - Explicit stale/deleted/offline observations invalidate reuse. Process absence affects reuse only through the enabled, exact-PID confirmed-dead cleanup path.
 
-### Thread is deleted
+### Stale thread delivery
 
-- Target mapping becomes stale.
-- On next outbound failure or reconnect, leader records a diagnostic.
-- Depending on policy, recreate a thread or mark the instance as needing operator action.
+Local regression evidence covers continuity and cleanup authority; operator-coordinated live Restore verification remains tracked in [BACKLOG.md](../BACKLOG.md).
+
+- Direct replies, menus, activity, target-aware edits, and multipart transport capture the request target and local authority before sending. Exact typed HTTP 400 stale-thread evidence stages invalidation of only the matching unchanged binding. The thread store rechecks leader/session/profile authority, binding identity, snapshot revisions, and destination path at the synchronous owner-fenced rename; no staged invalidation enters the live projection before durable commit, and a rejected commit preserves newer state.
+- Shared recovery marks topic, target-binding, and transport freshness suspect and schedules a diagnostic snapshot. Accepted local work and its active-turn target remain unchanged; a failed send is not replayed or redirected, and recovery does not create a replacement thread or probe on every send. Errors without a proven request target do not authorize invalidation.
+- Reconnect and explicit Restore remain separate authority-bearing operations. A stale API response proves target failure, not who deleted or closed the thread.
+
+### Restore controls and cleanup
+
+Operator-confirmed client flow: send ordinary text from the **All** tab; Telegram creates a new thread containing that text. Choose **Replace/restore thread…** and the existing Pi instance. Successful leader Restore binds and renames the new thread, dispatches the original message to the same Pi, and removes the old thread. The resulting prompt's thread-name label reflects the restored destination, not proof that the user typed in the old thread. A threadless `/start` is not equivalent to this ordinary-text flow.
+
+The bounded pending reroute owns its original source target and the returned chooser message ID independently from remaining messages. Authenticated callbacks must match the stored chat/chooser and any supplied thread field. `InaccessibleMessage` may omit the thread field; a missing callback message, unknown chooser, conflicting identity, threadless source, or already-owned Restore source fails closed rather than forwarding to the old target. Restart or expiry without that pending identity does not authorize reconstruction from callback data alone. When the original input itself has no thread ID (including an All-tab `/start`), the chooser offers routing only, not Restore; old Restore callbacks explain that a plain message must first be sent in the destination thread. Client tab selection is not inferred from recent topic creation or from the chosen Pi instance.
+
+After dispatch, cleanup retries retain source identity but never redispatch accepted messages. Confirmed typed HTTP 400 `message to delete not found` completes message deletion idempotently; permission and transient failures remain errors. Reroute cleanup rechecks current bindings, live targets, reservations, and pending provisions before close, before delete, and on retry. Other destructive cleanup origins use the shared synchronous target-protection policy: explicit retirement permits only its unchanged departing binding, persisted shutdown intent permits only its original pre-intent binding, and reservation/provision cleanup permits only the corresponding unchanged claim. Protection checks also guard post-API local invalidation, reservation, and disconnect completion. A newly protected target cancels remaining cleanup. Already-issued remote operations cannot be undone by a later local ownership change; checks prevent subsequent effects, not retroactive cancellation.
+
+Follower Restore requires exact registration generation and expected old target both before and after awaited IPC acknowledgement/store loading. Completion also rechecks the restored target and generation after persistence before publishing status or acknowledging success. A mismatched, replaced, or same-target request cannot overwrite the current registration.
 
 ### Split brain
 

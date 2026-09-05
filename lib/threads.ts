@@ -229,6 +229,11 @@ export interface TelegramTopicTargetStore {
   /** Discard process-local projections and reload owner-published state. */
   refresh?: () => Promise<void>;
   persist: () => Promise<void>;
+  invalidateTarget: (
+    target: TelegramTarget,
+    isCurrent: () => boolean,
+    lastSyncError: string,
+  ) => Promise<boolean>;
   list: () => TelegramTopicTargetRecord[];
   getFollowerRecoveryHintByTarget?: (
     target: TelegramTarget,
@@ -314,6 +319,50 @@ export function reconcileTelegramFreshAllocationCursor(
     lastReconcileAction: "live-cursor-realignment",
   });
   return true;
+}
+
+export function createTelegramCleanupTargetProtection(
+  store: Pick<TelegramTopicTargetStore, "list"> & Partial<Pick<TelegramTopicTargetStore, "listReservations" | "listPendingProvisions" | "listPendingCleanups">>,
+  departingRecord?: TelegramTopicTargetRecord,
+): NonNullable<ThreadReconciler.ThreadReconciliationApplyPorts["isCleanupTargetProtected"]> {
+  const records = store.list();
+  const reservations = store.listReservations?.() ?? [];
+  const provisions = store.listPendingProvisions?.() ?? [];
+  const intents = store.listPendingCleanups?.() ?? [];
+  const sameSnapshot = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
+  return (target, action) => {
+    for (const record of store.list()) {
+      if (!targetMatches(record.target, target)) continue;
+      // A persisted shutdown intent may retire only its original pre-intent
+      // binding. Registration/rebinding after that intent supersedes it.
+      const intent = action.kind === "close-delete-graceful-shutdown-topic"
+        ? intents.find((candidate) => candidate.id === action.cleanupIntentId && candidate.runtimeGeneration === action.runtimeGeneration)
+        : undefined;
+      const expectedDeparting = departingRecord ?? (intent && records.find((candidate) =>
+        candidate.instanceId === intent.instanceId && targetMatches(candidate.target, intent.target) &&
+        candidate.updatedAtMs <= intent.requestedAtMs));
+      if (expectedDeparting && "instanceId" in action &&
+        (action.kind === "close-delete-previous-leader-topic" || action.instanceId === expectedDeparting.instanceId) &&
+        sameSnapshot(record, expectedDeparting)) {
+        if (action.kind === "close-delete-previous-leader-topic" || action.kind === "close-stale-replaced-topic") continue;
+        if (action.kind === "close-delete-graceful-shutdown-topic" &&
+          store.listPendingCleanups?.().some((intent) => intent.id === action.cleanupIntentId &&
+            intent.instanceId === action.instanceId && intent.runtimeGeneration === action.runtimeGeneration &&
+            targetMatches(intent.target, target))) continue;
+      }
+      if (record.status === "active" || record.status === "starting" || record.status === "pending" || record.status === "probe-required") return true;
+    }
+    for (const reservation of store.listReservations?.() ?? []) {
+      if (!targetMatches(reservation.target, target)) continue;
+      if (action.kind !== "close-delete-reserved-topic" || !reservations.some((initial) => sameSnapshot(initial, reservation))) return true;
+    }
+    for (const provision of store.listPendingProvisions?.() ?? []) {
+      if (!provision.target || !targetMatches(provision.target, target)) continue;
+      if (action.kind !== "close-delete-expired-pending-provision-topic" || provision.id !== action.pendingProvisionId ||
+        !provisions.some((initial) => sameSnapshot(initial, provision))) return true;
+    }
+    return false;
+  };
 }
 
 export interface TelegramTopicTargetStoreOptions {
@@ -1293,25 +1342,20 @@ export function createTelegramTopicTargetStore(
     mutationRevision += 1;
   };
 
-  return {
-    async load() {
-      if (dirty) return;
-      await loadFromDisk();
-    },
-    refresh() {
-      const refresh = persistQueue.then(loadFromDisk);
-      persistQueue = refresh.catch(() => undefined);
-      return refresh;
-    },
-    persist() {
+  const persistSnapshot = (invalidation?: {
+    target: TelegramTarget;
+    isCurrent: () => boolean;
+    lastSyncError: string;
+  }): Promise<boolean> => {
       const persist = persistQueue.then(async () => {
         const path = getPath();
         if (loadedPath !== path && !dirty) resetForPath(path);
         if (options.canPersist && !options.canPersist()) {
-          await loadFromDisk();
-          return;
+          if (!invalidation) await loadFromDisk();
+          return false;
         }
         if (!dirty || !loaded) await loadFromDisk();
+        if (invalidation && !invalidation.isCurrent()) return false;
         await mkdir(dirname(path), { recursive: true });
         const tempPath = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
         const nowMs = getNowMs();
@@ -1359,6 +1403,21 @@ export function createTelegramTopicTargetStore(
             return serialized;
           }),
         };
+        if (invalidation) {
+          const record = file.threads.find((record) => targetMatches(record.target, invalidation.target));
+          if (!record) return false;
+          file.threads = file.threads.filter((candidate) => candidate !== record);
+          file.syncObservations = file.syncObservations.filter((observation) => !targetMatches(observation.target, record.target));
+          file.syncObservations.push({
+            target: { ...record.target },
+            syncStatus: "deleted",
+            observedAtMs: nowMs,
+            ...(record.instanceId ? { instanceId: record.instanceId } : {}),
+            ...(record.slot ? { slot: record.slot } : {}),
+            lastSyncError: invalidation.lastSyncError,
+            lastReconcileAction: "mark-stale",
+          });
+        }
         let persistedSemanticSnapshot: string | undefined;
         try {
           persistedSemanticSnapshot = serializeTelegramStateSemanticSnapshot(
@@ -1375,7 +1434,7 @@ export function createTelegramTopicTargetStore(
         ) {
           loaded = true;
           dirty = false;
-          return;
+          return true;
         }
         await writeFile(tempPath, `${JSON.stringify(file, null, 2)}\n`, {
           encoding: "utf8",
@@ -1383,6 +1442,25 @@ export function createTelegramTopicTargetStore(
         });
         await chmod(tempPath, 0o600);
         try {
+          if (invalidation) {
+            let applied = false;
+            const commit = () => {
+              if (getPath() !== path || mutationRevision !== persistedRevision ||
+                statusRevision !== persistedStatusRevision || !invalidation.isCurrent()) return;
+              // Fence and rename share one synchronous commit boundary. No stale
+              // invalidation enters the live projection before durable commit.
+              renameSync(tempPath, path);
+              records = new Map(Array.from(records).filter(([, record]) => !targetMatches(record.target, invalidation.target)));
+              syncObservations = file.syncObservations;
+              mutationRevision += 1;
+              dirty = false;
+              applied = true;
+            };
+            if (options.commitPersist) options.commitPersist(commit);
+            else if (!options.canPersist || options.canPersist()) commit();
+            if (!applied) await unlink(tempPath).catch(() => undefined);
+            return applied;
+          }
           if (options.commitPersist) {
             const committed = options.commitPersist(() => {
               renameSync(tempPath, path);
@@ -1404,9 +1482,27 @@ export function createTelegramTopicTargetStore(
         }
         loaded = true;
         if (mutationRevision === persistedRevision) dirty = false;
+        return true;
       });
-      persistQueue = persist.catch(() => undefined);
+      persistQueue = persist.then(() => undefined, () => undefined);
       return persist;
+  };
+
+  return {
+    async load() {
+      if (dirty) return;
+      await loadFromDisk();
+    },
+    refresh() {
+      const refresh = persistQueue.then(loadFromDisk);
+      persistQueue = refresh.catch(() => undefined);
+      return refresh;
+    },
+    async persist() {
+      await persistSnapshot();
+    },
+    invalidateTarget(target, isCurrent, lastSyncError) {
+      return persistSnapshot({ target, isCurrent, lastSyncError });
     },
     list() {
       return Array.from(records.values()).map(cloneRecord);
@@ -2100,6 +2196,7 @@ export async function provisionOwnBusTopic(
   if (typeof chatId !== "number") return undefined;
   await deps.store.load();
   const reservationCleanupPorts = {
+    isCleanupTargetProtected: createTelegramCleanupTargetProtection(deps.store),
     callApi: deps.callApi,
     markStaleByTarget: (
       target: TelegramTarget & { threadId: number },
@@ -2253,9 +2350,11 @@ export async function provisionOwnBusTopic(
       continue;
     }
     const previousLeaderCleanupStartedAtMs = Date.now();
+    const isCleanupTargetProtected = createTelegramCleanupTargetProtection(deps.store, record);
     const cleanup = await ThreadReconciler.applyThreadReconciliationPlan(
       { actions: [action] },
       {
+        isCleanupTargetProtected,
         callApi: deps.callApi,
         markStaleByTarget: (target, syncStatus, lastSyncError) =>
           deps.store.markStaleByTarget(target, syncStatus, lastSyncError),
@@ -2304,6 +2403,7 @@ export async function provisionOwnBusTopic(
         "Previous Telegram leader topic deletion was not confirmed.",
       );
     }
+    if (isCleanupTargetProtected(action.target, action)) continue;
     deps.store.markStaleByTarget(record.target);
     deps.store.reserveThread({
       target: record.target,

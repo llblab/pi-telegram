@@ -7,7 +7,75 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
-import type { TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
+import { callTelegram, createTelegramApiClient, createTelegramBridgeApiRuntime, type TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
+import { captureTelegramStaleTargetRequestRecovery, type TelegramSyncState } from "../lib/sync.ts";
+import type { TelegramTopicTargetRecord } from "../lib/threads.ts";
+
+test("Direct bus delivery invalidates only exact still-current stale request targets without replay", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const surface of ["reply", "menu", "activity", "multipart"] as const) {
+      for (const race of ["none", "epoch", "generation", "profile", "binding", "load", "unconfirmed", "permission"] as const) {
+        let epoch = 1;
+        let generation = 1;
+        let profile = "default";
+        let requests = 0;
+        let invalidations = 0;
+        let recovered = 0;
+        let state: TelegramSyncState = {};
+        let record: TelegramTopicTargetRecord | undefined = { profileKey: "leader", instanceId: "leader", target: { chatId: 100, threadId: 42 }, status: "active", createdAtMs: 1, updatedAtMs: 1 };
+        globalThis.fetch = async () => {
+          requests++;
+          if (race === "epoch") epoch++;
+          if (race === "generation") generation++;
+          if (race === "profile") profile = "other";
+          if (race === "binding") record = { ...record!, instanceId: "replacement", updatedAtMs: 2 };
+          return new Response(JSON.stringify({ ok: false, description: race === "unconfirmed" ? "Bad Request: possibly message thread not found later" : "Bad Request: message thread not found" }), { status: race === "permission" ? 403 : 400 });
+        };
+        const direct = createTelegramBridgeApiRuntime({
+          client: {
+            ...createTelegramApiClient(() => "test-token"),
+            callMultipart: (method, fields) => callTelegram("test-token", method, fields),
+          },
+          tempDir: "/unused", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1,
+          recordRuntimeEvent: () => {},
+          captureRequestErrorHandler: (body) => captureTelegramStaleTargetRequestRecovery(body, {
+            topicTargetStore: {
+              load: async () => { if (race === "load") generation++; },
+              list: () => record ? [record] : [],
+              markStaleByTarget: () => { record = undefined; invalidations++; return true; },
+              persist: async () => {},
+              invalidateTarget: async (_target, isCurrent) => {
+                if (race === "load") generation++;
+                if (!isCurrent()) return false;
+                record = undefined;
+                invalidations++;
+                return true;
+              },
+            },
+            getCurrentLeaderEpoch: () => epoch, getSessionGeneration: () => generation, getProfileName: () => profile,
+            getSyncState: () => state, setSyncState: (next) => { state = next; }, recordEvent: () => {},
+            onRecovered: () => { recovered++; },
+          }),
+        });
+        const runtime = createTelegramBusAwareApiRuntime({ directRuntime: direct, ownsDirect: () => true, callFollowerApi: async () => assert.fail("unexpected follower call") });
+        await assert.rejects(async () => {
+          const body = { chat_id: 100, message_thread_id: 42 };
+          if (surface === "reply") return runtime.sendRichMessage({ ...body, rich_message: { markdown: "answer" } });
+          if (surface === "menu") return runtime.sendMessage({ ...body, text: "menu" });
+          if (surface === "activity") return runtime.sendTypingAction(100, { message_thread_id: 42 });
+          return runtime.callMultipart("sendDocument", { chat_id: "100", message_thread_id: "42" }, "document", "/unused", "unused");
+        });
+        assert.equal(requests, 1, `${surface}/${race}: replay`);
+        assert.equal(invalidations, race === "none" ? 1 : 0, `${surface}/${race}: invalidation`);
+        assert.equal(recovered, invalidations);
+        if (race === "none") assert.equal(state["target-bindings"]?.status, "suspect");
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 function createDirectRuntime(calls: unknown[]): TelegramBridgeApiRuntime {
   return {

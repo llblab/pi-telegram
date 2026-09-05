@@ -11,12 +11,74 @@ import {
   createThreadReconciliationRuntime,
   planDisconnectedInstanceThreadCleanup,
   planThreadReconciliation,
+  type ThreadReconciliationAction,
 } from "../lib/thread-reconciler.ts";
+import { createTelegramCleanupTargetProtection } from "../lib/threads.ts";
 import type {
   TelegramThreadReservation,
   TelegramTopicSyncObservation,
   TelegramTopicTargetRecord,
 } from "../lib/threads.ts";
+
+test("Restore cleanup cancels target reuse before close, between close/delete, and on retry", async () => {
+  for (const reuseAt of [0, 1, 2]) {
+    let protectedTarget = reuseAt === 0;
+    const calls: string[] = [];
+    const plan = { actions: [{ kind: "close-delete-previous-leader-topic" as const, target: { chatId: 100, threadId: 42 }, reason: "previous-leader" as const, leaderEpoch: 1 }] };
+    const ports = {
+      getCurrentLeaderEpoch: () => 1,
+      isCleanupTargetProtected: () => protectedTarget,
+      callApi: async <T>(method: string): Promise<T> => {
+        calls.push(method);
+        if (reuseAt === 1) protectedTarget = true;
+        if (reuseAt === 2 && method === "deleteForumTopic") throw new Error("transient");
+        return true as T;
+      },
+    };
+    const first = await applyThreadReconciliationPlan(plan, ports);
+    if (reuseAt === 2) {
+      assert.equal(first.incompleteActions?.length, 1);
+      protectedTarget = true;
+      const retry = await applyThreadReconciliationPlan(plan, ports);
+      assert.equal(retry.incompleteActions?.length ?? 0, 0);
+    } else assert.equal(first.incompleteActions?.length ?? 0, 0);
+    assert.deepEqual(calls, reuseAt === 0 ? [] : reuseAt === 1 ? ["closeForumTopic"] : ["closeForumTopic", "deleteForumTopic"]);
+  }
+});
+
+test("Every destructive cleanup origin preserves a target acquired before or during cleanup", async () => {
+  const target = { chatId: 100, threadId: 42 };
+  const actions: ThreadReconciliationAction[] = [
+    { kind: "close-stale-replaced-topic", reason: "replaced-instance-binding", target },
+    { kind: "close-delete-unbound-topic", reason: "unbound-user-message", target, observedAtMs: 1 },
+    { kind: "close-delete-reserved-topic", reason: "startup-reservation", target, observedAtMs: 1 },
+    { kind: "close-delete-replaced-follower-topic", reason: "replaced-follower", target },
+    { kind: "close-delete-previous-leader-topic", reason: "previous-leader", target },
+    { kind: "close-delete-disconnected-instance-topic", reason: "manual-disconnect", target },
+    { kind: "close-delete-graceful-shutdown-topic", reason: "graceful-shutdown", target, instanceId: "old", runtimeGeneration: "old-generation", cleanupIntentId: "intent" },
+    { kind: "close-delete-expired-pending-provision-topic", reason: "expired-pending-provision", target, pendingProvisionId: "provision" },
+  ];
+  for (const action of actions) {
+    for (const acquireBefore of [true, false]) {
+      const replacement: TelegramTopicTargetRecord = { profileKey: "live", target, instanceId: "new", status: "active", createdAtMs: 2, updatedAtMs: 2 };
+      let records: TelegramTopicTargetRecord[] = [];
+      const isCleanupTargetProtected = createTelegramCleanupTargetProtection({ list: () => records });
+      if (acquireBefore) records = [replacement];
+      const calls: string[] = [];
+      await applyThreadReconciliationPlan({ actions: [action] }, {
+        isCleanupTargetProtected,
+        callApi: async <T>(method: string) => {
+          calls.push(method);
+          records = [replacement];
+          return true as T;
+        },
+        markStaleByTarget: () => assert.fail("must not invalidate a replacement binding"),
+      });
+      assert.deepEqual(calls, acquireBefore ? [] : ["closeForumTopic"], action.kind);
+      assert.equal(records[0], replacement);
+    }
+  }
+});
 
 const nowMs = 10_000;
 

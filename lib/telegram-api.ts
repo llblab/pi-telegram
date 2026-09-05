@@ -466,6 +466,8 @@ export interface TelegramApiClient {
 }
 
 export interface TelegramBridgeApiRuntimeDeps {
+  captureRequestErrorHandler?: (body: Record<string, unknown>) =>
+    ((error: unknown) => Promise<void>) | undefined;
   client: TelegramApiClient;
   tempDir: string;
   maxFileSizeBytes: number;
@@ -632,6 +634,11 @@ export function getTelegramApiErrorRequestTarget(
       ? error.requestTarget
       : undefined;
   return target ? { ...target } : undefined;
+}
+
+export function isTelegramStaleTargetHttpError(error: unknown): boolean {
+  if (!(error instanceof TelegramApiHttpError) || error.status !== 400) return false;
+  return /^Telegram API \w+ failed: HTTP 400: Bad Request: (message thread not found|thread not found|topic not found|topic deleted|topic closed|thread closed|forum topic closed|message thread closed|topic_id_invalid|topic_closed)$/i.test(error.message);
 }
 
 export function isTelegramMessageNotModifiedError(error: unknown): boolean {
@@ -1438,6 +1445,7 @@ export function createTelegramAssistantDraftSender(deps: {
 export function createDefaultTelegramBridgeApiRuntime(deps: {
   getBotToken: () => string | undefined;
   recordRuntimeEvent: TelegramBridgeApiRuntimeDeps["recordRuntimeEvent"];
+  captureRequestErrorHandler?: TelegramBridgeApiRuntimeDeps["captureRequestErrorHandler"];
 }): TelegramBridgeApiRuntime {
   return createTelegramBridgeApiRuntime({
     client: createTelegramApiClient(deps.getBotToken, {
@@ -1447,12 +1455,23 @@ export function createDefaultTelegramBridgeApiRuntime(deps: {
     maxFileSizeBytes: TELEGRAM_INBOUND_FILE_MAX_BYTES,
     tempFileMaxAgeMs: TELEGRAM_TEMP_FILE_MAX_AGE_MS,
     recordRuntimeEvent: deps.recordRuntimeEvent,
+    captureRequestErrorHandler: deps.captureRequestErrorHandler,
   });
 }
 
 export function createTelegramBridgeApiRuntime(
   deps: TelegramBridgeApiRuntimeDeps,
 ): TelegramBridgeApiRuntime {
+  const recoverRequestError = async (
+    handler: ((error: unknown) => Promise<void>) | undefined,
+    error: unknown,
+  ): Promise<void> => {
+    try {
+      await handler?.(error);
+    } catch (recoveryError) {
+      deps.recordRuntimeEvent("api", recoveryError, { phase: "stale-target-recovery" });
+    }
+  };
   const now = deps.now ?? Date.now;
   const chatActionMinIntervalMs = Math.max(
     0,
@@ -1488,6 +1507,7 @@ export function createTelegramBridgeApiRuntime(
     body: Record<string, unknown>,
     options?: TelegramApiCallOptions,
   ): Promise<TResponse> => {
+    const recoverError = deps.captureRequestErrorHandler?.(body);
     const chatActionKey = getChatActionKey(method, body);
     if (chatActionKey) {
       const nowMs = now();
@@ -1516,7 +1536,8 @@ export function createTelegramBridgeApiRuntime(
           gate.notBeforeMs = now() + chatActionMinIntervalMs;
           return result;
         })
-        .catch((error: unknown) => {
+        .catch(async (error: unknown) => {
+          await recoverRequestError(recoverError, error);
           if (error instanceof TelegramApiHttpError && error.status === 429) {
             const retryAfterMs = Math.max(
               chatActionMinIntervalMs,
@@ -1550,6 +1571,12 @@ export function createTelegramBridgeApiRuntime(
     try {
       return await deps.client.call<TResponse>(method, body, options);
     } catch (error) {
+      await recoverRequestError(recoverError, error);
+      if (method === "deleteMessage" && error instanceof TelegramApiHttpError &&
+        error.status === 400 && error.message ===
+          "Telegram API deleteMessage failed: HTTP 400: Bad Request: message to delete not found") {
+        return true as TResponse;
+      }
       deps.recordRuntimeEvent(
         "api",
         error,
@@ -1574,6 +1601,7 @@ export function createTelegramBridgeApiRuntime(
       fileName,
       options,
     ) => {
+      const recoverError = deps.captureRequestErrorHandler?.(fields);
       try {
         return await deps.client.callMultipart(
           method,
@@ -1584,6 +1612,7 @@ export function createTelegramBridgeApiRuntime(
           options,
         );
       } catch (error) {
+        await recoverRequestError(recoverError, error);
         deps.recordRuntimeEvent(
           "multipart",
           error,
@@ -1676,11 +1705,13 @@ export function createTelegramBridgeApiRuntime(
     sendRichMessageDraft: (body) =>
       callRecorded<boolean>("sendRichMessageDraft", body),
     editMessageText: async (body) => {
+      const recoverError = deps.captureRequestErrorHandler?.(body);
       try {
         await deps.client.call("editMessageText", body);
         return "edited";
       } catch (error) {
         if (isTelegramMessageNotModifiedError(error)) return "unchanged";
+        await recoverRequestError(recoverError, error);
         deps.recordRuntimeEvent(
           "api",
           error,
