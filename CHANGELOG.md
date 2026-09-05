@@ -7,6 +7,7 @@
 - `Thread Restore`: Retains validated source and chooser identity when callback messages omit thread metadata, hides Restore in threadless/All choosers and explains how to supply a destination, rejects conflicting Restore instead of forwarding to the old target, and treats confirmed already-deleted chooser cleanup as complete without redispatch.
 - `Target Safety`: Rechecks cleanup ownership before close/delete and local retirement across restore, disconnect, and provisioning paths; a rebound target is not deleted, invalidated, or reserved by obsolete cleanup. Follower restore rechecks registration generation and expected target after IPC, store-load, and persistence waits.
 - `Stale Delivery`: Direct replies, menus, activity, edits, and multipart sends capture exact stale-target authority; guarded invalidation rechecks generation, profile, binding, and snapshot revision at the synchronous durable commit without replaying failed sends or redirecting accepted work.
+- `State Continuity`: Snapshot reads cannot overwrite bindings or cleanup intents admitted while disk I/O was pending; equivalent persisted records retain cleanup authority regardless of property order or omitted optional fields.
 
 ## 0.42.3: Agent Diagnostics Hotfix
 

@@ -927,7 +927,7 @@ test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-c
     assert.deepEqual(deleteCall?.body, {
       chat_id: 77,
       message_thread_id: 42,
-    });
+    }, deleteCall ? undefined : await getRuntimeIntegrationDiagnostics(methods));
   } finally {
     restoreFetch();
     await telegramConfig.restore();

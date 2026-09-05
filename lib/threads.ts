@@ -1283,7 +1283,11 @@ export function createTelegramTopicTargetStore(
       loaded = true;
       return;
     }
+    const revision = mutationRevision;
     const content = await readFile(path, "utf8");
+    // A read begun before a local mutation must not replace the newly admitted
+    // binding/cleanup state with its older disk snapshot.
+    if (mutationRevision !== revision || getPath() !== path) return;
     const rawFile: unknown = JSON.parse(content);
     const file = parseTopicTargetFile(rawFile);
     followerRecoveryHints = parseFollowerRecoveryHints(rawFile);

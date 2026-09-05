@@ -93,6 +93,24 @@ test("Stale-target invalidation fences the durable commit and preserves a replac
   }
 });
 
+test("An in-flight snapshot load cannot erase a newly admitted cleanup intent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "telegram-load-race-"));
+  const store = createTelegramTopicTargetStore({ path: join(root, "state.json") });
+  try {
+    await store.persist();
+    const loading = store.load();
+    const intent = { id: "cleanup", owner: "leader" as const, instanceId: "owner", runtimeGeneration: "generation", target: { chatId: 77, threadId: 42 }, requestedAtMs: 1 };
+    store.upsertPendingCleanup(intent);
+    await loading;
+    assert.deepEqual(store.listPendingCleanups(), [intent]);
+    await store.persist();
+    await store.refresh?.();
+    assert.deepEqual(store.listPendingCleanups(), [intent]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Thread owner keys isolate named Telegram profiles without changing default keys", () => {
   assert.equal(
     getTelegramThreadOwnerKey({
