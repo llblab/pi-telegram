@@ -2160,6 +2160,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
     failurePhase: string,
     error: unknown,
     currentUpdateId?: number,
+    extraDetails?: Record<string, unknown>,
   ): "blocked" => {
     blocked = true;
     state.lastFailureAtMs = getNowMs();
@@ -2168,6 +2169,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
       phase: failurePhase,
       generation: owner?.generation,
       ...(currentUpdateId !== undefined ? { updateId: currentUpdateId } : {}),
+      ...extraDetails,
     });
     transition("blocked", currentUpdateId, blockedReason);
     return "blocked";
@@ -2553,6 +2555,10 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
             `Telegram queue receipt ${normalized.receiptId} conflicts with committed authority.`,
           ),
           currentUpdateId,
+          {
+            receiptId: normalized.receiptId,
+            sourceUpdateIds: normalized.sourceUpdateIds,
+          },
         );
       }
       return "duplicate";
