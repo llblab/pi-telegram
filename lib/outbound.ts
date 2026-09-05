@@ -835,6 +835,7 @@ export {
 
 export function createTelegramOutboundReplyPlanner(
   store: Pick<TelegramButtonActionStore, "register">,
+  getRenderingMode: () => "rich" | "html" = () => "rich",
 ): (
   markdown: string,
   options?: { binding?: TelegramOutboundButtonBinding },
@@ -842,6 +843,7 @@ export function createTelegramOutboundReplyPlanner(
   return (markdown, options) => {
     const buttonReply = planTelegramButtonReply(markdown, {
       registerAction: store.register,
+      rendering: getRenderingMode(),
       ...(options?.binding ? { binding: options.binding } : {}),
     });
 

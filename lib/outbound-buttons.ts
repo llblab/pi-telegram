@@ -12,6 +12,8 @@ import type {
 } from "./keyboard.ts";
 import {
   parseTelegramActionPayloadRows,
+  parseTelegramButtonPayloadRows,
+  replaceTelegramButtonFences,
   replaceTopLevelHtmlComments,
 } from "./outbound-markup.ts";
 import {
@@ -34,6 +36,7 @@ export interface TelegramOutboundButtonAction {
   prompt: string;
   binding?: TelegramOutboundButtonBinding;
   selectedStyle?: TelegramInlineKeyboardButtonStyle;
+  disabled?: true;
 }
 
 export interface TelegramOutboundButtonStoredAction extends TelegramOutboundButtonAction {
@@ -115,6 +118,12 @@ function parseTelegramButtonAction(
   const explicitLabel = getTelegramButtonString(payload, "label");
   const explicitPrompt = getTelegramButtonString(payload, "prompt");
   const label = explicitLabel ?? value ?? explicitPrompt;
+  if (payload.disabled !== undefined && typeof payload.disabled !== "boolean") {
+    return undefined;
+  }
+  if (payload.disabled === true) {
+    return { text: label ?? "", prompt: "", disabled: true };
+  }
   const prompt = explicitPrompt ?? value ?? explicitLabel;
   if (!label || !prompt) return undefined;
   const selectedStyle = payload.selected_style;
@@ -159,6 +168,7 @@ export function createTelegramButtonActionStore(
       return {
         text: action.text,
         prompt: action.prompt,
+        ...(action.disabled ? { disabled: true as const } : {}),
         ...(action.binding ? { binding: action.binding } : {}),
         ...(action.selectedStyle
           ? { selectedStyle: action.selectedStyle }
@@ -171,33 +181,75 @@ export function createTelegramButtonActionStore(
 const DEFAULT_TELEGRAM_BUTTON_REPLY_MARKDOWN =
   "☑️ **Choose an option:**";
 
+function escapeTelegramRichButtonText(text: string): string {
+  return text.replace(/[&<>"'`\\*_\[\]{}$~\r\n]/g, (character) =>
+    `&#${character.charCodeAt(0)};`,
+  );
+}
+
+function renderTelegramRichButtonRow(
+  row: TelegramOutboundButtonMarkup["inline_keyboard"][number],
+): string {
+  return `<tg-button-row>${row.map((button) => {
+    const attributes = button.disabled
+      ? 'type="disabled"'
+      : `type="callback_data" data="${escapeTelegramRichButtonText(button.callback_data)}"`;
+    return `<tg-button ${attributes}>${escapeTelegramRichButtonText(button.text)}</tg-button>`;
+  }).join("")}</tg-button-row>`;
+}
+
 export function planTelegramButtonReply(
   markdown: string,
   deps: {
     registerAction: (action: TelegramOutboundButtonAction) => string;
     binding?: TelegramOutboundButtonBinding;
+    rendering?: "rich" | "html";
   },
 ): TelegramButtonReplyPlan {
   const keyboard: TelegramOutboundButtonMarkup["inline_keyboard"] = [];
-  const stripped = replaceTopLevelHtmlComments(markdown, (comment) => {
+  const buildRows = (
+    payloadRows: Record<string, unknown>[][],
+    rich: boolean,
+  ): TelegramOutboundButtonMarkup["inline_keyboard"] | undefined => {
+    const actions = payloadRows.map((row) => row.map(parseTelegramButtonAction));
+    if (actions.some((row) => row.some((action) => !action))) return undefined;
+    if (rich && actions.some((row) => {
+      const projected = row.map((action) => action!.disabled
+        ? { text: action!.text || "\u00a0", disabled: {} }
+        : { text: action!.text, callback_data: "x".repeat(64) });
+      return row.length > 8 || renderTelegramRichButtonRow(projected).length > 32768;
+    })) return undefined;
+    return actions.map((row) => row.map((action) => action!.disabled
+      ? { text: action!.text || "\u00a0", disabled: {} }
+      : {
+          text: action!.text,
+          callback_data: deps.registerAction({
+            ...action!,
+            ...(deps.binding ? { binding: deps.binding } : {}),
+          }),
+        }));
+  };
+  const withRichButtons = replaceTelegramButtonFences(markdown, (payload, closed) => {
+    if (!closed) return "";
+    const payloadRows = parseTelegramButtonPayloadRows(payload);
+    if (!payloadRows) return "";
+    const rich = deps.rendering !== "html";
+    const rows = buildRows(payloadRows, rich);
+    if (!rows) return "";
+    if (!rich) {
+      keyboard.push(...rows);
+      return "";
+    }
+    return `\n${rows.map(renderTelegramRichButtonRow).join("\n\n")}\n`;
+  });
+  const stripped = replaceTopLevelHtmlComments(withRichButtons, (comment) => {
     const command = "telegram_button";
     const normalizedContent = comment.content.replace(/^\s+/, "").replace(/^!/, "");
     if (!normalizedContent.startsWith(command)) return comment.raw;
     const payloadRows = parseTelegramActionPayloadRows(comment, command);
     if (!payloadRows) return "";
-    const actionRows = payloadRows.map((payloadRow) =>
-      payloadRow.map(parseTelegramButtonAction),
-    );
-    if (actionRows.some((row) => row.some((action) => !action))) return "";
-    for (const actionRow of actionRows) {
-      keyboard.push(actionRow.map((action) => ({
-        text: action!.text,
-        callback_data: deps.registerAction({
-          ...action!,
-          ...(deps.binding ? { binding: deps.binding } : {}),
-        }),
-      })));
-    }
+    const rows = buildRows(payloadRows, false);
+    if (rows) keyboard.push(...rows);
     return "";
   });
   const visibleMarkdown = normalizeMarkdownAfterButtonExtraction(stripped);
@@ -254,7 +306,7 @@ export function markTelegramButtonSelected(
   let matched = false;
   const inlineKeyboard = replyMarkup.inline_keyboard.map((row) =>
     row.map((button) => {
-      if (button.callback_data !== callbackData) return { ...button };
+      if (button.disabled || button.callback_data !== callbackData) return { ...button };
       matched = true;
       return { ...button, style: selectedStyle };
     }),
@@ -275,6 +327,11 @@ export async function handleTelegramButtonCallbackQuery<TContext = unknown>(
       return true;
     }
     return false;
+  }
+
+  if (action.disabled) {
+    await deps.answerCallbackQuery(query.id, "Button action unavailable.");
+    return true;
   }
 
   const chatId = query.message?.chat?.id;

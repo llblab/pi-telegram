@@ -13,6 +13,13 @@ import {
   stripTelegramCommentMarkupForPreview,
 } from "../lib/outbound-markup.ts";
 
+test("Drafts hide complete and unfinished button fences but preserve outer code examples", () => {
+  assert.equal(stripTelegramCommentMarkupForPreview('Before\n```telegram_button\n{Hidden|secret prompt}'), 'Before');
+  assert.equal(stripTelegramCommentMarkupForPreview('Before\n```telegram_button\n{Hidden}\n```\nAfter'), 'Before\n\nAfter');
+  const example = '````markdown\n```telegram_button\n{Literal}\n```\n````';
+  assert.equal(stripTelegramCommentMarkupForPreview(example), example);
+});
+
 test("Markup collector ignores comments inside fenced code", () => {
   const markdown = [
     "```",

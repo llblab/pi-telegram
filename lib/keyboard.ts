@@ -9,11 +9,13 @@ export type TelegramInlineKeyboardButtonStyle =
   | "success"
   | "primary";
 
-export interface TelegramInlineKeyboardButton {
+export type TelegramInlineKeyboardButton = {
   text: string;
-  callback_data: string;
   style?: TelegramInlineKeyboardButtonStyle;
-}
+} & (
+  | { callback_data: string; disabled?: never }
+  | { disabled: Record<string, never>; callback_data?: never }
+);
 
 export interface TelegramInlineKeyboardMarkup {
   inline_keyboard: TelegramInlineKeyboardButton[][];

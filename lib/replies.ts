@@ -532,7 +532,7 @@ function splitTelegramNativeMarkdownCountedBlocks(block: string): string[] {
 function countTelegramNativeMarkdownBlocks(block: string): number {
   if (/^ {0,3}(`{3,}|~{3,})/.test(block)) return 1;
   const lines = block.split("\n").filter((line) => line.trim().length > 0);
-  if (lines.some((line) => /^\s*([-*+] |\d+\. |>|\|)/.test(line))) {
+  if (lines.some((line) => /^\s*([-*+] |\d+\. |>|\||<tg-button-row>)/.test(line))) {
     return Math.max(1, lines.length);
   }
   return 1;

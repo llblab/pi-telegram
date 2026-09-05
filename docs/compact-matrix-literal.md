@@ -1,6 +1,6 @@
 # Adaptive Button Literal
 
-> Status: Portable CML v3 button standard; `pi-telegram` also reuses its positional-cell mechanics for compact voice actions.
+> Status: Portable CML v4 button standard; `pi-telegram` also reuses its positional-cell mechanics for compact voice actions.
 
 Adaptive Button Literal is one bounded-depth matrix grammar over a shared button AST. It accepts strict JSON button objects, positional Compact Matrix Literal (CML) cells, or both in the same matrix and row. Commas between completed matrix or row elements are optional, so producers can progressively compress representation without changing runtime meaning.
 
@@ -8,7 +8,7 @@ Adaptive Button Literal is one bounded-depth matrix grammar over a shared button
 full named JSON → comma-optional adjacency → mixed named/positional cells → compact CML
 ```
 
-The compact form is not JSON: `{label|prompt|variant}` assigns meaning by position. The formats share semantics and topology, not syntax.
+The compact form is not JSON: `{label|prompt|selected_style|disabled}` assigns meaning by position. The formats share semantics and topology, not syntax.
 
 ## Goals
 
@@ -23,7 +23,7 @@ The compact form is not JSON: `{label|prompt|variant}` assigns meaning by positi
 Every accepted payload normalizes to a non-empty ordered list of non-empty rows:
 
 ```text
-Cell = { label?: string, prompt?: string, value?: string, selected_style?: string }
+Cell = { label?: string, prompt?: string, value?: string, selected_style?: string, disabled?: boolean }
 Rows = Cell[][]
 ```
 
@@ -58,7 +58,7 @@ A two-atom cell separates label and prompt:
 {Pause|music::pause}
 ```
 
-Only the first label position may be empty. Prompt-only `{|e2}` is equivalent to JSON `{"prompt":"e2"}`: the existing button fallback uses `e2` as both visible text and queued prompt without requiring a separately authored label.
+The first label position may be empty. Prompt-only `{|e2}` is equivalent to JSON `{"prompt":"e2"}`: the existing button fallback uses `e2` as both visible text and queued prompt without requiring a separately authored label.
 
 A three-atom cell adds the selected style and retains the same optional-label form:
 
@@ -67,7 +67,18 @@ A three-atom cell adds the selected style and retains the same optional-label fo
 {|e2|success}
 ```
 
-The prompt and style atoms remain required. The style atom is accepted only as `primary`, `success`, or `danger`.
+In a three-atom cell, the prompt and style remain required; style accepts only `primary`, `success`, or `danger`.
+
+A four-atom cell adds disabled state:
+
+```text
+{Next|||1}
+{|||1}
+{Next|counter::next|success|1}
+{Next|counter::next||0}
+```
+
+The fourth atom accepts `1` or `true` (disabled), and `0` or `false` (enabled), with exact lowercase spelling; omitting the fourth position keeps the button enabled. The third atom may be empty in this form to retain the default selected style. Disabled cells may omit the prompt, label, and selected style: `{Next|||1}` is a label-only control and `{|||1}` is a blank disabled cell. Enabled CML cells still require a prompt. Telegram requires a `text` field, so its renderer sends a non-breaking space (`U+00A0`) for a blank disabled cell; the notation itself does not invent a label or action. Client rendering of blank cells requires live verification. JSON uses a boolean `disabled`; other value types are invalid. Disabled cells remain visible in their original row but register no action and carry no callback data.
 
 ## Adaptive Grammar
 
@@ -83,6 +94,8 @@ boundary        := ws [","] ws
 positional-cell := "{" atom "}"
                  | "{" [atom] "|" atom "}"
                  | "{" [atom] "|" atom "|" atom "}"
+                 | "{" [atom] "|" atom "|" [atom] "|" ("0" | "false") "}"
+                 | "{" [atom] "|" [atom] "|" [atom] "|" ("1" | "true") "}"
 atom            := atom-unit+
 atom-unit       := ordinary | "\|" | "\}" | "\\"
 ws              := *(SP | HTAB | CR | LF)
@@ -117,7 +130,7 @@ A conforming parser:
 3. Tries one complete strict JSON object, then bounded trailing-comma recovery, at each cell boundary before positional interpretation.
 4. Keeps JSON-shaped named objects on the JSON path when validation fails instead of exposing their source as positional text.
 5. Accepts at most one comma between elements or immediately before a closing row or matrix delimiter, while rejecting leading, repeated, or property-level omitted commas.
-6. Rejects empty matrices, rows, one-atom cells, prompts, styles, and nesting deeper than one row; only the first label position may be empty in a two- or three-atom button cell.
+6. Rejects empty matrices, rows, one-atom cells, enabled-cell prompts, and nesting deeper than one row. The label may be empty in multi-atom cells; the style may additionally be empty in four-atom cells. Disabled four-atom cells may omit all first three atoms. Rejects unknown styles, invalid disabled values, and more than four button atoms.
 7. Decodes only `\|`, `\}`, and `\\` in positional cells.
 8. Extracts the first complete valid payload from a tolerant comment envelope and ignores unrelated text or isolated unmatched matrix brackets around it.
 9. Returns no partial rows or cells from a balanced malformed candidate.
@@ -127,16 +140,31 @@ Malformed JSON-looking input receives no generic recovery. It is accepted only i
 
 ## Telegram Profiles
 
-For `telegram_button` comments:
+For `telegram_button` hidden comments and fenced blocks:
 
 - JSON `value` keeps its existing label/prompt fallback semantics.
 - Positional `{value}` is equivalent to JSON `{"value":"value"}`; a lone JSON `label` or `prompt` has the same both-fields shorthand semantics.
 - Positional `{|prompt}` is equivalent to JSON `{"prompt":"prompt"}` and therefore uses the prompt as both visible text and queued prompt.
 - Positional `{label|prompt}` is equivalent to JSON `{"label":"label","prompt":"prompt"}`.
 - Positional `{label|prompt|selected_style}` and `{|prompt|selected_style}` are equivalent to their corresponding JSON objects.
+- Positional `{label|prompt|selected_style|1}` is equivalent to JSON `{"label":"label","prompt":"prompt","selected_style":"selected_style","disabled":true}` with a valid selected style; `{|prompt||1}` is equivalent to `{"prompt":"prompt","disabled":true}`. Fourth-position `0` or `false` matches `disabled: false`; `true` is equivalent to `1`.
+- `{label|||1}` matches JSON `{"label":"label","disabled":true}`; `{|||1}` matches `{"disabled":true}`. Disabled cells require no prompt and do not retain action or selected-style semantics.
+- Disabled buttons serialize as `{ text, disabled: {} }`, without `callback_data`; they neither enqueue prompts nor invoke bound app methods. Enabled controls keep existing selection and callback behavior.
 - Top-level cells become full-width rows.
 - Nested rows become horizontal keyboard rows.
 - Invalid payloads are stripped with their recognized action comment and register no callbacks.
+
+The wrapper selects placement without changing cell semantics. A hidden `telegram_button` HTML comment builds the footer keyboard. A standalone column-zero fenced block opened by exactly three backticks plus `telegram_button` renders rows between paragraphs in Native Rich Markdown. A singleton JSON/CML object needs no array in either wrapper. Fenced content must be one complete payload without trailing envelope text. Larger outer fences and ordinary code blocks remain literal examples; unclosed action fences are withheld. Native Rich rows support at most eight buttons and must fit one message chunk; these are renderer constraints, not grammar limits. HTML compatibility places fenced controls in the footer. See [Outbound](./outbound.md) for delivery and callback behavior.
+
+````markdown
+Description.
+
+```telegram_button
+[{Details|Explain this section.}[{Choose|Choose this option.}{Unavailable|||true}]]
+```
+
+Next paragraph.
+````
 
 For `telegram_voice`, one positional cell maps `{text}`, `{text|lang}`, or `{text|lang|rate}` to one voice artifact. JSON object cells remain available for named fields, escaping, and multiline text. Voice comments do not accept matrix or row composition.
 
@@ -157,7 +185,7 @@ The grammar imposes no visual row-width maximum. Renderer and interaction policy
 Accepted classes include:
 
 - Strict JSON objects and matrices.
-- Positional singleton, two-atom, prompt-only `{|prompt}`, and styled cells.
+- Positional singleton, two-atom, prompt-only `{|prompt}`, styled, and four-atom disabled-state cells.
 - Matrices and rows with commas, without commas, or a mixture of boundaries.
 - Named JSON and positional cells mixed in one matrix or row.
 - Literal commas inside positional atoms and strict JSON strings.
@@ -166,12 +194,12 @@ Accepted classes include:
 
 Rejected classes include:
 
-- Empty payloads, matrices, rows, one-atom cells, prompts, or style atoms; an empty label is valid only as the first position of a two- or three-atom button cell.
+- Empty payloads, matrices, rows, one-atom cells, enabled-cell prompts, or three-atom styles; disabled four-atom cells may omit the first three atoms but not the disabled flag.
 - Leading or repeated element commas.
 - Missing commas between properties inside a JSON object.
 - Deeper row nesting.
 - Missing, crossed, or mismatched delimiters.
-- A third positional separator, unknown style, unknown escape, or trailing backslash.
+- A fourth positional separator, unknown style, invalid disabled flag, unknown escape, or trailing backslash.
 - Internal control characters.
 - Valid JSON that fails the existing JSON action schema.
 
@@ -179,4 +207,4 @@ Every rejected case proves zero callback registration.
 
 ## Versioning
 
-This document defines CML v3. V3 extends the v2 positional grammar with strict JSON object cells, mixed representation, optional element-boundary commas, and prompt-only button cells that preserve the established JSON fallback semantics. It does not make JSON object internals permissive and does not add deeper structures. Future versions must preserve strict-JSON-first routing, bounded depth, atomic rejection, and an explicit discriminator for any new meaning at a security or ownership boundary.
+This document defines CML v4. V4 adds a fourth button atom for disabled state, permits an empty third atom in that form, and makes labels and prompts optional for disabled cells. Existing one-, two-, and three-atom button cells, JSON/CML mixing, optional element-boundary commas, and prompt-only fallback semantics remain unchanged. Voice cells retain their three-atom maximum. JSON object internals and nesting depth remain unchanged. Future versions must preserve strict-JSON-first routing, bounded depth, atomic rejection, and an explicit discriminator for any new meaning at a security or ownership boundary.

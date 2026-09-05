@@ -33,12 +33,15 @@ function getSettingsDescriptionOrder(text: string): string[] {
 }
 
 function getSettingsControlOrder(markup: {
-  inline_keyboard: Array<Array<{ callback_data: string }>>;
+  inline_keyboard: Array<Array<{ callback_data?: string }>>;
 }): string[] {
   return markup.inline_keyboard
     .slice(1)
     .flat()
-    .map((button) => button.callback_data.split(":").at(-1)!);
+    .map((button) => {
+      assert.ok(button.callback_data);
+      return button.callback_data.split(":").at(-1)!;
+    });
 }
 
 test("Settings descriptions follow visible control order", () => {

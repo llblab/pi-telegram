@@ -8,6 +8,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { TelegramInlineKeyboardMarkup } from "../lib/keyboard.ts";
 
 import { createTelegramActivityVerbosityRuntime } from "../lib/activity-verbosity.ts";
 import {
@@ -1710,9 +1711,7 @@ test("Queue menu keeps main-menu navigation on top", async () => {
   ];
   const texts: string[] = [];
   const modes: string[] = [];
-  const markups: Array<{
-    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
-  }> = [];
+  const markups: TelegramInlineKeyboardMarkup[] = [];
   const runtime = createTelegramQueueMenuRuntime<string>({
     telegramQueueStore: {
       getQueuedItems: () => queuedItems,
@@ -1915,9 +1914,7 @@ test("Queue item Keep and Skip selectors share deferred-removal state", async ()
   ];
   const texts: string[] = [];
   const notices: Array<string | undefined> = [];
-  const markups: Array<{
-    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
-  }> = [];
+  const markups: TelegramInlineKeyboardMarkup[] = [];
   const runtime = createTelegramQueueMenuRuntime<string>({
     telegramQueueStore: {
       getQueuedItems: () => queuedItems,
@@ -2058,9 +2055,7 @@ test("Queue item Keep and Skip selectors share deferred-removal state", async ()
 test("Queue refresh rotates empty queue title", async () => {
   const state = createMenuState(2);
   const texts: string[] = [];
-  const markups: Array<{
-    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
-  }> = [];
+  const markups: TelegramInlineKeyboardMarkup[] = [];
   const runtime = createTelegramQueueMenuRuntime<string>({
     telegramQueueStore: {
       getQueuedItems: () => [],

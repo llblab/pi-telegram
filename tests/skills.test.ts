@@ -23,6 +23,27 @@ async function readSkillReference(
   );
 }
 
+test("Local Bot API reference documents generation-stop controls on both draft methods", async () => {
+  const reference = (await readFile(
+    join(dirname(TELEGRAM_SKILLS_PATH), ".agents", "skills", "telegram-bot", "api.md"),
+    "utf8",
+  )).replace(/\r\n/g, "\n");
+  const section = (name: string): string => {
+    const start = reference.indexOf(`#### ${name}\n`);
+    assert.ok(start >= 0, name);
+    const end = reference.indexOf("\n#### ", start + 1);
+    return reference.slice(start, end < 0 ? undefined : end);
+  };
+  const plain = section("sendMessageDraft");
+  const rich = section("sendRichMessageDraft");
+  for (const field of ["can\\_stop", "keep\\_on\\_stop"]) {
+    const row = plain.split("\n").find((line) => line.startsWith(`| ${field} |`));
+    assert.ok(row, `Missing plain-draft field: ${field}`);
+    assert.ok(rich.split("\n").includes(row), `Missing or inconsistent rich-draft field: ${field}`);
+  }
+  assert.match(section("MessageGenerationStopped"), /draft\\_id/u);
+});
+
 test("Telegram extension contributes focused bundled skills", async () => {
   let resourceHook: (() => { skillPaths: string[] }) | undefined;
   registerTelegramSkillDiscovery({
@@ -63,9 +84,14 @@ test("Telegram extension contributes focused bundled skills", async () => {
   assert.match(bridge, /emoji \+ space \+ text/u);
   assert.match(bridge, /\{\|prompt\}.*prompt as both visible text and queued prompt/u);
   assert.match(bridge, /click creates an ordinary user request/u);
+  assert.match(bridge, /\{\|Next\|\|1\}/u);
+  assert.match(bridge, /Hidden comment for footer; `telegram_button` fence for in-body rows/u);
+  assert.match(bridge, /singleton JSON\/CML cell or mixed matrix/u);
+  assert.doesNotMatch(bridge, /only recognized top-level comments activate|one complete action in one comment/u);
+  assert.match(bridge, /Disabled controls.*no callback, queued prompt, or bound-method invocation/u);
   assert.match(
     bridge,
-    /removes every assistant-authored HTML comment.*only recognized top-level comments activate actions/su,
+    /removes every assistant-authored HTML comment.*only recognized top-level wrappers activate actions/su,
   );
   assert.match(
     bridge,
@@ -102,6 +128,8 @@ test("Telegram extension contributes focused bundled skills", async () => {
   assert.match(generatedSurface, /two columns only/u);
   assert.match(generatedSurface, /three through eight columns/u);
   assert.match(generatedSurface, /active transport contract/u);
+  assert.match(generatedSurface, /disabled control is not an action/u);
+  assert.match(generatedSurface, /at least one useful enabled action/u);
   assert.match(generatedSurface, /does not own.*transport syntax/su);
   assert.match(generatedSurface, /High-impact actions use two stages/u);
   assert.match(generatedSurface, /follow `generative-apps`/u);

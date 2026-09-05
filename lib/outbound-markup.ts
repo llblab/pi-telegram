@@ -90,6 +90,50 @@ export function collectTopLevelHtmlComments(markdown: string): {
   return { comments };
 }
 
+export function replaceTelegramButtonFences(
+  markdown: string,
+  replace: (payload: string, closed: boolean) => string,
+): string {
+  let result = "";
+  let copied = 0;
+  let offset = 0;
+  let fence: TelegramTopLevelFenceState | undefined;
+  let actionStart: number | undefined;
+  let contentStart = 0;
+  while (offset < markdown.length) {
+    const end = getMarkdownLineEnd(markdown, offset);
+    const line = getMarkdownLineText(markdown, offset, end);
+    if (fence) {
+      if (isTopLevelClosingFence(line, fence)) {
+        if (actionStart !== undefined) {
+          result += markdown.slice(copied, actionStart);
+          result += replace(markdown.slice(contentStart, offset), true) + "\n";
+          copied = end;
+          actionStart = undefined;
+        }
+        fence = undefined;
+      }
+    } else if (line.includes("<!--")) {
+      const close = markdown.indexOf("-->", offset + line.indexOf("<!--") + 4);
+      if (close < 0) break;
+      offset = getMarkdownLineEnd(markdown, close + 3);
+      continue;
+    } else {
+      fence = getTopLevelOpeningFence(line);
+      if (fence && /^```telegram_button[ \t]*$/.test(line)) {
+        actionStart = offset;
+        contentStart = end;
+      }
+    }
+    offset = end;
+  }
+  if (actionStart !== undefined) {
+    result += markdown.slice(copied, actionStart);
+    return result + replace(markdown.slice(contentStart), false);
+  }
+  return result + markdown.slice(copied);
+}
+
 export function replaceTopLevelHtmlComments(
   markdown: string,
   replacer: (comment: TelegramTopLevelHtmlComment) => string,
@@ -275,17 +319,26 @@ type TelegramCompactActionPayloadParser = (
 function parseTelegramButtonCompactActionPayload(
   atoms: readonly string[],
 ): Record<string, unknown> | undefined {
-  const [label, prompt, selectedStyle] = atoms;
+  const [label, prompt, selectedStyle, disabled] = atoms;
   if (atoms.length === 1) return label ? { value: label } : undefined;
-  if (!prompt) return undefined;
+  const isDisabled = disabled === "1" || disabled === "true";
+  if (!prompt && !(atoms.length === 4 && isDisabled)) return undefined;
   const action = label ? { label, prompt } : { prompt };
   if (atoms.length === 2) return action;
   if (
     selectedStyle !== "primary" &&
     selectedStyle !== "success" &&
-    selectedStyle !== "danger"
+    selectedStyle !== "danger" &&
+    !(atoms.length === 4 && selectedStyle === "")
   ) return undefined;
-  return { ...action, selected_style: selectedStyle };
+  if (atoms.length === 4 && !isDisabled && disabled !== "0" && disabled !== "false") {
+    return undefined;
+  }
+  return {
+    ...action,
+    ...(selectedStyle ? { selected_style: selectedStyle } : {}),
+    ...(atoms.length === 4 ? { disabled: isDisabled } : {}),
+  };
 }
 
 function parseTelegramVoiceCompactActionPayload(
@@ -303,7 +356,7 @@ function parseTelegramVoiceCompactActionPayload(
 function parseTelegramAdaptiveActionPayloadRows(
   source: string,
   parseCompactPayload: TelegramCompactActionPayloadParser,
-  options: { allowTrailing?: boolean } = {},
+  options: { allowTrailing?: boolean; maxCompactAtoms?: number } = {},
 ): { rows: Record<string, unknown>[][]; end: number } | undefined {
   let offset = 0;
   const isStructuralWhitespace = (character: string | undefined): boolean =>
@@ -343,7 +396,7 @@ function parseTelegramAdaptiveActionPayloadRows(
         continue;
       }
       if (character === "|") {
-        if (atomSources.length >= 3) return undefined;
+        if (atomSources.length >= (options.maxCompactAtoms ?? 3)) return undefined;
         atomSources.push([]);
         offset += 1;
         continue;
@@ -509,6 +562,16 @@ function isPlausibleTelegramMatrixStart(
   );
 }
 
+export function parseTelegramButtonPayloadRows(
+  source: string,
+): Record<string, unknown>[][] | undefined {
+  return parseTelegramAdaptiveActionPayloadRows(
+    source.trim(),
+    parseTelegramButtonCompactActionPayload,
+    { maxCompactAtoms: 4 },
+  )?.rows;
+}
+
 export function parseTelegramActionPayloadRows(
   comment: TelegramTopLevelHtmlComment,
   command: string,
@@ -533,7 +596,7 @@ export function parseTelegramActionPayloadRows(
     const parsed = parseTelegramAdaptiveActionPayloadRows(
       content.slice(offset),
       parseTelegramButtonCompactActionPayload,
-      { allowTrailing: true },
+      { allowTrailing: true, maxCompactAtoms: 4 },
     );
     if (parsed) return parsed.rows;
     const end = findTelegramStructuredPayloadEnd(content, offset);
@@ -546,8 +609,15 @@ export function parseTelegramActionPayloadRows(
     "prompt",
     "value",
     "selected_style",
+    "disabled",
   ]);
-  return attributes ? [[attributes]] : undefined;
+  if (!attributes) return undefined;
+  return [[{
+    ...attributes,
+    ...(attributes.disabled === "true" || attributes.disabled === "false"
+      ? { disabled: attributes.disabled === "true" }
+      : {}),
+  }]];
 }
 
 export function normalizeMarkdownAfterVoiceExtraction(
@@ -589,7 +659,9 @@ function stripTelegramHtmlCommentBlocks(markdown: string): string {
 }
 
 export function stripTelegramCommentMarkupForPreview(markdown: string): string {
-  const withoutClosedBlocks = stripTelegramHtmlCommentBlocks(markdown);
+  const withoutClosedBlocks = stripTelegramHtmlCommentBlocks(
+    replaceTelegramButtonFences(markdown, () => ""),
+  );
   const openBlockIndex =
     findTopLevelOpenOrPartialHtmlCommentIndex(withoutClosedBlocks);
   const previewMarkdown =

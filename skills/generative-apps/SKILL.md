@@ -29,9 +29,9 @@ Generated Control Surface → current context → model → one ephemeral surfac
 Generative App             → model → reusable program → many evolving surfaces
 ```
 
-Both Skills use the same logical button matrix and `label + prompt` interaction model. The Telegram runtime owns its full JSON/CML notation and callback routing; this Skill owns reusable program judgment, while `generated-control-surface` owns ephemeral agent-authored composition. Shared rendering needs no third button Skill and does not collapse those responsibilities.
+Both Skills use the same logical button matrix and `label + prompt` interaction model. An app may place groups beside their related content using the transport's in-body button blocks or keep whole-view controls in the footer; placement does not change binding, disabled state, or method authority. The Telegram runtime owns its full JSON/CML notation and callback routing; this Skill owns reusable program judgment, while `generated-control-surface` owns ephemeral agent-authored composition. Shared rendering needs no third button Skill and does not collapse those responsibilities.
 
-An app may mix deterministic `app::method` controls and ordinary prompts in one view. Compile only the stable transitions that benefit from inference bypass; keep explanation, interpretation, teaching, and adaptation on the model-mediated plane. When no reusable state or deterministic loop earns a script, load and use `generated-control-surface` instead.
+An app may mix deterministic `app::method` controls and ordinary prompts in one view, including one control group. Compact and named cells may coexist under the shared transport grammar; neither representation nor placement creates another action plane. Compile only the stable transitions that benefit from inference bypass; keep explanation, interpretation, teaching, and adaptation on the model-mediated plane. When no reusable state or deterministic loop earns a script, load and use `generated-control-surface` instead.
 
 The `generated` / `generative` distinction is intentional. Do not rename `generated-control-surface` to a competing generative term.
 
@@ -76,7 +76,7 @@ Another capability remains the authoritative real owner. The app stores validate
 1. Identify the repeated feedback loop, real state owner, and actions that are truly deterministic.
 2. Choose one stable lowercase app and one self-contained `<app>.mjs` source outside the managed installation directory.
 3. Keep `init` and every exported method small, named, bounded, shell-free, and capability-specific.
-4. Render one complete next view after each action.
+4. Render one complete next view after each action. Derive disabled controls from current state using the shared transport contract; visible disabled controls neither invoke methods nor enqueue prompts. Revalidate domain preconditions when an enabled control is invoked, because previously rendered views may be stale.
 5. Mix action planes intentionally:
 
 ```text
@@ -107,6 +107,7 @@ Before presenting an app as working:
 - Inspect the installed initial view and persisted bounded state.
 - Exercise at least one real bound action and prove it bypasses Pi queue/model admission.
 - Exercise at least one ordinary prompt when the app intentionally uses the model plane.
+- Verify the placements actually used by the app and prove disabled cells invoke nothing. A successful ordinary prompt-button smoke is not evidence of app-method dispatch or stale-revision rejection.
 - Verify replacement rejects stale buttons and failed initialization preserves the prior app.
 - For adapters, prove fresh external status and terminal mutation evidence.
 - Confirm failures are bounded, redacted, and do not silently render success.
