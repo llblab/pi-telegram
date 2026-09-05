@@ -1660,6 +1660,7 @@ test("Agent end runtime resets state, finalizes replies, sends attachments, and 
     "finalize:final",
     "clear:1",
     "markdown:final",
+    "preview:",
     "attachments:1",
     "dispatch",
   ]);
@@ -1705,6 +1706,7 @@ test("Agent end runtime delivers one Rich attachment result without duplicate te
     "preview",
     "rich:final",
     "clear",
+    "preview",
     "dispatch",
   ]);
 });
@@ -1934,6 +1936,7 @@ test("Agent end runtime can schedule active-turn final delivery without blocking
     "activity-idle",
     "preview:final",
     "finalize:final",
+    "preview:",
     "attachments:1",
     "dispatch",
   ]);
@@ -2247,6 +2250,7 @@ test("Agent end runtime keeps queued Telegram turn delivery independent from pol
     "status",
     "preview:final",
     "finalize:1:final",
+    "preview:",
     "attachments",
     "dispatch",
   ]);
@@ -2302,8 +2306,9 @@ test("Agent end runtime plans assistant button comments for active Telegram repl
   assert.equal(events[0], "reset");
   assert.equal(events[1], "status");
   assert.equal(events[2], "preview:Choose one:");
-  assert.equal(events[4], "attachments");
-  assert.equal(events[5], "dispatch");
+  assert.equal(events[4], "preview:");
+  assert.equal(events[5], "attachments");
+  assert.equal(events[6], "dispatch");
   const finalDelivery = events[3] as {
     finalize: string;
     target?: { chatId: number; threadId?: number };
@@ -2370,6 +2375,7 @@ test("Agent end runtime passes assistant button markup to final text delivery", 
     "status",
     "preview:Answer",
     { finalize: "Answer", replyMarkup },
+    "preview:",
     "attachments",
     "dispatch",
   ]);
@@ -2435,6 +2441,7 @@ test("Agent end runtime splits assistant voice markup into text and voice delive
     "status",
     "preview:Full technical text.",
     "finalize:Full technical text.",
+    "preview:",
     "voice:Short voice summary.:ru:+20%:false",
     "attachments",
     "dispatch",
@@ -2993,6 +3000,7 @@ test("Agent end hook binds assistant extraction and runtime ports", async () => 
     "status:ctx",
     "preview:final",
     "finalize:final",
+    "preview:",
     "attachments",
   ]);
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -3002,6 +3010,7 @@ test("Agent end hook binds assistant extraction and runtime ports", async () => 
     "status:ctx",
     "preview:final",
     "finalize:final",
+    "preview:",
     "attachments",
     "dispatch:ctx",
   ]);
@@ -3279,6 +3288,7 @@ test("Agent lifecycle hooks bind start, end, and tool lifecycle ports", async ()
     "pending:done",
     "preview:clear",
     "markdown:done",
+    "pending:",
   ]);
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(events, [
@@ -3299,6 +3309,7 @@ test("Agent lifecycle hooks bind start, end, and tool lifecycle ports", async ()
     "pending:done",
     "preview:clear",
     "markdown:done",
+    "pending:",
     "dispatch:ctx",
   ]);
 });
@@ -3378,6 +3389,7 @@ test("Agent lifecycle retains retryable errors until recovery or settlement", as
     "reset",
     "preview:Recovered answer",
     "final:Recovered answer",
+    "preview:",
     "dispatch",
   ]);
 
