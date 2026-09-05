@@ -492,14 +492,17 @@ test("Thread capability state runtime owns transition flags", () => {
   assert.equal(state.isBusPollingStarted(), false);
   assert.equal(state.isTopicModeUnavailable(), false);
   assert.equal(state.shouldForceFreshLeaderThread(), false);
+  assert.equal(state.getRequestedThreadName(), undefined);
 
   state.setBusPollingStarted(true);
   state.setTopicModeUnavailable(true);
   state.setForceFreshLeaderThread(true);
+  state.setRequestedThreadName("Flightprice");
 
   assert.equal(state.isBusPollingStarted(), true);
   assert.equal(state.isTopicModeUnavailable(), true);
   assert.equal(state.shouldForceFreshLeaderThread(), true);
+  assert.equal(state.getRequestedThreadName(), "Flightprice");
 });
 
 test("Thread-aware polling returns disabled mode to classic takeover despite retained thread history", async () => {

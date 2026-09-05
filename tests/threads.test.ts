@@ -123,6 +123,16 @@ test("Baked thread names can be selected from timestamp entropy", () => {
   assert.ok(nearby?.startsWith("C"));
 });
 
+test("Baked thread names skip occupied identities", () => {
+  const occupied = ["Cedar", "Comet", "Cipher", "Coral"];
+  const name = chooseTelegramThreadName({
+    slot: "C",
+    getRandom: () => 0,
+    occupied,
+  });
+  assert.equal(name, "Cinder");
+});
+
 test("Thread names include workspace and role hints", () => {
   const name = createTelegramThreadName({
     seed: "123",
@@ -1324,6 +1334,50 @@ test("Thread renamer rejects bare slot and generic role labels", async () => {
   assert.equal(store.getByProfileKey("cwd:/repo")?.threadName, "OldName");
 });
 
+test("Thread renamer rejects an occupied live thread name", async () => {
+  const calls: unknown[] = [];
+  const store = createTelegramTopicTargetStore({
+    path: "/tmp/unused-telegram-targets.json",
+    getNowMs: () => 3000,
+  });
+  store.upsert({
+    profileKey: "cwd:/repo-a",
+    target: { chatId: -1001, threadId: 42 },
+    status: "active",
+    createdAtMs: 1000,
+    updatedAtMs: 1000,
+    threadName: "Birch",
+    slot: "B",
+  });
+  store.upsert({
+    profileKey: "cwd:/repo-b",
+    target: { chatId: -1001, threadId: 43 },
+    status: "active",
+    createdAtMs: 1000,
+    updatedAtMs: 1000,
+    threadName: "Falcon",
+    slot: "F",
+  });
+  const rename = createTelegramTopicTargetRenamer({
+    store,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      calls.push({ method, body });
+      return {} as TResponse;
+    },
+  });
+
+  assert.equal(
+    await rename({
+      target: { chatId: -1001, threadId: 43 },
+      threadName: "Birch",
+      slot: "F",
+    }),
+    undefined,
+  );
+  assert.deepEqual(calls, []);
+  assert.equal(store.getByProfileKey("cwd:/repo-b")?.threadName, "Falcon");
+});
+
 test("Thread store preserves thread identity after stale target pruning", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-identity-"));
   const path = join(dir, "state.json");
@@ -1433,6 +1487,89 @@ test("Thread provisioner does not reuse offline target history by profile key", 
   assert.equal(store.getByProfileKey("cwd:/repo")?.status, "active");
   assert.equal(store.getByProfileKey("cwd:/repo")?.instanceId, "inst-b");
   assert.equal(store.getByProfileKey("cwd:/repo")?.threadName, "Atlas");
+});
+
+test("Thread provisioner honors a requested unique thread name", async () => {
+  const calls: unknown[] = [];
+  const store = createTelegramTopicTargetStore({
+    path: "/tmp/unused-telegram-targets.json",
+    getNowMs: () => 1000,
+  });
+  const provision = createTelegramTopicTargetProvisioner({
+    topicChatId: -1001,
+    store,
+    getNowMs: () => 2000,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      calls.push({ method, body });
+      return { message_thread_id: 99 } as TResponse;
+    },
+  });
+
+  const result = await provision({
+    instanceId: "inst-flight",
+    profileKey: "cwd:/flight-price",
+    threadName: "Flightprice",
+  });
+
+  assert.equal(result.reused, false);
+  assert.equal(result.record.threadName, "Flightprice");
+  assert.deepEqual(calls, [
+    {
+      method: "createForumTopic",
+      body: { chat_id: -1001, name: "Flightprice" },
+    },
+  ]);
+});
+
+test("Thread provisioner does not bake a live duplicate thread name", async () => {
+  const calls: unknown[] = [];
+  const store = createTelegramTopicTargetStore({
+    path: "/tmp/unused-telegram-targets.json",
+    getNowMs: () => 1000,
+  });
+  store.upsert({
+    profileKey: "cwd:/agent/pi",
+    owner: { kind: "leader", cwd: "/agent/pi", instanceId: "leader-a" },
+    target: { chatId: -1001, threadId: 10 },
+    status: "active",
+    createdAtMs: 500,
+    updatedAtMs: 500,
+    threadName: "Birch",
+    instanceId: "leader-a",
+    slot: "B",
+  });
+  const provision = createTelegramTopicTargetProvisioner({
+    topicChatId: -1001,
+    store,
+    getNowMs: () => 2000,
+    getRandom: () => 0.75,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      calls.push({ method, body });
+      return { message_thread_id: 99 } as TResponse;
+    },
+  });
+
+  const result = await provision({
+    instanceId: "inst-flight",
+    owner: { kind: "manual-follower", instanceId: "inst-flight" },
+    profileKey: "manual:inst-flight",
+    threadName: "Birch",
+  });
+
+  assert.equal(result.reused, false);
+  assert.notEqual(result.record.threadName, "Birch");
+  assert.ok(result.record.threadName);
+  assert.equal(
+    isTelegramTopicThreadNameValidForSlot(
+      result.record.threadName ?? "",
+      result.record.slot,
+    ),
+    true,
+  );
+  assert.equal(
+    (calls[0] as { body: { name: string } }).body.name,
+    result.record.threadName,
+  );
 });
 
 test("Thread provisioner restores an active manual follower profile across runtime replacement", async () => {

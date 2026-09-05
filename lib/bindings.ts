@@ -467,6 +467,7 @@ interface TelegramCommandsAndToolsBindingDeps {
   stopPolling?: () => Promise<void | string>;
   recoverPollingStart?: Commands.TelegramBridgeCommandRegistrationDeps["recoverPollingStart"];
   getDisconnectThreadName?: () => string | undefined;
+  renameCurrentThread?: Commands.TelegramBridgeCommandRegistrationDeps["renameCurrentThread"];
   onTransportChanged?: () => Promise<void> | void;
   getStatusLines: (
     options?: Status.TelegramBridgeStatusLineOptions,
@@ -502,6 +503,7 @@ export function registerTelegramCommandsAndTools({
   stopPolling,
   recoverPollingStart,
   getDisconnectThreadName,
+  renameCurrentThread,
   onTransportChanged,
   getStatusLines,
   buttonActionStore,
@@ -643,6 +645,7 @@ export function registerTelegramCommandsAndTools({
     stopPolling: stopPolling ?? lockedPollingRuntime.stop,
     recoverPollingStart,
     getDisconnectThreadName,
+    renameCurrentThread,
     queueAgentConnectionContext,
     updateStatus,
     getProfileNames: () =>

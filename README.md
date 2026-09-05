@@ -179,6 +179,8 @@ Run these inside Pi.
 | `/telegram-setup <profile>` | Save or update a named-profile bot token |
 | `/telegram-connect` / `/telegram-connect default` | Activate `profiles.default` and acquire its transport ownership |
 | `/telegram-connect <profile>` | Activate a named profile and acquire its transport ownership |
+| `/telegram-connect as=Name` | In Threaded Mode, request a unique operator tab name for a new binding |
+| `/telegram-name <Name>` | Rename this instance's current Threaded Mode tab to one unique capitalized Latin word |
 | `/telegram-disconnect` | Confirm, then stop polling, release ownership, and delete this instance's Threaded Mode tab; graceful Pi quit always preserves restart ownership and independently deletes the tab only when automatic cleanup is enabled |
 | `/telegram-status` | Inspect connection, mode, separate polling/worker progress, journal depth, queue, transport, automatic retry state, and recent diagnostics |
 

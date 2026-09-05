@@ -27,6 +27,7 @@ export interface TelegramLeaderThreadSyncDeps {
   cwd?: string;
   telegramProfile?: string;
   forceFreshUnnamed?: boolean;
+  requestedThreadName?: string;
   getNowMs?: () => number;
   getRandom?: () => number;
   getCurrentLeaderEpoch?: () => number | string | undefined;
@@ -587,6 +588,7 @@ export async function ensureTelegramLeaderThreadBinding(
     callApi: deps.callApi,
     getNowMs: deps.getNowMs,
     getRandom: deps.getRandom,
+    requestedThreadName: deps.requestedThreadName,
     recordEvent: deps.recordEvent,
   });
   assertLeaderEpoch("after-provision");

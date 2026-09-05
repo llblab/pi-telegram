@@ -288,6 +288,64 @@ test("Command helpers register pi setup and status commands", async () => {
   );
   assert.deepEqual(events, ["setup"]);
   assert.deepEqual(notifications, ["bot: @demo\npolling: stopped"]);
+  assert.equal(
+    [...harness.commands.keys()].includes("telegram-name"),
+    true,
+  );
+});
+
+test("Connect as=ThreadName requests a unique operator thread name", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const starts: Array<Record<string, unknown> | undefined> = [];
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async (_ctx, options) => {
+      starts.push(options as Record<string, unknown> | undefined);
+      return { ok: true, message: "connected" };
+    },
+    stopPolling: async () => {},
+    updateStatus: () => {},
+  });
+  const notifications: string[] = [];
+  const ctx = createBridgeCommandContext((message) => {
+    notifications.push(message);
+  });
+  await getRequiredCommand(harness.commands, "telegram-connect").handler(
+    "as=Flightprice",
+    ctx,
+  );
+  assert.equal(starts[0]?.requestedThreadName, "Flightprice");
+});
+
+test("telegram-name command renames the current Threaded Mode tab", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const renamed: string[] = [];
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async () => ({ ok: true }),
+    stopPolling: async () => {},
+    updateStatus: () => {},
+    renameCurrentThread: async (threadName) => {
+      renamed.push(threadName);
+      return { ok: true, threadName };
+    },
+  });
+  const notifications: string[] = [];
+  const ctx = createBridgeCommandContext((message) => {
+    notifications.push(message);
+  });
+  await getRequiredCommand(harness.commands, "telegram-name").handler(
+    "Flightprice",
+    ctx,
+  );
+  assert.deepEqual(renamed, ["Flightprice"]);
+  assert.match(notifications[0] ?? "", /Flightprice/);
 });
 
 test("Bare and explicit default setup/connect commands select the same profile", async () => {

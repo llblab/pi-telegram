@@ -1099,6 +1099,7 @@ export function createTelegramDirectDeliveryOwnershipChecker<
 export interface TelegramLockedPollingStartOptions {
   force?: boolean;
   forceFreshLeaderThread?: boolean;
+  requestedThreadName?: string;
   election?: { expectedOwner?: TelegramLockEntry };
   onAcquired?: () => Promise<void> | void;
 }

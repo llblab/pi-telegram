@@ -2,6 +2,10 @@
 
 > Each release keeps at most 8 outcome records of at most 512 characters.
 
+## Unreleased: Unique Operator Thread Names
+
+- `Thread Identity`: Bakes unused palette names for new Threaded Mode tabs, honors `/telegram-connect as=Name` on fresh bindings, and adds `/telegram-name` so operators can rename the current tab to one unique capitalized Latin word without colliding with another live title.
+
 ## 0.42.2: Telegram Comment Membrane
 
 - `Transport-Private HTML Comments`: Removes every assistant-authored `<!-- … -->` block from Telegram previews, active-turn finals, connected companion projections, direct sends, and Guest Mode regardless of Markdown position or owning extension; only recognized top-level comments activate actions, unclosed tails stay hidden, comment-only text plans send nothing, and the Pi terminal transcript remains unchanged.

@@ -632,6 +632,8 @@ export interface TelegramThreadCapabilityStateRuntime {
   isBusRuntimeEnabled(): boolean;
   shouldForceFreshLeaderThread(): boolean;
   setForceFreshLeaderThread(forceFresh: boolean): void;
+  getRequestedThreadName(): string | undefined;
+  setRequestedThreadName(threadName: string | undefined): void;
 }
 
 export type TelegramThreadTargetObservationHandler<TContext> = (
@@ -658,7 +660,10 @@ export function createTelegramThreadTargetObservationBinding<TContext>(): Telegr
 export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
   startPolling: (
     ctx: TContext,
-    options?: { forceFreshLeaderThread?: boolean },
+    options?: {
+      forceFreshLeaderThread?: boolean;
+      requestedThreadName?: string;
+    },
   ) => Promise<void>;
   stopPolling: () => Promise<void>;
   registerFollowerWithOwner: (
@@ -677,6 +682,7 @@ export interface TelegramThreadAwarePollingDeps<
   getPollingStartedWithTelegramBus: () => boolean;
   setPollingStartedWithTelegramBus: (started: boolean) => void;
   setForceFreshLeaderThreadOnNextStart: (forceFresh: boolean) => void;
+  setRequestedThreadNameOnNextStart?: (threadName: string | undefined) => void;
   startClassicPolling: (ctx: TContext) => MaybePromise<void>;
   stopClassicPolling: () => Promise<void>;
   startBusLeaderPolling: (ctx: TContext) => Promise<void>;
@@ -729,6 +735,7 @@ export function createTelegramThreadCapabilityStateRuntime(): TelegramThreadCapa
   let busPollingStarted = false;
   let topicModeUnavailable = false;
   let forceFreshLeaderThread = false;
+  let requestedThreadName: string | undefined;
   return {
     isBusPollingStarted: () => busPollingStarted,
     setBusPollingStarted(started) {
@@ -742,6 +749,10 @@ export function createTelegramThreadCapabilityStateRuntime(): TelegramThreadCapa
     shouldForceFreshLeaderThread: () => forceFreshLeaderThread,
     setForceFreshLeaderThread(forceFresh) {
       forceFreshLeaderThread = forceFresh;
+    },
+    getRequestedThreadName: () => requestedThreadName,
+    setRequestedThreadName(threadName) {
+      requestedThreadName = threadName;
     },
   };
 }
@@ -782,6 +793,7 @@ export function createTelegramThreadCapabilityOrchestration<TContext, TOwner>(
       setPollingStartedWithTelegramBus: deps.state.setBusPollingStarted,
       setForceFreshLeaderThreadOnNextStart:
         deps.state.setForceFreshLeaderThread,
+      setRequestedThreadNameOnNextStart: deps.state.setRequestedThreadName,
       startClassicPolling: deps.startClassicPolling,
       stopClassicPolling: deps.stopClassicPolling,
       startBusLeaderPolling: deps.startBusLeaderPolling,
@@ -965,7 +977,10 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
 ): TelegramThreadAwarePollingPorts<TContext, TOwner> {
   const startPolling = async (
     ctx: TContext,
-    options?: { forceFreshLeaderThread?: boolean },
+    options?: {
+      forceFreshLeaderThread?: boolean;
+      requestedThreadName?: string;
+    },
   ): Promise<void> => {
     await deps.topicTargetStore.load();
     let startupThreadCapability: boolean | undefined;
@@ -981,6 +996,9 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
         deps.setPollingStartedWithTelegramBus(true);
         deps.setForceFreshLeaderThreadOnNextStart(
           !!options?.forceFreshLeaderThread,
+        );
+        deps.setRequestedThreadNameOnNextStart?.(
+          options?.requestedThreadName,
         );
         await deps.startBusLeaderPolling(ctx);
         deps.startLeaderHealth();

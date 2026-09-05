@@ -84,6 +84,7 @@ export interface TelegramBusLeaderTargetProvisionerDeps<TContext> {
   getCwd?: (ctx: TContext) => string | undefined;
   getTelegramProfile?: () => string | undefined;
   shouldForceFreshUnnamed?: () => boolean;
+  getRequestedThreadName?: () => string | undefined;
   topicTargetStore: Threads.TelegramTopicTargetStore;
   callApi: <TResponse>(
     method: string,
@@ -191,6 +192,7 @@ export interface TelegramBusLeaderRuntimeAssemblyDeps<TContext> {
   getCwd?: (ctx: TContext) => string | undefined;
   getTelegramProfile?: () => string | undefined;
   shouldForceFreshUnnamed?: () => boolean;
+  getRequestedThreadName?: () => string | undefined;
   topicTargetStore: Threads.TelegramTopicTargetStore;
   callApi: TelegramBusLeaderTargetProvisionerDeps<TContext>["callApi"];
   callMultipart: TelegramBusLeaderApiProxyDeps["callMultipart"];
@@ -231,6 +233,7 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
       getCwd: deps.getCwd,
       getTelegramProfile: deps.getTelegramProfile,
       shouldForceFreshUnnamed: deps.shouldForceFreshUnnamed,
+      getRequestedThreadName: deps.getRequestedThreadName,
       getThreadReconciliationMachineState:
         deps.getThreadReconciliationMachineState,
       recordThreadReconciliationPlan: deps.recordThreadReconciliationPlan,
@@ -936,6 +939,7 @@ export function createTelegramBusLeaderTargetProvisioner<TContext>(
         cwd: deps.getCwd?.(ctx),
         telegramProfile: deps.getTelegramProfile?.(),
         forceFreshUnnamed: deps.shouldForceFreshUnnamed?.(),
+        requestedThreadName: deps.getRequestedThreadName?.(),
         getNowMs,
         getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
         getThreadReconciliationMachineState:

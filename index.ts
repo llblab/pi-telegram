@@ -1004,6 +1004,9 @@ export default function (pi: Pi.ExtensionAPI) {
         setActiveAuthSecret:
           telegramBusFollowerControlState.setActiveAuthSecret,
         getProfileKey: getTelegramManualFollowerProfileKey,
+        getThreadName() {
+          return telegramThreadCapabilityState.getRequestedThreadName();
+        },
         getProcessBirthId() {
           return telegramQueueProcessBirthId;
         },
@@ -1110,6 +1113,8 @@ export default function (pi: Pi.ExtensionAPI) {
       getTelegramProfile: configStore.getActiveProfileName,
       shouldForceFreshUnnamed:
         telegramThreadCapabilityState.shouldForceFreshLeaderThread,
+      getRequestedThreadName:
+        telegramThreadCapabilityState.getRequestedThreadName,
       topicTargetStore: threadStore,
       callApi(method, body) {
         return directTelegramApiRuntime.call(method, body);
@@ -1317,6 +1322,59 @@ export default function (pi: Pi.ExtensionAPI) {
       const record = findCurrentThreadRecord();
       if (!record?.target.threadId) return undefined;
       return record.threadName ?? "current Telegram thread";
+    },
+    async renameCurrentThread(threadName) {
+      const record = findCurrentThreadRecord();
+      if (!record?.target.threadId) {
+        return {
+          ok: false,
+          message: "No Threaded Mode tab is bound to this Pi instance.",
+        };
+      }
+      const rename = Threads.createTelegramTopicTargetRenamer({
+        store: threadStore,
+        callApi: callTelegramApi,
+      });
+      const renamed = await rename({
+        target: {
+          chatId: record.target.chatId,
+          threadId: record.target.threadId,
+        },
+        threadName,
+        slot: record.slot,
+      });
+      if (!renamed) {
+        return {
+          ok: false,
+          message:
+            "Could not rename this tab. Use one unique capitalized Latin word that is not already used by a live tab.",
+        };
+      }
+      await threadStore.persist();
+      if (telegramBusFollowerRegistrationState.isRegistered()) {
+        telegramBusFollowerRegistrationState.setRegistered(
+          true,
+          renamed.target,
+          {
+            slot: renamed.slot,
+            threadName: renamed.threadName,
+            generation: telegramBusFollowerRegistrationState.getGeneration(),
+            leaderProtocol:
+              telegramBusFollowerRegistrationState.getLeaderProtocol(),
+          },
+        );
+      } else {
+        telegramBusLeaderState.set({
+          target: renamed.target,
+          slot: renamed.slot,
+          threadName: renamed.threadName,
+        });
+      }
+      return {
+        ok: true,
+        threadName: renamed.threadName,
+        message: `Telegram thread renamed to ${renamed.threadName}.`,
+      };
     },
     onTransportChanged() {
       deliveryLifecycleRuntime.onSessionStart();

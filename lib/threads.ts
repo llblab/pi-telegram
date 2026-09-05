@@ -355,7 +355,7 @@ export interface TelegramTopicTargetProvisionerDeps {
 }
 
 export interface TelegramTopicTargetRenamerDeps {
-  store: Pick<TelegramTopicTargetStore, "renameByTarget">;
+  store: Pick<TelegramTopicTargetStore, "renameByTarget" | "list">;
   callApi: <TResponse>(
     method: string,
     body: Record<string, unknown>,
@@ -1840,15 +1840,38 @@ const TELEGRAM_THREAD_NAME_PALETTE: Record<string, readonly string[]> = {
   Z: ["Zenith", "Zephyr", "Zircon", "Zebra", "Zion"],
 };
 
+export function listOccupiedTelegramThreadIdentities(
+  records: readonly TelegramTopicTargetRecord[],
+  exceptTarget?: TelegramTarget,
+): string[] {
+  const occupied: string[] = [];
+  for (const record of records) {
+    if (!isCurrentThreadRecord(record) || !record.threadName) continue;
+    if (
+      exceptTarget &&
+      record.target.chatId === exceptTarget.chatId &&
+      record.target.threadId === exceptTarget.threadId
+    ) {
+      continue;
+    }
+    occupied.push(getTelegramTopicIdentityName(record.threadName));
+  }
+  return occupied;
+}
+
 export function chooseTelegramThreadName(input: {
   slot: string | undefined;
   entropy?: number | string;
   getRandom?: () => number;
+  occupied?: readonly string[];
 }): string | undefined {
   if (!input.slot || !/^[A-Z]$/.test(input.slot)) return undefined;
   const names = TELEGRAM_THREAD_NAME_PALETTE[input.slot];
   if (!names || names.length === 0) return undefined;
-  const index = input.getRandom
+  const occupied = new Set(
+    (input.occupied ?? []).map((name) => getTelegramTopicIdentityName(name)),
+  );
+  const start = input.getRandom
     ? Math.max(
         0,
         Math.min(
@@ -1857,7 +1880,16 @@ export function chooseTelegramThreadName(input: {
         ),
       )
     : getTelegramThreadNameEntropyIndex(input.entropy, names.length);
-  return names[index];
+  for (let offset = 0; offset < names.length; offset += 1) {
+    const name = names[(start + offset) % names.length];
+    if (!occupied.has(getTelegramTopicIdentityName(name))) return name;
+  }
+  for (const slot of "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+    for (const name of TELEGRAM_THREAD_NAME_PALETTE[slot] ?? []) {
+      if (!occupied.has(getTelegramTopicIdentityName(name))) return name;
+    }
+  }
+  return undefined;
 }
 
 function getTelegramThreadNameLeadingSlot(
@@ -2055,6 +2087,7 @@ export interface TelegramOwnTopicProvisionDeps {
   instanceId: string;
   cwd?: string;
   telegramProfile?: string;
+  requestedThreadName?: string;
   getNowMs?: () => number;
   getRandom?: () => number;
   getCurrentLeaderEpoch?: () => number | string | undefined;
@@ -2346,6 +2379,9 @@ export async function provisionOwnBusTopic(
     instanceId: deps.instanceId,
     owner: currentLeaderOwner,
     profileKey,
+    ...(deps.requestedThreadName
+      ? { threadName: deps.requestedThreadName }
+      : {}),
   });
   if (result.reused) {
     // Reused topics may already have a human-chosen Telegram title. Do not edit
@@ -2943,6 +2979,13 @@ export function createTelegramTopicTargetRenamer(
       !isTelegramTopicThreadNameValidForSlot(threadName, request.slot)
     )
       return undefined;
+    const occupied = new Set(
+      listOccupiedTelegramThreadIdentities(
+        deps.store.list(),
+        request.target,
+      ),
+    );
+    if (occupied.has(getTelegramTopicIdentityName(threadName))) return undefined;
     const name = getTelegramTopicTitleForThreadName(
       threadName,
       request.slot ?? "",
@@ -2985,15 +3028,21 @@ export function createTelegramTopicTargetProvisioner(
     const nowMs = getNowMs();
     if (existing && isCurrentThreadRecord(existing)) {
       const slot = existing.slot ?? deps.store.allocateSlot(request.profileKey);
+      const occupied = listOccupiedTelegramThreadIdentities(
+        deps.store.list(),
+        existing.target,
+      );
       const identityThreadName =
         identity?.threadName &&
-        isTelegramTopicThreadNameValidForSlot(identity.threadName, slot)
+        isTelegramTopicThreadNameValidForSlot(identity.threadName, slot) &&
+        !occupied.includes(getTelegramTopicIdentityName(identity.threadName))
           ? identity.threadName
           : undefined;
       const bakedThreadName = chooseTelegramThreadName({
         slot: getNextTelegramThreadNamePaletteSlot(deps.store.list(), slot),
         entropy: nowMs,
         getRandom,
+        occupied,
       });
       const record = deps.store.upsert({
         ...existing,
@@ -3057,7 +3106,14 @@ export function createTelegramTopicTargetProvisioner(
         return { target: claimed.target, reused: true, record: claimed };
       }
     }
-    const candidateThreadName = identity?.threadName;
+    const occupied = listOccupiedTelegramThreadIdentities(deps.store.list());
+    const requestedThreadName =
+      request.threadName &&
+      isTelegramTopicThreadNameValidForSlot(request.threadName, undefined) &&
+      !occupied.includes(getTelegramTopicIdentityName(request.threadName))
+        ? normalizeTelegramTopicTargetThreadName(request.threadName)
+        : undefined;
+    const candidateThreadName = requestedThreadName ?? identity?.threadName;
     const preferredNameSlot =
       getTelegramThreadNameLeadingSlot(candidateThreadName) ??
       getNextTelegramThreadNamePaletteSlot(deps.store.list(), undefined) ??
@@ -3071,11 +3127,15 @@ export function createTelegramTopicTargetProvisioner(
           ? request.preferredSlot
           : (request.preferredSlot ?? preferredNameSlot),
       );
-    const requestThreadName =
+    const uniqueCandidate =
       candidateThreadName &&
-      isTelegramTopicThreadNameValidForSlot(candidateThreadName, slot)
+      isTelegramTopicThreadNameValidForSlot(candidateThreadName, slot) &&
+      !occupied.includes(getTelegramTopicIdentityName(candidateThreadName))
         ? candidateThreadName
-        : chooseTelegramThreadName({ slot, entropy: nowMs, getRandom });
+        : undefined;
+    const requestThreadName =
+      uniqueCandidate ??
+      chooseTelegramThreadName({ slot, entropy: nowMs, getRandom, occupied });
     const pendingId = `provision:${request.instanceId}:${slot}:${nowMs}`;
     const pendingOwner =
       request.owner?.kind === "leader" ? "leader" : "manual-follower";
