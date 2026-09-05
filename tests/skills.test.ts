@@ -24,10 +24,10 @@ async function readSkillReference(
 }
 
 test("Local Bot API reference documents generation-stop controls on both draft methods", async () => {
-  const reference = await readFile(
+  const reference = (await readFile(
     join(dirname(TELEGRAM_SKILLS_PATH), ".agents", "skills", "telegram-bot", "api.md"),
     "utf8",
-  );
+  )).replace(/\r\n/g, "\n");
   const section = (name: string): string => {
     const start = reference.indexOf(`#### ${name}\n`);
     assert.ok(start >= 0, name);
