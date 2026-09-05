@@ -146,9 +146,9 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     commitPromptDispatch(item, ctx) {
       if ((item.admissionReceipts?.length ?? 0) === 0) return true;
       const settlement = deps.admission.getSettlement();
-      if (!settlement?.onPromptHandedOff) return false;
+      if (!settlement?.onPromptHandedOff) return true;
       settlement.onPromptHandedOff(item, ctx);
-      return !settlement.isItemReady(item);
+      return true;
     },
     onControlSettled(item, ctx) {
       deps.admission.getSettlement()?.onControlSettled(item, ctx);
