@@ -87,6 +87,35 @@ export function getTelegramDiagnosticsDisplayPaths(profileName?: string): {
   };
 }
 
+/** Durable Workspace admission ledger (<agentDir>/tmp/telegram/workspace-admission[.<profile>].json). */
+export function resolveTelegramWorkspaceAdmissionPath(
+  agentDir = resolveAgentDir(),
+  profileName?: string,
+): string {
+  return resolveTelegramProfileTempFilePath(
+    "workspace-admission",
+    "json",
+    agentDir,
+    profileName,
+  );
+}
+
+/** Durable inactive Thread cleanup work-set journal. */
+export function resolveTelegramThreadCleanupWorkPath(
+  agentDir = resolveAgentDir(),
+  profileName?: string,
+): string {
+  return resolveTelegramProfileTempFilePath("thread-cleanup", "json", agentDir, profileName);
+}
+
+/** Durable agent-authored channel post journal. */
+export function resolveTelegramChannelPostJournalPath(
+  agentDir = resolveAgentDir(),
+  profileName?: string,
+): string {
+  return resolveTelegramProfileTempFilePath("channel-posts", "json", agentDir, profileName);
+}
+
 /** Durable inbound update journal (<agentDir>/tmp/telegram/inbox[.<profile>].json). */
 export function resolveTelegramUpdateJournalPath(
   agentDir = resolveAgentDir(),

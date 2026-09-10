@@ -4,7 +4,8 @@
  * Covers current owner-key thread target reuse and Bot API topic provisioning seams
  */
 
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import fsPromises, { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -12,6 +13,7 @@ import test from "node:test";
 
 import {
   chooseTelegramThreadName,
+  commitTelegramWorkspaceProvisionBinding,
   createTelegramCurrentInstanceThreadRuntime,
   createTelegramCurrentThreadAssembly,
   createTelegramLeaderThreadStateRuntime,
@@ -19,6 +21,8 @@ import {
   createTelegramTopicTargetProvisioner,
   createTelegramThreadName,
   createTelegramTopicTargetRenamer,
+  createTelegramWorkspaceBindingIdentity,
+  createTelegramWorkspaceDirectoryKey,
   createTelegramTopicTargetStore,
   findCurrentTelegramInstanceThreadRecord,
   getTelegramThreadOwnerFromProfileKey,
@@ -35,14 +39,17 @@ import {
   listTelegramThreadStatusTargets,
   listTelegramThreadStatusReservations,
   listTelegramThreadStatusObservations,
+  getTelegramManualThreadDisplayNameValidationError,
   getTelegramTopicIdentityName,
   getTelegramTopicName,
   getTelegramTargetFromApiBody,
   isTelegramTopicThreadNameValidForSlot,
   isTelegramTopicModeUnavailableError,
   isTelegramTopicTargetStaleError,
+  normalizeTelegramWorkspacePath,
 } from "../lib/threads.ts";
 import { createTelegramLockRuntime } from "../lib/locks.ts";
+import { createTelegramWorkspaceAdmissionLedger } from "../lib/workspace-admission.ts";
 import {
   isTelegramApiCommitUnknownError,
   TelegramApiCommitUnknownError,
@@ -135,6 +142,94 @@ test("Thread owner keys isolate named Telegram profiles without changing default
   );
 });
 
+test("Thread store restores named-profile owner scope across persistence", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-profile-owner-"));
+  const path = join(dir, "state.omp.json");
+  try {
+    const legacyStore = createTelegramTopicTargetStore({ path });
+    legacyStore.upsert({
+      profileKey: "cwd:/repo",
+      owner: {
+        kind: "leader",
+        cwd: "/repo",
+        instanceId: "leader-a",
+      },
+      target: { chatId: 7, threadId: 42 },
+      status: "active",
+      createdAtMs: 1,
+      updatedAtMs: 1,
+      instanceId: "leader-a",
+      threadName: "Atlas",
+      slot: "A",
+    });
+    await legacyStore.persist();
+
+    const restored = createTelegramTopicTargetStore({
+      path,
+      telegramProfile: "omp",
+    });
+    await restored.load();
+    assert.deepEqual(
+      restored.getByProfileKey("profile:omp:cwd:/repo")?.owner,
+      {
+        kind: "leader",
+        cwd: "/repo",
+        instanceId: "leader-a",
+        telegramProfile: "omp",
+      },
+    );
+    assert.equal(restored.getByProfileKey("cwd:/repo"), undefined);
+    assert.deepEqual(
+      restored.getIdentityByProfileKey("profile:omp:cwd:/repo"),
+      {
+        profileKey: "profile:omp:cwd:/repo",
+        threadName: "Atlas",
+        slot: "A",
+        updatedAtMs: 1,
+      },
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Workspace identities use readable cwd keys and deterministic concurrent suffixes", () => {
+  const cwd = "/home/llb/.pi/agent/extensions/";
+  const normalized = normalizeTelegramWorkspacePath(cwd);
+  assert.equal(normalized, "/home/llb/.pi/agent/extensions");
+  assert.equal(
+    createTelegramWorkspaceDirectoryKey(cwd),
+    "--home-llb-.pi-agent-extensions--",
+  );
+  assert.deepEqual(createTelegramWorkspaceBindingIdentity(cwd), {
+    cwd: "/home/llb/.pi/agent/extensions",
+    workspaceKey: "--home-llb-.pi-agent-extensions--",
+    instanceSlot: "a",
+    bindingKey: "--home-llb-.pi-agent-extensions--",
+  });
+  assert.equal(
+    createTelegramWorkspaceBindingIdentity(cwd, 1)?.bindingKey,
+    "--home-llb-.pi-agent-extensions--b",
+  );
+  assert.equal(
+    createTelegramWorkspaceBindingIdentity(cwd, 26)?.instanceSlot,
+    "aa",
+  );
+  assert.equal(createTelegramWorkspaceBindingIdentity("", 0), undefined);
+  assert.equal(createTelegramWorkspaceBindingIdentity(cwd, -1), undefined);
+});
+
+test("Workspace directory keys stay bounded and collision-verifiable by exact cwd", () => {
+  const cwd = `/workspace/${"segment/".repeat(80)}project`;
+  const first = createTelegramWorkspaceBindingIdentity(cwd);
+  const second = createTelegramWorkspaceBindingIdentity(cwd);
+  assert.ok(first);
+  assert.deepEqual(first, second);
+  assert.ok(first.workspaceKey.length <= 180);
+  assert.equal(first.cwd, normalizeTelegramWorkspacePath(cwd));
+  assert.match(first.workspaceKey, /-[a-f0-9]{12}--$/u);
+});
+
 test("Thread names are deterministic for the same seed", () => {
   const input = {
     seed: "123",
@@ -165,6 +260,17 @@ test("Baked thread names stay compact for narrow Telegram tabs", () => {
     }
     assert.equal(seen.size, 5, `Expected five names for slot ${slot}`);
   }
+});
+
+test("Baked thread names skip identities reserved by Workspace bindings", () => {
+  assert.equal(
+    chooseTelegramThreadName({
+      slot: "C",
+      getRandom: () => 0,
+      occupied: ["Cedar", "Comet", "Cipher", "Coral"],
+    }),
+    "Cinder",
+  );
 });
 
 test("Baked thread names can be selected from timestamp entropy", () => {
@@ -224,6 +330,867 @@ test("Thread state path is transient and profile-aware", () => {
     getTelegramStatePath("/agent", "omp"),
     getTelegramTopicTargetsPath("/agent", "omp"),
   );
+});
+
+test("Thread store persists dormant workspace bindings with exact cwd", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-workspaces-"));
+  const path = join(dir, "state.json");
+  const identity = createTelegramWorkspaceBindingIdentity(
+    "/home/llb/.pi/agent/extensions",
+    1,
+  );
+  assert.ok(identity);
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    assert.deepEqual(
+      store.upsertWorkspaceBinding({
+        ...identity,
+        target: { chatId: 7, threadId: 42 },
+        threadName: "Ember",
+        slot: "B",
+        updatedAtMs: 1000,
+      }),
+      {
+        ...identity,
+        target: { chatId: 7, threadId: 42 },
+        threadName: "Ember",
+        slot: "B",
+        updatedAtMs: 1000,
+      },
+    );
+    await store.persist();
+    const persisted = JSON.parse(await readFile(path, "utf8"));
+    assert.deepEqual(persisted.workspaceBindings, [
+      {
+        ...identity,
+        target: { chatId: 7, threadId: 42 },
+        threadName: "Ember",
+        slot: "B",
+        updatedAtMs: 1000,
+      },
+    ]);
+
+    const restored = createTelegramTopicTargetStore({ path });
+    await restored.load();
+    assert.deepEqual(
+      restored.getWorkspaceBinding("/home/llb/.pi/agent/extensions/", "b"),
+      persisted.workspaceBindings[0],
+    );
+    const listed = restored.listWorkspaceBindings();
+    listed[0]!.target.threadId = 99;
+    assert.equal(
+      restored.getWorkspaceBinding(identity.cwd, "b")?.target.threadId,
+      42,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Acknowledged display titles persist separately and cannot cross target replacement", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-workspace-title-"));
+  const path = join(dir, "state.json");
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    const identity = createTelegramWorkspaceBindingIdentity("/repo")!;
+    const binding = { ...identity, target: { chatId: 7, threadId: 41 },
+      slot: "A", threadName: "Anchor", updatedAtMs: 1 };
+    store.upsertWorkspaceBinding(binding);
+    assert.equal(store.setWorkspaceDisplayTitle(binding, "repo_a"), true);
+    store.upsertWorkspaceBinding(binding);
+    await store.persist();
+    const reopened = createTelegramTopicTargetStore({ path });
+    await reopened.load();
+    const retained = reopened.getWorkspaceBinding("/repo")!;
+    assert.equal(retained.displayTitle, "repo_a");
+    assert.equal(retained.threadName, "Anchor");
+    reopened.upsertWorkspaceBinding({ ...retained, target: { chatId: 7, threadId: 42 } });
+    assert.equal(reopened.getWorkspaceBinding("/repo")?.displayTitle, undefined);
+    assert.equal(reopened.setWorkspaceDisplayTitle(retained, "stale"), false);
+    assert.equal(reopened.getWorkspaceBinding("/repo")?.threadName, "Anchor");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Workspace inactivity persists its first proof, survives stale upserts, and clears only on active ownership or replacement", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-workspace-inactivity-"));
+  const path = join(dir, "state.json");
+  let nowMs = 1000;
+  try {
+    const store = createTelegramTopicTargetStore({ path, getNowMs: () => nowMs });
+    const identity = createTelegramWorkspaceBindingIdentity("/repo")!;
+    const binding = { ...identity, target: { chatId: 7, threadId: 41 },
+      slot: "A", threadName: "Anchor", updatedAtMs: 1 };
+    store.upsertWorkspaceBinding(binding);
+    assert.equal(store.markWorkspaceBindingInactiveByTarget(binding.target), true);
+    nowMs = 2000;
+    assert.equal(store.markWorkspaceBindingInactiveByTarget(binding.target), false);
+    store.upsertWorkspaceBinding(binding);
+    assert.equal(store.getWorkspaceBinding("/repo")?.inactiveSinceMs, 1000);
+    await store.persist();
+    const reopened = createTelegramTopicTargetStore({ path });
+    await reopened.load();
+    assert.equal(reopened.getWorkspaceBinding("/repo")?.inactiveSinceMs, 1000);
+    const malformedSnapshot = JSON.parse(await readFile(path, "utf8"));
+    malformedSnapshot.workspaceBindings[0].inactiveSinceMs = "legacy-unknown";
+    await writeFile(path, JSON.stringify(malformedSnapshot));
+    const conservative = createTelegramTopicTargetStore({ path });
+    await conservative.load();
+    assert.equal(conservative.getWorkspaceBinding("/repo")?.threadName, "Anchor");
+    assert.equal(conservative.getWorkspaceBinding("/repo")?.inactiveSinceMs, undefined);
+    assert.equal(reopened.markWorkspaceBindingInactiveByTarget(binding.target, -1), false);
+    assert.equal(reopened.markWorkspaceBindingActiveByTarget(binding.target), true);
+    assert.equal(reopened.getWorkspaceBinding("/repo")?.inactiveSinceMs, undefined);
+    assert.equal(reopened.markWorkspaceBindingActiveByTarget(binding.target), false);
+    assert.equal(reopened.markWorkspaceBindingInactiveByTarget(binding.target, 3000), true);
+    reopened.upsertWorkspaceBinding({ ...reopened.getWorkspaceBinding("/repo")!,
+      target: { chatId: 7, threadId: 42 }, updatedAtMs: 4 });
+    assert.equal(reopened.getWorkspaceBinding("/repo")?.inactiveSinceMs, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Inactive Workspace cleanup commit removes only one exact unprotected binding", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-workspace-cleanup-commit-"));
+  const path = join(dir, "state.json");
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    const binding = { ...createTelegramWorkspaceBindingIdentity("/cleanup")!,
+      target: { chatId: 7, threadId: 41 }, slot: "A", threadName: "Anchor",
+      inactiveSinceMs: 10, updatedAtMs: 20 };
+    store.upsertWorkspaceBinding(binding);
+    await store.persist();
+    const cleanupSnapshot = { cwd: binding.cwd, workspaceKey: binding.workspaceKey,
+      instanceSlot: binding.instanceSlot, slot: binding.slot, bindingKey: binding.bindingKey,
+      target: binding.target, inactiveSinceMs: binding.inactiveSinceMs,
+      bindingUpdatedAtMs: binding.updatedAtMs };
+    assert.equal(await store.commitInactiveWorkspaceCleanup({ ...cleanupSnapshot,
+      bindingUpdatedAtMs: 21 }, () => true), false);
+    assert.equal(await store.commitInactiveWorkspaceCleanup(cleanupSnapshot, () => true), true);
+    assert.equal(await store.commitInactiveWorkspaceCleanup(cleanupSnapshot, () => true), true);
+    const reopened = createTelegramTopicTargetStore({ path });
+    await reopened.load();
+    assert.equal(reopened.getWorkspaceBinding("/cleanup"), undefined);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Inactive Workspace cleanup recovers binding publication before and after rename", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-workspace-cleanup-prefix-"));
+  try {
+    const makeBinding = () => ({ ...createTelegramWorkspaceBindingIdentity("/cleanup-prefix")!,
+      target: { chatId: 7, threadId: 41 }, slot: "A", threadName: "Anchor",
+      inactiveSinceMs: 10, updatedAtMs: 20 });
+    const snapshot = (binding: ReturnType<typeof makeBinding>) => ({ cwd: binding.cwd,
+      workspaceKey: binding.workspaceKey, instanceSlot: binding.instanceSlot, slot: binding.slot,
+      bindingKey: binding.bindingKey, target: binding.target, inactiveSinceMs: binding.inactiveSinceMs,
+      bindingUpdatedAtMs: binding.updatedAtMs });
+
+    let boundary: "normal" | "before" | "after" = "normal";
+    const path = join(dir, "before.json");
+    const store = createTelegramTopicTargetStore({ path, commitPersist(commit) {
+      if (boundary === "before") return false;
+      commit();
+      if (boundary === "after") throw new Error("lost binding commit acknowledgement");
+      return true;
+    } });
+    const binding = makeBinding();
+    store.upsertWorkspaceBinding(binding);
+    await store.persist();
+    boundary = "before";
+    await assert.rejects(store.commitInactiveWorkspaceCleanup(snapshot(binding), () => true));
+    assert.ok(store.getWorkspaceBinding("/cleanup-prefix"));
+    boundary = "normal";
+    assert.equal(await store.commitInactiveWorkspaceCleanup(snapshot(binding), () => true), true);
+
+    const afterPath = join(dir, "after.json");
+    boundary = "normal";
+    const after = createTelegramTopicTargetStore({ path: afterPath, commitPersist(commit) {
+      commit();
+      if (boundary === "after") throw new Error("lost binding commit acknowledgement");
+      return true;
+    } });
+    const afterBinding = makeBinding();
+    after.upsertWorkspaceBinding(afterBinding);
+    await after.persist();
+    boundary = "after";
+    assert.equal(await after.commitInactiveWorkspaceCleanup(snapshot(afterBinding), () => true), true);
+    assert.equal(after.getWorkspaceBinding("/cleanup-prefix"), undefined);
+    const reopened = createTelegramTopicTargetStore({ path: afterPath });
+    await reopened.load();
+    assert.equal(reopened.getWorkspaceBinding("/cleanup-prefix"), undefined);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Workspace journal keys accumulate while legacy completeness cannot be invented by registration", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-workspace-journal-keys-"));
+  const path = join(dir, "state.json");
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    const current = { ...createTelegramWorkspaceBindingIdentity("/current")!,
+      target: { chatId: 7, threadId: 41 }, slot: "A", threadName: "Anchor",
+      journalBindingKeys: [] as string[], journalBindingsComplete: true as const, updatedAtMs: 1 };
+    store.upsertWorkspaceBinding(current);
+    store.upsertWorkspaceBinding({ ...current, journalBindingKeys: ["manual:first"], updatedAtMs: 2 });
+    store.upsertWorkspaceBinding({ ...current, journalBindingKeys: ["manual:second", "manual:first"],
+      journalBindingsComplete: undefined, updatedAtMs: 3 });
+    const legacy = { ...createTelegramWorkspaceBindingIdentity("/legacy")!,
+      target: { chatId: 7, threadId: 42 }, slot: "B", threadName: "Briar", updatedAtMs: 1 };
+    store.upsertWorkspaceBinding(legacy);
+    store.upsertWorkspaceBinding({ ...legacy, journalBindingKeys: ["manual:current"],
+      journalBindingsComplete: true, updatedAtMs: 2 });
+    await store.persist();
+    const restored = createTelegramTopicTargetStore({ path });
+    await restored.load();
+    assert.deepEqual(restored.getWorkspaceBinding("/current")?.journalBindingKeys,
+      ["manual:first", "manual:second"]);
+    assert.equal(restored.getWorkspaceBinding("/current")?.journalBindingsComplete, true);
+    assert.deepEqual(restored.getWorkspaceBinding("/legacy")?.journalBindingKeys,
+      ["manual:current"]);
+    assert.equal(restored.getWorkspaceBinding("/legacy")?.journalBindingsComplete, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Workspace occupancy snapshot fails closed across local operations and external work authority", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json", getNowMs: () => 1000 });
+  for (const [cwd, slot, threadId, inactiveSinceMs] of [
+    ["/eligible", "A", 41, 100], ["/live", "B", 42, 100],
+    ["/claimed", "C", 43, 100], ["/provisioning", "D", 44, 100],
+    ["/cleanup", "E", 45, 100], ["/unproven", "F", 46, undefined],
+    ["/unknown-work", "G", 47, 100], ["/accepted-work", "H", 48, 100],
+    ["/reserved", "I", 49, 100], ["/future-proof", "J", 50, 1100],
+    ["/external-live", "K", 51, 100],
+  ] as const) {
+    store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity(cwd)!,
+      target: { chatId: 7, threadId }, slot, threadName: "Anchor",
+      ...(inactiveSinceMs !== undefined ? { inactiveSinceMs } : {}), updatedAtMs: 1 });
+  }
+  store.upsert({ profileKey: "manual:live", instanceId: "live",
+    owner: { kind: "manual-follower", instanceId: "live" },
+    target: { chatId: 7, threadId: 42 }, slot: "B", status: "active",
+    createdAtMs: 1, updatedAtMs: 1 });
+  assert.equal(store.claimWorkspaceIdentity("/claimed", "claim")?.slot, "C");
+  store.upsertPendingProvision({ id: "provision", owner: "manual-follower",
+    instanceId: "provision", slot: "D", target: { chatId: 7, threadId: 44 },
+    startedAtMs: 1, expiresAtMs: 2000 });
+  store.upsertPendingCleanup({ id: "cleanup", owner: "manual-follower",
+    instanceId: "cleanup", runtimeGeneration: "cleanup:1",
+    target: { chatId: 7, threadId: 45 }, requestedAtMs: 1 });
+  store.reserveThread({ target: { chatId: 7, threadId: 49 }, slot: "I",
+    reason: "leader-reload", createdAtMs: 1, updatedAtMs: 1, expiresAtMs: 2000 });
+  const snapshot = store.captureWorkspaceSlotOccupancy((binding) => ({
+    liveOwner: binding.cwd === "/external-live" ? "protected" : "clear",
+    acceptedWork: binding.cwd === "/accepted-work" ? "protected" : "clear",
+    deliveryAuthority: binding.cwd === "/unknown-work" ? "unknown" : "clear",
+  }));
+  assert.deepEqual(Object.fromEntries(snapshot.bindings.map((entry) => [entry.slot, entry.protection])), {
+    a: "eligible", b: "protected", c: "protected", d: "protected", e: "protected",
+    f: "unknown", g: "unknown", h: "protected", i: "protected", j: "unknown",
+    k: "protected",
+  });
+  assert.equal(snapshot.bindings.find((entry) => entry.slot === "a")?.inactiveSinceMs, 100);
+  assert.deepEqual(new Set(snapshot.reservedSlots), new Set(["b", "c", "d", "i"]));
+});
+
+test("Workspace claims report only proven global slot exhaustion as capacity failure", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  for (const [index, slot] of Array.from("ABCDEFGHIJKLMNOPQRSTUVWXYZ").entries()) {
+    store.upsertWorkspaceBinding({
+      ...createTelegramWorkspaceBindingIdentity(`/repo/${index}`)!,
+      target: { chatId: 7, threadId: 100 + index }, slot,
+      inactiveSinceMs: index + 1, updatedAtMs: index + 1,
+    });
+  }
+  let capacityFailures = 0;
+  assert.equal(store.claimWorkspaceIdentity("/fresh", "fresh", undefined, {
+    onCapacityUnavailable() { capacityFailures++; },
+  }), undefined);
+  assert.equal(capacityFailures, 1);
+  assert.equal(store.claimWorkspaceIdentity("/repo/0", "existing", undefined, {
+    onCapacityUnavailable() { capacityFailures++; },
+  })?.slot, "A");
+  assert.equal(capacityFailures, 1);
+  assert.equal(store.claimWorkspaceIdentity("/other", "existing", undefined, {
+    onCapacityUnavailable() { capacityFailures++; },
+  }), undefined);
+  assert.equal(capacityFailures, 1);
+});
+
+test("Workspace retirement intents persist an exact binding and protect it until exact removal", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-workspace-retirement-intent-"));
+  const path = join(dir, "state.json");
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    const binding = { ...createTelegramWorkspaceBindingIdentity("/repo")!,
+      target: { chatId: 7, threadId: 41 }, slot: "A", threadName: "Anchor",
+      inactiveSinceMs: 100, updatedAtMs: 200 };
+    store.upsertWorkspaceBinding(binding);
+    const intent = { id: "retire:repo:a:100", reason: "pressure" as const,
+      profileKey: "default", binding, leaderEpoch: "leader:1", requestedAtMs: 300 };
+    assert.equal(store.upsertWorkspaceRetirementIntent(intent), true);
+    assert.equal(store.upsertWorkspaceRetirementIntent(structuredClone(intent)), true);
+    assert.equal(store.upsertWorkspaceRetirementIntent({ ...intent, id: "retire:other" }), false);
+    await store.persist();
+    const restored = createTelegramTopicTargetStore({ path });
+    await restored.load();
+    assert.deepEqual(restored.listWorkspaceRetirementIntents(), [intent]);
+    assert.equal(restored.claimWorkspaceIdentity("/repo", "returning"), undefined);
+    assert.equal(restored.setWorkspaceDisplayTitle(binding, "Changed"), false);
+    assert.equal(restored.markWorkspaceBindingActiveByTarget(binding.target), false);
+    assert.equal(restored.getWorkspaceBinding("/repo")?.inactiveSinceMs, 100);
+    const clearExternal = () => ({ liveOwner: "clear" as const,
+      acceptedWork: "clear" as const, deliveryAuthority: "clear" as const });
+    assert.equal(restored.captureWorkspaceSlotOccupancy(clearExternal).bindings[0]?.protection, "protected");
+    assert.equal(restored.captureWorkspaceSlotOccupancy(clearExternal,
+      { expectedRetirement: intent }).bindings[0]?.protection, "eligible");
+    assert.equal(restored.captureWorkspaceSlotOccupancy(clearExternal,
+      { expectedRetirement: { ...intent, leaderEpoch: "stale" } }).bindings[0]?.protection, "protected");
+    const listed = restored.listWorkspaceRetirementIntents()[0]!;
+    listed.binding.target.threadId = 99;
+    assert.equal(restored.listWorkspaceRetirementIntents()[0]?.binding.target.threadId, 41);
+    const current = restored.getWorkspaceBinding("/repo")!;
+    const changed = { ...current, threadName: "Navigator", updatedAtMs: 400 };
+    assert.equal(restored.upsertWorkspaceBinding(changed), undefined);
+    assert.equal(restored.getWorkspaceBinding("/repo")?.threadName, "Anchor");
+    const replacement = { ...intent, binding: changed, requestedAtMs: 500 };
+    assert.equal(restored.upsertWorkspaceRetirementIntent(replacement), false);
+    assert.equal(restored.removeWorkspaceRetirementIntent(replacement), false);
+    assert.equal(restored.removeWorkspaceRetirementIntent(intent), true);
+    const committed = restored.upsertWorkspaceBinding(changed)!;
+    assert.equal(committed.threadName, "Navigator");
+    assert.equal(restored.upsertWorkspaceRetirementIntent({
+      ...replacement, binding: committed,
+    }), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Workspace suffix exposure persists after multiplicity, stale upserts, and sibling retirement", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-workspace-display-"));
+  const path = join(dir, "state.json");
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    const first = createTelegramWorkspaceBindingIdentity("/repo");
+    const second = createTelegramWorkspaceBindingIdentity("/repo", 1);
+    assert.ok(first);
+    assert.ok(second);
+    const firstBinding = { ...first, target: { chatId: 7, threadId: 41 },
+      slot: "A", threadName: "Anchor", updatedAtMs: 1 };
+    store.upsertWorkspaceBinding(firstBinding);
+    assert.equal(store.getWorkspaceBinding("/repo")?.showSlotSuffix, undefined);
+    store.upsertWorkspaceBinding({ ...second, target: { chatId: 7, threadId: 42 },
+      slot: "C", threadName: "Cedar", updatedAtMs: 2 });
+    assert.ok(store.listWorkspaceBindings().every((binding) => binding.showSlotSuffix));
+    store.upsertWorkspaceBinding(firstBinding);
+    assert.equal(store.getWorkspaceBinding("/repo")?.showSlotSuffix, true);
+    await store.persist();
+    const snapshot = JSON.parse(await readFile(path, "utf8"));
+    snapshot.workspaceBindings = snapshot.workspaceBindings.filter(
+      (binding: { bindingKey: string }) => binding.bindingKey === first.bindingKey,
+    );
+    await writeFile(path, JSON.stringify(snapshot));
+    const reopened = createTelegramTopicTargetStore({ path });
+    await reopened.load();
+    assert.equal(reopened.listWorkspaceBindings().length, 1);
+    assert.equal(reopened.getWorkspaceBinding("/repo")?.showSlotSuffix, true);
+    assert.equal(reopened.getWorkspaceBinding("/repo")?.threadName, "Anchor");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Thread store rejects readable-key collisions across exact cwd values", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const first = createTelegramWorkspaceBindingIdentity("/repo/a-b");
+  const colliding = createTelegramWorkspaceBindingIdentity("/repo/a/b");
+  assert.ok(first);
+  assert.ok(colliding);
+  assert.equal(first.workspaceKey, colliding.workspaceKey);
+  assert.ok(
+    store.upsertWorkspaceBinding({
+      ...first,
+      target: { chatId: 7, threadId: 42 },
+      updatedAtMs: 1,
+    }),
+  );
+  assert.equal(
+    store.upsertWorkspaceBinding({
+      ...colliding,
+      target: { chatId: 7, threadId: 43 },
+      updatedAtMs: 2,
+    }),
+    undefined,
+  );
+});
+
+test("Workspace claims allocate deterministic concurrent slots and release them", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const cwd = "/home/llb/.pi/agent/extensions";
+  assert.equal(store.claimWorkspaceIdentity(cwd, "instance-a")?.bindingKey,
+    "--home-llb-.pi-agent-extensions--");
+  assert.equal(store.claimWorkspaceIdentity(cwd, "instance-a")?.instanceSlot,
+    "a");
+  assert.equal(store.claimWorkspaceIdentity(cwd, "instance-b")?.bindingKey,
+    "--home-llb-.pi-agent-extensions--b");
+  assert.equal(store.releaseWorkspaceClaim("instance-a"), true);
+  assert.equal(store.releaseWorkspaceClaim("instance-a"), false);
+  assert.equal(store.claimWorkspaceIdentity(cwd, "instance-c")?.instanceSlot,
+    "a");
+  assert.equal(
+    store.claimWorkspaceIdentity("/another/workspace", "instance-c"),
+    undefined,
+  );
+});
+
+test("Workspace claims reserve global letters across directories and fence slot commits", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const first = store.claimWorkspaceIdentity("/one", "first");
+  const second = store.claimWorkspaceIdentity("/two", "second");
+  assert.ok(first);
+  assert.ok(second);
+  assert.equal(first.instanceSlot, "a");
+  assert.equal(second.instanceSlot, "a");
+  assert.deepEqual([first.slot, second.slot], ["A", "B"]);
+  assert.equal(store.upsertWorkspaceBinding({
+    ...second, slot: "A", target: { chatId: 7, threadId: 42 }, updatedAtMs: 1,
+  }, "second"), undefined);
+  assert.ok(store.upsertWorkspaceBinding({
+    ...second, target: { chatId: 7, threadId: 42 }, updatedAtMs: 1,
+  }, "second"));
+  assert.equal(store.releaseWorkspaceClaim("first"), true);
+  assert.equal(store.claimWorkspaceIdentity("/three", "third")?.slot, "A");
+  assert.equal(store.claimWorkspaceIdentity("/four", "fourth")?.slot, "C");
+  assert.equal(store.claimWorkspaceIdentity("/two", "reopened")?.slot, "B");
+});
+
+test("Global Workspace slots survive reload without rekeying legacy directory identities", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-global-workspace-slots-"));
+  const path = join(dir, "state.json");
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    for (const [cwd, slot, threadId] of [["/one", "A", 41], ["/two", "C", 42]] as const) {
+      const identity = createTelegramWorkspaceBindingIdentity(cwd);
+      assert.ok(identity);
+      store.upsertWorkspaceBinding({
+        ...identity, slot, target: { chatId: 7, threadId }, updatedAtMs: 1,
+      });
+    }
+    await store.persist();
+    const restored = createTelegramTopicTargetStore({ path });
+    await restored.load();
+    const before = restored.listWorkspaceBindings();
+    assert.equal(restored.claimWorkspaceIdentity("/fresh", "fresh")?.slot, "B");
+    assert.equal(restored.claimWorkspaceIdentity("/two", "returning")?.slot, "C");
+    assert.deepEqual(restored.listWorkspaceBindings(), before);
+    assert.equal(restored.getWorkspaceBinding("/two")?.bindingKey,
+      createTelegramWorkspaceBindingIdentity("/two")?.bindingKey);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Legacy missing global slots migrate only through an exact claim commit", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-legacy-missing-slot-"));
+  const path = join(dir, "state.json");
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    const occupied = createTelegramWorkspaceBindingIdentity("/occupied")!;
+    const missing = createTelegramWorkspaceBindingIdentity("/missing")!;
+    store.upsertWorkspaceBinding({ ...occupied, target: { chatId: 7, threadId: 41 },
+      slot: "A", threadName: "Anchor", updatedAtMs: 1 });
+    store.upsertWorkspaceBinding({ ...missing, target: { chatId: 7, threadId: 42 },
+      threadName: "Briar", updatedAtMs: 1 });
+    await store.persist();
+    const restored = createTelegramTopicTargetStore({ path });
+    await restored.load();
+    const firstClaim = restored.claimWorkspaceIdentity("/missing/", "first", undefined,
+      { existingBindingOnly: true });
+    assert.equal(firstClaim?.slot, "B");
+    assert.equal(firstClaim?.bindingKey, missing.bindingKey);
+    assert.equal(restored.getWorkspaceBinding("/missing")?.slot, undefined);
+    assert.equal(restored.releaseWorkspaceClaim("first"), true);
+    const retry = restored.claimWorkspaceIdentity("/missing", "retry", undefined,
+      { existingBindingOnly: true });
+    assert.equal(retry?.slot, "B");
+    assert.ok(retry && restored.upsertWorkspaceBinding({ ...retry,
+      target: { chatId: 7, threadId: 42 }, threadName: "Briar", updatedAtMs: 2,
+    }, "retry"));
+    await restored.persist();
+    const committed = createTelegramTopicTargetStore({ path });
+    await committed.load();
+    assert.equal(committed.getWorkspaceBinding("/missing")?.slot, "B");
+    assert.equal(committed.getWorkspaceBinding("/missing")?.instanceSlot, "a");
+    assert.equal(committed.getWorkspaceBinding("/missing")?.bindingKey, missing.bindingKey);
+    assert.equal(committed.getWorkspaceBinding("/missing")?.inactiveSinceMs, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Legacy duplicate global slots migrate only the exact claimed binding", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-legacy-duplicate-slot-"));
+  const path = join(dir, "state.json");
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/one")!,
+      target: { chatId: 7, threadId: 41 }, slot: "A", threadName: "Anchor", updatedAtMs: 1 });
+    assert.equal(store.upsertWorkspaceBinding({
+      ...createTelegramWorkspaceBindingIdentity("/two")!,
+      target: { chatId: 7, threadId: 42 }, slot: "A", threadName: "Briar", updatedAtMs: 1,
+    }), undefined);
+    await store.persist();
+    const legacySnapshot = JSON.parse(await readFile(path, "utf8"));
+    legacySnapshot.workspaceBindings.push({
+      ...createTelegramWorkspaceBindingIdentity("/two")!,
+      target: { chatId: 7, threadId: 42 }, slot: "A", threadName: "Briar", updatedAtMs: 1,
+    });
+    await writeFile(path, JSON.stringify(legacySnapshot));
+    const restored = createTelegramTopicTargetStore({ path });
+    await restored.load();
+    const before = restored.listWorkspaceBindings();
+    assert.equal(restored.claimWorkspaceIdentity("/fresh", "fresh"), undefined);
+    const first = restored.claimWorkspaceIdentity("/one", "one", undefined,
+      { existingBindingOnly: true });
+    assert.equal(first?.slot, "B");
+    assert.deepEqual(restored.listWorkspaceBindings(), before);
+    assert.equal(restored.releaseWorkspaceClaim("one"), true);
+    const retry = restored.claimWorkspaceIdentity("/one", "retry", undefined,
+      { existingBindingOnly: true });
+    assert.equal(retry?.slot, "B");
+    assert.ok(retry && restored.upsertWorkspaceBinding({ ...retry,
+      target: { chatId: 7, threadId: 41 }, threadName: "Anchor", updatedAtMs: 2,
+    }, "retry"));
+    assert.equal(restored.getWorkspaceBinding("/one")?.slot, "B");
+    assert.equal(restored.getWorkspaceBinding("/two")?.slot, "A");
+    assert.equal(restored.claimWorkspaceIdentity("/fresh", "fresh")?.slot, "C");
+    assert.equal(restored.getWorkspaceBinding("/one")?.inactiveSinceMs, undefined);
+    assert.equal(restored.getWorkspaceBinding("/two")?.inactiveSinceMs, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Workspace capacity protects all 26 live claims instead of extending or evicting", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  for (let index = 0; index < 26; index++) {
+    assert.equal(store.claimWorkspaceIdentity(`/repo/${index}`, `instance-${index}`)?.slot,
+      String.fromCharCode(65 + index));
+  }
+  assert.equal(store.claimWorkspaceIdentity("/overflow", "overflow"), undefined);
+  assert.equal(store.listWorkspaceBindings().length, 0);
+  assert.equal(store.releaseWorkspaceClaim("instance-12"), true);
+  assert.equal(store.claimWorkspaceIdentity("/overflow", "overflow")?.slot, "M");
+});
+
+test("Workspace restore-only claims reuse bindings without allocating new identities", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+
+  assert.equal(
+    store.claimWorkspaceIdentity("/fresh", "fresh", undefined, {
+      existingBindingOnly: true,
+    }),
+    undefined,
+  );
+  assert.equal(store.hasWorkspaceBinding("/fresh"), false);
+
+  const identity = store.claimWorkspaceIdentity("/repo/", "seed");
+  assert.ok(identity);
+  assert.ok(store.upsertWorkspaceBinding({
+    ...identity,
+    target: { chatId: 7, threadId: 42 },
+    threadName: "Atlas",
+    updatedAtMs: 1,
+  }, "seed"));
+  assert.equal(store.releaseWorkspaceClaim("seed"), false);
+  assert.equal(store.hasWorkspaceBinding("/repo"), true);
+
+  assert.equal(
+    store.claimWorkspaceIdentity("/repo", "restore", undefined, {
+      existingBindingOnly: true,
+    })?.bindingKey,
+    identity.bindingKey,
+  );
+  assert.equal(
+    store.claimWorkspaceIdentity("/repo", "other", undefined, {
+      existingBindingOnly: true,
+    }),
+    undefined,
+  );
+  assert.equal(store.listWorkspaceBindings().length, 1);
+
+  const legacyStore = createTelegramTopicTargetStore({
+    path: "/unused/legacy-state.json",
+  });
+  legacyStore.upsert({
+    profileKey: "cwd:/legacy",
+    owner: {
+      kind: "leader",
+      instanceId: "legacy",
+      cwd: "/legacy",
+    },
+    target: { chatId: 7, threadId: 43 },
+    status: "active",
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    instanceId: "legacy",
+    threadName: "Beacon",
+  });
+  assert.ok(
+    legacyStore.claimWorkspaceIdentity("/legacy", "restore", undefined, {
+      existingBindingOnly: true,
+    }),
+  );
+  assert.deepEqual(
+    legacyStore.getWorkspaceBinding("/legacy")?.target,
+    { chatId: 7, threadId: 43 },
+  );
+});
+
+test("Explicit same-cwd claims skip a live leader binding without migrating its target", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const leaderIdentity = store.claimWorkspaceIdentity("/repo", "leader");
+  assert.ok(leaderIdentity);
+  store.upsertWorkspaceBinding({
+    ...leaderIdentity,
+    target: { chatId: 7, threadId: 41 },
+    threadName: "Atlas",
+    slot: "A",
+    updatedAtMs: 1,
+  }, "leader");
+  store.upsert({
+    profileKey: "cwd:/repo",
+    owner: { kind: "leader", cwd: "/repo", instanceId: "leader" },
+    instanceId: "leader",
+    target: { chatId: 7, threadId: 41 },
+    status: "active",
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    threadName: "Atlas",
+    slot: "A",
+  });
+  assert.equal(store.claimWorkspaceIdentity("/repo", "startup", undefined, {
+    existingBindingOnly: true,
+  }), undefined);
+  const follower = store.claimWorkspaceIdentity("/repo/", "follower");
+  assert.equal(follower?.instanceSlot, "b");
+  assert.equal(store.getWorkspaceBinding("/repo", "b"), undefined);
+  assert.equal(store.claimWorkspaceIdentity("/repo", "another")?.instanceSlot, "c");
+  assert.equal(store.listWorkspaceBindings().length, 1);
+  assert.equal(store.getByProfileKey("cwd:/repo")?.instanceId, "leader");
+  assert.equal(store.getWorkspaceBinding("/repo")?.target.threadId, 41);
+});
+
+test("Retained Workspace admission fences reserve slots across allocation paths", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-fence-slots-"));
+  try {
+    const admission = createTelegramWorkspaceAdmissionLedger({
+      path: join(dir, "admission.json"),
+      profileKey: "default",
+      owner: {
+        processId: process.pid,
+        processBirthId: `${process.pid}:slot-fence-test`,
+      },
+      getProcessLiveness: () => "alive",
+    });
+    const fence = admission.acquireRetirementFence({
+      operationId: "slot-fence",
+      retirementIntentId: "slot-intent",
+      bindingKey: "slot-binding",
+      slot: "A",
+      target: { chatId: 7, threadId: 42 },
+      leaderEpoch: 1,
+      retirementRequestedAtMs: 1,
+    });
+    assert.equal(fence.kind, "acquired");
+    const store = createTelegramTopicTargetStore({
+      path: join(dir, "state.json"),
+      getExternalReservedSlots: admission.listReservedSlots,
+    });
+    assert.equal(store.allocateSlot("manual:new"), "B");
+    assert.equal(store.claimWorkspaceIdentity("/repo", "claim")?.slot, "B");
+    const occupancy = store.captureWorkspaceSlotOccupancy(() => ({
+      liveOwner: "clear",
+      acceptedWork: "clear",
+      deliveryAuthority: "clear",
+    }));
+    assert.equal(occupancy.reservedSlots.includes("a"), true);
+    store.releaseWorkspaceClaim("claim");
+    if (fence.kind === "acquired") {
+      assert.equal(admission.releaseUnissuedRetirementFence(fence.fence), true);
+    }
+    assert.equal(store.allocateSlot("manual:new"), "A");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Unverifiable external slot reservations fail allocation closed", () => {
+  for (const getExternalReservedSlots of [
+    () => ["a"],
+    () => {
+      throw new Error("admission ledger unavailable");
+    },
+  ]) {
+    let capacityUnavailable = false;
+    const store = createTelegramTopicTargetStore({
+      path: "/unused/state.json",
+      getExternalReservedSlots,
+    });
+    assert.equal(store.allocateSlot("manual:new"), undefined);
+    assert.equal(store.claimWorkspaceIdentity("/repo", "claim", undefined, {
+      onCapacityUnavailable() {
+        capacityUnavailable = true;
+      },
+    }), undefined);
+    assert.equal(capacityUnavailable, true);
+    assert.equal(
+      store.captureWorkspaceSlotOccupancy(() => ({
+        liveOwner: "clear",
+        acceptedWork: "clear",
+        deliveryAuthority: "clear",
+      })).reservedSlots.includes("invalid"),
+      true,
+    );
+  }
+});
+
+test("Generic allocation cannot reuse a transient Workspace claim slot", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  assert.equal(store.claimWorkspaceIdentity("/claimed", "claim-owner")?.slot, "A");
+  assert.equal(store.allocateSlot("manual:other"), "B");
+  store.releaseWorkspaceClaim("claim-owner");
+  assert.equal(store.allocateSlot("manual:other"), "A");
+});
+
+test("Workspace claims preserve live bindings and disambiguate readable-key collisions", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const first = store.claimWorkspaceIdentity("/repo/a-b", "instance-a");
+  const colliding = store.claimWorkspaceIdentity("/repo/a/b", "instance-b");
+  assert.ok(first);
+  assert.ok(colliding);
+  assert.notEqual(colliding.workspaceKey, first.workspaceKey);
+  assert.match(colliding.workspaceKey, /-[a-f0-9]{12}--$/u);
+  assert.ok(
+    store.upsertWorkspaceBinding({
+      ...first,
+      target: { chatId: 7, threadId: 42 },
+      threadName: "Ember",
+      updatedAtMs: 1,
+    }, "instance-a"),
+  );
+  store.upsert({
+    profileKey: "manual:instance-a",
+    owner: { kind: "manual-follower", instanceId: "instance-a" },
+    target: { chatId: 7, threadId: 42 },
+    status: "active",
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    instanceId: "instance-a",
+  });
+  assert.equal(
+    store.claimWorkspaceIdentity("/repo/a-b", "instance-c")?.instanceSlot,
+    "b",
+  );
+});
+
+test("Workspace claims migrate legacy cwd and concurrent manual bindings", () => {
+  const store = createTelegramTopicTargetStore({
+    path: "/unused/state.json",
+    getNowMs: () => 2000,
+  });
+  store.upsert({
+    profileKey: "cwd:/repo",
+    owner: { kind: "leader", cwd: "/repo", instanceId: "leader-old" },
+    target: { chatId: 7, threadId: 41 },
+    status: "active",
+    createdAtMs: 1,
+    updatedAtMs: 1000,
+    instanceId: "leader-old",
+    threadName: "Atlas",
+    slot: "A",
+  });
+  const leaderIdentity = store.claimWorkspaceIdentity(
+    "/repo/",
+    "leader-new",
+    "leader-old",
+  );
+  assert.equal(leaderIdentity?.instanceSlot, "a");
+  assert.deepEqual(store.getWorkspaceBinding("/repo"), {
+    ...leaderIdentity,
+    target: { chatId: 7, threadId: 41 },
+    threadName: "Atlas",
+    slot: "A",
+    updatedAtMs: 2000,
+  });
+  assert.ok(
+    leaderIdentity &&
+      store.upsertWorkspaceBinding(
+        {
+          ...leaderIdentity,
+          target: { chatId: 7, threadId: 41 },
+          threadName: "Atlas",
+          slot: "A",
+          updatedAtMs: 2001,
+        },
+        "leader-new",
+      ),
+  );
+
+  store.upsert({
+    profileKey: "manual:worker-old",
+    owner: { kind: "manual-follower", instanceId: "worker-profile" },
+    target: { chatId: 7, threadId: 42 },
+    status: "active",
+    createdAtMs: 1,
+    updatedAtMs: 1001,
+    instanceId: "worker-old",
+    threadName: "Cedar",
+    slot: "C",
+  });
+  const followerIdentity = store.claimWorkspaceIdentity(
+    "/repo",
+    "worker-new",
+    "worker-old",
+  );
+  assert.equal(followerIdentity?.instanceSlot, "b");
+  assert.deepEqual(store.getWorkspaceBinding("/repo", "b"), {
+    ...followerIdentity,
+    showSlotSuffix: true,
+    target: { chatId: 7, threadId: 42 },
+    threadName: "Cedar",
+    slot: "C",
+    updatedAtMs: 2000,
+  });
+});
+
+test("Workspace binding commit is fenced by its exact transient claim", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const identity = store.claimWorkspaceIdentity("/repo", "instance-a");
+  assert.ok(identity);
+  const binding = {
+    ...identity,
+    target: { chatId: 7, threadId: 42 },
+    updatedAtMs: 1,
+  };
+  assert.equal(
+    store.upsertWorkspaceBinding(binding, "instance-b"),
+    undefined,
+  );
+  assert.equal(store.releaseWorkspaceClaim("instance-a"), true);
+  assert.equal(
+    store.upsertWorkspaceBinding(binding, "instance-a"),
+    undefined,
+  );
+  assert.deepEqual(
+    store.claimWorkspaceIdentity("/repo", "instance-a"),
+    identity,
+  );
+  assert.ok(store.upsertWorkspaceBinding(binding, "instance-a"));
+  assert.equal(store.releaseWorkspaceClaim("instance-a"), false);
 });
 
 test("Thread store persists explicit owner target mappings privately", async () => {
@@ -557,9 +1524,11 @@ test("Thread store snapshot commit is fenced by exact transport ownership", asyn
   }
 });
 
-test("Thread store skips semantically unchanged state snapshots", async () => {
+test("Thread store skips semantically unchanged state snapshots", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-state-semantic-"));
   const path = join(dir, "state.json");
+  const mkdirSpy = t.mock.method(fsPromises, "mkdir");
+  syncBuiltinESMExports();
   try {
     let nowMs = 1000;
     const store = createTelegramTopicTargetStore({
@@ -569,8 +1538,10 @@ test("Thread store skips semantically unchanged state snapshots", async () => {
     store.setBotState({ threadMode: "enabled" });
     await store.persist();
     const initial = await readFile(path, "utf8");
+    assert.equal(mkdirSpy.mock.callCount(), 1);
     nowMs = 2000;
     await store.persist();
+    assert.equal(mkdirSpy.mock.callCount(), 1);
     assert.equal(await readFile(path, "utf8"), initial);
     store.setStatusSnapshot({ diagnostics: { recentEvents: 1 } });
     await store.persist();
@@ -581,6 +1552,50 @@ test("Thread store skips semantically unchanged state snapshots", async () => {
     store.setStatusSnapshot({ diagnostics: { recentEvents: 1 } });
     await store.persist();
     assert.equal(await readFile(path, "utf8"), diagnostic);
+    assert.equal(mkdirSpy.mock.callCount(), 2);
+  } finally {
+    mkdirSpy.mock.restore();
+    syncBuiltinESMExports();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Snapshot equality ignores object key order but preserves array order and JSON values", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-state-order-"));
+  const path = join(dir, "state.json");
+  try {
+    let nowMs = 1000;
+    const store = createTelegramTopicTargetStore({ path, getNowMs: () => nowMs });
+    const identity = store.claimWorkspaceIdentity("/repo", "instance-a")!;
+    const target = { chatId: 7, threadId: 42 };
+    store.upsertWorkspaceBinding({ ...identity, target, updatedAtMs: 1000 }, "instance-a");
+    store.upsert({ profileKey: "manual:instance-a", instanceId: "instance-a", slot: "A",
+      target, status: "active", createdAtMs: 1000, updatedAtMs: 1000 });
+    await store.persist();
+    const initial = await readFile(path, "utf8");
+    nowMs++;
+    await store.persist();
+    assert.equal(await readFile(path, "utf8"), initial, "Reload-only key ordering must not rewrite the file");
+    store.setStatusSnapshot({ diagnostics: { payload: { first: 1, last: 2 }, list: ["a", "b"] } });
+    await store.persist();
+    const baseline = await readFile(path, "utf8");
+    nowMs++;
+    store.setStatusSnapshot({ diagnostics: { list: ["a", "b"], payload: { last: 2, first: 1, omitted: undefined } } });
+    await store.persist();
+    assert.equal(await readFile(path, "utf8"), baseline, "Nested JSON object order and omitted undefined are equivalent");
+    for (const diagnostics of [
+      { list: ["b", "a"], payload: { first: 1, last: 2 } },
+      { list: ["b", "a"], payload: { first: "1", last: 2 } },
+      { list: ["b", "a"], payload: { first: "1", last: 2, added: null } },
+    ]) {
+      const before = await readFile(path, "utf8");
+      nowMs++;
+      store.setStatusSnapshot({ diagnostics });
+      await store.persist();
+      const after = await readFile(path, "utf8");
+      assert.notEqual(after, before, "Array order, value type, and explicit null remain meaningful");
+      assert.deepEqual(JSON.parse(after).diagnostics, diagnostics);
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -822,10 +1837,10 @@ test("Thread store returns defensive copies and prunes offline/stale observation
   });
   assert.equal(
     store.renameByTarget({ chatId: -1001, threadId: 42 }, "  Blue   Unit  ")
-      ?.threadName,
+      ?.manualThreadName,
     "Blue Unit",
   );
-  assert.equal(store.getByProfileKey("cwd:/repo")?.threadName, "Blue Unit");
+  assert.equal(store.getByProfileKey("cwd:/repo")?.manualThreadName, "Blue Unit");
   assert.equal(store.markOfflineByInstanceId("inst-a"), 1);
   assert.equal(store.getByProfileKey("cwd:/repo"), undefined);
   store.upsert({
@@ -1302,7 +2317,7 @@ test("Thread store enforces one active target per live instance", () => {
   assert.equal(store.getByProfileKey("topic:1:11")?.instanceId, "inst-a");
 });
 
-test("Thread renamer edits the Telegram topic and persisted thread name", async () => {
+test("Thread renamer edits the Telegram topic and persists a manual override", async () => {
   const calls: unknown[] = [];
   const store = createTelegramTopicTargetStore({
     path: "/tmp/unused-telegram-targets.json",
@@ -1315,6 +2330,14 @@ test("Thread renamer edits the Telegram topic and persisted thread name", async 
     createdAtMs: 1000,
     updatedAtMs: 1000,
     threadName: "OldName",
+  });
+  const workspaceIdentity = createTelegramWorkspaceBindingIdentity("/repo");
+  assert.ok(workspaceIdentity);
+  store.upsertWorkspaceBinding({
+    ...workspaceIdentity,
+    target: { chatId: -1001, threadId: 42 },
+    threadName: "OldName",
+    updatedAtMs: 1000,
   });
   const rename = createTelegramTopicTargetRenamer({
     store,
@@ -1330,8 +2353,11 @@ test("Thread renamer edits the Telegram topic and persisted thread name", async 
     threadName: "  BlueUnit  ",
   });
 
-  assert.equal(record?.threadName, "BlueUnit");
+  assert.equal(record?.threadName, "OldName");
+  assert.equal(record?.manualThreadName, "BlueUnit");
   assert.equal(record?.updatedAtMs, 3000);
+  assert.equal(store.getWorkspaceBinding("/repo")?.threadName, "OldName");
+  assert.equal(store.getWorkspaceBinding("/repo")?.manualThreadName, "BlueUnit");
   assert.deepEqual(calls, [
     {
       method: "editForumTopic",
@@ -1342,9 +2368,111 @@ test("Thread renamer edits the Telegram topic and persisted thread name", async 
       },
     },
   ]);
+  const reset = store.clearManualNameByTarget(
+    { chatId: -1001, threadId: 42 },
+    "A",
+  );
+  assert.equal(reset?.manualThreadName, undefined);
+  assert.equal(reset?.threadName, "OldName");
+  assert.equal(store.getWorkspaceBinding("/repo")?.manualThreadName, undefined);
+  assert.equal(store.getWorkspaceBinding("/repo")?.displayTitle, "A");
 });
 
-test("Thread renamer rejects bare slot and generic role labels", async () => {
+test("Workspace rename preserves non-named display titles and fences a concurrent mode switch", async () => {
+  for (const mode of ["letters", "directories", "names", "switching"]) {
+    const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+    const identity = createTelegramWorkspaceBindingIdentity("/repo")!;
+    const target = { chatId: 7, threadId: 42 };
+    store.upsert({ profileKey: "cwd:/repo", target, instanceId: "leader", slot: "A",
+      threadName: "Anchor", status: "active", createdAtMs: 1, updatedAtMs: 1 });
+    store.upsertWorkspaceBinding({ ...identity, target, slot: "A", threadName: "Anchor",
+      displayTitle: mode === "letters" ? "A" : mode === "directories" ? "repo_a" : "Anchor", updatedAtMs: 1 });
+    const previousTitle = store.getWorkspaceBinding("/repo")?.displayTitle;
+    let displayName = mode === "names" || mode === "switching";
+    let edits = 0;
+    const rename = createTelegramTopicTargetRenamer({
+      store, shouldRenameDisplayedTitle: () => displayName,
+      async callApi<TResponse>() { edits++; if (mode === "switching") displayName = false; return true as TResponse; },
+    });
+    const run = rename({ target, threadName: "Navigator", slot: "A" });
+    if (mode === "switching") {
+      await assert.rejects(run, /display mode changed/);
+      assert.equal(store.getWorkspaceBinding("/repo")?.threadName, "Anchor");
+    } else {
+      assert.equal((await run)?.manualThreadName, "Navigator");
+      assert.equal(store.getWorkspaceBinding("/repo")?.displayTitle,
+        mode === "names" ? "Navigator" : previousTitle);
+      assert.equal(edits, mode === "names" ? 1 : 0);
+    }
+  }
+});
+
+test("Workspace target replacement preserves its manual Thread display name", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const identity = createTelegramWorkspaceBindingIdentity("/repo")!;
+  store.upsertWorkspaceBinding({
+    ...identity,
+    target: { chatId: 7, threadId: 41 },
+    slot: "A",
+    threadName: "Anchor",
+    manualThreadName: "wasd_123!?+$@",
+    displayTitle: "wasd_123!?+$@",
+    updatedAtMs: 1,
+  });
+  store.upsertWorkspaceBinding({
+    ...identity,
+    target: { chatId: 7, threadId: 42 },
+    slot: "A",
+    threadName: "Anchor",
+    updatedAtMs: 2,
+  });
+  const replaced = store.getWorkspaceBinding("/repo");
+  assert.deepEqual(replaced?.target, { chatId: 7, threadId: 42 });
+  assert.equal(replaced?.manualThreadName, "wasd_123!?+$@");
+  assert.equal(replaced?.displayTitle, undefined);
+});
+
+test("Thread renamer rejects a name reserved by another Workspace", async () => {
+  const calls: unknown[] = [];
+  const store = createTelegramTopicTargetStore({
+    path: "/tmp/unused-telegram-targets.json",
+  });
+  store.upsert({
+    profileKey: "cwd:/repo-a",
+    target: { chatId: 7, threadId: 42 },
+    status: "active",
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    threadName: "Atlas",
+  });
+  const workspaceIdentity = createTelegramWorkspaceBindingIdentity("/repo-b");
+  assert.ok(workspaceIdentity);
+  store.upsertWorkspaceBinding({
+    ...workspaceIdentity,
+    target: { chatId: 7, threadId: 43 },
+    threadName: "Cedar",
+    updatedAtMs: 1,
+  });
+  const rename = createTelegramTopicTargetRenamer({
+    store,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      calls.push({ method, body });
+      return {} as TResponse;
+    },
+  });
+
+  assert.equal(
+    await rename({
+      target: { chatId: 7, threadId: 42 },
+      threadName: "Cedar",
+    }),
+    undefined,
+  );
+  assert.deepEqual(calls, []);
+  assert.equal(store.getByProfileKey("cwd:/repo-a")?.threadName, "Atlas");
+});
+
+test("Thread renamer reserves bare slot letters for automatic reset", async () => {
   const calls: unknown[] = [];
   const store = createTelegramTopicTargetStore({
     path: "/tmp/unused-telegram-targets.json",
@@ -1375,15 +2503,14 @@ test("Thread renamer rejects bare slot and generic role labels", async () => {
     }),
     undefined,
   );
-  assert.equal(
-    await rename({
-      target: { chatId: -1001, threadId: 42 },
-      threadName: "Follower",
-      slot: "F",
-    }),
-    undefined,
-  );
-  assert.deepEqual(calls, []);
+  assert.equal(calls.length, 0);
+  const renamed = await rename({
+    target: { chatId: -1001, threadId: 42 },
+    threadName: "Follower",
+    slot: "F",
+  });
+  assert.equal(renamed?.manualThreadName, "Follower");
+  assert.equal(calls.length, 1);
   assert.equal(store.getByProfileKey("cwd:/repo")?.threadName, "OldName");
 });
 
@@ -1906,62 +3033,126 @@ test("Thread provisioner preserves its intent and stops binding after create los
   }
 });
 
-test("Thread provisioner keeps targeted pending provision after post-create binding failure", async () => {
-  const dir = await mkdtemp(
-    join(tmpdir(), "pi-telegram-provision-post-create-fail-"),
-  );
-  const path = join(dir, "state.json");
-  try {
-    const store = createTelegramTopicTargetStore({
-      path,
-      getNowMs: () => 2000,
-    });
-    const failingStore = {
-      ...store,
-      upsert(record: Parameters<typeof store.upsert>[0]) {
-        if (record.status === "starting") {
-          throw new Error("binding persist failed");
-        }
-        return store.upsert(record);
-      },
-    };
-    const provision = createTelegramTopicTargetProvisioner({
-      topicChatId: -1001,
-      store: failingStore,
-      getNowMs: () => 2000,
-      async callApi<TResponse>() {
-        return { message_thread_id: 88 } as TResponse;
-      },
-    });
+test("Post-create recovery preserves the acknowledged title with or without a starting record", async () => {
+  for (const failStatus of ["starting", "active"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "pi-telegram-provision-post-create-fail-"));
+    const path = join(dir, "state.json");
+    try {
+      const store = createTelegramTopicTargetStore({ path, getNowMs: () => 2000 });
+      const identity = store.claimWorkspaceIdentity("/repo/extensions", "inst-a")!;
+      const request = { instanceId: "inst-a", profileKey: "manual:inst-a",
+        workspaceBindingKey: identity.bindingKey, workspaceCwd: identity.cwd };
+      let creations = 0;
+      const provision = createTelegramTopicTargetProvisioner({
+        topicChatId: -1001, getNowMs: () => 2000,
+        store: { ...store, upsert(record) {
+          if (record.status === failStatus) throw new Error("binding persist failed");
+          return store.upsert(record);
+        } },
+        resolveInitialWorkspaceDisplayTitle: () => "extensions",
+        async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+          assert.equal(method, "createForumTopic");
+          assert.equal(body.name, "extensions");
+          creations++;
+          return { message_thread_id: 88 } as TResponse;
+        },
+      });
+      await assert.rejects(provision(request), /binding persist failed/);
+      const restored = createTelegramTopicTargetStore({ path, getNowMs: () => 3000 });
+      await restored.load();
+      assert.deepEqual(restored.listPendingProvisions(), [{
+        id: "provision:inst-a:A:2000", owner: "manual-follower", instanceId: "inst-a",
+        profileKey: "manual:inst-a", threadName: "Atlas", displayTitle: "extensions",
+        slot: "A", target: { chatId: -1001, threadId: 88 }, startedAtMs: 2000,
+      }]);
+      const recover = createTelegramTopicTargetProvisioner({
+        topicChatId: -1001, store: restored, getNowMs: () => 3000,
+        resolveInitialWorkspaceDisplayTitle() { throw new Error("must not reproject an acknowledged title"); },
+        async callApi() { throw new Error("must not recreate the acknowledged target"); },
+      });
+      const recovered = await recover(request);
+      assert.equal(recovered.reused, true);
+      assert.equal(recovered.displayTitle, "extensions", failStatus);
+      assert.equal(recovered.record.threadName, "Atlas");
+      assert.deepEqual(recovered.target, { chatId: -1001, threadId: 88 });
+      assert.equal(restored.listPendingProvisions().length, 1,
+        "Creation evidence remains until the exact Workspace commit");
+      await store.load();
+      const committed = commitTelegramWorkspaceProvisionBinding({
+        store, instanceId: request.instanceId, profileKey: request.profileKey,
+        binding: { ...identity, target: recovered.target, slot: recovered.record.slot,
+          threadName: recovered.record.threadName, updatedAtMs: 3000 },
+      });
+      assert.equal(committed.displayTitle, "extensions");
+      assert.deepEqual(store.listPendingProvisions(), []);
+      assert.equal(JSON.parse(await readFile(path, "utf8")).pendingProvisions.length, 1,
+        "The caller still owns durable settlement");
+      await store.persist();
+      const settled = createTelegramTopicTargetStore({ path });
+      await settled.load();
+      assert.equal(settled.getWorkspaceBinding(identity.cwd)?.displayTitle, "extensions");
+      assert.deepEqual(settled.listPendingProvisions(), []);
+      assert.equal(creations, 1);
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
+  }
+});
 
-    await assert.rejects(
-      () =>
-        provision({
-          instanceId: "inst-a",
-          profileKey: "manual:inst-a",
-        }),
-      /binding persist failed/,
-    );
-    assert.deepEqual(store.listPendingProvisions(), [
-      {
-        id: "provision:inst-a:A:2000",
-        owner: "manual-follower",
-        instanceId: "inst-a",
-        profileKey: "manual:inst-a",
-        threadName: "Atlas",
-        slot: "A",
-        target: { chatId: -1001, threadId: 88 },
-        startedAtMs: 2000,
-      },
-    ]);
-    const file = JSON.parse(await readFile(path, "utf8"));
-    assert.deepEqual(file.pendingProvisions?.[0]?.target, {
-      chatId: -1001,
-      threadId: 88,
-    });
-    assert.deepEqual(file.threads, []);
-  } finally {
-    await rm(dir, { force: true, recursive: true });
+test("Deleted creation evidence cannot resurrect a pending target, while closed and cleanup targets stay protected", async () => {
+  for (const scenario of ["active-deleted", "pending-deleted", "legacy-deleted", "closed", "cleanup"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "pi-telegram-pending-invalidation-"));
+    try {
+      const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 2000 });
+      const identity = store.claimWorkspaceIdentity("/repo/extensions", "inst-a")!;
+      const request = { instanceId: "inst-a", profileKey: "manual:inst-a",
+        workspaceBindingKey: identity.bindingKey, workspaceCwd: identity.cwd };
+      let creations = 0;
+      const provision = createTelegramTopicTargetProvisioner({
+        topicChatId: 7, store: { ...store, upsert(record) {
+          if (scenario === "pending-deleted" && creations === 1) throw new Error("post-create failure");
+          return store.upsert(record);
+        } },
+        getNowMs: () => 2000, resolveInitialWorkspaceDisplayTitle: () => "extensions",
+        async callApi<TResponse>() { return { message_thread_id: 41 + ++creations } as TResponse; },
+      });
+      if (scenario === "pending-deleted") await assert.rejects(provision(request), /post-create failure/);
+      else await provision(request);
+      const retained = store.listPendingProvisions()[0]!;
+      assert.equal(store.markStaleByTarget({ chatId: 8, threadId: 42 }, "deleted"), false);
+      assert.equal(store.listPendingProvisions().length, 1);
+      if (scenario === "cleanup") {
+        store.upsertPendingCleanup({ id: "cleanup", owner: "manual-follower", instanceId: "inst-a",
+          profileKey: request.profileKey, target: { chatId: 7, threadId: 42 },
+          runtimeGeneration: "inst-a:1", requestedAtMs: 2000 });
+      } else {
+        assert.equal(store.markStaleByTarget({ chatId: 7, threadId: 42 },
+          scenario === "closed" ? "closed" : "deleted"), true);
+        if (scenario === "legacy-deleted") store.upsertPendingProvision(retained);
+      }
+      await store.persist();
+      if (scenario === "closed" || scenario === "cleanup") {
+        assert.throws(() => commitTelegramWorkspaceProvisionBinding({
+          store, instanceId: request.instanceId, profileKey: request.profileKey,
+          binding: { ...identity, target: { chatId: 7, threadId: 42 }, updatedAtMs: 2000 },
+          displayTitle: "extensions",
+        }), /requires reconciliation/);
+        assert.equal(store.getWorkspaceBinding(identity.cwd), undefined);
+        assert.deepEqual(store.listPendingProvisions(), [retained]);
+        await assert.rejects(provision(request), /requires reconciliation/);
+        assert.deepEqual(store.listPendingProvisions(), [retained]);
+        assert.equal(creations, 1);
+      } else {
+        const replacement = await provision(request);
+        assert.equal(replacement.reused, false);
+        assert.deepEqual(replacement.target, { chatId: 7, threadId: 43 });
+        assert.equal(replacement.displayTitle, "extensions");
+        assert.equal(creations, 2);
+        assert.equal(store.listPendingProvisions().some((entry) => entry.target?.threadId === 42), false);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -1997,6 +3188,86 @@ test("Thread provisioner creates forum topics without retrying non-idempotent re
       options: { maxAttempts: 1 },
     },
   ]);
+});
+
+test("Thread provisioner rejects slotless fresh targets at global capacity", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-provision-capacity-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+  for (const [index, slot] of Array.from("ABCDEFGHIJKLMNOPQRSTUVWXYZ").entries()) {
+    const identity = createTelegramWorkspaceBindingIdentity(`/retained/${index}`);
+    assert.ok(identity);
+    store.upsertWorkspaceBinding({
+      ...identity,
+      target: { chatId: 7, threadId: 100 + index },
+      slot,
+      updatedAtMs: index + 1,
+    });
+  }
+  let apiCalls = 0;
+  const provision = createTelegramTopicTargetProvisioner({
+    topicChatId: 7,
+    store,
+    async callApi<TResponse>() {
+      apiCalls += 1;
+      return { message_thread_id: 900 } as TResponse;
+    },
+  });
+  try {
+    await assert.rejects(provision({
+      instanceId: "legacy-follower",
+      owner: { kind: "manual-follower", instanceId: "legacy-follower" },
+      profileKey: "manual:legacy-follower",
+    }), /Telegram Workspace slot reservation is unavailable/u);
+    assert.equal(apiCalls, 0);
+    assert.equal(store.list().length, 0);
+    assert.equal(store.listPendingProvisions().length, 0);
+    assert.equal(store.listWorkspaceBindings().length, 26);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Thread provisioner skips names reserved by dormant Workspaces", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-workspace-name-"));
+  const calls: unknown[] = [];
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+  const workspaceIdentity = createTelegramWorkspaceBindingIdentity("/repo/old");
+  assert.ok(workspaceIdentity);
+  store.upsertWorkspaceBinding({
+    ...workspaceIdentity,
+    target: { chatId: 7, threadId: 41 },
+    threadName: "Cedar",
+    slot: "C",
+    updatedAtMs: 1,
+  });
+  const provision = createTelegramTopicTargetProvisioner({
+    topicChatId: 7,
+    store,
+    getNowMs: () => 2000,
+    getRandom: () => 0,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      calls.push({ method, body });
+      return { message_thread_id: 42 } as TResponse;
+    },
+  });
+  try {
+    const result = await provision({
+      instanceId: "new",
+      owner: { kind: "manual-follower", instanceId: "new" },
+      profileKey: "manual:new",
+      preferredSlot: "C",
+    });
+    assert.equal(result.record.slot, "A");
+    assert.equal(result.record.threadName, "Atlas");
+    assert.deepEqual(calls, [
+      {
+        method: "createForumTopic",
+        body: { chat_id: 7, name: "Atlas" },
+      },
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("Thread provisioner creates a new topic for new or stale profiles", async () => {
@@ -2335,7 +3606,7 @@ test("Thread provisioner assigns fresh baked names from visible thread-name sequ
     profileKey: "manual:follower",
   });
 
-  assert.equal(store.getByProfileKey("cwd:/leader")?.slot, "D");
+  assert.equal(store.getByProfileKey("cwd:/leader")?.slot, "E");
   assert.equal(result.record.slot, "F");
   assert.equal(result.record.threadName, "Falcon");
   assert.deepEqual(calls, [
@@ -2477,6 +3748,7 @@ test("Leader thread state runtime owns target identity transitions", () => {
 });
 
 test("Current-thread assembly owns preferred-target order and status identity", () => {
+  let followerDisplayTitle: string | undefined;
   let activeTarget: { chatId: number; threadId: number } | undefined = {
     chatId: 7,
     threadId: 12,
@@ -2501,6 +3773,13 @@ test("Current-thread assembly owns preferred-target order and status identity", 
     isFollowerRegistered: () => true,
     getFollowerSlot: () => "C",
     getFollowerThreadName: () => "Cedar",
+    getFollowerDisplayTitle: () => followerDisplayTitle,
+    listWorkspaceBindings: () => [
+      { ...createTelegramWorkspaceBindingIdentity("/repo")!, target: { chatId: 7, threadId: 11 },
+        threadName: "Cedar", slot: "C", displayTitle: "stale-disk-title", updatedAtMs: 1 },
+      { ...createTelegramWorkspaceBindingIdentity("/other")!, target: { chatId: 7, threadId: 55 },
+        threadName: "Oak", slot: "O", displayTitle: "other", updatedAtMs: 1 },
+    ],
     getLeaderIdentity: () => ({
       target: { chatId: 7, threadId: 10 },
       slot: "L",
@@ -2528,6 +3807,15 @@ test("Current-thread assembly owns preferred-target order and status identity", 
   });
   assert.equal(assembly.status.getBusRole(), "follower");
   assert.equal(assembly.status.getInstanceThreadName(), "Cedar");
+  assert.equal(assembly.getDisplayTitle({ chatId: 7, threadId: 11 }), undefined);
+  assert.equal(assembly.getDisplayTitle({ chatId: 7, threadId: 55 }), "other");
+  assert.equal(assembly.getDisplayTitle({ chatId: 8, threadId: 55 }), undefined);
+  followerDisplayTitle = "repo_c";
+  assert.equal(assembly.getDisplayTitle({ chatId: 7, threadId: 11 }), "repo_c");
+  assert.equal(assembly.current.getIdentity().threadName, "repo_c");
+  assert.equal(assembly.status.getInstanceThreadName(), "repo_c");
+  assert.equal(assembly.status.getLocalBus().followerThreadName, "repo_c");
+  assert.equal(assembly.current.getRestorationIdentity().threadName, "Cedar");
 });
 
 test("Current-instance thread runtime owns record and live identity selection", () => {
@@ -2798,21 +4086,30 @@ test("Thread stale error helper detects deleted or missing topics", () => {
   );
 });
 
-test("Thread identity helpers require compact capitalized Latin names", () => {
+test("Thread recovery identities remain compact capitalized Latin names", () => {
   assert.equal(getTelegramTopicIdentityName("Jname"), "Jname");
   assert.equal(getTelegramTopicIdentityName("  Jname  "), "Jname");
   assert.equal(isTelegramTopicThreadNameValidForSlot("Jname", "J"), true);
-  assert.equal(isTelegramTopicThreadNameValidForSlot("Aname", "J"), true);
-  assert.equal(isTelegramTopicThreadNameValidForSlot("J", "J"), false);
-  assert.equal(isTelegramTopicThreadNameValidForSlot("name", "N"), false);
-  assert.equal(isTelegramTopicThreadNameValidForSlot("Follower", "F"), false);
-  assert.equal(isTelegramTopicThreadNameValidForSlot("J identity", "J"), false);
-  assert.equal(isTelegramTopicThreadNameValidForSlot("J-identity", "J"), false);
-  assert.equal(isTelegramTopicThreadNameValidForSlot("Word Word", "W"), false);
-  assert.equal(
-    isTelegramTopicThreadNameValidForSlot("🌙 J-identity", "J"),
-    false,
-  );
+  for (const name of [
+    "J", "name", "Follower", "J identity", "J-identity", "Word Word",
+    "wasd_123!?+$@", "🌙 J-identity",
+  ]) {
+    assert.equal(isTelegramTopicThreadNameValidForSlot(name, "J"), false, name);
+  }
+});
+
+test("Manual Thread display names accept bounded printable ASCII", () => {
+  for (const name of [
+    "Jname", "name", "Follower", "J identity", "J-identity", "Word Word",
+    "wasd_123!?+$@",
+  ]) {
+    assert.equal(getTelegramManualThreadDisplayNameValidationError(name), undefined, name);
+  }
+  assert.match(getTelegramManualThreadDisplayNameValidationError("A") ?? "", /reset/);
+  assert.match(getTelegramManualThreadDisplayNameValidationError("   ") ?? "", /empty/);
+  assert.match(getTelegramManualThreadDisplayNameValidationError("🌙") ?? "", /printable ASCII/);
+  assert.match(getTelegramManualThreadDisplayNameValidationError("line\nbreak") ?? "", /printable ASCII/);
+  assert.match(getTelegramManualThreadDisplayNameValidationError("x".repeat(97)) ?? "", /96/);
 });
 
 test("Thread titles are trimmed and capped to Telegram's 128 character limit", () => {

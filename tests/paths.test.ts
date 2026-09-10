@@ -18,6 +18,8 @@ import {
   resolveTelegramProfileTempFilePath,
   resolveTelegramRuntimeLogPath,
   resolveTelegramTempDir,
+  resolveTelegramChannelPostJournalPath,
+  resolveTelegramThreadCleanupWorkPath,
   resolveTelegramUpdateJournalPath,
 } from "../lib/paths.ts";
 
@@ -89,7 +91,21 @@ await test("resolveTelegramRuntimeLogPath", () => {
   );
 });
 
-await test("update journal paths are profile-scoped", () => {
+await test("thread cleanup work paths are profile-scoped", () => {
+  assert.equal(resolveTelegramThreadCleanupWorkPath("/agent", "default"),
+    join("/agent", "tmp", "telegram", "thread-cleanup.json"));
+  assert.equal(resolveTelegramThreadCleanupWorkPath("/agent", "work"),
+    join("/agent", "tmp", "telegram", "thread-cleanup.work.json"));
+});
+
+test("channel post journal paths are profile-scoped", () => {
+  assert.equal(resolveTelegramChannelPostJournalPath("/agent", "default"),
+    join("/agent", "tmp", "telegram", "channel-posts.json"));
+  assert.equal(resolveTelegramChannelPostJournalPath("/agent", "work"),
+    join("/agent", "tmp", "telegram", "channel-posts.work.json"));
+});
+
+test("update journal paths are profile-scoped", () => {
   assert.equal(
     resolveTelegramUpdateJournalPath("/agent", "default"),
     join("/agent", "tmp", "telegram", "inbox.json"),

@@ -1527,7 +1527,7 @@ export interface TelegramAgentEndRuntimeDeps<
     chatId: number,
     replyToMessageId: number,
     text: string,
-    options?: { target?: TelegramQueueTarget },
+    options?: { target?: TelegramQueueTarget; parseMode?: "HTML" },
   ) => Promise<unknown>;
   sendQueuedAttachments: (
     turn: TTurn,
@@ -1908,23 +1908,37 @@ export async function handleTelegramAgentEndRuntime<
   const deliverActiveTurn = async () => {
     await deps.waitForActivityIdle?.();
     if (!isDeliveryActive()) return;
-    if (endPlan.shouldClearPreview || (!finalText && hasOutboundArtifacts)) {
+    let previewCleared = false;
+    const clearTurnPreview = async () => {
+      if (previewCleared) return;
       await clearPreview?.();
+      previewCleared = true;
+    };
+    if (endPlan.shouldClearPreview || (!finalText && hasOutboundArtifacts)) {
+      await clearTurnPreview();
       if (!isDeliveryActive()) return;
     }
     if (endPlan.shouldSendErrorMessage) {
+      const errorMessage = assistant.errorMessage ||
+        "Telegram bridge: Pi failed while processing the request.";
+      const isOperationAborted = errorMessage.trim().replace(/\.$/, "") ===
+        "This operation was aborted";
       await deps.sendTextReply(
         turn.chatId,
         turn.replyToMessageId,
-        assistant.errorMessage ||
-          "Telegram bridge: Pi failed while processing the request.",
-        { target: turn.target },
+        isOperationAborted
+          ? "<b>⏹️ This operation was aborted.</b>"
+          : errorMessage,
+        {
+          target: turn.target,
+          ...(isOperationAborted ? { parseMode: "HTML" as const } : {}),
+        },
       );
       if (!isDeliveryActive()) return;
       if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
       return;
     }
-    if (finalText) setPreviewPendingText(finalText);
+    if (finalText && turn.queuedAttachments.length === 0) setPreviewPendingText(finalText);
 
     if (!isDeliveryActive()) return;
     let richAttachmentDelivered = false;
@@ -1942,7 +1956,7 @@ export async function handleTelegramAgentEndRuntime<
         );
         if (!isDeliveryActive()) return;
         if (richAttachmentDelivered) {
-          await clearPreview?.();
+          await clearTurnPreview();
           if (!isDeliveryActive()) return;
           setPreviewPendingText("");
         }
@@ -1957,24 +1971,42 @@ export async function handleTelegramAgentEndRuntime<
       }
     }
     if (!isDeliveryActive()) return;
+    let queuedAttachmentsDelivered = false;
+    if (!richAttachmentDelivered && turn.queuedAttachments.length > 0) {
+      await clearTurnPreview();
+      if (!isDeliveryActive()) return;
+      setPreviewPendingText("");
+      await deps.sendQueuedAttachments(turn, { isDeliveryActive });
+      if (!isDeliveryActive()) return;
+      queuedAttachmentsDelivered = true;
+    }
     if (!richAttachmentDelivered && endPlan.kind === "text" && finalText) {
       try {
-        const finalized = await finalizeMarkdownPreview(
-          turn.chatId,
-          finalText,
-          turn.replyToMessageId,
-          { replyMarkup, target: turn.target },
-        );
-        if (!isDeliveryActive()) return;
-        if (!finalized) {
-          await clearPreview?.();
-          if (!isDeliveryActive()) return;
+        if (queuedAttachmentsDelivered) {
           await deps.sendMarkdownReply(
             turn.chatId,
             turn.replyToMessageId,
             finalText,
             { replyMarkup, target: turn.target },
           );
+        } else {
+          const finalized = await finalizeMarkdownPreview(
+            turn.chatId,
+            finalText,
+            turn.replyToMessageId,
+            { replyMarkup, target: turn.target },
+          );
+          if (!isDeliveryActive()) return;
+          if (!finalized) {
+            await clearTurnPreview();
+            if (!isDeliveryActive()) return;
+            await deps.sendMarkdownReply(
+              turn.chatId,
+              turn.replyToMessageId,
+              finalText,
+              { replyMarkup, target: turn.target },
+            );
+          }
         }
         if (!isDeliveryActive()) return;
         setPreviewPendingText("");
@@ -2041,7 +2073,9 @@ export async function handleTelegramAgentEndRuntime<
       );
     }
     if (!isDeliveryActive()) return;
-    if (!richAttachmentDelivered) await deps.sendQueuedAttachments(turn, { isDeliveryActive });
+    if (!richAttachmentDelivered && !queuedAttachmentsDelivered) {
+      await deps.sendQueuedAttachments(turn, { isDeliveryActive });
+    }
     if (!isDeliveryActive()) return;
     if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
   };

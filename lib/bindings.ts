@@ -6,6 +6,7 @@
 
 import * as Activity from "./activity.ts";
 import * as ActivityVerbosity from "./activity-verbosity.ts";
+import * as ChannelPosts from "./channel-posts.ts";
 import * as CommandTemplates from "./command-templates.ts";
 import * as Commands from "./commands.ts";
 import * as Config from "./config.ts";
@@ -498,6 +499,10 @@ interface TelegramCommandsAndToolsBindingDeps {
   stopPolling?: () => Promise<void | string>;
   recoverPollingStart?: Commands.TelegramBridgeCommandRegistrationDeps["recoverPollingStart"];
   getDisconnectThreadName?: () => string | undefined;
+  setRequestedThreadNameForPollingStart?: (
+    threadName: string | undefined,
+  ) => void;
+  validateThreadName?: Commands.TelegramBridgeCommandRegistrationDeps["validateThreadName"];
   onTransportChanged?: () => Promise<void> | void;
   getStatusLines: (
     options?: Status.TelegramBridgeStatusLineOptions,
@@ -512,6 +517,12 @@ interface TelegramCommandsAndToolsBindingDeps {
       target?: { chatId: number; threadId?: number };
     },
   ) => Promise<number | undefined>;
+  sendChannelMarkdownMessage: NonNullable<
+    OutboundAttachments.TelegramOutboundMessageToolRegistrationDeps["sendChannelMarkdownMessage"]
+  >;
+  listChannelPosts: ChannelPosts.TelegramChannelPostJournalStore["list"];
+  mutateChannelPost(input: { action: "edit" | "delete"; operationId: string;
+    mutationId: string; markdown?: string }): Promise<ChannelPosts.TelegramChannelPostRecord>;
   callMultipart: OutboundHandlers.TelegramVoiceReplySenderDeps["sendMultipart"];
   getDefaultChatId: () => number | undefined;
   getDefaultTarget?: () => OutboundAttachments.TelegramQueuedOutboundAttachmentTurnView["target"];
@@ -533,10 +544,15 @@ export function registerTelegramCommandsAndTools({
   stopPolling,
   recoverPollingStart,
   getDisconnectThreadName,
+  setRequestedThreadNameForPollingStart,
+  validateThreadName,
   onTransportChanged,
   getStatusLines,
   buttonActionStore,
   sendMarkdownReply,
+  sendChannelMarkdownMessage,
+  listChannelPosts,
+  mutateChannelPost,
   callMultipart,
   getDefaultChatId,
   getDefaultTarget,
@@ -556,6 +572,8 @@ export function registerTelegramCommandsAndTools({
     sendMarkdownReply,
     recordRuntimeEvent,
   });
+  ChannelPosts.registerTelegramChannelPostMutationTool(pi, { mutate: mutateChannelPost });
+  ChannelPosts.registerTelegramChannelPostListTool(pi, { list: listChannelPosts });
   OutboundAttachments.registerTelegramOutboundAttachmentTool(pi, {
     getActiveTurn: activeTurnRuntime.get,
     getDefaultChatId,
@@ -578,6 +596,7 @@ export function registerTelegramCommandsAndTools({
       ),
     sendMarkdownMessage: (chatId, markdown, options) =>
       sendMarkdownReply(chatId, undefined, markdown, options),
+    sendChannelMarkdownMessage,
     recordRuntimeEvent,
   });
   const queueAgentConnectionContext = (connected: boolean): void => {
@@ -636,7 +655,11 @@ export function registerTelegramCommandsAndTools({
               );
             }
             await configStore.load();
-            configStore.setProfile(profileName, profile);
+            const latestProfile = configStore.getStoredConfig().profiles?.[profileName];
+            configStore.setProfile(profileName, {
+              ...profile,
+              threadDisplayMode: latestProfile?.threadDisplayMode,
+            });
             configStore.activateProfile(profileName);
             await onTransportChanged?.();
             await persistConfig(configStore.get());
@@ -670,16 +693,20 @@ export function registerTelegramCommandsAndTools({
     reloadConfig: configStore.load,
     hasBotToken: configStore.hasBotToken,
     startPolling: async (ctx, options) => {
+      setRequestedThreadNameForPollingStart?.(options?.requestedThreadName);
       try {
         return await lockedPollingRuntime.start(ctx, options);
       } catch (error) {
         recordRuntimeEvent("recovery", error, { phase: "polling-start" });
         throw error;
+      } finally {
+        setRequestedThreadNameForPollingStart?.(undefined);
       }
     },
     stopPolling: stopPolling ?? lockedPollingRuntime.stop,
     recoverPollingStart,
     getDisconnectThreadName,
+    validateThreadName,
     queueAgentConnectionContext,
     updateStatus,
     getProfileNames: () =>

@@ -279,6 +279,20 @@ test("Status bar text renders bridge connection and queue states", () => {
       pollingActive: false,
       paired: true,
       busRole: "follower",
+      followerRegistered: false,
+      instanceThreadName: "Haven",
+      compactionInProgress: false,
+      processing: false,
+      queuedStatus: " +1",
+    }),
+    "<accent>Haven</accent> <warning>reconnecting</warning><success> +1</success>",
+  );
+  assert.equal(
+    buildTelegramStatusBarText(theme, {
+      hasBotToken: true,
+      pollingActive: false,
+      paired: true,
+      busRole: "follower",
       instanceThreadName: "Amber",
       compactionInProgress: false,
       processing: true,
@@ -484,6 +498,7 @@ test("Status lines expose polling and inbound-worker progress separately", () =>
       generation: 3,
       currentUpdateId: 9,
       blockedReason: "execution",
+      blockedInputCustody: { updateId: 9, kind: "running-outcome-unknown" },
       journalEntryCount: 4,
       journalSerializedBytes: 2048,
       oldestAdmittedAtMs: 500,
@@ -564,6 +579,8 @@ test("Status lines expose polling and inbound-worker progress separately", () =>
   );
   assert.equal(diagnostic.includes("- operator action:"), false);
   assert.ok(diagnostic.includes("- blocked reason: execution"));
+  assert.ok(diagnostic.includes(
+    "- blocked input custody: update=9, kind=running-outcome-unknown"));
   assert.ok(
     diagnostic.includes(
       "- last successful response: 1970-01-01T00:00:01.500Z (updates=2)",
@@ -729,12 +746,14 @@ test("Bridge status runtime stays active while tools run after queue changes", (
 test("Persistent polling conflict remains visible across ordinary refreshes until transport recovers", () => {
   let stopReason: string | undefined = "persistent-conflict";
   let busRole: "follower" | undefined;
+  let followerRegistered = false;
   const rendered: string[] = [];
   const runtime = createTelegramBridgeStatusRuntime({
     getConfig: () => ({ botToken: "token", allowedUserId: 7 }),
     isPollingActive: () => stopReason === undefined,
     getPollingState: () => ({ phase: stopReason ? "stopped" : "starting", stopReason }),
     getBusRole: () => busRole,
+    getLocalBus: () => (busRole ? { followerRegistered } : undefined),
     getActiveSourceMessageIds: () => undefined, hasActiveTurn: () => false,
     hasDispatchPending: () => false, isCompactionInProgress: () => false,
     getActiveToolExecutions: () => 0, hasPendingModelSwitch: () => false,
@@ -749,6 +768,9 @@ test("Persistent polling conflict remains visible across ordinary refreshes unti
   assert.deepEqual(rendered, ["telegram error", "telegram error"]);
   assert.ok(runtime.getStatusLines().some((line) => line.includes("persistent-conflict")));
   busRole = "follower";
+  runtime.updateStatus(ctx);
+  assert.equal(rendered.at(-1), "telegram reconnecting");
+  followerRegistered = true;
   runtime.updateStatus(ctx);
   assert.equal(rendered.at(-1), "telegram follower");
   busRole = undefined;

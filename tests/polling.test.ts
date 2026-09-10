@@ -424,6 +424,71 @@ test("Thread capability monitor stays passive before transport authorization", a
   assert.equal(calls, 0);
 });
 
+test("Thread capability monitor stops after synchronous stale-context preflight", async () => {
+  let ownershipReads = 0;
+  let records = 0;
+  let apiCalls = 0;
+  const staleContext = { get cwd(): string {
+    ownershipReads += 1;
+    throw new Error("This extension ctx is stale after session replacement or reload.");
+  } };
+  const monitor = createTelegramThreadCapabilityMonitor({
+    getAllowedUserId: () => 7,
+    callApi: async <TResponse>() => { apiCalls += 1; return {} as TResponse; },
+    topicTargetStore: { load: async () => {}, persist: async () => {},
+      getBotState: () => ({}), setBotState: () => {} },
+    ownsLock: (ctx: typeof staleContext) => ctx.cwd === "/project",
+    isFollowerRegistered: () => false,
+    getPollingStartedWithTelegramBus: () => false,
+    setPollingStartedWithTelegramBus: () => {}, setTopicModeUnavailable: () => {},
+    stopFollowerRegistration: () => {}, startClassicPolling: () => {},
+    stopClassicPolling: () => {}, startBusPolling: () => {}, stopBusPolling: () => {},
+    startLeaderHealth: () => {}, stopLeaderHealth: () => {}, updateStatus: () => {},
+    recordEvent: (_category, error) => {
+      assert.match(String(error), /ctx is stale/);
+      records += 1;
+      throw new Error("diagnostic sink failed");
+    },
+    intervalMs: 1,
+  });
+  monitor.start(staleContext);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(ownershipReads, 1);
+  assert.equal(apiCalls, 0);
+  assert.equal(records, 1);
+  monitor.stop();
+});
+
+test("Thread capability monitor invalidates a replaced session before reading its context", async () => {
+  const reads = { old: 0, current: 0 };
+  let records = 0;
+  const oldContext = { session: "old" as const };
+  const currentContext = { session: "current" as const };
+  const monitor = createTelegramThreadCapabilityMonitor({
+    getAllowedUserId: () => 7, callApi: async <TResponse>() => ({} as TResponse),
+    topicTargetStore: { load: async () => {}, persist: async () => {},
+      getBotState: () => ({}), setBotState: () => {} },
+    ownsLock: (ctx: typeof oldContext | typeof currentContext) => {
+      reads[ctx.session] += 1;
+      if (ctx.session === "old") throw new Error("old context was read");
+      return false;
+    },
+    isFollowerRegistered: () => false, getPollingStartedWithTelegramBus: () => false,
+    setPollingStartedWithTelegramBus: () => {}, setTopicModeUnavailable: () => {},
+    stopFollowerRegistration: () => {}, startClassicPolling: () => {},
+    stopClassicPolling: () => {}, startBusPolling: () => {}, stopBusPolling: () => {},
+    startLeaderHealth: () => {}, stopLeaderHealth: () => {}, updateStatus: () => {},
+    recordEvent: () => { records += 1; }, intervalMs: 1,
+  });
+  monitor.start(oldContext);
+  monitor.start(currentContext);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  monitor.stop();
+  assert.equal(reads.old, 0);
+  assert.ok(reads.current > 0);
+  assert.equal(records, 0);
+});
+
 test("Thread capability monitor serializes probes across lifecycle generations", async () => {
   let calls = 0;
   let state: { threadMode?: "enabled" | "disabled" | "unknown" } = {};
@@ -496,14 +561,17 @@ test("Thread capability state runtime owns transition flags", () => {
   assert.equal(state.isBusPollingStarted(), false);
   assert.equal(state.isTopicModeUnavailable(), false);
   assert.equal(state.shouldForceFreshLeaderThread(), false);
+  assert.equal(state.getRequestedThreadName(), undefined);
 
   state.setBusPollingStarted(true);
   state.setTopicModeUnavailable(true);
   state.setForceFreshLeaderThread(true);
+  state.setRequestedThreadName("Navigator");
 
   assert.equal(state.isBusPollingStarted(), true);
   assert.equal(state.isTopicModeUnavailable(), true);
   assert.equal(state.shouldForceFreshLeaderThread(), true);
+  assert.equal(state.getRequestedThreadName(), "Navigator");
 });
 
 function createCapabilityLifecycleFixture(hooks: {
@@ -724,6 +792,59 @@ test("Thread-aware polling refreshes owner-published enabled mode over stale loc
   assert.equal(followerRegistrations, 1);
 });
 
+test("Thread-aware polling auto-restores followers only for remembered Workspaces", async () => {
+  let remembered = false;
+  let restores = 0;
+  const store = {
+    async load() {},
+    async refresh() {},
+    async persist() {},
+    getBotState() {
+      return { threadMode: "enabled" as const };
+    },
+    setBotState() {},
+    list() {
+      return [];
+    },
+  };
+  const ports = createTelegramThreadAwarePollingPorts({
+    getAllowedUserId: () => 42,
+    callApi: async <TResponse,>(): Promise<TResponse> => ({}) as TResponse,
+    topicTargetStore: store,
+    isBusRuntimeEnabled: () => false,
+    isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false,
+    setPollingStartedWithTelegramBus() {},
+    setForceFreshLeaderThreadOnNextStart() {},
+    setTopicModeUnavailable() {},
+    startClassicPolling() {},
+    async stopClassicPolling() {},
+    async startBusLeaderPolling() {},
+    async stopBusLeaderPolling() {},
+    startLeaderHealth() {},
+    stopLeaderHealth() {},
+    registerFollowerWithLeader: async () => true,
+    hasRememberedWorkspaceBinding: () => remembered,
+    restoreFollowerWithLeader: async () => {
+      restores += 1;
+      return true;
+    },
+    stopFollowerRegistration() {},
+    recordEvent() {},
+  });
+
+  assert.equal(
+    await ports.restoreFollowerWithOwner(TEST_CONTEXT, { pid: 1 }),
+    undefined,
+  );
+  remembered = true;
+  assert.equal(
+    await ports.restoreFollowerWithOwner(TEST_CONTEXT, { pid: 1 }),
+    true,
+  );
+  assert.equal(restores, 1);
+});
+
 test("Thread capability downgrade retries classic restore after failure", async () => {
   let state: {
     threadMode?: "enabled" | "disabled" | "unknown";
@@ -735,6 +856,7 @@ test("Thread capability downgrade retries classic restore after failure", async 
   };
   let pollingStartedWithBus = true;
   let classicStarts = 0;
+  let suspendedTargets = 0;
   let persisted = 0;
   const events: Array<{ category: string; details?: Record<string, unknown> }> = [];
   const store = {
@@ -767,8 +889,12 @@ test("Thread capability downgrade retries classic restore after failure", async 
       pollingStartedWithBus = started;
     },
     setTopicModeUnavailable() {},
+    suspendLiveThreadTarget() {
+      suspendedTargets += 1;
+    },
     stopFollowerRegistration() {},
     startClassicPolling() {
+      assert.equal(suspendedTargets, 1);
       classicStarts += 1;
       if (classicStarts === 1) throw new Error("classic unavailable");
     },
@@ -796,6 +922,7 @@ test("Thread capability downgrade retries classic restore after failure", async 
     "capability-monitor-disabled-confirmed-classic-restore-failed",
   );
   assert.equal(pollingStartedWithBus, false);
+  assert.equal(suspendedTargets, 1);
 
   await applyTelegramThreadCapability(
     TEST_CONTEXT,
@@ -804,6 +931,7 @@ test("Thread capability downgrade retries classic restore after failure", async 
     deps,
   );
   assert.equal(classicStarts, 2);
+  assert.equal(suspendedTargets, 1);
   assert.equal(state.lastReconcileAction, "capability-monitor-disabled-confirmed");
   assert.equal(persisted >= 3, true);
   assert.equal(events[0].details?.phase, "capability-monitor-disabled-confirmed-classic-restore");
@@ -1214,7 +1342,7 @@ test("Durable polling assembly owns journal ports and cursor bootstrap validatio
     },
     persistConfig: async () => undefined,
     journal: {
-      appendBatch: () => undefined,
+      appendBatch: () => ({ nonExcludedUpdateIds: [] }),
       getAcceptedThroughUpdateId: () => undefined,
       getEntryCount: () => 0,
       signalWorker: () => undefined,
@@ -1239,6 +1367,66 @@ test("Durable polling assembly owns journal ports and cursor bootstrap validatio
   await assembly.admission.stop();
   assert.equal(assembly.controller.isActive(), false);
   assert.deepEqual(events, ["deleteWebhook"]);
+});
+
+test("Durable polling prepares only admitted non-excluded runs before any microtask consumer", async () => {
+  for (const scenario of ["included", "excluded", "barrier", "publication-failure", "preparation-failure", "diagnostic-failure"] as const) {
+    const events: string[] = [];
+    const prepared: number[][] = [];
+    const diagnostics: unknown[] = [];
+    let observed: number[][] | undefined;
+    let calls = 0;
+    let cursor = 0;
+    let finished!: () => void;
+    const received = new Promise<void>((resolve) => { finished = resolve; });
+    const included = scenario === "excluded" ? [] : scenario === "barrier" ? [1, 3] : [1, 2, 3];
+    const assembly = createTelegramDurablePollingRuntimeAssembly<{ update_id: number }, string>({
+      getConfig: () => ({ botToken: "fixture" }), hasBotToken: () => true,
+      deleteWebhook: async () => {}, persistConfig: async () => {},
+      getUpdates: async () => {
+        if (calls++ === 0) return [{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }];
+        finished();
+        throw new DOMException("stop", "AbortError");
+      },
+      journal: {
+        appendBatch(_updates, admittedCursor) {
+          events.push("append");
+          if (scenario === "publication-failure") throw new Error("fixture publication failed");
+          cursor = admittedCursor!;
+          // Models an already-draining consumer, not one started by signalWorker.
+          queueMicrotask(() => { observed = prepared.map((batch) => [...batch]); events.push("reader"); });
+          return { nonExcludedUpdateIds: included };
+        },
+        getAcceptedThroughUpdateId: () => cursor,
+        getEntryCount: () => 0, getBootstrapEntryCount: () => 0,
+        signalWorker: () => { events.push("signal"); }, onSessionStart: async () => {},
+      },
+      prepareUpdateBatch: (updates) => {
+        if (scenario === "preparation-failure" || scenario === "diagnostic-failure") throw new Error("fixture preparation failed");
+        const ids = updates.map((update) => update.update_id);
+        prepared.push(ids);
+        events.push(`prepare:${ids.join(",")}`);
+      },
+      recordRuntimeEvent: (_category, _error, details) => {
+        if (details?.phase !== "batch-preparation") return;
+        diagnostics.push(details.phase);
+        if (scenario === "diagnostic-failure") throw new Error("fixture diagnostics failed");
+      },
+      sleep: async () => {}, stopTypingLoop: () => {}, updateStatus: () => {},
+    });
+    try {
+      await assembly.admission.start(TEST_CONTEXT);
+      await received;
+      const expected = scenario === "included" ? [[1, 2, 3]] : scenario === "barrier" ? [[1], [3]] : [];
+      assert.deepEqual(prepared, expected, scenario);
+      assert.deepEqual(diagnostics, scenario === "preparation-failure" || scenario === "diagnostic-failure" ? ["batch-preparation"] : [], scenario);
+      assert.deepEqual(observed, scenario === "publication-failure" ? undefined : expected, scenario);
+      assert.deepEqual(events, ["append", ...expected.map((ids) => `prepare:${ids.join(",")}`),
+        ...(scenario === "publication-failure" ? [] : ["reader", "signal"])], scenario);
+    } finally {
+      await assembly.admission.stop();
+    }
+  }
 });
 
 test("Polling controller runtime binds loop runner and controller state", async () => {
@@ -1538,9 +1726,7 @@ test("Journal-first poll loop advances before unresolved worker execution", asyn
     persistConfig: async () => {
       assert.fail("config persistence must not own the polling cursor");
     },
-    prepareUpdateBatch: (updates) => {
-      events.push(`prepare:${updates.length}`);
-    },
+
     onErrorStatus: () => {},
     onStatusReset: () => {},
     sleep: async () => {},
@@ -1550,7 +1736,6 @@ test("Journal-first poll loop advances before unresolved worker execution", asyn
   assert.equal(getUpdatesCalls, 2);
   assert.deepEqual(events, [
     "phase:long-poll",
-    "prepare:1",
     "phase:persisting-journal",
     "append:1:1",
     "signal",
@@ -1583,7 +1768,7 @@ test("Journal-first poll loop rejects a missing cursor with retained authority",
   assert.equal(getUpdatesCalls, 0);
 });
 
-test("Poll loop bootstraps once and journals each prepared response batch", async () => {
+test("Poll loop bootstraps once and journals each response batch", async () => {
   const lifecycle: string[] = [];
   const config: { botToken: string; lastUpdateId?: number } = {
     botToken: "123:abc",
@@ -1613,9 +1798,7 @@ test("Poll loop bootstraps once and journals each prepared response batch", asyn
     getAcceptedThroughUpdateId: () => acceptedThroughUpdateId,
     getJournalEntryCount: () => 0,
     signalUpdateWorker: () => lifecycle.push("signal"),
-    prepareUpdateBatch: (updates) => {
-      lifecycle.push(`batch:${updates.map((update) => update.update_id).join(",")}`);
-    },
+
     onErrorStatus: () => {},
     onStatusReset: () => {},
     sleep: async () => {},
@@ -1624,7 +1807,6 @@ test("Poll loop bootstraps once and journals each prepared response batch", asyn
   assert.equal(acceptedThroughUpdateId, 7);
   assert.deepEqual(lifecycle, [
     "append::5",
-    "batch:6,7",
     "append:6,7:7",
     "signal",
   ]);

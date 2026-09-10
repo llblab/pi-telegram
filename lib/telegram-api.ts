@@ -37,6 +37,7 @@ function getTelegramApiTempDir(): string {
   return resolveTelegramTempDir();
 }
 const TELEGRAM_TEMP_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const activeTelegramApiWorkspaceAdmissionOperationIds = new Set<string>();
 const TELEGRAM_TEMP_SCRATCH_FILE_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/u;
 const TELEGRAM_INBOUND_FILE_MAX_BYTES = getTelegramInboundFileByteLimitFromEnv(
@@ -463,6 +464,263 @@ export interface TelegramApiClient {
     text?: string,
     options?: TelegramAnswerGuestQueryOptions,
   ) => Promise<void>;
+}
+
+export interface TelegramApiTargetActivityRuntime {
+  begin: (
+    method: string,
+    body: Record<string, unknown>,
+  ) => () => void;
+  hasPendingTarget: (target: { chatId: number; threadId?: number }) => boolean;
+  listPendingTargets: () => { chatId: number; threadId: number }[];
+  listPendingChats: () => number[];
+}
+
+function parseTelegramApiTargetInteger(value: unknown): number | undefined {
+  const parsed = typeof value === "number" ? value :
+    typeof value === "string" && /^-?\d+$/u.test(value) ? Number(value) : undefined;
+  return parsed !== undefined && Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+export function createTelegramApiTargetActivityRuntime(): TelegramApiTargetActivityRuntime {
+  const pending = new Map<string, {
+    target: { chatId: number; threadId: number };
+    count: number;
+  }>();
+  const pendingChats = new Map<number, number>();
+  const messageScopedMethods = new Set([
+    "deleteMessage",
+    "editMessageCaption",
+    "editMessageReplyMarkup",
+    "editMessageText",
+  ]);
+  return {
+    begin(method, body) {
+      const chatId = parseTelegramApiTargetInteger(body.chat_id);
+      const threadId = parseTelegramApiTargetInteger(body.message_thread_id);
+      const messageId = parseTelegramApiTargetInteger(body.message_id);
+      const chatScoped = chatId !== undefined && threadId === undefined &&
+        messageId !== undefined && messageScopedMethods.has(method);
+      if (chatId === undefined || (threadId === undefined && !chatScoped)) {
+        return () => undefined;
+      }
+      const key = threadId === undefined ? undefined : `${chatId}:${threadId}`;
+      if (key) {
+        const existing = pending.get(key);
+        if (existing) existing.count += 1;
+        else pending.set(key, { target: { chatId, threadId: threadId! }, count: 1 });
+      } else {
+        pendingChats.set(chatId, (pendingChats.get(chatId) ?? 0) + 1);
+      }
+      let completed = false;
+      return () => {
+        if (completed) return;
+        completed = true;
+        if (!key) {
+          const count = pendingChats.get(chatId);
+          if (!count || count <= 1) pendingChats.delete(chatId);
+          else pendingChats.set(chatId, count - 1);
+          return;
+        }
+        const current = pending.get(key);
+        if (!current || current.count <= 1) pending.delete(key);
+        else current.count -= 1;
+      };
+    },
+    hasPendingTarget(target) {
+      return pendingChats.has(target.chatId) ||
+        (target.threadId !== undefined && pending.has(`${target.chatId}:${target.threadId}`));
+    },
+    listPendingTargets() {
+      return Array.from(pending.values(), ({ target }) => ({ ...target }));
+    },
+    listPendingChats() {
+      return Array.from(pendingChats.keys());
+    },
+  };
+}
+
+export function createTelegramApiTargetTrackingClient(
+  client: TelegramApiClient,
+  activity: TelegramApiTargetActivityRuntime,
+): TelegramApiClient {
+  const track = async <T>(
+    method: string,
+    body: Record<string, unknown>,
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    const end = activity.begin(method, body);
+    try {
+      return await operation();
+    } finally {
+      end();
+    }
+  };
+  return {
+    call: (method, body, options) => track(
+      method,
+      body,
+      () => client.call(method, body, options),
+    ),
+    callMultipart: (method, fields, fileField, filePath, fileName, options) =>
+      track(method, fields, () => client.callMultipart(
+        method, fields, fileField, filePath, fileName, options,
+      )),
+    downloadFile: client.downloadFile,
+    answerCallbackQuery: client.answerCallbackQuery,
+    ...(client.answerGuestQuery
+      ? { answerGuestQuery: client.answerGuestQuery }
+      : {}),
+  };
+}
+
+export type TelegramApiWorkspaceAdmissionScopeLike =
+  | { kind: "target"; target: { chatId: number; threadId: number } }
+  | { kind: "chat"; chatId: number }
+  | { kind: "profile" };
+
+export interface TelegramApiWorkspaceAdmissionLeaseLike {
+  operationId: string;
+  operationKind: string;
+  profileKey: string;
+  scope: TelegramApiWorkspaceAdmissionScopeLike;
+  owner: { processId: number; processBirthId: string };
+  acquiredAtMs: number;
+}
+
+export interface TelegramApiWorkspaceAdmissionPort {
+  acquireAdmission: (input: {
+    operationId: string;
+    operationKind: string;
+    scope: TelegramApiWorkspaceAdmissionScopeLike;
+  }) =>
+    | {
+        kind: "acquired";
+        lease: TelegramApiWorkspaceAdmissionLeaseLike;
+        resumed: boolean;
+      }
+    | { kind: "blocked"; reason: "retirement-fenced" };
+  releaseAdmission: (expected: TelegramApiWorkspaceAdmissionLeaseLike) => boolean;
+}
+
+export class TelegramApiWorkspaceAdmissionError extends Error {
+  readonly code: "blocked" | "unavailable" | "release-lost" | "duplicate-operation";
+
+  constructor(code: TelegramApiWorkspaceAdmissionError["code"], message: string) {
+    super(message);
+    this.name = "TelegramApiWorkspaceAdmissionError";
+    this.code = code;
+  }
+}
+
+export function getTelegramApiWorkspaceAdmissionScope(
+  body: Record<string, unknown>,
+): TelegramApiWorkspaceAdmissionScopeLike | undefined {
+  if (!("chat_id" in body)) return undefined;
+  const chatId = parseTelegramApiTargetInteger(body.chat_id);
+  if (chatId === undefined || chatId === 0) return { kind: "profile" };
+  if (!("message_thread_id" in body) || body.message_thread_id === undefined) {
+    return { kind: "chat", chatId };
+  }
+  const threadId = parseTelegramApiTargetInteger(body.message_thread_id);
+  if (threadId === undefined || threadId <= 0) return { kind: "profile" };
+  return { kind: "target", target: { chatId, threadId } };
+}
+
+export function createTelegramApiWorkspaceAdmissionClient(
+  client: TelegramApiClient,
+  admission:
+    | TelegramApiWorkspaceAdmissionPort
+    | (() => TelegramApiWorkspaceAdmissionPort | undefined),
+  options: {
+    onReleaseError?: (error: unknown, method: string) => void;
+    createOperationId?: () => string;
+  } = {},
+): TelegramApiClient {
+  const admit = async <T>(
+    method: string,
+    body: Record<string, unknown>,
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    const scope = getTelegramApiWorkspaceAdmissionScope(body);
+    if (!scope) return operation();
+    const currentAdmission =
+      typeof admission === "function" ? admission() : admission;
+    if (!currentAdmission) {
+      throw new TelegramApiWorkspaceAdmissionError(
+        "unavailable",
+        "Telegram API Workspace admission authority is unavailable.",
+      );
+    }
+    const operationId = `api:${(options.createOperationId ?? randomUUID)()}`;
+    if (activeTelegramApiWorkspaceAdmissionOperationIds.has(operationId)) {
+      throw new TelegramApiWorkspaceAdmissionError(
+        "duplicate-operation",
+        "Telegram API Workspace admission operation is already active.",
+      );
+    }
+    activeTelegramApiWorkspaceAdmissionOperationIds.add(operationId);
+    try {
+      const acquired = currentAdmission.acquireAdmission({
+        operationId,
+        operationKind: `api.${method}`,
+        scope,
+      });
+      if (acquired.kind === "blocked") {
+        throw new TelegramApiWorkspaceAdmissionError(
+          "blocked",
+          "Telegram API target is temporarily unavailable during Workspace retirement.",
+        );
+      }
+      try {
+        return await operation();
+      } finally {
+        try {
+          if (!currentAdmission.releaseAdmission(acquired.lease)) {
+            throw new TelegramApiWorkspaceAdmissionError(
+              "release-lost",
+              "Telegram API Workspace admission lease disappeared before release.",
+            );
+          }
+        } catch (error) {
+          try {
+            options.onReleaseError?.(error, method);
+          } catch {
+            // Diagnostics cannot convert an already-settled API request into replay.
+          }
+        }
+      }
+    } finally {
+      activeTelegramApiWorkspaceAdmissionOperationIds.delete(operationId);
+    }
+  };
+  return {
+    call: (method, body, callOptions) =>
+      admit(method, body, () => client.call(method, body, callOptions)),
+    callMultipart: (
+      method,
+      fields,
+      fileField,
+      filePath,
+      fileName,
+      callOptions,
+    ) =>
+      admit(method, fields, () =>
+        client.callMultipart(
+          method,
+          fields,
+          fileField,
+          filePath,
+          fileName,
+          callOptions,
+        ),
+      ),
+    downloadFile: client.downloadFile,
+    answerCallbackQuery: client.answerCallbackQuery,
+    ...(client.answerGuestQuery
+      ? { answerGuestQuery: client.answerGuestQuery }
+      : {}),
+  };
 }
 
 export interface TelegramBridgeApiRuntimeDeps {
@@ -1411,7 +1669,7 @@ export function createTelegramNativeMarkdownDraftSender(deps: {
     return deps.sendRichMessageDraft({
       chat_id: chatId,
       draft_id: draftId,
-      rich_message: { markdown: text, skip_entity_detection: true },
+      rich_message: { markdown: text },
       ...(options?.message_thread_id !== undefined
         ? { message_thread_id: options.message_thread_id }
         : {}),
@@ -1446,11 +1704,28 @@ export function createDefaultTelegramBridgeApiRuntime(deps: {
   getBotToken: () => string | undefined;
   recordRuntimeEvent: TelegramBridgeApiRuntimeDeps["recordRuntimeEvent"];
   captureRequestErrorHandler?: TelegramBridgeApiRuntimeDeps["captureRequestErrorHandler"];
+  targetActivity?: TelegramApiTargetActivityRuntime;
+  workspaceAdmission?:
+    | TelegramApiWorkspaceAdmissionPort
+    | (() => TelegramApiWorkspaceAdmissionPort | undefined);
 }): TelegramBridgeApiRuntime {
+  const client = createTelegramApiClient(deps.getBotToken, {
+    recordRuntimeEvent: deps.recordRuntimeEvent,
+  });
+  const admittedClient = deps.workspaceAdmission
+    ? createTelegramApiWorkspaceAdmissionClient(client, deps.workspaceAdmission, {
+        onReleaseError(error, method) {
+          deps.recordRuntimeEvent("api", error, {
+            phase: "workspace-admission-release",
+            method,
+          });
+        },
+      })
+    : client;
   return createTelegramBridgeApiRuntime({
-    client: createTelegramApiClient(deps.getBotToken, {
-      recordRuntimeEvent: deps.recordRuntimeEvent,
-    }),
+    client: deps.targetActivity
+      ? createTelegramApiTargetTrackingClient(admittedClient, deps.targetActivity)
+      : admittedClient,
     tempDir: getTelegramApiTempDir(),
     maxFileSizeBytes: TELEGRAM_INBOUND_FILE_MAX_BYTES,
     tempFileMaxAgeMs: TELEGRAM_TEMP_FILE_MAX_AGE_MS,

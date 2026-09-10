@@ -99,6 +99,11 @@ export interface TelegramOutboundMessageToolRegistrationDeps extends TelegramOut
     markdown: string,
     options?: { replyMarkup?: unknown; target?: TelegramTarget },
   ) => Promise<number | undefined>;
+  sendChannelMarkdownMessage?: (
+    channel: number | string,
+    markdown: string,
+    options: { operationId: string; replyMarkup?: unknown },
+  ) => Promise<number | undefined>;
 }
 
 export interface TelegramQueuedOutboundAttachmentView {
@@ -177,7 +182,7 @@ export function planTelegramRichOutboundAttachment(options: {
   if (!mediaType) return undefined;
   const mediaId = "artifact";
   const richMessage = {
-    markdown: `${normalizeTelegramNativeMarkdown(options.markdown)}\n\n![](tg://${mediaType}?id=${mediaId})`,
+    markdown: `![](tg://${mediaType}?id=${mediaId})\n\n${normalizeTelegramNativeMarkdown(options.markdown)}`,
     media: [
       {
         id: mediaId,
@@ -187,7 +192,6 @@ export function planTelegramRichOutboundAttachment(options: {
         },
       },
     ],
-    skip_entity_detection: true,
   };
   return {
     method: "sendRichMessage",
@@ -347,7 +351,7 @@ function formatTelegramOutboundAttachmentToolResultText(
   return ["", `${verb} ${count} Telegram attachment(s).`].join("\n");
 }
 
-function formatTelegramOutboundMessageToolResultText(chatId: number): string {
+function formatTelegramOutboundMessageToolResultText(chatId: number | string): string {
   return ["", `Sent Telegram message to ${chatId}.`].join("\n");
 }
 
@@ -513,19 +517,25 @@ export function registerTelegramOutboundMessageTool(
     name: "telegram_message",
     label: "Telegram Message",
     description:
-      "Send a Markdown text message directly to the paired/default Telegram chat or an explicit chat_id. Hidden telegram_button comments in the text become attached inline prompt buttons.",
+      "Send Markdown text directly to the paired/default Telegram chat, an exact channel chat_id, or an explicit live target. Channel posting requires Telegram-granted bot permission. Hidden telegram_button comments become inline prompt buttons.",
     promptSnippet: TELEGRAM_MESSAGE_PROMPT_SNIPPET,
     promptGuidelines: [...TELEGRAM_MESSAGE_PROMPT_GUIDELINES],
     parameters: Type.Object({
       text: Type.String({ description: "Message text to send" }),
       chat_id: Type.Optional(
-        Type.Number({ description: "Optional Telegram chat id" }),
+        Type.Union([
+          Type.Number(),
+          Type.String({ pattern: "^@[A-Za-z0-9_]{5,32}$" }),
+        ], { description: "Optional exact Telegram chat id or public channel @username" }),
       ),
       thread_id: Type.Optional(
         Type.Number({
           description: "Optional Telegram topic thread id with chat_id",
         }),
       ),
+      channel: Type.Optional(Type.Boolean({
+        description: "Set true only when a numeric chat_id is explicitly intended as a channel",
+      })),
       thread: Type.Optional(
         Type.Union([Type.String(), Type.Number()], {
           description:
@@ -533,10 +543,12 @@ export function registerTelegramOutboundMessageTool(
         }),
       ),
     }),
-    async execute(_toolCallId, params) {
+    async execute(toolCallId, params) {
       try {
         return await sendTelegramOutboundMessage({
           text: params.text,
+          operationId: toolCallId,
+          channel: params.channel,
           chatId: params.chat_id,
           threadId: params.thread_id,
           agentThread: params.thread,
@@ -548,10 +560,14 @@ export function registerTelegramOutboundMessageTool(
           canSendDirect: deps.canSendDirect,
           planMessage: deps.planMessage,
           sendMarkdownMessage: deps.sendMarkdownMessage,
+          sendChannelMarkdownMessage: deps.sendChannelMarkdownMessage,
         });
       } catch (error) {
-        deps.recordRuntimeEvent?.("message", error, { phase: "direct" });
-        throw formatTelegramOutboundToolError(error);
+        const reportableError = typeof params.chat_id === "string" || params.channel === true
+          ? new Error("Telegram channel publication failed; inspect the retained local record before retrying.")
+          : error;
+        deps.recordRuntimeEvent?.("message", reportableError, { phase: "direct" });
+        throw formatTelegramOutboundToolError(reportableError);
       }
     },
   });
@@ -755,7 +771,9 @@ export async function deliverTelegramGuestCachedAttachment(options: {
 
 export async function sendTelegramOutboundMessage(options: {
   text: string;
-  chatId?: number;
+  operationId?: string;
+  channel?: boolean;
+  chatId?: number | string;
   threadId?: number;
   agentThread?: string | number;
   target?: TelegramTarget;
@@ -775,12 +793,35 @@ export async function sendTelegramOutboundMessage(options: {
     markdown: string,
     options?: { replyMarkup?: unknown; target?: TelegramTarget },
   ) => Promise<number | undefined>;
+  sendChannelMarkdownMessage?: (
+    channel: number | string,
+    markdown: string,
+    options: { operationId: string; replyMarkup?: unknown },
+  ) => Promise<number | undefined>;
 }): Promise<{
   content: Array<{ type: "text"; text: string }>;
-  details: { chatId: number; messageId?: number };
+  details: { chatId: number | string; messageId?: number };
 }> {
   assertTelegramDirectDeliveryAllowed(options.canSendDirect);
   const activeTurn = options.getActiveTurn?.();
+  if (typeof options.chatId === "string" || options.channel === true) {
+    if (!((typeof options.chatId === "string" && /^@[A-Za-z0-9_]{5,32}$/u.test(options.chatId)) ||
+        (typeof options.chatId === "number" && Number.isSafeInteger(options.chatId) && options.chatId < 0)) ||
+        options.threadId !== undefined ||
+        options.target !== undefined || options.agentThread !== undefined) {
+      throw new Error("Telegram channel delivery requires one exact @username or negative numeric channel ID without a thread target.");
+    }
+    if (!options.sendChannelMarkdownMessage || !options.operationId) {
+      throw new Error("Telegram channel delivery requires direct leader transport ownership and operation identity.");
+    }
+    const plan = options.planMessage(options.text);
+    const messageId = await options.sendChannelMarkdownMessage(
+      options.chatId, plan.markdown, { operationId: options.operationId,
+        replyMarkup: plan.replyMarkup });
+    return { content: [{ type: "text",
+      text: formatTelegramOutboundMessageToolResultText(options.chatId) }],
+    details: { chatId: options.chatId, messageId } };
+  }
   const requestedAgentSelector: TelegramBusAgentTargetSelector | undefined =
     options.agentThread !== undefined
       ? typeof options.agentThread === "number"

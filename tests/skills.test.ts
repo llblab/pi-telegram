@@ -56,6 +56,7 @@ test("Telegram extension contributes focused bundled skills", async () => {
   assert.deepEqual(resourceHook?.(), { skillPaths: [TELEGRAM_SKILLS_PATH] });
   const skillNames = [
     "telegram-bridge",
+    "show-me",
     "generated-control-surface",
     "generative-apps",
   ];
@@ -111,6 +112,25 @@ test("Telegram extension contributes focused bundled skills", async () => {
     assert.match(bridge, new RegExp(reference.replace(".", "\\."), "u"));
     assert.ok((await readSkillReference("telegram-bridge", reference)).length > 200);
   }
+
+  const showMe = sources.get("show-me") ?? "";
+  assert.ok(
+    showMe.trim().split(/\s+/u).length <= 1_100,
+    "show-me core exceeded its progressive-disclosure budget",
+  );
+  assert.match(showMe, /references\/telegram-surfaces\.md/u);
+  assert.match(showMe, /retained diff, status, and validation evidence/u);
+  assert.match(showMe, /Do not infer that an affordance is clickable/u);
+  assert.match(showMe, /State: locally implemented · validated · not released · not live/u);
+  const telegramSurfaces = await readSkillReference(
+    "show-me",
+    "telegram-surfaces.md",
+  );
+  assert.match(telegramSurfaces, /Design for a phone before a desktop/u);
+  assert.match(telegramSurfaces, /rendered Markdown in the current reply/u);
+  assert.match(telegramSurfaces, /single self-contained file/u);
+  assert.match(telegramSurfaces, /source shape does not prove native clickability/u);
+  assert.match(telegramSurfaces, /Do not expose local paths/u);
 
   const generatedSurface = sources.get("generated-control-surface") ?? "";
   assert.ok(

@@ -4,7 +4,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -424,4 +424,16 @@ test("Downgrade checker and runtime journal agree on shared entry schema", async
       await expectBlocked(() => runCheck(agentDir), /cannot verify/u);
     });
   }
+});
+
+test("downgrade check leaves the inert agent-owned channel post journal untouched", async () => {
+  await withAgentDir(async ({ agentDir, runtimeDir }) => {
+    const path = join(runtimeDir, "channel-posts.json");
+    const content = `${JSON.stringify({ version: 1, profile: "default",
+      tokenSha256: "a".repeat(64), records: [{ state: "outcome-unknown" }] })}\n`;
+    await writeFile(path, content, { mode: 0o600 });
+    const result = await runCheck(agentDir);
+    assert.match(result.stdout, /SAFE:/u);
+    assert.equal(await readFile(path, "utf8"), content);
+  });
 });

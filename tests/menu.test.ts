@@ -1533,6 +1533,7 @@ test("Menu helpers build pure render payloads before transport", () => {
 
 test("Menu action runtime opens and updates interactive menu messages", async () => {
   const events: string[] = [];
+  let idle = true;
   const modelA = createMenuModel("openai", "gpt-5", true);
   const state = createMenuState<typeof modelA>(2, {
     scope: "all",
@@ -1547,10 +1548,10 @@ test("Menu action runtime opens and updates interactive menu messages", async ()
     storeModelMenuState: (nextState) => {
       events.push(`store:${nextState.messageId}`);
     },
-    isIdle: () => true,
+    isIdle: () => idle,
     canOfferInFlightModelSwitch: () => false,
-    sendTextReply: async (_chatId, _replyToMessageId, text) => {
-      events.push(`text:${text}`);
+    sendTextReply: async (_chatId, _replyToMessageId, text, options) => {
+      events.push(`text:${options?.parseMode}:${text}`);
     },
     editInteractiveMessage: async (chatId, messageId, text, mode) => {
       events.push(`edit:${chatId}:${messageId}:${mode}:${text}`);
@@ -1572,6 +1573,13 @@ test("Menu action runtime opens and updates interactive menu messages", async ()
   assert.equal(events[4], "store:99");
   assert.equal(events[5], "send:1:html:<b>🤖 Choose a model:</b>");
   assert.equal(events[6], "store:99");
+
+  idle = false;
+  await runtime.openModelMenu(1, 2, "ctx");
+  assert.equal(
+    events[7],
+    "text:HTML:<b>⏳ Cannot switch model while Pi is busy. Send /abort, /next, or /stop.</b>",
+  );
 });
 
 test("Menu action runtime with state builder opens menus from settings runtime", async () => {

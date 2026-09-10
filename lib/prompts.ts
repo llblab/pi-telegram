@@ -14,7 +14,7 @@ export const TELEGRAM_DISCONNECTED_CONTEXT_MESSAGE =
 
 const LOCAL_SYSTEM_PROMPT_SUFFIX = `
 
-${TELEGRAM_CONNECTED_CONTEXT_MESSAGE} For Telegram work, consult bundled Skills in routing order: \`telegram-bridge\` for the transport and turn protocol, \`generated-control-surface\` when contextual controls materially shorten feedback, then \`generative-apps\` when the interaction warrants a reusable deterministic app. Load a Skill only if its instructions are not already present in the current context. Do not use Telegram-specific features from unrelated local/TUI prompts.`;
+${TELEGRAM_CONNECTED_CONTEXT_MESSAGE} For Telegram work, consult bundled Skills in routing order: \`telegram-bridge\` for the transport and turn protocol, \`show-me\` when a user needs a truthful visual explanation of work or behavior, \`generated-control-surface\` when contextual controls materially shorten feedback, then \`generative-apps\` when the interaction warrants a reusable deterministic app. Load a Skill only if its instructions are not already present in the current context. Do not use Telegram-specific features from unrelated local/TUI prompts.`;
 
 const TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX = `
 
@@ -28,9 +28,10 @@ export const TELEGRAM_ATTACH_PROMPT_GUIDELINES = [
   "For an explicit thread target, provide chat_id plus thread_id; registered multi-instance followers default to their assigned thread target.",
 ] as const;
 export const TELEGRAM_MESSAGE_PROMPT_SNIPPET =
-  "Send direct Telegram Markdown text when the user explicitly asks for Telegram delivery outside the normal reply flow.";
+  "Send direct Telegram Markdown text when the user explicitly asks for Telegram delivery to a concrete chat, channel, or live Pi Thread outside the normal reply flow.";
 export const TELEGRAM_MESSAGE_PROMPT_GUIDELINES = [
   "Use telegram_message only when the user explicitly asks to send a message to Telegram from the local/TUI side, or names a concrete Telegram delivery target.",
+  "For an explicitly requested channel post, pass its exact numeric id or public @username as chat_id; no local channel registry is required, and Telegram remains the authority on the bot's posting permission.",
   "For a live Pi thread target, provide thread as its case-insensitive name or numeric id; the bridge sends visibly and admits one attributed turn to that live instance. Unknown, ambiguous, same, or offline targets fail before sending.",
   "Add buttons by embedding the same top-level telegram_button HTML comments used in normal Telegram replies; Telegram does not support standalone buttons.",
   "During an active Telegram turn, omit telegram_message for the current target and answer normally; use thread only when the user requests delivery to a different live Pi thread.",
@@ -48,6 +49,8 @@ const TELEGRAM_TOOL_METADATA_LINES = Object.fromEntries(
 const TELEGRAM_MODEL_CONTEXT_TOOL_NAMES = new Set([
   "telegram_attach",
   "telegram_bind",
+  "telegram_channel_post",
+  "telegram_channel_posts",
   "telegram_message",
 ]);
 const TELEGRAM_MODEL_CONTEXT_MEMORY_KEY = Symbol.for(

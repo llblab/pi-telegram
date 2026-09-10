@@ -365,12 +365,10 @@ test("Paired update runtime binds pairing ports into update routing", async () =
   let allowedUserId: number | undefined;
   const runtime = createTelegramPairedUpdateRuntime({
     getAllowedUserId: () => allowedUserId,
-    setAllowedUserId: (userId) => {
+    persistAllowedUserId: async (userId) => {
+      events.push(`persist:${userId}`);
       allowedUserId = userId;
-      events.push(`set:${userId}`);
-    },
-    persistConfig: async () => {
-      events.push("persist");
+      return true;
     },
     updateStatus: (ctx: string) => {
       events.push(`status:${ctx}`);
@@ -398,19 +396,79 @@ test("Paired update runtime binds pairing ports into update routing", async () =
     "ctx",
   );
   assert.deepEqual(events, [
-    "set:42",
-    "persist",
+    "persist:42",
     "status:ctx",
     "message:ctx:10",
   ]);
+});
+
+test("Unpaired messages, edits, and callbacks require successful pairing publication before execution", async () => {
+  const message = { chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+    message_id: 10, message_thread_id: 42 };
+  const updates: TelegramUpdateFlow[] = [
+    { message }, { edited_message: message },
+    { callback_query: { id: "callback", from: message.from, message } },
+  ];
+  for (const route of ["local", "unbound", "message-owner", "target-owner"]) for (const update of updates) {
+    let outcome: "failure" | "denied" | "allowed" = "failure";
+    let allowedUserId: number | undefined;
+    let attempts = 0;
+    let executions = 0;
+    let ownershipEffects = 0;
+    const runtime = createTelegramPairedUpdateRuntime({
+      getAllowedUserId: () => allowedUserId,
+      getCurrentInstanceId: () => "leader",
+      getMessageOwnership: () => route === "message-owner" ? { instanceId: "follower" } : undefined,
+      getTargetOwnership: () => route === "target-owner" ? { instanceId: "follower" } : undefined,
+      recordMessageOwnership() { ownershipEffects++; },
+      foreignOwnedUpdateForwarder: {
+        async forwardMessage() { executions++; return acceptedForeignUpdateSettlement(); },
+        async forwardEditedMessage() { executions++; return acceptedForeignUpdateSettlement(); },
+        async forwardCallback() { executions++; return acceptedForeignUpdateSettlement(); },
+      },
+      ...(route === "unbound" ? { async handleUnboundTelegramTopicMessage() { executions++; } } : {}),
+      async persistAllowedUserId(userId) {
+        attempts++;
+        if (outcome === "failure") throw new Error("publication failed");
+        if (outcome === "denied") return false;
+        allowedUserId = userId;
+        return true;
+      },
+      updateStatus() {}, removePendingMediaGroupMessages() {},
+      removeQueuedTelegramTurnsByMessageIds: () => 0,
+      applyQueuedTelegramTurnReactionByMessageId: () => false,
+      async answerCallbackQuery() {}, async answerGuestQuery() {},
+      async sendTextReply() { return undefined; },
+      async handleAuthorizedTelegramCallbackQuery() { executions++; },
+      async handleAuthorizedTelegramMessage() { executions++; },
+      handleAuthorizedTelegramEditedMessage() { executions++; },
+    });
+    await assert.rejects(runtime.handleUpdate(update, {}), /publication failed/);
+    assert.equal(executions, 0, route);
+    assert.equal(ownershipEffects, 0, route);
+    assert.equal(allowedUserId, undefined);
+    outcome = "denied";
+    await runtime.handleUpdate(update, {});
+    assert.equal(executions, 0, route);
+    assert.equal(ownershipEffects, 0, route);
+    outcome = "allowed";
+    await runtime.handleUpdate(update, {});
+    assert.equal(executions, 1);
+    assert.equal(attempts, 3);
+    const admittedOwnershipEffects = ownershipEffects;
+    allowedUserId = 8;
+    await runtime.handleUpdate(update, {});
+    assert.equal(executions, 1, "An existing different owner also blocks delegation");
+    assert.equal(attempts, 3);
+    assert.equal(ownershipEffects, admittedOwnershipEffects);
+  }
 });
 
 test("Paired update runtime preserves follower target ownership forwarding", async () => {
   const events: string[] = [];
   const runtime = createTelegramPairedUpdateRuntime({
     getAllowedUserId: () => 7,
-    setAllowedUserId: () => {},
-    persistConfig: async () => {},
+    persistAllowedUserId: async () => true,
     updateStatus: () => {},
     getCurrentInstanceId: () => "leader",
     getTargetOwnership: (target) =>
@@ -458,8 +516,7 @@ test("Paired update runtime preserves topic lifecycle handling", async () => {
   const events: string[] = [];
   const runtime = createTelegramPairedUpdateRuntime({
     getAllowedUserId: () => 7,
-    setAllowedUserId: () => {},
-    persistConfig: async () => {},
+    persistAllowedUserId: async () => true,
     updateStatus: () => {},
     removePendingMediaGroupMessages: () => {},
     removeQueuedTelegramTurnsByMessageIds: () => 0,
@@ -1204,6 +1261,51 @@ test("Update runtime preserves both flags from complete reaction sets with remov
   ]);
 });
 
+test("Reaction sender admission precedes private/group ownership lookup, forwarding, and queue effects", async () => {
+  const cases = [
+    { name: "owner", allowed: 7, user: { id: 7, is_bot: false }, permitted: true },
+    { name: "unpaired", allowed: undefined, user: { id: 7, is_bot: false }, permitted: false },
+    { name: "other-user", allowed: 7, user: { id: 8, is_bot: false }, permitted: false },
+    { name: "bot", allowed: 7, user: { id: 7, is_bot: true }, permitted: false },
+    { name: "missing-user", allowed: 7, user: undefined, permitted: false },
+    { name: "invalid-owner", allowed: 0, user: { id: 0, is_bot: false }, permitted: false },
+    { name: "actor-chat", allowed: 7, user: undefined, actor_chat: { id: -100 }, permitted: false },
+    { name: "ambiguous-actor", allowed: 7, user: { id: 7, is_bot: false }, actor_chat: { id: -100 }, permitted: false },
+  ];
+  for (const chatType of ["private", "supergroup"]) {
+    for (const foreign of [false, true]) {
+      for (const scenario of cases) {
+        const events: string[] = [];
+        const reaction = {
+          chat: { id: 7, type: chatType }, user: scenario.user,
+          ...(scenario.actor_chat ? { actor_chat: scenario.actor_chat } : {}),
+          message_id: 10, old_reaction: [], new_reaction: [{ type: "emoji" as const, emoji: "👎" }],
+        };
+        await handleAuthorizedTelegramReactionUpdate(reaction, {
+          allowedUserId: scenario.allowed, ctx: TEST_CONTEXT,
+          getCurrentInstanceId: () => { events.push("instance"); return "local"; },
+          getMessageOwnership: () => { events.push("lookup"); return { instanceId: foreign ? "remote" : "local" }; },
+          foreignOwnedUpdateForwarder: { forwardReaction: () => {
+            events.push("forward"); return acceptedForeignUpdateSettlement();
+          } },
+          flushPendingMediaGroupMessage: async () => { events.push("media"); return true; },
+          flushPendingTextGroupMessage: async () => { events.push("text"); return true; },
+          applyQueuedTelegramTurnReactionByMessageId: () => { events.push("apply"); return true; },
+        });
+        const label = `${chatType}/${foreign ? "foreign" : "local"}/${scenario.name}`;
+        if (!scenario.permitted) assert.deepEqual(events, [], label);
+        else if (foreign) {
+          assert.equal(events.filter((event) => event === "forward").length, 1, label);
+          assert.equal(events.includes("apply"), false, label);
+        } else {
+          assert.deepEqual(events.slice(-3), ["media", "text", "apply"], label);
+          assert.equal(events.includes("forward"), false, label);
+        }
+      }
+    }
+  }
+});
+
 test("Reaction reconciliation materializes pending groups before queue mutation", async () => {
   const events: string[] = [];
   await handleAuthorizedTelegramReactionUpdate(
@@ -1781,6 +1883,64 @@ test("Update runtime forwards callbacks owned by another instance", async () => 
     },
   );
   assert.deepEqual(events, ["forward:instance-b:ctx"]);
+});
+
+test("Callback ownership rebinds a stable message binding to the current follower generation", async () => {
+  const observed: Array<{
+    instanceId: string;
+    ownerGeneration?: string;
+    recipientBindingKey?: string;
+  }> = [];
+  await executeTelegramUpdatePlan(
+    {
+      kind: "callback",
+      query: {
+        id: "cb-reconnected",
+        from: { id: 7, is_bot: false },
+        message: { chat: { id: 10, type: "private" }, message_id: 99,
+          message_thread_id: 42 },
+      },
+      shouldPair: false,
+      shouldDeny: false,
+    },
+    {
+      ctx: TEST_CONTEXT,
+      getCurrentInstanceId: () => "leader",
+      getMessageOwnership: () => ({
+        instanceId: "old-follower",
+        ownerGeneration: "old-generation",
+        recipientBindingKey: "workspace:b",
+      }),
+      getTargetOwnership: () => ({
+        instanceId: "current-follower",
+        ownerGeneration: "current-generation",
+        recipientBindingKey: "workspace:b",
+      }),
+      foreignOwnedUpdateForwarder: {
+        forwardCallback: ({ ownership }) => {
+          observed.push(ownership);
+          return acceptedForeignUpdateSettlement();
+        },
+      },
+      removePendingMediaGroupMessages: () => {},
+      removeQueuedTelegramTurnsByMessageIds: () => 0,
+      handleAuthorizedTelegramReactionUpdate: async () => {},
+      pairTelegramUserIfNeeded: async () => false,
+      answerCallbackQuery: async () => {},
+      answerGuestQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => {
+        assert.fail("Reconnected follower callback reached local handling.");
+      },
+      sendTextReply: async () => undefined,
+      handleAuthorizedTelegramMessage: async () => {},
+      handleAuthorizedTelegramEditedMessage: async () => {},
+    },
+  );
+  assert.deepEqual(observed, [{
+  instanceId: "current-follower",
+  ownerGeneration: "current-generation",
+  recipientBindingKey: "workspace:b",
+  }]);
 });
 
 test("Update runtime forwards callbacks from threads owned by another target instance", async () => {
@@ -3356,6 +3516,216 @@ test("Conflicting queued receipts expose exact ids without settling either sourc
   }
 });
 
+test("Admission worker selects optional custody and bypasses legacy settlement", async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  const owner = { instanceId: "one", processId: 1, processBirthId: "1:test",
+    sessionGeneration: 1, acquisitionId: "custody", acquiredAtMs: 1 };
+  const receipt = { journalBindingKey: "journal", tokenSha256: "a".repeat(64),
+    updateId: 1, owner };
+  const worker = createTelegramUpdateAdmissionWorkerRuntime({ journal: storage.journal,
+    inputCustody: {
+      acquireInput: () => ({ acquired: true, receipt }),
+      startInput: () => ({ started: true as const, update: { update_id: 1 } }),
+      completeInput: () => ({ removedUpdateIds: [
+        ...storage.journal.removeCompleted([1]).removedUpdateIds],
+        entryCount: storage.getUpdateIds().length, serializedBytes: storage.getUpdateIds().length * 100 }),
+      queueInputs: () => { throw new Error("queue not expected"); },
+    },
+    getJournalBindingKey: () => "journal", getRecipientBindingKey: () => "workspace:owner",
+    hasAuthority: () => true,
+    async defaultHandle() {},
+  });
+  try {
+    worker.start(TEST_CONTEXT);
+    await worker.waitForDrain();
+    assert.deepEqual(storage.getUpdateIds(), []);
+    assert.deepEqual(storage.getRemovals(), [[1]]);
+  } finally { await worker.stop(); }
+});
+
+test("Update worker consumes custodied completion without a second legacy settlement", async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  const worker = createTelegramUpdateWorkerRuntime({ journal: storage.journal,
+    hasAuthority: () => true,
+    executeUpdate: () => { throw new Error("legacy execution must remain unused"); },
+    async executeCustodiedUpdate(update) {
+      storage.journal.removeCompleted([update.update_id]);
+      return { status: "completed" };
+    },
+  });
+  try {
+    worker.start(TEST_CONTEXT);
+    await worker.waitForDrain();
+    assert.deepEqual(storage.getUpdateIds(), []);
+    assert.deepEqual(storage.getRemovals(), [[1]]);
+    assert.equal(worker.getState().phase, "idle");
+  } finally { await worker.stop(); }
+});
+
+test("Update worker consumes already-durable late custodied completion", async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  let signal!: AbortSignal;
+  const worker = createTelegramUpdateWorkerRuntime({ journal: storage.journal,
+    hasAuthority: () => true,
+    executeUpdate: () => { throw new Error("legacy execution must remain unused"); },
+    async executeCustodiedUpdate(_update, _ctx, currentSignal) {
+      signal = currentSignal;
+      return { status: "deferred", receipt: {
+        journalBindingKey: "journal", tokenSha256: "a".repeat(64), updateId: 1,
+        owner: { instanceId: "one", processId: 1, processBirthId: "1:test",
+          sessionGeneration: 1, acquisitionId: "running", acquiredAtMs: 1 },
+      } };
+    },
+  });
+  try {
+    worker.start(TEST_CONTEXT);
+    await worker.waitForDrain();
+    storage.journal.removeCompleted([1]);
+    worker.settleCustodied({ updateId: 1, result: { status: "completed" }, signal });
+    await worker.waitForDrain();
+    assert.deepEqual(storage.getUpdateIds(), []);
+    assert.deepEqual(storage.getRemovals(), [[1]]);
+    assert.equal(worker.getState().deferredClaimCount, 0);
+  } finally { await worker.stop(); }
+});
+
+test("Update worker blocks retained outcome-unknown custody without retry mutation", async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  let calls = 0;
+  const worker = createTelegramUpdateWorkerRuntime({ journal: storage.journal,
+    hasAuthority: () => true,
+    executeUpdate: () => { throw new Error("legacy execution must remain unused"); },
+    async executeCustodiedUpdate() {
+      calls += 1;
+      return { status: "outcome-unknown", receipt: {
+        journalBindingKey: "journal", tokenSha256: "a".repeat(64), updateId: 1,
+        owner: { instanceId: "one", processId: 1, processBirthId: "1:test",
+          sessionGeneration: 1, acquisitionId: "running", acquiredAtMs: 1 },
+      } };
+    },
+  });
+  try {
+    worker.start(TEST_CONTEXT);
+    await worker.waitForDrain();
+    assert.equal(calls, 1);
+    assert.deepEqual(storage.getUpdateIds(), [1]);
+    assert.deepEqual(storage.getRemovals(), []);
+    assert.equal(worker.getState().blockedReason, "execution");
+  } finally { await worker.stop(); }
+});
+
+test("Update worker honors journal exclusion across an awaited snapshot, not payload flags or later approval", async () => {
+  const storage = createTestUpdateWorkerJournal([
+    { update_id: 1 },
+    { update_id: 2, preApprovalExcluded: false },
+    { update_id: 3, preApprovalExcluded: true },
+  ]);
+  let resume!: () => void;
+  const gate = new Promise<void>((resolve) => { resume = resolve; });
+  let waiting = false;
+  let approved = false;
+  const executed: Array<[number, boolean]> = [];
+  const completed: number[] = [];
+  const worker = createTelegramUpdateWorkerRuntime({
+    journal: {
+      ...storage.journal,
+      read: () => {
+        const snapshot = storage.journal.read();
+        return { ...snapshot, version: 2, entries: snapshot.entries.map((entry) => ({
+          ...entry, preApprovalExcluded: entry.updateId === 2,
+        })) };
+      },
+    },
+    hasAuthority: () => true,
+    executeUpdate: async (update) => {
+      executed.push([update.update_id, approved]);
+      if (update.update_id === 1) { waiting = true; await gate; }
+      return { kind: "complete" };
+    },
+    onUpdateCompleted: (updateId) => { completed.push(updateId); },
+  });
+  try {
+    worker.start(TEST_CONTEXT);
+    await waitForUpdateWorkerCondition(() => waiting, "The first handler did not enter its await boundary");
+    assert.equal(storage.getReadCount(), 1, "The remaining entries are already in the held snapshot");
+    approved = true;
+    resume();
+    await worker.waitForDrain();
+    assert.deepEqual(executed, [[1, false], [3, true]]);
+    assert.deepEqual(completed, [1, 2, 3]);
+    assert.deepEqual(storage.getRemovals(), [[1, 2, 3]]);
+    assert.deepEqual(storage.getQueueReceipts(), []);
+  } finally {
+    resume();
+    await worker.stop();
+  }
+});
+
+test("Admission worker exclusion precedes execution preparation, registered handlers, and default routing", async () => {
+  const storage = createTestUpdateWorkerJournal([{ update_id: 1, message: { text: "excluded" } }]);
+  const calls = { prepare: 0, registered: 0, routed: 0 };
+  const worker = createTelegramUpdateAdmissionWorkerRuntime<TelegramJournaledUpdate & TelegramUpdateFlow, string>({
+    journal: { ...storage.journal, read: () => {
+      const snapshot = storage.journal.read();
+      return { ...snapshot, version: 2, entries: snapshot.entries.map((entry) => ({ ...entry, preApprovalExcluded: true })) };
+    } },
+    hasAuthority: () => true,
+    prepareUpdateForExecution: (update) => { calls.prepare++; return update; },
+    registry: { version: 1, add: () => () => {}, dispatch: async () => { calls.registered++; return "pass"; } },
+    defaultHandle: async () => { calls.routed++; },
+  });
+  try {
+    worker.start(TEST_CONTEXT);
+    await worker.waitForDrain();
+    assert.deepEqual(calls, { prepare: 0, registered: 0, routed: 0 });
+    assert.deepEqual(storage.getRemovals(), [[1]]);
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("Update worker rejects invalid exclusion snapshots before execution or queue recovery", async () => {
+  for (const scenario of ["missing", "malformed", "queued-excluded", "unknown-version", "missing-version"] as const) {
+    const storage = createTestUpdateWorkerJournal([1, 2]);
+    const queueOwner = { instanceId: "fixture", processId: process.pid,
+      processBirthId: `${process.pid}:fixture`, sessionGeneration: 1 };
+    storage.journal.markQueued({ queueKind: "prompt", receiptId: "prefix", sourceUpdateIds: [1], owner: queueOwner });
+    let executed = 0;
+    let recovered = 0;
+    const worker = createTelegramUpdateWorkerRuntime({
+      journal: {
+        ...storage.journal,
+        read: () => {
+          const snapshot = storage.journal.read();
+          return {
+            ...snapshot, version: scenario === "unknown-version" ? 3 : scenario === "missing-version" ? undefined : 2,
+            entries: snapshot.entries.map((entry) => ({
+              ...entry,
+              preApprovalExcluded: scenario === "missing-version" ? undefined : entry.updateId === 1 ? false : scenario === "missing" ? undefined : scenario === "malformed" ? "false" : true,
+              ...(entry.updateId === 2 && scenario === "queued-excluded" ? { state: "queued" } : {}),
+            })),
+          } as TelegramUpdateWorkerJournalSnapshot;
+        },
+      },
+      hasAuthority: () => true,
+      getQueueOwnerIdentity: () => queueOwner,
+      executeUpdate: () => { executed++; return { kind: "complete" }; },
+      onQueueReceiptCommitted: () => { recovered++; },
+    });
+    try {
+      worker.start(TEST_CONTEXT);
+      await worker.waitForDrain();
+      assert.equal(worker.getState().phase, "blocked", scenario);
+      assert.equal(executed, 0, scenario);
+      assert.equal(recovered, 0, scenario);
+      assert.deepEqual(storage.getRemovals(), [], scenario);
+      assert.deepEqual(storage.getUpdateIds(), [1, 2], scenario);
+    } finally {
+      await worker.stop();
+    }
+  }
+});
+
 test("Update worker drains one validated snapshot per bounded batch", async () => {
   const storage = createTestUpdateWorkerJournal([1, 2, 3, 4, 5]);
   const worker = createTelegramUpdateWorkerRuntime({
@@ -3644,7 +4014,7 @@ test("Admission runtime assembly owns queue identity and leader/follower workers
         recoveryKey: "leader-binding",
         journal: {
           ...leaderStorage.journal,
-          appendBatch: () => undefined,
+          appendBatch: () => ({ nonExcludedUpdateIds: [] }),
         },
       }),
       hasAuthority: () => true,
@@ -3655,7 +4025,7 @@ test("Admission runtime assembly owns queue identity and leader/follower workers
         recoveryKey: "follower-binding",
         journal: {
           ...followerStorage.journal,
-          appendBatch: () => undefined,
+          appendBatch: () => ({ nonExcludedUpdateIds: [] }),
         },
       }),
       isRegistered: () => followerRegistered,
@@ -3705,7 +4075,7 @@ test("Admission lifecycle reuses only the active runtime identity without resett
       recoveryKey,
       journal: {
         ...storage.journal,
-        appendBatch: () => undefined,
+        appendBatch: () => ({ nonExcludedUpdateIds: [] }),
       },
     }),
     createWorker(journal) {
@@ -3738,6 +4108,90 @@ test("Admission lifecycle reuses only the active runtime identity without resett
   await lifecycle.onSessionShutdown();
 });
 
+test("Admission replacement selects only a fresh descriptor with unchanged originating keys after stop", async (t) => {
+  for (const entrypoint of ["startup", "transport"] as const) {
+    for (const change of ["runtime", "recovery", "missing", "descriptor"] as const) {
+      await t.test(`${entrypoint}: ${change}`, async () => {
+        const storage = createTestUpdateWorkerJournal([]);
+        const events: string[] = [];
+        let runtimeKey = "old-runtime";
+        let recoveryKey = "source";
+        let present = true;
+        let portVersion = 0;
+        let hold = false;
+        const stopped = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        const lifecycle = createTelegramUpdateAdmissionLifecycleRuntime<string>({
+          resolveBinding() {
+            if (!present) return undefined;
+            const capturedVersion = portVersion;
+            const checkPort = (operation: string) => {
+              events.push(`${operation}:${capturedVersion}`);
+              assert.equal(capturedVersion, portVersion, "expired journal port");
+            };
+            return {
+              runtimeKey, recoveryKey,
+              journal: {
+                ...storage.journal,
+                read() { checkPort("read"); return storage.journal.read(); },
+                appendBatch() { checkPort("append"); return { nonExcludedUpdateIds: [] }; },
+                applyOperatorDisposition() { checkPort("retry"); assert.fail("empty journal has no failures"); },
+                recoverDeadQueueOwner() { checkPort("cleanup"); assert.fail("empty journal has no receipts"); },
+              },
+            };
+          },
+          getQueueOwnerIdentity: () => ({ instanceId: "local", processId: 1, processBirthId: "birth", sessionGeneration: 1 }),
+          createWorker(journal) {
+            events.push(`create:${portVersion}`);
+            const worker = createTelegramUpdateWorkerRuntime<string>({
+              journal, hasAuthority: () => true, executeUpdate: () => ({ kind: "complete" }),
+            });
+            return { ...worker, async stop() {
+              await worker.stop();
+              if (hold) { stopped.resolve(); await release.promise; }
+            } };
+          },
+        });
+        await lifecycle.onSessionStart("old");
+        hold = true;
+        // Startup needs a replacement runtime; transport must force replacement even with stable keys.
+        if (entrypoint === "startup") runtimeKey = "starting-runtime";
+        const replacing = entrypoint === "startup"
+          ? lifecycle.onSessionStart("next")
+          : lifecycle.onTransportChanged("next");
+        await stopped.promise;
+        const before = [...events];
+        portVersion += 1;
+        if (change === "runtime") runtimeKey = "changed-runtime";
+        if (change === "recovery") recoveryKey = "changed-source";
+        if (change === "missing") present = false;
+        release.resolve();
+        if (change !== "descriptor") {
+          await assert.rejects(replacing, /binding changed/);
+          assert.deepEqual(events, before, "refusal must precede create/read/retry/cleanup");
+          assert.equal(lifecycle.getState(), undefined);
+          assert.equal(lifecycle.getJournalBindingKey(), undefined);
+          assert.throws(() => lifecycle.appendBatch([]), /not active/);
+          present = true;
+          await lifecycle.onSessionStart("retry");
+        } else {
+          await replacing;
+        }
+        lifecycle.appendBatch([]);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(lifecycle.getJournalBindingKey(), recoveryKey);
+        assert.equal(events.filter((event) => event.startsWith("create:")).length, 2);
+        assert.ok(events.slice(before.length).includes("read:1"));
+        assert.ok(events.slice(before.length).includes("append:1"));
+        assert.equal(lifecycle.getState()?.blockedReason, undefined);
+        await lifecycle.onTransportChanged();
+        assert.equal(lifecycle.getState(), undefined);
+        assert.throws(() => lifecycle.appendBatch([]), /not active/);
+      });
+    }
+  }
+});
+
 test("Admission lifecycle resumes legacy terminal authority automatically", async () => {
   const storage = createTestUpdateWorkerJournal([1]);
   storage.journal.markExecutionFailure({
@@ -3756,7 +4210,7 @@ test("Admission lifecycle resumes legacy terminal authority automatically", asyn
       recoveryKey: "legacy-terminal",
       journal: {
         ...storage.journal,
-        appendBatch: () => undefined,
+        appendBatch: () => ({ nonExcludedUpdateIds: [] }),
         read() {
           const snapshot = storage.journal.read();
           return {
@@ -3831,7 +4285,7 @@ test("Admission lifecycle scopes failed reaction dependencies to their queued ta
       recoveryKey: "reaction-target",
       journal: {
         ...storage.journal,
-        appendBatch: () => undefined,
+        appendBatch: () => ({ nonExcludedUpdateIds: [] }),
       },
     }),
     createWorker(journal) {
@@ -3898,7 +4352,7 @@ test("Admission lifecycle recovers confirmed-dead queue authority before worker 
       recoveryKey: "dead-owner-profile",
       journal: {
         ...storage.journal,
-        appendBatch: () => undefined,
+        appendBatch: () => ({ nonExcludedUpdateIds: [] }),
         recoverDeadQueueOwner(input) {
           recoveryCalls += 1;
           const entry = storage.getEntries()[0]!;
@@ -4525,7 +4979,7 @@ test("Admission lifecycle exposes exact live queue handoff operations", async ()
       recoveryKey: "handoff-recovery",
       journal: {
         ...storage.journal,
-        appendBatch: () => undefined,
+        appendBatch: () => ({ nonExcludedUpdateIds: [] }),
         offerQueuedHandoff(input) {
           assert.deepEqual(input, handoffInput);
           calls.push("offer");
@@ -4619,7 +5073,7 @@ test("Admission lifecycle preserves queue authority owned by another live proces
       recoveryKey: "profile-a",
       journal: {
         ...storage.journal,
-        appendBatch: () => undefined,
+        appendBatch: () => ({ nonExcludedUpdateIds: [] }),
         recoverDeadQueueOwner(input) {
           recoveryCalls += 1;
           return {

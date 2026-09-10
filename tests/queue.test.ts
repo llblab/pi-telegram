@@ -1624,7 +1624,7 @@ test("Agent end dispatch policy resumes after success and error, but not abort-h
   );
 });
 
-test("Agent end runtime resets state, finalizes replies, sends attachments, and dispatches", async () => {
+test("Agent end runtime clears previews and sends attachments before the final reply", async () => {
   const events: string[] = [];
   const turn: PendingTelegramTurn = createQueueTestPromptTurn({
     queuedAttachments: [{ path: "/tmp/demo.txt", fileName: "demo.txt" }],
@@ -1669,12 +1669,11 @@ test("Agent end runtime resets state, finalizes replies, sends attachments, and 
     "reset",
     "typing-idle",
     "status",
-    "preview:final",
-    "finalize:final",
     "clear:1",
-    "markdown:final",
     "preview:",
     "attachments:1",
+    "markdown:final",
+    "preview:",
     "dispatch",
   ]);
 });
@@ -1716,7 +1715,6 @@ test("Agent end runtime delivers one Rich attachment result without duplicate te
   assert.deepEqual(events, [
     "reset",
     "status",
-    "preview",
     "rich:final",
     "clear",
     "preview",
@@ -2063,8 +2061,8 @@ test("Agent end runtime can schedule active-turn final delivery without blocking
       events.push(`finalize:${markdown}`);
       return true;
     },
-    sendMarkdownReply: async () => {
-      events.push("unexpected:markdown");
+    sendMarkdownReply: async (_chatId, _replyToMessageId, markdown) => {
+      events.push(`markdown:${markdown}`);
     },
     sendTextReply: async () => {
       events.push("unexpected:text");
@@ -2081,10 +2079,11 @@ test("Agent end runtime can schedule active-turn final delivery without blocking
     "status",
     "scheduled",
     "activity-idle",
-    "preview:final",
-    "finalize:final",
+    "clear:1",
     "preview:",
     "attachments:1",
+    "markdown:final",
+    "preview:",
     "dispatch",
   ]);
 });
@@ -2269,7 +2268,7 @@ test("Agent end Rich attachment delivery stops stale continuation after replacem
     },
   });
 
-  assert.deepEqual(events, ["reset", "status", "preview", "rich"]);
+  assert.deepEqual(events, ["reset", "status", "rich"]);
 });
 
 test("Agent end stops old-profile delivery after preview finalization yields", async () => {
@@ -2443,7 +2442,7 @@ test("Agent end runtime keeps queued Telegram turn delivery independent from pol
       return true;
     },
     sendMarkdownReply: async () => {
-      events.push("unexpected:markdown");
+      events.push("markdown");
     },
     sendTextReply: async () => {
       events.push("unexpected:text");
@@ -2458,10 +2457,11 @@ test("Agent end runtime keeps queued Telegram turn delivery independent from pol
   assert.deepEqual(events, [
     "reset",
     "status",
-    "preview:final",
-    "finalize:1:final",
+    "clear:1",
     "preview:",
     "attachments",
+    "markdown",
+    "preview:",
     "dispatch",
   ]);
 });
@@ -3480,7 +3480,7 @@ test("Agent end hook binds assistant extraction and runtime ports", async () => 
   ]);
 });
 
-test("Agent end runtime reports errors and dispatches next turn", async () => {
+test("Agent end runtime renders the operation-aborted error as HTML", async () => {
   const events: string[] = [];
   await handleTelegramAgentEndRuntime({
     turn: {
@@ -3496,7 +3496,7 @@ test("Agent end runtime reports errors and dispatches next turn", async () => {
       historyText: "prompt",
       statusSummary: "prompt",
     },
-    assistant: { stopReason: "error", errorMessage: "boom" },
+    assistant: { stopReason: "error", errorMessage: "This operation was aborted" },
     foldQueuedPromptsIntoHistory: false,
     resetRuntimeState: () => {
       events.push("reset");
@@ -3517,8 +3517,8 @@ test("Agent end runtime reports errors and dispatches next turn", async () => {
     sendMarkdownReply: async () => {
       events.push("unexpected:markdown");
     },
-    sendTextReply: async (_chatId, _replyToMessageId, text) => {
-      events.push(`text:${text}`);
+    sendTextReply: async (_chatId, _replyToMessageId, text, options) => {
+      events.push(`text:${text}:${options?.parseMode ?? "plain"}`);
     },
     sendQueuedAttachments: async () => {
       events.push("unexpected:attachments");
@@ -3528,7 +3528,7 @@ test("Agent end runtime reports errors and dispatches next turn", async () => {
     "reset",
     "status",
     "clear:1",
-    "text:boom",
+    "text:<b>⏹️ This operation was aborted.</b>:HTML",
     "dispatch",
   ]);
 });

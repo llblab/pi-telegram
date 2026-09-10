@@ -9,6 +9,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  rm,
   stat,
   utimes,
   writeFile,
@@ -24,6 +25,9 @@ import {
   cleanupTelegramTempFiles,
   createDefaultTelegramBridgeApiRuntime,
   createTelegramApiClient,
+  createTelegramApiTargetActivityRuntime,
+  createTelegramApiTargetTrackingClient,
+  createTelegramApiWorkspaceAdmissionClient,
   createTelegramAssistantDraftSender,
   createTelegramBridgeApiRuntime,
   createTelegramChatActionSender,
@@ -31,19 +35,358 @@ import {
   downloadTelegramFile,
   fetchTelegramBotIdentity,
   getTelegramApiErrorRequestTarget,
+  getTelegramApiWorkspaceAdmissionScope,
   getTelegramInboundFileByteLimitFromEnv,
   isTelegramApiCommitUnknownError,
   isTelegramMessageNotModifiedError,
   setTelegramApiHttpsFetchForTesting,
   prepareTelegramTempDir,
   TELEGRAM_FILE_MAX_BYTES,
+  TelegramApiWorkspaceAdmissionError,
   type TelegramApiCallOptions,
   type TelegramApiClient,
   type TelegramInputRichMessage,
 } from "../lib/telegram-api.ts";
 import { isTelegramTopicTargetStaleError } from "../lib/threads.ts";
+import { createTelegramWorkspaceAdmissionLedger } from "../lib/workspace-admission.ts";
 import { createTelegramAssistantPreviewRuntime } from "../lib/preview.ts";
 import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
+
+test("Target activity tracks exact JSON and multipart transport until settlement", async () => {
+  const activity = createTelegramApiTargetActivityRuntime();
+  let release: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const client: TelegramApiClient = {
+    async call<TResponse>() { await held; return true as TResponse; },
+    async callMultipart() { throw new Error("upload failed"); },
+    async downloadFile() { return "/tmp/file"; },
+    async answerCallbackQuery() {},
+  };
+  const tracked = createTelegramApiTargetTrackingClient(client, activity);
+  const request = tracked.call("sendMessage", {
+    chat_id: "-1007", message_thread_id: "42", text: "hello",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(activity.hasPendingTarget({ chatId: -1007, threadId: 42 }), true);
+  assert.deepEqual(activity.listPendingTargets(), [{ chatId: -1007, threadId: 42 }]);
+  assert.equal(activity.hasPendingTarget({ chatId: -1007, threadId: 43 }), false);
+  release?.();
+  await request;
+  assert.equal(activity.hasPendingTarget({ chatId: -1007, threadId: 42 }), false);
+  await assert.rejects(tracked.callMultipart("sendDocument", {
+    chat_id: "-1007", message_thread_id: "42",
+  }, "document", "/tmp/file", "file.txt"), /upload failed/);
+  assert.deepEqual(activity.listPendingTargets(), []);
+  const messageScoped = activity.begin("editMessageText", {
+    chat_id: -1007, message_id: 9,
+  });
+  assert.equal(activity.hasPendingTarget({ chatId: -1007, threadId: 42 }), true);
+  assert.deepEqual(activity.listPendingChats(), [-1007]);
+  messageScoped();
+  assert.equal(activity.hasPendingTarget({ chatId: -1007, threadId: 42 }), false);
+  const unscoped = activity.begin("getUpdates", { timeout: 1 });
+  assert.deepEqual(activity.listPendingTargets(), []);
+  assert.deepEqual(activity.listPendingChats(), []);
+  unscoped();
+});
+
+test("API Workspace admission scope is exact, chat-wide, or conservatively profile-wide", () => {
+  assert.deepEqual(
+    getTelegramApiWorkspaceAdmissionScope({
+      chat_id: "-1007",
+      message_thread_id: "42",
+    }),
+    { kind: "target", target: { chatId: -1007, threadId: 42 } },
+  );
+  assert.deepEqual(
+    getTelegramApiWorkspaceAdmissionScope({ chat_id: -1007, message_id: 9 }),
+    { kind: "chat", chatId: -1007 },
+  );
+  assert.deepEqual(
+    getTelegramApiWorkspaceAdmissionScope({
+      chat_id: -1007,
+      message_thread_id: "invalid",
+    }),
+    { kind: "profile" },
+  );
+  assert.deepEqual(
+    getTelegramApiWorkspaceAdmissionScope({ chat_id: "invalid" }),
+    { kind: "profile" },
+  );
+  assert.equal(getTelegramApiWorkspaceAdmissionScope({ timeout: 30 }), undefined);
+});
+
+test("JSON and multipart API calls hold exact Workspace admission through settlement", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-api-admission-"));
+  try {
+    const admission = createTelegramWorkspaceAdmissionLedger({
+      path: join(dir, "workspace-admission.json"),
+      profileKey: "profile:api",
+      owner: {
+        processId: process.pid,
+        processBirthId: `${process.pid}:api-admission-test`,
+      },
+      getProcessLiveness: () => "alive",
+    });
+    let jsonObserved = false;
+    let multipartObserved = false;
+    const client: TelegramApiClient = {
+      async call<TResponse>() {
+        const snapshot = admission.read();
+        jsonObserved =
+          snapshot.leases.length === 1 &&
+          snapshot.leases[0]?.operationKind === "api.sendMessage" &&
+          snapshot.leases[0]?.scope.kind === "target";
+        const fence = admission.acquireRetirementFence({
+          operationId: "api-json-fence",
+          retirementIntentId: "api-json-intent",
+          bindingKey: "api-json-binding",
+          slot: "A",
+          target: { chatId: -1007, threadId: 42 },
+          leaderEpoch: 1,
+          retirementRequestedAtMs: 1,
+        });
+        assert.deepEqual(fence, { kind: "blocked", reason: "admission-active" });
+        return true as TResponse;
+      },
+      async callMultipart<TResponse>() {
+        const snapshot = admission.read();
+        multipartObserved =
+          snapshot.leases.length === 1 &&
+          snapshot.leases[0]?.operationKind === "api.sendDocument" &&
+          snapshot.leases[0]?.scope.kind === "target";
+        return true as TResponse;
+      },
+      async downloadFile() {
+        return "/tmp/file";
+      },
+      async answerCallbackQuery() {},
+    };
+    const admitted = createTelegramApiWorkspaceAdmissionClient(
+      client,
+      admission,
+      { createOperationId: () => "stable-api-operation" },
+    );
+    assert.equal(
+      await admitted.call("sendMessage", {
+        chat_id: -1007,
+        message_thread_id: 42,
+        text: "hello",
+      }),
+      true,
+    );
+    assert.deepEqual(admission.read().leases, []);
+    assert.equal(
+      await admitted.callMultipart(
+        "sendDocument",
+        { chat_id: "-1007", message_thread_id: "42" },
+        "document",
+        "/tmp/file",
+        "file.txt",
+      ),
+      true,
+    );
+    assert.equal(jsonObserved, true);
+    assert.equal(multipartObserved, true);
+    assert.deepEqual(admission.read().leases, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Concurrent API calls cannot share one Workspace admission operation identity", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-api-operation-id-"));
+  let releaseTransport: (() => void) | undefined;
+  try {
+    const admission = createTelegramWorkspaceAdmissionLedger({
+      path: join(dir, "workspace-admission.json"),
+      profileKey: "profile:api-duplicate",
+      owner: {
+        processId: process.pid,
+        processBirthId: `${process.pid}:api-duplicate-test`,
+      },
+      getProcessLiveness: () => "alive",
+    });
+    const heldTransport = new Promise<void>((resolve) => {
+      releaseTransport = resolve;
+    });
+    let transportCalls = 0;
+    const client: TelegramApiClient = {
+      async call<TResponse>() {
+        transportCalls += 1;
+        await heldTransport;
+        return true as TResponse;
+      },
+      async callMultipart<TResponse>() {
+        return true as TResponse;
+      },
+      async downloadFile() {
+        return "/tmp/file";
+      },
+      async answerCallbackQuery() {},
+    };
+    const admitted = createTelegramApiWorkspaceAdmissionClient(
+      client,
+      admission,
+      { createOperationId: () => "shared-live-operation" },
+    );
+    const first = admitted.call("sendMessage", {
+      chat_id: -1007,
+      message_thread_id: 42,
+      text: "first",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(admission.read().leases.length, 1);
+
+    await assert.rejects(
+      () => admitted.call("sendMessage", {
+        chat_id: -1007,
+        message_thread_id: 42,
+        text: "second",
+      }),
+      (error) => error instanceof TelegramApiWorkspaceAdmissionError &&
+        error.code === "duplicate-operation",
+    );
+    assert.equal(transportCalls, 1);
+    assert.equal(admission.read().leases.length, 1);
+    assert.deepEqual(
+      admission.acquireRetirementFence({
+        operationId: "duplicate-api-fence",
+        retirementIntentId: "duplicate-api-intent",
+        bindingKey: "duplicate-api-binding",
+        slot: "A",
+        target: { chatId: -1007, threadId: 42 },
+        leaderEpoch: 1,
+        retirementRequestedAtMs: 1,
+      }),
+      { kind: "blocked", reason: "admission-active" },
+    );
+    if (!releaseTransport) throw new Error("Transport release was not captured.");
+    releaseTransport();
+    await first;
+    assert.deepEqual(admission.read().leases, []);
+  } finally {
+    releaseTransport?.();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("API Workspace fence blocks issuance and failed requests still release leases", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-api-fence-"));
+  try {
+    const admission = createTelegramWorkspaceAdmissionLedger({
+      path: join(dir, "workspace-admission.json"),
+      profileKey: "profile:api",
+      owner: {
+        processId: process.pid,
+        processBirthId: `${process.pid}:api-admission-test`,
+      },
+      getProcessLiveness: () => "alive",
+    });
+    const fenced = admission.acquireRetirementFence({
+      operationId: "api-active-fence",
+      retirementIntentId: "api-active-intent",
+      bindingKey: "api-active-binding",
+      slot: "A",
+      target: { chatId: -1007, threadId: 42 },
+      leaderEpoch: 1,
+      retirementRequestedAtMs: 1,
+    });
+    assert.equal(fenced.kind, "acquired");
+    let calls = 0;
+    const client: TelegramApiClient = {
+      async call() {
+        calls += 1;
+        throw new Error("request failed");
+      },
+      async callMultipart<TResponse>() {
+        calls += 1;
+        return true as TResponse;
+      },
+      async downloadFile() {
+        return "/tmp/file";
+      },
+      async answerCallbackQuery() {},
+    };
+    const admitted = createTelegramApiWorkspaceAdmissionClient(client, admission);
+    await assert.rejects(
+      admitted.call("sendMessage", {
+        chat_id: -1007,
+        message_thread_id: 42,
+      }),
+      (error) =>
+        error instanceof TelegramApiWorkspaceAdmissionError &&
+        error.code === "blocked",
+    );
+    assert.equal(calls, 0);
+    if (fenced.kind === "acquired") {
+      assert.equal(admission.releaseUnissuedRetirementFence(fenced.fence), true);
+    }
+    await assert.rejects(
+      admitted.call("sendMessage", {
+        chat_id: -1007,
+        message_thread_id: 42,
+      }),
+      /request failed/u,
+    );
+    assert.equal(calls, 1);
+    assert.deepEqual(admission.read().leases, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("API admission release failure cannot turn a settled request into replay", async () => {
+  const releaseErrors: unknown[] = [];
+  const admitted = createTelegramApiWorkspaceAdmissionClient(
+    {
+      async call<TResponse>() {
+        return "sent" as TResponse;
+      },
+      async callMultipart<TResponse>() {
+        return "uploaded" as TResponse;
+      },
+      async downloadFile() {
+        return "/tmp/file";
+      },
+      async answerCallbackQuery() {},
+    },
+    {
+      acquireAdmission(input) {
+        return {
+          kind: "acquired",
+          resumed: false,
+          lease: {
+            ...input,
+            profileKey: "profile:api",
+            owner: {
+              processId: process.pid,
+              processBirthId: `${process.pid}:api-admission-test`,
+            },
+            acquiredAtMs: 1,
+          },
+        };
+      },
+      releaseAdmission() {
+        throw new Error("release outcome unknown");
+      },
+    },
+    {
+      createOperationId: () => "settled-request",
+      onReleaseError(error) {
+        releaseErrors.push(error);
+      },
+    },
+  );
+  assert.equal(
+    await admitted.call("sendMessage", {
+      chat_id: -1007,
+      message_thread_id: 42,
+    }),
+    "sent",
+  );
+  assert.equal(releaseErrors.length, 1);
+});
 
 function createApiResponseBody(result: unknown): { ok: true; result: unknown } {
   return { ok: true, result };
@@ -614,7 +957,7 @@ test("Telegram bridge API runtime still rejects non-rate-limit chat-action failu
   assert.deepEqual(events, ["api:chat action failed"]);
 });
 
-test("Telegram native Markdown draft sender disables automatic entity detection", async () => {
+test("Telegram native Markdown draft sender permits automatic entity detection", async () => {
   const richBodies: Record<string, unknown>[] = [];
   const legacyCalls: unknown[] = [];
   const sendDraft = createTelegramNativeMarkdownDraftSender({
@@ -635,8 +978,7 @@ test("Telegram native Markdown draft sender disables automatic entity detection"
       draft_id: 9,
       rich_message: {
         markdown: "#tag /cmd https://example.com",
-        skip_entity_detection: true,
-      },
+      }
     },
   ]);
   assert.equal(legacyCalls.length, 1);
@@ -1305,6 +1647,56 @@ test("Default Telegram bridge API runtime binds lazy token client and defaults",
     });
     assert.equal(await runtime.sendTypingAction(7), true);
     assert.match(calls[0] ?? "", /bot123:abc\/sendChatAction$/);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("Default Telegram bridge API runtime applies optional Workspace admission", async () => {
+  let activeLease:
+    | {
+        operationId: string;
+        operationKind: string;
+        profileKey: string;
+        scope:
+          | { kind: "target"; target: { chatId: number; threadId: number } }
+          | { kind: "chat"; chatId: number }
+          | { kind: "profile" };
+        owner: { processId: number; processBirthId: string };
+        acquiredAtMs: number;
+      }
+    | undefined;
+  const restoreFetch = setApiTestFetch(async () => {
+    assert.equal(activeLease?.operationKind, "api.sendChatAction");
+    assert.deepEqual(activeLease?.scope, { kind: "chat", chatId: 7 });
+    return createApiJsonResponse(true);
+  });
+  try {
+    const runtime = createDefaultTelegramBridgeApiRuntime({
+      getBotToken: () => "123:abc",
+      recordRuntimeEvent: () => {},
+      workspaceAdmission: {
+        acquireAdmission(input) {
+          activeLease = {
+            ...input,
+            profileKey: "profile:api",
+            owner: {
+              processId: process.pid,
+              processBirthId: `${process.pid}:api-admission-test`,
+            },
+            acquiredAtMs: 1,
+          };
+          return { kind: "acquired", lease: activeLease, resumed: false };
+        },
+        releaseAdmission(expected) {
+          assert.deepEqual(expected, activeLease);
+          activeLease = undefined;
+          return true;
+        },
+      },
+    });
+    assert.equal(await runtime.sendTypingAction(7), true);
+    assert.equal(activeLease, undefined);
   } finally {
     restoreFetch();
   }

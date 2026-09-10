@@ -104,10 +104,15 @@ test("Prompt helpers keep local prompts on compact safety guidance only", () => 
   assert.match(result, /Telegram session connected/);
   assert.match(result, /connectivity alone is not user intent/);
   assert.match(result, /`telegram-bridge`/);
+  assert.match(result, /`show-me`/);
   assert.match(result, /`generated-control-surface`/);
   assert.match(result, /`generative-apps`/);
   assert.match(result, /bundled Skills in routing order/);
   assert.match(result, /`telegram-bridge` for the transport and turn protocol/);
+  assert.match(
+    result,
+    /`show-me` when a user needs a truthful visual explanation of work or behavior/,
+  );
   assert.match(
     result,
     /`generated-control-surface` when contextual controls materially shorten feedback/,

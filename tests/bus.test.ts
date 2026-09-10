@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 
 import {
   classifyTelegramBusTransportError,
@@ -25,8 +26,12 @@ import {
 } from "../lib/bus-transport.ts";
 import {
   createCurrentTelegramBusProcessRuntime,
+  canUseTelegramBusInputCustodyReference,
   createTelegramBusFollowerDeliveryIdentity,
+  createTelegramBusForwardOwnershipValidator,
+  createTelegramBusFollowerSourceReferenceDeliveryIdentity,
   createTelegramBusFollowerRegistry,
+  type TelegramBusEnvelope,
   createTelegramBusFollowerThreadRestoreHandler,
   createTelegramBusProtocolIdentity,
   createTelegramBusForeignOwnedUpdateForwarder,
@@ -39,12 +44,15 @@ import {
   getTelegramBusEnvelopeTrafficClass,
   getTelegramBusFollowerSocketPath,
   getTelegramBusProtocolCompatibility,
+  getTelegramInputCustodyPeerReadiness,
   getTelegramBusSocketPath,
   getTelegramFollowerTargetOwnership,
   getTelegramProcessBirthIdentity,
+  getTelegramProcessBirthIdentityLiveness,
   getTelegramProcessLiveness,
   hasTelegramBusCapability,
   isTelegramBusEnvelopeAuthorized,
+  isTelegramBusForwardOwnershipCurrent,
   isTelegramFollowerApiCallAllowed,
   markTelegramBusAggregateDelivery,
   markTelegramBusCrossTargetDelivery,
@@ -53,8 +61,15 @@ import {
   stripTelegramBusApiMetadata,
   sendTelegramBusLocalEnvelope,
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
+  TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+  TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
+  TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
 } from "../lib/bus.ts";
+import {
+  getTelegramThreadOwnerFromProfileKey,
+  getTelegramThreadOwnerKey,
+} from "../lib/threads.ts";
 
 test("Bus envelope auth compares the exact secret in constant time", () => {
   const secret = "leader-minted-secret";
@@ -182,6 +197,40 @@ test("Bus protocol compatibility ignores build skew and enforces capabilities", 
   );
 });
 
+test("Bus custody peer readiness uses only live generation and protocol evidence", () => {
+  const ready = createTelegramBusProtocolIdentity({ runtimeBuild: "0.45.0",
+    capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
+      TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE] });
+  const legacy = createTelegramBusProtocolIdentity({ runtimeBuild: "0.44.0" });
+  assert.deepEqual(getTelegramInputCustodyPeerReadiness([
+    { registrationGeneration: "g1", protocol: ready },
+    { registrationGeneration: "g2", protocol: legacy },
+    { registrationGeneration: "g3" },
+    { protocol: ready },
+  ]), ["ready", "legacy", "unknown", "unknown"]);
+});
+
+test("Bus custody reference requires mutual capability and exact accepted handoff", () => {
+  const capable = createTelegramBusProtocolIdentity({ runtimeBuild: "0.45.0",
+    capabilities: [TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE] });
+  const legacy = createTelegramBusProtocolIdentity({ runtimeBuild: "0.44.0" });
+  assert.equal(canUseTelegramBusInputCustodyReference({ local: capable, remote: capable }), true);
+  assert.equal(canUseTelegramBusInputCustodyReference({ local: capable, remote: legacy }), false);
+  assert.equal(canUseTelegramBusInputCustodyReference({ local: legacy, remote: capable }), false);
+  const source = { updateId: 44, owner: { acquisitionId: "acquisition-44",
+    handoffId: "input-handoff-44" } };
+  const delivery = createTelegramBusFollowerSourceReferenceDeliveryIdentity({
+    kind: "leader.wakeInputCustody", recipientBindingKey: "workspace:recipient",
+    sourceRecoveryKey: "journal:source", source });
+  assert.deepEqual(delivery.sourceClaim, { acquisitionId: "acquisition-44",
+    handoffId: "input-handoff-44" });
+  assert.equal(delivery.sourceRecoveryKey, "journal:source");
+  assert.throws(() => createTelegramBusFollowerSourceReferenceDeliveryIdentity({
+    kind: "leader.wakeInputCustody", recipientBindingKey: "workspace:recipient",
+    sourceRecoveryKey: "journal:source", source: { ...source, owner: {
+      acquisitionId: "acquisition-44" } } }), /requires an accepted handoff/);
+});
+
 test("Follower delivery identity stays stable across registration replacement", () => {
   const first = createTelegramBusFollowerDeliveryIdentity({
     kind: "leader.forwardMessage",
@@ -285,6 +334,33 @@ test("Process liveness requires a stable platform birth proof", () => {
     ),
     "unverifiable",
   );
+});
+
+test("Wrapped follower owner keys expose their raw process-birth identity", () => {
+  for (const telegramProfile of [undefined, "work"]) {
+    const key = getTelegramThreadOwnerKey({ kind: "manual-follower",
+      instanceId: "42:start:12345", ...(telegramProfile ? { telegramProfile } : {}) });
+    const owner = getTelegramThreadOwnerFromProfileKey(key);
+    assert.equal(owner.kind, "manual-follower");
+    if (owner.kind !== "manual-follower") continue;
+    assert.equal(owner.instanceId, "42:start:12345");
+    assert.equal(getTelegramProcessBirthIdentityLiveness(owner.instanceId, {
+      platform: "linux", isProcessAlive: () => false,
+    }), "dead");
+  }
+});
+
+test("Process birth identity liveness fails closed for opaque and live fallback identities", () => {
+  const stat = `(worker) S ${Array(18).fill("0").join(" ")} 12345`;
+  const options = { platform: "linux" as const, isProcessAlive: () => true,
+    readProcStat: () => stat };
+  assert.equal(getTelegramProcessBirthIdentityLiveness("42:start:12345", options), "alive");
+  assert.equal(getTelegramProcessBirthIdentityLiveness("42:start:999", options), "dead");
+  assert.equal(getTelegramProcessBirthIdentityLiveness("42:generation:fallback", options), "unverifiable");
+  assert.equal(getTelegramProcessBirthIdentityLiveness("opaque", options), "unverifiable");
+  assert.equal(getTelegramProcessBirthIdentityLiveness("42:start:12345", {
+    ...options, isProcessAlive: () => false,
+  }), "dead");
 });
 
 test("Process birth identity preserves Linux start ticks and fallback", () => {
@@ -528,6 +604,35 @@ test("Bus contract encodes and parses follower registration envelopes", () => {
   );
 });
 
+test("Bus contract encodes and parses Workspace follower restore envelopes", () => {
+  const envelope = {
+    kind: "follower.restoreWorkspace" as const,
+    requestId: "inst-a:restore:1",
+    registration: {
+      instanceId: "inst-a",
+      cwd: "/work/project",
+      pid: 123,
+      protocol: createTelegramBusProtocolIdentity({
+        runtimeBuild: "0.45.0",
+        capabilities: [
+          TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
+        ],
+      }),
+      connectedAtMs: 1000,
+    },
+  };
+
+  assert.deepEqual(
+    parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()),
+    envelope,
+  );
+  assert.equal(getTelegramBusEnvelopeTrafficClass(envelope), "bootstrap");
+  assert.equal(
+    TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
+    "workspace-follower-auto-connect-v1",
+  );
+});
+
 test("Bus contract encodes and parses explicit follower disconnect envelopes", () => {
   const envelope = {
     kind: "follower.disconnect" as const,
@@ -541,6 +646,51 @@ test("Bus contract encodes and parses explicit follower disconnect envelopes", (
     parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()),
     envelope,
   );
+});
+
+test("Bus contract validates exact-generation Thread display setting envelopes", () => {
+  for (const mode of ["letters", "names", "directories"] as const) {
+    const envelope = { kind: "follower.setThreadDisplayMode" as const,
+      requestId: "one", instanceId: "follower", registrationGeneration: "generation", mode };
+    assert.deepEqual(parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()), envelope);
+    assert.equal(getTelegramBusEnvelopeTrafficClass(envelope), "generation-fenced");
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, mode: "invalid" })), undefined);
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, registrationGeneration: undefined })), undefined);
+  }
+});
+
+test("Bus contract encodes and parses Workspace Thread rename envelopes", () => {
+  const envelope = {
+    kind: "follower.renameThread" as const,
+    requestId: "inst-a:3",
+    instanceId: "inst-a",
+    registrationGeneration: "inst-a:1",
+    target: { chatId: 7, threadId: 42 },
+    threadName: "Navigator",
+    sentAtMs: 2000,
+  };
+
+  assert.deepEqual(
+    parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()),
+    envelope,
+  );
+  assert.equal(
+    TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
+    "workspace-thread-rename-v1",
+  );
+  const reset = {
+    kind: "follower.resetThreadName" as const,
+    requestId: "inst-a:4",
+    instanceId: "inst-a",
+    registrationGeneration: "inst-a:1",
+    target: { chatId: 7, threadId: 42 },
+    sentAtMs: 2001,
+  };
+  assert.deepEqual(
+    parseTelegramBusEnvelope(encodeTelegramBusEnvelope(reset).trimEnd()),
+    reset,
+  );
+  assert.equal(getTelegramBusEnvelopeTrafficClass(reset), "generation-fenced");
 });
 
 test("Bus contract encodes and parses follower target replacement envelopes", () => {
@@ -1611,6 +1761,80 @@ test("Bus local client classifies response timeouts as transport timeouts", asyn
   }
 });
 
+test("Bus local client accepts a buffered response after its event loop resumes past the deadline", { timeout: 2_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-client-stall-"));
+  const socketPath = process.platform === "win32"
+    ? getTelegramBusFollowerEndpoint({
+        agentDir: dir,
+        platform: process.platform,
+        instanceId: "stall-test",
+      })
+    : resolveTelegramBusSocketPath(join(dir, "bus.sock"));
+  const worker = new Worker(
+    `
+      import { createServer } from "node:net";
+      import { parentPort, workerData } from "node:worker_threads";
+
+      const server = createServer((socket) => {
+        let buffer = "";
+        socket.setEncoding("utf8");
+        socket.on("error", () => undefined);
+        socket.on("data", (chunk) => {
+          buffer += chunk;
+          const newlineIndex = buffer.indexOf("\\n");
+          if (newlineIndex < 0) return;
+          const envelope = JSON.parse(buffer.slice(0, newlineIndex));
+          parentPort.postMessage("received");
+          setTimeout(() => {
+            socket.end(JSON.stringify({
+              kind: "bus.ack",
+              requestId: envelope.requestId,
+              ok: true,
+            }) + "\\n", () => {
+              server.close(() => parentPort.close());
+            });
+          }, 5);
+        });
+      });
+      server.listen(workerData.socketPath, () => parentPort.postMessage("ready"));
+    `,
+    { eval: true, workerData: { socketPath } },
+  );
+  try {
+    await new Promise<void>((resolve, reject) => {
+      worker.once("message", (message) => {
+        if (message === "ready") resolve();
+        else reject(new Error(`Unexpected worker message: ${String(message)}`));
+      });
+      worker.once("error", reject);
+    });
+    const received = new Promise<void>((resolve) => {
+      worker.once("message", () => resolve());
+    });
+    const responsePromise = sendTelegramBusLocalEnvelope({
+      socketPath,
+      timeoutMs: 100,
+      envelope: {
+        kind: "follower.heartbeat",
+        requestId: "inst-a:stalled-event-loop",
+        instanceId: "inst-a",
+        sentAtMs: 2000,
+      },
+    });
+    await received;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+    assert.deepEqual(await responsePromise, {
+      kind: "bus.ack",
+      requestId: "inst-a:stalled-event-loop",
+      ok: true,
+      message: undefined,
+    });
+  } finally {
+    await worker.terminate();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Bus local server memoizes completed and in-flight request results", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-ledger-"));
   const socketPath = join(dir, "bus.sock");
@@ -2023,6 +2247,77 @@ test("Bus foreign-owned update forwarder sends routed update envelopes", async (
   }
 });
 
+test("Bus forwarder selects payload-free custody wake only for capable peers", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-custody-forwarder-"));
+  const socketPath = join(dir, "bus.sock");
+  const received: TelegramBusEnvelope[] = [];
+  const server = createTelegramBusLocalServer({ socketPath, handleEnvelope(envelope) {
+    received.push(envelope);
+    return { kind: "bus.ack", requestId: envelope.requestId, ok: true,
+      ...(envelope.kind === "leader.wakeInputCustody" ? { result: {
+        deliveryId: envelope.delivery.deliveryId,
+        sourceUpdateId: envelope.delivery.sourceUpdateId } } : {}) };
+  } });
+  const capable = createTelegramBusProtocolIdentity({ runtimeBuild: "0.45.0",
+    capabilities: [TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE] });
+  const expectedOwnership = { instanceId: "inst-b", ownerGeneration: "g1",
+    recipientBindingKey: "workspace:recipient", protocolIdentity: capable };
+  let currentOwnership = expectedOwnership;
+  const forwarder = createTelegramBusForeignOwnedUpdateForwarder({ socketPath,
+    createRequestId: () => "leader:custody", getNowMs: () => 9_000,
+    localProtocolIdentity: capable,
+    validateForwardOwnership: ownership =>
+      isTelegramBusForwardOwnershipCurrent(ownership, currentOwnership),
+    resolveInputCustodyReference: ({ sourceUpdateId }) => {
+      if (sourceUpdateId === 46) currentOwnership = { ...expectedOwnership,
+        ownerGeneration: "g2", protocolIdentity: createTelegramBusProtocolIdentity({
+          runtimeBuild: "0.44.0" }) };
+      return sourceUpdateId === 44 || sourceUpdateId === 46 ? {
+        sourceRecoveryKey: "journal:source", source: { updateId: sourceUpdateId,
+          owner: { acquisitionId: `acquisition-${sourceUpdateId}`,
+            handoffId: `handoff-${sourceUpdateId}` } } } : undefined;
+    },
+  });
+  try {
+    await server.start();
+    const missing = await forwarder.forwardMessage({ message: {
+      message_id: 7, pi_telegram_source_update_id: 45 }, ownership: {
+      instanceId: "inst-b", ownerGeneration: "g1", recipientBindingKey: "workspace:recipient",
+      protocolIdentity: capable }, ctx: "ctx" });
+    assert.equal(missing.status, "retryable");
+    assert.equal("failureClass" in missing && missing.failureClass, "source-reference-missing");
+    const accepted = await forwarder.forwardMessage({ message: {
+      message_id: 8, text: "must-not-cross", pi_telegram_source_update_id: 44 },
+      ownership: expectedOwnership, ctx: "ctx" });
+    assert.equal(accepted.status, "accepted");
+    assert.equal(received.length, 1);
+    assert.deepEqual(received[0], { kind: "leader.wakeInputCustody", requestId: "leader:custody",
+      recipientInstanceId: "inst-b", recipientRegistrationGeneration: "g1",
+      delivery: createTelegramBusFollowerSourceReferenceDeliveryIdentity({
+        kind: "leader.wakeInputCustody", recipientBindingKey: "workspace:recipient",
+        sourceRecoveryKey: "journal:source", source: { updateId: 44,
+          owner: { acquisitionId: "acquisition-44", handoffId: "handoff-44" } } }),
+      sentAtMs: 9_000 });
+    assert.doesNotMatch(JSON.stringify(received), /must-not-cross|message_id/);
+    currentOwnership = { ...expectedOwnership, ownerGeneration: "g2",
+      protocolIdentity: createTelegramBusProtocolIdentity({ runtimeBuild: "0.44.0" }) };
+    const postAcceptRetry = await forwarder.forwardMessage({ message: {
+      message_id: 8, text: "must-not-cross", pi_telegram_source_update_id: 44 },
+      ownership: expectedOwnership, ctx: "ctx" });
+    assert.equal(postAcceptRetry.status, "retryable");
+    assert.equal("failureClass" in postAcceptRetry && postAcceptRetry.failureClass,
+      "recipient-ownership-stale");
+    assert.equal(received.length, 1);
+    currentOwnership = expectedOwnership;
+    const stale = await forwarder.forwardMessage({ message: {
+      message_id: 9, pi_telegram_source_update_id: 46 },
+      ownership: expectedOwnership, ctx: "ctx" });
+    assert.equal(stale.status, "retryable");
+    assert.equal("failureClass" in stale && stale.failureClass, "recipient-ownership-stale");
+    assert.equal(received.length, 1);
+  } finally { await server.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("Bus durable follower forwarding rejects an ACK without the exact receipt", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-missing-receipt-"));
   const socketPath = join(dir, "bus.sock");
@@ -2358,6 +2653,35 @@ test("Bus follower registry replaces stale registrations by profile and target",
   );
 });
 
+test("Bus forward ownership validator follows live registry replacement", () => {
+  const registry = createTelegramBusFollowerRegistry();
+  const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "0.45.0",
+    capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
+      TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE] });
+  registry.register({ instanceId: "follower", profileKey: "workspace:recipient",
+    registrationGeneration: "g1", protocol, connectedAtMs: 1 });
+  const validate = createTelegramBusForwardOwnershipValidator(registry);
+  const ownership = { instanceId: "follower", ownerGeneration: "g1",
+    recipientBindingKey: "workspace:recipient", protocolIdentity: protocol };
+  assert.equal(validate(ownership), true);
+  registry.register({ instanceId: "follower", profileKey: "workspace:recipient",
+    registrationGeneration: "g1", protocol: createTelegramBusProtocolIdentity({
+      runtimeBuild: "0.44.0", capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] }),
+    connectedAtMs: 2 });
+  assert.equal(validate(ownership), false);
+  registry.remove("follower");
+  assert.equal(validate(ownership), false);
+  registry.register({ instanceId: "follower", profileKey: "workspace:recipient",
+    registrationGeneration: "g2", protocol: createTelegramBusProtocolIdentity({
+      runtimeBuild: "0.44.0", capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] }),
+    connectedAtMs: 2 });
+  assert.equal(validate(ownership), false);
+  const current = getTelegramFollowerTargetOwnership({ target: { chatId: 1, threadId: 2 },
+    followers: [{ ...registry.get("follower")!, target: { chatId: 1, threadId: 2 } }] });
+  assert.ok(current);
+  assert.equal(validate(current), true);
+});
+
 test("Bus follower target ownership carries the live registration generation", () => {
   assert.deepEqual(
     getTelegramFollowerTargetOwnership({
@@ -2383,6 +2707,8 @@ test("Bus follower target ownership carries the live registration generation", (
       instanceId: "follower-live",
       ownerGeneration: "registration-2",
       recipientBindingKey: "manual:owner-live",
+      protocolIdentity: createTelegramBusProtocolIdentity({ runtimeBuild: "0.28.0",
+        capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] }),
     },
   );
 });
@@ -2420,8 +2746,25 @@ test("Bus follower target ownership requires negotiated routing capabilities", (
       instanceId: "follower-live",
       ownerGeneration: "registration-2",
       recipientBindingKey: "manual:owner-a",
+      protocolIdentity: follower.protocol,
     },
   );
+  const local = createTelegramBusProtocolIdentity({ runtimeBuild: "0.45.0",
+    capabilities: [TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE] });
+  assert.equal(canUseTelegramBusInputCustodyReference({ local,
+    remote: getTelegramFollowerTargetOwnership({ target: { chatId: 1, threadId: 2 },
+      followers: [follower] })?.protocolIdentity }), false);
+  follower.protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "0.45.0",
+    capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
+      TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE] });
+  assert.equal(canUseTelegramBusInputCustodyReference({ local,
+    remote: getTelegramFollowerTargetOwnership({ target: { chatId: 1, threadId: 2 },
+      followers: [follower] })?.protocolIdentity }), true);
+  follower.protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "0.44.0",
+    capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] });
+  assert.equal(canUseTelegramBusInputCustodyReference({ local,
+    remote: getTelegramFollowerTargetOwnership({ target: { chatId: 1, threadId: 2 },
+      followers: [follower] })?.protocolIdentity }), false);
 });
 
 test("Bus follower target ownership never treats persisted bindings as live authority", () => {

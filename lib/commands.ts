@@ -6,6 +6,7 @@
 
 import {
   pairTelegramUserIfNeeded,
+  type TelegramConfigStore,
   TELEGRAM_DEFAULT_PROFILE_NAME,
 } from "./config.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
@@ -170,6 +171,7 @@ export const TELEGRAM_COMMAND_EMOJI = {
   continue: "▶️",
   abort: "⏹️",
   stop: "🟥",
+  name: "🏷️",
 } as const;
 
 export type TelegramCommandEmojiName = keyof typeof TELEGRAM_COMMAND_EMOJI;
@@ -186,11 +188,46 @@ export function formatTelegramCommandEmojiPrefix(
   return `${getTelegramCommandEmoji(command)} `;
 }
 
+export function formatTelegramPiCommandHtml(command: string): string {
+  return `<code>${escapeHtml(command)}</code>`;
+}
+
 export function formatTelegramInformationHeading(
   emoji: string,
   text: string,
 ): string {
   return `<b>${escapeHtml(emoji)} ${escapeHtml(text)}</b>`;
+}
+
+export function formatTelegramInvalidInstanceName(
+  validationError: string,
+): string {
+  const details = validationError.replace(
+    /^Invalid Telegram (?:instance name|Thread display name):\s*/,
+    "",
+  );
+  const items = details
+    .split(/;\s+|(?<=\.)\s+(?=[A-Z])/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => /[.!?]$/.test(item) ? item : `${item}.`)
+    .map((item) => item[0]!.toUpperCase() + item.slice(1));
+  return [
+    "<b>⚠️ Invalid Thread Display Name:</b>\n",
+    ...items.map((item) => `• ${escapeHtml(item)}`),
+  ].join("\n");
+}
+
+export function formatTelegramThreadDisplayNameSavedHeading(
+  name: string,
+): string {
+  return `<b>✅ Thread display name saved as <i>${escapeHtml(name)}</i>.</b>`;
+}
+
+export function formatTelegramAutomaticThreadDisplayNameRestoredHeading(
+  name: string,
+): string {
+  return `<b>✅ Automatic Thread display name restored as <i>${escapeHtml(name)}</i>.</b>`;
 }
 
 export const TELEGRAM_COMPACTION_STARTED_TEXT =
@@ -219,6 +256,13 @@ export const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinitio
       description: formatTelegramBotCommandDescription(
         "start",
         "Open menu / Pair bridge",
+      ),
+    },
+    {
+      command: "name",
+      description: formatTelegramBotCommandDescription(
+        "name",
+        "Rename this thread",
       ),
     },
     {
@@ -319,6 +363,7 @@ export function createTelegramBotCommandRegistrar(
 export interface TelegramBridgeCommandStartPollingOptions {
   force?: boolean;
   forceFreshLeaderThread?: boolean;
+  requestedThreadName?: string;
 }
 
 export interface TelegramBridgeCommandStartPollingResult {
@@ -358,13 +403,74 @@ export interface TelegramBridgeCommandRegistrationDeps {
     ctx: ExtensionCommandContext,
     profileName: string,
   ) => Promise<boolean>;
+  validateThreadName?: (threadName: string) => string | undefined;
+}
+
+export type TelegramThreadDisplayNameRenamePort = (
+  target: { chatId: number; threadId?: number },
+  threadName: string,
+) => Promise<{ ok: boolean; threadName?: string; message?: string }>;
+
+export type TelegramThreadDisplayNameResetPort = (
+  target: { chatId: number; threadId?: number },
+) => Promise<{
+  ok: boolean;
+  threadName?: string;
+  message?: string;
+}>;
+
+export function createTelegramThreadDisplayNameResetBinding(): {
+  bind: (reset: TelegramThreadDisplayNameResetPort) => void;
+  reset: TelegramThreadDisplayNameResetPort;
+} {
+  let current: TelegramThreadDisplayNameResetPort | undefined;
+  return {
+    bind(reset) { current = reset; },
+    async reset(target) {
+      return current
+        ? current(target)
+        : { ok: false, message: "Thread display name reset is unavailable." };
+    },
+  };
+}
+
+export function createTelegramThreadDisplayNameRenameBinding(): {
+  bind: (rename: TelegramThreadDisplayNameRenamePort) => void;
+  rename: TelegramThreadDisplayNameRenamePort;
+} {
+  let current: TelegramThreadDisplayNameRenamePort | undefined;
+  return {
+    bind(rename) {
+      current = rename;
+    },
+    async rename(target, threadName) {
+      if (!current) {
+        return {
+          ok: false,
+          message: "Thread display naming is unavailable.",
+        };
+      }
+      return current(target, threadName);
+    },
+  };
 }
 
 function parseTelegramProfileArg(args: string): string | undefined {
   const word = args.trim().split(/\s+/)[0];
   if (!word || word.length === 0) return undefined;
-  if (word.startsWith("-")) return undefined;
+  if (word.startsWith("-") || /^as=/i.test(word)) return undefined;
   return word === TELEGRAM_DEFAULT_PROFILE_NAME ? undefined : word;
+}
+
+export function parseTelegramRequestedThreadName(
+  args: string,
+): string | undefined {
+  const token = args
+    .trim()
+    .split(/\s+/)
+    .find((word) => /^as=/i.test(word));
+  const value = token?.slice(3).trim();
+  return value || undefined;
 }
 
 function formatTelegramTakeoverTitle(ctx: ExtensionCommandContext): string {
@@ -403,9 +509,28 @@ export function registerTelegramBridgeCommands(
     },
   });
   pi.registerCommand("telegram-connect", {
-    description: "Start the Telegram bridge. Use /telegram-connect <name> for named profiles.",
+    description:
+      "Start the Telegram bridge. Use /telegram-connect <profile> and optional as=Name for a fresh Workspace Thread.",
     handler: async (args, ctx) => {
       const profileName = parseTelegramProfileArg(args);
+      const requestedNameTokens = args
+        .trim()
+        .split(/\s+/)
+        .filter((word) => /^as=/i.test(word));
+      const requestedThreadName = parseTelegramRequestedThreadName(args);
+      const requestedNameError =
+        requestedNameTokens.length > 1
+          ? "Specify at most one as=Name Workspace Thread name."
+          : requestedNameTokens.length === 1 && !requestedThreadName
+            ? "Usage: /telegram-connect [profile] as=Flightprice"
+            : requestedThreadName
+              ? deps.validateThreadName?.(requestedThreadName)
+              : undefined;
+      if (requestedNameError) {
+        ctx.ui.notify(requestedNameError, "warning");
+        deps.updateStatus(ctx);
+        return;
+      }
       if (profileName && deps.activateProfileConfig) {
         const ok = await deps.activateProfileConfig(ctx, profileName);
         if (!ok) {
@@ -466,6 +591,7 @@ export function registerTelegramBridgeCommands(
       };
       let result = await startWithRecovery({
         forceFreshLeaderThread: true,
+        ...(requestedThreadName ? { requestedThreadName } : {}),
       });
       if (result && !result.ok && result.canTakeover) {
         const confirmed = await ctx.ui.confirm(
@@ -480,6 +606,7 @@ export function registerTelegramBridgeCommands(
         result = await startWithRecovery({
           force: true,
           forceFreshLeaderThread: true,
+          ...(requestedThreadName ? { requestedThreadName } : {}),
         });
       }
       if (result?.message) {
@@ -527,6 +654,7 @@ export function registerTelegramBridgeCommands(
 
 export const TELEGRAM_RESERVED_COMMAND_NAMES = [
   "stop",
+  "name",
   "abort",
   "next",
   "continue",
@@ -559,6 +687,7 @@ export function isTelegramReservedCommandName(
 export type TelegramCommandAction =
   | { kind: "ignore"; executionMode: "ignored" }
   | { kind: "stop"; executionMode: "immediate" }
+  | { kind: "name"; executionMode: "immediate" }
   | { kind: "abort"; executionMode: "immediate" }
   | { kind: "next"; executionMode: "immediate" }
   | { kind: "continue"; executionMode: "immediate" }
@@ -578,6 +707,7 @@ export type TelegramCommandExecutionMode = "ignored" | "immediate";
 
 export interface TelegramCommandActionDeps<TMessage, TContext> {
   handleStop: (message: TMessage, ctx: TContext) => Promise<void>;
+  handleName: (message: TMessage, ctx: TContext, name: string) => Promise<void>;
   handleAbort: (message: TMessage, ctx: TContext) => Promise<void>;
   handleNext: (message: TMessage, ctx: TContext) => Promise<void>;
   handleContinue: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -971,10 +1101,15 @@ export function createTelegramCommandTargetRuntime<
 export interface TelegramCommandOrPromptRuntimeDeps<TMessage, TContext> {
   extractRawText: (messages: TMessage[]) => string;
   shouldIgnoreMessages?: (messages: TMessage[]) => boolean;
+  consumeThreadNameInput?: (
+    messages: TMessage[],
+    ctx: TContext,
+  ) => Promise<boolean>;
   handleCommand: (
     commandName: string | undefined,
     message: TMessage,
     ctx: TContext,
+    commandArgs?: string,
   ) => Promise<boolean>;
   executeExtensionCommand?: (
     command: ParsedTelegramCommand,
@@ -1039,11 +1174,17 @@ export interface TelegramCommandRuntimeDeps<
   openThinkingMenu: (message: TMessage, ctx: TContext) => Promise<void>;
   openQueueMenu: (message: TMessage, ctx: TContext) => Promise<void>;
   openSettingsMenu?: (message: TMessage, ctx: TContext) => Promise<void>;
+  validateThreadName?: (threadName: string) => string | undefined;
+  renameCurrentThread?: TelegramThreadDisplayNameRenamePort;
+  resetCurrentThreadName?: TelegramThreadDisplayNameResetPort;
+  openThreadNameDialog?: (
+    message: TMessage,
+    ctx: TContext,
+  ) => Promise<void>;
   getAllowedUserId: () => number | undefined;
-  setAllowedUserId: (userId: number) => void;
+  persistAllowedUserId: TelegramConfigStore["persistAllowedUserId"];
   registerBotCommands: () => Promise<void>;
   getPromptTemplateCommands?: () => readonly TelegramPromptTemplateMenuCommand[];
-  persistConfig: () => Promise<void>;
   sendTextReply: (
     message: TMessage,
     text: string,
@@ -1060,6 +1201,7 @@ export const TELEGRAM_APP_MENU_INTRO_HTML = [
   "<b>Pi Telegram</b>",
   "",
   `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
+  `${formatTelegramCommandEmojiPrefix("name")}/name Name — Rename this thread`,
   `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
   `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
   `${formatTelegramCommandEmojiPrefix("continue")}/continue — Queue continue prompt`,
@@ -1100,6 +1242,7 @@ function buildTelegramAppMenuIntroHtml(): string {
     "<b>Pi Telegram</b>",
     "",
     `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
+    `${formatTelegramCommandEmojiPrefix("name")}/name Name — Rename this thread`,
     `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
     ...extensionLines,
     `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
@@ -1168,6 +1311,7 @@ export function parseTelegramCommand(
 
 export const TELEGRAM_COMMAND_ACTIONS = {
   stop: { kind: "stop", executionMode: "immediate" },
+  name: { kind: "name", executionMode: "immediate" },
   abort: { kind: "abort", executionMode: "immediate" },
   next: { kind: "next", executionMode: "immediate" },
   continue: { kind: "continue", executionMode: "immediate" },
@@ -1294,7 +1438,7 @@ export async function handleTelegramNextCommand(deps: {
     deps.updateStatus();
     const notice = formatTelegramInformationHeading(
       "⏩",
-      "Operation aborted. Dispatching next queued turn.",
+      "Dispatching next queued turn.",
     );
     if (activeTurnReply) {
       await activeTurnReply(notice, { parseMode: "HTML" });
@@ -1525,12 +1669,16 @@ export async function executeTelegramCommandAction<TMessage, TContext>(
   message: TMessage,
   ctx: TContext,
   deps: TelegramCommandActionDeps<TMessage, TContext>,
+  commandArgs = "",
 ): Promise<boolean> {
   switch (action.kind) {
     case "ignore":
       return false;
     case "stop":
       await deps.handleStop(message, ctx);
+      return true;
+    case "name":
+      await deps.handleName(message, ctx, commandArgs);
       return true;
     case "abort":
       await deps.handleAbort(message, ctx);
@@ -1595,6 +1743,7 @@ export function createTelegramCommandHandlerTargetRuntime<
   commandName: string | undefined,
   message: TMessage,
   ctx: TContext,
+  commandArgs?: string,
 ) => Promise<boolean> {
   const commandTargetRuntime = createTelegramCommandTargetQueueRuntime<
     TMessage,
@@ -1643,11 +1792,14 @@ export function createTelegramCommandHandlerTargetRuntime<
     openSettingsMenu: commandTargetRuntime.openSettingsMenu,
     handleForumBootstrap: deps.handleForumBootstrap,
     getAllowedUserId: deps.getAllowedUserId,
-    setAllowedUserId: deps.setAllowedUserId,
+    persistAllowedUserId: deps.persistAllowedUserId,
     registerBotCommands: createTelegramBotCommandRegistrar({
       setMyCommands: deps.setMyCommands,
     }),
-    persistConfig: deps.persistConfig,
+    validateThreadName: deps.validateThreadName,
+    renameCurrentThread: deps.renameCurrentThread,
+    resetCurrentThreadName: deps.resetCurrentThreadName,
+    openThreadNameDialog: deps.openThreadNameDialog,
     sendTextReply: commandTargetRuntime.sendTextReply,
     recordRuntimeEvent: deps.recordRuntimeEvent,
   });
@@ -1661,8 +1813,9 @@ export function createTelegramCommandHandler<
     commandName: string | undefined,
     message: TMessage,
     ctx: TContext,
+    commandArgs?: string,
   ): Promise<boolean> => {
-    return handleTelegramCommandRuntime(commandName, message, ctx, deps);
+    return handleTelegramCommandRuntime(commandName, message, ctx, deps, commandArgs);
   };
 }
 
@@ -1678,11 +1831,16 @@ export function createTelegramCommandOrPromptRuntime<TMessage, TContext>(
       if (!firstMessage) return;
       if (deps.shouldIgnoreMessages?.(messages)) return;
       deps.assertExecutionCurrent?.(firstMessage);
+      if (await deps.consumeThreadNameInput?.(messages, ctx)) {
+        deps.assertExecutionCurrent?.(firstMessage);
+        return;
+      }
       const command = parseTelegramCommand(deps.extractRawText(messages));
       const handled = await deps.handleCommand(
         command?.name,
         firstMessage,
         ctx,
+        command?.args,
       );
       deps.assertExecutionCurrent?.(firstMessage);
       if (handled) return;
@@ -1755,6 +1913,7 @@ async function handleTelegramCommandRuntime<
   message: TMessage,
   ctx: TContext,
   deps: TelegramCommandRuntimeDeps<TMessage, TContext>,
+  commandArgs = "",
 ): Promise<boolean> {
   const assertExecutionCurrentFor = (nextMessage: TMessage) => (): void =>
     deps.assertExecutionCurrent?.(nextMessage);
@@ -1783,6 +1942,69 @@ async function handleTelegramCommandRuntime<
           updateStatus: updateStatusFor(commandCtx),
           sendTextReply: sendReplyFor(nextMessage),
         });
+      },
+      handleName: async (nextMessage, _commandCtx, requestedName) => {
+        const threadName = requestedName.trim();
+        if (!threadName) {
+          if (deps.openThreadNameDialog) {
+            await deps.openThreadNameDialog(nextMessage, _commandCtx);
+          } else {
+            await sendReplyFor(nextMessage)(
+              formatTelegramInformationHeading("🏷️", "Usage: /name Navigator"),
+              { parseMode: "HTML" },
+            );
+          }
+          return;
+        }
+        if (/^[A-Z]$/.test(threadName) && deps.resetCurrentThreadName) {
+          const result = await deps.resetCurrentThreadName(
+            getTelegramCommandMessageTarget(nextMessage),
+          );
+          await sendReplyFor(nextMessage)(
+            result.ok && !result.message
+              ? formatTelegramAutomaticThreadDisplayNameRestoredHeading(
+                result.threadName ?? threadName,
+              )
+              : formatTelegramInformationHeading(
+                result.ok ? "✅" : "⚠️",
+                result.message ?? "Thread display name reset failed.",
+              ),
+            { parseMode: "HTML" },
+          );
+          return;
+        }
+        const validationError = deps.validateThreadName?.(threadName);
+        if (validationError) {
+          await sendReplyFor(nextMessage)(
+            formatTelegramInvalidInstanceName(validationError),
+            { parseMode: "HTML" },
+          );
+          return;
+        }
+        if (!deps.renameCurrentThread) {
+          await sendReplyFor(nextMessage)(
+            formatTelegramInformationHeading("🚫", "Thread display naming is unavailable."),
+            { parseMode: "HTML" },
+          );
+          return;
+        }
+        deps.assertExecutionCurrent?.(nextMessage);
+        const result = await deps.renameCurrentThread(
+          getTelegramCommandMessageTarget(nextMessage),
+          threadName,
+        );
+        deps.assertExecutionCurrent?.(nextMessage);
+        await sendReplyFor(nextMessage)(
+          result.ok && !result.message
+            ? formatTelegramThreadDisplayNameSavedHeading(
+              result.threadName ?? threadName,
+            )
+            : formatTelegramInformationHeading(
+              result.ok ? "✅" : "⚠️",
+              result.message ?? "Thread display name update failed.",
+            ),
+          { parseMode: "HTML" },
+        );
       },
       handleAbort: async (nextMessage, commandCtx) => {
         await handleTelegramAbortCommand({
@@ -1916,14 +2138,14 @@ async function handleTelegramCommandRuntime<
           nextMessage.from?.id !== undefined &&
           canPairTelegramUserFromCommandMessage(nextMessage)
         ) {
-          await pairTelegramUserIfNeeded(nextMessage.from.id, {
+          const allowed = await pairTelegramUserIfNeeded(nextMessage.from.id, {
             allowedUserId: deps.getAllowedUserId(),
             ctx: undefined,
-            setAllowedUserId: deps.setAllowedUserId,
-            persistConfig: deps.persistConfig,
+            persistAllowedUserId: deps.persistAllowedUserId,
             updateStatus: updateStatusFor(commandCtx),
             assertExecutionCurrent: assertExecutionCurrentFor(nextMessage),
           });
+          if (!allowed) return;
         }
         const isContextActive = () =>
           deps.isContextActive?.(commandCtx) !== false;
@@ -1959,5 +2181,6 @@ async function handleTelegramCommandRuntime<
         );
       },
     },
+    commandArgs,
   );
 }
