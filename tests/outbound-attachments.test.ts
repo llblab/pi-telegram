@@ -132,7 +132,7 @@ test("Rich outbound attachment planner builds one target-scoped media result", (
         chat_id: "1",
         message_thread_id: "42",
         rich_message: JSON.stringify({
-          markdown: ">quoted report\n\n![](tg://photo?id=artifact)",
+          markdown: "![](tg://photo?id=artifact)\n\n>quoted report",
           media: [
             {
               id: "artifact",
@@ -142,7 +142,6 @@ test("Rich outbound attachment planner builds one target-scoped media result", (
               },
             },
           ],
-          skip_entity_detection: true,
         }),
         reply_markup: JSON.stringify(replyMarkup),
       },
@@ -431,6 +430,45 @@ test("Outbound message tool sends direct Telegram markdown with parsed buttons",
       target: undefined,
     },
   ]);
+});
+
+test("Outbound message tool sends a public @channel username through direct leader delivery", async () => {
+  const tools = new Map<string, RegisteredAnyTool>();
+  const sent: Array<{ channel: number | string; markdown: string; replyMarkup?: unknown }> = [];
+  const recordedErrors: Error[] = [];
+  const api = { registerTool: (definition: RegisteredAnyTool) => {
+    if (definition.name) tools.set(definition.name, definition);
+  } } as unknown as ExtensionAPI;
+  registerTelegramOutboundMessageTool(api, {
+    getDefaultChatId: () => 7,
+    canSendDirect: () => true,
+    planMessage: (markdown) => ({ markdown, replyMarkup: { inline_keyboard: [] } }),
+    sendMarkdownMessage: async () => assert.fail("Channel username entered numeric chat delivery"),
+    sendChannelMarkdownMessage: async (channel, markdown, options) => {
+      if (markdown === "SECRET") throw new Error("transport leaked SECRET token");
+      sent.push({ channel, markdown, replyMarkup: options.replyMarkup });
+      return 91;
+    },
+    recordRuntimeEvent: (_kind, error) => {
+      if (error instanceof Error) recordedErrors.push(error);
+    },
+  });
+  const tool = tools.get("telegram_message")!;
+  await tool.execute("tool-call", { text: "Channel post", chat_id: "@public_channel" });
+  assert.deepEqual(sent, [{ channel: "@public_channel", markdown: "Channel post",
+    replyMarkup: { inline_keyboard: [] } }]);
+  await tool.execute("numeric-call", { text: "Numeric post", chat_id: -100123, channel: true });
+  assert.deepEqual(sent[1], { channel: -100123, markdown: "Numeric post",
+    replyMarkup: { inline_keyboard: [] } });
+  await assert.rejects(tool.execute("tool-call", {
+    text: "Invalid", chat_id: "@public_channel", thread_id: 2,
+  }), /Telegram channel publication failed/u);
+  await assert.rejects(tool.execute("secret-call", {
+    text: "SECRET", chat_id: "@public_channel",
+  }), error => error instanceof Error && !error.message.includes("SECRET") &&
+    !error.message.includes("token"));
+  assert.equal(recordedErrors.some(error => error.message.includes("SECRET") ||
+    error.message.includes("token")), false);
 });
 
 test("Outbound message tool errors start on a visually separated line", async () => {

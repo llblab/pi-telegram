@@ -5,6 +5,9 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import {
   mkdir,
   mkdtemp,
@@ -39,11 +42,14 @@ import {
   normalizeTelegramDefaultProfileConfig,
   pairTelegramUserIfNeeded,
   readTelegramConfig,
+  resolveTelegramThreadDisplayMode,
+  setTelegramThreadDisplayMode,
   setGlobalTelegramConfigRuntime,
   updateTelegramVoiceConfig,
   writeTelegramConfig,
 } from "../lib/config.ts";
 import { createTelegramSettingsMenuRuntime } from "../lib/menu-settings.ts";
+import { createTelegramLockRuntime } from "../lib/locks.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -56,6 +62,76 @@ import {
   getTelegramBotTokenPromptSpec,
   runTelegramSetup,
 } from "../lib/setup.ts";
+
+test("Thread display mode maps legacy names and invalid values to letters", () => {
+  for (const mode of [undefined, "invalid", null]) {
+    assert.equal(resolveTelegramThreadDisplayMode(legacyConfig({
+      threadDisplayMode: mode,
+    })), "letters");
+  }
+  assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "names" }), "letters");
+  assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "letters" }), "letters");
+  assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "directories" }), "directories");
+});
+
+test("Thread display mode persists per profile and survives effective config updates", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-display-mode-"));
+  const configPath = join(agentDir, "telegram.json");
+  const store = createTelegramConfigStore({ agentDir, configPath, initialConfig: {
+    profiles: {
+      default: { botToken: "token-default", threadDisplayMode: "letters" },
+      work: { botToken: "token-work", threadDisplayMode: "directories" },
+    },
+  } });
+  try {
+    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "letters");
+    store.activateProfile("work");
+    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directories");
+    store.update((config) => { config.assistant = { rendering: "html" }; });
+    await store.persist();
+    const saved = await readTelegramConfig(configPath);
+    assert.equal(saved.threadDisplayMode, undefined);
+    assert.equal(saved.profiles?.default.threadDisplayMode, "letters");
+    assert.equal(saved.profiles?.work.threadDisplayMode, "directories");
+    const restored = createTelegramConfigStore({ agentDir, configPath });
+    await restored.load();
+    assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "letters");
+    restored.activateProfile("work");
+    assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "directories");
+    restored.update((config) => { config.threadDisplayMode = "names"; });
+    await restored.persist();
+    restored.activateProfile("default");
+    assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "letters");
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("Thread display preference writes fence authority inside the config transaction", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-display-fence-"));
+  const configPath = join(agentDir, "telegram.json");
+  const store = createTelegramConfigStore({ agentDir, configPath,
+    initialConfig: { profiles: { default: { botToken: "token" } } } });
+  try {
+    await store.persist();
+    await setTelegramThreadDisplayMode(store, "directories", () => true);
+    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directories");
+    let current = true;
+    const pending = store.persist({ ...store.get(), threadDisplayMode: "letters" }, {
+      isCurrent: () => current,
+    });
+    current = false;
+    await assert.rejects(pending, /originating authority/);
+    assert.equal((await readTelegramConfig(configPath)).profiles?.default.threadDisplayMode, "directories");
+    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directories");
+    await assert.rejects(
+      setTelegramThreadDisplayMode(store, "names", () => false),
+      /Invalid Telegram Thread display mode/,
+    );
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
 
 test("Config projections own bot and effective profile lookup", () => {
   const store = createTelegramConfigStore({
@@ -184,6 +260,70 @@ test("Concurrent config processes preserve independent settings mutations", asyn
     assert.equal(persisted.assistant.activity, "quiet");
     assert.equal(persisted.assistant.timeInjection, "always");
   } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("Cross-process pairing observation serializes before an owner-fenced grant", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "telegram-pair-process-order-"));
+  const configPath = join(agentDir, "telegram.json");
+  const locksPath = join(agentDir, "owners.json");
+  const startPath = join(agentDir, "start");
+  const ownerHeldPath = join(agentDir, "owner-held");
+  const configModule = new URL("../lib/config.ts", import.meta.url).href;
+  const locksModule = new URL("../lib/locks.ts", import.meta.url).href;
+  await writeFile(configPath, JSON.stringify({ profiles: { default: { botToken: "fixture-token" } } }));
+  const script = `
+    import { existsSync, writeFileSync } from "node:fs";
+    import { createTelegramConfigStore } from ${JSON.stringify(configModule)};
+    import { createTelegramLockRuntime } from ${JSON.stringify(locksModule)};
+    const store = createTelegramConfigStore({ agentDir: process.env.TEST_AGENT_DIR, configPath: process.env.TEST_CONFIG_PATH });
+    await store.load();
+    const deadline = Date.now() + 8000;
+    while (!existsSync(process.env.TEST_START_PATH)) {
+      if (Date.now() >= deadline) throw new Error("start barrier timed out");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+    }
+    const owner = createTelegramLockRuntime({ locksPath: process.env.TEST_LOCKS_PATH, instanceId: "pair-grant-child" });
+    if (!owner.acquire({ cwd: "/fixture" }).ok) throw new Error("fixture ownership unavailable");
+    try {
+      const allowed = await store.persistAllowedUserId(42, undefined, (publish) => owner.commitIfOwned(() => {
+        writeFileSync(process.env.TEST_OWNER_HELD_PATH, "held");
+        publish();
+      }));
+      process.stdout.write(JSON.stringify({ allowed, userId: store.getAllowedUserId() }));
+    } finally { owner.release(); }
+  `;
+  const grant = execFileAsync(process.execPath,
+    ["--experimental-strip-types", "--input-type=module", "--eval", script], {
+      env: { ...process.env, TEST_AGENT_DIR: agentDir, TEST_CONFIG_PATH: configPath,
+        TEST_LOCKS_PATH: locksPath, TEST_START_PATH: startPath, TEST_OWNER_HELD_PATH: ownerHeldPath },
+      timeout: 15_000,
+    });
+  try {
+    const store = createTelegramConfigStore({ agentDir, configPath });
+    await store.load();
+    const tokenSha256 = createHash("sha256").update("fixture-token").digest("hex");
+    const before = store.withPairingAdmission("default", tokenSha256, (excluded) => {
+      fs.writeFileSync(startPath, "start");
+      const deadline = Date.now() + 8000;
+      while (!fs.existsSync(ownerHeldPath)) {
+        if (Date.now() >= deadline) throw new Error("owner barrier timed out");
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+      }
+      assert.equal(fs.existsSync(`${configPath}.transaction`), true);
+      assert.equal(fs.existsSync(`${locksPath}.transaction`), true);
+      assert.equal(JSON.parse(fs.readFileSync(configPath, "utf8")).profiles.default.allowedUserId, undefined);
+      return excluded;
+    });
+    assert.equal(before, true);
+    assert.deepEqual(JSON.parse((await grant).stdout), { allowed: true, userId: 42 });
+    assert.equal(store.getAllowedUserId(), undefined, "The observing process still has its original cache");
+    assert.equal(store.withPairingAdmission("default", tokenSha256, (excluded) => excluded), false);
+    assert.equal(fs.existsSync(`${configPath}.transaction`), false);
+    assert.equal(fs.existsSync(`${locksPath}.transaction`), false);
+  } finally {
+    await grant.catch(() => undefined);
     await rm(agentDir, { recursive: true, force: true });
   }
 });
@@ -895,6 +1035,481 @@ test("Telegram config store owns load, mutation, and persistence", async () => {
   });
 });
 
+test("Paired-only admission adopts a peer grant without writing config or losing local settings", async (t) => {
+  for (const profileName of ["default", "work"]) {
+    const dir = await mkdtemp(join(tmpdir(), "telegram-paired-only-"));
+    const configPath = join(dir, "telegram.json");
+    const hash = createHash("sha256").update("fixture-token").digest("hex");
+    let pendingSettings: Promise<void> | undefined;
+    try {
+      await writeFile(configPath, JSON.stringify({ profiles: { [profileName]: { botToken: "fixture-token" } }, assistant: { activity: "verbose" } }));
+      const store = createTelegramConfigStore({ agentDir: dir, configPath });
+      await store.load();
+      assert.equal(store.activateProfile(profileName), true);
+      const unpaired = await readFile(configPath, "utf8");
+      assert.deepEqual(store.withPairedUserAdmission(profileName, hash, 42, () => assert.fail("unpaired publication")), { admitted: false });
+      assert.equal(store.getAllowedUserId(), undefined);
+      assert.equal(await readFile(configPath, "utf8"), unpaired);
+      const peer = createTelegramConfigStore({ agentDir: dir, configPath });
+      await peer.load();
+      peer.activateProfile(profileName);
+      assert.equal(await peer.persistAllowedUserId(42), true);
+      const granted = await readFile(configPath, "utf8");
+      store.update((value) => { value.assistant = { ...value.assistant, activity: "quiet" }; });
+      pendingSettings = store.persist();
+      const originalRename = fs.renameSync;
+      const rename = t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
+        if (to === configPath) assert.fail("paired-only admission wrote config");
+        return originalRename(from, to);
+      });
+      syncBuiltinESMExports();
+      try {
+        assert.deepEqual(store.withPairedUserAdmission(profileName, hash, 42, () => {
+          assert.equal(fs.existsSync(`${configPath}.transaction`), true);
+          assert.equal(store.getAllowedUserId(), 42, "Refresh must precede the publication callback");
+          assert.equal(store.get().assistant?.activity, "quiet");
+          return "published";
+        }), { admitted: true, value: "published" });
+        assert.deepEqual(store.withPairedUserAdmission(profileName, hash, 43, () => assert.fail("wrong-owner publication")), { admitted: false });
+        assert.throws(() => store.withPairedUserAdmission(profileName, hash, 42, () => { throw new Error("append failed"); }), /append failed/);
+        assert.equal(store.getAllowedUserId(), 42, "A failed append does not revoke an existing durable grant");
+        assert.equal(fs.existsSync(`${configPath}.transaction`), false);
+        assert.equal(fs.readFileSync(configPath, "utf8"), granted);
+      } finally {
+        rename.mock.restore();
+        syncBuiltinESMExports();
+      }
+      store.update((value) => { value.assistant = { ...value.assistant, timeInjection: "always" }; });
+      await pendingSettings;
+      assert.equal(store.getAllowedUserId(), 42);
+      assert.equal(store.get().assistant?.timeInjection, "always");
+      await store.persist();
+      const persisted = JSON.parse(await readFile(configPath, "utf8"));
+      assert.equal(persisted.profiles[profileName].allowedUserId, 42);
+      assert.equal(persisted.assistant.activity, "quiet");
+      assert.equal(persisted.assistant.timeInjection, "always");
+    } finally {
+      await pendingSettings?.catch(() => undefined);
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+for (const profileName of ["default", "work"]) {
+  for (const change of ["local-unpair", "disk-revocation"] as const) {
+    test(`Queued config adoption preserves ${change} after paired observation (${profileName})`, async () => {
+      const dir = await mkdtemp(join(tmpdir(), "telegram-observation-rebase-"));
+      const configPath = join(dir, "telegram.json");
+      const hash = createHash("sha256").update("fixture-token").digest("hex");
+      let pendingSettings: Promise<void> | undefined;
+      try {
+        await writeFile(configPath, JSON.stringify({ profiles: { [profileName]: { botToken: "fixture-token" } } }));
+        const store = createTelegramConfigStore({ agentDir: dir, configPath });
+        await store.load();
+        store.activateProfile(profileName);
+        const peer = createTelegramConfigStore({ agentDir: dir, configPath });
+        await peer.load();
+        peer.activateProfile(profileName);
+        await peer.persistAllowedUserId(42);
+        store.update((value) => { value.assistant = { ...value.assistant, activity: "quiet" }; });
+        pendingSettings = store.persist();
+        assert.deepEqual(store.withPairedUserAdmission(profileName, hash, 42, () => "observed"),
+          { admitted: true, value: "observed" });
+        if (change === "local-unpair") {
+          store.update((value) => { delete value.allowedUserId; });
+        } else {
+          store.update((value) => { value.assistant = { ...value.assistant, timeInjection: "always" }; });
+          const revoked = JSON.parse(fs.readFileSync(configPath, "utf8"));
+          delete revoked.profiles[profileName].allowedUserId;
+          fs.writeFileSync(configPath, JSON.stringify(revoked));
+        }
+        await pendingSettings;
+        const diskOwner = JSON.parse(await readFile(configPath, "utf8")).profiles[profileName].allowedUserId;
+        assert.equal(diskOwner, change === "local-unpair" ? 42 : undefined);
+        assert.equal(store.getAllowedUserId(), undefined, "Queued completion must not restore observed authority into the cache");
+        assert.equal(store.get().assistant?.activity, "quiet");
+        const admit = () => store.withPairedUserAdmission(profileName, hash, 42, () => assert.fail("unpaired publication"));
+        if (change === "local-unpair") assert.throws(admit, /local profile authority/);
+        else {
+          assert.deepEqual(admit(), { admitted: false });
+          assert.equal(store.get().assistant?.timeInjection, "always");
+        }
+        await store.persist();
+        assert.equal(JSON.parse(await readFile(configPath, "utf8")).profiles[profileName].allowedUserId, undefined,
+          "A later settings save must not recreate a grant");
+        assert.equal(store.getAllowedUserId(), undefined);
+      } finally {
+        await pendingSettings?.catch(() => undefined);
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+test("Paired-only admission rejects stale or conflicting authority without cache adoption or publication", async () => {
+  for (const scenario of ["entry-fence", "commit-fence", "local-profile", "local-token", "local-owner", "local-unpair", "disk-token", "disk-owner", "malformed-owner", "invalid-user"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "telegram-paired-only-denial-"));
+    const configPath = join(dir, "telegram.json");
+    const hash = createHash("sha256").update("fixture-token").digest("hex");
+    try {
+      await writeFile(configPath, JSON.stringify({ profiles: { default: { botToken: "fixture-token" } } }));
+      const store = createTelegramConfigStore({ agentDir: dir, configPath });
+      await store.load();
+      await writeFile(configPath, JSON.stringify({ profiles: { default: {
+        botToken: scenario === "disk-token" ? "rebound" : "fixture-token",
+        allowedUserId: scenario === "disk-owner" ? 43 : scenario === "malformed-owner" ? "42" : 42,
+      } } }));
+      if (scenario === "local-profile") { store.setProfile("other", { botToken: "other" }); store.activateProfile("other"); }
+      if (scenario === "local-token") store.update((value) => { value.botToken = "unsaved-token"; });
+      if (scenario === "local-owner") store.setAllowedUserId(9);
+      if (scenario === "local-unpair") { await store.load(); store.update((value) => { delete value.allowedUserId; }); }
+      const before = structuredClone(store.getStoredConfig());
+      const bytes = await readFile(configPath, "utf8");
+      let checks = 0;
+      const attempt = () => store.withPairedUserAdmission("default", hash, scenario === "invalid-user" ? 0 : 42,
+        () => assert.fail(`rejected source reached publication: ${scenario}`), () => {
+          checks++;
+          if (scenario === "entry-fence" || (scenario === "commit-fence" && checks === 2)) throw new Error("fixture stale authority");
+        });
+      if (scenario === "disk-owner" || scenario === "invalid-user") assert.deepEqual(attempt(), { admitted: false }, scenario);
+      else assert.throws(attempt, /authority|local profile/, scenario);
+      assert.deepEqual(store.getStoredConfig(), before, scenario);
+      assert.equal(await readFile(configPath, "utf8"), bytes, scenario);
+      assert.equal(fs.existsSync(`${configPath}.transaction`), false, scenario);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Source serialization is lock-only across config absence, corruption and authority changes", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "telegram-source-serialization-"));
+  const configPath = join(dir, "telegram.json");
+  const originalRead = fs.readFileSync;
+  const read = t.mock.method(fs, "readFileSync", (...args: Parameters<typeof fs.readFileSync>) => {
+    assert.notEqual(args[0], configPath, "Serialization must not read config contents");
+    return originalRead(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    for (const activeProfile of [undefined, "work"]) {
+      const store = createTelegramConfigStore({ agentDir: dir, configPath, initialConfig: {
+        profiles: {
+          default: { botToken: "cached-default", allowedUserId: 42 },
+          work: { botToken: "cached-work", allowedUserId: 43 },
+        },
+      } });
+      assert.equal(store.activateProfile(activeProfile), true);
+      store.update((config) => { config.assistant = { activity: "quiet" }; });
+      const cached = store.getStoredConfig();
+      for (const bytes of [undefined, "{broken", JSON.stringify({ profiles: {
+        default: { botToken: "rotated-default" },
+        work: { botToken: "rotated-work", allowedUserId: 99 },
+      } })]) {
+        if (bytes === undefined) await rm(configPath, { force: true });
+        else await writeFile(configPath, bytes);
+        const result = {};
+        let calls = 0;
+        assert.equal(store.withSourceSerialization((...args) => {
+          calls += 1;
+          assert.deepEqual(args, [], "No config data or lock capability is exposed");
+          assert.equal(fs.existsSync(`${configPath}.transaction`), true);
+          return result;
+        }), result);
+        assert.equal(calls, 1);
+        const failure = new Error("source operation failed");
+        assert.throws(() => store.withSourceSerialization(() => { throw failure; }), (error) => error === failure);
+        assert.equal(fs.existsSync(`${configPath}.transaction`), false);
+        assert.equal(store.withSourceSerialization(() => "retry"), "retry");
+        assert.equal(store.getStoredConfig(), cached);
+        assert.equal(store.getActiveProfileName(), activeProfile);
+        assert.equal(store.getAllowedUserId(), activeProfile ? 43 : 42);
+        assert.equal(store.get().assistant?.activity, "quiet");
+        if (bytes === undefined) assert.equal(fs.existsSync(configPath), false);
+        else assert.equal(await readFile(configPath, "utf8"), bytes);
+        assert.deepEqual(await readdir(dir), bytes === undefined ? [] : ["telegram.json"]);
+      }
+      // Misuse witness: an async continuation is outside this synchronous contract.
+      let lockAfterAwait: boolean | undefined;
+      const unsupported = store.withSourceSerialization(async () => {
+        assert.equal(fs.existsSync(`${configPath}.transaction`), true);
+        await Promise.resolve();
+        lockAfterAwait = fs.existsSync(`${configPath}.transaction`);
+      });
+      assert.equal(fs.existsSync(`${configPath}.transaction`), false);
+      await unsupported;
+      assert.equal(lockAfterAwait, false);
+    }
+  } finally {
+    read.mock.restore();
+    syncBuiltinESMExports();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Source serialization contends with real observation, sender admission and owner-fenced grant", async (t) => {
+  for (const mode of ["observation", "paired", "grant"] as const) {
+    await t.test(mode, async () => {
+      const dir = await mkdtemp(join(tmpdir(), "telegram-source-contention-"));
+      const configPath = join(dir, "telegram.json");
+      const startPath = join(dir, "start");
+      const blockedPath = join(dir, "blocked");
+      const enteredPath = join(dir, "entered");
+      const configModule = new URL("../lib/config.ts", import.meta.url).href;
+      const locksModule = new URL("../lib/locks.ts", import.meta.url).href;
+      const original = JSON.stringify({ profiles: { default: {
+        botToken: "fixture-token", ...(mode === "paired" ? { allowedUserId: 42 } : {}),
+      } } });
+      await writeFile(configPath, original);
+      const script = `
+        import fs from "node:fs";
+        import { syncBuiltinESMExports } from "node:module";
+        import { createHash } from "node:crypto";
+        import { createTelegramConfigStore } from ${JSON.stringify(configModule)};
+        import { createTelegramLockRuntime } from ${JSON.stringify(locksModule)};
+        const dir = ${JSON.stringify(dir)};
+        const configPath = ${JSON.stringify(configPath)};
+        const mode = ${JSON.stringify(mode)};
+        const store = createTelegramConfigStore({ agentDir: dir, configPath });
+        await store.load();
+        const deadline = Date.now() + 8000;
+        while (!fs.existsSync(${JSON.stringify(startPath)})) {
+          if (Date.now() >= deadline) throw new Error("start barrier timed out");
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+        }
+        const exists = fs.existsSync;
+        fs.existsSync = (path) => {
+          const present = exists(path);
+          // The real guard refuses publication when this acquisition check returns true.
+          if (path === configPath + ".transaction" && present) {
+            fs.writeFileSync(${JSON.stringify(blockedPath)}, "contended acquisition");
+          }
+          return present;
+        };
+        syncBuiltinESMExports();
+        const hash = createHash("sha256").update("fixture-token").digest("hex");
+        const entered = () => { fs.writeFileSync(${JSON.stringify(enteredPath)}, "entered"); return "entered"; };
+        let result;
+        if (mode === "observation") result = store.withPairingAdmission("default", hash, entered);
+        else if (mode === "paired") result = store.withPairedUserAdmission("default", hash, 42, entered);
+        else {
+          const owner = createTelegramLockRuntime({ locksPath: dir + "/owners.json", instanceId: "source-grant-child" });
+          if (!owner.acquire({ cwd: "/fixture" }).ok) throw new Error("fixture owner unavailable");
+          try { result = await store.persistAllowedUserId(42, undefined, owner.commitIfOwned); entered(); }
+          finally { owner.release(); }
+        }
+        process.stdout.write(JSON.stringify(result));
+      `;
+      const child = execFileAsync(process.execPath,
+        ["--experimental-strip-types", "--input-type=module", "--eval", script], { timeout: 15_000 });
+      try {
+        const store = createTelegramConfigStore({ agentDir: dir, configPath });
+        store.withSourceSerialization(() => {
+          fs.writeFileSync(startPath, "start");
+          const deadline = Date.now() + 8000;
+          while (!fs.existsSync(blockedPath)) {
+            if (Date.now() >= deadline) throw new Error("contention barrier timed out");
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+          }
+          assert.equal(fs.existsSync(enteredPath), false);
+          assert.equal(fs.readFileSync(configPath, "utf8"), original);
+        });
+        const result = JSON.parse((await child).stdout);
+        assert.deepEqual(result, mode === "paired" ? { admitted: true, value: "entered" } : mode === "grant" ? true : "entered");
+        assert.equal(fs.existsSync(enteredPath), true);
+        assert.equal(fs.existsSync(`${configPath}.transaction`), false);
+        assert.equal(fs.existsSync(join(dir, "owners.json.transaction")), false);
+        if (mode === "grant") assert.equal(JSON.parse(await readFile(configPath, "utf8")).profiles.default.allowedUserId, 42);
+        else assert.equal(await readFile(configPath, "utf8"), original);
+      } finally {
+        await child.catch(() => undefined);
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Pairing admission observes exact persisted identity under the config transaction", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "telegram-pair-observation-"));
+  const configPath = join(dir, "telegram.json");
+  const tokenSha256 = createHash("sha256").update("fixture-token").digest("hex");
+  try {
+    await writeFile(configPath, JSON.stringify({ profiles: { default: { botToken: "fixture-token" } } }));
+    const store = createTelegramConfigStore({ agentDir: dir, configPath });
+    await store.load();
+    const classifications: boolean[] = [];
+    const observe = () => store.withPairingAdmission("default", tokenSha256, (excluded) => {
+      assert.equal(fs.existsSync(`${configPath}.transaction`), true);
+      classifications.push(excluded);
+      return "synchronous-result";
+    });
+    const grant = store.persistAllowedUserId(42);
+    assert.equal(observe(), "synchronous-result");
+    assert.equal(store.getAllowedUserId(), undefined);
+    await grant;
+    observe();
+    assert.deepEqual(classifications, [true, false]);
+    assert.equal(fs.existsSync(`${configPath}.transaction`), false);
+    const original = await readFile(configPath, "utf8");
+    for (const [profile, hash] of [["missing", tokenSha256], ["default", "b".repeat(64)], ["../work", tokenSha256]]) {
+      assert.throws(() => store.withPairingAdmission(profile!, hash!, () => assert.fail("invalid identity reached publication")), /pairing admission/);
+    }
+    assert.throws(() => store.withPairingAdmission("default", tokenSha256, () => { throw new Error("append failed"); }), /append failed/);
+    assert.equal(fs.existsSync(`${configPath}.transaction`), false);
+    assert.equal(await readFile(configPath, "utf8"), original);
+    await writeFile(configPath, JSON.stringify({ profiles: { default: { botToken: "fixture-token" } } }));
+    observe();
+    assert.deepEqual(classifications, [true, false, true], "Admission must not trust the cached paired owner");
+    await writeFile(configPath, JSON.stringify({ profiles: { default: { botToken: "fixture-token", allowedUserId: "unknown" } } }));
+    assert.throws(observe, /authority is unavailable or changed/);
+    assert.equal(classifications.length, 3);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Pairing owner guard encloses the queued synchronous config commit and rejects a replaced owner", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "telegram-pair-owner-commit-"));
+  const configPath = join(dir, "telegram.json");
+  const locksPath = join(dir, "owners.json");
+  const originalRename = fs.renameSync;
+  let configRenames = 0;
+  const rename = t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
+    if (to === configPath) {
+      configRenames++;
+      assert.equal(fs.existsSync(`${locksPath}.transaction`), true, "Owner transaction must enclose rename");
+      assert.equal(fs.existsSync(`${configPath}.transaction`), true, "Config transaction must enclose rename");
+    }
+    return originalRename(from, to);
+  });
+  syncBuiltinESMExports();
+  try {
+    await writeFile(configPath, JSON.stringify({ profiles: { default: { botToken: "fixture-token" } } }));
+    const store = createTelegramConfigStore({ agentDir: dir, configPath });
+    await store.load();
+    const first = createTelegramLockRuntime({ locksPath, instanceId: "first" });
+    const acquired = first.acquire({ cwd: "/fixture" });
+    assert.equal(acquired.ok, true);
+    let callReturned = false;
+    const pending = store.persistAllowedUserId(42, undefined, (commit) => {
+      assert.equal(callReturned, true, "Do not acquire owner authority while waiting for the persistence queue");
+      return first.commitIfOwned(commit);
+    });
+    callReturned = true;
+    const replacement = createTelegramLockRuntime({ locksPath, instanceId: "replacement" });
+    assert.equal(replacement.acquire({ cwd: "/fixture" }, {
+      force: true, expectedOwner: acquired.ok ? acquired.lock : undefined,
+    }).ok, true);
+    await assert.rejects(pending, /lost transport ownership/);
+    assert.equal(store.getAllowedUserId(), undefined);
+    assert.equal(configRenames, 0);
+    assert.equal(await store.persistAllowedUserId(42, undefined, replacement.commitIfOwned), true);
+    assert.equal(configRenames, 1);
+    assert.equal(store.getAllowedUserId(), 42);
+    assert.equal(fs.existsSync(`${locksPath}.transaction`), false);
+    assert.equal(fs.existsSync(`${configPath}.transaction`), false);
+  } finally {
+    rename.mock.restore();
+    syncBuiltinESMExports();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Pairing publication failure never grants in-memory authority and retry publishes first", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "telegram-pair-publication-"));
+  const configPath = join(dir, "telegram.json");
+  const renameSync = fs.renameSync;
+  let fail = true;
+  const rename = t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
+    if (to === configPath && fail) throw new Error("injected pairing publication failure");
+    return renameSync(from, to);
+  });
+  syncBuiltinESMExports();
+  try {
+    await writeFile(configPath, JSON.stringify({ profiles: { default: { botToken: "fixture-token" } } }));
+    const store = createTelegramConfigStore({ agentDir: dir, configPath });
+    await store.load();
+    const original = await readFile(configPath, "utf8");
+    let statuses = 0;
+    const runtime = createTelegramUserPairingRuntime({ getAllowedUserId: store.getAllowedUserId,
+      persistAllowedUserId: store.persistAllowedUserId, updateStatus() { statuses++; } });
+    const rejected = runtime.pairIfNeeded(42, {});
+    assert.equal(store.getAllowedUserId(), undefined);
+    await assert.rejects(rejected, /pairing publication failure/);
+    assert.equal(store.getAllowedUserId(), undefined);
+    assert.equal(await readFile(configPath, "utf8"), original);
+    assert.equal(statuses, 0);
+    fail = false;
+    assert.equal(await runtime.pairIfNeeded(42, {}), true);
+    assert.equal(store.getAllowedUserId(), 42);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).profiles.default.allowedUserId, 42);
+    assert.equal(statuses, 1);
+  } finally {
+    rename.mock.restore();
+    syncBuiltinESMExports();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Pairing compares the disk owner atomically and preserves unrelated local edits and profiles", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "telegram-pair-owner-"));
+  const configPath = join(dir, "telegram.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ profiles: {
+      default: { botToken: "fixture-default" }, work: { botToken: "fixture-work" },
+    } }));
+    const first = createTelegramConfigStore({ agentDir: dir, configPath });
+    const second = createTelegramConfigStore({ agentDir: dir, configPath });
+    await first.load();
+    await second.load();
+    second.update((config) => { config.assistant = { activity: "quiet" }; });
+    assert.deepEqual(await Promise.all([first.persistAllowedUserId(42), second.persistAllowedUserId(43)]), [true, false]);
+    assert.equal(second.getAllowedUserId(), 42);
+    assert.equal(second.get().assistant?.activity, "quiet");
+    await second.persist();
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).profiles.default.allowedUserId, 42);
+    second.activateProfile("work");
+    assert.equal(second.getAllowedUserId(), undefined);
+    assert.equal(await second.persistAllowedUserId(43), true);
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(saved.profiles.default.allowedUserId, 42);
+    assert.equal(saved.profiles.work.allowedUserId, 43);
+    assert.equal(saved.assistant.activity, "quiet");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Pairing rejects stale execution, switched profiles, and changed disk bot identity before publication", async () => {
+  for (const scenario of ["stale-entry", "stale-commit", "profile-switch", "token-rebind"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "telegram-pair-fence-"));
+    const configPath = join(dir, "telegram.json");
+    try {
+      const initial = { profiles: { default: { botToken: "fixture-default" }, work: { botToken: "fixture-work" } } };
+      await writeFile(configPath, JSON.stringify(initial));
+      const store = createTelegramConfigStore({ agentDir: dir, configPath });
+      await store.load();
+      let guards = 0;
+      const pending = store.persistAllowedUserId(42, () => {
+        guards++;
+        if ((scenario === "stale-entry" && guards === 1) || (scenario === "stale-commit" && guards === 2)) {
+          throw new Error("stale execution");
+        }
+      });
+      if (scenario === "profile-switch") store.activateProfile("work");
+      if (scenario === "token-rebind") {
+        initial.profiles.default.botToken = "fixture-replacement";
+        fs.writeFileSync(configPath, JSON.stringify(initial));
+      }
+      await assert.rejects(pending, /stale execution|profile authority|profile is unavailable or changed/);
+      assert.equal(store.getAllowedUserId(), undefined);
+      assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), initial);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("Telegram config helpers classify authorization state for pair, allow, and deny", () => {
   assert.deepEqual(getTelegramAuthorizationState(10), {
     kind: "pair",
@@ -911,12 +1526,10 @@ test("Telegram config helpers pair only when no user is configured", async () =>
     await pairTelegramUserIfNeeded(10, {
       allowedUserId,
       ctx: "ctx",
-      setAllowedUserId: (userId) => {
+      persistAllowedUserId: async (userId) => {
+        events.push(`persist:${userId}`);
         allowedUserId = userId;
-        events.push(`set:${userId}`);
-      },
-      persistConfig: async () => {
-        events.push("persist");
+        return true;
       },
       updateStatus: (ctx) => {
         events.push(`status:${ctx}`);
@@ -928,11 +1541,9 @@ test("Telegram config helpers pair only when no user is configured", async () =>
     await pairTelegramUserIfNeeded(11, {
       allowedUserId,
       ctx: "ctx",
-      setAllowedUserId: () => {
-        events.push("unexpected:set");
-      },
-      persistConfig: async () => {
+      persistAllowedUserId: async () => {
         events.push("unexpected:persist");
+        return false;
       },
       updateStatus: () => {
         events.push("unexpected:status");
@@ -941,20 +1552,18 @@ test("Telegram config helpers pair only when no user is configured", async () =>
     false,
   );
   assert.equal(allowedUserId, 10);
-  assert.deepEqual(events, ["set:10", "persist", "status:ctx"]);
+  assert.deepEqual(events, ["persist:10", "status:ctx"]);
 });
 
 test("Telegram config pairing rechecks execution authority around persistence", async () => {
-  let current = true;
+  let current = false;
   let persisted = 0;
   await assert.rejects(
     pairTelegramUserIfNeeded(10, {
       ctx: "ctx",
-      setAllowedUserId: () => {
-        current = false;
-      },
-      persistConfig: async () => {
+      persistAllowedUserId: async () => {
         persisted += 1;
+        return true;
       },
       updateStatus: () => {},
       assertExecutionCurrent() {
@@ -970,8 +1579,7 @@ test("Telegram config pairing swallows only stale context status errors", async 
   await assert.doesNotReject(() =>
     pairTelegramUserIfNeeded(10, {
       ctx: "ctx",
-      setAllowedUserId: () => {},
-      persistConfig: async () => {},
+      persistAllowedUserId: async () => true,
       updateStatus: () => {
         throw new Error("ctx is stale after session replacement");
       },
@@ -981,8 +1589,7 @@ test("Telegram config pairing swallows only stale context status errors", async 
     () =>
       pairTelegramUserIfNeeded(10, {
         ctx: "ctx",
-        setAllowedUserId: () => {},
-        persistConfig: async () => {},
+        persistAllowedUserId: async () => true,
         updateStatus: () => {
           throw new Error("status broke");
         },
@@ -996,20 +1603,19 @@ test("Telegram config pairing runtime binds config and status ports", async () =
   let allowedUserId: number | undefined;
   const runtime = createTelegramUserPairingRuntime({
     getAllowedUserId: () => allowedUserId,
-    setAllowedUserId: (userId) => {
+    persistAllowedUserId: async (userId) => {
+      events.push(`persist:${userId}`);
       allowedUserId = userId;
-      events.push(`set:${userId}`);
-    },
-    persistConfig: async () => {
-      events.push("persist");
+      return true;
     },
     updateStatus: (ctx: string) => {
       events.push(`status:${ctx}`);
     },
   });
   assert.equal(await runtime.pairIfNeeded(7, "ctx"), true);
+  assert.equal(await runtime.pairIfNeeded(7, "ctx"), true);
   assert.equal(await runtime.pairIfNeeded(8, "ctx"), false);
-  assert.deepEqual(events, ["set:7", "persist", "status:ctx"]);
+  assert.deepEqual(events, ["persist:7", "status:ctx"]);
 });
 
 test("Bot token input prefers stored config over env vars", () => {

@@ -8,6 +8,7 @@ import type {
   TelegramActivityVerbosity,
   TelegramAssistantRenderingMode,
   TelegramTimeMode,
+  TelegramThreadDisplayMode,
 } from "./config.ts";
 import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
 import type { TelegramModelMenuState } from "./menu-model.ts";
@@ -21,6 +22,7 @@ import type { TelegramVoiceReplyMode } from "./voice.ts";
 export type TelegramSettingsMenuReplyMarkup = TelegramInlineKeyboardMarkup;
 
 export interface TelegramSettingsStateDeps {
+  getThreadDisplayMode?: () => TelegramThreadDisplayMode | undefined;
   areDraftPreviewsEnabled: () => boolean;
   getAssistantRenderingMode: () => TelegramAssistantRenderingMode;
   getActivityVerbosity: () => TelegramActivityVerbosity;
@@ -31,6 +33,7 @@ export interface TelegramSettingsStateDeps {
 }
 
 export interface TelegramSettingsMutationDeps extends TelegramSettingsStateDeps {
+  setThreadDisplayMode?: (mode: TelegramThreadDisplayMode) => Promise<void>;
   setDraftPreviewsEnabled: (enabled: boolean) => Promise<void>;
   setAssistantRenderingMode: (
     mode: TelegramAssistantRenderingMode,
@@ -43,6 +46,11 @@ export interface TelegramSettingsMutationDeps extends TelegramSettingsStateDeps 
   ) => Promise<void>;
   setTimeInjectionMode: (mode: TelegramTimeMode) => Promise<void>;
   setAutomaticThreadCleanupEnabled: (enabled: boolean) => Promise<void>;
+  reviewInactiveThreads?: () => Promise<{ count: number; operationId?: string }>;
+  cleanInactiveThreads?: (operationId: string) => Promise<{
+    deleted: number; outcomeUnknown: number; blocked?: number;
+    recovery?: "commit-ready" | "deletion-outcome-unknown" | "authority-blocked";
+  }>;
 }
 
 export interface TelegramSettingsMenuOpenDeps<
@@ -137,6 +145,7 @@ export interface TelegramSettingsMenuRuntimeDeps<
 export const SETTINGS_MENU_TITLE = "<b>⚙️ Settings:</b>";
 export const AUTOMATIC_THREAD_CLEANUP_SETTINGS_TITLE =
   "<b>🧹 Thread cleanup:</b>";
+export const INACTIVE_THREAD_REVIEW_TITLE = "<b>🔎 Inactive tabs review:</b>";
 export const DRAFT_PREVIEWS_SETTINGS_TITLE = "<b>📝 Draft previews:</b>";
 export const ASSISTANT_RENDERING_SETTINGS_TITLE =
   "<b>🧾 Assistant rendering:</b>";
@@ -145,6 +154,7 @@ export const ACTIVITY_VERBOSITY_SETTINGS_TITLE =
 export const TIME_INJECTION_MODE_SETTINGS_TITLE =
   "<b>🕒 Time injection mode:</b>";
 export const VOICE_REPLY_MODE_SETTINGS_TITLE = "<b>👄 Voice reply mode:</b>";
+export const THREAD_DISPLAY_SETTINGS_TITLE = "<b>🧵 Thread display:</b>";
 
 function getVoiceReplyModeLabel(mode: TelegramVoiceReplyMode): string {
   return mode;
@@ -165,6 +175,18 @@ export function buildTelegramSettingsMenuText(): string {
   return SETTINGS_MENU_TITLE;
 }
 
+export function buildThreadDisplaySettingsText(mode: TelegramThreadDisplayMode): string {
+  return [
+    `${THREAD_DISPLAY_SETTINGS_TITLE} <code>${mode}</code>`,
+    "",
+    "Choose how this bot profile labels Telegram tabs and Pi terminal status. Each slot is unique across this bot profile.",
+    "",
+    "<code>-</code> <code>letters</code> (default): show the unique slot, such as <b><i>A</i></b> or <b><i>B</i></b>.",
+    "<code>-</code> <code>directories</code>: show the directory, such as <b><i>extensions</i></b>; shared Workspaces keep slot suffixes, such as <b><i>extensions_a</i></b> and <b><i>extensions_c</i></b>.",
+    "A manual <code>/name Name</code> overrides this Thread display name until reset.",
+  ].join("\n");
+}
+
 export function buildAutomaticThreadCleanupSettingsText(
   enabled: boolean,
 ): string {
@@ -175,7 +197,33 @@ export function buildAutomaticThreadCleanupSettingsText(
     "",
     "<code>-</code> <code>on</code> (default): delete the bound thread and release Telegram authority on graceful quit.",
     "<code>-</code> <code>off</code>: preserve the tab as a restart hint; manual <code>/telegram-disconnect</code> still confirms and deletes it.",
+    "",
+    "Review inactive tabs checks current owner and work evidence. Review never deletes tabs.",
   ].join("\n");
+}
+
+export function buildInactiveThreadReviewText(count: number): string {
+  return [INACTIVE_THREAD_REVIEW_TITLE, "",
+    `${count} proven inactive tab${count === 1 ? "" : "s"}.`,
+    "No tabs were deleted.",
+    "Deletion requires a separate confirmed Clean action.",
+  ].join("\n");
+}
+
+export function buildInactiveThreadReviewReplyMarkup(
+  operationId?: string,
+  canCleanInactiveThreads = false,
+): TelegramSettingsMenuReplyMarkup {
+  const validOperationId = typeof operationId === "string" &&
+    /^thread-cleanup:[a-f0-9]{32}$/u.test(operationId);
+  return { inline_keyboard: [
+    [{ text: "⬆️ Back to Thread cleanup",
+      callback_data: "settings:open:automatic-thread-cleanup" }],
+    ...(canCleanInactiveThreads && validOperationId ? [[{
+      text: "🧹 Clean inactive tabs",
+      callback_data: `settings:clean:${operationId}`,
+    }]] : []),
+  ] };
 }
 
 export function buildDraftPreviewsSettingsText(enabled: boolean): string {
@@ -259,6 +307,7 @@ export function buildTelegramSettingsMenuReplyMarkup(
   voiceReplyModeConfigured = true,
   automaticThreadCleanupEnabled = true,
   activityVerbosity: TelegramActivityVerbosity = "quiet",
+  threadDisplayMode?: TelegramThreadDisplayMode,
 ): TelegramSettingsMenuReplyMarkup {
   const hasRenderingMode =
     assistantRenderingModeOrVoiceReplyMode === "rich" ||
@@ -317,6 +366,10 @@ export function buildTelegramSettingsMenuReplyMarkup(
       callback_data: "settings:open:automatic-thread-cleanup",
     },
   ];
+  if (threadDisplayMode) settingsButtons.push({
+    text: `🧵 Thread display: ${threadDisplayMode}`,
+    callback_data: "settings:open:thread-display",
+  });
   if (sectionRegistry) {
     const extensionRows = getTelegramExtensionSettingsRows(sectionRegistry);
     settingsButtons.push(
@@ -349,6 +402,7 @@ export async function openTelegramSettingsMenu<
       deps.isVoiceReplyModeConfigured(),
       deps.isAutomaticThreadCleanupEnabled(),
       deps.getActivityVerbosity(),
+      deps.getThreadDisplayMode?.(),
     ),
   );
   if (messageId === undefined) return;
@@ -357,8 +411,19 @@ export async function openTelegramSettingsMenu<
   deps.storeModelMenuState(state);
 }
 
+export function buildThreadDisplaySettingsReplyMarkup(mode: TelegramThreadDisplayMode): TelegramSettingsMenuReplyMarkup {
+  return { inline_keyboard: [
+    [{ text: "⬆️ Back", callback_data: "settings:list" }],
+    ...(["letters", "directories"] as const).map((value) => [{
+      text: `${mode === value ? "🟢 " : ""}${value}`,
+      callback_data: `settings:set:thread-display:${value}`,
+    }]),
+  ] };
+}
+
 export function buildAutomaticThreadCleanupSettingsReplyMarkup(
   enabled: boolean,
+  canReviewInactiveThreads = false,
 ): TelegramSettingsMenuReplyMarkup {
   return {
     inline_keyboard: [
@@ -373,6 +438,10 @@ export function buildAutomaticThreadCleanupSettingsReplyMarkup(
           callback_data: "settings:set:automatic-thread-cleanup:off",
         },
       ],
+      ...(canReviewInactiveThreads ? [[{
+        text: "🔎 Review inactive tabs",
+        callback_data: "settings:review:inactive-threads",
+      }]] : []),
     ],
   };
 }
@@ -417,21 +486,16 @@ export function buildAssistantRenderingSettingsReplyMarkup(
 export function buildActivityVerbositySettingsReplyMarkup(
   verbosity: TelegramActivityVerbosity,
 ): TelegramSettingsMenuReplyMarkup {
-  const values: TelegramActivityVerbosity[] = [
-    "quiet",
-    "thinking",
-    "tools",
-    "verbose",
-  ];
+  const button = (value: TelegramActivityVerbosity) => ({
+    text: `${value === verbosity ? "🟢 " : ""}${value}`,
+    callback_data: `settings:set:activity-verbosity:${value}`,
+  });
   return {
     inline_keyboard: [
       [{ text: "⬆️ Back", callback_data: "settings:list" }],
-      ...values.map((value) => [
-        {
-          text: `${value === verbosity ? "🟢 " : ""}${value}`,
-          callback_data: `settings:set:activity-verbosity:${value}`,
-        },
-      ]),
+      [button("quiet")],
+      [button("thinking"), button("tools")],
+      [button("verbose")],
     ],
   };
 }
@@ -487,6 +551,7 @@ export async function updateTelegramSettingsMenuMessage(
       deps.isVoiceReplyModeConfigured(),
       deps.isAutomaticThreadCleanupEnabled(),
       deps.getActivityVerbosity(),
+      deps.getThreadDisplayMode?.(),
     ),
   );
 }
@@ -497,7 +562,7 @@ export async function updateAutomaticThreadCleanupSettingsMessage(
   const enabled = deps.isAutomaticThreadCleanupEnabled();
   await deps.updateSettingsMessage(
     buildAutomaticThreadCleanupSettingsText(enabled),
-    buildAutomaticThreadCleanupSettingsReplyMarkup(enabled),
+    buildAutomaticThreadCleanupSettingsReplyMarkup(enabled, !!deps.reviewInactiveThreads),
   );
 }
 
@@ -558,6 +623,36 @@ export async function handleTelegramSettingsMenuCallbackAction(
   deps: TelegramSettingsMenuCallbackDeps,
 ): Promise<boolean> {
   if (!data?.startsWith("settings:")) return false;
+  if (data === "settings:open:thread-display" || data.startsWith("settings:set:thread-display:")) {
+    if (!deps.getThreadDisplayMode?.() || !deps.setThreadDisplayMode) {
+      await deps.answerCallbackQuery(callbackQueryId, "Thread display requires Threaded Mode and a connected instance.");
+      return true;
+    }
+    if (data.startsWith("settings:set:thread-display:")) {
+      const mode = data.slice("settings:set:thread-display:".length);
+      if (mode !== "letters" && mode !== "names" && mode !== "directories") {
+        await deps.answerCallbackQuery(callbackQueryId, "Unknown Thread display mode.");
+        return true;
+      }
+      try {
+        await deps.setThreadDisplayMode(mode);
+      } catch {
+        await deps.answerCallbackQuery(callbackQueryId, "Thread display was not fully applied. The preference may be saved; retry after checking the leader.");
+        return true;
+      }
+    }
+    const mode = deps.getThreadDisplayMode();
+    if (!mode) {
+      await deps.answerCallbackQuery(callbackQueryId, "Threaded Mode is no longer available.");
+      return true;
+    }
+    await deps.updateSettingsMessage(
+      buildThreadDisplaySettingsText(mode),
+      buildThreadDisplaySettingsReplyMarkup(mode),
+    );
+    await deps.answerCallbackQuery(callbackQueryId);
+    return true;
+  }
   if (data === "settings:list") {
     await updateTelegramSettingsMenuMessage(deps, deps.sectionRegistry);
     await deps.answerCallbackQuery(callbackQueryId);
@@ -692,6 +787,44 @@ export async function handleTelegramSettingsMenuCallbackAction(
       return true;
     }
   }
+  if (data === "settings:review:inactive-threads") {
+    if (!deps.reviewInactiveThreads) {
+      await deps.answerCallbackQuery(callbackQueryId, "Inactive tab review is unavailable.");
+      return true;
+    }
+    try {
+      const review = await deps.reviewInactiveThreads();
+      if (review.count === 0) {
+        await deps.answerCallbackQuery(callbackQueryId, "No proven inactive tabs.");
+      } else {
+        await deps.updateSettingsMessage(buildInactiveThreadReviewText(review.count),
+          buildInactiveThreadReviewReplyMarkup(review.operationId, !!deps.cleanInactiveThreads));
+        await deps.answerCallbackQuery(callbackQueryId, "Review prepared. No tabs were deleted.");
+      }
+    } catch {
+      await deps.answerCallbackQuery(callbackQueryId, "Could not safely review inactive tabs.");
+    }
+    return true;
+  }
+  if (data.startsWith("settings:clean:")) {
+    const operationId = data.slice("settings:clean:".length);
+    if (!/^thread-cleanup:[a-f0-9]{32}$/u.test(operationId) || !deps.cleanInactiveThreads) {
+      await deps.answerCallbackQuery(callbackQueryId, "Cleanup confirmation is unavailable or stale.");
+      return true;
+    }
+    try {
+      const result = await deps.cleanInactiveThreads(operationId);
+      await deps.answerCallbackQuery(callbackQueryId,
+        `Deleted: ${result.deleted}. Outcome unknown: ${result.outcomeUnknown}.` +
+      (result.blocked ? ` Blocked: ${result.blocked}.` : "") +
+      (result.recovery === "commit-ready" ? " Recovery: safe local commit pending." :
+        result.recovery === "deletion-outcome-unknown" ? " Recovery: deletion outcome unknown; no retry." :
+        result.recovery === "authority-blocked" ? " Recovery: cleanup authority unavailable." : ""));
+    } catch {
+      await deps.answerCallbackQuery(callbackQueryId, "Cleanup could not be safely completed.");
+    }
+    return true;
+  }
   if (
     data === "settings:set:automatic-thread-cleanup:on" ||
     data === "settings:set:automatic-thread-cleanup:off"
@@ -729,6 +862,7 @@ export function createTelegramSettingsMenuRuntime<
           isVoiceReplyModeConfigured: deps.isVoiceReplyModeConfigured,
           getTimeInjectionMode: deps.getTimeInjectionMode,
           isAutomaticThreadCleanupEnabled: deps.isAutomaticThreadCleanupEnabled,
+          getThreadDisplayMode: deps.getThreadDisplayMode,
           sendSettingsMenu: (state, text, replyMarkup) =>
             deps.sendInteractiveMessage(
               state.chatId,
@@ -752,6 +886,7 @@ export function createTelegramSettingsMenuRuntime<
           isVoiceReplyModeConfigured: deps.isVoiceReplyModeConfigured,
           getTimeInjectionMode: deps.getTimeInjectionMode,
           isAutomaticThreadCleanupEnabled: deps.isAutomaticThreadCleanupEnabled,
+          getThreadDisplayMode: deps.getThreadDisplayMode,
           updateSettingsMessage: (text, replyMarkup) =>
             deps.editInteractiveMessage(
               state.chatId,
@@ -795,12 +930,16 @@ export function createTelegramSettingsMenuRuntime<
         isVoiceReplyModeConfigured: deps.isVoiceReplyModeConfigured,
         getTimeInjectionMode: deps.getTimeInjectionMode,
         isAutomaticThreadCleanupEnabled: deps.isAutomaticThreadCleanupEnabled,
+        getThreadDisplayMode: deps.getThreadDisplayMode,
+        setThreadDisplayMode: deps.setThreadDisplayMode,
         setDraftPreviewsEnabled: deps.setDraftPreviewsEnabled,
         setAssistantRenderingMode: deps.setAssistantRenderingMode,
         setActivityVerbosity: deps.setActivityVerbosity,
         setVoiceReplyMode: deps.setVoiceReplyMode,
         setTimeInjectionMode: deps.setTimeInjectionMode,
         setAutomaticThreadCleanupEnabled: deps.setAutomaticThreadCleanupEnabled,
+        ...(deps.reviewInactiveThreads ? { reviewInactiveThreads: deps.reviewInactiveThreads } : {}),
+        ...(deps.cleanInactiveThreads ? { cleanInactiveThreads: deps.cleanInactiveThreads } : {}),
         updateSettingsMessage: (text, replyMarkup) =>
           deps.editInteractiveMessage(
             state.chatId,

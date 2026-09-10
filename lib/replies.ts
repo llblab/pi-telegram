@@ -672,7 +672,7 @@ export async function sendTelegramNativeMarkdownReply<TReplyMarkup = unknown>(
       chatId, index === 0 ? replyToMessageId : undefined, options?.target,
       (replyParameters) => deps.sendRichMessage({
         chat_id: chatId,
-        rich_message: { markdown: chunk, skip_entity_detection: true },
+        rich_message: { markdown: chunk },
         reply_markup:
           index === chunks.length - 1 ? options?.replyMarkup : undefined,
         ...(replyParameters ? { reply_parameters: replyParameters } : {}),
@@ -894,7 +894,7 @@ export function createGuestMarkdownReplySender(deps: {
   return async (guestQueryId: string, markdown: string) => {
     const [richMarkdown = markdown] = splitTelegramNativeMarkdown(markdown);
     await deps.answerGuestQuery(guestQueryId, undefined, {
-      richMessage: { markdown: richMarkdown, skip_entity_detection: true },
+      richMessage: { markdown: richMarkdown },
     });
   };
 }

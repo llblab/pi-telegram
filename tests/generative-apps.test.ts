@@ -12,6 +12,7 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
+
 import {
   bindGenerativeApp,
   formatDisplayedGenerativeAppToolOutput,
@@ -631,6 +632,23 @@ test("telegram_bind Tool exposes mutually exclusive install and invocation shape
     assert.equal(tool?.name, "telegram_bind");
     assert.equal((tool?.parameters as { type?: unknown }).type, "object");
     assert.equal("anyOf" in (tool?.parameters as object), false);
+    const parameters = tool?.parameters as { properties?: Record<string, unknown>;
+      $defs?: Record<string, unknown> };
+    const argumentSchema = parameters.properties?.argument as { $ref?: unknown };
+    const argumentDefinition = parameters.$defs?.TelegramBindJsonValue as {
+      anyOf?: Array<{ type?: unknown; items?: unknown; additionalProperties?: unknown }> };
+    assert.notEqual(argumentSchema, true);
+    assert.equal(argumentSchema.$ref, "#/$defs/TelegramBindJsonValue");
+    assert.deepEqual(argumentDefinition.anyOf?.map(branch => branch.type),
+      ["null", "boolean", "number", "string", "array", "object"]);
+    assert.equal((argumentDefinition.anyOf?.[4]?.items as { $ref?: unknown })?.$ref,
+      "#/$defs/TelegramBindJsonValue");
+    assert.equal((argumentDefinition.anyOf?.[5]?.additionalProperties as { $ref?: unknown })?.$ref,
+      "#/$defs/TelegramBindJsonValue");
+    const serializedParameters = JSON.stringify(parameters);
+    assert.equal(serializedParameters.includes('"argument":true'), false);
+    assert.equal(serializedParameters.includes('"$ref":"TelegramBindJsonValue"'), false);
+
     const installed = await tool!.execute("call-1", {
       app: "counter",
       script,

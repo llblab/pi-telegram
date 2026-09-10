@@ -12,6 +12,7 @@ Living index of project documentation in `/docs`.
 - [activity.md](./activity.md) — Normalized Pi lifecycle API for extension-owned reasoning, intermediate prose, tool activity, source identity, delivery contexts, and consumer policy examples
 - [../.agents/skills/telegram-bot/SKILL.md](../.agents/skills/telegram-bot/SKILL.md) — Agent-facing Telegram Bot API lookup skill backed by a local full Bot API reference
 - [../.agents/skills/domain-dag/SKILL.md](../.agents/skills/domain-dag/SKILL.md) — Project-local Domain DAG architecture skill and validator guidance
+- [../skills/show-me/SKILL.md](../skills/show-me/SKILL.md) — Portable visual-explanation skill with Telegram phone-width Markdown and self-contained browser-artifact guidance
 - [command-templates.md](./command-templates.md) — Portable command-template standard core
 - [inbound.md](./inbound.md) — Local `pi-telegram` inbound text/media handler bus, programmatic inbound handlers, registered STT provider fallbacks, legacy `attachmentHandlers` compatibility, placeholders, and fallbacks
 - [outbound.md](./outbound.md) — Local `pi-telegram` outbound-handler config, text/voice/button behavior, single-artifact Rich results, voice synthesis provider fallback priority, artifact outputs, and callback routing

@@ -131,7 +131,7 @@ test("Native sends preserve in-body controls, target ownership and chunk boundar
     recordOwnership: (value) => { ownership.push(value); },
     sendRichMessage: async (body) => {
       assert.equal(body.message_thread_id, 9);
-      assert.deepEqual(body.rich_message, { markdown: chunks[sends], skip_entity_detection: true });
+      assert.deepEqual(body.rich_message, { markdown: chunks[sends] });
       assert.equal(body.reply_parameters?.message_id, sends === 0 ? 5 : undefined);
       sends += 1;
       return { message_id: sends };

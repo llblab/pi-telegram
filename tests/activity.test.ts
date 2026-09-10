@@ -921,7 +921,6 @@ test("Assistant output projection plans prompt buttons before proactive delivery
   assert.equal(sent.length, 1);
   assert.deepEqual(sent[0]?.rich_message, {
     markdown: "Ready.",
-    skip_entity_detection: true,
   });
   const replyMarkup = sent[0]?.reply_markup as {
     inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
@@ -1013,7 +1012,6 @@ test("Assistant output projection strips foreign comments and skips comment-only
   assert.equal(sent.length, 1);
   assert.deepEqual(sent[0]?.rich_message, {
     markdown: "Visible  text.",
-    skip_entity_detection: true,
   });
 });
 

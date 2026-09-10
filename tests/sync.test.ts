@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,6 +13,7 @@ import {
   TELEGRAM_SYNC_SLICES,
   createTelegramLeaderHealthRuntime,
   createTelegramManualThreadDisconnectHandler,
+  createTelegramObservedTopicLifecycleSyncHandler,
   createTelegramProvisioningActivityRuntime,
   createTelegramSyncStateRuntime,
   createTelegramThreadDisconnectAssembly,
@@ -26,7 +27,27 @@ import {
   shouldReconcileTelegramSync,
 } from "../lib/sync.ts";
 import { TelegramApiStaleTargetError } from "../lib/telegram-api.ts";
-import { createTelegramTopicTargetStore } from "../lib/threads.ts";
+import {
+  createTelegramWorkspaceAdmissionLedger,
+  runWithTelegramWorkspaceAdmissionsAsync,
+  TelegramWorkspaceAdmissionError,
+} from "../lib/workspace-admission.ts";
+import {
+  createTelegramTopicTargetStore,
+  createTelegramWorkspaceBindingIdentity,
+} from "../lib/threads.ts";
+import { createTelegramWorkspaceOperationRuntime } from "../lib/workspace-retirement.ts";
+
+async function runWorkspaceOperation<T>(
+  _input: {
+    operationId: string;
+    operationKind: string;
+    scopes: readonly [{ kind: "profile" }];
+  },
+  operation: () => Promise<T>,
+): Promise<T> {
+  return operation();
+}
 
 test("Telegram sync state runtime owns transitions and nested provisioning activity", () => {
   const syncState = createTelegramSyncStateRuntime();
@@ -172,6 +193,71 @@ test("Telegram sync recovers stale topic API errors outside the entrypoint", asy
   assert.deepEqual(events, [
     { category: "bus", phase: "topic-target-stale", threadId: 42 },
   ]);
+});
+
+test("Stale target recovery obeys exact retained-fence scope before mutation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-stale-recovery-fence-"));
+  const admission = createTelegramWorkspaceAdmissionLedger({
+    path: join(dir, "workspace-admission.json"),
+    profileKey: "profile:stale-recovery",
+    owner: {
+      processId: process.pid,
+      processBirthId: `${process.pid}:stale-recovery-test`,
+    },
+    getProcessLiveness: () => "alive",
+  });
+  const fence = admission.acquireRetirementFence({
+    operationId: "stale-recovery-fence",
+    retirementIntentId: "stale-recovery-intent",
+    bindingKey: "stale-recovery-binding",
+    slot: "A",
+    target: { chatId: 7, threadId: 42 },
+    leaderEpoch: 1,
+    retirementRequestedAtMs: 1,
+  });
+  assert.equal(fence.kind, "acquired");
+  const store = createTopicStore([
+    { target: { chatId: 7, threadId: 42 }, status: "active" },
+    { target: { chatId: 7, threadId: 43 }, status: "active" },
+  ]);
+  let state = createUnknownTelegramSyncState();
+  const deps = {
+    topicTargetStore: store,
+    getWorkspaceAdmission: () => admission,
+    getSyncState: () => state,
+    setSyncState(nextState: typeof state) {
+      state = nextState;
+    },
+    recordEvent() {},
+  };
+  try {
+    await assert.rejects(
+      recoverStaleTelegramTopicApiError(
+        { chat_id: 7, message_thread_id: 42 },
+        new Error("Telegram API sendMessage failed: TOPIC_ID_INVALID"),
+        deps,
+      ),
+      /blocked by retirement/u,
+    );
+    assert.equal(store.records[0]?.status, "active");
+    assert.equal(store.persisted, false);
+
+    assert.equal(
+      await recoverStaleTelegramTopicApiError(
+        { chat_id: 7, message_thread_id: 43 },
+        new Error("Telegram API sendMessage failed: TOPIC_ID_INVALID"),
+        deps,
+      ),
+      true,
+    );
+    assert.equal(store.records[1]?.status, "stale");
+    assert.deepEqual(admission.read().leases, []);
+  } finally {
+    if (fence.kind === "acquired") {
+      admission.releaseUnissuedRetirementFence(fence.fence);
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("Telegram sync terminally settles authenticated stale evidence after leader recovery", async () => {
@@ -557,12 +643,69 @@ test("Leader thread sync reuses same-process legacy leader topic across reload",
     assert.equal(store.listReservations().length, 0);
     assert.equal(
       events.some(
-        (event) => event.phase === "leader-topic-same-process-preserve",
+        (event) => event.phase === "leader-thread-reused",
       ),
       true,
     );
   } finally {
     await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("Leader Workspace recovery commits claim-assigned legacy slots before activation", async () => {
+  for (const duplicate of [false, true]) {
+    const dir = await mkdtemp(join(tmpdir(), "pi-telegram-leader-slot-migration-"));
+    const path = join(dir, "telegram-targets.json");
+    try {
+      const store = createTelegramTopicTargetStore({ path, getNowMs: () => 2000 });
+      store.upsertWorkspaceBinding({
+        ...createTelegramWorkspaceBindingIdentity("/repo")!,
+        target: { chatId: 7, threadId: 41 },
+        ...(duplicate ? { slot: "A" } : {}),
+        updatedAtMs: 1,
+      });
+      store.upsert({
+        profileKey: "cwd:/repo",
+        owner: { kind: "leader", cwd: "/repo", instanceId: "leader" },
+        target: { chatId: 7, threadId: 41 },
+        status: "probe-required",
+        createdAtMs: 1,
+        updatedAtMs: 1,
+        instanceId: "leader",
+      });
+      await store.persist();
+      if (duplicate) {
+        const snapshot = JSON.parse(await readFile(path, "utf8"));
+        snapshot.workspaceBindings.push({
+          ...createTelegramWorkspaceBindingIdentity("/other")!,
+          target: { chatId: 7, threadId: 42 },
+          slot: "A",
+          updatedAtMs: 1,
+        });
+        await writeFile(path, JSON.stringify(snapshot));
+      }
+      const restored = createTelegramTopicTargetStore({ path, getNowMs: () => 2000 });
+      let apiCalls = 0;
+      const result = await ensureTelegramLeaderThreadBinding({
+        getAllowedUserId: () => 7,
+        instanceId: "leader",
+        cwd: "/repo",
+        topicTargetStore: restored,
+        async callApi<TResponse>() {
+          apiCalls += 1;
+          return {} as TResponse;
+        },
+        recordEvent() {},
+      });
+      const expectedSlot = duplicate ? "B" : "A";
+      assert.equal(result?.slot, expectedSlot);
+      assert.equal(restored.getWorkspaceBinding("/repo")?.slot, expectedSlot);
+      assert.equal(restored.getByProfileKey("cwd:/repo")?.slot, expectedSlot);
+      assert.equal(restored.getByProfileKey("cwd:/repo")?.status, "active");
+      assert.equal(apiCalls, 0);
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
   }
 });
 
@@ -849,7 +992,7 @@ test("Leader thread sync aborts local previous-leader cleanup after ownership lo
   }
 });
 
-test("Leader thread sync gets next monotonic slot after D on reload", async () => {
+test("Leader Workspace sync claims the first free global slot while D remains reserved", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-leader-sync-d-to-e-"));
   const store = createTelegramTopicTargetStore({
     path: join(dir, "state.json"),
@@ -885,7 +1028,7 @@ test("Leader thread sync gets next monotonic slot after D on reload", async () =
       "previous-process-cleaned-without-visible-probe",
     );
     const newRecord = store.getByProfileKey("cwd:/repo");
-    assert.equal(newRecord?.slot, "E");
+    assert.equal(newRecord?.slot, "A");
   } finally {
     await rm(dir, { force: true, recursive: true });
   }
@@ -1259,6 +1402,84 @@ test("Topic lifecycle sync does not delete unknown created topics during provisi
   assert.equal(events[0]?.phase, "topic-lifecycle-provisioning-skip");
 });
 
+test("Observed topic lifecycle stops before state or store mutation behind retained fences", async () => {
+  for (const phase of ["fenced", "deletion-issued"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "pi-telegram-lifecycle-admission-"));
+    try {
+      const store = createTelegramTopicTargetStore({
+        path: join(dir, "telegram-targets.json"),
+        getNowMs: () => 2000,
+      });
+      store.upsert({
+        profileKey: "cwd:/repo",
+        owner: { kind: "leader", cwd: "/repo", instanceId: "leader-a" },
+        target: { chatId: 7, threadId: 42 },
+        status: "active",
+        createdAtMs: 1000,
+        updatedAtMs: 1000,
+        instanceId: "leader-a",
+        slot: "A",
+      });
+      await store.persist();
+      const admission = createTelegramWorkspaceAdmissionLedger({
+        path: join(dir, "workspace-admission.json"),
+        profileKey: "profile:lifecycle",
+        owner: {
+          processId: process.pid,
+          processBirthId: `${process.pid}:lifecycle-admission-test`,
+        },
+        getProcessLiveness: () => "alive",
+      });
+      const acquired = admission.acquireRetirementFence({
+        operationId: `lifecycle-fence:${phase}`,
+        retirementIntentId: `lifecycle-intent:${phase}`,
+        bindingKey: "lifecycle-binding",
+        slot: "A",
+        target: { chatId: 7, threadId: 42 },
+        leaderEpoch: 1,
+        retirementRequestedAtMs: 1,
+      });
+      assert.equal(acquired.kind, "acquired");
+      if (acquired.kind !== "acquired") continue;
+      if (phase === "deletion-issued") {
+        assert.equal(admission.issueDeletionPermit(acquired.fence).kind, "issued");
+      }
+      const operationRuntime = createTelegramWorkspaceOperationRuntime({
+        getWorkspaceAdmission: () => admission,
+      });
+      let syncState = createUnknownTelegramSyncState();
+      let syncWrites = 0;
+      const handler = createTelegramObservedTopicLifecycleSyncHandler({
+        topicTargetStore: store,
+        isBusEnabled: () => true,
+        callApi: async <TResponse>() => ({ ok: true }) as TResponse,
+        getCurrentLeaderEpoch: () => 1,
+        runWorkspaceOperation: operationRuntime.run,
+        getSyncState: () => syncState,
+        setSyncState(state) {
+          syncWrites += 1;
+          syncState = state;
+        },
+      });
+
+      await assert.rejects(
+        () => handler({
+          kind: "closed",
+          target: { chatId: 7, threadId: 42 },
+          message: {},
+        }),
+        (error) => error instanceof TelegramWorkspaceAdmissionError &&
+          error.code === "admission-blocked",
+      );
+      assert.equal(syncWrites, 0);
+      assert.equal(store.list()[0]?.status, "active");
+      assert.deepEqual(store.listSyncObservations(), []);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("Thread disconnect assembly distinguishes manual stop from restart suspension", async () => {
   const events: string[] = [];
   const assembly = createTelegramThreadDisconnectAssembly({
@@ -1286,6 +1507,7 @@ test("Thread disconnect assembly distinguishes manual stop from restart suspensi
       events.push("suspend");
     },
     recordRuntimeEvent: () => {},
+    runWorkspaceOperation,
   });
 
   assert.equal(await assembly.disconnect(), "stopped");
@@ -1294,6 +1516,119 @@ test("Thread disconnect assembly distinguishes manual stop from restart suspensi
     "Telegram bridge suspended for session restart.",
   );
   assert.deepEqual(events, ["stop", "suspend"]);
+});
+
+test("Thread disconnect and restart cleanup stop before mutation behind every retained fence phase", async () => {
+  const cases = [
+    { entrypoint: "disconnect" as const, operationKind: "workspace.disconnect-thread" },
+    {
+      entrypoint: "cleanupForSessionRestart" as const,
+      operationKind: "workspace.cleanup-session-restart",
+    },
+  ];
+  for (const phase of ["fenced", "deletion-issued"] as const) {
+    for (const testCase of cases) {
+      const dir = await mkdtemp(join(tmpdir(), "pi-telegram-disconnect-admission-"));
+      try {
+        const ledger = createTelegramWorkspaceAdmissionLedger({
+          path: join(dir, "workspace-admission.json"),
+          profileKey: "profile:test",
+          owner: { processId: 101, processBirthId: "101:start:owner" },
+          getNowMs: () => 1000,
+          getProcessLiveness: () => "alive",
+        });
+        const acquired = ledger.acquireRetirementFence({
+          operationId: `retirement:${phase}:${testCase.entrypoint}`,
+          retirementIntentId: `intent:${phase}:${testCase.entrypoint}`,
+          bindingKey: "binding-one",
+          slot: "A",
+          target: { chatId: 7, threadId: 42 },
+          leaderEpoch: "epoch-one",
+          retirementRequestedAtMs: 900,
+        });
+        assert.equal(acquired.kind, "acquired");
+        if (acquired.kind !== "acquired") continue;
+        if (phase === "deletion-issued") {
+          assert.equal(
+            ledger.issueDeletionPermit(acquired.fence).kind,
+            "issued",
+          );
+        }
+        const mutations: string[] = [];
+        const operationKinds: string[] = [];
+        const assembly = createTelegramThreadDisconnectAssembly({
+          instanceId: "leader-runtime:1",
+          getCurrentThreadRecord: () => {
+            mutations.push("read-current-record");
+            return {
+              owner: { kind: "leader" },
+              instanceId: "leader-runtime:1",
+              target: { chatId: 7, threadId: 42 },
+            };
+          },
+          topicTargetStore: {
+            list: () => {
+              mutations.push("list");
+              return [];
+            },
+            markStaleByTarget: () => {
+              mutations.push("mark-stale");
+              return true;
+            },
+            upsertPendingCleanup: () => {
+              mutations.push("upsert-cleanup");
+            },
+            removePendingCleanup: () => {
+              mutations.push("remove-cleanup");
+              return true;
+            },
+            persist: async () => {
+              mutations.push("persist");
+            },
+          },
+          callApi: async <TResponse>() => {
+            mutations.push("api");
+            return { ok: true } as TResponse;
+          },
+          getCurrentLeaderEpoch: () => 1,
+          getLeaderTarget: () => ({ chatId: 7, threadId: 42 }),
+          clearLeaderTarget: () => {
+            mutations.push("clear-leader-target");
+          },
+          getSyncState: createUnknownTelegramSyncState,
+          setSyncState: () => {
+            mutations.push("set-sync-state");
+          },
+          stopPolling: async () => {
+            mutations.push("stop-polling");
+            return "stopped";
+          },
+          suspendPolling: async () => {
+            mutations.push("suspend-polling");
+          },
+          recordRuntimeEvent: () => undefined,
+          runWorkspaceOperation(input, operation) {
+            operationKinds.push(input.operationKind);
+            return runWithTelegramWorkspaceAdmissionsAsync({
+              ledger,
+              ...input,
+              operation,
+            });
+          },
+        });
+
+        await assert.rejects(
+          () => assembly[testCase.entrypoint](),
+          (error) => error instanceof TelegramWorkspaceAdmissionError &&
+            error.code === "admission-blocked",
+        );
+        assert.deepEqual(operationKinds, [testCase.operationKind]);
+        assert.deepEqual(mutations, []);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+  }
 });
 
 test("Manual follower disconnect delegates thread deletion to its live leader", async () => {
@@ -1333,6 +1668,7 @@ test("Manual follower disconnect delegates thread deletion to its live leader", 
     },
     stopPolling: async () => "stopped",
     recordRuntimeEvent: () => undefined,
+    runWorkspaceOperation,
     getNowMs: () => 2000,
   });
 
@@ -1393,6 +1729,7 @@ test("Manual leader disconnect releases transport after cleanup loses epoch", as
       return "stopped";
     },
     recordRuntimeEvent: () => undefined,
+    runWorkspaceOperation,
   });
 
   assert.equal(
@@ -1460,6 +1797,7 @@ test("Promoted leader deletes its inherited follower thread under owned epoch", 
       return "stopped";
     },
     recordRuntimeEvent: () => undefined,
+    runWorkspaceOperation,
   });
 
   assert.equal(await disconnect(), "stopped");
@@ -1527,6 +1865,7 @@ test("Promoted leader disconnect releases leadership when deletion is unconfirme
       return "stopped";
     },
     recordRuntimeEvent: () => undefined,
+    runWorkspaceOperation,
   });
 
   assert.equal(

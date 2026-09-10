@@ -56,7 +56,7 @@ interface RegistrationRecoveryRaceInput {
   instanceId: string;
   profileKey: string;
   registrationGeneration: string;
-  target: { chatId: number; threadId: number };
+  target: { chatId: number; threadId: number; slot: string };
 }
 
 async function waitForFile(path: string): Promise<void> {
@@ -137,6 +137,7 @@ async function runRegistrationRecoveryRace(
             registrationGeneration: input.registrationGeneration,
             protocol,
             target: input.target,
+            slot: input.target.slot,
             connectedAtMs: Date.now(),
           },
         },

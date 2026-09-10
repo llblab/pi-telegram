@@ -2065,6 +2065,56 @@ test("Locked polling runtime auto-starts only from an existing owned lock", asyn
   }
 });
 
+test("Locked polling runtime auto-connects a remembered follower under a live leader", async () => {
+  const temp = createTempLockPath();
+  try {
+    const owner = {
+      pid: 20,
+      cwd: "/leader",
+      instanceId: "leader",
+      heartbeatMs: Date.now(),
+      leaderEpoch: "leader-epoch",
+    };
+    writeFileSync(temp.path, JSON.stringify({ [TELEGRAM_LOCK_KEY]: owner }));
+    const lock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      instanceId: "follower",
+      isProcessAlive: (pid) => pid === 20,
+    });
+    const events: string[] = [];
+    const runtime = createTelegramLockedPollingRuntime({
+      lock,
+      hasBotToken: () => true,
+      startPolling: async () => {
+        events.push("leader-start");
+      },
+      stopPolling: async () => undefined,
+      restoreFollowerWithOwner: async (_ctx, observedOwner) => {
+        assert.equal(observedOwner.pid, owner.pid);
+        assert.equal(observedOwner.instanceId, owner.instanceId);
+        assert.equal(observedOwner.leaderEpoch, owner.leaderEpoch);
+        events.push("follower-restore");
+        return true;
+      },
+      onTransportAvailabilityChanged: () => {
+        events.push("availability");
+      },
+      updateStatus: () => {
+        events.push("status");
+      },
+    });
+
+    await runtime.onSessionStart({}, { cwd: "/repo" });
+    await waitForCondition(() => events.includes("status"));
+    assert.deepEqual(events, ["follower-restore", "availability", "status"]);
+    assert.deepEqual(readLocks(temp.path)[TELEGRAM_LOCK_KEY], owner);
+    await runtime.suspend();
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
 test("Locked polling runtime session auto-start does not block session initialization", async () => {
   const temp = createTempLockPath();
   try {

@@ -54,6 +54,10 @@ function test(
   void testRoot(name, { concurrency: false, timeout: timeoutMs }, fn);
 }
 
+function strictFileTest(name: string, fn: RuntimeTestHandler): void {
+  void testRoot(name, { concurrency: false, skip: process.platform === "win32", timeout: 5_000 }, fn);
+}
+
 let runtimeTelegramExtension: RuntimeTelegramExtension | undefined;
 let runtimeAgentDir: string | undefined;
 
@@ -195,7 +199,7 @@ function runRegistrationRecoveryRaceProcess(input: {
   instanceId: string;
   profileKey: string;
   registrationGeneration: string;
-  target: { chatId: number; threadId: number };
+  target: { chatId: number; threadId: number; slot: string };
 }): Promise<RegistrationRecoveryRaceResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(
@@ -744,6 +748,10 @@ type RuntimeHarnessHandler = (event: unknown, ctx: unknown) => Promise<unknown>;
 type RuntimeHarnessCommand = {
   handler: (args: string, ctx: unknown) => Promise<void>;
 };
+type RuntimeHarnessTool = {
+  name: string;
+  execute: (toolCallId: string, params: Record<string, unknown>) => Promise<unknown>;
+};
 type RuntimePiHarnessOptions = {
   sendMessage?: (message: unknown, options?: unknown) => void;
   sendUserMessage?: (content: RuntimeHarnessMessage) => void;
@@ -757,6 +765,7 @@ type RuntimePiHarnessOptions = {
 function createRuntimePiHarness(options: RuntimePiHarnessOptions = {}) {
   const handlers = new Map<string, RuntimeHarnessHandler>();
   const commands = new Map<string, RuntimeHarnessCommand>();
+  const tools = new Map<string, RuntimeHarnessTool>();
   let activeTools = [...(options.activeTools ?? ["read", "foreign_tool"])];
   const pi = {
     on: (event: string, handler: RuntimeHarnessHandler) => {
@@ -765,7 +774,8 @@ function createRuntimePiHarness(options: RuntimePiHarnessOptions = {}) {
     registerCommand: (name: string, definition: RuntimeHarnessCommand) => {
       commands.set(name, definition);
     },
-    registerTool: (definition: { name: string }) => {
+    registerTool: (definition: RuntimeHarnessTool) => {
+      tools.set(definition.name, definition);
       if (!activeTools.includes(definition.name)) activeTools.push(definition.name);
     },
     getActiveTools: () => [...activeTools],
@@ -784,6 +794,7 @@ function createRuntimePiHarness(options: RuntimePiHarnessOptions = {}) {
   return {
     handlers,
     commands,
+    tools,
     pi: pi as never,
     getActiveTools: () => [...activeTools],
   };
@@ -2563,7 +2574,7 @@ test("Replacement registration stays live while its process races dead-owner rec
       instanceId,
       profileKey: "manual:replacement-race",
       registrationGeneration: "replacement-race:generation-1",
-      target: { chatId: 7, threadId: 45 },
+      target: { chatId: 7, threadId: 45, slot: "A" },
     });
     assert.deepEqual(result, {
       phase: "result",
@@ -3288,6 +3299,8 @@ test("Extension runtime ignores the retired proactive opt-out while Telegram is 
       "foreign_tool",
       "telegram_attach",
       "telegram_bind",
+      "telegram_channel_post",
+      "telegram_channel_posts",
       "telegram_message",
     ]);
     await flushMicrotasks(20);
@@ -3345,6 +3358,64 @@ test("Extension runtime ignores the retired proactive opt-out while Telegram is 
       ),
       { systemPrompt: "base" },
     );
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    restoreFetch();
+    await telegramConfig.restore();
+  }
+});
+
+strictFileTest("Channel post tool does not resend lost success or outcome across reconnect replacement", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const { handlers, commands, tools, pi } = createRuntimePiHarness();
+  let sends = 0;
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "deleteWebhook") return createRuntimeTelegramApiResponse(true);
+    if (method === "getUpdates") throw new DOMException("stop", "AbortError");
+    if (method === "getChat") return createRuntimeTelegramApiResponse({
+      id: -100123, type: "channel", username: "public_channel", title: "Public Channel",
+    });
+    if (method === "sendRichMessage") {
+      sends += 1;
+      const body = parseJsonRequestBody(init) ?? {};
+      if ((body.rich_message as { markdown?: unknown } | undefined)?.markdown === "Ambiguous") {
+        throw new Error("lost Bot API response");
+      }
+      return createRuntimeTelegramApiResponse({
+        message_id: 91, chat: { id: -100123, type: "channel" },
+      });
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({ botToken: "123:abc", allowedUserId: 77, lastUpdateId: 0 });
+    await writeRuntimeTelegramLocks({});
+    (await getRuntimeTelegramExtension())(pi);
+    const ctx = createRuntimeExtensionContext({ cwd: "/repo/channel-replacement" });
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    const tool = tools.get("telegram_message");
+    assert.ok(tool);
+    await tool.execute("stable-channel-operation", {
+      text: "Channel post", chat_id: -100123, channel: true,
+    });
+    await commands.get("telegram-disconnect")?.handler("", ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    await tool.execute("stable-channel-operation", {
+      text: "Channel post", chat_id: -100123, channel: true,
+    });
+    assert.equal(sends, 1);
+    await assert.rejects(tool.execute("ambiguous-channel-operation", {
+      text: "Ambiguous", chat_id: -100123, channel: true,
+    }), /channel publication failed/u);
+    await commands.get("telegram-disconnect")?.handler("", ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    await assert.rejects(tool.execute("ambiguous-channel-operation", {
+      text: "Ambiguous", chat_id: -100123, channel: true,
+    }), /channel publication failed/u);
+    assert.equal(sends, 2);
+    await commands.get("telegram-disconnect")?.handler("", ctx);
     await handlers.get("session_shutdown")?.({}, ctx);
   } finally {
     restoreFetch();
@@ -3578,6 +3649,7 @@ test("Extension runtime sends proactive checkpoints and final once in source ord
       },
       ctx,
     );
+    await flushMicrotasks(20);
     assert.equal(sentBodies.length, 2);
     assert.deepEqual(
       sentBodies.map((body) => body.chat_id),

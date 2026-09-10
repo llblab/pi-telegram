@@ -18,6 +18,7 @@ export interface TelegramAgentMessageRuntimeDeps<TContext, TUpdate> {
   getAllowedChatId: () => number | undefined;
   getLeaderTarget: () => TelegramTarget | undefined;
   getLeaderThreadName: () => string | undefined;
+  getDisplayTitle?: (target: TelegramTarget) => string | undefined;
   followerRegistry: TelegramBusFollowerRegistry;
   getContext: () => TContext | undefined;
   handleUpdate: (update: TUpdate, ctx: TContext) => Promise<void>;
@@ -39,7 +40,7 @@ export function createTelegramAgentMessageRuntime<TContext, TUpdate>(
     if (leaderTarget?.threadId) {
       targets.push({
         target: { chatId: leaderTarget.chatId, threadId: leaderTarget.threadId },
-        threadName: deps.getLeaderThreadName(),
+        threadName: deps.getDisplayTitle?.(leaderTarget) ?? deps.getLeaderThreadName(),
       });
     }
     for (const follower of deps.followerRegistry.list()) {
@@ -49,7 +50,7 @@ export function createTelegramAgentMessageRuntime<TContext, TUpdate>(
           chatId: follower.target.chatId,
           threadId: follower.target.threadId,
         },
-        threadName: follower.threadName,
+        threadName: deps.getDisplayTitle?.(follower.target) ?? follower.threadName,
       });
     }
     return targets;
@@ -98,8 +99,10 @@ export function createTelegramAgentMessageRuntime<TContext, TUpdate>(
       if (allowedChatId === undefined || !ctx) {
         throw new Error("Telegram agent turn routing is unavailable.");
       }
+      const sourceTitle = (input.sourceTarget ? deps.getDisplayTitle?.(input.sourceTarget) : undefined)
+        ?? input.sourceThreadName;
       const sourceLabel =
-        input.sourceThreadName
+        sourceTitle
           ?.replace(/[\r\n\[\]]+/g, " ")
           .trim()
           .slice(0, 64) || "Pi";

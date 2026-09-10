@@ -284,7 +284,14 @@ test("Reply runtime bundles text, native markdown, and UI/compat interactive del
     },
   });
   assert.equal(await runtime.sendTextReply(7, 42, "hello"), 1);
-  assert.equal(await runtime.sendMarkdownReply(7, 43, "**hello**"), 77);
+  assert.equal(
+    await runtime.sendMarkdownReply(
+      7,
+      43,
+      "**hello** /start https://example.com",
+    ),
+    77,
+  );
   assert.equal(
     await runtime.sendInteractiveMessage(
       7,
@@ -307,7 +314,7 @@ test("Reply runtime bundles text, native markdown, and UI/compat interactive del
   assert.deepEqual(richSent, [
     {
       chat_id: 7,
-      rich_message: { markdown: "**hello**", skip_entity_detection: true },
+      rich_message: { markdown: "**hello** /start https://example.com" },
       reply_markup: undefined,
       reply_parameters: {
         message_id: 43,
@@ -419,7 +426,7 @@ test("Reply runtime can send markdown through native rich messages", async () =>
   assert.deepEqual(richBodies, [
     {
       chat_id: 7,
-      rich_message: { markdown: "# hello", skip_entity_detection: true },
+      rich_message: { markdown: "# hello" },
       reply_markup: {
         inline_keyboard: [[{ text: "ok", callback_data: "noop" }]],
       },
@@ -467,7 +474,7 @@ test("Reply runtime uses native rich messages for anchored thread markdown repli
   assert.deepEqual(richBodies, [
     {
       chat_id: -1007,
-      rich_message: { markdown: "# hello", skip_entity_detection: true },
+      rich_message: { markdown: "# hello" },
       reply_markup: {
         inline_keyboard: [[{ text: "ok", callback_data: "noop" }]],
       },
@@ -548,7 +555,6 @@ test("Guest replies answer with native Rich Markdown content", async () => {
       options: {
         richMessage: {
           markdown: "**hello** /start",
-          skip_entity_detection: true,
         },
       },
     },
@@ -666,7 +672,6 @@ test("Native Markdown delivery preserves Bot API 10.2 structured blocks", async 
       chat_id: 7,
       rich_message: {
         markdown: expected,
-        skip_entity_detection: true,
       },
       reply_markup: undefined,
     },

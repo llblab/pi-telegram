@@ -862,6 +862,22 @@ export function formatGenerativeAppToolError(error: unknown): Error {
   return new Error(`\n${message.replace(/^\n+/u, "") || "Generative App operation failed."}`);
 }
 
+const TELEGRAM_BIND_JSON_ARGUMENT_REFERENCE = "#/$defs/TelegramBindJsonValue";
+const TELEGRAM_BIND_JSON_ARGUMENT_SCHEMA = {
+  $ref: TELEGRAM_BIND_JSON_ARGUMENT_REFERENCE,
+} as unknown as ReturnType<typeof Type.Unknown>;
+const TELEGRAM_BIND_JSON_ARGUMENT_DEFINITION = {
+  anyOf: [
+    { type: "null" },
+    { type: "boolean" },
+    { type: "number" },
+    { type: "string" },
+    { type: "array", items: { $ref: TELEGRAM_BIND_JSON_ARGUMENT_REFERENCE } },
+    { type: "object", properties: {},
+      additionalProperties: { $ref: TELEGRAM_BIND_JSON_ARGUMENT_REFERENCE } },
+  ],
+};
+
 export function registerTelegramBindTool(
   pi: ExtensionAPI,
   deps: TelegramBindToolRegistrationDeps,
@@ -877,8 +893,10 @@ export function registerTelegramBindTool(
       method: Type.Optional(Type.String()),
       replace: Type.Optional(Type.Boolean()),
       display: Type.Optional(Type.Boolean()),
-      argument: Type.Optional(Type.Unknown()),
-    }, { additionalProperties: false }),
+      argument: Type.Optional(TELEGRAM_BIND_JSON_ARGUMENT_SCHEMA),
+    }, { additionalProperties: false,
+      $defs: { TelegramBindJsonValue: TELEGRAM_BIND_JSON_ARGUMENT_DEFINITION },
+    }),
     async execute(_toolCallId, params) {
       try {
         const result = await bindGenerativeApp({

@@ -49,6 +49,7 @@ import {
   type TelegramQueueHandoffPayload,
 } from "./queue.ts";
 import type { TelegramTarget } from "./target.ts";
+import type { TelegramThreadDisplayMode } from "./config.ts";
 import { isProcessAlive } from "./locks.ts";
 import { resolveAgentDir } from "./paths.ts";
 
@@ -152,6 +153,22 @@ export function getTelegramProcessLiveness(
   return proof.identity === owner.processBirthId ? "alive" : "dead";
 }
 
+export function getTelegramProcessBirthIdentityLiveness(
+  processBirthId: string,
+  options: TelegramProcessLivenessOptions = {},
+): TelegramProcessLiveness {
+  const match = /^(\d+):(start|generation):(.+)$/u.exec(processBirthId);
+  if (!match) return "unverifiable";
+  const processId = Number(match[1]);
+  if (!Number.isSafeInteger(processId) || processId <= 0) return "unverifiable";
+  const processAlive = options.isProcessAlive ?? isProcessAlive;
+  if (!processAlive(processId)) return "dead";
+  if (match[2] === "generation") return "unverifiable";
+  const proof = getTelegramProcessBirthProof(processId, options);
+  if (proof.status === "unverifiable") return "unverifiable";
+  return proof.identity === processBirthId ? "alive" : "dead";
+}
+
 export function createCurrentTelegramBusProcessRuntime(input: {
   getActiveProfileName: () => string | undefined;
   pid?: number;
@@ -208,6 +225,13 @@ export const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION =
   "durable-follower-admission-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF =
   "queue-handoff-v1" as const;
+export const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE =
+  "input-custody-reference-v1" as const;
+export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME =
+  "workspace-thread-rename-v1" as const;
+export const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE = "thread-display-mode-v1" as const;
+export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT =
+  "workspace-follower-auto-connect-v1" as const;
 
 export interface TelegramBusProtocolIdentity {
   protocolVersion: number;
@@ -267,6 +291,19 @@ export function hasTelegramBusCapability(
   capability: string,
 ): boolean {
   return identity?.capabilities.includes(capability) ?? false;
+}
+
+export function getTelegramInputCustodyPeerReadiness(
+  followers: readonly Pick<TelegramBusFollowerView,
+    "registrationGeneration" | "protocol">[],
+): ("ready" | "legacy" | "unknown")[] {
+  return followers.map(follower => {
+    if (!follower.registrationGeneration || !follower.protocol) return "unknown";
+    return hasTelegramBusCapability(follower.protocol,
+      TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION) &&
+      hasTelegramBusCapability(follower.protocol,
+        TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE) ? "ready" : "legacy";
+  });
 }
 
 export function getTelegramBusProtocolCompatibility(input: {
@@ -361,6 +398,7 @@ export function getTelegramFollowerTargetOwnership(input: {
   instanceId: string;
   ownerGeneration: string;
   recipientBindingKey: string;
+  protocolIdentity: TelegramBusProtocolIdentity;
 } | undefined {
   const liveFollower = input.followers.find((follower) => {
     return (
@@ -379,6 +417,7 @@ export function getTelegramFollowerTargetOwnership(input: {
       instanceId: liveFollower.instanceId,
       ownerGeneration: liveFollower.registrationGeneration,
       recipientBindingKey: liveFollower.profileKey,
+      protocolIdentity: liveFollower.protocol,
     };
   }
   // Persisted records are restart hints, not live routing authority. Only an
@@ -622,12 +661,19 @@ export interface TelegramBusFollowerDeliveryIdentity {
   deliveryId: string;
   sourceUpdateId: number;
   recipientBindingKey: string;
+  sourceRecoveryKey?: string;
+  sourceClaim?: {
+    acquisitionId: string;
+    handoffId: string;
+  };
 }
 
 export type TelegramBusForeignUpdateFailureClass =
   | "source-update-identity-missing"
   | "recipient-binding-missing"
   | "recipient-generation-missing"
+  | "source-reference-missing"
+  | "recipient-ownership-stale"
   | "transport-failed"
   | "acknowledgement-missing"
   | "acknowledgement-rejected"
@@ -653,14 +699,23 @@ export function createTelegramBusFollowerDeliveryIdentity(input: {
     | "leader.forwardCallback"
     | "leader.forwardReaction"
     | "leader.forwardMessage"
-    | "leader.forwardEditedMessage";
+    | "leader.forwardEditedMessage"
+    | "leader.wakeInputCustody";
   recipientBindingKey: string;
   sourceUpdateId: number;
+  sourceRecoveryKey?: string;
+  sourceClaim?: {
+    acquisitionId: string;
+    handoffId: string;
+  };
 }): TelegramBusFollowerDeliveryIdentity {
   if (
     !input.recipientBindingKey ||
     !Number.isSafeInteger(input.sourceUpdateId) ||
-    input.sourceUpdateId < 0
+    input.sourceUpdateId < 0 ||
+    (input.sourceClaim !== undefined &&
+      (!input.sourceClaim.acquisitionId || input.sourceClaim.acquisitionId.length > 256 ||
+        !input.sourceClaim.handoffId || input.sourceClaim.handoffId.length > 256))
   ) {
     throw new Error("Telegram follower delivery identity is incomplete.");
   }
@@ -678,12 +733,45 @@ export function createTelegramBusFollowerDeliveryIdentity(input: {
     deliveryId: `telegram-follower-v1-${deliveryId}`,
     sourceUpdateId: input.sourceUpdateId,
     recipientBindingKey: input.recipientBindingKey,
+    ...(input.sourceRecoveryKey ? { sourceRecoveryKey: input.sourceRecoveryKey } : {}),
+    ...(input.sourceClaim ? { sourceClaim: { ...input.sourceClaim } } : {}),
   };
+}
+
+export function canUseTelegramBusInputCustodyReference(input: {
+  local?: TelegramBusProtocolIdentity;
+  remote?: TelegramBusProtocolIdentity;
+}): boolean {
+  return hasTelegramBusCapability(input.local, TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE) &&
+    hasTelegramBusCapability(input.remote, TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE);
+}
+
+export function createTelegramBusFollowerSourceReferenceDeliveryIdentity(input: {
+  kind: "leader.forwardCallback" | "leader.forwardReaction" |
+    "leader.forwardMessage" | "leader.forwardEditedMessage" | "leader.wakeInputCustody";
+  recipientBindingKey: string;
+  sourceRecoveryKey: string;
+  source: { updateId: number; owner: { acquisitionId: string; handoffId?: string } };
+}): TelegramBusFollowerDeliveryIdentity {
+  if (!input.sourceRecoveryKey || !input.source.owner.handoffId) throw new Error(
+    "Telegram follower source-reference delivery requires an accepted handoff.",
+  );
+  return createTelegramBusFollowerDeliveryIdentity({ kind: input.kind,
+    recipientBindingKey: input.recipientBindingKey,
+    sourceUpdateId: input.source.updateId,
+    sourceRecoveryKey: input.sourceRecoveryKey,
+    sourceClaim: { acquisitionId: input.source.owner.acquisitionId,
+      handoffId: input.source.owner.handoffId } });
 }
 
 export type TelegramBusEnvelope = (
   | {
       kind: "follower.register";
+      requestId: string;
+      registration: TelegramBusInstanceRegistration;
+    }
+  | {
+      kind: "follower.restoreWorkspace";
       requestId: string;
       registration: TelegramBusInstanceRegistration;
     }
@@ -699,6 +787,30 @@ export type TelegramBusEnvelope = (
       requestId: string;
       instanceId: string;
       registrationGeneration?: string;
+      sentAtMs: number;
+    }
+  | {
+      kind: "follower.setThreadDisplayMode";
+      requestId: string;
+      instanceId: string;
+      registrationGeneration: string;
+      mode: TelegramThreadDisplayMode;
+    }
+  | {
+      kind: "follower.renameThread";
+      requestId: string;
+      instanceId: string;
+      registrationGeneration: string;
+      target: TelegramTarget & { threadId: number };
+      threadName: string;
+      sentAtMs: number;
+    }
+  | {
+      kind: "follower.resetThreadName";
+      requestId: string;
+      instanceId: string;
+      registrationGeneration: string;
+      target: TelegramTarget & { threadId: number };
       sentAtMs: number;
     }
   | {
@@ -736,6 +848,25 @@ export type TelegramBusEnvelope = (
       recipientRegistrationGeneration: string;
       delivery: TelegramBusFollowerDeliveryIdentity;
       message: unknown;
+      sentAtMs: number;
+    }
+  | {
+      kind: "leader.offerInputCustodyHandoff";
+      requestId: string;
+      recipientInstanceId: string;
+      recipientRegistrationGeneration: string;
+      recipientBindingKey: string;
+      sourceRecoveryKey: string;
+      source: { journalBindingKey: string; tokenSha256: string; updateId: number };
+      handoffId: string;
+      sentAtMs: number;
+    }
+  | {
+      kind: "leader.wakeInputCustody";
+      requestId: string;
+      recipientInstanceId: string;
+      recipientRegistrationGeneration: string;
+      delivery: TelegramBusFollowerDeliveryIdentity;
       sentAtMs: number;
     }
   | {
@@ -817,7 +948,8 @@ export type TelegramBusEnvelope = (
           | "request-id-collision"
           | "ledger-overloaded"
           | "incompatible-protocol"
-          | "stale-target";
+          | "stale-target"
+          | "workspace-binding-unavailable";
         method?: string;
         chatId?: number;
         threadId?: number;
@@ -833,7 +965,10 @@ export type TelegramBusEnvelopeTrafficClass =
 export function getTelegramBusEnvelopeTrafficClass(
   envelope: TelegramBusEnvelope,
 ): TelegramBusEnvelopeTrafficClass {
-  if (envelope.kind === "follower.register") return "bootstrap";
+  if (
+    envelope.kind === "follower.register" ||
+    envelope.kind === "follower.restoreWorkspace"
+  ) return "bootstrap";
   if (envelope.kind === "bus.ack") return "response";
   return "generation-fenced";
 }
@@ -879,7 +1014,8 @@ export function parseTelegramBusEnvelope(
   let envelope: TelegramBusEnvelope | undefined;
   switch (kind) {
     case "follower.register":
-      envelope = parseRegisterEnvelope(value, requestId);
+    case "follower.restoreWorkspace":
+      envelope = parseRegisterEnvelope(value, requestId, kind);
       break;
     case "follower.heartbeat":
       envelope = parseHeartbeatEnvelope(value, requestId);
@@ -887,11 +1023,45 @@ export function parseTelegramBusEnvelope(
     case "follower.disconnect":
       envelope = parseDisconnectEnvelope(value, requestId);
       break;
+    case "follower.setThreadDisplayMode":
+      if (typeof value.instanceId === "string" &&
+          typeof value.registrationGeneration === "string" &&
+          (value.mode === "letters" || value.mode === "names" || value.mode === "directories")) {
+        envelope = { kind, requestId, instanceId: value.instanceId,
+          registrationGeneration: value.registrationGeneration, mode: value.mode };
+      }
+      break;
+    case "follower.renameThread":
+      envelope = parseRenameThreadEnvelope(value, requestId);
+      break;
+    case "follower.resetThreadName": {
+      const target = parseTarget(value.target);
+      if (typeof value.instanceId === "string" &&
+          typeof value.registrationGeneration === "string" &&
+          typeof value.sentAtMs === "number" &&
+          target?.threadId !== undefined) {
+        envelope = {
+          kind,
+          requestId,
+          instanceId: value.instanceId,
+          registrationGeneration: value.registrationGeneration,
+          target: { chatId: target.chatId, threadId: target.threadId },
+          sentAtMs: value.sentAtMs,
+        };
+      }
+      break;
+    }
     case "leader.forwardCallback":
       envelope = parseForwardCallbackEnvelope(value, requestId);
       break;
     case "leader.forwardReaction":
       envelope = parseForwardReactionEnvelope(value, requestId);
+      break;
+    case "leader.offerInputCustodyHandoff":
+      envelope = parseOfferInputCustodyHandoffEnvelope(value, requestId);
+      break;
+    case "leader.wakeInputCustody":
+      envelope = parseWakeInputCustodyEnvelope(value, requestId);
       break;
     case "leader.forwardMessage":
       envelope = parseForwardMessageEnvelope(
@@ -1031,6 +1201,14 @@ export interface TelegramBusForeignOwnedForwarderDeps<TMessage = unknown> {
   getForwardCommentBatchPosition?: (
     message: TMessage,
   ) => "comment" | "forward" | undefined;
+  localProtocolIdentity?: TelegramBusProtocolIdentity;
+  validateForwardOwnership?: (ownership: TelegramBusForwardOwnership) => boolean;
+  resolveInputCustodyReference?: (input: {
+    sourceUpdateId: number;
+    recipientBindingKey: string;
+  }) => { sourceRecoveryKey: string; source: {
+    updateId: number; owner: { acquisitionId: string; handoffId?: string };
+  } } | undefined;
   recordRuntimeEvent?: (
     category: string,
     error: unknown,
@@ -1038,10 +1216,21 @@ export interface TelegramBusForeignOwnedForwarderDeps<TMessage = unknown> {
   ) => void;
 }
 
-interface TelegramBusForwardOwnership {
+export interface TelegramBusForwardOwnership {
   instanceId: string;
   ownerGeneration?: string;
   recipientBindingKey?: string;
+  protocolIdentity?: TelegramBusProtocolIdentity;
+}
+
+export function isTelegramBusForwardOwnershipCurrent(
+  expected: TelegramBusForwardOwnership,
+  current: TelegramBusForwardOwnership | undefined,
+): boolean {
+  return Boolean(current && current.instanceId === expected.instanceId &&
+    current.ownerGeneration === expected.ownerGeneration &&
+    current.recipientBindingKey === expected.recipientBindingKey &&
+    JSON.stringify(current.protocolIdentity) === JSON.stringify(expected.protocolIdentity));
 }
 
 type TelegramBusDurableForwardEnvelope = Extract<
@@ -1051,7 +1240,8 @@ type TelegramBusDurableForwardEnvelope = Extract<
       | "leader.forwardCallback"
       | "leader.forwardReaction"
       | "leader.forwardMessage"
-      | "leader.forwardEditedMessage";
+      | "leader.forwardEditedMessage"
+      | "leader.wakeInputCustody";
   }
 > & {
   recipientRegistrationGeneration: string;
@@ -1145,13 +1335,15 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
     return settlement;
   };
   const prepare = (
-    kind: TelegramBusDurableForwardEnvelope["kind"],
+    kind: "leader.forwardCallback" | "leader.forwardReaction" |
+      "leader.forwardMessage" | "leader.forwardEditedMessage",
     value: unknown,
     ownership: TelegramBusForwardOwnership,
   ):
     | {
         delivery: TelegramBusFollowerDeliveryIdentity;
         recipientRegistrationGeneration: string;
+        sourceReference: boolean;
       }
     | { settlement: TelegramBusForeignUpdateSettlement } => {
     const sourceUpdateId = getTelegramBusForwardSourceUpdateId(value);
@@ -1178,11 +1370,19 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
         }),
       };
     }
-    const delivery = createTelegramBusForwardDelivery(
-      kind,
-      sourceUpdateId,
-      ownership.recipientBindingKey,
-    );
+    const sourceReference = canUseTelegramBusInputCustodyReference({
+      local: deps.localProtocolIdentity, remote: ownership.protocolIdentity });
+    const reference = sourceReference ? deps.resolveInputCustodyReference?.({
+      sourceUpdateId, recipientBindingKey: ownership.recipientBindingKey }) : undefined;
+    if (sourceReference && !reference) return { settlement: reject({
+      status: "retryable", failureClass: "source-reference-missing",
+      message: "Forwarded Telegram update has no exact custody reference.",
+      envelopeKind: kind, ownership, sourceUpdateId }) };
+    const delivery = reference
+      ? createTelegramBusFollowerSourceReferenceDeliveryIdentity({
+          kind: "leader.wakeInputCustody", recipientBindingKey: ownership.recipientBindingKey,
+          sourceRecoveryKey: reference.sourceRecoveryKey, source: reference.source })
+      : createTelegramBusForwardDelivery(kind, sourceUpdateId, ownership.recipientBindingKey);
     if (!ownership.ownerGeneration) {
       return {
         settlement: reject({
@@ -1198,12 +1398,17 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
     return {
       delivery,
       recipientRegistrationGeneration: ownership.ownerGeneration,
+      sourceReference,
     };
   };
   const send = async (
     envelope: TelegramBusDurableForwardEnvelope,
     ownership: TelegramBusForwardOwnership,
   ): Promise<TelegramBusForeignUpdateSettlement> => {
+    if (deps.validateForwardOwnership && !deps.validateForwardOwnership(ownership)) return reject({
+      status: "retryable", failureClass: "recipient-ownership-stale",
+      message: "Telegram follower ownership changed before forwarding.",
+      envelopeKind: envelope.kind, ownership, delivery: envelope.delivery });
     if (deps.getAuthSecret) envelope.auth = deps.getAuthSecret();
     const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
     let response: TelegramBusEnvelope | undefined;
@@ -1295,6 +1500,10 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
     forwardCallback: ({ query, ownership }) => {
       const prepared = prepare("leader.forwardCallback", query, ownership);
       if ("settlement" in prepared) return Promise.resolve(prepared.settlement);
+      if (prepared.sourceReference) return send({ kind: "leader.wakeInputCustody",
+        requestId: deps.createRequestId(), recipientInstanceId: ownership.instanceId,
+        recipientRegistrationGeneration: prepared.recipientRegistrationGeneration,
+        delivery: prepared.delivery, sentAtMs: getNowMs() }, ownership);
       return send(
         {
           kind: "leader.forwardCallback",
@@ -1316,6 +1525,10 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
         ownership,
       );
       if ("settlement" in prepared) return Promise.resolve(prepared.settlement);
+      if (prepared.sourceReference) return send({ kind: "leader.wakeInputCustody",
+        requestId: deps.createRequestId(), recipientInstanceId: ownership.instanceId,
+        recipientRegistrationGeneration: prepared.recipientRegistrationGeneration,
+        delivery: prepared.delivery, sentAtMs: getNowMs() }, ownership);
       return send(
         {
           kind: "leader.forwardReaction",
@@ -1333,6 +1546,10 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
     forwardMessage: ({ message, ownership }) => {
       const prepared = prepare("leader.forwardMessage", message, ownership);
       if ("settlement" in prepared) return Promise.resolve(prepared.settlement);
+      if (prepared.sourceReference) return send({ kind: "leader.wakeInputCustody",
+        requestId: deps.createRequestId(), recipientInstanceId: ownership.instanceId,
+        recipientRegistrationGeneration: prepared.recipientRegistrationGeneration,
+        delivery: prepared.delivery, sentAtMs: getNowMs() }, ownership);
       return send(
         {
           kind: "leader.forwardMessage",
@@ -1360,6 +1577,10 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
         ownership,
       );
       if ("settlement" in prepared) return Promise.resolve(prepared.settlement);
+      if (prepared.sourceReference) return send({ kind: "leader.wakeInputCustody",
+        requestId: deps.createRequestId(), recipientInstanceId: ownership.instanceId,
+        recipientRegistrationGeneration: prepared.recipientRegistrationGeneration,
+        delivery: prepared.delivery, sentAtMs: getNowMs() }, ownership);
       return send(
         {
           kind: "leader.forwardEditedMessage",
@@ -1512,7 +1733,8 @@ export function createTelegramBusLocalServer(
   );
   const getRequestLedgerKey = (envelope: TelegramBusEnvelope): string => {
     const identity =
-      envelope.kind === "follower.register"
+      envelope.kind === "follower.register" ||
+      envelope.kind === "follower.restoreWorkspace"
         ? envelope.registration.instanceId
         : "instanceId" in envelope
           ? envelope.instanceId
@@ -1823,21 +2045,32 @@ function sendTelegramBusLocalEnvelopeOnce(
     const socket = createConnection(options.socketPath);
     let settled = false;
     let buffer = "";
+    let timeoutFinalizer: ReturnType<typeof setImmediate> | undefined;
     const settle = (callback: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      if (timeoutFinalizer) clearImmediate(timeoutFinalizer);
       socket.destroy();
       callback();
     };
     const timeout = setTimeout(() => {
-      settle(() =>
-        reject(
-          createTelegramBusTransportTimeoutError(
-            "Timed out waiting for Telegram bus response",
-          ),
-        ),
-      );
+      // A long synchronous Pi/TUI turn can resume in the timers phase after
+      // the peer acknowledgement is already buffered. Give pending socket I/O
+      // two poll phases before converting elapsed wall time into a transport
+      // failure; Darwin can surface buffered Unix-socket input only on the
+      // second cycle after a long stall, while a silent peer stays bounded.
+      timeoutFinalizer = setImmediate(() => {
+        timeoutFinalizer = setImmediate(() => {
+          settle(() =>
+            reject(
+              createTelegramBusTransportTimeoutError(
+                "Timed out waiting for Telegram bus response",
+              ),
+            ),
+          );
+        });
+      });
     }, timeoutMs);
     socket.setEncoding("utf8");
     socket.once("connect", () => {
@@ -1909,6 +2142,21 @@ export interface TelegramBusFollowerRegistry {
     nowMs: number,
     staleAfterMs: number,
   ) => TelegramBusFollowerView[];
+}
+
+export function createTelegramBusForwardOwnershipValidator(
+  registry: Pick<TelegramBusFollowerRegistry, "get">,
+): (ownership: TelegramBusForwardOwnership) => boolean {
+  return ownership => {
+    const follower = registry.get(ownership.instanceId);
+    return isTelegramBusForwardOwnershipCurrent(ownership,
+      follower?.registrationGeneration && follower.profileKey && follower.protocol ? {
+        instanceId: follower.instanceId,
+        ownerGeneration: follower.registrationGeneration,
+        recipientBindingKey: follower.profileKey,
+        protocolIdentity: follower.protocol,
+      } : undefined);
+  };
 }
 
 export function createTelegramBusFollowerRegistry(): TelegramBusFollowerRegistry {
@@ -2047,11 +2295,10 @@ async function handleTelegramBusSocketLine(
 function parseRegisterEnvelope(
   value: Record<string, unknown>,
   requestId: string,
+  kind: "follower.register" | "follower.restoreWorkspace",
 ): TelegramBusEnvelope | undefined {
   const registration = parseRegistration(value.registration);
-  return registration
-    ? { kind: "follower.register", requestId, registration }
-    : undefined;
+  return registration ? { kind, requestId, registration } : undefined;
 }
 
 function parseHeartbeatEnvelope(
@@ -2090,6 +2337,28 @@ function parseDisconnectEnvelope(
     : undefined;
 }
 
+function parseRenameThreadEnvelope(
+  value: Record<string, unknown>,
+  requestId: string,
+): TelegramBusEnvelope | undefined {
+  const target = parseTarget(value.target);
+  return typeof value.instanceId === "string" &&
+    typeof value.registrationGeneration === "string" &&
+    target?.threadId !== undefined &&
+    typeof value.threadName === "string" &&
+    typeof value.sentAtMs === "number"
+    ? {
+        kind: "follower.renameThread",
+        requestId,
+        instanceId: value.instanceId,
+        registrationGeneration: value.registrationGeneration,
+        target: { chatId: target.chatId, threadId: target.threadId },
+        threadName: value.threadName,
+        sentAtMs: value.sentAtMs,
+      }
+    : undefined;
+}
+
 function parseTelegramBusFollowerDeliveryIdentity(
   value: unknown,
 ): TelegramBusFollowerDeliveryIdentity | undefined {
@@ -2100,7 +2369,16 @@ function parseTelegramBusFollowerDeliveryIdentity(
     !Number.isSafeInteger(value.sourceUpdateId) ||
     (value.sourceUpdateId as number) < 0 ||
     typeof value.recipientBindingKey !== "string" ||
-    !value.recipientBindingKey
+    !value.recipientBindingKey ||
+    (value.sourceRecoveryKey !== undefined &&
+      (typeof value.sourceRecoveryKey !== "string" || !value.sourceRecoveryKey ||
+        value.sourceRecoveryKey.length > 1_024)) ||
+    (value.sourceClaim !== undefined &&
+      (!isRecord(value.sourceClaim) ||
+        typeof value.sourceClaim.acquisitionId !== "string" ||
+        !value.sourceClaim.acquisitionId || value.sourceClaim.acquisitionId.length > 256 ||
+        typeof value.sourceClaim.handoffId !== "string" ||
+        !value.sourceClaim.handoffId || value.sourceClaim.handoffId.length > 256))
   ) {
     return undefined;
   }
@@ -2108,6 +2386,11 @@ function parseTelegramBusFollowerDeliveryIdentity(
     deliveryId: value.deliveryId,
     sourceUpdateId: value.sourceUpdateId as number,
     recipientBindingKey: value.recipientBindingKey,
+    ...(typeof value.sourceRecoveryKey === "string"
+      ? { sourceRecoveryKey: value.sourceRecoveryKey } : {}),
+    ...(isRecord(value.sourceClaim)
+      ? { sourceClaim: { acquisitionId: value.sourceClaim.acquisitionId as string,
+          handoffId: value.sourceClaim.handoffId as string } } : {}),
   };
 }
 
@@ -2179,6 +2462,46 @@ function parseForwardMessageEnvelope(
           : {}),
         sentAtMs: value.sentAtMs,
       }
+    : undefined;
+}
+
+function parseOfferInputCustodyHandoffEnvelope(
+  value: Record<string, unknown>, requestId: string,
+): TelegramBusEnvelope | undefined {
+  const source = value.source;
+  if (!isRecord(source) || typeof value.recipientInstanceId !== "string" ||
+    typeof value.recipientRegistrationGeneration !== "string" ||
+    typeof value.recipientBindingKey !== "string" || !value.recipientBindingKey ||
+    typeof value.sourceRecoveryKey !== "string" || !value.sourceRecoveryKey ||
+    value.sourceRecoveryKey.length > 1_024 ||
+    typeof source.journalBindingKey !== "string" || !source.journalBindingKey ||
+    source.journalBindingKey !== value.sourceRecoveryKey ||
+    typeof source.tokenSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(source.tokenSha256) ||
+    !Number.isSafeInteger(source.updateId) || (source.updateId as number) < 0 ||
+    typeof value.handoffId !== "string" || !value.handoffId || value.handoffId.length > 256 ||
+    typeof value.sentAtMs !== "number") return undefined;
+  return { kind: "leader.offerInputCustodyHandoff", requestId,
+    recipientInstanceId: value.recipientInstanceId,
+    recipientRegistrationGeneration: value.recipientRegistrationGeneration,
+    recipientBindingKey: value.recipientBindingKey,
+    sourceRecoveryKey: value.sourceRecoveryKey,
+    source: { journalBindingKey: source.journalBindingKey,
+      tokenSha256: source.tokenSha256, updateId: source.updateId as number },
+    handoffId: value.handoffId, sentAtMs: value.sentAtMs };
+}
+
+function parseWakeInputCustodyEnvelope(
+  value: Record<string, unknown>, requestId: string,
+): TelegramBusEnvelope | undefined {
+  const delivery = parseTelegramBusFollowerDeliveryIdentity(value.delivery);
+  return delivery && delivery.sourceRecoveryKey && delivery.sourceClaim &&
+    typeof value.recipientInstanceId === "string" &&
+    typeof value.recipientRegistrationGeneration === "string" &&
+    typeof value.sentAtMs === "number"
+    ? { kind: "leader.wakeInputCustody", requestId,
+        recipientInstanceId: value.recipientInstanceId,
+        recipientRegistrationGeneration: value.recipientRegistrationGeneration,
+        delivery, sentAtMs: value.sentAtMs }
     : undefined;
 }
 
@@ -2578,7 +2901,8 @@ function parseAckEnvelope(
       code === "request-id-collision" ||
       code === "ledger-overloaded" ||
       code === "incompatible-protocol" ||
-      code === "stale-target"
+      code === "stale-target" ||
+      code === "workspace-binding-unavailable"
     ) {
       const chatId = value.error.chatId;
       const threadId = value.error.threadId;

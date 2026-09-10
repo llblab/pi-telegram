@@ -280,11 +280,12 @@ export type TelegramDurablePollingRuntimeAssemblyDeps<
   "appendUpdateBatch" | "getJournalEntryCount" | "signalUpdateWorker"
 > & {
   canStart?: (ctx: TContext) => boolean;
+  prepareUpdateBatch?: (updates: readonly TUpdate[]) => void;
   journal: {
     appendBatch: (
       updates: readonly TUpdate[],
       acceptedThroughUpdateId?: number,
-    ) => MaybePromise<unknown>;
+    ) => { nonExcludedUpdateIds: readonly number[] };
     getAcceptedThroughUpdateId: () => number | undefined;
     prepareCursorCutover?: () => MaybePromise<void>;
     getEntryCount: () => number;
@@ -303,7 +304,30 @@ export function createTelegramDurablePollingRuntimeAssembly<
 ): TelegramDurablePollingRuntimeAssembly<TContext> {
   const controller = createTelegramPollingControllerRuntime({
     ...deps,
-    appendUpdateBatch: deps.journal.appendBatch,
+    appendUpdateBatch(updates, cursor) {
+      const result = deps.journal.appendBatch(updates, cursor);
+      if (!deps.prepareUpdateBatch) return result;
+      // No await: an already-draining worker must not observe the new batch before preparation.
+      try {
+        const included = new Set(result.nonExcludedUpdateIds);
+        let batch: TUpdate[] = [];
+        for (const update of updates) {
+          if (included.has(update.update_id)) batch.push(update);
+          else if (batch.length > 0) {
+            deps.prepareUpdateBatch(batch);
+            batch = [];
+          }
+        }
+        if (batch.length > 0) deps.prepareUpdateBatch(batch);
+      } catch (error) {
+        try {
+          deps.recordRuntimeEvent?.("polling", error, { phase: "batch-preparation", updateCount: updates.length });
+        } catch {
+          // Already-published input must still reach the worker if diagnostics fail.
+        }
+      }
+      return result;
+    },
     getAcceptedThroughUpdateId: deps.journal.getAcceptedThroughUpdateId,
     getJournalEntryCount: deps.journal.getEntryCount,
     signalUpdateWorker: deps.journal.signalWorker,
@@ -393,7 +417,6 @@ export function createTelegramPollingControllerRuntime<
       getAcceptedThroughUpdateId: deps.getAcceptedThroughUpdateId,
       getJournalEntryCount: deps.getJournalEntryCount,
       signalUpdateWorker: deps.signalUpdateWorker,
-      prepareUpdateBatch: deps.prepareUpdateBatch,
       updateStatus: deps.updateStatus,
       sleep: deps.sleep,
       onPhaseChange(phase, currentUpdateId) {
@@ -651,6 +674,7 @@ export interface TelegramThreadCapabilityRuntimeDeps<
   getPollingStartedWithTelegramBus: () => boolean;
   setPollingStartedWithTelegramBus: (started: boolean) => void;
   setTopicModeUnavailable: (unavailable: boolean) => void;
+  suspendLiveThreadTarget?: () => void;
   stopFollowerRegistration: () => void;
   startClassicPolling: (ctx: TContext) => MaybePromise<void>;
   stopClassicPolling: () => MaybePromise<void>;
@@ -682,6 +706,8 @@ export interface TelegramThreadCapabilityStateRuntime {
   isBusRuntimeEnabled(): boolean;
   shouldForceFreshLeaderThread(): boolean;
   setForceFreshLeaderThread(forceFresh: boolean): void;
+  getRequestedThreadName(): string | undefined;
+  setRequestedThreadName(threadName: string | undefined): void;
 }
 
 export type TelegramThreadTargetObservationHandler<TContext> = (
@@ -715,6 +741,10 @@ export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
     ctx: TContext,
     owner: TOwner,
   ) => Promise<boolean | undefined>;
+  restoreFollowerWithOwner: (
+    ctx: TContext,
+    owner: TOwner,
+  ) => Promise<boolean | undefined>;
   stopFollowerRegistration: () => void;
 }
 
@@ -738,6 +768,11 @@ export interface TelegramThreadAwarePollingDeps<
     ctx: TContext,
     owner: TOwner,
   ) => Promise<boolean | undefined>;
+  restoreFollowerWithLeader?: (
+    ctx: TContext,
+    owner: TOwner,
+  ) => Promise<boolean | undefined>;
+  hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
   stopFollowerRegistration: () => void;
 }
 
@@ -760,6 +795,12 @@ export interface TelegramThreadCapabilityOrchestrationDeps<
     ctx: TContext,
     owner: TOwner,
   ) => Promise<boolean | undefined>;
+  restoreFollowerWithLeader?: (
+    ctx: TContext,
+    owner: TOwner,
+  ) => Promise<boolean | undefined>;
+  hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
+  suspendLiveThreadTarget?: () => void;
   stopFollowerRegistration: () => void;
   isTopicModeUnavailableError: (error: unknown) => boolean;
   updateStatus: (ctx: TContext) => void;
@@ -780,6 +821,7 @@ export function createTelegramThreadCapabilityStateRuntime(): TelegramThreadCapa
   let busPollingStarted = false;
   let topicModeUnavailable = false;
   let forceFreshLeaderThread = false;
+  let requestedThreadName: string | undefined;
   return {
     isBusPollingStarted: () => busPollingStarted,
     setBusPollingStarted(started) {
@@ -793,6 +835,10 @@ export function createTelegramThreadCapabilityStateRuntime(): TelegramThreadCapa
     shouldForceFreshLeaderThread: () => forceFreshLeaderThread,
     setForceFreshLeaderThread(forceFresh) {
       forceFreshLeaderThread = forceFresh;
+    },
+    getRequestedThreadName: () => requestedThreadName,
+    setRequestedThreadName(threadName) {
+      requestedThreadName = threadName;
     },
   };
 }
@@ -818,6 +864,7 @@ export function createTelegramThreadCapabilityOrchestration<TContext, TOwner>(
     getPollingStartedWithTelegramBus: deps.state.isBusPollingStarted,
     setPollingStartedWithTelegramBus: deps.state.setBusPollingStarted,
     setTopicModeUnavailable: deps.state.setTopicModeUnavailable,
+    suspendLiveThreadTarget: deps.suspendLiveThreadTarget,
     stopFollowerRegistration: deps.stopFollowerRegistration,
     startClassicPolling: deps.startClassicPolling,
     stopClassicPolling: deps.stopClassicPolling,
@@ -850,6 +897,8 @@ export function createTelegramThreadCapabilityOrchestration<TContext, TOwner>(
       startLeaderHealth: deps.startLeaderHealth,
       stopLeaderHealth: deps.stopLeaderHealth,
       registerFollowerWithLeader: deps.registerFollowerWithLeader,
+      restoreFollowerWithLeader: deps.restoreFollowerWithLeader,
+      hasRememberedWorkspaceBinding: deps.hasRememberedWorkspaceBinding,
       stopFollowerRegistration: deps.stopFollowerRegistration,
       recordEvent: deps.recordEvent,
       setTopicModeUnavailable: deps.state.setTopicModeUnavailable,
@@ -958,14 +1007,16 @@ export async function applyTelegramThreadCapability<TContext>(
     if (!isCurrent()) return;
     deps.setTopicModeUnavailable(true);
     deps.stopFollowerRegistration();
+    const hadLiveThreadTransport = deps.getPollingStartedWithTelegramBus();
     if (
-      deps.getPollingStartedWithTelegramBus() ||
+      hadLiveThreadTransport ||
       hasTelegramClassicRestoreFailure(previousBotState)
     ) {
       deps.stopLeaderHealth();
       await deps.stopBusPolling();
       if (!isCurrent()) return;
       deps.setPollingStartedWithTelegramBus(false);
+      if (hadLiveThreadTransport) deps.suspendLiveThreadTarget?.();
       try {
         await deps.startClassicPolling(ctx);
         if (!isCurrent()) return;
@@ -1110,24 +1161,34 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
     }
     await deps.stopClassicPolling();
   };
-  const registerFollowerWithOwner = async (
-    ctx: TContext,
-    owner: TOwner,
-  ): Promise<boolean | undefined> => {
+  const refreshFollowerState = async (): Promise<boolean> => {
     if (deps.topicTargetStore.refresh) {
       await deps.topicTargetStore.refresh();
     } else {
       await deps.topicTargetStore.load();
     }
-    if (deps.topicTargetStore.getBotState().threadMode !== "enabled") {
-      return undefined;
-    }
+    return deps.topicTargetStore.getBotState().threadMode === "enabled";
+  };
+  const registerFollowerWithOwner = async (
+    ctx: TContext,
+    owner: TOwner,
+  ): Promise<boolean | undefined> => {
+    if (!(await refreshFollowerState())) return undefined;
     return deps.registerFollowerWithLeader(ctx, owner);
+  };
+  const restoreFollowerWithOwner = async (
+    ctx: TContext,
+    owner: TOwner,
+  ): Promise<boolean | undefined> => {
+    if (!(await refreshFollowerState())) return undefined;
+    if (!deps.hasRememberedWorkspaceBinding?.(ctx)) return undefined;
+    return deps.restoreFollowerWithLeader?.(ctx, owner);
   };
   return {
     startPolling,
     stopPolling,
     registerFollowerWithOwner,
+    restoreFollowerWithOwner,
     stopFollowerRegistration: deps.stopFollowerRegistration,
   };
 }
@@ -1179,9 +1240,9 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
   let consecutiveDisabledProbes = 0;
   const stop = (): void => {
     generation += 1;
-    deps.lifecycle?.invalidate();
     if (interval) clearInterval(interval);
     interval = undefined;
+    deps.lifecycle?.invalidate();
   };
   const check = (ctx: TContext): void => {
     if (transitionPromise || !canProbeTelegramThreadCapability(ctx, deps)) {
@@ -1276,8 +1337,19 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
   return {
     start(ctx) {
       stop();
+      const expectedGeneration = generation;
       interval = setInterval(() => {
-        check(ctx);
+        if (generation !== expectedGeneration) return;
+        try {
+          check(ctx);
+        } catch (error) {
+          try { stop(); } catch { /* Timer shutdown must not escape the callback. */ }
+          try {
+            deps.recordEvent("bus", error, { phase: "capability-monitor" });
+          } catch {
+            // Monitor diagnostics cannot create an uncaught interval exception.
+          }
+        }
       }, intervalMs);
       interval.unref?.();
     },
@@ -1416,7 +1488,6 @@ export interface TelegramPollLoopDeps<
   getAcceptedThroughUpdateId?: () => number | undefined;
   getJournalEntryCount: () => number;
   signalUpdateWorker: () => void;
-  prepareUpdateBatch?: (updates: readonly TUpdate[]) => void;
   onErrorStatus: (message: string) => void;
   onStatusReset: () => void;
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -1446,7 +1517,6 @@ export interface TelegramPollLoopRunnerDeps<
   getAcceptedThroughUpdateId?: () => number | undefined;
   getJournalEntryCount: () => number;
   signalUpdateWorker: () => void;
-  prepareUpdateBatch?: (updates: readonly TUpdate[]) => void;
   updateStatus: (ctx: TContext, message?: string) => void;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   onPhaseChange?: (
@@ -1501,7 +1571,6 @@ export function createTelegramPollLoopRunner<
       getAcceptedThroughUpdateId: deps.getAcceptedThroughUpdateId,
       getJournalEntryCount: deps.getJournalEntryCount,
       signalUpdateWorker: deps.signalUpdateWorker,
-      prepareUpdateBatch: deps.prepareUpdateBatch,
       onErrorStatus: (message) => {
         updateTelegramPollingStatusSafely(deps.updateStatus, ctx, {
           message,
@@ -1702,7 +1771,6 @@ export async function runTelegramPollLoop<
       reportTelegramPollingPhase(deps, "long-poll");
       const updates = await requestTelegramUpdatesWithinBudget(deps, request);
       reportTelegramPollingResponse(deps, updates.length);
-      deps.prepareUpdateBatch?.(updates);
       consecutiveGetUpdatesConflicts = 0;
       currentUpdateId = updates[0]?.update_id;
       await admitTelegramPollingUpdateBatch({

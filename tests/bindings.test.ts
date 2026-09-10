@@ -19,6 +19,7 @@ import {
   registerTelegramLifecycleRuntimeHooks,
 } from "../lib/bindings.ts";
 import * as Activity from "../lib/activity.ts";
+import * as Config from "../lib/config.ts";
 import * as Bus from "../lib/bus.ts";
 import * as BusApi from "../lib/bus-api.ts";
 import * as BusFollower from "../lib/bus-follower.ts";
@@ -542,7 +543,7 @@ for (const replaceRegistration of [false, true]) {
         }).catch((error) => failures.push(error));
       }
       await new Promise<void>((resolve) => setImmediate(resolve));
-      const prefix = preparation === "attachment" ? ["Final caption"] : [];
+      const prefix: string[] = [];
       assert.deepEqual(committed, prefix);
       if (replaceRegistration) {
         generation = "registration-2";
@@ -552,7 +553,9 @@ for (const replaceRegistration of [false, true]) {
       await binding.publicationRuntime.enqueue(async () => {});
       const expected = preparation === "text"
         ? ["Prepared final", "tool"]
-        : [...prefix, preparation === "voice" ? "sendVoice" : "sendDocument", "tool", "Following notice"];
+        : preparation === "attachment"
+          ? ["sendDocument", "Final caption", "tool", "Following notice"]
+          : ["sendVoice", "tool", "Following notice"];
       assert.deepEqual(committed, replaceRegistration ? prefix : expected);
       assert.equal(requestId, replaceRegistration ? prefix.length : expected.length);
       assert.equal(failures.length, replaceRegistration && preparation === "text" ? 1 : 0);
@@ -808,6 +811,58 @@ test("Command binding does not expose a thread rename tool", () => {
   assert.equal(harness.tools.has("telegram_rename_thread"), false);
 });
 
+test("Command binding scopes a requested Thread name to one polling start", async () => {
+  const harness = createBindingApiHarness();
+  let requestedThreadName: string | undefined;
+  const observed: Array<string | undefined> = [];
+  registerTelegramCommandsAndTools({
+    pi: harness.api,
+    configStore: {
+      get: () => ({ botToken: "token" }),
+      getStoredConfig: () => ({ botToken: "token" }),
+      getActiveProfileName: () => undefined,
+      activateProfile: () => true,
+      getAllowedUserId: () => 840585,
+      getOutboundHandlers: () => [],
+      hasBotToken: () => true,
+      load: async () => {},
+      persist: async () => {},
+      set: () => {},
+    },
+    setup: { start: () => true, finish: () => {} },
+    activeTurnRuntime: { get: () => undefined },
+    lockedPollingRuntime: {
+      start: async () => {
+        observed.push(requestedThreadName);
+        return { ok: true };
+      },
+      stop: async () => undefined,
+    },
+    setRequestedThreadNameForPollingStart(threadName: string | undefined) {
+      requestedThreadName = threadName;
+    },
+    getStatusLines: () => [],
+    buttonActionStore: { register: () => "button-action" },
+    sendMarkdownReply: async () => 1,
+    callMultipart: async () => ({ ok: true }),
+    getDefaultChatId: () => 840585,
+    canSendDirect: () => true,
+    updateStatus: () => {},
+    recordRuntimeEvent: () => {},
+  } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
+  const connect = harness.commands.get("telegram-connect") as {
+    handler: (args: string, ctx: ExtensionContext) => Promise<void>;
+  };
+
+  await connect.handler("as=Navigator", {
+    cwd: "/repo",
+    ui: { notify: () => undefined },
+  } as unknown as ExtensionContext);
+
+  assert.deepEqual(observed, ["Navigator"]);
+  assert.equal(requestedThreadName, undefined);
+});
+
 test("Command binding rejects a missing profile without stopping active polling", async () => {
   const harness = createBindingApiHarness();
   const events: string[] = [];
@@ -1030,6 +1085,51 @@ test("Named profile setup cancellation preserves the active runtime", async () =
   assert.equal(activeProfileName, "active");
   assert.deepEqual(events, ["guard-start", "guard-finish"]);
   assert.deepEqual(notifications, []);
+});
+
+test("Named setup preserves a display preference changed while the token form was open", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-setup-display-"));
+  const configPath = join(dir, "telegram.json");
+  const store = Config.createTelegramConfigStore({ agentDir: dir, configPath, initialConfig: {
+    profiles: { default: { botToken: "default-token" },
+      work: { botToken: "old-token", threadDisplayMode: "letters" } },
+  } });
+  await store.persist();
+  t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
+    ok: true, result: { id: 123, username: "testbot" },
+  }), { headers: { "content-type": "application/json" } }));
+  const harness = createBindingApiHarness();
+  registerTelegramCommandsAndTools({
+    pi: harness.api, configStore: store, persistConfig: store.persist,
+    setup: { start: () => true, finish() {} }, activeTurnRuntime: { get: () => undefined },
+    lockedPollingRuntime: { start: async () => ({ ok: true }), stop: async () => "stopped" },
+    getStatusLines: () => [], buttonActionStore: { register: () => "button-action" },
+    sendMarkdownReply: async () => 1, callMultipart: async () => ({ ok: true }),
+    getDefaultChatId: () => 7, canSendDirect: () => true, updateStatus() {}, recordRuntimeEvent() {},
+  } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
+  try {
+    const setupCommand = harness.commands.get("telegram-setup") as {
+      handler(args: string, ctx: ExtensionContext): Promise<void>;
+    };
+    await setupCommand.handler("work", {
+      cwd: "/repo", hasUI: true,
+      ui: {
+        async editor() {
+          const other = Config.createTelegramConfigStore({ agentDir: dir, configPath });
+          await other.load(); other.activateProfile("work");
+          await Config.setTelegramThreadDisplayMode(other, "directories", () => true);
+          return "new-token";
+        },
+        async input() { return "new-token"; }, notify() {},
+      },
+    } as unknown as ExtensionContext);
+    const saved = await Config.readTelegramConfig(configPath);
+    assert.equal(saved.profiles?.work.botToken, "new-token");
+    assert.equal(saved.profiles?.work.threadDisplayMode, "directories");
+    assert.equal(store.getActiveProfileName(), "work");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("Lifecycle binding disconnects only graceful quit and preserves cleanup after failure", async () => {

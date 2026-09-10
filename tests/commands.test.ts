@@ -20,6 +20,9 @@ import {
   buildTelegramCommandAction,
   isTelegramReservedCommandName,
   formatTelegramCommandEmojiPrefix,
+  formatTelegramInvalidInstanceName,
+  formatTelegramPiCommandHtml,
+  formatTelegramThreadDisplayNameSavedHeading,
   createTelegramAppMenuHtmlBuilder,
   createTelegramBotCommandRegistrar,
   createTelegramCommandControlEnqueueAdapter,
@@ -42,6 +45,7 @@ import {
   handleTelegramStatusCommand,
   handleTelegramStopCommand,
   parseTelegramCommand,
+  parseTelegramRequestedThreadName,
   registerTelegramBotCommands,
   registerTelegramCommand,
   registerTelegramBridgeCommands,
@@ -99,14 +103,53 @@ function createBridgeCommandContext(
   } as unknown as ExtensionCommandContext;
 }
 
+test("Thread display-name headings escape printable-ASCII markup", () => {
+  assert.equal(
+    formatTelegramThreadDisplayNameSavedHeading("wasd<&>"),
+    "<b>✅ Thread display name saved as <i>wasd&lt;&amp;&gt;</i>.</b>",
+  );
+});
+
+test("Invalid instance-name guidance bolds only its heading", () => {
+  assert.equal(
+    formatTelegramInvalidInstanceName(
+      "Invalid Telegram instance name: it is empty after trimming; use A.",
+    ),
+    "<b>⚠️ Invalid Thread Display Name:</b>\n\n• It is empty after trimming.\n• Use A.",
+  );
+});
+
 test("Command helpers expose Telegram bot command definitions", () => {
   assert.deepEqual(TELEGRAM_COMMAND_EMOJI.model, "🤖");
   assert.deepEqual(TELEGRAM_COMMAND_EMOJI.thinking, "🧠");
   assert.equal(formatTelegramCommandEmojiPrefix("model"), "🤖 ");
+  assert.equal(
+    formatTelegramPiCommandHtml("/telegram-connect <profile>"),
+    "<code>/telegram-connect &lt;profile&gt;</code>",
+  );
+  for (const command of [
+    "start",
+    "compact",
+    "next",
+    "continue",
+    "abort",
+    "stop",
+  ]) {
+    assert.match(TELEGRAM_APP_MENU_INTRO_HTML, new RegExp(` /${command} —`));
+  }
+  assert.match(TELEGRAM_APP_MENU_INTRO_HTML, / \/name Name —/);
+  assert.doesNotMatch(
+    TELEGRAM_APP_MENU_INTRO_HTML,
+    /<code>\/(?:start|compact|next|continue|abort|stop|name)<\/code>/,
+  );
   const expectedBuiltins = [
     {
       command: "start",
       description: "🟢 Open menu / Pair bridge",
+    },
+    {
+      command: "name",
+      description: "🏷️ Rename this thread",
     },
     { command: "compact", description: "🗜 Compact current session" },
     {
@@ -202,10 +245,9 @@ test("Command helpers register extension Telegram bot commands when visible", as
   });
   assert.deepEqual(calls, [
     [
-      TELEGRAM_BOT_COMMANDS[0],
-      TELEGRAM_BOT_COMMANDS[1],
+      ...TELEGRAM_BOT_COMMANDS.slice(0, 3),
       { command: "new", description: "🆕 Start fresh" },
-      ...TELEGRAM_BOT_COMMANDS.slice(2),
+      ...TELEGRAM_BOT_COMMANDS.slice(3),
     ],
   ]);
   dispose();
@@ -288,6 +330,76 @@ test("Command helpers register pi setup and status commands", async () => {
   );
   assert.deepEqual(events, ["setup"]);
   assert.deepEqual(notifications, ["bot: @demo\npolling: stopped"]);
+  assert.equal(harness.commands.has("telegram-name"), false);
+});
+
+test("Connect requests an optional fresh Workspace Thread name", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const starts: Array<Record<string, unknown> | undefined> = [];
+  const activations: string[] = [];
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async (_ctx, options) => {
+      starts.push(options as Record<string, unknown> | undefined);
+      return { ok: true };
+    },
+    stopPolling: async () => {},
+    updateStatus: () => {},
+    activateDefaultProfileConfig: async () => {
+      activations.push("default");
+    },
+    activateProfileConfig: async (_ctx, profileName) => {
+      activations.push(profileName);
+      return true;
+    },
+  });
+  const connect = getRequiredCommand(harness.commands, "telegram-connect");
+  const ctx = createBridgeCommandContext();
+
+  await connect.handler("as=Flightprice", ctx);
+  await connect.handler("work as=Navigator", ctx);
+
+  assert.deepEqual(activations, ["default", "work"]);
+  assert.equal(starts[0]?.requestedThreadName, "Flightprice");
+  assert.equal(starts[1]?.requestedThreadName, "Navigator");
+  assert.equal(parseTelegramRequestedThreadName("work as=Navigator"), "Navigator");
+});
+
+test("Connect rejects an invalid requested Workspace Thread name before startup", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const notifications: string[] = [];
+  let starts = 0;
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async () => {
+      starts += 1;
+    },
+    stopPolling: async () => {},
+    validateThreadName: (threadName) =>
+      threadName === "bad-name" ? "Invalid Workspace Thread name." : undefined,
+    updateStatus: () => {},
+  });
+
+  const connect = getRequiredCommand(harness.commands, "telegram-connect");
+  const ctx = createBridgeCommandContext((message) =>
+    notifications.push(message),
+  );
+  await connect.handler("as=bad-name", ctx);
+  await connect.handler("as=", ctx);
+  await connect.handler("as=Navigator as=Voyager", ctx);
+
+  assert.equal(starts, 0);
+  assert.deepEqual(notifications, [
+    "Invalid Workspace Thread name.",
+    "Usage: /telegram-connect [profile] as=Flightprice",
+    "Specify at most one as=Name Workspace Thread name.",
+  ]);
 });
 
 test("Bare and explicit default setup/connect commands select the same profile", async () => {
@@ -1131,7 +1243,7 @@ test("Next command falls back to the command when the active turn has no reply t
   assert.equal(dispatched, false);
   assert.deepEqual(replies, [
     {
-      text: "<b>⏩ Operation aborted. Dispatching next queued turn.</b>",
+      text: "<b>⏩ Dispatching next queued turn.</b>",
       parseMode: "HTML",
     },
   ]);
@@ -1169,7 +1281,7 @@ test("Next command snapshots its active-turn reply before aborting", async () =>
   assert.deepEqual(events, ["snapshot", "abort"]);
   assert.deepEqual(commandReplies, []);
   assert.deepEqual(activeTurnReplies, [
-    "<b>⏩ Operation aborted. Dispatching next queued turn.</b>",
+    "<b>⏩ Dispatching next queued turn.</b>",
   ]);
 });
 
@@ -1315,9 +1427,8 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
     openThinkingMenu: async () => {},
     openQueueMenu: async () => {},
     getAllowedUserId: () => 1,
-    setAllowedUserId: () => {},
+    persistAllowedUserId: async () => true,
     registerBotCommands: async () => {},
-    persistConfig: async () => {},
     sendTextReply: async () => {},
     sendInteractiveMessage: async (
       chatId,
@@ -1667,16 +1778,53 @@ test("Command handler target runtime binds command targets into command handling
     openModelMenu: async () => {},
     openThinkingMenu: async () => {},
     openQueueMenu: async () => {},
+    validateThreadName: (name) => name === "bad" ? "Invalid name." : undefined,
+    renameCurrentThread: async (_target, name) => {
+      calls.push(`rename:${name}`);
+      return { ok: true, threadName: name };
+    },
+    resetCurrentThreadName: async () => {
+      calls.push("reset-name");
+      return { ok: true, threadName: "A" };
+    },
+    openThreadNameDialog: async () => {
+      calls.push("name-dialog");
+    },
     getAllowedUserId: () => 7,
-    setAllowedUserId: () => {},
+    persistAllowedUserId: async () => true,
     setMyCommands: async () => {},
-    persistConfig: async () => {},
     sendTextReply: async (_chatId, _replyToMessageId, text) => {
       calls.push(`reply:${text}`);
     },
   });
   assert.equal(
     await handleCommand("status", { chat: { id: 7 }, message_id: 11 }, "ctx"),
+    true,
+  );
+  assert.equal(
+    await handleCommand(
+      "name",
+      { chat: { id: 7 }, message_id: 12 },
+      "ctx",
+      "Navigator",
+    ),
+    true,
+  );
+  assert.equal(
+    await handleCommand(
+      "name",
+      { chat: { id: 7 }, message_id: 13 },
+      "ctx",
+      "A",
+    ),
+    true,
+  );
+  assert.equal(
+    await handleCommand(
+      "name",
+      { chat: { id: 7 }, message_id: 14 },
+      "ctx",
+    ),
     true,
   );
   assert.equal(
@@ -1691,7 +1839,15 @@ test("Command handler target runtime binds command targets into command handling
     ),
     true,
   );
-  assert.deepEqual(calls, ["show:ctx", "show:ctx"]);
+  assert.deepEqual(calls, [
+    "show:ctx",
+    "rename:Navigator",
+    "reply:<b>✅ Thread display name saved as <i>Navigator</i>.</b>",
+    "reset-name",
+    "reply:<b>✅ Automatic Thread display name restored as <i>A</i>.</b>",
+    "name-dialog",
+    "show:ctx",
+  ]);
 });
 
 test("Command runtime routes commands through runtime ports", async () => {
@@ -1783,20 +1939,30 @@ test("Command runtime routes commands through runtime ports", async () => {
       events.push(`queue:${nextMessage.chat.id}`);
     },
     getAllowedUserId: () => allowedUserId,
-    setAllowedUserId: (userId: number) => {
+    persistAllowedUserId: async (userId: number) => {
+      events.push(`pair:${userId}`, "persist");
       allowedUserId = userId;
-      events.push(`pair:${userId}`);
+      return true;
     },
     registerBotCommands: async () => {
       events.push("register");
-    },
-    persistConfig: async () => {
-      events.push("persist");
     },
     sendTextReply: async (nextMessage: typeof message, text: string) => {
       events.push(`reply:${nextMessage.message_id}:${text}`);
     },
   };
+  for (const failedPublication of [true, false]) {
+    const blocked = createTelegramCommandHandler({ ...deps,
+      persistAllowedUserId: async () => {
+        if (failedPublication) throw new Error("pairing publication failed");
+        return false;
+      },
+    });
+    if (failedPublication) await assert.rejects(blocked("start", message, { idle: true }), /pairing publication failed/);
+    else assert.equal(await blocked("start", message, { idle: true }), true);
+    assert.deepEqual(events, [], "Rejected pairing must not schedule menu, status, or command synchronization");
+    assert.equal(allowedUserId, undefined);
+  }
   const handleCommand = createTelegramCommandHandler(deps);
   assert.equal(await handleCommand("status", message, { idle: true }), true);
   assert.equal(await handleCommand("model", message, { idle: true }), true);
@@ -1890,18 +2056,16 @@ test("Command admission advances polling while start-menu effects remain unsettl
     openThinkingMenu: async () => {},
     openQueueMenu: async () => {},
     getAllowedUserId: () => allowedUserId,
-    setAllowedUserId: (userId: number) => {
+    persistAllowedUserId: async (userId: number) => {
+      events.push(`pair:${userId}`, "persist");
       allowedUserId = userId;
-      events.push(`pair:${userId}`);
+      return true;
     },
     registerBotCommands: async () => {
       events.push("register");
       await new Promise<void>((_resolve, reject) => {
         failRegistration = reject;
       });
-    },
-    persistConfig: async () => {
-      events.push("persist");
     },
     sendTextReply: async (_message: typeof message, text: string) => {
       events.push(`reply:${text}`);
@@ -1975,8 +2139,8 @@ test("Command or prompt runtime routes commands before enqueue fallback", async 
   >({
     extractRawText: (messages) =>
       messages.map((message) => message.text).join(" "),
-    handleCommand: async (commandName, message, ctx) => {
-      events.push(`command:${commandName ?? "none"}:${message.text}:${ctx.id}`);
+    handleCommand: async (commandName, message, ctx, args) => {
+      events.push(`command:${commandName ?? "none"}:${args ?? "none"}:${message.text}:${ctx.id}`);
       return commandName === "status";
     },
     executeExtensionCommand: async (command, message, ctx) => {
@@ -1998,13 +2162,13 @@ test("Command or prompt runtime routes commands before enqueue fallback", async 
   await runtime.dispatchMessages([{ text: "hello" }], { id: "ctx" });
   await runtime.dispatchMessages([], { id: "ctx" });
   assert.deepEqual(events, [
-    "command:status:/status:ctx",
-    "command:review:/review staged:ctx",
+    "command:status::/status:ctx",
+    "command:review:staged:/review staged:ctx",
     "extension:review:staged:/review staged:ctx",
-    "command:fix_tests:/fix_tests now:ctx",
+    "command:fix_tests:now:/fix_tests now:ctx",
     "extension:fix_tests:now:/fix_tests now:ctx",
     "enqueue:1:/fix_tests now:ctx",
-    "command:none:hello:ctx",
+    "command:none:none:hello:ctx",
     "enqueue:1:hello:ctx",
   ]);
 });
@@ -2098,6 +2262,9 @@ test("Command helpers execute command actions through provided handlers", async 
     handleStop: async () => {
       events.push("stop");
     },
+    handleName: async (_message: unknown, _ctx: unknown, name: string) => {
+      events.push(`name:${name}`);
+    },
     handleCompact: async () => {
       events.push("compact");
     },
@@ -2146,6 +2313,16 @@ test("Command helpers execute command actions through provided handlers", async 
   );
   assert.equal(
     await executeTelegramCommandAction(
+      { kind: "name", executionMode: "immediate" },
+      {},
+      {},
+      deps,
+      "Navigator",
+    ),
+    true,
+  );
+  assert.equal(
+    await executeTelegramCommandAction(
       { kind: "help", commandName: "start", executionMode: "immediate" },
       {},
       {},
@@ -2153,5 +2330,5 @@ test("Command helpers execute command actions through provided handlers", async 
     ),
     true,
   );
-  assert.deepEqual(events, ["stop", "help:start"]);
+  assert.deepEqual(events, ["stop", "name:Navigator", "help:start"]);
 });

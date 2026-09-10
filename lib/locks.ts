@@ -1108,6 +1108,7 @@ export function createTelegramDirectDeliveryOwnershipChecker<
 export interface TelegramLockedPollingStartOptions {
   force?: boolean;
   forceFreshLeaderThread?: boolean;
+  requestedThreadName?: string;
   election?: { expectedOwner?: TelegramLockEntry };
   onAcquired?: () => Promise<void> | void;
 }
@@ -1131,6 +1132,10 @@ export interface TelegramLockedPollingRuntime<
     ctx: TContext,
     owner: TelegramLockEntry,
   ) => boolean | undefined | Promise<boolean | undefined>;
+  restoreFollowerWithOwner?: (
+    ctx: TContext,
+    owner: TelegramLockEntry,
+  ) => boolean | undefined | Promise<boolean | undefined>;
   stopFollowerRegistration?: () => void;
 }
 
@@ -1148,6 +1153,10 @@ export interface TelegramLockedPollingRuntimeDeps<
   ) => void | Promise<void>;
   stopPolling: () => Promise<void>;
   registerFollowerWithOwner?: (
+    ctx: TContext,
+    owner: TelegramLockEntry,
+  ) => boolean | undefined | Promise<boolean | undefined>;
+  restoreFollowerWithOwner?: (
     ctx: TContext,
     owner: TelegramLockEntry,
   ) => boolean | undefined | Promise<boolean | undefined>;
@@ -1198,6 +1207,7 @@ export function createTelegramLockedPollingRuntime<
     stopOwnershipWatcher();
     if (sessionAutoStartRun) {
       await sessionAutoStartRun;
+      deps.stopFollowerRegistration?.();
     }
     if (ownershipStop) {
       await ownershipStop;
@@ -1452,10 +1462,14 @@ export function createTelegramLockedPollingRuntime<
       const canHandoffSameProcess =
         state?.kind === "active-here" &&
         (!state.lock.cwd || state.lock.cwd === ctx.cwd);
+      const canRestoreRememberedFollower =
+        state?.kind === "active-elsewhere" &&
+        deps.restoreFollowerWithOwner !== undefined;
       if (
         !ownsCurrentLock &&
         !canResumeStaleSameCwd &&
-        !canHandoffSameProcess
+        !canHandoffSameProcess &&
+        !canRestoreRememberedFollower
       ) {
         return;
       }
@@ -1466,11 +1480,27 @@ export function createTelegramLockedPollingRuntime<
       const startedAtMs = Date.now();
       deps.recordRuntimeEvent?.("lock", "Telegram auto-start scheduled", {
         phase: "auto-start-scheduled",
+        mode: canRestoreRememberedFollower ? "follower-restore" : "leader",
       });
       const run = (async () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
         if (ownershipStop) await ownershipStop;
         if (!isCurrent()) return;
+        if (canRestoreRememberedFollower && state?.kind === "active-elsewhere") {
+          const restored = await deps.restoreFollowerWithOwner?.(
+            ctx,
+            state.lock,
+          );
+          if (!isCurrent() || !restored) return;
+          deps.onTransportAvailabilityChanged?.();
+          deps.updateStatus(ctx);
+          deps.recordRuntimeEvent?.(
+            "bus",
+            "Telegram follower auto-connect completed",
+            { phase: "follower-auto-connect" },
+          );
+          return;
+        }
         if (canResumeStaleSameCwd || canHandoffSameProcess) {
           const acquired = deps.lock.acquire(
             ctx,
@@ -1503,6 +1533,13 @@ export function createTelegramLockedPollingRuntime<
           const registered = await deps.registerFollowerWithOwner?.(ctx, owner);
           if (registered) deps.updateStatus(ctx);
           return registered === true;
+        }
+      : undefined,
+    restoreFollowerWithOwner: deps.restoreFollowerWithOwner
+      ? async (ctx, owner) => {
+          const restored = await deps.restoreFollowerWithOwner?.(ctx, owner);
+          if (restored) deps.updateStatus(ctx);
+          return restored === true;
         }
       : undefined,
     stopFollowerRegistration: deps.stopFollowerRegistration,

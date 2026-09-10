@@ -7,7 +7,7 @@ Read this reference only for explicit local/TUI Telegram delivery, cross-target 
 Use `telegram_message` only when the user explicitly requests Telegram delivery from local/TUI or names a concrete different Telegram target.
 
 - Omitted target selects the paired/default target only outside an active Telegram turn.
-- `chat_id` plus optional `thread_id` selects an explicit Bot API target.
+- `chat_id` plus optional `thread_id` selects an explicit Bot API target. A public `@username`, or an exact negative numeric channel ID with `channel: true`, uses `chat_id` without `thread_id`; channel delivery requires the direct leader, and Telegram enforces the bot's posting permission.
 - `thread` selects another live Pi Thread by case-insensitive name or numeric id and admits one attributed turn there.
 - During an active Telegram turn, answer the current target normally; direct delivery to that same target is rejected.
 - Direct delivery requires this Pi instance to own transport or hold a live Threaded Mode registration.
