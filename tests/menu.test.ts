@@ -1800,7 +1800,7 @@ test("Queue menu keeps main-menu navigation on top", async () => {
   assert.equal(markups[0]?.inline_keyboard[0]?.[0]?.callback_data, "menu:back");
   assert.equal(markups[1]?.inline_keyboard[0]?.[0]?.callback_data, "menu:back");
   assert.deepEqual(markups[0]?.inline_keyboard[1], [
-    { text: "🌀 Refresh", callback_data: "queue:refresh" },
+    { text: "🔄 Refresh", callback_data: "queue:refresh" },
   ]);
   assert.equal(
     markups[0]?.inline_keyboard[2]?.[0]?.text,
@@ -1828,7 +1828,7 @@ test("Queue menu keeps main-menu navigation on top", async () => {
   );
   assert.deepEqual(markups[5]?.inline_keyboard, [
     [{ text: "⬆️ Main menu", callback_data: "menu:back" }],
-    [{ text: "🌀 Refresh", callback_data: "queue:refresh:1" }],
+    [{ text: "🔄 Refresh", callback_data: "queue:refresh:1" }],
   ]);
   assert.equal(texts[0], "<b>⏳ Queue:</b>");
   assert.equal(
