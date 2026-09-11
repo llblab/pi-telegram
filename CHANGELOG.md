@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.45.3: Thread Display Names Hotfix
+
+- `Thread Display Names`: Settings again offers the dictionary naming mode as the second chooser between Letters and Directories. Names shows each Workspace's generated slot-letter palette word, such as `Anchor` for slot `A`; switching renames live tabs and fresh tabs start under the active projection. `profiles.<name>.threadDisplayMode` persists all three values, absent or invalid ones resolve to Letters, and Names works with legacy followers that predate `thread-display-mode-v1`.
+
 ## 0.45.2: Provider-Compatible Bind Schema Hotfix
 
 - `Provider-Compatible Bind Argument`: Serializes the `telegram_bind` `argument` schema as an inline builder-made JSON-value union bounded to four container levels, with no `$ref`/`$defs` recursion or raw TypeBox marker leakage; OpenAI no longer rejects every request with "Recursive JSON schemas are not currently supported" (#273) and Gemini no longer rejects the unknown `~optional` field (#269) while the tool is registered.

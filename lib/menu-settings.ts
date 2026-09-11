@@ -182,6 +182,7 @@ export function buildThreadDisplaySettingsText(mode: TelegramThreadDisplayMode):
     "Choose how this bot profile labels Telegram tabs and Pi terminal status. Each slot is unique across this bot profile.",
     "",
     "<code>-</code> <code>letters</code> (default): show the unique slot, such as <b><i>A</i></b> or <b><i>B</i></b>.",
+    "<code>-</code> <code>names</code>: show the generated dictionary name for the slot, such as <b><i>Anchor</i></b> or <b><i>Briar</i></b>.",
     "<code>-</code> <code>directories</code>: show the directory, such as <b><i>extensions</i></b>; shared Workspaces keep slot suffixes, such as <b><i>extensions_a</i></b> and <b><i>extensions_c</i></b>.",
     "A manual <code>/name Name</code> overrides this Thread display name until reset.",
   ].join("\n");
@@ -414,7 +415,7 @@ export async function openTelegramSettingsMenu<
 export function buildThreadDisplaySettingsReplyMarkup(mode: TelegramThreadDisplayMode): TelegramSettingsMenuReplyMarkup {
   return { inline_keyboard: [
     [{ text: "⬆️ Back", callback_data: "settings:list" }],
-    ...(["letters", "directories"] as const).map((value) => [{
+    ...(["letters", "names", "directories"] as const).map((value) => [{
       text: `${mode === value ? "🟢 " : ""}${value}`,
       callback_data: `settings:set:thread-display:${value}`,
     }]),

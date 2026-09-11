@@ -232,7 +232,7 @@ Rules:
 - Explain what the setting does and what the options mean only as much as needed.
 - Order setting value descriptions exactly like the chooser: rows top-to-bottom and values in a shared row left-to-right. Keep `(default)` on the actual default wherever it falls; default status never changes order.
 - Keep descriptions short and clear.
-- Automatic Thread display uses the same setting card: current value in `<code>`, then descriptions ordered `letters`, `directories`, with `(default)` only on `letters`. Its vertical chooser marks only the current option. A manual `/name Name` sets the current Thread display name and supersedes either automatic projection until reset; switching automatic mode preserves the slot and override.
+- Automatic Thread display uses the same setting card: current value in `<code>`, then descriptions ordered `letters`, `names`, `directories`, with `(default)` only on `letters`. Its vertical chooser marks only the current option. A manual `/name Name` sets the current Thread display name and supersedes any automatic projection until reset; switching automatic mode preserves the slot and override.
 
 Examples:
 

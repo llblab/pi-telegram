@@ -48,13 +48,13 @@ function getSettingsControlOrder(markup: {
     });
 }
 
-test("Thread display Settings offer the two automatic modes and gate mutation", async () => {
+test("Thread display Settings offer the three automatic modes and gate mutation", async () => {
   const markup = buildThreadDisplaySettingsReplyMarkup("letters");
   const root = buildTelegramSettingsMenuReplyMarkup(true, "rich", "manual", "hidden", undefined, false, false, "verbose", "names");
   assert.ok(root.inline_keyboard.flat().some((button) => button.callback_data === "settings:open:thread-display"));
   const classic = buildTelegramSettingsMenuReplyMarkup(true, "rich", "manual", "hidden");
   assert.equal(classic.inline_keyboard.flat().some((button) => button.callback_data === "settings:open:thread-display"), false);
-  assert.deepEqual(getSettingsControlOrder(markup), ["letters", "directories"]);
+  assert.deepEqual(getSettingsControlOrder(markup), ["letters", "names", "directories"]);
   assert.equal(markup.inline_keyboard[1][0].text, "🟢 letters");
   const calls: string[] = [];
   let currentMode: "letters" | "names" | "directories" = "names";
@@ -84,6 +84,10 @@ test("Thread display Settings offer the two automatic modes and gate mutation", 
   await handleTelegramSettingsMenuCallbackAction("q", "settings:set:thread-display:directories", deps);
   assert.deepEqual(calls, ["set:directories", "update", "ack"]);
   assert.equal(renderedText, buildThreadDisplaySettingsText("directories"));
+  calls.length = 0;
+  await handleTelegramSettingsMenuCallbackAction("q", "settings:set:thread-display:names", deps);
+  assert.deepEqual(calls, ["set:names", "update", "ack"]);
+  assert.equal(renderedText, buildThreadDisplaySettingsText("names"));
   calls.length = 0;
   fail = true;
   await handleTelegramSettingsMenuCallbackAction("q", "settings:set:thread-display:letters", deps);
@@ -141,7 +145,7 @@ test("Settings descriptions follow visible control order", () => {
 });
 
 test("Thread display detail follows the setting-card style and marks only the current option", () => {
-  const values = ["letters", "directories"] as const;
+  const values = ["letters", "names", "directories"] as const;
   for (const mode of values) {
     const text = buildThreadDisplaySettingsText(mode);
     assert.ok(text.startsWith(`<b>🧵 Thread display:</b> <code>${mode}</code>\n`));
@@ -150,7 +154,7 @@ test("Thread display detail follows the setting-card style and marks only the cu
     assert.match(text, /Choose how this bot profile labels Telegram tabs and Pi terminal status\. Each slot is unique across this bot profile\./u);
     assert.match(text, /<code>letters<\/code> \(default\):/u);
     assert.match(text, /manual <code>\/name Name<\/code> overrides/u);
-    for (const example of ["A", "B", "extensions", "extensions_a", "extensions_c"]) {
+    for (const example of ["A", "B", "Anchor", "Briar", "extensions", "extensions_a", "extensions_c"]) {
       assert.match(text, new RegExp(`<b><i>${example}</i></b>`, "u"));
     }
     assert.doesNotMatch(text, /Switching changes labels only/u);

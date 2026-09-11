@@ -141,9 +141,11 @@ export type TelegramThreadDisplayMode = "letters" | "names" | "directories";
 export function resolveTelegramThreadDisplayMode(
   config: Pick<TelegramConfig, "threadDisplayMode">,
 ): TelegramThreadDisplayMode {
-  return config.threadDisplayMode === "directories"
-    ? "directories"
-    : "letters";
+  return config.threadDisplayMode === "names"
+    ? "names"
+    : config.threadDisplayMode === "directories"
+      ? "directories"
+      : "letters";
 }
 
 export async function setTelegramThreadDisplayMode(
@@ -151,7 +153,7 @@ export async function setTelegramThreadDisplayMode(
   mode: TelegramThreadDisplayMode,
   isCurrent: () => boolean,
 ): Promise<void> {
-  if (!["letters", "directories"].includes(mode)) {
+  if (!["letters", "names", "directories"].includes(mode)) {
     throw new Error("Invalid Telegram Thread display mode.");
   }
   const profile = store.getActiveProfileName();

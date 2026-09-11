@@ -29,10 +29,13 @@ test("Three modes project the same stable bindings without changing named identi
   assert.deepEqual(bindings, before);
 });
 
-test("Manual names override both automatic display modes", () => {
+test("Manual names override every automatic display mode", () => {
   const overridden = { ...bindings[0], manualThreadName: "Navigator" };
   assert.equal(resolveTelegramWorkspaceDisplayNames(
     [overridden], "letters",
+  ).get("one"), "Navigator");
+  assert.equal(resolveTelegramWorkspaceDisplayNames(
+    [overridden], "names",
   ).get("one"), "Navigator");
   assert.equal(resolveTelegramWorkspaceDisplayNames(
     [overridden], "directories",
