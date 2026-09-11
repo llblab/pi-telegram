@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.45.5: Queue Refresh Icon Hotfix
+
+- `Queue Refresh Icon`: The queue menu's Refresh row now uses `🔄`, the canonical refresh glyph, reserving `🌀` for the State Flow Telegram identity. The button label is the only change; queue refresh behavior, callbacks, and the rotating empty-queue notices are unchanged.
+
 ## 0.45.4: Draft Cadence Hotfix
 
 - `Draft Cadence`: Each preview segment now holds its first frame for one full two-second interval from its first visible text, so the opening draft is an accumulated passage instead of a single streamed word. Later frames keep the trailing cadence, message/turn rollover preserves the remaining interval and reopens the window, and sealing or final publication still cancels the pending timer; first frames no longer ship immediately.

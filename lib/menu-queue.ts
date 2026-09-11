@@ -88,7 +88,7 @@ function buildTelegramQueueMenuReplyMarkup(
     items.length === 0
       ? `queue:refresh:${nextEmptyRefreshIndex}`
       : "queue:refresh";
-  const refreshRow = [{ text: "🌀 Refresh", callback_data: refreshData }];
+  const refreshRow = [{ text: "🔄 Refresh", callback_data: refreshData }];
   if (items.length === 0) return { inline_keyboard: [backRow, refreshRow] };
   const rows = items.map((item) => {
     const prefix = item.reactionSuppressionEmoji
