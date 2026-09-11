@@ -777,22 +777,25 @@ test("telegram_bind Tool exposes mutually exclusive install and invocation shape
     assert.equal(tool?.name, "telegram_bind");
     assert.equal((tool?.parameters as { type?: unknown }).type, "object");
     assert.equal("anyOf" in (tool?.parameters as object), false);
-    const parameters = tool?.parameters as { properties?: Record<string, unknown>;
-      $defs?: Record<string, unknown> };
-    const argumentSchema = parameters.properties?.argument as { $ref?: unknown };
-    const argumentDefinition = parameters.$defs?.TelegramBindJsonValue as {
-      anyOf?: Array<{ type?: unknown; items?: unknown; additionalProperties?: unknown }> };
-    assert.notEqual(argumentSchema, true);
-    assert.equal(argumentSchema.$ref, "#/$defs/TelegramBindJsonValue");
-    assert.deepEqual(argumentDefinition.anyOf?.map(branch => branch.type),
-      ["null", "boolean", "number", "string", "array", "object"]);
-    assert.equal((argumentDefinition.anyOf?.[4]?.items as { $ref?: unknown })?.$ref,
-      "#/$defs/TelegramBindJsonValue");
-    assert.equal((argumentDefinition.anyOf?.[5]?.additionalProperties as { $ref?: unknown })?.$ref,
-      "#/$defs/TelegramBindJsonValue");
+    const parameters = tool?.parameters as { properties?: Record<string, unknown> };
+    // Provider compatibility: no recursion, reference resolution, or TypeBox markers
+    // may leak into the serialized schema (OpenAI 400 recursion, Gemini ~optional).
     const serializedParameters = JSON.stringify(parameters);
+    assert.equal(serializedParameters.includes("$defs"), false);
+    assert.equal(serializedParameters.includes("$ref"), false);
+    assert.equal(serializedParameters.includes("~optional"), false);
     assert.equal(serializedParameters.includes('"argument":true'), false);
-    assert.equal(serializedParameters.includes('"$ref":"TelegramBindJsonValue"'), false);
+    type JsonValueUnion = {
+      anyOf?: Array<{ type?: unknown; items?: JsonValueUnion; additionalProperties?: JsonValueUnion }> };
+    const argumentSchema = parameters.properties?.argument as JsonValueUnion;
+    const scalarTypes = ["null", "boolean", "number", "string"];
+    let union: JsonValueUnion | undefined = argumentSchema;
+    for (let depth = 0; depth < 4; depth += 1) {
+      assert.deepEqual(union?.anyOf?.map(branch => branch.type), [...scalarTypes, "array", "object"]);
+      assert.deepEqual(union?.anyOf?.[5]?.additionalProperties, union?.anyOf?.[4]?.items);
+      union = union?.anyOf?.[4]?.items;
+    }
+    assert.deepEqual(union?.anyOf?.map(branch => branch.type), scalarTypes);
 
     const installed = await tool!.execute("call-1", {
       app: "counter",
