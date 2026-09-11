@@ -306,7 +306,7 @@ test("Preview runtime optional send gate clears without sending new content", as
   assert.equal(harness.getState(), undefined);
 });
 
-test("Draft throttle sends immediately then the latest snapshot at two seconds without debounce starvation", async (t) => {
+test("Draft throttle holds the first frame for one interval then sends the latest snapshot without debounce starvation", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 10_000 });
   const drafts: Array<{ text: string | undefined; at: number }> = [];
   const preview = createTelegramAssistantPreviewRuntime<{ text: string }>({
@@ -321,9 +321,37 @@ test("Draft throttle sends immediately then the latest snapshot at two seconds w
     t.mock.timers.tick(1000);
     await preview.onMessageUpdate({ message: { text: "Latest" } }); await preview.flush(7);
     t.mock.timers.tick(999);
-    assert.deepEqual(drafts, [{ text: "First", at: 10_000 }]);
+    assert.deepEqual(drafts, [], "The opening frame waits for the initial accumulation window");
     t.mock.timers.tick(1); await preview.flush(7);
-    assert.deepEqual(drafts, [{ text: "First", at: 10_000 }, { text: "Latest", at: 12_000 }]);
+    assert.deepEqual(drafts, [{ text: "Latest", at: 12_000 }]);
+    await preview.onMessageUpdate({ message: { text: "Tail" } }); await preview.flush(7);
+    t.mock.timers.tick(2000); await preview.flush(7);
+    assert.deepEqual(drafts, [{ text: "Latest", at: 12_000 }, { text: "Tail", at: 14_000 }]);
+  } finally { preview.invalidate(); }
+});
+
+test("Message rollover after a long tool gap reopens the opening draft window", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 10_000 });
+  const drafts: Array<{ text: string; at: number }> = [];
+  const preview = createTelegramAssistantPreviewRuntime<{ text: string }>({
+    getActiveTurn: () => ({ chatId: 7 }), isAssistantMessage: () => true, getMessageText: (message) => message.text,
+    sendDraft: async (_chat, _id, text) => { drafts.push({ text: text!, at: Date.now() }); },
+    sendMarkdownReply: async () => 100,
+  });
+  try {
+    preview.resetState();
+    await preview.onMessageUpdate({ message: { text: "First segment." } });
+    t.mock.timers.tick(2000); await preview.flush(7);
+    preview.seal();
+    t.mock.timers.tick(30_000);
+    await preview.onMessageStart({ message: { text: "" } });
+    await preview.onMessageUpdate({ message: { text: "Continuation" } }); await preview.flush(7);
+    assert.deepEqual(drafts, [{ text: "First segment.", at: 12_000 }], "A stale cadence boundary must not ship the continuation's first word");
+    t.mock.timers.tick(2000); await preview.flush(7);
+    assert.deepEqual(drafts, [
+      { text: "First segment.", at: 12_000 },
+      { text: "Continuation", at: 44_000 },
+    ]);
   } finally { preview.invalidate(); }
 });
 
@@ -345,7 +373,7 @@ test("Final publication cancels the draft throttle timer without waiting for its
     assert.equal(Date.now(), 10_000);
     assert.equal(state.flushTimer, undefined);
     t.mock.timers.tick(2000); await Promise.resolve();
-    assert.deepEqual(effects, ["draft:First", "final"]);
+    assert.deepEqual(effects, ["final"], "The held opening frame never shipped");
   } finally { preview.invalidate(); }
 });
 
@@ -362,6 +390,7 @@ test("Replacing a throttled preview cancels old text and retains the interval wi
   try {
     preview.resetState();
     await preview.onMessageUpdate({ message: { text: "First" } }); await preview.flush(7);
+    t.mock.timers.tick(2000); await preview.flush(7);
     await preview.onMessageUpdate({ message: { text: "Obsolete" } }); await preview.flush(7);
     const old = preview.getState()!;
     threadId = 43; preview.resetState();
@@ -384,15 +413,17 @@ test("Slow draft requests remain single-flight and coalesce updates past the thr
   });
   preview.resetState();
   await preview.onMessageUpdate({ message: { text: "First" } });
-  const flush = preview.getState()?.flushPromise;
   try {
+    t.mock.timers.tick(2000);
+    assert.deepEqual(texts, ["First"]);
     t.mock.timers.tick(2500);
     await preview.onMessageUpdate({ message: { text: "Intermediate" } });
     await preview.onMessageUpdate({ message: { text: "Latest" } });
     assert.deepEqual(texts, ["First"]);
-    release(); await flush;
+    release();
+    await preview.flush(7);
     assert.deepEqual(texts, ["First", "Latest"]);
-  } finally { release(); await flush; preview.invalidate(); }
+  } finally { release(); await preview.flush(7).catch(() => {}); preview.invalidate(); }
 });
 
 test("Sealed preview ignores late updates while a replacement preview can stream", async (t) => {
@@ -407,14 +438,16 @@ test("Sealed preview ignores late updates while a replacement preview can stream
   });
   preview.resetState();
   await preview.onMessageUpdate({ message: { text: "First draft." } });
+  t.mock.timers.tick(2000);
   await preview.flush(7);
   preview.seal();
   await preview.onMessageUpdate({ message: { text: "Obsolete late update." } });
   await preview.flush(7);
   assert.equal(preview.getState()?.pendingText, "First draft.");
-  t.mock.timers.tick(2000);
   preview.resetState();
   await preview.onMessageUpdate({ message: { text: "Replacement draft." } });
+  await preview.flush(7);
+  t.mock.timers.tick(2000);
   await preview.flush(7);
   assert.deepEqual(drafts, ["First draft.", "Replacement draft."]);
   preview.invalidate();
@@ -486,7 +519,8 @@ test("A deferred draft does not consume its latest text snapshot", async (t) => 
   } finally { preview.invalidate(); }
 });
 
-test("Prepared final rechecks delivery authority after its original draft flush", async () => {
+test("Prepared final rechecks delivery authority after its original draft flush", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 10_000 });
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   let active = true;
@@ -499,6 +533,7 @@ test("Prepared final rechecks delivery authority after its original draft flush"
   });
   preview.resetState();
   await preview.onMessageUpdate({ message: { text: "Original draft." } });
+  t.mock.timers.tick(2000);
   const original = preview.getState();
   const prepared = preview.prepareDelivery(() => active);
   const result = prepared.finalizeMarkdownPreview(7, "Final.", 21);
@@ -622,21 +657,22 @@ test("Preview rollover waits for admitted publication without holding the messag
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(started, true);
     await runtime.onMessageUpdate({ message: { text: "Next draft." } });
-    assert.deepEqual(drafts, ["Old draft."]);
+    assert.deepEqual(drafts, []);
     release();
     await preparation.wait();
-    assert.deepEqual(drafts, ["Old draft."], "Next draft must also wait for the permanent publication");
     t.mock.timers.tick(2000);
+    assert.deepEqual(drafts, [], "The sealed segment's held opening frame never ships and the next draft waits for the permanent publication");
     preparation.settle();
     await runtime.flush(7);
-    assert.deepEqual(drafts, ["Old draft.", "Next draft."]);
+    assert.deepEqual(drafts, ["Next draft."]);
   } finally {
     release(); preparation.settle(); await start; await runtime.flush(7); runtime.invalidate();
   }
 });
 
 for (const operation of ["final", "clear"] as const) {
-  test(`Preview rollover carries issued draft authority into ${operation} without a new update`, async () => {
+  test(`Preview rollover carries issued draft authority into ${operation} without a new update`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 10_000 });
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const effects: string[] = [];
@@ -648,6 +684,7 @@ for (const operation of ["final", "clear"] as const) {
     });
     runtime.resetState();
     await runtime.onMessageUpdate({ message: { text: "Old draft." } });
+    t.mock.timers.tick(2000);
     await runtime.onMessageStart({ message: { text: "" } });
     const delivery = operation === "final" ? runtime.finalizeMarkdown(7, "Final.") : runtime.prepareClear(7)();
     try {

@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.45.4: Draft Cadence Hotfix
+
+- `Draft Cadence`: Each preview segment now holds its first frame for one full two-second interval from its first visible text, so the opening draft is an accumulated passage instead of a single streamed word. Later frames keep the trailing cadence, message/turn rollover preserves the remaining interval and reopens the window, and sealing or final publication still cancels the pending timer; first frames no longer ship immediately.
+
 ## 0.45.3: Thread Display Names Hotfix
 
 - `Thread Display Names`: Settings again offers the dictionary naming mode as the second chooser between Letters and Directories. Names shows each Workspace's generated slot-letter palette word, such as `Anchor` for slot `A`; switching renames live tabs and fresh tabs start under the active projection. `profiles.<name>.threadDisplayMode` persists all three values, absent or invalid ones resolve to Letters, and Names works with legacy followers that predate `thread-display-mode-v1`.
