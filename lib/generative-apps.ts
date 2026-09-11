@@ -862,21 +862,23 @@ export function formatGenerativeAppToolError(error: unknown): Error {
   return new Error(`\n${message.replace(/^\n+/u, "") || "Generative App operation failed."}`);
 }
 
-const TELEGRAM_BIND_JSON_ARGUMENT_REFERENCE = "#/$defs/TelegramBindJsonValue";
-const TELEGRAM_BIND_JSON_ARGUMENT_SCHEMA = {
-  $ref: TELEGRAM_BIND_JSON_ARGUMENT_REFERENCE,
-} as unknown as ReturnType<typeof Type.Unknown>;
-const TELEGRAM_BIND_JSON_ARGUMENT_DEFINITION = {
-  anyOf: [
-    { type: "null" },
-    { type: "boolean" },
-    { type: "number" },
-    { type: "string" },
-    { type: "array", items: { $ref: TELEGRAM_BIND_JSON_ARGUMENT_REFERENCE } },
-    { type: "object", properties: {},
-      additionalProperties: { $ref: TELEGRAM_BIND_JSON_ARGUMENT_REFERENCE } },
-  ],
-};
+// Provider tool APIs reject recursive $ref schemas (OpenAI) and raw TypeBox
+// optional markers on non-builder objects (Gemini), while llama-server rejects
+// unconstrained subschemas; one bounded builder-made JSON-value union satisfies all.
+const TELEGRAM_BIND_JSON_ARGUMENT_MAX_DEPTH = 4;
+
+function createTelegramBindJsonArgumentSchema(
+  depth: number,
+): ReturnType<typeof Type.Union> {
+  const scalars = [Type.Null(), Type.Boolean(), Type.Number(), Type.String()];
+  if (depth <= 0) return Type.Union(scalars);
+  const nested = createTelegramBindJsonArgumentSchema(depth - 1);
+  return Type.Union([
+    ...scalars,
+    Type.Array(nested),
+    Type.Object({}, { additionalProperties: nested }),
+  ]);
+}
 
 export function registerTelegramBindTool(
   pi: ExtensionAPI,
@@ -893,10 +895,10 @@ export function registerTelegramBindTool(
       method: Type.Optional(Type.String()),
       replace: Type.Optional(Type.Boolean()),
       display: Type.Optional(Type.Boolean()),
-      argument: Type.Optional(TELEGRAM_BIND_JSON_ARGUMENT_SCHEMA),
-    }, { additionalProperties: false,
-      $defs: { TelegramBindJsonValue: TELEGRAM_BIND_JSON_ARGUMENT_DEFINITION },
-    }),
+      argument: Type.Optional(
+        createTelegramBindJsonArgumentSchema(TELEGRAM_BIND_JSON_ARGUMENT_MAX_DEPTH),
+      ),
+    }, { additionalProperties: false }),
     async execute(_toolCallId, params) {
       try {
         const result = await bindGenerativeApp({

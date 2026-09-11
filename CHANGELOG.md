@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.45.2: Provider-Compatible Bind Schema Hotfix
+
+- `Provider-Compatible Bind Argument`: Serializes the `telegram_bind` `argument` schema as an inline builder-made JSON-value union bounded to four container levels, with no `$ref`/`$defs` recursion or raw TypeBox marker leakage; OpenAI no longer rejects every request with "Recursive JSON schemas are not currently supported" (#273) and Gemini no longer rejects the unknown `~optional` field (#269) while the tool is registered.
+
 ## 0.45.1: Guest Mode And Channel Media Hotfixes
 
 - `Environment-backed bot tokens`: `telegram.json` profiles may store an exact `$NAME`/`${NAME}` reference instead of a copied token. Resolution happens only at validation/activation boundaries, including pairing identity hashing; setup prefills the first supported alias, validates the resolved value, and persists the alias; literals stay compatible; unresolved references fail closed with a redacted named-variable diagnostic in setup, connect, and status.

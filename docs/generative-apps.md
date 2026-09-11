@@ -98,7 +98,7 @@ An absent, stale, or invalid bound app fails closed and never degrades into an a
 
 ## `telegram_bind` Tool
 
-One agent Tool owns installation and deliberate invocation through two mutually exclusive shapes. Its optional `argument` schema explicitly describes recursive JSON values (`null`, boolean, number, string, array, or object) rather than using an unconstrained subschema. Pi keeps the same JSON semantics, while schema aggregators cannot lower this field to a bare `true` schema that some llama-server grammars reject. The recursive definition lives in the tool root `$defs` and uses only local `#/$defs/TelegramBindJsonValue` references; it does not rely on named/remote reference resolution or newer TypeBox runtime helpers.
+One agent Tool owns installation and deliberate invocation through two mutually exclusive shapes. Its optional `argument` schema explicitly describes JSON values (`null`, boolean, number, string, array, or object) as a bounded union nested four container levels deep rather than using an unconstrained subschema. Pi keeps the same JSON semantics, while schema aggregators cannot lower this field to a bare `true` schema that some llama-server grammars reject. The union is built through standard schema builders and serialized inline with no `$ref`/`$defs` recursion, so provider tool APIs that reject recursive or reference-resolved schemas (OpenAI) accept it alongside providers strict about unknown schema fields (Gemini).
 
 Install an external self-contained module and initialize it:
 
