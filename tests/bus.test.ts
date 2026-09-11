@@ -737,6 +737,8 @@ test("Bus contract encodes and parses queue handoff envelopes", () => {
     chatId: 7,
     target: { chatId: 7, threadId: 42 },
     replyToMessageId: 10,
+    guestQueryId: "guest-1",
+    guestInlineMessageId: "inline-1",
     queueOrder: 1,
     queueLane: "default" as const,
     laneOrder: 1,

@@ -1819,6 +1819,30 @@ test("Locked polling runtime releases ownership when setup is missing", async ()
   }
 });
 
+test("Locked polling runtime reports an unresolved token reference", async () => {
+  const temp = createTempLockPath();
+  try {
+    const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
+    const runtime = createTelegramLockedPollingRuntime({
+      lock,
+      hasBotToken: () => false,
+      getBotTokenDiagnostic: () =>
+        "Telegram bot token environment variable WORK_BOT_TOKEN is not set.",
+      startPolling: async () => undefined,
+      stopPolling: async () => undefined,
+      updateStatus: () => undefined,
+    });
+    const started = await runtime.start({ cwd: "/repo" });
+    assert.deepEqual(started, {
+      ok: false,
+      message: "Telegram bot token environment variable WORK_BOT_TOKEN is not set.",
+    });
+    assert.deepEqual(readLocks(temp.path), {});
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
 test("Locked polling runtime refuses start when run mode disallows polling", async () => {
   const temp = createTempLockPath();
   try {

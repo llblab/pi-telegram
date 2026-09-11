@@ -22,6 +22,7 @@ import * as TextGroups from "../lib/text-groups.ts";
 import * as Threads from "../lib/threads.ts";
 import * as Updates from "../lib/updates.ts";
 import { createDefaultTelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
+import { TELEGRAM_GUEST_TURN_NOTE } from "../lib/turns.ts";
 import {
   createTelegramWorkspaceAdmissionLedger,
   TelegramWorkspaceAdmissionError,
@@ -429,6 +430,12 @@ interface RouteHarnessOptions {
     TestContext,
     TestModel
   >["callApi"];
+  answerGuestQueryForInlineMessage?: Routing.TelegramInboundRouteRuntimeDeps<
+    TestMessage,
+    TestCallbackQuery,
+    TestContext,
+    TestModel
+  >["answerGuestQueryForInlineMessage"];
   deleteMessage?: Routing.TelegramInboundRouteRuntimeDeps<
     TestMessage,
     TestCallbackQuery,
@@ -613,6 +620,7 @@ function createRouteHarness(options: RouteHarnessOptions = {}) {
       if (text) events.push(`answer:${text}`);
     },
     answerGuestQuery: async () => undefined,
+    answerGuestQueryForInlineMessage: options.answerGuestQueryForInlineMessage,
     editMessageReplyMarkup: options.editMessageReplyMarkup,
     editInteractiveMessage: options.editInteractiveMessage,
     sendInteractiveMessage: options.sendInteractiveMessage ??  (async (_chatId, text, mode, replyMarkup, sendOptions) => {
@@ -1698,11 +1706,86 @@ test("Routing runtime assigns guest-mode prompts to the current transport leader
     queued?.kind === "prompt" ? queued.target : undefined,
     undefined,
   );
-  assert.match(
+  assert.equal(
     queued?.kind === "prompt" && queued.content[0]?.type === "text"
       ? queued.content[0].text
       : "",
-    /^\[telegram\|guest:Guest Room\] guest question$/,
+    `[telegram|guest:Guest Room] guest question\n\n${TELEGRAM_GUEST_TURN_NOTE}`,
+  );
+});
+
+test("Routing runtime answers guest-mode queries early with an HTML working ACK", async () => {
+  const acks: Array<{
+    guestQueryId: string;
+    text: string;
+    options?: { parseMode?: "HTML" };
+  }> = [];
+  const { routeRuntime, telegramQueueStore } = createRouteHarness({
+    answerGuestQueryForInlineMessage: async (guestQueryId, text, options) => {
+      acks.push({ guestQueryId, text, options });
+      return "inline-1";
+    },
+  });
+
+  await routeRuntime.handleUpdate(
+    {
+      guest_message: {
+        guest_query_id: "guest-1",
+        chat: { type: "supergroup", title: "Guest Room" } as never,
+        from: { id: 7, is_bot: false, username: "guest" } as TestUser & {
+          username: string;
+        },
+        text: "guest question",
+      },
+    },
+    { cwd: "/repo" },
+  );
+
+  assert.deepEqual(acks, [
+    {
+      guestQueryId: "guest-1",
+      text: "<b>⚙️ Received. Working on it…</b>",
+      options: { parseMode: "HTML" },
+    },
+  ]);
+  const queued = telegramQueueStore.getQueuedItems()[0];
+  assert.equal(queued?.kind, "prompt");
+  assert.equal(
+    queued?.kind === "prompt" ? queued.guestInlineMessageId : undefined,
+    "inline-1",
+  );
+});
+
+test("Routing runtime keeps the guest-mode turn when the ACK experiment answer fails", async () => {
+  const { events, routeRuntime, telegramQueueStore } = createRouteHarness({
+    answerGuestQueryForInlineMessage: async () => {
+      throw new Error("query is too old");
+    },
+  });
+
+  await routeRuntime.handleUpdate(
+    {
+      guest_message: {
+        guest_query_id: "guest-1",
+        chat: { type: "supergroup", title: "Guest Room" } as never,
+        from: { id: 7, is_bot: false, username: "guest" } as TestUser & {
+          username: string;
+        },
+        text: "guest question",
+      },
+    },
+    { cwd: "/repo" },
+  );
+
+  assert.equal(
+    events.includes("event:guest:Error: query is too old"),
+    true,
+  );
+  const queued = telegramQueueStore.getQueuedItems()[0];
+  assert.equal(queued?.kind, "prompt");
+  assert.equal(
+    queued?.kind === "prompt" ? queued.guestInlineMessageId : undefined,
+    undefined,
   );
 });
 
@@ -1728,7 +1811,7 @@ test("Routing runtime labels private guest-mode prompts with dm metadata", async
     queued?.kind === "prompt" && queued.content[0]?.type === "text"
       ? queued.content[0].text
       : "",
-    "[telegram|guest:guest] private guest question",
+    `[telegram|guest:guest] private guest question\n\n${TELEGRAM_GUEST_TURN_NOTE}`,
   );
 });
 
@@ -1759,7 +1842,7 @@ test("Routing runtime labels owner-authored private guest turns with the remote 
     queued?.kind === "prompt" && queued.content[0]?.type === "text"
       ? queued.content[0].text
       : "",
-    "[telegram|guest:counterparty] @k1awbot attach something",
+    `[telegram|guest:counterparty] @k1awbot attach something\n\n${TELEGRAM_GUEST_TURN_NOTE}`,
   );
 });
 
@@ -1874,6 +1957,8 @@ test("Routing runtime separates private guest identity from replied peer metadat
       "",
       "[attachments|from:quotedparty] /tmp",
       "- /photo-22.jpg",
+      "",
+      TELEGRAM_GUEST_TURN_NOTE,
     ].join("\n"),
   );
 });
@@ -1929,6 +2014,8 @@ test("Routing runtime keeps replied voice transcription inside Guest Mode reply 
       "",
       "[outputs|from:quotedparty]",
       "- guest replied voice transcript",
+      "",
+      TELEGRAM_GUEST_TURN_NOTE,
     ].join("\n"),
   );
 });
@@ -1971,6 +2058,8 @@ test("Routing runtime keeps private guest identity when replying to the bot", as
       "[telegram|guest:counterparty] @k1awbot follow up",
       "",
       "[reply|from:k1awbot] Bot answer",
+      "",
+      TELEGRAM_GUEST_TURN_NOTE,
     ].join("\n"),
   );
 });

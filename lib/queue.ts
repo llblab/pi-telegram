@@ -110,6 +110,7 @@ export interface TelegramQueueItemBase {
   transportStamp?: TelegramTransportStamp;
   replyToMessageId: number;
   guestQueryId?: string;
+  guestInlineMessageId?: string;
   queueOrder: number;
   queueLane: TelegramQueueLane;
   laneOrder: number;
@@ -152,6 +153,7 @@ export interface TelegramQueueHandoffBase {
   transportStamp?: TelegramTransportStamp;
   replyToMessageId: number;
   guestQueryId?: string;
+  guestInlineMessageId?: string;
   queueOrder: number;
   queueLane: TelegramQueueLane;
   laneOrder: number;
@@ -612,6 +614,9 @@ export function createTelegramQueueHandoffPayload<TContext>(
       ...(item.transportStamp ? { transportStamp: item.transportStamp } : {}),
       replyToMessageId: item.replyToMessageId,
       ...(item.guestQueryId ? { guestQueryId: item.guestQueryId } : {}),
+      ...(item.guestInlineMessageId
+        ? { guestInlineMessageId: item.guestInlineMessageId }
+        : {}),
       queueOrder: item.queueOrder,
       queueLane: item.queueLane,
       laneOrder: item.laneOrder,
@@ -626,6 +631,9 @@ export function createTelegramQueueHandoffPayload<TContext>(
     ...(item.transportStamp ? { transportStamp: item.transportStamp } : {}),
     replyToMessageId: item.replyToMessageId,
     ...(item.guestQueryId ? { guestQueryId: item.guestQueryId } : {}),
+    ...(item.guestInlineMessageId
+      ? { guestInlineMessageId: item.guestInlineMessageId }
+      : {}),
     queueOrder: item.queueOrder,
     queueLane: item.queueLane,
     laneOrder: item.laneOrder,
@@ -1544,6 +1552,8 @@ export interface TelegramAgentEndRuntimeDeps<
     options?: { parseMode?: string },
   ) => Promise<void>;
   sendGuestReply?: (guestQueryId: string, markdown: string) => Promise<void>;
+  /** Replaces the early guest ACK with the final text. */
+  editGuestReply?: (inlineMessageId: string, markdown: string) => Promise<void>;
   sendGuestAttachment?: (
     turn: TTurn,
     attachment: QueuedAttachment,
@@ -1622,6 +1632,7 @@ export interface TelegramAgentEndHookRuntimeDeps<
   >["sendRichAttachmentReply"];
   answerGuestQuery?: TelegramAgentEndRuntimeDeps<TTurn>["answerGuestQuery"];
   sendGuestReply?: TelegramAgentEndRuntimeDeps<TTurn>["sendGuestReply"];
+  editGuestReply?: TelegramAgentEndRuntimeDeps<TTurn>["editGuestReply"];
   sendGuestAttachment?: TelegramAgentEndRuntimeDeps<TTurn>["sendGuestAttachment"];
   sendGuestVoiceReply?: TelegramAgentEndRuntimeDeps<TTurn>["sendGuestVoiceReply"];
   planOutboundReply?: TelegramAgentEndRuntimeDeps<
@@ -1762,6 +1773,7 @@ export function createTelegramAgentEndHook<
         sendRichAttachmentReply: deps.sendRichAttachmentReply,
         answerGuestQuery: deps.answerGuestQuery,
         sendGuestReply: deps.sendGuestReply,
+        editGuestReply: deps.editGuestReply,
         sendGuestAttachment: deps.sendGuestAttachment,
         sendGuestVoiceReply: deps.sendGuestVoiceReply,
         planOutboundReply: deps.planOutboundReply,
@@ -1854,11 +1866,47 @@ export async function handleTelegramAgentEndRuntime<
     return;
   }
   if (turn.guestQueryId) {
+    if (turn.guestInlineMessageId && deps.editGuestReply) {
+      const experimentText = assistant.errorMessage
+        ? "Telegram bridge: Pi failed while processing the request."
+        : finalText;
+      if (experimentText) {
+        try {
+          await deps.editGuestReply(turn.guestInlineMessageId, experimentText);
+          deps.recordRuntimeEvent?.(
+            "guest",
+            new Error("Guest ACK experiment edited the guest answer"),
+            { phase: "guest-ack-edited", guestQueryId: turn.guestQueryId },
+          );
+        } catch (error) {
+          deps.recordRuntimeEvent?.("delivery", error, {
+            phase: "guest-ack-edit",
+            guestQueryId: turn.guestQueryId,
+          });
+        }
+      } else {
+        deps.recordRuntimeEvent?.(
+          "delivery",
+          new Error("Guest ACK experiment turn produced no editable text"),
+          { phase: "guest-ack-edit-empty", guestQueryId: turn.guestQueryId },
+        );
+      }
+      if (!isDeliveryActive()) return;
+      if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
+      return;
+    }
     if (assistant.errorMessage) {
-      await deps.answerGuestQuery?.(
-        turn.guestQueryId,
-        "Telegram bridge: Pi failed while processing the request.",
-      );
+      try {
+        await deps.answerGuestQuery?.(
+          turn.guestQueryId,
+          "Telegram bridge: Pi failed while processing the request.",
+        );
+      } catch (error) {
+        deps.recordRuntimeEvent?.("delivery", error, {
+          phase: "guest-error-reply",
+          guestQueryId: turn.guestQueryId,
+        });
+      }
       if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
       return;
     }
@@ -1894,10 +1942,20 @@ export async function handleTelegramAgentEndRuntime<
         });
       }
     } else if (finalText) {
-      if (deps.sendGuestReply) {
-        await deps.sendGuestReply(turn.guestQueryId, finalText);
-      } else {
-        await deps.answerGuestQuery?.(turn.guestQueryId, finalText);
+      try {
+        if (deps.sendGuestReply) {
+          await deps.sendGuestReply(turn.guestQueryId, finalText);
+        } else {
+          await deps.answerGuestQuery?.(turn.guestQueryId, finalText);
+        }
+      } catch (error) {
+        // Guest queries expire after Telegram's response timeout, so a slow
+        // turn can fail the only delivery attempt. Record and continue the
+        // agent-end lifecycle instead of rejecting the extension hook.
+        deps.recordRuntimeEvent?.("delivery", error, {
+          phase: "guest-reply",
+          guestQueryId: turn.guestQueryId,
+        });
       }
     }
     if (!isDeliveryActive()) return;

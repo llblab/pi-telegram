@@ -297,6 +297,36 @@ test("Command helpers register disposable extension commands", () => {
   clearTelegramExtensionCommands();
 });
 
+test("Connect reports an unresolved token reference before prompting setup", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const notifications: string[] = [];
+  const events: string[] = [];
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {
+      events.push("setup");
+    },
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => false,
+    getBotTokenDiagnostic: () =>
+      "Telegram bot token environment variable WORK_BOT_TOKEN is not set.",
+    startPolling: async () => {
+      events.push("start");
+    },
+    stopPolling: async () => {},
+    updateStatus: () => {},
+  });
+  const connect = getRequiredCommand(harness.commands, "telegram-connect");
+  await connect.handler(
+    "",
+    createBridgeCommandContext((message) => notifications.push(message)),
+  );
+  assert.deepEqual(events, ["setup"]);
+  assert.deepEqual(notifications, [
+    "Telegram bot token environment variable WORK_BOT_TOKEN is not set.",
+  ]);
+});
+
 test("Command helpers register pi setup and status commands", async () => {
   const harness = createCommandRegistrationApiHarness();
   const events: string[] = [];

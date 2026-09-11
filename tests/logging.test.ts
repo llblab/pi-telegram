@@ -15,7 +15,7 @@ import {
   createTelegramRuntimeJsonlLog,
   getTelegramPreviousRuntimeLogPath,
   getTelegramRuntimeLogPath,
-} from "../lib/logs.ts";
+} from "../lib/logging.ts";
 
 async function readJsonl(path: string): Promise<unknown[]> {
   const text = await readFile(path, "utf8");
@@ -253,7 +253,7 @@ test("Runtime JSONL append failures stay contained and do not poison later recor
 test("Runtime JSONL contains one failed record under strict unhandled rejection mode", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-log-strict-failure-"));
   const blockerPath = join(dir, "not-a-directory");
-  const moduleUrl = new URL("../lib/logs.ts", import.meta.url).href;
+  const moduleUrl = new URL("../lib/logging.ts", import.meta.url).href;
   try {
     await writeFile(blockerPath, "block mkdir");
     const source = `
@@ -276,7 +276,7 @@ test("Runtime JSONL appends serialize across processes without lost lines", asyn
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-log-race-"));
   const path = join(dir, "logs.jsonl");
   const startPath = join(dir, "start");
-  const moduleUrl = new URL("../lib/logs.ts", import.meta.url).href;
+  const moduleUrl = new URL("../lib/logging.ts", import.meta.url).href;
   const children = ["a", "b"].map((worker) => {
     const readyPath = join(dir, `ready-${worker}`);
     const source = `

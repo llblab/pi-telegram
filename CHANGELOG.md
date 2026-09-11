@@ -4,7 +4,12 @@
 
 ## Unreleased
 
-- No unreleased changes.
+## 0.45.1: Guest Mode And Channel Media Hotfixes
+
+- `Environment-backed bot tokens`: `telegram.json` profiles may store an exact `$NAME`/`${NAME}` reference instead of a copied token. Resolution happens only at validation/activation boundaries, including pairing identity hashing; setup prefills the first supported alias, validates the resolved value, and persists the alias; literals stay compatible; unresolved references fail closed with a redacted named-variable diagnostic in setup, connect, and status.
+- `Guest Mode`: Records a failed guest answer as a delivery runtime event instead of rejecting the agent-end hook, so an expired guest query no longer surfaces as a Pi extension error or skips the next queued turn; the Pi-failure notice answer is contained identically. Every guest query now receives a bold `⚙️` ACK and later replaces it through `editMessageText` with the returned `inline_message_id`; an owner-run live acceptance confirmed this update path.
+- `Guest Speed`: Guest turns never emit streaming draft previews, because one guest query allows exactly one answer and cannot be patched afterward, and every guest turn text ends with a `[guest]` note that one reply is allowed within Telegram's limited window, so the agent answers as quickly as possible.
+- `Channel Media`: `telegram_message` channel delivery uploads one .jpg/.jpeg/.png/.webp photo or .mp4 video with `text` as its HTML caption, validating kind, size (photo ≤ 10 MiB, video ≤ 50 MiB), and 1024 visible caption characters; unsupported types and albums are rejected. The channel-post journal binds kind/file name/size/SHA-256 plus caption, so duplicates and lost acknowledgements never re-upload, and media edits replace captions via `editMessageCaption`. Markdown spoilers render as `<tg-spoiler>`; live image publication passed.
 
 ## 0.45.0: Durable Workspace Threads
 

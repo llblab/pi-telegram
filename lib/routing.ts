@@ -659,6 +659,12 @@ export interface TelegramInboundRouteRuntimeDeps<
   ) => Promise<number | undefined>;
   deleteMessage?: (chatId: number, messageId: number) => Promise<void>;
   answerGuestQuery: (guestQueryId: string, text?: string) => Promise<void>;
+  /** Answers the guest query immediately and returns its inline message id. */
+  answerGuestQueryForInlineMessage?: (
+    guestQueryId: string,
+    text: string,
+    options?: { parseMode?: "HTML" },
+  ) => Promise<string | undefined>;
   sendTextReply: (
     chatId: number,
     replyToMessageId: number,
@@ -2655,6 +2661,9 @@ export function createTelegramInboundRouteRuntime<
     await deps.threadStore.load();
     assertExecutionCurrent();
   };
+  // Answer the guest query immediately so the agent-end edit can replace the
+  // early ACK once the turn settles. See BACKLOG.md for live acceptance.
+  const TELEGRAM_GUEST_ACK_HTML = "<b>⚙️ Received. Working on it…</b>";
   const handleAuthorizedTelegramGuestMessage = async (
     guestMessage: Updates.TelegramGuestMessage & { from: TelegramUser },
     ctx: TContext,
@@ -2662,6 +2671,31 @@ export function createTelegramInboundRouteRuntime<
     const assertExecutionCurrent =
       Updates.createTelegramUpdateExecutionFenceGuard(guestMessage);
     assertExecutionCurrent();
+    let guestInlineMessageId: string | undefined;
+    if (deps.answerGuestQueryForInlineMessage) {
+      try {
+        guestInlineMessageId = await deps.answerGuestQueryForInlineMessage(
+          guestMessage.guest_query_id,
+          TELEGRAM_GUEST_ACK_HTML,
+          { parseMode: "HTML" },
+        );
+        deps.recordRuntimeEvent?.(
+          "guest",
+          new Error("Guest ACK experiment answered the guest query"),
+          {
+            phase: "guest-ack-sent",
+            guestQueryId: guestMessage.guest_query_id,
+            hasInlineMessageId: !!guestInlineMessageId,
+          },
+        );
+      } catch (error) {
+        deps.recordRuntimeEvent?.("guest", error, {
+          phase: "guest-ack-failed",
+          guestQueryId: guestMessage.guest_query_id,
+        });
+      }
+      assertExecutionCurrent();
+    }
     const text = guestMessage.text ?? "";
     const gm = guestMessage as unknown as Record<string, unknown>;
     // Build telegram prefix with guest context
@@ -2752,6 +2786,10 @@ export function createTelegramInboundRouteRuntime<
       promptFiles: processed.promptFiles,
       handlerOutputs: processed.handlerOutputs,
       sourceContext,
+      // Guest Mode allows exactly one reply within Telegram's limited response
+      // window; the note travels with the turn text so the agent sees it at
+      // execution time without a guest-specific system prompt variant.
+      guestTurn: true,
     });
     const order = deps.bridgeRuntime.queue.allocateItemOrder();
     const content: Queue.TelegramPromptContent[] = [
@@ -2778,6 +2816,7 @@ export function createTelegramInboundRouteRuntime<
       chatId: 0,
       replyToMessageId: 0,
       guestQueryId: guestMessage.guest_query_id,
+      ...(guestInlineMessageId ? { guestInlineMessageId } : {}),
       sourceMessageIds: [],
       queueOrder: order,
       queueLane: "default",

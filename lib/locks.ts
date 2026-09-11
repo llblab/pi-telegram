@@ -1144,6 +1144,7 @@ export interface TelegramLockedPollingRuntimeDeps<
 > {
   lock: TelegramLockRuntime<TContext>;
   hasBotToken: () => boolean;
+  getBotTokenDiagnostic?: () => string | undefined;
   canStartPolling?: (ctx: TContext) => boolean;
   isContextCurrent?: (ctx: TContext) => boolean;
   formatStartBlockedMessage?: (ctx: TContext) => string;
@@ -1305,7 +1306,11 @@ export function createTelegramLockedPollingRuntime<
   return {
     start: async (ctx, options = {}) => {
       if (!deps.hasBotToken()) {
-        return { ok: false, message: "Telegram bot is not configured." };
+        return {
+          ok: false,
+          message:
+            deps.getBotTokenDiagnostic?.() ?? "Telegram bot is not configured.",
+        };
       }
       if (!canStartPolling(ctx)) {
         return { ok: false, message: formatStartBlockedMessage(ctx) };

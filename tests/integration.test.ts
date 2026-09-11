@@ -3423,6 +3423,94 @@ strictFileTest("Channel post tool does not resend lost success or outcome across
   }
 });
 
+strictFileTest("Channel media tool publishes one local upload and edits its caption without replay", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const { handlers, commands, tools, pi } = createRuntimePiHarness();
+  const agentDir = await ensureRuntimeAgentDir();
+  const mediaPath = join(agentDir, "channel-cover.jpg");
+  await writeFile(mediaPath, Buffer.from("fake-jpeg-bytes"));
+  const calls: Array<{ method: string; caption?: unknown; mediaPresent?: boolean }> = [];
+  let sends = 0;
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "deleteWebhook") return createRuntimeTelegramApiResponse(true);
+    if (method === "getUpdates") throw new DOMException("stop", "AbortError");
+    if (method === "getChat") return createRuntimeTelegramApiResponse({
+      id: -100123, type: "channel", username: "public_channel", title: "Public Channel",
+    });
+    if (method === "sendPhoto" || method === "sendVideo") {
+      sends += 1;
+      const body = init?.body;
+      const fileField = method === "sendPhoto" ? "photo" : "video";
+      calls.push({ method,
+        caption: body instanceof FormData ? body.get("caption") : undefined,
+        mediaPresent: body instanceof FormData && body.get(fileField) !== null });
+      return createRuntimeTelegramApiResponse({
+        message_id: 92, chat: { id: -100123, type: "channel" },
+      });
+    }
+    if (method === "editMessageCaption") {
+      calls.push({ method, caption: (parseJsonRequestBody(init) ?? {}).caption });
+      return createRuntimeTelegramApiResponse({
+        message_id: 92, chat: { id: -100123, type: "channel" },
+      });
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({ botToken: "123:abc", allowedUserId: 77, lastUpdateId: 0 });
+    await writeRuntimeTelegramLocks({});
+    (await getRuntimeTelegramExtension())(pi);
+    const ctx = createRuntimeExtensionContext({ cwd: "/repo/channel-media" });
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    const messageTool = tools.get("telegram_message");
+    const mutationTool = tools.get("telegram_channel_post");
+    const listTool = tools.get("telegram_channel_posts");
+    assert.ok(messageTool);
+    assert.ok(mutationTool);
+    assert.ok(listTool);
+    await messageTool.execute("stable-media-operation", {
+      text: "Cover **title**", media: mediaPath, chat_id: -100123, channel: true,
+    });
+    assert.equal(sends, 1);
+    await messageTool.execute("stable-media-operation", {
+      text: "Cover **title**", media: mediaPath, chat_id: -100123, channel: true,
+    });
+    assert.equal(sends, 1);
+    const listed = await listTool.execute("media-list", { chat_id: -100123, limit: 1 }) as {
+      details: { records: Array<{ operationId: string; media?: { kind: string; fileName: string } }> } };
+    assert.equal(listed.details.records[0]?.operationId, "stable-media-operation");
+    assert.equal(listed.details.records[0]?.media?.kind, "photo");
+    assert.equal(listed.details.records[0]?.media?.fileName, "channel-cover.jpg");
+    await mutationTool.execute("media-edit-call", {
+      action: "edit", operation_id: "stable-media-operation", markdown: "||Hidden|| update",
+    });
+    const videoPath = join(agentDir, "channel-clip.mp4");
+    await writeFile(videoPath, Buffer.from("fake-mp4-bytes"));
+    try {
+      await messageTool.execute("stable-media-video-operation", {
+        text: "Clip", media: videoPath, chat_id: -100123, channel: true,
+      });
+    } finally {
+      await rm(videoPath, { force: true });
+    }
+    assert.deepEqual(calls.map(call => call.method),
+      ["sendPhoto", "editMessageCaption", "sendVideo"]);
+    assert.equal(calls[0]?.caption, "Cover <b>title</b>");
+    assert.equal(calls[0]?.mediaPresent, true);
+    assert.equal(calls[1]?.caption, "<tg-spoiler>Hidden</tg-spoiler> update");
+    assert.equal(calls[2]?.caption, "Clip");
+    assert.equal(calls[2]?.mediaPresent, true);
+    await commands.get("telegram-disconnect")?.handler("", ctx);
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    restoreFetch();
+    await telegramConfig.restore();
+    await rm(mediaPath, { force: true });
+  }
+});
+
 test("Extension runtime resolves stale same-cwd lock before proactive local result", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentBodies: Array<Record<string, unknown>> = [];

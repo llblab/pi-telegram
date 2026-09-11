@@ -898,3 +898,22 @@ export function createGuestMarkdownReplySender(deps: {
     });
   };
 }
+
+/**
+ * Guest reply editor: replaces an early Guest Mode answer (the temporary ACK
+ * experiment) with native Rich Markdown content addressed by
+ * `inline_message_id` instead of a chat/message pair.
+ */
+export function createGuestMarkdownReplyEditor(deps: {
+  editGuestInlineMessage: (
+    inlineMessageId: string,
+    content: { richMessage?: TelegramInputRichMessage; text?: string },
+  ) => Promise<void>;
+}) {
+  return async (inlineMessageId: string, markdown: string) => {
+    const [richMarkdown = markdown] = splitTelegramNativeMarkdown(markdown);
+    await deps.editGuestInlineMessage(inlineMessageId, {
+      richMessage: { markdown: richMarkdown },
+    });
+  };
+}

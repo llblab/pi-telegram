@@ -383,6 +383,7 @@ export interface TelegramBridgeCommandRegistrationDeps {
   getStatusLines: (options?: TelegramBridgeStatusLineOptions) => string[];
   reloadConfig: () => Promise<void>;
   hasBotToken: () => boolean;
+  getBotTokenDiagnostic?: () => string | undefined;
   startPolling: (
     ctx: ExtensionCommandContext,
     options?: TelegramBridgeCommandStartPollingOptions,
@@ -543,6 +544,8 @@ export function registerTelegramBridgeCommands(
         await (deps.activateDefaultProfileConfig?.(ctx) ?? deps.reloadConfig());
       }
       if (!deps.hasBotToken()) {
+        const botTokenDiagnostic = deps.getBotTokenDiagnostic?.();
+        if (botTokenDiagnostic) ctx.ui.notify(botTokenDiagnostic, "error");
         const profileNames = deps.getProfileNames?.() ?? [];
         if (!profileName && profileNames.length > 0) {
           ctx.ui.notify(

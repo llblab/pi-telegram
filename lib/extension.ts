@@ -21,7 +21,7 @@ import * as Inbound from "./inbound.ts";
 import * as Journal from "./journal.ts";
 import * as Lifecycle from "./lifecycle.ts";
 import * as Locks from "./locks.ts";
-import * as Logs from "./logs.ts";
+import * as Logging from "./logging.ts";
 import * as Media from "./media.ts";
 import * as MenuQueue from "./menu-queue.ts";
 import * as MenuSettings from "./menu-settings.ts";
@@ -82,7 +82,7 @@ export default function (pi: Pi.ExtensionAPI) {
   } = piRuntime;
   const bridgeRuntime = Runtime.createTelegramBridgeRuntime();
   const runtimeDiagnostics =
-    Logs.createTelegramRuntimeDiagnosticsRuntime<Pi.ExtensionContext>();
+    Logging.createTelegramRuntimeDiagnosticsRuntime<Pi.ExtensionContext>();
   const runtimeEvents = runtimeDiagnostics.events;
   const recordRuntimeEvent = runtimeDiagnostics.recordRuntimeEvent;
   const configStore = Config.createTelegramConfigStore({ recordRuntimeEvent });
@@ -443,7 +443,7 @@ export default function (pi: Pi.ExtensionAPI) {
     Pi.ExtensionContext,
     Queue.TelegramQueueItem<Pi.ExtensionContext>
   >({
-    getConfig: configStore.get,
+    getConfig: Status.createTelegramBridgeStatusConfigGetter(configStore),
     getActiveProfileName: configStore.getActiveProfileName,
     getDiagnosticPaths: Paths.getTelegramDiagnosticsDisplayPaths,
     isPollingActive: Polling.createTelegramPollingActivityReader(
@@ -580,6 +580,13 @@ export default function (pi: Pi.ExtensionAPI) {
 
   const sendGuestReply = Replies.createGuestMarkdownReplySender({
     answerGuestQuery,
+  });
+
+  // Answer guest queries immediately and replace the ACK with the final text.
+  const answerGuestQueryForInlineMessage =
+    telegramApiRuntime.answerGuestQueryForInlineMessage;
+  const editGuestReply = Replies.createGuestMarkdownReplyEditor({
+    editGuestInlineMessage: telegramApiRuntime.editGuestInlineMessage,
   });
 
   const promptDispatchRuntime = Runtime.createTelegramPromptDispatchRuntime({
@@ -970,6 +977,7 @@ export default function (pi: Pi.ExtensionAPI) {
     sendInteractiveMessage,
     deleteMessage: deleteTelegramMessage,
     answerGuestQuery,
+    answerGuestQueryForInlineMessage,
     sendTextReply,
     setMyCommands,
     validateThreadName(threadName) {
@@ -1408,6 +1416,7 @@ export default function (pi: Pi.ExtensionAPI) {
     lock: lockRuntime,
     transportMonitor: telegramThreadCapabilityMonitor,
     hasBotToken: configStore.hasBotToken,
+    getBotTokenDiagnostic: configStore.getBotTokenDiagnostic,
     canStartPolling: Pi.canStartPollingInExtensionContext,
     isContextCurrent: telegramSessionContextStore.isCurrent,
     formatStartBlockedMessage: Pi.formatPollingStartBlockedByRunMode,
@@ -1675,6 +1684,41 @@ export default function (pi: Pi.ExtensionAPI) {
       });
       return record.state === "published" ? record.messageId : undefined;
     },
+    async sendChannelMediaMessage(channel, mediaPath, markdown, options) {
+      if (!lockRuntime.owns()) {
+        throw new Error("Telegram channel media delivery requires direct leader transport ownership.");
+      }
+      const profileName = configStore.getActiveProfileName() ?? "default";
+      const botToken = configStore.getBotToken();
+      if (!botToken) throw new Error("Telegram channel media delivery requires an active bot token.");
+      const media = await ChannelPosts.inspectTelegramChannelPostMedia(mediaPath);
+      const caption = Replies.renderTelegramMarkdownToHtmlDraft(markdown);
+      ChannelPosts.assertTelegramChannelPostCaptionWithinLimit(caption);
+      const store = ChannelPosts.createTelegramChannelPostJournalStore({
+        path: Paths.resolveTelegramChannelPostJournalPath(undefined, profileName),
+        profileName,
+        tokenSha256: Journal.createTelegramUpdateJournalBotIdentity({ botToken }).tokenSha256,
+      });
+      const record = await ChannelPosts.publishTelegramChannelPost({
+        store, operationId: options.operationId,
+        channel: channel as ChannelPosts.TelegramChannelPostAddress, markdown, media,
+        async observeChannel(channelAddress) {
+          return telegramApiRuntime.call("getChat", { chat_id: channelAddress });
+        },
+        async send(channelAddress) {
+          const sent = await telegramApiRuntime.callMultipart<TelegramApi.TelegramSentMessage & {
+            chat: { id: number; type: string };
+          }>(media.kind === "photo" ? "sendPhoto" : "sendVideo", {
+            chat_id: String(channelAddress),
+            caption,
+            parse_mode: "HTML",
+            ...(options.replyMarkup ? { reply_markup: JSON.stringify(options.replyMarkup) } : {}),
+          }, media.kind === "photo" ? "photo" : "video", mediaPath, media.fileName);
+          return { messageId: sent.message_id, chat: sent.chat };
+        },
+      });
+      return record.state === "published" ? record.messageId : undefined;
+    },
     listChannelPosts(input) {
       const profileName = configStore.getActiveProfileName() ?? "default";
       const botToken = configStore.getBotToken();
@@ -1696,6 +1740,12 @@ export default function (pi: Pi.ExtensionAPI) {
       });
       if (input.action === "edit") {
         if (!input.markdown) throw new Error("Telegram channel post edit requires markdown.");
+        const current = store.get(input.operationId);
+        const caption = current?.media
+          ? Replies.renderTelegramMarkdownToHtmlDraft(input.markdown) : undefined;
+        if (caption !== undefined) {
+          ChannelPosts.assertTelegramChannelPostCaptionWithinLimit(caption);
+        }
         const begun = store.beginEdit({ operationId: input.operationId,
           mutationId: input.mutationId, markdown: input.markdown });
         if (!begun.began) {
@@ -1704,9 +1754,17 @@ export default function (pi: Pi.ExtensionAPI) {
           throw new Error("Telegram channel post edit outcome is unknown; refusing automatic replay.");
         }
         if (begun.record.state !== "edit-outcome-unknown") throw new Error("Telegram channel post edit authority is invalid.");
-        await telegramApiRuntime.call("editMessageText", { chat_id: begun.record.channelId,
-          message_id: begun.record.messageId,
-          text: Replies.renderTelegramMarkdownToHtmlDraft(input.markdown), parse_mode: "HTML" });
+        if (begun.record.media) {
+          if (caption === undefined) {
+            throw new Error("Telegram channel post media caption edit requires retained media identity.");
+          }
+          await telegramApiRuntime.call("editMessageCaption", { chat_id: begun.record.channelId,
+            message_id: begun.record.messageId, caption, parse_mode: "HTML" });
+        } else {
+          await telegramApiRuntime.call("editMessageText", { chat_id: begun.record.channelId,
+            message_id: begun.record.messageId,
+            text: Replies.renderTelegramMarkdownToHtmlDraft(input.markdown), parse_mode: "HTML" });
+        }
         return store.confirmEdited({ operationId: input.operationId, mutationId: input.mutationId }).record;
       }
       if (input.markdown !== undefined) throw new Error("Telegram channel post deletion does not accept markdown.");
@@ -1769,6 +1827,7 @@ export default function (pi: Pi.ExtensionAPI) {
     answerGuestQuery,
     deleteMessage: deleteTelegramMessage,
     sendGuestReply,
+    editGuestReply,
     finalizeMarkdownPreview,
     preparePreviewDelivery,
     proactivePushTargetGetter,

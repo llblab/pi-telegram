@@ -13,6 +13,10 @@ import type {
   TelegramBusAgentMessage,
   TelegramBusAgentTargetSelector,
 } from "./bus.ts";
+import {
+  isTelegramChannelPostValidationError,
+  TelegramChannelPostValidationError,
+} from "./channel-posts.ts";
 import type { ExtensionAPI } from "./pi.ts";
 import {
   TELEGRAM_ATTACH_PROMPT_GUIDELINES,
@@ -101,6 +105,12 @@ export interface TelegramOutboundMessageToolRegistrationDeps extends TelegramOut
   ) => Promise<number | undefined>;
   sendChannelMarkdownMessage?: (
     channel: number | string,
+    markdown: string,
+    options: { operationId: string; replyMarkup?: unknown },
+  ) => Promise<number | undefined>;
+  sendChannelMediaMessage?: (
+    channel: number | string,
+    mediaPath: string,
     markdown: string,
     options: { operationId: string; replyMarkup?: unknown },
   ) => Promise<number | undefined>;
@@ -517,11 +527,18 @@ export function registerTelegramOutboundMessageTool(
     name: "telegram_message",
     label: "Telegram Message",
     description:
-      "Send Markdown text directly to the paired/default Telegram chat, an exact channel chat_id, or an explicit live target. Channel posting requires Telegram-granted bot permission. Hidden telegram_button comments become inline prompt buttons.",
+      "Send Markdown text directly to the paired/default Telegram chat, an exact channel chat_id, or an explicit live target. Channel delivery supports one optional local photo or video upload with the text as its caption. Channel posting requires Telegram-granted bot permission. Hidden telegram_button comments become inline prompt buttons.",
     promptSnippet: TELEGRAM_MESSAGE_PROMPT_SNIPPET,
     promptGuidelines: [...TELEGRAM_MESSAGE_PROMPT_GUIDELINES],
     parameters: Type.Object({
       text: Type.String({ description: "Message text to send" }),
+      media: Type.Optional(
+        Type.String({
+          minLength: 1,
+          description:
+            "Local single-file channel upload: .jpg/.jpeg/.png/.webp photo or .mp4 video; the text becomes its caption (max 1024 characters). Albums and other media types are rejected.",
+        }),
+      ),
       chat_id: Type.Optional(
         Type.Union([
           Type.Number(),
@@ -547,6 +564,7 @@ export function registerTelegramOutboundMessageTool(
       try {
         return await sendTelegramOutboundMessage({
           text: params.text,
+          media: params.media,
           operationId: toolCallId,
           channel: params.channel,
           chatId: params.chat_id,
@@ -561,9 +579,12 @@ export function registerTelegramOutboundMessageTool(
           planMessage: deps.planMessage,
           sendMarkdownMessage: deps.sendMarkdownMessage,
           sendChannelMarkdownMessage: deps.sendChannelMarkdownMessage,
+          sendChannelMediaMessage: deps.sendChannelMediaMessage,
         });
       } catch (error) {
-        const reportableError = typeof params.chat_id === "string" || params.channel === true
+        const isChannelTarget = typeof params.chat_id === "string" || params.channel === true;
+        const reportableError = isChannelTarget &&
+            !isTelegramChannelPostValidationError(error)
           ? new Error("Telegram channel publication failed; inspect the retained local record before retrying.")
           : error;
         deps.recordRuntimeEvent?.("message", reportableError, { phase: "direct" });
@@ -771,6 +792,7 @@ export async function deliverTelegramGuestCachedAttachment(options: {
 
 export async function sendTelegramOutboundMessage(options: {
   text: string;
+  media?: string;
   operationId?: string;
   channel?: boolean;
   chatId?: number | string;
@@ -798,6 +820,12 @@ export async function sendTelegramOutboundMessage(options: {
     markdown: string,
     options: { operationId: string; replyMarkup?: unknown },
   ) => Promise<number | undefined>;
+  sendChannelMediaMessage?: (
+    channel: number | string,
+    mediaPath: string,
+    markdown: string,
+    options: { operationId: string; replyMarkup?: unknown },
+  ) => Promise<number | undefined>;
 }): Promise<{
   content: Array<{ type: "text"; text: string }>;
   details: { chatId: number | string; messageId?: number };
@@ -811,16 +839,34 @@ export async function sendTelegramOutboundMessage(options: {
         options.target !== undefined || options.agentThread !== undefined) {
       throw new Error("Telegram channel delivery requires one exact @username or negative numeric channel ID without a thread target.");
     }
+    const plan = options.planMessage(options.text);
+    if (options.media !== undefined) {
+      if (!options.sendChannelMediaMessage || !options.operationId) {
+        throw new TelegramChannelPostValidationError(
+          "Telegram channel media delivery requires direct leader transport ownership and operation identity.",
+        );
+      }
+      const messageId = await options.sendChannelMediaMessage(
+        options.chatId, options.media, plan.markdown,
+        { operationId: options.operationId, replyMarkup: plan.replyMarkup });
+      return { content: [{ type: "text",
+        text: formatTelegramOutboundMessageToolResultText(options.chatId) }],
+      details: { chatId: options.chatId, messageId } };
+    }
     if (!options.sendChannelMarkdownMessage || !options.operationId) {
       throw new Error("Telegram channel delivery requires direct leader transport ownership and operation identity.");
     }
-    const plan = options.planMessage(options.text);
     const messageId = await options.sendChannelMarkdownMessage(
       options.chatId, plan.markdown, { operationId: options.operationId,
         replyMarkup: plan.replyMarkup });
     return { content: [{ type: "text",
       text: formatTelegramOutboundMessageToolResultText(options.chatId) }],
     details: { chatId: options.chatId, messageId } };
+  }
+  if (options.media !== undefined) {
+    throw new TelegramChannelPostValidationError(
+      "telegram_message media uploads require channel delivery with an exact @username or negative numeric channel ID and channel: true.",
+    );
   }
   const requestedAgentSelector: TelegramBusAgentTargetSelector | undefined =
     options.agentThread !== undefined

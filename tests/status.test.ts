@@ -908,6 +908,79 @@ test("Bridge status lines distinguish unknown bot identity from missing config",
     buildTelegramBridgeStatusLines({ ...base, hasBotToken: false })[1],
     "- bot: not configured",
   );
+  assert.equal(
+    buildTelegramBridgeStatusLines({
+      ...base,
+      hasBotToken: false,
+      botTokenDiagnostic:
+        "Telegram bot token environment variable WORK_BOT_TOKEN is not set.",
+    })[1],
+    "- bot: Telegram bot token environment variable WORK_BOT_TOKEN is not set.",
+  );
+});
+
+test("Bridge status honors caller-resolved token availability and diagnostics", () => {
+  const rendered: string[] = [];
+  const runtime = createTelegramBridgeStatusRuntime({
+    getConfig: () => ({
+      botToken: "$PI_TELEGRAM_TEST_MISSING_TOKEN",
+      botHasToken: false,
+      botTokenDiagnostic:
+        "Telegram bot token environment variable PI_TELEGRAM_TEST_MISSING_TOKEN is not set.",
+    }),
+    isPollingActive: () => false,
+    getActiveSourceMessageIds: () => undefined,
+    hasActiveTurn: () => false,
+    hasDispatchPending: () => false,
+    isCompactionInProgress: () => false,
+    getActiveToolExecutions: () => 0,
+    hasPendingModelSwitch: () => false,
+    getQueuedItems: () => [],
+    formatQueuedStatus: () => "",
+    getRecentRuntimeEvents: () => [],
+  });
+  runtime.updateStatus({
+    ui: {
+      theme: { fg: (_token: string, text: string) => text },
+      setStatus: (_key: string, text: string) => {
+        rendered.push(text);
+      },
+    },
+  });
+  assert.equal(rendered[0], "telegram not configured");
+  assert.ok(
+    runtime
+      .getStatusLines()
+      .includes(
+        "- bot: Telegram bot token environment variable PI_TELEGRAM_TEST_MISSING_TOKEN is not set.",
+      ),
+  );
+});
+
+test("Bridge status falls back to raw token presence without a resolved flag", () => {
+  const rendered: string[] = [];
+  const runtime = createTelegramBridgeStatusRuntime({
+    getConfig: () => ({ botToken: "123:abc" }),
+    isPollingActive: () => true,
+    getActiveSourceMessageIds: () => undefined,
+    hasActiveTurn: () => false,
+    hasDispatchPending: () => false,
+    isCompactionInProgress: () => false,
+    getActiveToolExecutions: () => 0,
+    hasPendingModelSwitch: () => false,
+    getQueuedItems: () => [],
+    formatQueuedStatus: () => "",
+    getRecentRuntimeEvents: () => [],
+  });
+  runtime.updateStatus({
+    ui: {
+      theme: { fg: (_token: string, text: string) => text },
+      setStatus: (_key: string, text: string) => {
+        rendered.push(text);
+      },
+    },
+  });
+  assert.equal(rendered[0], "telegram awaiting pairing");
 });
 
 test("Bridge status lines include role, instance, and protocol identity", () => {

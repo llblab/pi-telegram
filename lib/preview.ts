@@ -70,6 +70,7 @@ export interface TelegramPreviewActiveTurn {
   target?: TelegramTarget;
   voiceReplyPreferred?: boolean;
   voiceReplyRequired?: boolean;
+  guestQueryId?: string;
 }
 
 export interface TelegramAssistantMessagePreviewStartDeps<TMessage> {
@@ -408,6 +409,17 @@ export function createTelegramAssistantMessagePreviewHooks<TMessage>(
   };
 }
 
+/**
+ * Returns true when the active turn is a Telegram Guest Mode query. A guest
+ * query allows exactly one answer within a limited Telegram response window,
+ * so it must never emit streaming draft previews.
+ */
+export function shouldSuppressPreviewForGuestTurn(
+  turn: { guestQueryId?: string } | null | undefined,
+): boolean {
+  return !!turn?.guestQueryId;
+}
+
 export async function handleTelegramAssistantMessagePreviewStart<TMessage>(
   message: TMessage,
   deps: TelegramAssistantMessagePreviewStartDeps<TMessage>,
@@ -419,6 +431,10 @@ export async function handleTelegramAssistantMessagePreviewStart<TMessage>(
     return;
   }
   if (shouldSuppressPreviewForVoice(turn)) {
+    deps.setState(undefined);
+    return;
+  }
+  if (shouldSuppressPreviewForGuestTurn(turn)) {
     deps.setState(undefined);
     return;
   }
@@ -443,6 +459,7 @@ export async function handleTelegramAssistantMessagePreviewUpdate<TMessage>(
     return;
   }
   if (shouldSuppressPreviewForVoice(turn)) return;
+  if (shouldSuppressPreviewForGuestTurn(turn)) return;
   let state = deps.getState();
   if (!state) {
     state = deps.createPreviewState();

@@ -125,6 +125,21 @@ test("Underscores inside words do not become italic", () => {
   assert.match(chunks[0]?.text ?? "", /<b>bold<\/b>/);
 });
 
+test("Spoiler markers render as Telegram HTML spoilers", () => {
+  const chunks = renderTelegramMessage("Secret: ||hidden|| and **bold**.", {
+    mode: "markdown",
+  });
+  assert.equal(chunks.length, 1);
+  assert.match(chunks[0]?.text ?? "", /<tg-spoiler>hidden<\/tg-spoiler>/);
+  assert.match(chunks[0]?.text ?? "", /<b>bold<\/b>/);
+
+  const nested = renderTelegramMessage("||**hidden**||", { mode: "markdown" });
+  assert.equal(nested[0]?.text, "<tg-spoiler><b>hidden</b></tg-spoiler>");
+
+  const literal = renderTelegramMessage("a || b", { mode: "markdown" });
+  assert.equal(literal[0]?.text, "a || b");
+});
+
 test("Bold markdown can span soft line breaks", () => {
   const chunks = renderTelegramMessage(
     "Скорее: **архитектурно — да,\nпрактически — почти**.",

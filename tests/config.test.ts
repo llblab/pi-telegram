@@ -26,6 +26,8 @@ import test from "node:test";
 
 import type { TelegramConfig } from "../lib/config.ts";
 import {
+  getTelegramBotTokenDiagnostic,
+  resolveTelegramBotToken,
   createTelegramActiveProfileKeyGetter,
   createTelegramConfigBotIdGetter,
   createTelegramConfigControls,
@@ -1638,7 +1640,7 @@ test("Bot token input prefers the first configured Telegram env var when no conf
     TELEGRAM_BOT_KEY: "key-second",
     TELEGRAM_BOT_TOKEN: "token-first",
   });
-  assert.equal(value, "token-first");
+  assert.equal(value, "$TELEGRAM_BOT_TOKEN");
 });
 
 test("Bot token prompt uses the editor when a real prefill exists", () => {
@@ -1647,7 +1649,7 @@ test("Bot token prompt uses the editor when a real prefill exists", () => {
   });
   assert.deepEqual(prompt, {
     method: "editor",
-    value: "token-first",
+    value: "$TELEGRAM_BOT_TOKEN",
   });
 });
 
@@ -1730,7 +1732,7 @@ test("Setup runtime prompts, validates token, persists config, and starts pollin
     },
   });
   assert.deepEqual(events, [
-    "editor:Telegram bot token:env-token",
+    "editor:Telegram bot token:$TELEGRAM_BOT_TOKEN",
     "getMe:new-token",
     "persist:new-token:demo_bot",
     "notify:info:Telegram bot connected: @demo_bot",
@@ -1841,7 +1843,7 @@ test("Setup prompt runtime guards concurrent setup and stores successful config"
   });
   assert.deepEqual(events, [
     "start",
-    "editor:env-token",
+    "editor:$TELEGRAM_BOT_TOKEN",
     "getMe:new-token",
     "set:demo_bot",
     "persist:new-token",
@@ -1852,4 +1854,133 @@ test("Setup prompt runtime guards concurrent setup and stores successful config"
     "finish",
     "start",
   ]);
+});
+
+test("Stored token references resolve from the configured environment", () => {
+  assert.equal(resolveTelegramBotToken(undefined), undefined);
+  assert.equal(resolveTelegramBotToken("  "), undefined);
+  assert.equal(resolveTelegramBotToken("123:abc", {}), "123:abc");
+  assert.equal(
+    resolveTelegramBotToken("$WORK_BOT_TOKEN", { WORK_BOT_TOKEN: " 456:def " }),
+    "456:def",
+  );
+  assert.equal(
+    resolveTelegramBotToken("${WORK_BOT_TOKEN}", { WORK_BOT_TOKEN: "456:def" }),
+    "456:def",
+  );
+  assert.equal(resolveTelegramBotToken("$MISSING_BOT_TOKEN", {}), undefined);
+  assert.equal(resolveTelegramBotToken("$not-a-valid-name", {}), undefined);
+
+  const store = createTelegramConfigStore({
+    initialConfig: legacyConfig({ botToken: "$WORK_BOT_TOKEN" }),
+    env: { WORK_BOT_TOKEN: "456:def" },
+  });
+  assert.equal(store.getBotToken(), "456:def");
+  assert.equal(store.hasBotToken(), true);
+  assert.equal(store.getBotTokenDiagnostic(), undefined);
+  assert.equal(
+    store.get().botToken,
+    "$WORK_BOT_TOKEN",
+    "The effective config retains the reference",
+  );
+});
+
+test("Unresolved and malformed token references fail closed with a redacted diagnostic", () => {
+  const missing = createTelegramConfigStore({
+    initialConfig: legacyConfig({ botToken: "$MISSING_BOT_TOKEN" }),
+    env: {},
+  });
+  assert.equal(missing.hasBotToken(), false);
+  assert.equal(missing.getBotToken(), undefined);
+  assert.equal(
+    missing.getBotTokenDiagnostic(),
+    "Telegram bot token environment variable MISSING_BOT_TOKEN is not set.",
+  );
+  assert.equal(
+    getTelegramBotTokenDiagnostic("$MISSING_BOT_TOKEN", {}),
+    "Telegram bot token environment variable MISSING_BOT_TOKEN is not set.",
+  );
+
+  const malformed = createTelegramConfigStore({
+    initialConfig: legacyConfig({ botToken: "$not-a-valid-name" }),
+    env: { "not-a-valid-name": "secret-value" },
+  });
+  assert.equal(malformed.hasBotToken(), false);
+  assert.match(malformed.getBotTokenDiagnostic() ?? "", /malformed/);
+  assert.doesNotMatch(
+    malformed.getBotTokenDiagnostic() ?? "",
+    /secret-value/,
+  );
+});
+
+test("Token references persist and reload per named profile without copying secrets", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-token-ref-"));
+  const configPath = join(agentDir, "telegram.json");
+  const env = {
+    DEFAULT_BOT_TOKEN: "123:abc",
+    WORK_BOT_TOKEN: "456:def",
+  };
+  try {
+    const store = createTelegramConfigStore({
+      agentDir,
+      configPath,
+      env,
+      initialConfig: legacyConfig({
+        botToken: "$DEFAULT_BOT_TOKEN",
+        profiles: { work: { botToken: "${WORK_BOT_TOKEN}" } },
+      }),
+    });
+    await store.persist();
+    const raw = await readFile(configPath, "utf8");
+    assert.doesNotMatch(raw, /123:abc/);
+    assert.doesNotMatch(raw, /456:def/);
+    assert.match(raw, /\$DEFAULT_BOT_TOKEN/);
+    assert.match(raw, /\$\{WORK_BOT_TOKEN\}/);
+
+    const reloaded = createTelegramConfigStore({ agentDir, configPath, env });
+    await reloaded.load();
+    assert.equal(reloaded.getBotToken(), "123:abc");
+    assert.equal(reloaded.activateProfile("work"), true);
+    assert.equal(reloaded.getBotToken(), "456:def");
+    assert.equal(reloaded.getBotTokenDiagnostic(), undefined);
+    assert.deepEqual(await readTelegramConfig(configPath), {
+      profiles: {
+        default: { botToken: "$DEFAULT_BOT_TOKEN" },
+        work: { botToken: "${WORK_BOT_TOKEN}" },
+      },
+    });
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("Pairing admission hashes the resolved token reference", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-token-ref-pairing-"));
+  const configPath = join(agentDir, "telegram.json");
+  try {
+    const store = createTelegramConfigStore({
+      agentDir,
+      configPath,
+      env: { PAIR_BOT_TOKEN: "123:pairing" },
+      initialConfig: legacyConfig({ botToken: "$PAIR_BOT_TOKEN" }),
+    });
+    await store.persist();
+    const resolvedSha256 = createHash("sha256")
+      .update("123:pairing")
+      .digest("hex");
+    const rawSha256 = createHash("sha256")
+      .update("$PAIR_BOT_TOKEN")
+      .digest("hex");
+    assert.equal(
+      store.withPairingAdmission("default", resolvedSha256, (excluded) => excluded),
+      true,
+    );
+    assert.throws(
+      () =>
+        store.withPairingAdmission("default", rawSha256, (excluded) => excluded),
+      /pairing admission authority is unavailable or changed/,
+    );
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
 });

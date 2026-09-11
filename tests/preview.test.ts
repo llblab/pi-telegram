@@ -17,6 +17,7 @@ import {
   finalizeTelegramPreview,
   flushTelegramPreview,
   getSafeTelegramRichMarkdownDraftPrefix,
+  shouldSuppressPreviewForGuestTurn,
   shouldUseTelegramDraftPreview,
   type TelegramPreviewRuntimeState,
 } from "../lib/preview.ts";
@@ -681,6 +682,35 @@ test("Assistant preview runtime suppresses text preview for voice-tagged turns",
   });
   assert.equal(runtime.getState(), undefined);
   assert.deepEqual(events, []);
+});
+
+test("Assistant preview runtime suppresses text preview for guest turns", async () => {
+  const events: string[] = [];
+  const activeTurn = { chatId: 0, guestQueryId: "guest-1" };
+  const runtime = createTelegramAssistantPreviewRuntime<{
+    role: string;
+    text?: string;
+  }>({
+    getActiveTurn: () => activeTurn,
+    isAssistantMessage: (message) => message.role === "assistant",
+    getMessageText: (message) => message.text ?? "",
+    maxMessageLength: 100,
+    sendDraft: async () => {
+      events.push("draft");
+    },
+    sendMarkdownReply: async () => undefined,
+  });
+  await runtime.onMessageStart({ message: { role: "assistant" } });
+  assert.equal(runtime.getState(), undefined);
+  await runtime.onMessageUpdate({
+    message: { role: "assistant", text: "hello" },
+  });
+  assert.equal(runtime.getState(), undefined);
+  assert.deepEqual(events, []);
+  assert.equal(shouldSuppressPreviewForGuestTurn(activeTurn), true);
+  assert.equal(shouldSuppressPreviewForGuestTurn({ guestQueryId: "" }), false);
+  assert.equal(shouldSuppressPreviewForGuestTurn(null), false);
+  assert.equal(shouldSuppressPreviewForGuestTurn(undefined), false);
 });
 
 test("Preview controller runtime binds Bot API draft transport", async () => {
