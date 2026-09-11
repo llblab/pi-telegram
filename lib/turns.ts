@@ -42,7 +42,7 @@ import {
 export const TELEGRAM_PREFIX = "[telegram]";
 
 export const TELEGRAM_GUEST_TURN_NOTE =
-  "[guest] Telegram Guest Mode: exactly one reply is allowed and the response window is limited. Answer as quickly as possible; prefer a fast, concise, self-contained answer and avoid extended research or long tool chains.";
+  "[guest] delivery: answer quickly with one concise, self-contained reply";
 
 export interface TelegramTurnTarget {
   chatId: number;
