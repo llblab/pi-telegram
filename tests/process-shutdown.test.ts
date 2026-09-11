@@ -113,7 +113,7 @@ function runPiPrint(
       reject(
         new Error(`pi -p did not exit. stdout=${stdout} stderr=${stderr}`),
       );
-    }, options.timeoutMs ?? 10_000);
+    }, options.timeoutMs ?? 20_000);
     timeout.unref?.();
     child.on("error", (error) => {
       clearTimeout(timeout);

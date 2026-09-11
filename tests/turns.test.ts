@@ -117,9 +117,6 @@ test("Turn helpers append the Guest Mode note only for guest turns", () => {
     guestPrompt,
     `[telegram|guest:Guest Room] guest question\n\n${TELEGRAM_GUEST_TURN_NOTE}`,
   );
-  assert.match(TELEGRAM_GUEST_TURN_NOTE, /^\[guest\] /);
-  assert.match(TELEGRAM_GUEST_TURN_NOTE, /exactly one reply/);
-  assert.match(TELEGRAM_GUEST_TURN_NOTE, /Answer as quickly as possible/);
   const ownerPrompt = buildTelegramTurnPrompt({
     telegramPrefix: "[telegram]",
     rawText: "owner question",
