@@ -602,7 +602,8 @@ for (const { status, retryAfter, delayMs } of [
   });
 }
 
-test("Sealed preview drains its issued request but never waits for a 429 draft retry", async () => {
+test("Sealed preview drains its issued request but never waits for a 429 draft retry", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 10_000 });
   let release!: () => void;
   let entered!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -632,6 +633,7 @@ test("Sealed preview drains its issued request but never waits for a 429 draft r
   try {
     preview.resetState();
     await preview.onMessageUpdate({ message: { text: "Completed answer." } });
+    t.mock.timers.tick(2000);
     flush = preview.getState()?.flushPromise;
     await issued;
     final = preview.finalizeMarkdown(7, "Completed answer.", 21);

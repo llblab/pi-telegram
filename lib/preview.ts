@@ -15,6 +15,9 @@ import { shouldSuppressPreviewForVoice } from "./voice.ts";
 
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_DRAFT_PREVIEW_MAX_CHARS = 4096;
+// Native draft cadence: at most one frame per interval, and a fresh preview
+// segment holds its first frame for one full interval so the opening frame is
+// an accumulated passage rather than a single streamed word.
 const TELEGRAM_DRAFT_INTERVAL_MS = 2_000;
 
 export type TelegramDraftSupport = "unknown" | "supported";
@@ -90,6 +93,7 @@ export interface TelegramAssistantMessagePreviewUpdateDeps<TMessage> {
   createPreviewState: () => TelegramPreviewRuntimeState;
   canSend?: () => boolean;
   getMessageText: (message: TMessage) => string;
+  minDraftIntervalMs?: number;
   schedulePreviewFlush: (
     chatId: number,
     options?: { target?: TelegramTarget },
@@ -305,6 +309,7 @@ export function createTelegramAssistantPreviewRuntime<
       createPreviewState: controller.createState,
       canSend: deps.canSend,
       getMessageText: deps.getMessageText,
+      minDraftIntervalMs: TELEGRAM_DRAFT_INTERVAL_MS,
       schedulePreviewFlush: controller.scheduleFlush,
     }),
   };
@@ -466,9 +471,24 @@ export async function handleTelegramAssistantMessagePreviewUpdate<TMessage>(
     deps.setState(state);
   }
   if (state.sealed) return;
+  const hadVisibleText = state.pendingText.length > 0;
   state.pendingText = stripTelegramCommentMarkupForPreview(
     deps.getMessageText(message),
   );
+  // The first visible text of a preview segment opens an initial accumulation
+  // window, so the segment's first frame cannot ship as a single word even
+  // when the previous cadence boundary has already passed (fresh turn, slow
+  // first token, or message rollover after tool work). Later deltas keep the
+  // trailing deadline instead of sliding it on every update.
+  const interval = deps.minDraftIntervalMs ?? 0;
+  if (
+    interval > 0 &&
+    !hadVisibleText &&
+    !state.lastSentText &&
+    state.pendingText.length > 0
+  ) {
+    state.nextDraftAt = Math.max(state.nextDraftAt ?? 0, Date.now() + interval);
+  }
   deps.schedulePreviewFlush(turn.chatId, { target: turn.target });
 }
 
