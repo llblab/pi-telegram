@@ -1840,7 +1840,7 @@ test("Queue menu keeps main-menu navigation on top", async () => {
     "<b>1.</b>\n<pre>[telegram] queued &lt;prompt&gt;\n\nfull body</pre>",
   );
   assert.equal(texts[4], "<b>⏳ Queue:</b>");
-  assert.equal(texts[5], "<b>⌛ Queue is empty.</b>");
+  assert.equal(texts[5], "<b>⌛ Queue is empty</b>");
   assert.deepEqual(modes, ["html", "html", "html", "html", "html", "html"]);
 });
 
@@ -2117,9 +2117,9 @@ test("Queue refresh rotates empty queue title", async () => {
     "ctx",
   );
   assert.deepEqual(texts, [
-    "<b>⌛ Queue is empty.</b>",
-    "<b>🫙 Still nothing in queue.</b>",
-    "<b>🍃 Queue remains empty.</b>",
+    "<b>⌛ Queue is empty</b>",
+    "<b>🫙 Still nothing in queue</b>",
+    "<b>🍃 Queue remains empty</b>",
   ]);
   assert.equal(
     markups[0]?.inline_keyboard[1]?.[0]?.callback_data,

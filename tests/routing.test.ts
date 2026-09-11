@@ -436,6 +436,12 @@ interface RouteHarnessOptions {
     TestContext,
     TestModel
   >["answerGuestQueryForInlineMessage"];
+  startGuestPlaceholder?: Routing.TelegramInboundRouteRuntimeDeps<
+    TestMessage,
+    TestCallbackQuery,
+    TestContext,
+    TestModel
+  >["startGuestPlaceholder"];
   deleteMessage?: Routing.TelegramInboundRouteRuntimeDeps<
     TestMessage,
     TestCallbackQuery,
@@ -621,6 +627,7 @@ function createRouteHarness(options: RouteHarnessOptions = {}) {
     },
     answerGuestQuery: async () => undefined,
     answerGuestQueryForInlineMessage: options.answerGuestQueryForInlineMessage,
+    startGuestPlaceholder: options.startGuestPlaceholder,
     editMessageReplyMarkup: options.editMessageReplyMarkup,
     editInteractiveMessage: options.editInteractiveMessage,
     sendInteractiveMessage: options.sendInteractiveMessage ??  (async (_chatId, text, mode, replyMarkup, sendOptions) => {
@@ -1714,16 +1721,20 @@ test("Routing runtime assigns guest-mode prompts to the current transport leader
   );
 });
 
-test("Routing runtime answers guest-mode queries early with an HTML working ACK", async () => {
+test("Routing runtime answers guest-mode queries early with the globe ACK and starts the placeholder", async () => {
   const acks: Array<{
     guestQueryId: string;
     text: string;
     options?: { parseMode?: "HTML" };
   }> = [];
+  const starts: string[] = [];
   const { routeRuntime, telegramQueueStore } = createRouteHarness({
     answerGuestQueryForInlineMessage: async (guestQueryId, text, options) => {
       acks.push({ guestQueryId, text, options });
       return "inline-1";
+    },
+    startGuestPlaceholder: (inlineMessageId) => {
+      starts.push(inlineMessageId);
     },
   });
 
@@ -1744,10 +1755,11 @@ test("Routing runtime answers guest-mode queries early with an HTML working ACK"
   assert.deepEqual(acks, [
     {
       guestQueryId: "guest-1",
-      text: "<b>⚙️ Received. Working on it…</b>",
+      text: "<b>🌎 Working on it.</b>",
       options: { parseMode: "HTML" },
     },
   ]);
+  assert.deepEqual(starts, ["inline-1"]);
   const queued = telegramQueueStore.getQueuedItems()[0];
   assert.equal(queued?.kind, "prompt");
   assert.equal(
@@ -1756,7 +1768,7 @@ test("Routing runtime answers guest-mode queries early with an HTML working ACK"
   );
 });
 
-test("Routing runtime keeps the guest-mode turn when the ACK experiment answer fails", async () => {
+test("Routing runtime keeps the guest-mode turn when the guest ACK fails", async () => {
   const { events, routeRuntime, telegramQueueStore } = createRouteHarness({
     answerGuestQueryForInlineMessage: async () => {
       throw new Error("query is too old");

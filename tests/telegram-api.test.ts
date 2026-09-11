@@ -1196,6 +1196,88 @@ test("Retry-safe Telegram API methods replay 5xx responses", async () => {
   }
 });
 
+test("Rate-limit retry waits record the method and duration before the pause", async () => {
+  const events: Array<{
+    kind: string;
+    message: string;
+    details?: Record<string, unknown>;
+  }> = [];
+  let calls = 0;
+  const restoreFetch = setApiTestFetch(async () => {
+    calls += 1;
+    return calls === 1
+      ? createApiErrorResponse(
+          429,
+          "Too Many Requests",
+          new Headers({ "retry-after": "2" }),
+        )
+      : createApiJsonResponse(true);
+  });
+  try {
+    const client = createTelegramApiClient(() => "123:abc", {
+      recordRuntimeEvent: (kind, error, details) => {
+        events.push({
+          kind,
+          message: error instanceof Error ? error.message : String(error),
+          ...(details ? { details } : {}),
+        });
+      },
+    });
+    assert.equal(
+      await client.call<boolean>("editMessageText", {}, {
+        sleep: async () => {},
+      }),
+      true,
+    );
+    assert.equal(calls, 2);
+    assert.deepEqual(events, [
+      {
+        kind: "api",
+        message:
+          "Telegram API rate limit: waiting 2000 ms before retrying editMessageText",
+        details: {
+          phase: "retry-wait",
+          method: "editMessageText",
+          waitMs: 2000,
+          attempt: 0,
+          retryAfterSeconds: 2,
+        },
+      },
+    ]);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("5xx retry waits stay out of the rate-limit event stream", async () => {
+  const events: unknown[] = [];
+  let calls = 0;
+  const restoreFetch = setApiTestFetch(async () => {
+    calls += 1;
+    return calls === 1
+      ? createApiErrorResponse(500, "Server Error")
+      : createApiJsonResponse(true);
+  });
+  try {
+    const client = createTelegramApiClient(() => "123:abc", {
+      recordRuntimeEvent: () => {
+        events.push(true);
+      },
+    });
+    assert.equal(
+      await client.call<boolean>("editMessageText", {}, {
+        retryBaseDelayMs: 0,
+        sleep: async () => {},
+      }),
+      true,
+    );
+    assert.deepEqual(events, []);
+    assert.equal(calls, 2);
+  } finally {
+    restoreFetch();
+  }
+});
+
 test("Telegram API retry waits settle immediately when their owner aborts", async () => {
   const controller = new AbortController();
   const reason = { kind: "polling-request-expired" };
@@ -1849,6 +1931,10 @@ test("Telegram bridge API runtime captures guest inline message ids and edits th
     richMessage: { markdown: "**done**" },
   });
   await runtime.editGuestInlineMessage("inline-43", { text: "plain" });
+  await runtime.editGuestInlineMessage("inline-44", {
+    text: "<b>frame</b>",
+    parseMode: "HTML",
+  });
   assert.deepEqual(calls, [
     {
       method: "answerGuestQuery",
@@ -1884,6 +1970,14 @@ test("Telegram bridge API runtime captures guest inline message ids and edits th
     {
       method: "editMessageText",
       body: { inline_message_id: "inline-43", text: "plain" },
+    },
+    {
+      method: "editMessageText",
+      body: {
+        inline_message_id: "inline-44",
+        text: "<b>frame</b>",
+        parse_mode: "HTML",
+      },
     },
   ]);
 });

@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+## 0.45.6: Guest Placeholder And Delivery Hotfix
+
+- `Guest Placeholder`: The guest ACK answers with the first bold globe frame (`🌎 Working on it.`) and rotates `🌍`/`🌏` once per second with the dots growing every two seconds. Rotation now completes whole 6-frame cycles and stops only after the 20 s minimum, so a pending answer holds the cycle's final frame (`🌏 Working on it...`) instead of cutting mid-step; a 26 s safety bound stays clear of the ~28 s Telegram flood-control wall, and error backoff and pre-replacement cancellation are unchanged.
+- `Guest Answer Delivery`: The guest replacement now falls back to the run's latest completed assistant text when Pi's final assistant message is empty, so an answer preserved by a companion extension's fallback turn (for example State Flow's suppressed final:true patch turn) is still edited into the guest message instead of being skipped as "no editable text".
+- `Rate-Limit Visibility`: A `429` retry wait now records an `api` runtime event with the method, wait duration, attempt, and server `retry_after`, so a silent flood-control pause before the final guest replacement is visible in the runtime log instead of appearing only as a frozen frame.
+- `Thread Display Hint`: The Thread display settings card no longer carries the manual `/name Name` override hint; the current-value line, the three mode descriptions, and the live chooser are unchanged.
+- `Queue Empty Headings`: The default empty-queue line and every rotating refresh title drop the trailing period, so the fully bold queue headings read as headings; wording, emoji, rotation order, callbacks, and refresh behavior are unchanged.
+
 ## 0.45.5: Queue Refresh Icon Hotfix
 
 - `Queue Refresh Icon`: The queue menu's Refresh row now uses `🔄`, the canonical refresh glyph, reserving `🌀` for the State Flow Telegram identity. The button label is the only change; queue refresh behavior, callbacks, and the rotating empty-queue notices are unchanged.

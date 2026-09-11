@@ -1554,6 +1554,8 @@ export interface TelegramAgentEndRuntimeDeps<
   sendGuestReply?: (guestQueryId: string, markdown: string) => Promise<void>;
   /** Replaces the early guest ACK with the final text. */
   editGuestReply?: (inlineMessageId: string, markdown: string) => Promise<void>;
+  /** Cancels the animated guest placeholder before the final edit. */
+  stopGuestPlaceholder?: (inlineMessageId: string) => Promise<void>;
   sendGuestAttachment?: (
     turn: TTurn,
     attachment: QueuedAttachment,
@@ -1633,6 +1635,7 @@ export interface TelegramAgentEndHookRuntimeDeps<
   answerGuestQuery?: TelegramAgentEndRuntimeDeps<TTurn>["answerGuestQuery"];
   sendGuestReply?: TelegramAgentEndRuntimeDeps<TTurn>["sendGuestReply"];
   editGuestReply?: TelegramAgentEndRuntimeDeps<TTurn>["editGuestReply"];
+  stopGuestPlaceholder?: TelegramAgentEndRuntimeDeps<TTurn>["stopGuestPlaceholder"];
   sendGuestAttachment?: TelegramAgentEndRuntimeDeps<TTurn>["sendGuestAttachment"];
   sendGuestVoiceReply?: TelegramAgentEndRuntimeDeps<TTurn>["sendGuestVoiceReply"];
   planOutboundReply?: TelegramAgentEndRuntimeDeps<
@@ -1774,6 +1777,7 @@ export function createTelegramAgentEndHook<
         answerGuestQuery: deps.answerGuestQuery,
         sendGuestReply: deps.sendGuestReply,
         editGuestReply: deps.editGuestReply,
+        stopGuestPlaceholder: deps.stopGuestPlaceholder,
         sendGuestAttachment: deps.sendGuestAttachment,
         sendGuestVoiceReply: deps.sendGuestVoiceReply,
         planOutboundReply: deps.planOutboundReply,
@@ -1866,6 +1870,16 @@ export async function handleTelegramAgentEndRuntime<
     return;
   }
   if (turn.guestQueryId) {
+    if (turn.guestInlineMessageId && deps.stopGuestPlaceholder) {
+      try {
+        await deps.stopGuestPlaceholder(turn.guestInlineMessageId);
+      } catch (error) {
+        deps.recordRuntimeEvent?.("delivery", error, {
+          phase: "guest-placeholder-stop",
+          guestQueryId: turn.guestQueryId,
+        });
+      }
+    }
     if (turn.guestInlineMessageId && deps.editGuestReply) {
       const experimentText = assistant.errorMessage
         ? "Telegram bridge: Pi failed while processing the request."
@@ -1875,7 +1889,7 @@ export async function handleTelegramAgentEndRuntime<
           await deps.editGuestReply(turn.guestInlineMessageId, experimentText);
           deps.recordRuntimeEvent?.(
             "guest",
-            new Error("Guest ACK experiment edited the guest answer"),
+            new Error("Guest ACK edited the guest answer"),
             { phase: "guest-ack-edited", guestQueryId: turn.guestQueryId },
           );
         } catch (error) {
@@ -1887,7 +1901,7 @@ export async function handleTelegramAgentEndRuntime<
       } else {
         deps.recordRuntimeEvent?.(
           "delivery",
-          new Error("Guest ACK experiment turn produced no editable text"),
+          new Error("Guest ACK turn produced no editable text"),
           { phase: "guest-ack-edit-empty", guestQueryId: turn.guestQueryId },
         );
       }

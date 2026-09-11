@@ -265,6 +265,7 @@ export interface TelegramBridgeSessionServiceRuntime {
   inboundWorker: { onSessionShutdown(): Promise<void> };
   capabilityMonitor: { start(ctx: ExtensionContext): void; stop(): void };
   queueWatchdog: { start(ctx: ExtensionContext): void; stop(): void };
+  guestPlaceholder?: { stopAll(): void };
 }
 
 export interface TelegramBridgeSessionLifecycleAssemblyDeps<
@@ -320,6 +321,7 @@ export interface TelegramBridgeSessionLifecyclePorts<
     inboundWorker: TelegramBridgeSessionServiceRuntime["inboundWorker"];
     capabilityMonitor: TelegramBridgeSessionServiceRuntime["capabilityMonitor"];
     queueWatchdog: TelegramBridgeSessionServiceRuntime["queueWatchdog"];
+    guestPlaceholder?: TelegramBridgeSessionServiceRuntime["guestPlaceholder"];
   };
 }
 
@@ -347,6 +349,7 @@ export function createTelegramBridgeSessionLifecycleDeps<
       inboundWorker: ports.services.inboundWorker,
       capabilityMonitor: ports.services.capabilityMonitor,
       queueWatchdog: ports.services.queueWatchdog,
+      guestPlaceholder: ports.services.guestPlaceholder,
     },
   };
 }
@@ -383,6 +386,7 @@ export function createTelegramBridgeSessionLifecycleAssembly<
     },
     async onSessionShutdown(event, ctx) {
       if (!isSessionActive(ctx)) return;
+      deps.services.guestPlaceholder?.stopAll();
       await deps.services.delivery.onSessionShutdown();
       if (!isSessionActive(ctx)) return;
       deps.services.queueWatchdog.stop();

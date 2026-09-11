@@ -1243,7 +1243,7 @@ test("Next command renders an emphasized empty queue notice", async () => {
   });
 
   assert.deepEqual(replies, [
-    { text: "<b>⌛ Queue is empty.</b>", parseMode: "HTML" },
+    { text: "<b>⌛ Queue is empty</b>", parseMode: "HTML" },
   ]);
 });
 

@@ -1,6 +1,6 @@
 /**
  * Regression tests for Telegram reply delivery helpers
- * Covers UI/compat rendered-message transport, chunk delivery, and native/plain final reply sending
+ * Covers UI/compat rendered-message transport, chunk delivery, native/plain final reply sending, and guest placeholder rotation
  */
 
 import assert from "node:assert/strict";
@@ -12,16 +12,19 @@ test.beforeEach(() => {
 });
 
 import {
+  buildTelegramGuestPlaceholderFrame,
   buildTelegramReplyParameters,
   withTelegramReplyParameters,
   buildTelegramReplyTransport,
   createGuestMarkdownReplySender,
   createReplyDedupRuntime,
+  createTelegramGuestPlaceholderRuntime,
   createTelegramRenderedMessageDeliveryRuntime,
   createTelegramRenderedMessageRuntime,
   dedupSendTextReply,
   editTelegramRenderedMessage,
   extractLatestAssistantMessageText,
+  extractRunAssistantMessage,
   getAgentMessageText,
   isAssistantAgentMessage,
   normalizeTelegramNativeMarkdown,
@@ -30,6 +33,10 @@ import {
   sendTelegramPlainReply,
   sendTelegramRenderedChunks,
   splitTelegramNativeMarkdown,
+  TELEGRAM_GUEST_PLACEHOLDER_FRAME_MS,
+  TELEGRAM_GUEST_PLACEHOLDER_FRAMES,
+  TELEGRAM_GUEST_PLACEHOLDER_MAX_MS,
+  TELEGRAM_GUEST_PLACEHOLDER_MIN_MS,
   TELEGRAM_RICH_MESSAGE_MAX_BLOCKS,
   TELEGRAM_RICH_MESSAGE_MAX_CHARS,
 } from "../lib/replies.ts";
@@ -59,6 +66,59 @@ test("Reply helpers extract assistant message text and metadata", () => {
     stopReason: "error",
     errorMessage: "boom",
   });
+});
+
+test("Run assistant extraction keeps the preserved answer when the final message is suppressed", () => {
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "question" }] },
+    {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "preserved answer" }],
+    },
+    { role: "custom", customType: "state-flow-validation" },
+    { role: "assistant", stopReason: "stop", content: [] },
+  ];
+  assert.deepEqual(extractRunAssistantMessage(messages), {
+    text: "preserved answer",
+    stopReason: "stop",
+    errorMessage: undefined,
+  });
+});
+
+test("Run assistant extraction never promotes tool-use prefaces or errors", () => {
+  assert.deepEqual(
+    extractRunAssistantMessage([
+      {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "text", text: "Let me check." }],
+      },
+      { role: "assistant", stopReason: "stop", content: [] },
+    ]),
+    { text: undefined, stopReason: "stop", errorMessage: undefined },
+  );
+  assert.deepEqual(
+    extractRunAssistantMessage([
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "boom",
+        content: [],
+      },
+    ]),
+    { text: undefined, stopReason: "error", errorMessage: "boom" },
+  );
+  assert.deepEqual(
+    extractRunAssistantMessage([
+      {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: "latest" }],
+      },
+    ]),
+    { text: "latest", stopReason: "stop", errorMessage: undefined },
+  );
 });
 
 test("Reply transport forwards send and edit operations through delivery helpers", async () => {
@@ -1058,4 +1118,288 @@ test("Dedup reset fires on agent_start through lifecycle hook", async () => {
     true,
     "reset clears previous reply state",
   );
+});
+
+interface GuestPlaceholderTestTimer {
+  id: number;
+}
+
+function createGuestPlaceholderTimers() {
+  let nextId = 1;
+  let currentMs = 0;
+  const callbacks = new Map<number, { callback: () => void; ms: number }>();
+  const scheduledDelays: number[] = [];
+  return {
+    scheduledDelays,
+    now: () => currentMs,
+    pendingCount: () => callbacks.size,
+    advance(ms: number) {
+      currentMs += ms;
+    },
+    setTimer(callback: () => void, ms: number) {
+      scheduledDelays.push(ms);
+      const timer = { id: nextId++ };
+      callbacks.set(timer.id, { callback, ms });
+      return timer as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimer(timer: ReturnType<typeof setTimeout>) {
+      callbacks.delete((timer as unknown as GuestPlaceholderTestTimer).id);
+    },
+    async fire() {
+      const entry = callbacks.entries().next();
+      if (entry.done) throw new Error("No guest placeholder timer is pending");
+      const [id, scheduled] = entry.value;
+      callbacks.delete(id);
+      currentMs += scheduled.ms;
+      scheduled.callback();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    },
+  };
+}
+
+test("Guest placeholder frames step the globe every frame and grow the dots every two seconds", () => {
+  assert.equal(TELEGRAM_GUEST_PLACEHOLDER_FRAME_MS, 1_000);
+  assert.equal(TELEGRAM_GUEST_PLACEHOLDER_FRAMES.length, 6);
+  assert.equal(
+    buildTelegramGuestPlaceholderFrame(0),
+    "<b>🌎 Working on it.</b>",
+  );
+  assert.equal(
+    buildTelegramGuestPlaceholderFrame(1),
+    "<b>🌍 Working on it.</b>",
+  );
+  assert.equal(
+    buildTelegramGuestPlaceholderFrame(2),
+    "<b>🌏 Working on it..</b>",
+  );
+  assert.equal(
+    buildTelegramGuestPlaceholderFrame(3),
+    "<b>🌎 Working on it..</b>",
+  );
+  assert.equal(
+    buildTelegramGuestPlaceholderFrame(4),
+    "<b>🌍 Working on it...</b>",
+  );
+  assert.equal(
+    buildTelegramGuestPlaceholderFrame(5),
+    "<b>🌏 Working on it...</b>",
+  );
+  assert.equal(
+    buildTelegramGuestPlaceholderFrame(6),
+    buildTelegramGuestPlaceholderFrame(0),
+  );
+  assert.equal(
+    buildTelegramGuestPlaceholderFrame(-1),
+    buildTelegramGuestPlaceholderFrame(5),
+  );
+});
+
+test("Guest placeholder runtime edits the inline message once per interval", async () => {
+  const edits: Array<[string, string]> = [];
+  const timers = createGuestPlaceholderTimers();
+  const runtime = createTelegramGuestPlaceholderRuntime({
+    editGuestInlineMessage: async (inlineMessageId, content) => {
+      edits.push([inlineMessageId, content.text]);
+    },
+    intervalMs: 1_000,
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  });
+  runtime.start("inline-1");
+  assert.deepEqual(edits, []);
+  assert.equal(timers.pendingCount(), 1);
+  assert.deepEqual(timers.scheduledDelays, [1_000]);
+  await timers.fire();
+  assert.deepEqual(edits, [["inline-1", "<b>🌍 Working on it.</b>"]]);
+  assert.equal(timers.pendingCount(), 1);
+  await timers.fire();
+  assert.deepEqual(edits[1], ["inline-1", "<b>🌏 Working on it..</b>"]);
+  await timers.fire();
+  assert.deepEqual(edits[2], ["inline-1", "<b>🌎 Working on it..</b>"]);
+  await runtime.stop("inline-1");
+  assert.equal(timers.pendingCount(), 0);
+});
+
+test("Guest placeholder rotation completes whole cycles for at least 20 seconds and holds the final frame", async () => {
+  const edits: string[] = [];
+  const events: Array<Record<string, unknown>> = [];
+  const timers = createGuestPlaceholderTimers();
+  const runtime = createTelegramGuestPlaceholderRuntime({
+    editGuestInlineMessage: async (_inlineMessageId, content) => {
+      edits.push(content.text);
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(details ?? {});
+    },
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: timers.now,
+  });
+  assert.equal(TELEGRAM_GUEST_PLACEHOLDER_MIN_MS, 20_000);
+  assert.equal(TELEGRAM_GUEST_PLACEHOLDER_MAX_MS, 26_000);
+  runtime.start("inline-1");
+  for (let fired = 0; fired < 40 && timers.pendingCount() > 0; fired += 1) {
+    await timers.fire();
+  }
+  // Four full six-frame cycles end with the cycle's last frame at 23 s.
+  assert.equal(edits.length, 23);
+  assert.equal(edits.at(-1), "<b>🌏 Working on it...</b>");
+  assert.equal(timers.pendingCount(), 0);
+  assert.deepEqual(events, [
+    {
+      phase: "guest-placeholder-capped",
+      minMs: 20_000,
+      maxMs: 26_000,
+      elapsedMs: 23_000,
+      step: 23,
+    },
+  ]);
+  await runtime.stop("inline-1");
+});
+
+test("Guest placeholder rotation still finishes a whole cycle when frames run slower", async () => {
+  const edits: string[] = [];
+  const events: Array<Record<string, unknown>> = [];
+  const timers = createGuestPlaceholderTimers();
+  const runtime = createTelegramGuestPlaceholderRuntime({
+    editGuestInlineMessage: async (_inlineMessageId, content) => {
+      edits.push(content.text);
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(details ?? {});
+    },
+    intervalMs: 1_300,
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: timers.now,
+  });
+  runtime.start("inline-1");
+  for (let fired = 0; fired < 40 && timers.pendingCount() > 0; fired += 1) {
+    await timers.fire();
+  }
+  // The first cycle end at/after 20 s is step 17 (three cycles at 1.3 s frames).
+  assert.equal(edits.length, 17);
+  assert.equal(edits.at(-1), "<b>🌏 Working on it...</b>");
+  assert.deepEqual(events, [
+    {
+      phase: "guest-placeholder-capped",
+      minMs: 20_000,
+      maxMs: 26_000,
+      elapsedMs: 22_100,
+      step: 17,
+    },
+  ]);
+  await runtime.stop("inline-1");
+});
+
+test("Guest placeholder safety bound stops a slow stream mid-cycle instead of reaching the flood wall", async () => {
+  const edits: string[] = [];
+  const events: Array<Record<string, unknown>> = [];
+  const timers = createGuestPlaceholderTimers();
+  const runtime = createTelegramGuestPlaceholderRuntime({
+    editGuestInlineMessage: async (_inlineMessageId, content) => {
+      edits.push(content.text);
+      timers.advance(1_800);
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(details ?? {});
+    },
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: timers.now,
+  });
+  runtime.start("inline-1");
+  for (let fired = 0; fired < 40 && timers.pendingCount() > 0; fired += 1) {
+    await timers.fire();
+  }
+  assert.equal(edits.length, 9);
+  assert.equal(edits.at(-1), "<b>🌎 Working on it..</b>");
+  assert.deepEqual(events, [
+    {
+      phase: "guest-placeholder-capped",
+      minMs: 20_000,
+      maxMs: 26_000,
+      elapsedMs: 25_200,
+      step: 9,
+    },
+  ]);
+  await runtime.stop("inline-1");
+});
+
+test("Guest placeholder stop waits for the in-flight frame and cancels the loop", async () => {
+  const edits: string[] = [];
+  let releaseEdit: (() => void) | undefined;
+  const timers = createGuestPlaceholderTimers();
+  const runtime = createTelegramGuestPlaceholderRuntime({
+    editGuestInlineMessage: async (_inlineMessageId, content) => {
+      edits.push(content.text);
+      await new Promise<void>((resolve) => {
+        releaseEdit = resolve;
+      });
+    },
+    intervalMs: 1_000,
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  });
+  runtime.start("inline-1");
+  await timers.fire();
+  assert.equal(edits.length, 1);
+  let settled = false;
+  const stopping = runtime.stop("inline-1").then(() => {
+    settled = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  releaseEdit?.();
+  await stopping;
+  assert.equal(settled, true);
+  assert.equal(timers.pendingCount(), 0);
+  await runtime.stop("inline-1");
+});
+
+test("Guest placeholder edit failures stay fail-open and honor retry_after", async () => {
+  const events: Array<Record<string, unknown>> = [];
+  const timers = createGuestPlaceholderTimers();
+  let attempts = 0;
+  const runtime = createTelegramGuestPlaceholderRuntime({
+    editGuestInlineMessage: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw Object.assign(new Error("Too Many Requests"), {
+          retryAfterSeconds: 2,
+        });
+      }
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(details ?? {});
+    },
+    intervalMs: 1_000,
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  });
+  runtime.start("inline-1");
+  await timers.fire();
+  assert.deepEqual(events, [
+    { phase: "guest-placeholder-edit", retryAfterMs: 2_000 },
+  ]);
+  assert.deepEqual(timers.scheduledDelays, [1_000, 2_000]);
+  await timers.fire();
+  assert.equal(attempts, 2);
+  assert.deepEqual(timers.scheduledDelays, [1_000, 2_000, 1_000]);
+  await runtime.stop("inline-1");
+});
+
+test("Guest placeholder stopAll cancels every pending loop", async () => {
+  const timers = createGuestPlaceholderTimers();
+  const runtime = createTelegramGuestPlaceholderRuntime({
+    editGuestInlineMessage: async () => {},
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  });
+  runtime.start("inline-1");
+  runtime.start("inline-2");
+  assert.equal(timers.pendingCount(), 2);
+  runtime.stopAll();
+  assert.equal(timers.pendingCount(), 0);
+  await runtime.stop("inline-1");
 });

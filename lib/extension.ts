@@ -588,6 +588,12 @@ export default function (pi: Pi.ExtensionAPI) {
   const editGuestReply = Replies.createGuestMarkdownReplyEditor({
     editGuestInlineMessage: telegramApiRuntime.editGuestInlineMessage,
   });
+  // Rotate the guest placeholder frames until the final replacement stops them.
+  const guestPlaceholderRuntime =
+    Replies.createTelegramGuestPlaceholderRuntime({
+      editGuestInlineMessage: telegramApiRuntime.editGuestInlineMessage,
+      recordRuntimeEvent,
+    });
 
   const promptDispatchRuntime = Runtime.createTelegramPromptDispatchRuntime({
     lifecycle,
@@ -978,6 +984,7 @@ export default function (pi: Pi.ExtensionAPI) {
     deleteMessage: deleteTelegramMessage,
     answerGuestQuery,
     answerGuestQueryForInlineMessage,
+    startGuestPlaceholder: guestPlaceholderRuntime.start,
     sendTextReply,
     setMyCommands,
     validateThreadName(threadName) {
@@ -1508,6 +1515,7 @@ export default function (pi: Pi.ExtensionAPI) {
         },
         capabilityMonitor: telegramThreadCapabilityMonitor,
         queueWatchdog: queueDispatchWatchdogRuntime,
+        guestPlaceholder: { stopAll: guestPlaceholderRuntime.stopAll },
       },
     });
   const sessionLifecycleRuntime =
@@ -1828,6 +1836,7 @@ export default function (pi: Pi.ExtensionAPI) {
     deleteMessage: deleteTelegramMessage,
     sendGuestReply,
     editGuestReply,
+    stopGuestPlaceholder: guestPlaceholderRuntime.stop,
     finalizeMarkdownPreview,
     preparePreviewDelivery,
     proactivePushTargetGetter,

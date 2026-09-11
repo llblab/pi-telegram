@@ -104,7 +104,7 @@ The menu may clear internal Skip but cannot remove a reaction created by the use
 
 ### Decorative Or Local-Example Emoji
 
-Some emoji are intentionally local examples or decorative variants, not global semantics. Empty-queue rotating messages (`🫙`, `🍃`, `🕳`, `🦗`, `🌙`, `🧘`, `🪐`, `🧺`, `🔭`, `🫧`, `🛸`) are copy flavor only and must not become controls. Example extension icons such as `🧪`, `🔧`, and `🗂` are documentation fixtures for companion extensions, not built-in pi-telegram meanings.
+Some emoji are intentionally local examples or decorative variants, not global semantics. Empty-queue rotating messages (`🫙`, `🍃`, `🕳`, `🦗`, `🌙`, `🧘`, `🪐`, `🧺`, `🔭`, `🫧`, `🛸`) are copy flavor only and must not become controls. The Guest Mode placeholder frames (`🌎`, `🌍`, `🌏` stepping every second with dots growing once every two seconds) are the same kind of decorative copy: they complete whole 6-frame cycles over at least a ~20 s rotation while a guest answer is pending and then hold the cycle's final frame (a 26 s safety bound caps slow streams), never become controls, and must not carry another meaning. Example extension icons such as `🧪`, `🔧`, and `🗂` are documentation fixtures for companion extensions, not built-in pi-telegram meanings.
 
 Thread UI rule: when a message heading, chooser, or status line is specifically about Telegram/Pi threads or target thread selection, start the heading with `🧵`. Button labels for concrete thread targets should stay clean (`threadName` or slot fallback) and should not add `🧵` to every target button unless the row would otherwise be ambiguous.
 
@@ -224,7 +224,7 @@ Message cards and standalone informational notices sent by the bot should start 
 Rules:
 
 - Start with a bold heading or, for dialogs, a bold question.
-- Format standalone notices as one fully bold line: relevant emoji, one space, concise sentence, and terminal period. Menu or chooser headings use the same fully bold form but end in a colon when controls or detail follow.
+- Format standalone notices as one fully bold line: relevant emoji, one space, concise sentence, and terminal period. Menu or chooser headings use the same fully bold form but end in a colon when controls or detail follow. Empty-queue headings are the deliberate exception: fully bold, with no trailing period or colon.
 - Keep the emoji and complete sentence or heading inside the single bold span; do not bold only a fragment. A material name or phrase may receive nested italic emphasis without breaking the outer bold hierarchy—for example `<b>📡 Instance <i>Cedar</i> connected.</b>`.
 - Apply the same hierarchy to success, progress, empty, busy, unavailable, cancellation, and failure notices.
 - Callback alerts remain plain text because Telegram does not support rich text there, but still keep the relevant emoji and concise sentence.

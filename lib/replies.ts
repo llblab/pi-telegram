@@ -1,7 +1,7 @@
 /**
  * Telegram reply delivery helpers
  * Zones: telegram outbound, native rich markdown, UI/compat rendering transport
- * Owns native assistant replies, rendered UI delivery, reply transport wiring, and plain text replies
+ * Owns native assistant replies, rendered UI delivery, guest placeholder rotation, reply transport wiring, and plain text replies
  */
 
 import { assertTelegramInlineKeyboardCallbackData } from "./keyboard.ts";
@@ -175,6 +175,47 @@ export function extractLatestAssistantMessageText(
     return { text: text || undefined, stopReason, errorMessage };
   }
   return {};
+}
+
+/**
+ * Extract the run's answer without trusting an empty final assistant message.
+ * A low-level run may end with a completed assistant message whose content was
+ * suppressed (a companion extension preserving an earlier draft, for example
+ * State Flow's fallback final:true patch turn). In that case the run's answer
+ * is the latest earlier completed assistant message that carries text;
+ * tool-use prefaces, errors, and aborts stay excluded.
+ */
+export function extractRunAssistantMessage(
+  messages: readonly unknown[],
+): {
+  text?: string;
+  stopReason?: string;
+  errorMessage?: string;
+} {
+  const latest = extractLatestAssistantMessageText(messages);
+  if (latest.text || latest.stopReason !== "stop") return latest;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!message || !isAssistantAgentMessage(message)) continue;
+    const rawStopReason = getAgentMessageField(message, "stopReason");
+    if (
+      rawStopReason === "toolUse" ||
+      rawStopReason === "error" ||
+      rawStopReason === "aborted"
+    ) {
+      continue;
+    }
+    const text = getAgentMessageText(message);
+    if (!text) continue;
+    const rawErrorMessage = getAgentMessageField(message, "errorMessage");
+    return {
+      text,
+      stopReason: typeof rawStopReason === "string" ? rawStopReason : undefined,
+      errorMessage:
+        typeof rawErrorMessage === "string" ? rawErrorMessage : undefined,
+    };
+  }
+  return latest;
 }
 
 export interface TelegramReplyOwnershipRecorder {
@@ -900,9 +941,9 @@ export function createGuestMarkdownReplySender(deps: {
 }
 
 /**
- * Guest reply editor: replaces an early Guest Mode answer (the temporary ACK
- * experiment) with native Rich Markdown content addressed by
- * `inline_message_id` instead of a chat/message pair.
+ * Guest reply editor: replaces the early Guest Mode placeholder ACK with
+ * native Rich Markdown content addressed by `inline_message_id` instead of a
+ * chat/message pair.
  */
 export function createGuestMarkdownReplyEditor(deps: {
   editGuestInlineMessage: (
@@ -915,5 +956,221 @@ export function createGuestMarkdownReplyEditor(deps: {
     await deps.editGuestInlineMessage(inlineMessageId, {
       richMessage: { markdown: richMarkdown },
     });
+  };
+}
+
+/**
+ * Guest Mode placeholder rotation: the early ACK is the first placeholder
+ * frame and the runtime steps the remaining frames once per interval, moving
+ * the globe every second while the trailing dots grow once every two seconds.
+ *
+ * Rotation completes whole six-frame cycles and only stops once at least
+ * `TELEGRAM_GUEST_PLACEHOLDER_MIN_MS` has elapsed, so a pending answer holds
+ * the finished cycle's last frame (`🌏 Working on it...`) instead of whatever
+ * step a hard time cap happens to cut. The `TELEGRAM_GUEST_PLACEHOLDER_MAX_MS`
+ * safety bound keeps the edit stream clear of the first flood-control
+ * rejections measured in live guest runs (+26.5 s at ~53 edits, +27.8 s at
+ * ~28 edits): rotation caps at 23 edits and never starts a frame after 26 s.
+ */
+
+export const TELEGRAM_GUEST_PLACEHOLDER_FRAME_MS = 1_000;
+
+export const TELEGRAM_GUEST_PLACEHOLDER_MIN_MS = 20_000;
+
+export const TELEGRAM_GUEST_PLACEHOLDER_MAX_MS = 26_000;
+
+export const TELEGRAM_GUEST_PLACEHOLDER_FRAMES = [
+  "<b>🌎 Working on it.</b>",
+  "<b>🌍 Working on it.</b>",
+  "<b>🌏 Working on it..</b>",
+  "<b>🌎 Working on it..</b>",
+  "<b>🌍 Working on it...</b>",
+  "<b>🌏 Working on it...</b>",
+] as const;
+
+export function buildTelegramGuestPlaceholderFrame(step: number): string {
+  const frames: readonly string[] = TELEGRAM_GUEST_PLACEHOLDER_FRAMES;
+  const index = ((step % frames.length) + frames.length) % frames.length;
+  return frames[index]!;
+}
+
+export interface TelegramGuestPlaceholderRuntimeDeps {
+  editGuestInlineMessage: (
+    inlineMessageId: string,
+    content: { text: string; parseMode: "HTML" },
+  ) => Promise<void>;
+  recordRuntimeEvent?: (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
+  intervalMs?: number;
+  minMs?: number;
+  maxMs?: number;
+  now?: () => number;
+  setTimer?: (
+    callback: () => void,
+    ms: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+}
+
+export interface TelegramGuestPlaceholderRuntime {
+  /** Starts the frame loop on an answered guest inline message. */
+  start: (inlineMessageId: string) => void;
+  /** Cancels the loop and waits for any in-flight frame edit before returning. */
+  stop: (inlineMessageId: string) => Promise<void>;
+  /** Cancels every loop without waiting for in-flight edits (session shutdown). */
+  stopAll: () => void;
+}
+
+interface TelegramGuestPlaceholderSession {
+  step: number;
+  stopped: boolean;
+  startedAtMs: number;
+  finished: boolean;
+  timer?: ReturnType<typeof setTimeout>;
+  inflight?: Promise<void>;
+}
+
+function getTelegramGuestPlaceholderRetryDelayMs(
+  error: unknown,
+  fallbackMs: number,
+): number {
+  const retryAfterSeconds = (
+    error as { retryAfterSeconds?: unknown } | undefined
+  )?.retryAfterSeconds;
+  return typeof retryAfterSeconds === "number" && retryAfterSeconds > 0
+    ? Math.max(fallbackMs, retryAfterSeconds * 1_000)
+    : fallbackMs;
+}
+
+export function createTelegramGuestPlaceholderRuntime(
+  deps: TelegramGuestPlaceholderRuntimeDeps,
+): TelegramGuestPlaceholderRuntime {
+  const intervalMs = deps.intervalMs ?? TELEGRAM_GUEST_PLACEHOLDER_FRAME_MS;
+  const minMs = deps.minMs ?? TELEGRAM_GUEST_PLACEHOLDER_MIN_MS;
+  const maxMs = deps.maxMs ?? TELEGRAM_GUEST_PLACEHOLDER_MAX_MS;
+  const now = deps.now ?? Date.now;
+  const setTimer =
+    deps.setTimer ??
+    ((callback: () => void, ms: number): ReturnType<typeof setTimeout> =>
+      setTimeout(callback, ms));
+  const clearTimer =
+    deps.clearTimer ??
+    ((timer: ReturnType<typeof setTimeout>): void => clearTimeout(timer));
+  const sessions = new Map<string, TelegramGuestPlaceholderSession>();
+
+  const finishRotation = (
+    session: TelegramGuestPlaceholderSession,
+    elapsedMs: number,
+  ): void => {
+    if (session.finished) return;
+    session.finished = true;
+    deps.recordRuntimeEvent?.(
+      "guest",
+      "Guest placeholder rotation reached its bound",
+      {
+        phase: "guest-placeholder-capped",
+        minMs,
+        maxMs,
+        elapsedMs,
+        step: session.step,
+      },
+    );
+  };
+
+  const scheduleFrame = (
+    inlineMessageId: string,
+    session: TelegramGuestPlaceholderSession,
+    delayMs: number,
+  ): void => {
+    if (session.stopped) return;
+    const elapsedMs = now() - session.startedAtMs;
+    const frameCount = TELEGRAM_GUEST_PLACEHOLDER_FRAMES.length;
+    const cycleComplete =
+      session.step > 0 && session.step % frameCount === frameCount - 1;
+    if (cycleComplete && elapsedMs >= minMs) {
+      finishRotation(session, elapsedMs);
+      return;
+    }
+    if (elapsedMs + delayMs > maxMs) {
+      finishRotation(session, elapsedMs);
+      return;
+    }
+    const timer = setTimer(() => {
+      session.timer = undefined;
+      runFrame(inlineMessageId, session);
+    }, delayMs);
+    timer.unref?.();
+    session.timer = timer;
+  };
+
+  const runFrame = (
+    inlineMessageId: string,
+    session: TelegramGuestPlaceholderSession,
+  ): void => {
+    if (session.stopped) return;
+    session.step += 1;
+    let nextDelayMs = intervalMs;
+    session.inflight = (async () => {
+      try {
+        await deps.editGuestInlineMessage(inlineMessageId, {
+          text: buildTelegramGuestPlaceholderFrame(session.step),
+          parseMode: "HTML",
+        });
+      } catch (error) {
+        nextDelayMs = getTelegramGuestPlaceholderRetryDelayMs(error, intervalMs);
+        deps.recordRuntimeEvent?.("guest", error, {
+          phase: "guest-placeholder-edit",
+          retryAfterMs: nextDelayMs,
+        });
+      } finally {
+        session.inflight = undefined;
+        scheduleFrame(inlineMessageId, session, nextDelayMs);
+      }
+    })();
+  };
+
+  const stop = async (inlineMessageId: string): Promise<void> => {
+    const session = sessions.get(inlineMessageId);
+    if (!session) return;
+    sessions.delete(inlineMessageId);
+    session.stopped = true;
+    if (session.timer !== undefined) {
+      clearTimer(session.timer);
+      session.timer = undefined;
+    }
+    try {
+      await session.inflight;
+    } catch {
+      // Frame failures are reported as runtime events; stopping stays fail-open.
+    }
+  };
+
+  return {
+    start(inlineMessageId) {
+      const existing = sessions.get(inlineMessageId);
+      if (existing) {
+        existing.stopped = true;
+        if (existing.timer !== undefined) clearTimer(existing.timer);
+      }
+      const session: TelegramGuestPlaceholderSession = {
+        step: 0,
+        stopped: false,
+        startedAtMs: now(),
+        finished: false,
+      };
+      sessions.set(inlineMessageId, session);
+      scheduleFrame(inlineMessageId, session, intervalMs);
+    },
+    stop,
+    stopAll() {
+      for (const session of sessions.values()) {
+        session.stopped = true;
+        if (session.timer !== undefined) clearTimer(session.timer);
+      }
+      sessions.clear();
+    },
   };
 }
