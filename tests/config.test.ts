@@ -65,13 +65,13 @@ import {
   runTelegramSetup,
 } from "../lib/setup.ts";
 
-test("Thread display mode maps legacy names and invalid values to letters", () => {
+test("Thread display mode keeps all three modes and maps invalid values to letters", () => {
   for (const mode of [undefined, "invalid", null]) {
     assert.equal(resolveTelegramThreadDisplayMode(legacyConfig({
       threadDisplayMode: mode,
     })), "letters");
   }
-  assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "names" }), "letters");
+  assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "names" }), "names");
   assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "letters" }), "letters");
   assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "directories" }), "directories");
 });
@@ -102,6 +102,7 @@ test("Thread display mode persists per profile and survives effective config upd
     assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "directories");
     restored.update((config) => { config.threadDisplayMode = "names"; });
     await restored.persist();
+    assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "names");
     restored.activateProfile("default");
     assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "letters");
   } finally {
@@ -128,6 +129,10 @@ test("Thread display preference writes fence authority inside the config transac
     assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directories");
     await assert.rejects(
       setTelegramThreadDisplayMode(store, "names", () => false),
+      /lost authority/,
+    );
+    await assert.rejects(
+      setTelegramThreadDisplayMode(store, "bogus" as never, () => true),
       /Invalid Telegram Thread display mode/,
     );
   } finally {
