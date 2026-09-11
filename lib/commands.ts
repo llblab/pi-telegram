@@ -1429,7 +1429,7 @@ export async function handleTelegramNextCommand(deps: {
   deps.clearPendingModelSwitch();
   if (!deps.hasQueuedItems()) {
     await deps.sendTextReply(
-      formatTelegramInformationHeading("⌛", "Queue is empty."),
+      formatTelegramInformationHeading("⌛", "Queue is empty"),
       { parseMode: "HTML" },
     );
     return;

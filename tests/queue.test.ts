@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerTelegramVoiceSynthesisProvider } from "../lib/voice.ts";
 import { createTelegramActivityPublicationRuntime } from "../lib/activity.ts";
+import { extractRunAssistantMessage } from "../lib/replies.ts";
 import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 import { createTelegramPreviewController, createTelegramAssistantPreviewRuntime } from "../lib/preview.ts";
 import {
@@ -1993,14 +1994,89 @@ test("Agent end runtime edits the Guest Mode ACK message with the final answer",
     editGuestReply: async (inlineMessageId, markdown) => {
       events.push(["guest-ack-edit", inlineMessageId, markdown]);
     },
+    stopGuestPlaceholder: async (inlineMessageId) => {
+      events.push(["guest-placeholder-stop", inlineMessageId]);
+    },
     recordRuntimeEvent: (_category, _error, details) => {
       events.push(`record:${details?.phase}`);
     },
   });
   assert.deepEqual(events, [
+    ["guest-placeholder-stop", "inline-1"],
     ["guest-ack-edit", "inline-1", "final answer"],
     "record:guest-ack-edited",
     "dispatch",
+  ]);
+});
+
+test("Agent end hook keeps the preserved Guest Mode answer when the final run message is suppressed", async () => {
+  const events: unknown[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    chatId: 0,
+    replyToMessageId: 0,
+    guestQueryId: "guest-1",
+    guestInlineMessageId: "inline-1",
+  });
+  const hook = createTelegramAgentEndHook<
+    PendingTelegramTurn,
+    { id: string },
+    unknown
+  >({
+    getActiveTurn: () => turn,
+    extractAssistant: extractRunAssistantMessage,
+    getFoldQueuedPromptsIntoHistory: () => false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: (ctx) => {
+      events.push(`dispatch:${ctx.id}`);
+    },
+    requestDeferredDispatchNextQueuedTelegramTurn: (dispatch) => {
+      dispatch({ id: "session" });
+    },
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {
+      events.push("unexpected:markdown");
+    },
+    sendTextReply: async () => {
+      events.push("unexpected:text");
+    },
+    sendQueuedAttachments: async () => {
+      events.push("unexpected:attachment");
+    },
+    sendGuestReply: async () => {
+      events.push("unexpected:guest-text");
+    },
+    editGuestReply: async (inlineMessageId, markdown) => {
+      events.push(["guest-ack-edit", inlineMessageId, markdown]);
+    },
+    stopGuestPlaceholder: async (inlineMessageId) => {
+      events.push(["guest-placeholder-stop", inlineMessageId]);
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(`record:${details?.phase}`);
+    },
+  });
+  await hook(
+    {
+      messages: [
+        {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "preserved answer" }],
+        },
+        { role: "custom", customType: "state-flow-validation" },
+        { role: "assistant", stopReason: "stop", content: [] },
+      ],
+    },
+    { id: "session" },
+  );
+  assert.deepEqual(events, [
+    ["guest-placeholder-stop", "inline-1"],
+    ["guest-ack-edit", "inline-1", "preserved answer"],
+    "record:guest-ack-edited",
+    "dispatch:session",
   ]);
 });
 

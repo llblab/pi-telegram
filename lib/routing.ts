@@ -16,6 +16,7 @@ import * as Model from "./model.ts";
 import * as OutboundHandlers from "./outbound.ts";
 import * as PromptTemplates from "./prompt-templates.ts";
 import * as Queue from "./queue.ts";
+import * as Replies from "./replies.ts";
 import type { TelegramBridgeRuntime } from "./runtime.ts";
 import type { TelegramSectionRegistry } from "./sections.ts";
 import * as TextGroups from "./text-groups.ts";
@@ -665,6 +666,8 @@ export interface TelegramInboundRouteRuntimeDeps<
     text: string,
     options?: { parseMode?: "HTML" },
   ) => Promise<string | undefined>;
+  /** Starts the animated placeholder on an answered guest inline message. */
+  startGuestPlaceholder?: (inlineMessageId: string) => void;
   sendTextReply: (
     chatId: number,
     replyToMessageId: number,
@@ -2662,8 +2665,10 @@ export function createTelegramInboundRouteRuntime<
     assertExecutionCurrent();
   };
   // Answer the guest query immediately so the agent-end edit can replace the
-  // early ACK once the turn settles. See BACKLOG.md for live acceptance.
-  const TELEGRAM_GUEST_ACK_HTML = "<b>⚙️ Received. Working on it…</b>";
+  // early ACK once the turn settles. The ACK is the first placeholder frame and
+  // the loop rotates through the remaining frames until the replacement.
+  const TELEGRAM_GUEST_ACK_HTML =
+    Replies.buildTelegramGuestPlaceholderFrame(0);
   const handleAuthorizedTelegramGuestMessage = async (
     guestMessage: Updates.TelegramGuestMessage & { from: TelegramUser },
     ctx: TContext,
@@ -2679,9 +2684,12 @@ export function createTelegramInboundRouteRuntime<
           TELEGRAM_GUEST_ACK_HTML,
           { parseMode: "HTML" },
         );
+        if (guestInlineMessageId) {
+          deps.startGuestPlaceholder?.(guestInlineMessageId);
+        }
         deps.recordRuntimeEvent?.(
           "guest",
-          new Error("Guest ACK experiment answered the guest query"),
+          new Error("Guest ACK answered the guest query"),
           {
             phase: "guest-ack-sent",
             guestQueryId: guestMessage.guest_query_id,

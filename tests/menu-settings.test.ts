@@ -153,12 +153,12 @@ test("Thread display detail follows the setting-card style and marks only the cu
     assert.equal((text.match(/\(default\)/gu) ?? []).length, 1);
     assert.match(text, /Choose how this bot profile labels Telegram tabs and Pi terminal status\. Each slot is unique across this bot profile\./u);
     assert.match(text, /<code>letters<\/code> \(default\):/u);
-    assert.match(text, /manual <code>\/name Name<\/code> overrides/u);
+    assert.doesNotMatch(text, /manual <code>\/name Name<\/code>/u);
     for (const example of ["A", "B", "Anchor", "Briar", "extensions", "extensions_a", "extensions_c"]) {
       assert.match(text, new RegExp(`<b><i>${example}</i></b>`, "u"));
     }
     assert.doesNotMatch(text, /Switching changes labels only/u);
-    assert.ok(text.endsWith("until reset."));
+    assert.ok(text.endsWith("extensions_c</i></b>."));
     const rows = buildThreadDisplaySettingsReplyMarkup(mode).inline_keyboard;
     assert.deepEqual(rows[0], [{ text: "⬆️ Back", callback_data: "settings:list" }]);
     assert.deepEqual(rows.slice(1).map((row) => row[0].text),

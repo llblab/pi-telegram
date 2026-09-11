@@ -184,7 +184,6 @@ export function buildThreadDisplaySettingsText(mode: TelegramThreadDisplayMode):
     "<code>-</code> <code>letters</code> (default): show the unique slot, such as <b><i>A</i></b> or <b><i>B</i></b>.",
     "<code>-</code> <code>names</code>: show the generated dictionary name for the slot, such as <b><i>Anchor</i></b> or <b><i>Briar</i></b>.",
     "<code>-</code> <code>directories</code>: show the directory, such as <b><i>extensions</i></b>; shared Workspaces keep slot suffixes, such as <b><i>extensions_a</i></b> and <b><i>extensions_c</i></b>.",
-    "A manual <code>/name Name</code> overrides this Thread display name until reset.",
   ].join("\n");
 }
 

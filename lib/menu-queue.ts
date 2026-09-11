@@ -14,18 +14,18 @@ import * as Queue from "./queue.ts";
 const QUEUE_ITEM_PROMPT_HTML_LIMIT = 3600;
 const QUEUE_ITEM_PROMPT_TRUNCATION_SUFFIX = "\n… [truncated]";
 const EMPTY_QUEUE_REFRESH_TITLES = [
-  "<b>⌛ Queue is still empty.</b>",
-  "<b>🫙 Still nothing in queue.</b>",
-  "<b>🍃 Queue remains empty.</b>",
-  "<b>🕳 Nothing queued yet.</b>",
-  "<b>🦗 Queue crickets continue.</b>",
-  "<b>🌙 Queue is peacefully idle.</b>",
-  "<b>🧘 Nothing waiting. Very zen.</b>",
-  "<b>🪐 Queue orbit is clear.</b>",
-  "<b>🧺 Basket is empty.</b>",
-  "<b>🔭 No prompts on the horizon.</b>",
-  "<b>🫧 Queue bubbles: none.</b>",
-  "<b>🛸 No queued signals detected.</b>",
+  "<b>⌛ Queue is still empty</b>",
+  "<b>🫙 Still nothing in queue</b>",
+  "<b>🍃 Queue remains empty</b>",
+  "<b>🕳 Nothing queued yet</b>",
+  "<b>🦗 Queue crickets continue</b>",
+  "<b>🌙 Queue is peacefully idle</b>",
+  "<b>🧘 Nothing waiting. Very zen</b>",
+  "<b>🪐 Queue orbit is clear</b>",
+  "<b>🧺 Basket is empty</b>",
+  "<b>🔭 No prompts on the horizon</b>",
+  "<b>🫧 Queue bubbles: none</b>",
+  "<b>🛸 No queued signals detected</b>",
 ] as const;
 type TelegramQueueMenuReplyMarkup = TelegramInlineKeyboardMarkup;
 interface TelegramQueueMenuItem {
@@ -340,7 +340,7 @@ function getTelegramQueueMenuListText(
   emptyRefreshIndex?: number,
 ): string {
   if (items.length > 0) return "<b>⏳ Queue:</b>";
-  if (emptyRefreshIndex === undefined) return "<b>⌛ Queue is empty.</b>";
+  if (emptyRefreshIndex === undefined) return "<b>⌛ Queue is empty</b>";
   return EMPTY_QUEUE_REFRESH_TITLES[
     emptyRefreshIndex % EMPTY_QUEUE_REFRESH_TITLES.length
   ];

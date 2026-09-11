@@ -374,6 +374,13 @@ interface TelegramApiResponse<T> {
   parameters?: { retry_after?: number };
 }
 
+export interface TelegramApiRetryWait {
+  method: string;
+  delayMs: number;
+  attempt: number;
+  retryAfterSeconds?: number;
+}
+
 export interface TelegramApiCallOptions {
   signal?: AbortSignal;
   maxAttempts?: number;
@@ -381,6 +388,8 @@ export interface TelegramApiCallOptions {
   retrySafety?: "safe" | "non-idempotent";
   retryBaseDelayMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /** Observability hook fired before a 429 retry wait, never for 5xx waits. */
+  onRetryWait?: (wait: TelegramApiRetryWait) => void;
 }
 
 interface TelegramGetFileResult {
@@ -434,6 +443,7 @@ export interface TelegramAnswerGuestQueryOptions {
 export interface TelegramEditGuestInlineMessageContent {
   text?: string;
   richMessage?: TelegramInputRichMessage;
+  parseMode?: "HTML";
 }
 
 export interface TelegramAnswerCallbackQueryOptions {
@@ -1380,7 +1390,25 @@ async function callTelegramWithRetry<TResponse>(
       isTelegramApiMethodRetrySafe(method));
   const maxAttempts = Math.max(1, options?.maxAttempts ?? 3);
   const retryBaseDelayMs = options?.retryBaseDelayMs ?? 500;
-  const waitBeforeRetry = async (ms: number): Promise<void> => {
+  const waitBeforeRetry = async (
+    error: unknown,
+    attempt: number,
+  ): Promise<void> => {
+    const ms = getTelegramRetryDelayMs(error, attempt, retryBaseDelayMs);
+    if (
+      !options?.signal?.aborted &&
+      error instanceof TelegramApiHttpError &&
+      error.status === 429
+    ) {
+      options?.onRetryWait?.({
+        method,
+        delayMs: ms,
+        attempt,
+        ...(error.retryAfterSeconds !== undefined
+          ? { retryAfterSeconds: error.retryAfterSeconds }
+          : {}),
+      });
+    }
     if (options?.sleep) await options.sleep(ms);
     else await sleepTelegramRetry(ms, options?.signal);
     throwIfTelegramApiCallAborted(options?.signal);
@@ -1406,9 +1434,7 @@ async function callTelegramWithRetry<TResponse>(
       if (!retrySafe) {
         if (error instanceof TelegramApiHttpError && error.status === 429) {
           if (attempt >= maxAttempts - 1) throw error;
-          await waitBeforeRetry(
-            getTelegramRetryDelayMs(error, attempt, retryBaseDelayMs),
-          );
+          await waitBeforeRetry(error, attempt);
           continue;
         }
         if (
@@ -1423,9 +1449,7 @@ async function callTelegramWithRetry<TResponse>(
         throw error;
       }
       if (attempt >= maxAttempts - 1 || !retryable) throw error;
-      await waitBeforeRetry(
-        getTelegramRetryDelayMs(error, attempt, retryBaseDelayMs),
-      );
+      await waitBeforeRetry(error, attempt);
     }
   }
 }
@@ -2095,6 +2119,7 @@ export function createTelegramBridgeApiRuntime(
         ...(content.richMessage
           ? { rich_message: content.richMessage }
           : { text: content.text }),
+        ...(content.parseMode ? { parse_mode: content.parseMode } : {}),
       });
     },
     prepareTempDir: () =>
@@ -2117,6 +2142,7 @@ export function createTelegramApiClient(
   options: TelegramAnswerCallbackQueryOptions & { now?: () => number } = {},
 ): TelegramApiClient {
   const now = options.now ?? Date.now;
+  const recordRuntimeEvent = options.recordRuntimeEvent;
   const draftRetryNotBeforeByTarget = new Map<string, number>();
   return {
     call: async <TResponse>(
@@ -2140,9 +2166,31 @@ export function createTelegramApiClient(
       }
       try {
         // A draft is a replaceable snapshot, not a body to replay after backoff.
-        return await callTelegram<TResponse>(
-          token, method, body, isDraft ? { ...options, maxAttempts: 1 } : options,
-        );
+        const retryWaitOptions: TelegramApiCallOptions = recordRuntimeEvent
+          ? {
+              onRetryWait: (wait) => {
+                recordRuntimeEvent(
+                  "api",
+                  new Error(
+                    `Telegram API rate limit: waiting ${wait.delayMs} ms before retrying ${wait.method}`,
+                  ),
+                  {
+                    phase: "retry-wait",
+                    method: wait.method,
+                    waitMs: wait.delayMs,
+                    attempt: wait.attempt,
+                    ...(wait.retryAfterSeconds !== undefined
+                      ? { retryAfterSeconds: wait.retryAfterSeconds }
+                      : {}),
+                  },
+                );
+              },
+            }
+          : {};
+        return await callTelegram<TResponse>(token, method, body, {
+          ...(isDraft ? { ...options, maxAttempts: 1 } : options),
+          ...retryWaitOptions,
+        });
       } catch (error) {
         if (draftKey && isRetryableTelegramApiError(error)) {
           draftRetryNotBeforeByTarget.set(draftKey, Math.max(

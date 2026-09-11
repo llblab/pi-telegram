@@ -823,6 +823,12 @@ interface TelegramLifecycleBindingDeps {
     Pi.AgentEndEvent["messages"][number],
     Keyboard.TelegramInlineKeyboardMarkup
   >["editGuestReply"];
+  stopGuestPlaceholder?: Queue.TelegramAgentEndHookRuntimeDeps<
+    Queue.PendingTelegramTurn,
+    Pi.ExtensionContext,
+    Pi.AgentEndEvent["messages"][number],
+    Keyboard.TelegramInlineKeyboardMarkup
+  >["stopGuestPlaceholder"];
   preparePreviewDelivery?: Queue.TelegramAgentEndRuntimeDeps<Queue.PendingTelegramTurn>["preparePreviewDelivery"];
   finalizeMarkdownPreview: Queue.TelegramAgentEndHookRuntimeDeps<
     Queue.PendingTelegramTurn,
@@ -876,6 +882,7 @@ export function registerTelegramLifecycleRuntimeHooks({
   deleteMessage,
   sendGuestReply,
   editGuestReply,
+  stopGuestPlaceholder,
   preparePreviewDelivery,
   finalizeMarkdownPreview,
   proactivePushTargetGetter,
@@ -1056,7 +1063,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     updateStatus,
     getActiveTurn: activeTurnRuntime.get,
     loadConfig: configStore.load,
-    extractAssistant: Replies.extractLatestAssistantMessageText,
+    extractAssistant: Replies.extractRunAssistantMessage,
     getFoldQueuedPromptsIntoHistory:
       lifecycle.shouldFoldQueuedPromptsIntoHistory,
     resetRuntimeState: agentEndResetter,
@@ -1090,6 +1097,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     answerGuestQuery,
     sendGuestReply,
     editGuestReply,
+    stopGuestPlaceholder,
     sendGuestAttachment,
     sendGuestVoiceReply,
     planOutboundReply: outboundReplyPlanner,
