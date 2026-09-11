@@ -11,6 +11,10 @@ import test from "node:test";
 
 import { createTelegramConfigStore } from "../lib/config.ts";
 import {
+  getTelegramBotTokenDiagnostic,
+  resolveTelegramBotToken,
+} from "../lib/config.ts";
+import {
   TELEGRAM_BOT_TOKEN_INPUT_PLACEHOLDER,
   createTelegramSetupPromptRuntime,
   getTelegramBotTokenInputDefault,
@@ -19,7 +23,7 @@ import {
   type TelegramSetupConfig,
 } from "../lib/setup.ts";
 
-test("Setup token defaults prefer config, then env aliases, then placeholder", () => {
+test("Setup token defaults prefer config, then env alias references, then placeholder", () => {
   assert.equal(
     getTelegramBotTokenInputDefault(
       { TELEGRAM_BOT_TOKEN: " env-token " },
@@ -29,12 +33,116 @@ test("Setup token defaults prefer config, then env aliases, then placeholder", (
   );
   assert.equal(
     getTelegramBotTokenInputDefault({ TELEGRAM_KEY: " env-key " }),
-    "env-key",
+    "$TELEGRAM_KEY",
   );
   assert.equal(
     getTelegramBotTokenInputDefault({}),
     TELEGRAM_BOT_TOKEN_INPUT_PLACEHOLDER,
   );
+});
+
+test("Setup prefill persists the env alias and validates its resolved value", async () => {
+  const calls: string[] = [];
+  let persisted: TelegramSetupConfig | undefined;
+  const result = await runTelegramSetup({
+    hasUI: true,
+    env: { TELEGRAM_BOT_TOKEN: "resolved-secret" },
+    config: {},
+    promptInput: async () => undefined,
+    promptEditor: async (_label, value) => {
+      calls.push(`editor:${value}`);
+      return value;
+    },
+    getMe: async (botToken) => {
+      calls.push(`getMe:${botToken}`);
+      return { ok: true, result: { id: 9, username: "env_bot" } };
+    },
+    resolveBotToken: (value) =>
+      resolveTelegramBotToken(value, { TELEGRAM_BOT_TOKEN: "resolved-secret" }),
+    describeBotToken: (value) =>
+      getTelegramBotTokenDiagnostic(value, {
+        TELEGRAM_BOT_TOKEN: "resolved-secret",
+      }),
+    persistConfig: async (config) => {
+      persisted = config;
+    },
+    notify: (message, level) => calls.push(`${level}:${message}`),
+    startPolling: () => ({ ok: true }),
+    updateStatus: () => calls.push("status"),
+  });
+
+  assert.equal(calls[0], "editor:$TELEGRAM_BOT_TOKEN");
+  assert.equal(calls[1], "getMe:resolved-secret");
+  assert.equal(persisted?.botToken, "$TELEGRAM_BOT_TOKEN");
+  assert.equal(result.status, "success");
+  assert.equal(
+    result.status === "success" && result.config.botToken,
+    "$TELEGRAM_BOT_TOKEN",
+  );
+  assert.ok(
+    !calls.some(
+      (call) =>
+        (call.startsWith("info:") || call.startsWith("error:")) &&
+        call.includes("resolved-secret"),
+    ),
+    "setup notifications must not expose the resolved secret",
+  );
+});
+
+test("Setup rejects an unresolved token reference with a redacted diagnostic", async () => {
+  const calls: string[] = [];
+  const result = await runTelegramSetup({
+    hasUI: true,
+    env: {},
+    config: {},
+    promptInput: async () => "$MISSING_TELEGRAM_TOKEN",
+    promptEditor: async () => undefined,
+    getMe: async () => {
+      calls.push("getMe");
+      return { ok: false };
+    },
+    resolveBotToken: (value) => resolveTelegramBotToken(value, {}),
+    describeBotToken: (value) => getTelegramBotTokenDiagnostic(value, {}),
+    persistConfig: async () => {
+      calls.push("persist");
+    },
+    notify: (message, level) => calls.push(`${level}:${message}`),
+    startPolling: () => calls.push("poll"),
+    updateStatus: () => calls.push("status"),
+  });
+
+  assert.deepEqual(result, { status: "validation-failed" });
+  assert.deepEqual(calls, [
+    "error:Telegram bot token environment variable MISSING_TELEGRAM_TOKEN is not set.",
+  ]);
+});
+
+test("Setup rejects a malformed token reference without echoing it", async () => {
+  const calls: string[] = [];
+  const result = await runTelegramSetup({
+    hasUI: true,
+    env: {},
+    config: { botToken: "$not-a-valid-name" },
+    promptInput: async () => undefined,
+    promptEditor: async (_label, value) => value,
+    getMe: async () => {
+      calls.push("getMe");
+      return { ok: false };
+    },
+    resolveBotToken: (value) => resolveTelegramBotToken(value, {}),
+    describeBotToken: (value) => getTelegramBotTokenDiagnostic(value, {}),
+    persistConfig: async () => {
+      calls.push("persist");
+    },
+    notify: (message, level) => calls.push(`${level}:${message}`),
+    startPolling: () => calls.push("poll"),
+    updateStatus: () => calls.push("status"),
+  });
+
+  assert.deepEqual(result, { status: "validation-failed" });
+  assert.deepEqual(calls, [
+    "error:Telegram bot token environment reference is malformed; use $NAME or ${NAME}.",
+  ]);
 });
 
 test("Setup prompt spec uses editor for real tokens and input for placeholder", () => {

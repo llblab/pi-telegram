@@ -245,6 +245,8 @@ export interface TelegramBridgeInboundWorkerState {
 export interface TelegramBridgeStatusLineState {
   hasBotToken?: boolean;
   botUsername?: string;
+  /** Redacted named-variable diagnostic when the stored token reference cannot resolve. */
+  botTokenDiagnostic?: string;
   activeProfileName?: string;
   diagnosticPaths?: { state: string; logs: string };
   allowedUserId?: number;
@@ -323,8 +325,38 @@ export interface TelegramStatusRuntimeDeps<
 
 export interface TelegramBridgeStatusConfig {
   botToken?: string;
+  /** Caller-resolved token availability; falls back to raw presence. */
+  botHasToken?: boolean;
+  /** Caller-supplied redacted diagnostic for an unresolved token reference. */
+  botTokenDiagnostic?: string;
   botUsername?: string;
   allowedUserId?: number;
+}
+
+/** Narrow config-store view used to project resolved bot-token availability. */
+export interface TelegramBridgeStatusConfigSource {
+  get: () => TelegramBridgeStatusConfig;
+  hasBotToken?: () => boolean;
+  getBotTokenDiagnostic?: () => string | undefined;
+}
+
+/**
+ * Project a config store into the status view without moving token-reference
+ * resolution into this structural leaf domain.
+ */
+export function createTelegramBridgeStatusConfigGetter(
+  source: TelegramBridgeStatusConfigSource,
+): () => TelegramBridgeStatusConfig {
+  return () => {
+    const config = source.get();
+    return {
+      ...config,
+      ...(source.hasBotToken ? { botHasToken: source.hasBotToken() } : {}),
+      ...(source.getBotTokenDiagnostic
+        ? { botTokenDiagnostic: source.getBotTokenDiagnostic() }
+        : {}),
+    };
+  };
 }
 
 export interface TelegramBridgeStatusRuntimeDeps<
@@ -681,7 +713,7 @@ export function createTelegramBridgeStatusRuntime<
       const compactionInProgress = deps.isCompactionInProgress();
       const localBus = deps.getLocalBus?.();
       return {
-        hasBotToken: !!config.botToken,
+        hasBotToken: config.botHasToken ?? Boolean(config.botToken),
         pollingActive: deps.isPollingActive(),
         paired: !!config.allowedUserId,
         busRole: deps.getBusRole?.(),
@@ -715,8 +747,9 @@ export function createTelegramBridgeStatusRuntime<
         ? (deps.getActiveProfileName() ?? TELEGRAM_STATUS_DEFAULT_PROFILE_NAME)
         : undefined;
       return {
-        hasBotToken: Boolean(config.botToken),
+        hasBotToken: config.botHasToken ?? Boolean(config.botToken),
         botUsername: config.botUsername,
+        botTokenDiagnostic: config.botTokenDiagnostic,
         activeProfileName,
         diagnosticPaths: deps.getDiagnosticPaths?.(activeProfileName),
         allowedUserId: config.allowedUserId,
@@ -925,10 +958,14 @@ export function buildTelegramStatusBarText(
 }
 
 function formatTelegramBridgeBotStatus(
-  state: Pick<TelegramBridgeStatusLineState, "hasBotToken" | "botUsername">,
+  state: Pick<
+    TelegramBridgeStatusLineState,
+    "hasBotToken" | "botUsername" | "botTokenDiagnostic"
+  >,
 ): string {
   if (state.botUsername) return `@${state.botUsername}`;
-  return state.hasBotToken ? "unknown" : "not configured";
+  if (state.hasBotToken) return "unknown";
+  return state.botTokenDiagnostic ?? "not configured";
 }
 
 function formatTelegramStatusTarget(

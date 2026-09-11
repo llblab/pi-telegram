@@ -2603,6 +2603,8 @@ function parseQueueHandoffPayload(
     !Number.isSafeInteger(value.replyToMessageId) ||
     (value.guestQueryId !== undefined &&
       typeof value.guestQueryId !== "string") ||
+    (value.guestInlineMessageId !== undefined &&
+      typeof value.guestInlineMessageId !== "string") ||
     !Number.isSafeInteger(value.queueOrder) ||
     (value.queueLane !== "control" &&
       value.queueLane !== "priority" &&
@@ -2631,6 +2633,9 @@ function parseQueueHandoffPayload(
     replyToMessageId: value.replyToMessageId as number,
     ...(typeof value.guestQueryId === "string"
       ? { guestQueryId: value.guestQueryId }
+      : {}),
+    ...(typeof value.guestInlineMessageId === "string"
+      ? { guestInlineMessageId: value.guestInlineMessageId }
       : {}),
     queueOrder: value.queueOrder as number,
     queueLane,

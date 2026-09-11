@@ -41,6 +41,9 @@ import {
 
 export const TELEGRAM_PREFIX = "[telegram]";
 
+export const TELEGRAM_GUEST_TURN_NOTE =
+  "[guest] Telegram Guest Mode: exactly one reply is allowed and the response window is limited. Answer as quickly as possible; prefer a fast, concise, self-contained answer and avoid extended research or long tool chains.";
+
 export interface TelegramTurnTarget {
   chatId: number;
   threadId?: number;
@@ -198,6 +201,7 @@ export function buildTelegramTurnPrompt(options: {
   historyTurns?: Pick<PendingTelegramTurn, "historyText">[];
   timeLine?: string | null;
   voiceContext?: Record<string, string>;
+  guestTurn?: boolean;
 }): string {
   let prompt = options.telegramPrefix;
   if ((options.historyTurns?.length ?? 0) > 0) {
@@ -228,6 +232,9 @@ export function buildTelegramTurnPrompt(options: {
   }
   if (options.timeLine) {
     prompt = `${prompt}\n\n[time] ${options.timeLine}`;
+  }
+  if (options.guestTurn) {
+    prompt = `${prompt}\n\n${TELEGRAM_GUEST_TURN_NOTE}`;
   }
   return prompt;
 }

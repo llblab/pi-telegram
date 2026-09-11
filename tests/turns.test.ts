@@ -16,6 +16,7 @@ import {
   createTelegramPromptTurnRuntimeBuilder,
   createTelegramQueuedPromptEditRuntime,
   formatTelegramTurnStatusSummary,
+  TELEGRAM_GUEST_TURN_NOTE,
   truncateTelegramQueueSummary,
   updateQueuedTelegramPromptTurnText,
   updateTelegramPromptTurnText,
@@ -103,6 +104,28 @@ test("Turn helpers still inject [time] when raw text is empty", () => {
     timeLine: "2026-05-16 14:32:10 UTC",
   });
   assert.equal(prompt, "[telegram]\n\n[time] 2026-05-16 14:32:10 UTC");
+});
+
+test("Turn helpers append the Guest Mode note only for guest turns", () => {
+  const guestPrompt = buildTelegramTurnPrompt({
+    telegramPrefix: "[telegram|guest:Guest Room]",
+    rawText: "guest question",
+    files: [],
+    guestTurn: true,
+  });
+  assert.equal(
+    guestPrompt,
+    `[telegram|guest:Guest Room] guest question\n\n${TELEGRAM_GUEST_TURN_NOTE}`,
+  );
+  assert.match(TELEGRAM_GUEST_TURN_NOTE, /^\[guest\] /);
+  assert.match(TELEGRAM_GUEST_TURN_NOTE, /exactly one reply/);
+  assert.match(TELEGRAM_GUEST_TURN_NOTE, /Answer as quickly as possible/);
+  const ownerPrompt = buildTelegramTurnPrompt({
+    telegramPrefix: "[telegram]",
+    rawText: "owner question",
+    files: [],
+  });
+  assert.equal(ownerPrompt, "[telegram] owner question");
 });
 
 test("Turn runtime builder folds agent source into Telegram thread metadata", async () => {

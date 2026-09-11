@@ -520,6 +520,9 @@ interface TelegramCommandsAndToolsBindingDeps {
   sendChannelMarkdownMessage: NonNullable<
     OutboundAttachments.TelegramOutboundMessageToolRegistrationDeps["sendChannelMarkdownMessage"]
   >;
+  sendChannelMediaMessage: NonNullable<
+    OutboundAttachments.TelegramOutboundMessageToolRegistrationDeps["sendChannelMediaMessage"]
+  >;
   listChannelPosts: ChannelPosts.TelegramChannelPostJournalStore["list"];
   mutateChannelPost(input: { action: "edit" | "delete"; operationId: string;
     mutationId: string; markdown?: string }): Promise<ChannelPosts.TelegramChannelPostRecord>;
@@ -551,6 +554,7 @@ export function registerTelegramCommandsAndTools({
   buttonActionStore,
   sendMarkdownReply,
   sendChannelMarkdownMessage,
+  sendChannelMediaMessage,
   listChannelPosts,
   mutateChannelPost,
   callMultipart,
@@ -597,6 +601,7 @@ export function registerTelegramCommandsAndTools({
     sendMarkdownMessage: (chatId, markdown, options) =>
       sendMarkdownReply(chatId, undefined, markdown, options),
     sendChannelMarkdownMessage,
+    sendChannelMediaMessage,
     recordRuntimeEvent,
   });
   const queueAgentConnectionContext = (connected: boolean): void => {
@@ -676,6 +681,10 @@ export function registerTelegramCommandsAndTools({
         setConfig: setupConfigStore.set,
         setupGuard: setup,
         getMe: TelegramApi.fetchTelegramBotIdentity,
+        resolveBotToken: (value) =>
+          Config.resolveTelegramBotToken(value, process.env),
+        describeBotToken: (value) =>
+          Config.getTelegramBotTokenDiagnostic(value, process.env),
         persistConfig: persistSetupConfig,
         startPolling: lockedPollingRuntime.start,
         updateStatus,
@@ -692,6 +701,7 @@ export function registerTelegramCommandsAndTools({
     getStatusLines,
     reloadConfig: configStore.load,
     hasBotToken: configStore.hasBotToken,
+    getBotTokenDiagnostic: configStore.getBotTokenDiagnostic,
     startPolling: async (ctx, options) => {
       setRequestedThreadNameForPollingStart?.(options?.requestedThreadName);
       try {
@@ -807,6 +817,12 @@ interface TelegramLifecycleBindingDeps {
       Keyboard.TelegramInlineKeyboardMarkup
     >["sendGuestReply"]
   >;
+  editGuestReply?: Queue.TelegramAgentEndHookRuntimeDeps<
+    Queue.PendingTelegramTurn,
+    Pi.ExtensionContext,
+    Pi.AgentEndEvent["messages"][number],
+    Keyboard.TelegramInlineKeyboardMarkup
+  >["editGuestReply"];
   preparePreviewDelivery?: Queue.TelegramAgentEndRuntimeDeps<Queue.PendingTelegramTurn>["preparePreviewDelivery"];
   finalizeMarkdownPreview: Queue.TelegramAgentEndHookRuntimeDeps<
     Queue.PendingTelegramTurn,
@@ -859,6 +875,7 @@ export function registerTelegramLifecycleRuntimeHooks({
   answerGuestQuery,
   deleteMessage,
   sendGuestReply,
+  editGuestReply,
   preparePreviewDelivery,
   finalizeMarkdownPreview,
   proactivePushTargetGetter,
@@ -1072,6 +1089,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     sendRichAttachmentReply: richAttachmentSender,
     answerGuestQuery,
     sendGuestReply,
+    editGuestReply,
     sendGuestAttachment,
     sendGuestVoiceReply,
     planOutboundReply: outboundReplyPlanner,

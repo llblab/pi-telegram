@@ -555,6 +555,8 @@ test("Queue handoff payload preserves prompts and reconstructs controls without 
     admissionReceipts: [receipt],
     target: { chatId: 1, threadId: 9 },
     reactionSuppressionEmoji: "👎",
+    guestQueryId: "guest-1",
+    guestInlineMessageId: "inline-1",
     content: [
       { type: "text", text: "handoff prompt" },
       { type: "image", data: "image-data", mimeType: "image/png" },
@@ -1889,6 +1891,226 @@ test("Agent end runtime records Guest Mode attachment failure without a second a
     "record:guest-attachment",
     "dispatch",
   ]);
+});
+
+test("Agent end runtime records Guest Mode text answer failure without rejecting the hook", async () => {
+  const events: string[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    chatId: 0,
+    replyToMessageId: 0,
+    guestQueryId: "guest-1",
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "final answer" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    answerGuestQuery: async () => {
+      events.push("unexpected:fallback");
+    },
+    sendGuestReply: async () => {
+      events.push("text");
+      throw new Error(
+        "Telegram API answerGuestQuery failed: HTTP 400: Bad Request: query is too old and response timeout expired or query ID is invalid",
+      );
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(`record:${details?.phase}`);
+    },
+  });
+  assert.deepEqual(events, ["text", "record:guest-reply", "dispatch"]);
+});
+
+test("Agent end runtime records Guest Mode failure notice answer failure without rejecting the hook", async () => {
+  const events: string[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    chatId: 0,
+    replyToMessageId: 0,
+    guestQueryId: "guest-1",
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { stopReason: "error", errorMessage: "fixture failure" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    answerGuestQuery: async () => {
+      events.push("error-answer");
+      throw new Error("query is too old");
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(`record:${details?.phase}`);
+    },
+  });
+  assert.deepEqual(events, [
+    "error-answer",
+    "record:guest-error-reply",
+    "dispatch",
+  ]);
+});
+
+test("Agent end runtime edits the Guest Mode ACK message with the final answer", async () => {
+  const events: unknown[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    chatId: 0,
+    replyToMessageId: 0,
+    guestQueryId: "guest-1",
+    guestInlineMessageId: "inline-1",
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "final answer" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {
+      events.push("unexpected:attachment");
+    },
+    sendGuestReply: async () => {
+      events.push("unexpected:text");
+    },
+    editGuestReply: async (inlineMessageId, markdown) => {
+      events.push(["guest-ack-edit", inlineMessageId, markdown]);
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(`record:${details?.phase}`);
+    },
+  });
+  assert.deepEqual(events, [
+    ["guest-ack-edit", "inline-1", "final answer"],
+    "record:guest-ack-edited",
+    "dispatch",
+  ]);
+});
+
+test("Agent end runtime edits the Guest Mode ACK message with the failure notice", async () => {
+  const events: string[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    chatId: 0,
+    replyToMessageId: 0,
+    guestQueryId: "guest-1",
+    guestInlineMessageId: "inline-1",
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { stopReason: "error", errorMessage: "fixture failure" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    answerGuestQuery: async () => {
+      events.push("unexpected:answer");
+    },
+    editGuestReply: async (_inlineMessageId, markdown) => {
+      events.push(`edit:${markdown}`);
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(`record:${details?.phase}`);
+    },
+  });
+  assert.deepEqual(events, [
+    "edit:Telegram bridge: Pi failed while processing the request.",
+    "record:guest-ack-edited",
+    "dispatch",
+  ]);
+});
+
+test("Agent end runtime records Guest Mode ACK edit failure without rejecting the hook", async () => {
+  const events: string[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    chatId: 0,
+    replyToMessageId: 0,
+    guestQueryId: "guest-1",
+    guestInlineMessageId: "inline-1",
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: { text: "final answer" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    sendGuestReply: async () => {
+      events.push("unexpected:text");
+    },
+    editGuestReply: async () => {
+      throw new Error(
+        "Telegram API editMessageText failed: HTTP 400: Bad Request: message to edit not found",
+      );
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(`record:${details?.phase}`);
+    },
+  });
+  assert.deepEqual(events, ["record:guest-ack-edit", "dispatch"]);
+});
+
+test("Agent end runtime records a Guest Mode ACK turn without editable text", async () => {
+  const events: string[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+    chatId: 0,
+    replyToMessageId: 0,
+    guestQueryId: "guest-1",
+    guestInlineMessageId: "inline-1",
+    queuedAttachments: [{ path: "/tmp/demo.txt", fileName: "demo.txt" }],
+  });
+  await handleTelegramAgentEndRuntime({
+    turn,
+    assistant: {},
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    sendGuestAttachment: async () => {
+      events.push("unexpected:attachment");
+    },
+    editGuestReply: async () => {
+      events.push("unexpected:edit");
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(`record:${details?.phase}`);
+    },
+  });
+  assert.deepEqual(events, ["record:guest-ack-edit-empty", "dispatch"]);
 });
 
 for (const [boundary, stage] of [

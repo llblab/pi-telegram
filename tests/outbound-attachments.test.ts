@@ -25,6 +25,7 @@ import {
   type TelegramOutboundAttachmentQueueTargetView,
   type TelegramQueuedOutboundAttachmentTurnView,
 } from "../lib/outbound-attachments.ts";
+import { TelegramChannelPostValidationError } from "../lib/channel-posts.ts";
 import type { ExtensionAPI } from "../lib/pi.ts";
 import { createTelegramThreadTarget } from "../lib/target.ts";
 import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
@@ -469,6 +470,56 @@ test("Outbound message tool sends a public @channel username through direct lead
     !error.message.includes("token"));
   assert.equal(recordedErrors.some(error => error.message.includes("SECRET") ||
     error.message.includes("token")), false);
+});
+
+test("Outbound message tool routes one local channel media upload to the media port", async () => {
+  const tools = new Map<string, RegisteredAnyTool>();
+  const mediaSends: Array<{ channel: number | string; mediaPath: string; markdown: string;
+    operationId: string; replyMarkup?: unknown }> = [];
+  const api = { registerTool: (definition: RegisteredAnyTool) => {
+    if (definition.name) tools.set(definition.name, definition);
+  } } as unknown as ExtensionAPI;
+  registerTelegramOutboundMessageTool(api, {
+    getDefaultChatId: () => 7,
+    canSendDirect: () => true,
+    planMessage: () => ({ markdown: "**Caption**",
+      replyMarkup: { inline_keyboard: [] } }),
+    sendMarkdownMessage: async () => assert.fail("Channel media entered numeric chat delivery"),
+    sendChannelMediaMessage: async (channel, mediaPath, markdown, options) => {
+      mediaSends.push({ channel, mediaPath, markdown, operationId: options.operationId,
+        replyMarkup: options.replyMarkup });
+      return 92;
+    },
+  });
+  const tool = tools.get("telegram_message")!;
+  const result = await tool.execute("media-call", { text: "Caption",
+    media: "/tmp/photo.jpg", chat_id: "@public_channel" }) as {
+      details: { chatId: number | string; messageId?: number } };
+  assert.deepEqual(mediaSends, [{ channel: "@public_channel", mediaPath: "/tmp/photo.jpg",
+    markdown: "**Caption**", operationId: "media-call", replyMarkup: { inline_keyboard: [] } }]);
+  assert.deepEqual(result.details, { chatId: "@public_channel", messageId: 92 });
+});
+
+test("Outbound message tool rejects media without channel delivery and reports safe validation", async () => {
+  const tools = new Map<string, RegisteredAnyTool>();
+  const api = { registerTool: (definition: RegisteredAnyTool) => {
+    if (definition.name) tools.set(definition.name, definition);
+  } } as unknown as ExtensionAPI;
+  registerTelegramOutboundMessageTool(api, {
+    getDefaultChatId: () => 7,
+    canSendDirect: () => true,
+    planMessage: (markdown) => ({ markdown }),
+    sendMarkdownMessage: async () => 9,
+    sendChannelMediaMessage: async () => {
+      throw new TelegramChannelPostValidationError(
+        "Unsupported channel media type. Supported single files: .jpg, .jpeg, .png, .webp photos and .mp4 videos; albums are not supported.");
+    },
+  });
+  const tool = tools.get("telegram_message")!;
+  await assert.rejects(tool.execute("local-media", { text: "Caption", media: "/tmp/clip.mov" }),
+    /media uploads require channel delivery/u);
+  await assert.rejects(tool.execute("channel-media", { text: "Caption", media: "/tmp/clip.mov",
+    chat_id: "@public_channel" }), /Unsupported channel media type/u);
 });
 
 test("Outbound message tool errors start on a visually separated line", async () => {

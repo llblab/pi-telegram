@@ -62,6 +62,59 @@ function getConfigPath(): string {
   return resolveTelegramConfigPath();
 }
 
+const TELEGRAM_BOT_TOKEN_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** Parsed stored bot-token form: a literal secret or one environment-variable reference. */
+export type TelegramBotTokenReference =
+  | { kind: "literal"; token: string }
+  | { kind: "environment"; variable: string }
+  | { kind: "malformed" };
+
+/**
+ * Parse a persisted bot-token value. `$NAME` and `${NAME}` are exact
+ * environment-variable references. Any other `$`-prefixed value is malformed
+ * rather than a literal secret so a broken reference fails closed.
+ */
+export function getTelegramBotTokenReference(
+  value: string | undefined,
+): TelegramBotTokenReference | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  if (!trimmed.startsWith("$")) return { kind: "literal", token: trimmed };
+  const body =
+    trimmed.startsWith("${") && trimmed.endsWith("}")
+      ? trimmed.slice(2, -1)
+      : trimmed.slice(1);
+  return TELEGRAM_BOT_TOKEN_ENV_NAME_PATTERN.test(body)
+    ? { kind: "environment", variable: body }
+    : { kind: "malformed" };
+}
+
+/** Resolve a persisted token at a validation/activation boundary. */
+export function resolveTelegramBotToken(
+  value: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const reference = getTelegramBotTokenReference(value);
+  if (reference?.kind === "literal") return reference.token;
+  if (reference?.kind !== "environment") return undefined;
+  return env[reference.variable]?.trim() || undefined;
+}
+
+/** Redacted diagnostic for an unresolved or malformed token reference. */
+export function getTelegramBotTokenDiagnostic(
+  value: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const reference = getTelegramBotTokenReference(value);
+  if (reference?.kind === "malformed") {
+    return "Telegram bot token environment reference is malformed; use $NAME or ${NAME}.";
+  }
+  if (reference?.kind !== "environment") return undefined;
+  if (resolveTelegramBotToken(value, env)) return undefined;
+  return `Telegram bot token environment variable ${reference.variable} is not set.`;
+}
+
 export type TelegramOutboundCommandTemplateConfig =
   string | CommandTemplateObjectConfig;
 export interface TelegramOutboundHandlerConfig extends CommandTemplateObjectConfig {
@@ -206,6 +259,7 @@ export interface TelegramConfigStore {
   activateProfile: (profileName: string | undefined) => boolean;
   getActiveProfileName: () => string | undefined;
   getBotToken: () => string | undefined;
+  getBotTokenDiagnostic: () => string | undefined;
   hasBotToken: () => boolean;
   getAllowedUserId: () => number | undefined;
   getLegacyPollingCursor: () => number | undefined;
@@ -261,6 +315,8 @@ export interface TelegramConfigStoreOptions {
   initialConfig?: TelegramConfig;
   agentDir?: string;
   configPath?: string;
+  /** Environment used to resolve `$NAME` token references; defaults to process.env. */
+  env?: NodeJS.ProcessEnv;
   recordRuntimeEvent?: (
     category: string,
     error: unknown,
@@ -653,6 +709,7 @@ export function createTelegramConfigStore(
   let lastLoadRecoveredInvalidConfig = false;
   const agentDir = options.agentDir ?? resolveAgentDir();
   const configPath = options.configPath ?? getConfigPath();
+  const env = options.env ?? process.env;
   const getEffectiveConfig = () =>
     applyTelegramProfile(config, activeProfileName);
   const setEffectiveConfig = (nextConfig: TelegramConfig) => {
@@ -683,8 +740,12 @@ export function createTelegramConfigStore(
     return withTelegramFileTransaction(`${configPath}.transaction`, () => {
       const latest = readTelegramConfigForTransaction(configPath);
       const profile = latest.profiles?.[profileName];
-      if (typeof profile?.botToken !== "string" || !profile.botToken ||
-          createHash("sha256").update(profile.botToken).digest("hex") !== tokenSha256 ||
+      const resolvedToken =
+        typeof profile?.botToken === "string"
+          ? resolveTelegramBotToken(profile.botToken, env)
+          : undefined;
+      if (!profile || !resolvedToken ||
+          createHash("sha256").update(resolvedToken).digest("hex") !== tokenSha256 ||
           (profile.allowedUserId !== undefined &&
             (!Number.isSafeInteger(profile.allowedUserId) || profile.allowedUserId <= 0))) {
         throw new Error("Telegram pairing admission authority is unavailable or changed.");
@@ -723,8 +784,10 @@ export function createTelegramConfigStore(
       return true;
     },
     getActiveProfileName: () => activeProfileName,
-    getBotToken: () => getEffectiveConfig().botToken,
-    hasBotToken: () => !!getEffectiveConfig().botToken,
+    getBotToken: () => resolveTelegramBotToken(getEffectiveConfig().botToken, env),
+    getBotTokenDiagnostic: () =>
+      getTelegramBotTokenDiagnostic(getEffectiveConfig().botToken, env),
+    hasBotToken: () => !!resolveTelegramBotToken(getEffectiveConfig().botToken, env),
     getAllowedUserId: () => getEffectiveConfig().allowedUserId,
     getLegacyPollingCursor: () =>
       (getEffectiveConfig() as TelegramConfig & TelegramLegacyCursorCarrier)

@@ -4,10 +4,11 @@
  * Owns publication intent, outcome-unknown fencing, confirmed post identity, and bounded local listing
  */
 
-import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync,
+import { chmodSync, closeSync, constants, createReadStream, fstatSync, lstatSync, mkdirSync, openSync,
   readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { randomUUID } from "node:crypto";
+import { lstat } from "node:fs/promises";
+import { basename, dirname } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 
 import { Type } from "@sinclair/typebox";
 
@@ -20,6 +21,125 @@ const DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
 const MAX_ID_LENGTH = 256;
 const MAX_MARKDOWN_LENGTH = 100_000;
 const MAX_CHANNEL_TITLE_LENGTH = 255;
+
+export type TelegramChannelPostMediaKind = "photo" | "video";
+
+export interface TelegramChannelPostMediaIntent {
+  kind: TelegramChannelPostMediaKind;
+  fileName: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export const TELEGRAM_CHANNEL_POST_MEDIA_MAX_BYTES: Record<TelegramChannelPostMediaKind, number> = {
+  photo: 10 * 1024 * 1024,
+  video: 50 * 1024 * 1024,
+};
+export const TELEGRAM_CHANNEL_POST_CAPTION_MAX_LENGTH = 1024;
+export const TELEGRAM_CHANNEL_POST_MEDIA_FILE_NAME_MAX_LENGTH = 255;
+
+/** Safe, content-free local validation failure for channel media publication intent. */
+export class TelegramChannelPostValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TelegramChannelPostValidationError";
+  }
+}
+
+export function isTelegramChannelPostValidationError(
+  error: unknown,
+): error is TelegramChannelPostValidationError {
+  return error instanceof TelegramChannelPostValidationError;
+}
+
+const TELEGRAM_CHANNEL_POST_PHOTO_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+const TELEGRAM_CHANNEL_POST_VIDEO_EXTENSIONS = new Set([".mp4"]);
+
+export function resolveTelegramChannelPostMediaKind(
+  path: string,
+): TelegramChannelPostMediaKind | undefined {
+  if (typeof path !== "string" || path.length === 0) return undefined;
+  const name = basename(path).toLowerCase();
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0) return undefined;
+  const extension = name.slice(dot);
+  if (TELEGRAM_CHANNEL_POST_PHOTO_EXTENSIONS.has(extension)) return "photo";
+  if (TELEGRAM_CHANNEL_POST_VIDEO_EXTENSIONS.has(extension)) return "video";
+  return undefined;
+}
+
+export function assertTelegramChannelPostMediaSize(
+  kind: TelegramChannelPostMediaKind,
+  sizeBytes: number,
+): void {
+  if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0) {
+    throw new TelegramChannelPostValidationError("Channel media file is empty or unreadable.");
+  }
+  const limit = TELEGRAM_CHANNEL_POST_MEDIA_MAX_BYTES[kind];
+  if (sizeBytes > limit) {
+    throw new TelegramChannelPostValidationError(
+      `Channel ${kind} exceeds the Telegram ${kind} upload limit of ${limit} bytes.`,
+    );
+  }
+}
+
+async function hashTelegramChannelPostMedia(path: string): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    stream.on("data", (chunk: Buffer) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
+}
+
+export async function inspectTelegramChannelPostMedia(
+  path: string,
+): Promise<TelegramChannelPostMediaIntent> {
+  const kind = resolveTelegramChannelPostMediaKind(path);
+  if (!kind) {
+    throw new TelegramChannelPostValidationError(
+      "Unsupported channel media type. Supported single files: .jpg, .jpeg, .png, .webp photos and .mp4 videos; albums are not supported.",
+    );
+  }
+  let stats;
+  try {
+    stats = await lstat(path);
+  } catch {
+    throw new TelegramChannelPostValidationError(
+      "Channel media upload requires one readable regular local file.",
+    );
+  }
+  if (!stats.isFile() || stats.isSymbolicLink()) {
+    throw new TelegramChannelPostValidationError(
+      "Channel media upload requires one regular local file without symbolic links.",
+    );
+  }
+  assertTelegramChannelPostMediaSize(kind, stats.size);
+  return { kind, fileName: basename(path), sizeBytes: stats.size,
+    sha256: await hashTelegramChannelPostMedia(path) };
+}
+
+export function getTelegramChannelPostCaptionLength(caption: string): number {
+  const visible = caption
+    .replace(/<br\s*\/?>/giu, "\n")
+    .replace(/<[^>]*>/gu, "")
+    .replace(/&lt;/gu, "<")
+    .replace(/&gt;/gu, ">")
+    .replace(/&quot;/gu, "\"")
+    .replace(/&#39;/gu, "'")
+    .replace(/&amp;/gu, "&");
+  return visible.length;
+}
+
+export function assertTelegramChannelPostCaptionWithinLimit(caption: string): void {
+  if (getTelegramChannelPostCaptionLength(caption) >
+      TELEGRAM_CHANNEL_POST_CAPTION_MAX_LENGTH) {
+    throw new TelegramChannelPostValidationError(
+      `Channel media caption exceeds the Telegram limit of ${TELEGRAM_CHANNEL_POST_CAPTION_MAX_LENGTH} characters.`,
+    );
+  }
+}
 
 type ChannelPostJournalCode = "invalid" | "conflict" | "capacity" | "io";
 
@@ -39,6 +159,7 @@ interface TelegramChannelPostRecordBase {
   operationId: string;
   requestedChannel: TelegramChannelPostAddress;
   markdown: string;
+  media?: TelegramChannelPostMediaIntent;
   createdAtMs: number;
   updatedAtMs: number;
 }
@@ -82,8 +203,10 @@ export interface TelegramChannelPostJournalStoreOptions {
 }
 
 export interface TelegramChannelPostJournalStore {
-  prepare(input: { operationId: string; channel: TelegramChannelPostAddress; markdown: string }):
+  prepare(input: { operationId: string; channel: TelegramChannelPostAddress; markdown: string;
+    media?: TelegramChannelPostMediaIntent }):
     { prepared: boolean; record: TelegramChannelPostRecord };
+  get(operationId: string): TelegramChannelPostRecord | undefined;
   beginPublication(operationId: string): { began: boolean; record: TelegramChannelPostRecord };
   confirmPublished(input: { operationId: string; channelId: number; messageId: number;
     channelUsername?: `@${string}`; channelTitle?: string }):
@@ -104,6 +227,7 @@ export async function publishTelegramChannelPost(input: {
   operationId: string;
   channel: TelegramChannelPostAddress;
   markdown: string;
+  media?: TelegramChannelPostMediaIntent;
   observeChannel(channel: TelegramChannelPostAddress): Promise<{
     id: number; type: string; username?: string; title?: string;
   }>;
@@ -119,7 +243,8 @@ export async function publishTelegramChannelPost(input: {
         observed.title.length > MAX_CHANNEL_TITLE_LENGTH))) {
     throw new Error("Telegram channel delivery requires bounded exact getChat channel identity.");
   }
-  input.store.prepare({ operationId: input.operationId, channel: input.channel, markdown: input.markdown });
+  input.store.prepare({ operationId: input.operationId, channel: input.channel,
+    markdown: input.markdown, ...(input.media === undefined ? {} : { media: input.media }) });
   const issuance = input.store.beginPublication(input.operationId);
   if (!issuance.began) {
     if (issuance.record.state === "published") return issuance.record;
@@ -135,6 +260,16 @@ export async function publishTelegramChannelPost(input: {
     ...(observed.title ? { channelTitle: observed.title } : {}) }).record;
 }
 
+function formatTelegramChannelPostToolOutput(value: unknown): string {
+  // Pi's compact tool rows need one leading newline to separate call and result.
+  return `\n${JSON.stringify(value, null, 2)}`;
+}
+
+function formatTelegramChannelPostToolError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  return new Error(`\n${message.replace(/^\n+/u, "") || "Telegram channel post operation failed."}`);
+}
+
 export function registerTelegramChannelPostMutationTool(
   pi: ExtensionAPI,
   deps: { mutate(input: { action: "edit" | "delete"; operationId: string;
@@ -143,7 +278,7 @@ export function registerTelegramChannelPostMutationTool(
   pi.registerTool({
     name: "telegram_channel_post",
     label: "Edit or Delete Telegram Channel Post",
-    description: "Edit or delete one exact published post retained by telegram_channel_posts. Unknown outcomes are never replayed.",
+    description: "Edit or delete one exact published post retained by telegram_channel_posts; a media post edit replaces its caption. Unknown outcomes are never replayed.",
     parameters: Type.Object({
       action: Type.Union([Type.Literal("edit"), Type.Literal("delete")]),
       operation_id: Type.String({ minLength: 1, maxLength: MAX_ID_LENGTH }),
@@ -153,10 +288,13 @@ export function registerTelegramChannelPostMutationTool(
       try {
         const record = await deps.mutate({ action: params.action, operationId: params.operation_id,
           mutationId: toolCallId, ...(params.markdown === undefined ? {} : { markdown: params.markdown }) });
-        return { content: [{ type: "text" as const, text: JSON.stringify(record, null, 2) }],
+        return { content: [{ type: "text" as const, text: formatTelegramChannelPostToolOutput(record) }],
           details: { record } };
-      } catch {
-        throw new Error("Telegram channel post mutation failed; inspect the retained local record before retrying.");
+      } catch (error) {
+        if (isTelegramChannelPostValidationError(error)) {
+          throw formatTelegramChannelPostToolError(error);
+        }
+        throw new Error("\nTelegram channel post mutation failed; inspect the retained local record before retrying.");
       }
     },
   });
@@ -182,10 +320,10 @@ export function registerTelegramChannelPostListTool(
           channel: params.chat_id as TelegramChannelPostAddress | undefined,
           limit: params.limit,
         });
-        return { content: [{ type: "text" as const, text: JSON.stringify(records, null, 2) }],
+        return { content: [{ type: "text" as const, text: formatTelegramChannelPostToolOutput(records) }],
           details: { records } };
       } catch {
-        throw new Error("Telegram channel post listing failed without exposing retained content or storage details.");
+        throw new Error("\nTelegram channel post listing failed without exposing retained content or storage details.");
       }
     },
   });
@@ -212,9 +350,33 @@ function normalizeChannel(value: unknown): TelegramChannelPostAddress {
   throw new TelegramChannelPostJournalError("invalid", "Telegram channel post requires an exact negative channel ID or public @username.");
 }
 
+function validateTelegramChannelPostMedia(value: unknown): TelegramChannelPostMediaIntent {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["kind", "fileName", "sizeBytes", "sha256"]) ||
+      (value.kind !== "photo" && value.kind !== "video") ||
+      typeof value.fileName !== "string" || value.fileName.length === 0 ||
+      value.fileName.length > TELEGRAM_CHANNEL_POST_MEDIA_FILE_NAME_MAX_LENGTH ||
+      !Number.isSafeInteger(value.sizeBytes) || (value.sizeBytes as number) <= 0 ||
+      (value.sizeBytes as number) > TELEGRAM_CHANNEL_POST_MEDIA_MAX_BYTES[value.kind] ||
+      typeof value.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(value.sha256)) {
+    throw new TelegramChannelPostJournalError("invalid",
+      "Telegram channel post journal contains an invalid media intent.");
+  }
+  return { kind: value.kind, fileName: value.fileName,
+    sizeBytes: value.sizeBytes as number, sha256: value.sha256 };
+}
+
+function sameTelegramChannelPostMedia(
+  left: TelegramChannelPostMediaIntent | undefined,
+  right: TelegramChannelPostMediaIntent | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.kind === right.kind && left.fileName === right.fileName &&
+    left.sizeBytes === right.sizeBytes && left.sha256 === right.sha256;
+}
+
 function validateRecord(value: unknown): TelegramChannelPostRecord {
   if (!isRecord(value) || !hasOnlyKeys(value, ["operationId", "requestedChannel", "markdown",
-    "createdAtMs", "updatedAtMs", "state", "issuedAtMs", "publishedAtMs", "channelId",
+    "media", "createdAtMs", "updatedAtMs", "state", "issuedAtMs", "publishedAtMs", "channelId",
     "messageId", "channelUsername", "mutationId", "attemptedMarkdown",
     "mutationIssuedAtMs", "deletedAtMs", "lastMutationId", "channelTitle"]) || typeof value.operationId !== "string" ||
     value.operationId.length === 0 || value.operationId.length > MAX_ID_LENGTH ||
@@ -225,7 +387,8 @@ function validateRecord(value: unknown): TelegramChannelPostRecord {
   }
   const base: TelegramChannelPostRecordBase = { operationId: value.operationId,
     requestedChannel: normalizeChannel(value.requestedChannel), markdown: value.markdown,
-    createdAtMs: value.createdAtMs, updatedAtMs: value.updatedAtMs };
+    createdAtMs: value.createdAtMs, updatedAtMs: value.updatedAtMs,
+    ...(value.media === undefined ? {} : { media: validateTelegramChannelPostMedia(value.media) }) };
   if (value.state === "prepared" && value.issuedAtMs === undefined && value.publishedAtMs === undefined &&
       value.channelId === undefined && value.messageId === undefined && value.channelUsername === undefined &&
       value.mutationId === undefined && value.attemptedMarkdown === undefined &&
@@ -379,6 +542,8 @@ export function createTelegramChannelPostJournalStore(
     prepare(input) {
       const operationId = input.operationId;
       const channel = normalizeChannel(input.channel);
+      const media = input.media === undefined ? undefined
+        : validateTelegramChannelPostMedia(input.media);
       if (typeof operationId !== "string" || operationId.length === 0 || operationId.length > MAX_ID_LENGTH ||
           typeof input.markdown !== "string" || input.markdown.length === 0 ||
           input.markdown.length > MAX_MARKDOWN_LENGTH) {
@@ -387,7 +552,8 @@ export function createTelegramChannelPostJournalStore(
       return mutate(file => {
         const existing = file.records.find(record => record.operationId === operationId);
         if (existing) {
-          if (existing.requestedChannel !== channel || existing.markdown !== input.markdown) {
+          if (existing.requestedChannel !== channel || existing.markdown !== input.markdown ||
+              !sameTelegramChannelPostMedia(existing.media, media)) {
             throw new TelegramChannelPostJournalError("conflict", "Telegram channel post operation conflicts with retained intent.");
           }
           return { prepared: false, record: structuredClone(existing) };
@@ -395,7 +561,8 @@ export function createTelegramChannelPostJournalStore(
         const atMs = now();
         if (!isSafeTime(atMs)) throw new TelegramChannelPostJournalError("invalid", "Telegram channel post clock is invalid.");
         const record: TelegramChannelPostRecord = { operationId, requestedChannel: channel,
-          markdown: input.markdown, createdAtMs: atMs, updatedAtMs: atMs, state: "prepared" };
+          markdown: input.markdown, createdAtMs: atMs, updatedAtMs: atMs, state: "prepared",
+          ...(media === undefined ? {} : { media }) };
         publish({ ...file, records: [...file.records, record] });
         return { prepared: true, record: structuredClone(record) };
       });
@@ -530,6 +697,13 @@ export function createTelegramChannelPostJournalStore(
         const records = [...file.records]; records[index] = record; publish({ ...file, records });
         return { confirmed: true, record: structuredClone(record) };
       });
+    },
+    get(operationId) {
+      if (typeof operationId !== "string" || operationId.length === 0 || operationId.length > MAX_ID_LENGTH) {
+        throw new TelegramChannelPostJournalError("invalid", "Telegram channel post operation ID is invalid.");
+      }
+      const record = read().records.find(candidate => candidate.operationId === operationId);
+      return record === undefined ? undefined : structuredClone(record);
     },
     list(input = {}) {
       const limit = input.limit ?? 20;

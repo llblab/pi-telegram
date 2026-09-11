@@ -278,6 +278,151 @@ test("Generative App replacement requires an existing installation", async () =>
   }
 });
 
+test("Generative App method arguments round-trip scalar, object, and absent shapes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
+  const agentDir = join(root, "agent");
+  try {
+    const script = await writeApp(
+      root,
+      "echo",
+      `
+export function init() { return { state: {}, output: "ready" }; }
+export function echo({ argument }) { return { output: JSON.stringify(argument ?? null) }; }
+`,
+    );
+    await installGenerativeApp({ agentDir, app: "echo", script });
+    assert.equal(
+      (await invokeGenerativeApp({ agentDir, method: "echo", app: "echo" })).output,
+      "null",
+    );
+    assert.equal(
+      (await invokeGenerativeApp({ agentDir, argument: 7, method: "echo", app: "echo" })).output,
+      "7",
+    );
+    assert.equal(
+      (await invokeGenerativeApp({
+        agentDir,
+        argument: { a: [1, 2], b: "x" },
+        method: "echo",
+        app: "echo",
+      })).output,
+      '{"a":[1,2],"b":"x"}',
+    );
+    assert.equal(
+      (await invokeGenerativeAppBoundAction({
+        agentDir,
+        prompt: 'echo::echo({"nested":{"n":true}})',
+      }))?.output,
+      '{"nested":{"n":true}}',
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Generative App method failure leaves state and journal unchanged and later calls succeed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
+  const agentDir = join(root, "agent");
+  try {
+    const script = await writeApp(
+      root,
+      "counter",
+      `
+export function init() { return { state: { count: 0 }, output: "ready" }; }
+export function boom() { throw new Error("kaboom"); }
+export function increment({ state }) { return { state: { count: state.count + 1 }, output: "ok" }; }
+`,
+    );
+    await installGenerativeApp({ agentDir, app: "counter", script });
+    const appDir = resolveGenerativeAppDir(agentDir, "counter");
+    const previousState = await readFile(join(appDir, "state.json"), "utf8");
+    const previousJournal = await readFile(join(appDir, "states.jsonl"), "utf8");
+    await assert.rejects(
+      invokeGenerativeApp({ agentDir, method: "boom", app: "counter" }),
+      /kaboom/,
+    );
+    assert.equal(await readFile(join(appDir, "state.json"), "utf8"), previousState);
+    assert.equal(await readFile(join(appDir, "states.jsonl"), "utf8"), previousJournal);
+    const incremented = await invokeGenerativeApp({
+      agentDir,
+      method: "increment",
+      app: "counter",
+    });
+    assert.equal(incremented.output, "ok");
+    assert.equal(incremented.revision, 1);
+    assert.deepEqual(
+      JSON.parse(await readFile(join(appDir, "state.json"), "utf8")),
+      { count: 1 },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Generative App rejects oversized argument, output, and state before durable mutation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
+  const agentDir = join(root, "agent");
+  try {
+    const script = await writeApp(
+      root,
+      "limits",
+      `
+export function init() { return { state: {}, output: "ready" }; }
+export function inspect() { return { output: "ok" }; }
+export function huge_output() { return { output: "x".repeat(70 * 1024) }; }
+export function huge_state() { return { state: { blob: "y".repeat(270 * 1024) }, output: "ok" }; }
+`,
+    );
+    await installGenerativeApp({ agentDir, app: "limits", script });
+    const appDir = resolveGenerativeAppDir(agentDir, "limits");
+    const previousState = await readFile(join(appDir, "state.json"), "utf8");
+    const previousJournal = await readFile(join(appDir, "states.jsonl"), "utf8");
+    await assert.rejects(
+      invokeGenerativeApp({
+        agentDir,
+        argument: { blob: "z".repeat(270 * 1024) },
+        method: "inspect",
+        app: "limits",
+      }),
+      /argument exceeds 262144 bytes/,
+    );
+    await assert.rejects(
+      invokeGenerativeApp({ agentDir, method: "huge_output", app: "limits" }),
+      /output exceeds 65536 bytes/,
+    );
+    await assert.rejects(
+      invokeGenerativeApp({ agentDir, method: "huge_state", app: "limits" }),
+      /state exceeds 262144 bytes/,
+    );
+    assert.equal(await readFile(join(appDir, "state.json"), "utf8"), previousState);
+    assert.equal(await readFile(join(appDir, "states.jsonl"), "utf8"), previousJournal);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Generative App install rejects an oversized module", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
+  const agentDir = join(root, "agent");
+  try {
+    const script = await writeApp(
+      root,
+      "huge",
+      `/*${"z".repeat(1024 * 1024)}*/\nexport function init() { return { state: {}, output: "ready" }; }\n`,
+    );
+    await assert.rejects(
+      installGenerativeApp({ agentDir, app: "huge", script }),
+      /module exceeds 1048576 bytes/,
+    );
+    await assert.rejects(
+      readdir(resolveGenerativeAppDir(agentDir, "huge")),
+      /ENOENT/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Generative App install rejects noncanonical scripts and source symlinks", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
   const agentDir = join(root, "agent");

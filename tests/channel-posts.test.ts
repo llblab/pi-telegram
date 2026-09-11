@@ -12,11 +12,17 @@ import assert from "node:assert/strict";
 import nodeTest from "node:test";
 
 import {
+  assertTelegramChannelPostCaptionWithinLimit,
+  assertTelegramChannelPostMediaSize,
   createTelegramChannelPostJournalStore,
+  getTelegramChannelPostCaptionLength,
+  inspectTelegramChannelPostMedia,
   publishTelegramChannelPost,
   registerTelegramChannelPostListTool,
   registerTelegramChannelPostMutationTool,
+  resolveTelegramChannelPostMediaKind,
   TelegramChannelPostJournalError,
+  TelegramChannelPostValidationError,
 } from "../lib/channel-posts.ts";
 import type { ExtensionAPI } from "../lib/pi.ts";
 
@@ -179,12 +185,15 @@ test("Channel post mutation tool binds the tool call to one exact mutation", asy
       channelId: -1001, messageId: 7 };
   } });
   assert.ok(tool);
-  await tool.execute("mutation-call", { action: "edit", operation_id: "post", markdown: "New" });
+  const result = await tool.execute("mutation-call", {
+    action: "edit", operation_id: "post", markdown: "New",
+  }) as { content: Array<{ type: "text"; text: string }> };
+  assert.equal(result.content[0]?.text.startsWith("\n"), true);
   assert.deepEqual(observed, { action: "edit", operationId: "post", mutationId: "mutation-call", markdown: "New" });
   await assert.rejects(tool.execute("secret-call", {
     action: "edit", operation_id: "post", markdown: "SECRET",
-  }), error => error instanceof Error && !error.message.includes("SECRET") &&
-    !error.message.includes("token"));
+  }), error => error instanceof Error && error.message.startsWith("\n") &&
+    !error.message.includes("SECRET") && !error.message.includes("token"));
 });
 
 test("Channel post list tool returns only bounded local journal records", async () => {
@@ -196,8 +205,10 @@ test("Channel post list tool returns only bounded local journal records", async 
     } } as unknown as ExtensionAPI, { list: store.list });
     assert.ok(tool);
     const result = await tool.execute("read", { chat_id: "@public_channel", limit: 1 }) as {
+      content: Array<{ type: "text"; text: string }>;
       details: { records: Array<{ operationId: string }> };
     };
+    assert.equal(result.content[0]?.text.startsWith("\n"), true);
     assert.deepEqual(result.details.records.map(record => record.operationId), ["post"]);
   });
 });
@@ -232,5 +243,123 @@ test("Channel post journal retains unknown outcomes and refuses invalid identity
     await writeFile(path, JSON.stringify({ version: 1, profile: "work", tokenSha256, records: [] }),
       { mode: 0o644 });
     assert.throws(() => store.list(), error => isCode(error, "invalid"));
+  });
+});
+
+test("Channel post journal binds one exact media intent to publication and retains it", async () => {
+  await withStore(async ({ path, store, now }) => {
+    const media = { kind: "photo" as const, fileName: "cover.jpg", sizeBytes: 4,
+      sha256: "b".repeat(64) };
+    assert.equal(store.prepare({ operationId: "media-1", channel: "@public_channel",
+      markdown: "Cover", media }).prepared, true);
+    assert.equal(store.prepare({ operationId: "media-1", channel: "@public_channel",
+      markdown: "Cover", media }).prepared, false);
+    assert.throws(() => store.prepare({ operationId: "media-1", channel: "@public_channel",
+      markdown: "Cover", media: { ...media, sha256: "c".repeat(64) } }),
+      error => isCode(error, "conflict"));
+    assert.throws(() => store.prepare({ operationId: "media-1", channel: "@public_channel",
+      markdown: "Cover", media: { ...media, kind: "video" } }),
+      error => isCode(error, "conflict"));
+    assert.throws(() => store.prepare({ operationId: "media-1", channel: "@public_channel",
+      markdown: "Other caption", media }), error => isCode(error, "conflict"));
+    assert.throws(() => store.prepare({ operationId: "media-bad", channel: "@public_channel",
+      markdown: "Cover", media: { ...media, fileName: "" } }),
+      error => isCode(error, "invalid"));
+    assert.throws(() => store.prepare({ operationId: "media-bad", channel: "@public_channel",
+      markdown: "Cover", media: { ...media, sha256: "nope" } }),
+      error => isCode(error, "invalid"));
+    assert.equal(store.get("missing"), undefined);
+    now(110);
+    assert.equal(store.beginPublication("media-1").began, true);
+    now(120);
+    store.confirmPublished({ operationId: "media-1", channelId: -1001, messageId: 7 });
+    const restarted = createTelegramChannelPostJournalStore({ path, profileName: "work", tokenSha256 });
+    assert.deepEqual(restarted.get("media-1")?.media, media);
+  });
+});
+
+test("Channel media inspection resolves supported kinds and binds content identity", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-channel-media-"));
+  try {
+    const photoPath = join(dir, "Cover.JPG");
+    await writeFile(photoPath, Buffer.from("image-bytes"));
+    const photo = await inspectTelegramChannelPostMedia(photoPath);
+    assert.equal(photo.kind, "photo");
+    assert.equal(photo.fileName, "Cover.JPG");
+    assert.equal(photo.sizeBytes, 11);
+    assert.match(photo.sha256, /^[a-f0-9]{64}$/u);
+    const videoPath = join(dir, "clip.mp4");
+    await writeFile(videoPath, Buffer.from("video-bytes"));
+    assert.equal((await inspectTelegramChannelPostMedia(videoPath)).kind, "video");
+    assert.equal(resolveTelegramChannelPostMediaKind("no-extension"), undefined);
+    assert.equal(resolveTelegramChannelPostMediaKind("cover.gif"), undefined);
+    await assert.rejects(inspectTelegramChannelPostMedia(join(dir, "clip.gif")),
+      error => error instanceof TelegramChannelPostValidationError &&
+        /Unsupported channel media type/u.test(error.message));
+    const linkPath = join(dir, "linked.png");
+    await symlink(photoPath, linkPath);
+    await assert.rejects(inspectTelegramChannelPostMedia(linkPath),
+      error => error instanceof TelegramChannelPostValidationError &&
+        /without symbolic links/u.test(error.message));
+    await assert.rejects(inspectTelegramChannelPostMedia(join(dir, "missing.png")),
+      error => error instanceof TelegramChannelPostValidationError &&
+        /readable regular local file/u.test(error.message));
+    const emptyPath = join(dir, "empty.png");
+    await writeFile(emptyPath, Buffer.alloc(0));
+    await assert.rejects(inspectTelegramChannelPostMedia(emptyPath),
+      error => error instanceof TelegramChannelPostValidationError && /empty/u.test(error.message));
+    assertTelegramChannelPostMediaSize("photo", 10 * 1024 * 1024);
+    assertTelegramChannelPostMediaSize("video", 50 * 1024 * 1024);
+    assert.throws(() => assertTelegramChannelPostMediaSize("photo", 10 * 1024 * 1024 + 1),
+      error => error instanceof TelegramChannelPostValidationError && /upload limit/u.test(error.message));
+    assert.throws(() => assertTelegramChannelPostMediaSize("video", 50 * 1024 * 1024 + 1),
+      error => error instanceof TelegramChannelPostValidationError && /upload limit/u.test(error.message));
+    assert.throws(() => assertTelegramChannelPostMediaSize("photo", 0),
+      error => error instanceof TelegramChannelPostValidationError && /empty/u.test(error.message));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Channel media caption validation counts visible characters only", () => {
+  assert.equal(
+    getTelegramChannelPostCaptionLength(
+      "<b>Bold</b> &amp; <tg-spoiler>hidden</tg-spoiler><br>tail"),
+    "Bold & hidden\ntail".length,
+  );
+  assertTelegramChannelPostCaptionWithinLimit("x".repeat(1024));
+  assert.throws(() => assertTelegramChannelPostCaptionWithinLimit("x".repeat(1025)),
+    error => error instanceof TelegramChannelPostValidationError &&
+      /limit of 1024/u.test(error.message));
+  assertTelegramChannelPostCaptionWithinLimit(`<b>${"x".repeat(1024)}</b>`);
+});
+
+test("Channel media publication does not resend after lost success or ambiguous acknowledgement", async () => {
+  await withStore(async ({ path, store }) => {
+    const media = { kind: "photo" as const, fileName: "cover.jpg", sizeBytes: 4,
+      sha256: "d".repeat(64) };
+    let sends = 0;
+    const successInput = {
+      store, operationId: "media-success", channel: -1001 as const, markdown: "Cover", media,
+      async observeChannel() { return { id: -1001, type: "channel" }; },
+      async send() { sends += 1; return { messageId: 8, chat: { id: -1001, type: "channel" } }; },
+    };
+    await publishTelegramChannelPost(successInput);
+    const replacement = createTelegramChannelPostJournalStore({ path, profileName: "work", tokenSha256 });
+    const replay = await publishTelegramChannelPost({ ...successInput, store: replacement });
+    assert.equal(replay.state, "published");
+    assert.equal(sends, 1);
+    assert.deepEqual(replay.media, media);
+
+    let ambiguous = 0;
+    const ambiguousInput = {
+      store, operationId: "media-ambiguous", channel: -1002 as const, markdown: "Cover", media,
+      async observeChannel() { return { id: -1002, type: "channel" }; },
+      async send(): Promise<never> { ambiguous += 1; throw new Error("lost Bot API acknowledgement"); },
+    };
+    await assert.rejects(publishTelegramChannelPost(ambiguousInput));
+    const next = createTelegramChannelPostJournalStore({ path, profileName: "work", tokenSha256 });
+    await assert.rejects(publishTelegramChannelPost({ ...ambiguousInput, store: next }),
+      /outcome is unknown/u);
+    assert.equal(ambiguous, 1);
+    assert.equal(store.list({ channel: -1002 })[0]?.media?.sha256, media.sha256);
   });
 });

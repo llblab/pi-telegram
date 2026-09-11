@@ -200,6 +200,10 @@ export interface TelegramSentMessage {
   message_id: number;
 }
 
+export interface TelegramSentGuestMessage {
+  inline_message_id?: string;
+}
+
 export interface TelegramReplyParameters {
   message_id: number;
   allow_sending_without_reply?: boolean;
@@ -425,6 +429,11 @@ export interface TelegramAnswerGuestQueryOptions {
   parseMode?: string;
   richMessage?: TelegramInputRichMessage;
   result?: TelegramGuestCachedMediaResult;
+}
+
+export interface TelegramEditGuestInlineMessageContent {
+  text?: string;
+  richMessage?: TelegramInputRichMessage;
 }
 
 export interface TelegramAnswerCallbackQueryOptions {
@@ -809,6 +818,21 @@ export interface TelegramBridgeApiRuntime {
     guestQueryId: string,
     text?: string,
     options?: TelegramAnswerGuestQueryOptions,
+  ) => Promise<void>;
+  /**
+   * Temporary Guest Mode ACK experiment: answers the guest query and returns
+   * the sent inline message id so the final answer can edit that early reply.
+   * Requires direct transport ownership; Telegram does not document editing
+   * guest answers, so this exists only to falsify that behavior live.
+   */
+  answerGuestQueryForInlineMessage: (
+    guestQueryId: string,
+    text?: string,
+    options?: TelegramAnswerGuestQueryOptions,
+  ) => Promise<string | undefined>;
+  editGuestInlineMessage: (
+    inlineMessageId: string,
+    content: TelegramEditGuestInlineMessageContent,
   ) => Promise<void>;
   deleteMessage: (chatId: number, messageId: number) => Promise<void>;
   prepareTempDir: () => Promise<number>;
@@ -1700,6 +1724,31 @@ export function createTelegramAssistantDraftSender(deps: {
   };
 }
 
+export function buildTelegramAnswerGuestQueryBody(
+  guestQueryId: string,
+  text?: string,
+  options?: TelegramAnswerGuestQueryOptions,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = { guest_query_id: guestQueryId };
+  if (options?.result) {
+    body.result = options.result;
+  } else if (text !== undefined || options?.richMessage) {
+    const inputContent: Record<string, unknown> = options?.richMessage
+      ? { rich_message: options.richMessage }
+      : { message_text: text };
+    if (!options?.richMessage && options?.parseMode) {
+      inputContent.parse_mode = options.parseMode;
+    }
+    body.result = {
+      type: "article",
+      id: "1",
+      title: "Response",
+      input_message_content: inputContent,
+    };
+  }
+  return body;
+}
+
 export function createDefaultTelegramBridgeApiRuntime(deps: {
   getBotToken: () => string | undefined;
   recordRuntimeEvent: TelegramBridgeApiRuntimeDeps["recordRuntimeEvent"];
@@ -2021,25 +2070,32 @@ export function createTelegramBridgeApiRuntime(
       guestQueryId: string,
       text: string | undefined,
       options: TelegramAnswerGuestQueryOptions | undefined,
+    ) =>
+      callRecorded<void>(
+        "answerGuestQuery",
+        buildTelegramAnswerGuestQueryBody(guestQueryId, text, options),
+      ),
+    answerGuestQueryForInlineMessage: async (
+      guestQueryId: string,
+      text: string | undefined,
+      options: TelegramAnswerGuestQueryOptions | undefined,
     ) => {
-      const body: Record<string, unknown> = { guest_query_id: guestQueryId };
-      if (options?.result) {
-        body.result = options.result;
-      } else if (text !== undefined || options?.richMessage) {
-        const inputContent: Record<string, unknown> = options?.richMessage
-          ? { rich_message: options.richMessage }
-          : { message_text: text };
-        if (!options?.richMessage && options?.parseMode) {
-          inputContent.parse_mode = options.parseMode;
-        }
-        body.result = {
-          type: "article",
-          id: "1",
-          title: "Response",
-          input_message_content: inputContent,
-        };
-      }
-      return callRecorded<void>("answerGuestQuery", body);
+      const sent = await callRecorded<TelegramSentGuestMessage | undefined>(
+        "answerGuestQuery",
+        buildTelegramAnswerGuestQueryBody(guestQueryId, text, options),
+      );
+      return sent?.inline_message_id;
+    },
+    editGuestInlineMessage: async (
+      inlineMessageId: string,
+      content: TelegramEditGuestInlineMessageContent,
+    ) => {
+      await callRecorded("editMessageText", {
+        inline_message_id: inlineMessageId,
+        ...(content.richMessage
+          ? { rich_message: content.richMessage }
+          : { text: content.text }),
+      });
     },
     prepareTempDir: () =>
       prepareTelegramTempDir(deps.tempDir, deps.tempFileMaxAgeMs),

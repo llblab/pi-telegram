@@ -8,11 +8,15 @@ import {
   markTelegramBusCrossTargetDelivery,
   stripTelegramBusApiMetadata,
 } from "./bus.ts";
-import { isTelegramMessageNotModifiedError } from "./telegram-api.ts";
+import {
+  buildTelegramAnswerGuestQueryBody,
+  isTelegramMessageNotModifiedError,
+} from "./telegram-api.ts";
 import type {
   TelegramAnswerGuestQueryOptions,
   TelegramApiCallOptions,
   TelegramBridgeApiRuntime,
+  TelegramEditGuestInlineMessageContent,
   TelegramEditMessageTextBody,
   TelegramSendMessageBody,
   TelegramSendMessageDraftBody,
@@ -342,24 +346,33 @@ export function createTelegramBusAwareApiRuntime(
         await deps.directRuntime.answerGuestQuery(guestQueryId, text, options);
         return;
       }
-      const body: Record<string, unknown> = { guest_query_id: guestQueryId };
-      if (options?.result) {
-        body.result = options.result;
-      } else if (text !== undefined || options?.richMessage) {
-        const inputContent: Record<string, unknown> = options?.richMessage
-          ? { rich_message: options.richMessage }
-          : { message_text: text };
-        if (!options?.richMessage && options?.parseMode) {
-          inputContent.parse_mode = options.parseMode;
-        }
-        body.result = {
-          type: "article",
-          id: "1",
-          title: "Response",
-          input_message_content: inputContent,
-        };
-      }
-      await deps.callFollowerApi("call", ["answerGuestQuery", body]);
+      await deps.callFollowerApi("call", [
+        "answerGuestQuery",
+        buildTelegramAnswerGuestQueryBody(guestQueryId, text, options),
+      ]);
+    },
+    answerGuestQueryForInlineMessage(
+      guestQueryId: string,
+      text?: string,
+      options?: TelegramAnswerGuestQueryOptions,
+    ): Promise<string | undefined> {
+      // Guest answers can only be edited while this instance owns direct
+      // transport; follower forwarding cannot preserve the inline message id.
+      return deps.ownsDirect()
+        ? deps.directRuntime.answerGuestQueryForInlineMessage(
+            guestQueryId,
+            text,
+            options,
+          )
+        : rejectTelegramDirectOwnership("answerGuestQueryForInlineMessage");
+    },
+    editGuestInlineMessage(
+      inlineMessageId: string,
+      content: TelegramEditGuestInlineMessageContent,
+    ): Promise<void> {
+      return deps.ownsDirect()
+        ? deps.directRuntime.editGuestInlineMessage(inlineMessageId, content)
+        : rejectTelegramDirectOwnership("editGuestInlineMessage");
     },
     async deleteMessage(chatId: number, messageId: number): Promise<void> {
       if (deps.ownsDirect())

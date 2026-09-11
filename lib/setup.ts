@@ -42,6 +42,10 @@ export interface TelegramSetupDeps {
     result?: TelegramSetupUser;
     description?: string;
   }>;
+  /** Resolve a submitted literal token or `$NAME`/`${NAME}` reference. */
+  resolveBotToken?: (value: string) => string | undefined;
+  /** Redacted diagnostic for an unresolved or malformed token reference. */
+  describeBotToken?: (value: string) => string | undefined;
   persistConfig: (config: TelegramSetupConfig) => Promise<void>;
   notify: (message: string, level: "info" | "error") => void;
   startPolling: () => unknown | Promise<unknown>;
@@ -70,6 +74,8 @@ export interface TelegramSetupPromptRuntimeDeps<
   setConfig: (config: TelegramSetupConfig) => void;
   setupGuard: TelegramSetupGuard;
   getMe: TelegramSetupDeps["getMe"];
+  resolveBotToken?: TelegramSetupDeps["resolveBotToken"];
+  describeBotToken?: TelegramSetupDeps["describeBotToken"];
   persistConfig: (config: TelegramSetupConfig) => Promise<void>;
   startPolling: (ctx: TContext) => unknown | Promise<unknown>;
   updateStatus: (ctx: TContext) => void;
@@ -88,6 +94,25 @@ const TELEGRAM_BOT_TOKEN_ENV_VARS = [
   "TELEGRAM_KEY",
 ] as const;
 
+/**
+ * Default submitted-token handling for structural callers that inject no
+ * reference port: plain literals pass through, while `$`-prefixed values fail
+ * closed instead of being sent to the Bot API as a literal token.
+ */
+function resolveSubmittedTelegramBotToken(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.startsWith("$")) return undefined;
+  return trimmed;
+}
+
+function describeSubmittedTelegramBotToken(
+  value: string,
+): string | undefined {
+  return value.trim().startsWith("$")
+    ? "Telegram bot token environment reference is unavailable in this setup environment."
+    : undefined;
+}
+
 function isTelegramPollingStartResult(
   value: unknown,
 ): value is TelegramPollingStartResult {
@@ -105,8 +130,8 @@ export function getTelegramBotTokenInputDefault(
   const trimmedConfigToken = configToken?.trim();
   if (trimmedConfigToken) return trimmedConfigToken;
   for (const key of TELEGRAM_BOT_TOKEN_ENV_VARS) {
-    const value = env[key]?.trim();
-    if (value) return value;
+    // Persist the originating alias rather than copying the resolved secret.
+    if (env[key]?.trim()) return `$${key}`;
   }
   return TELEGRAM_BOT_TOKEN_INPUT_PLACEHOLDER;
 }
@@ -135,13 +160,26 @@ export async function runTelegramSetup(
       ? await deps.promptEditor("Telegram bot token", tokenPrompt.value)
       : await deps.promptInput("Telegram bot token", tokenPrompt.value);
   if (!token) return { status: "cancelled" };
+  const submittedToken = token.trim();
+  const resolveBotToken =
+    deps.resolveBotToken ?? resolveSubmittedTelegramBotToken;
+  const describeBotToken =
+    deps.describeBotToken ?? describeSubmittedTelegramBotToken;
+  const resolvedToken = resolveBotToken(submittedToken);
   const nextConfig: TelegramSetupConfig = {
     ...deps.config,
-    botToken: token.trim(),
+    botToken: submittedToken,
   };
+  if (!resolvedToken) {
+    deps.notify(
+      describeBotToken(submittedToken) ?? "Invalid Telegram bot token",
+      "error",
+    );
+    return { status: "validation-failed" };
+  }
   let data: Awaited<ReturnType<TelegramSetupDeps["getMe"]>>;
   try {
-    data = await deps.getMe(nextConfig.botToken ?? "");
+    data = await deps.getMe(resolvedToken);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     deps.notify(`Telegram API check failed: ${message}`, "error");
@@ -195,6 +233,8 @@ export function createTelegramSetupPromptRuntime<
         promptInput: (label, value) => ctx.ui.input(label, value),
         promptEditor: (label, value) => ctx.ui.editor(label, value),
         getMe: deps.getMe,
+        resolveBotToken: deps.resolveBotToken,
+        describeBotToken: deps.describeBotToken,
         persistConfig: async (config) => {
           const previousConfig = deps.getConfig();
           deps.setConfig(config);

@@ -1808,6 +1808,84 @@ test("Telegram bridge API runtime records structured failures", async () => {
   ]);
 });
 
+test("Telegram bridge API runtime captures guest inline message ids and edits them", async () => {
+  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+  const runtime = createTelegramBridgeApiRuntime({
+    tempDir: "/tmp/telegram",
+    maxFileSizeBytes: 123,
+    tempFileMaxAgeMs: 60_000,
+    recordRuntimeEvent: () => {},
+    client: createApiRuntimeClient({
+      call: async <TResponse>(
+        method: string,
+        body: Record<string, unknown>,
+      ) => {
+        calls.push({ method, body });
+        const inputContent = (
+          (body.result as Record<string, unknown> | undefined)
+            ?.input_message_content as Record<string, unknown> | undefined
+        );
+        return (inputContent?.message_text === "ack"
+          ? { inline_message_id: "inline-42" }
+          : true) as TResponse;
+      },
+    }),
+  });
+  assert.equal(
+    await runtime.answerGuestQueryForInlineMessage("guest-1", "ack"),
+    "inline-42",
+  );
+  assert.equal(
+    await runtime.answerGuestQueryForInlineMessage(
+      "guest-2",
+      undefined,
+      { richMessage: { markdown: "hi" } },
+    ),
+    undefined,
+  );
+  await runtime.editGuestInlineMessage("inline-42", {
+    richMessage: { markdown: "**done**" },
+  });
+  await runtime.editGuestInlineMessage("inline-43", { text: "plain" });
+  assert.deepEqual(calls, [
+    {
+      method: "answerGuestQuery",
+      body: {
+        guest_query_id: "guest-1",
+        result: {
+          type: "article",
+          id: "1",
+          title: "Response",
+          input_message_content: { message_text: "ack" },
+        },
+      },
+    },
+    {
+      method: "answerGuestQuery",
+      body: {
+        guest_query_id: "guest-2",
+        result: {
+          type: "article",
+          id: "1",
+          title: "Response",
+          input_message_content: { rich_message: { markdown: "hi" } },
+        },
+      },
+    },
+    {
+      method: "editMessageText",
+      body: {
+        inline_message_id: "inline-42",
+        rich_message: { markdown: "**done**" },
+      },
+    },
+    {
+      method: "editMessageText",
+      body: { inline_message_id: "inline-43", text: "plain" },
+    },
+  ]);
+});
+
 test("Telegram bridge API runtime exposes typed Bot API helpers", async () => {
   const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
   const runtime = createTelegramBridgeApiRuntime({

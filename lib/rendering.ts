@@ -551,8 +551,11 @@ function applyInlineMarkdownStyles(text: string): string {
   result = renderDelimitedInlineStyle(result, "*", (content) => {
     return `<i>${content}</i>`;
   });
-  return renderDelimitedInlineStyle(result, "_", (content) => {
+  result = renderDelimitedInlineStyle(result, "_", (content) => {
     return `<i>${content}</i>`;
+  });
+  return renderDelimitedInlineStyle(result, "||", (content) => {
+    return `<tg-spoiler>${content}</tg-spoiler>`;
   });
 }
 

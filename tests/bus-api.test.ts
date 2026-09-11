@@ -157,6 +157,13 @@ function createDirectRuntime(calls: unknown[]): TelegramBridgeApiRuntime {
     answerGuestQuery: async (guestQueryId, text) => {
       calls.push({ kind: "answer-guest", guestQueryId, text });
     },
+    answerGuestQueryForInlineMessage: async (guestQueryId, text, options) => {
+      calls.push({ kind: "answer-guest-inline", guestQueryId, text, options });
+      return "inline-1";
+    },
+    editGuestInlineMessage: async (inlineMessageId, content) => {
+      calls.push({ kind: "edit-guest-inline", inlineMessageId, content });
+    },
     deleteMessage: async (chatId, messageId) => {
       calls.push({ kind: "delete", chatId, messageId });
     },
@@ -188,6 +195,54 @@ test("Bus-aware API runtime uses direct transport while this instance owns Teleg
   assert.deepEqual(directCalls, [
     { kind: "rich", body: { chat_id: 1, rich_message: { markdown: "hi" } } },
   ]);
+  assert.deepEqual(busCalls, []);
+});
+
+test("Bus-aware API runtime keeps the guest ACK experiment on direct transport", async () => {
+  const directCalls: unknown[] = [];
+  const direct = createTelegramBusAwareApiRuntime({
+    directRuntime: createDirectRuntime(directCalls),
+    ownsDirect: () => true,
+    callFollowerApi: async () => assert.fail("unexpected follower call"),
+  });
+  assert.equal(
+    await direct.answerGuestQueryForInlineMessage("guest-1", "ack"),
+    "inline-1",
+  );
+  await direct.editGuestInlineMessage("inline-1", {
+    richMessage: { markdown: "done" },
+  });
+  assert.deepEqual(directCalls, [
+    {
+      kind: "answer-guest-inline",
+      guestQueryId: "guest-1",
+      text: "ack",
+      options: undefined,
+    },
+    {
+      kind: "edit-guest-inline",
+      inlineMessageId: "inline-1",
+      content: { richMessage: { markdown: "done" } },
+    },
+  ]);
+
+  const busCalls: unknown[] = [];
+  const follower = createTelegramBusAwareApiRuntime({
+    directRuntime: createDirectRuntime([]),
+    ownsDirect: () => false,
+    callFollowerApi: async (method, args) => {
+      busCalls.push({ method, args });
+      return true;
+    },
+  });
+  await assert.rejects(
+    follower.answerGuestQueryForInlineMessage("guest-1", "ack"),
+    /answerGuestQueryForInlineMessage requires direct transport ownership/,
+  );
+  await assert.rejects(
+    follower.editGuestInlineMessage("inline-1", { text: "done" }),
+    /editGuestInlineMessage requires direct transport ownership/,
+  );
   assert.deepEqual(busCalls, []);
 });
 
