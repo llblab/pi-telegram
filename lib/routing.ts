@@ -2095,7 +2095,7 @@ export function createTelegramInboundRouteRuntime<
     }
     await menuCallbackHandler(query, ctx);
   };
-  const promptTurnBuilder = Turns.createTelegramPromptTurnRuntimeBuilder<
+  const preparePromptTurn = Turns.createTelegramPromptTurnRuntimePreparer<
     TMessage,
     TContext
   >({
@@ -2124,7 +2124,8 @@ export function createTelegramInboundRouteRuntime<
       text: "continue",
       caption: undefined,
     } as TMessage;
-    const turn = await promptTurnBuilder([continueMessage], [], ctx);
+    const buildTurn = await preparePromptTurn([continueMessage], ctx);
+    const turn = buildTurn([]);
     const continueTurn = {
       ...turn,
       queueLane: "control" as const,
@@ -2262,15 +2263,19 @@ export function createTelegramInboundRouteRuntime<
   const promptEnqueueController =
     Queue.createTelegramPromptEnqueueController<TMessage, TContext>({
       ...deps.telegramQueueStore,
+      hasPendingDispatch: deps.bridgeRuntime.lifecycle.hasDispatchPending,
       getFoldQueuedPromptsIntoHistory:
         deps.bridgeRuntime.lifecycle.shouldFoldQueuedPromptsIntoHistory,
       setFoldQueuedPromptsIntoHistory:
         deps.bridgeRuntime.lifecycle.setFoldQueuedPromptsIntoHistory,
-      createTurn: async (messages, historyTurns, turnCtx) => {
-        const turn = await promptTurnBuilder(messages, historyTurns, turnCtx);
-        return turn.replyToMessageId > 0
-          ? turn
-          : { ...turn, replyToMessageId: 0 };
+      prepareTurn: async (messages, turnCtx) => {
+        const buildTurn = await preparePromptTurn(messages, turnCtx);
+        return (historyTurns) => {
+          const turn = buildTurn(historyTurns);
+          return turn.replyToMessageId > 0
+            ? turn
+            : { ...turn, replyToMessageId: 0 };
+        };
       },
       updateStatus: deps.updateStatus,
       dispatchNextQueuedTelegramTurn: requestDispatchNextQueuedTelegramTurn,

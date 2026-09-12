@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.45.7: Queue Enqueue Race Hotfix
+
+- `Queue Enqueue`: Asynchronous voice/file preparation no longer restores consumed prompts or overwrites newer queue changes, preventing a settled phantom head from blocking accepted work. Final assembly uses current queue state and allocates order at commit; abort-history folding retains only surviving intended prompts and receipts while preserving a handed-off head until `agent_start`.
+
 ## 0.45.6: Guest Placeholder And Delivery Hotfix
 
 - `Guest Placeholder`: The guest ACK answers with the first bold globe frame (`🌎 Working on it.`) and rotates `🌍`/`🌏` once per second with the dots growing every two seconds. Rotation now completes whole 6-frame cycles and stops only after the 20 s minimum, so a pending answer holds the cycle's final frame (`🌏 Working on it...`) instead of cutting mid-step; a 26 s safety bound stays clear of the ~28 s Telegram flood-control wall, and error backoff and pre-replacement cancellation are unchanged.

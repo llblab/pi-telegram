@@ -13,7 +13,9 @@ import {
   buildTelegramPromptTurn,
   buildTelegramPromptTurnRuntime,
   buildTelegramTurnPrompt,
-  createTelegramPromptTurnRuntimeBuilder,
+  createTelegramPromptTurnRuntimePreparer,
+  type TelegramPromptTurnRuntimeBuilderDeps,
+  type TelegramTurnMessage,
   createTelegramQueuedPromptEditRuntime,
   formatTelegramTurnStatusSummary,
   TELEGRAM_GUEST_TURN_NOTE,
@@ -22,6 +24,20 @@ import {
   updateTelegramPromptTurnText,
 } from "../lib/turns.ts";
 import { getTelegramVoiceReplyMode } from "../lib/voice.ts";
+import type { TelegramMediaMessage } from "../lib/media.ts";
+import type { PendingTelegramTurn } from "../lib/queue.ts";
+
+// Formatting tests finalize immediately; queue integration tests own delayed finalization.
+function createTelegramPromptTurnRuntimeBuilder<
+  TMessage extends TelegramTurnMessage & TelegramMediaMessage,
+  TContext = unknown,
+>(deps: TelegramPromptTurnRuntimeBuilderDeps<TContext>) {
+  const prepareTurn = createTelegramPromptTurnRuntimePreparer<TMessage, TContext>(deps);
+  return async (messages: TMessage[], historyTurns: PendingTelegramTurn[] = [], ctx?: TContext) => {
+    const buildTurn = await prepareTurn(messages, ctx);
+    return buildTurn(historyTurns);
+  };
+}
 
 test("Turn helpers truncate queue summaries predictably", () => {
   assert.equal(

@@ -38,6 +38,7 @@ import {
   canDispatchTelegramTurnState,
   clearTelegramQueueItemsRuntime,
   compareTelegramQueueItems,
+  consumeDispatchedTelegramPrompt,
   createTelegramActiveTurnStore,
   createTelegramAgentEndHook,
   createTelegramAgentLifecycleHooks,
@@ -4625,7 +4626,8 @@ test("Prompt enqueue controller binds runtime ports to context", async () => {
     setFoldQueuedPromptsIntoHistory: (fold) => {
       events.push(`fold:${fold}`);
     },
-    createTurn: async ([message]) => ({
+    hasPendingDispatch: () => false,
+    prepareTurn: async ([message]) => () => ({
       kind: "prompt",
       chatId: 1,
       replyToMessageId: 2,
@@ -4655,6 +4657,72 @@ test("Prompt enqueue controller binds runtime ports to context", async () => {
     "status:ctx",
     "dispatch:ctx",
   ]);
+});
+
+test("Prompt enqueue never restores a head consumed during asynchronous construction", async () => {
+  const prompts = [1, 2, 3, 4].map((id) => createQueueTestPromptTurn({
+    replyToMessageId: id,
+    sourceMessageIds: [id],
+    queueOrder: id,
+    laneOrder: id,
+    admissionReceipts: [createTelegramQueueAdmissionReceipt({
+      queueKind: "prompt", scope: "enqueue-race", sourceUpdateIds: [id],
+    })!],
+  }));
+  let items: TelegramQueueItem[] = prompts.slice(0, 3);
+  const building = Promise.withResolvers<() => PendingTelegramTurn>();
+  const enqueue = enqueueTelegramPromptTurnRuntime([4], {
+    getQueuedItems: () => items,
+    setQueuedItems: (next) => { items = next; },
+    getFoldQueuedPromptsIntoHistory: () => false,
+    setFoldQueuedPromptsIntoHistory: () => {},
+    hasPendingDispatch: () => false,
+    prepareTurn: () => building.promise,
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+  });
+  const consumed = consumeDispatchedTelegramPrompt(items, true);
+  assert.equal(consumed.activeTurn, prompts[0]);
+  items = consumed.remainingItems;
+  building.resolve(() => prompts[3]!);
+  await enqueue;
+  assert.deepEqual(items, prompts.slice(1));
+});
+
+test("Prompt enqueue preserves live mutations and folds only surviving original identities", async () => {
+  for (const fold of [false, true]) {
+    const first = createQueueTestPromptTurn({ queueOrder: 1 });
+    const second = createQueueTestPromptTurn({ queueOrder: 2 });
+    const oldControl = createQueueTestControlItem({ queueOrder: 3 });
+    let items: TelegramQueueItem[] = [oldControl, first, second];
+    const prepared = Promise.withResolvers<(history: PendingTelegramTurn[]) => PendingTelegramTurn>();
+    const enqueue = enqueueTelegramPromptTurnRuntime([6], {
+      getQueuedItems: () => items,
+      setQueuedItems: (next) => { items = next; },
+      getFoldQueuedPromptsIntoHistory: () => fold,
+      setFoldQueuedPromptsIntoHistory: () => {},
+      hasPendingDispatch: () => false,
+      prepareTurn: () => prepared.promise,
+      updateStatus: () => {},
+      dispatchNextQueuedTelegramTurn: () => {},
+    });
+    const edited: PendingTelegramTurn = {
+      ...second, historyText: "edited", queueLane: "priority", laneOrder: 10,
+      priorityEmoji: "👍", reactionSuppressionEmoji: "👎",
+    };
+    const lateControl = createQueueTestControlItem({ queueOrder: 4 });
+    const latePrompt = createQueueTestPromptTurn({ queueOrder: 5 });
+    const nextTurn = createQueueTestPromptTurn({ queueOrder: 6 });
+    // The old head/control left while another input and a reaction updated the queue.
+    items = [lateControl, edited, latePrompt];
+    let folded: PendingTelegramTurn[] = [];
+    prepared.resolve((history) => { folded = history; return nextTurn; });
+    await enqueue;
+    assert.deepEqual(folded, fold ? [edited] : []);
+    assert.deepEqual(items, fold
+      ? [lateControl, latePrompt, nextTurn]
+      : [lateControl, edited, latePrompt, nextTurn]);
+  }
 });
 
 test("Prompt enqueue runtime folds queued prompts into history", async () => {
@@ -4698,7 +4766,8 @@ test("Prompt enqueue runtime folds queued prompts into history", async () => {
       foldHistory = fold;
       events.push(`fold:${fold}`);
     },
-    createTurn: async (_messages, historyTurns) => {
+    hasPendingDispatch: () => false,
+    prepareTurn: async () => (historyTurns) => {
       events.push(
         `history:${historyTurns.map((turn) => turn.historyText).join(",")}`,
       );
@@ -4729,38 +4798,38 @@ test("Prompt enqueue runtime folds queued prompts into history", async () => {
   ]);
 });
 
-test("Prompt enqueue rechecks execution authority after asynchronous turn building", async () => {
-  const queuedItems: TelegramQueueItem[] = [];
-  let committedItems = 0;
-  let current = true;
-  await assert.rejects(
-    enqueueTelegramPromptTurnRuntime(["message"], {
-      getQueuedItems: () => queuedItems,
-      setQueuedItems: () => {
-        committedItems += 1;
-      },
-      getFoldQueuedPromptsIntoHistory: () => false,
+test("Prompt enqueue failures preserve intervening queue changes without finalizing", async () => {
+  for (const failure of ["build", "stale"] as const) {
+    const old = createQueueTestPromptTurn({ queueOrder: 1 });
+    const replacement = createQueueTestPromptTurn({ queueOrder: 2 });
+    let items: TelegramQueueItem[] = [old];
+    let current = true;
+    let publications = 0;
+    const prepared = Promise.withResolvers<(history: PendingTelegramTurn[]) => PendingTelegramTurn>();
+    const enqueue = enqueueTelegramPromptTurnRuntime([3], {
+      getQueuedItems: () => items,
+      setQueuedItems: (next) => { items = next; publications += 1; },
+      getFoldQueuedPromptsIntoHistory: () => true,
       setFoldQueuedPromptsIntoHistory: () => {},
-      createTurn: async () => {
-        current = false;
-        return createQueueTestPromptTurn({
-          replyToMessageId: 1,
-          sourceMessageIds: [1],
-          content: [{ type: "text", text: "stale" }],
-          historyText: "stale",
-          statusSummary: "stale",
-        });
-      },
+      hasPendingDispatch: () => false,
+      prepareTurn: () => prepared.promise,
       assertExecutionCurrent() {
-        if (!current) throw new DOMException("Aborted", "AbortError");
+        if (!current) throw new Error("stale generation");
       },
+      onQueued: () => { publications += 1; },
       updateStatus: () => {},
-      dispatchNextQueuedTelegramTurn: () => {},
-    }),
-    /Abort/u,
-  );
-  assert.equal(committedItems, 0);
-  assert.deepEqual(queuedItems, []);
+      dispatchNextQueuedTelegramTurn: () => { publications += 1; },
+    });
+    items = [replacement];
+    if (failure === "build") prepared.reject(new Error("build failed"));
+    else {
+      current = false;
+      prepared.resolve(() => { throw new Error("must not finalize stale turn"); });
+    }
+    await assert.rejects(enqueue, failure === "build" ? /build failed/ : /stale generation/);
+    assert.deepEqual(items, [replacement]);
+    assert.equal(publications, 0);
+  }
 });
 
 test("Local agent start prevents stale abort-history mode from absorbing old queue", async () => {
@@ -4815,7 +4884,8 @@ test("Local agent start prevents stale abort-history mode from absorbing old que
       foldHistory = fold;
       events.push(`fold:${fold}`);
     },
-    createTurn: async (_messages, historyTurns) => {
+    hasPendingDispatch: () => false,
+    prepareTurn: async () => (historyTurns) => {
       events.push(`history:${historyTurns.length}`);
       return newPrompt;
     },
