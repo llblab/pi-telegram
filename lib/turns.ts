@@ -26,6 +26,7 @@ import {
   createTelegramQueueAdmissionReceipt,
   truncateTelegramQueueSummary,
   type PendingTelegramTurn,
+  type TelegramPreparedPromptTurn,
   type TelegramPromptContent,
   type TelegramQueueAdmissionReceipt,
   type TelegramQueueItem,
@@ -454,17 +455,16 @@ export interface TelegramPromptTurnRuntimeBuilderDeps<
   assertExecutionCurrent?: (message: TelegramTurnMessage) => void;
 }
 
-export function createTelegramPromptTurnRuntimeBuilder<
+export function createTelegramPromptTurnRuntimePreparer<
   TMessage extends TelegramTurnMessage & TelegramMediaMessage,
   TContext = unknown,
 >(
   deps: TelegramPromptTurnRuntimeBuilderDeps<TContext>,
 ): (
   messages: TMessage[],
-  historyTurns?: PendingTelegramTurn[],
   ctx?: TContext,
-) => Promise<PendingTelegramTurn> {
-  return async (messages, historyTurns = [], ctx) => {
+) => Promise<TelegramPreparedPromptTurn> {
+  return async (messages, ctx) => {
     const rawText = extractTelegramMessagesText(messages);
     const firstMessage = messages[0];
     if (firstMessage) deps.assertExecutionCurrent?.(firstMessage);
@@ -577,11 +577,10 @@ export function createTelegramPromptTurnRuntimeBuilder<
       thread: threadLabel,
       "from-thread": firstMessage?.pi_telegram_agent_source_thread,
     });
-    return buildTelegramPromptTurnRuntime({
+    const buildTurn = await prepareTelegramPromptTurn({
       telegramPrefix,
       messages,
-      historyTurns,
-      queueOrder: deps.allocateQueueOrder(),
+      readBinaryFile: readFile,
       rawText: promptRawText,
       sourceContext,
       statusText: processed.rawText,
@@ -602,6 +601,10 @@ export function createTelegramPromptTurnRuntimeBuilder<
       admissionScope: deps.getAdmissionScope?.(),
       admissionJournalBinding: deps.getAdmissionJournalBinding?.(),
     });
+    return (historyTurns) => {
+      if (firstMessage) deps.assertExecutionCurrent?.(firstMessage);
+      return buildTurn(deps.allocateQueueOrder(), historyTurns);
+    };
   };
 }
 
@@ -670,9 +673,29 @@ function collectTelegramTurnAdmissionReceipts(
   return [...receipts.values()];
 }
 
-export async function buildTelegramPromptTurn(
+async function prepareTelegramPromptTurn(
+  options: Omit<BuildTelegramPromptTurnOptions, "queueOrder" | "historyTurns">,
+): Promise<(queueOrder: number, historyTurns: PendingTelegramTurn[]) => PendingTelegramTurn> {
+  const images: TelegramPromptContent[] = [];
+  for (const file of options.files) {
+    if (!file.isImage) continue;
+    const mediaType = file.mimeType || options.inferImageMimeType(file.path);
+    if (!mediaType) continue;
+    const buffer = await options.readBinaryFile(file.path);
+    images.push({
+      type: "image",
+      data: Buffer.from(buffer).toString("base64"),
+      mimeType: mediaType,
+    });
+  }
+  return (queueOrder, historyTurns) =>
+    buildPreparedTelegramPromptTurn({ ...options, queueOrder, historyTurns }, images);
+}
+
+function buildPreparedTelegramPromptTurn(
   options: BuildTelegramPromptTurnOptions,
-): Promise<PendingTelegramTurn> {
+  images: TelegramPromptContent[],
+): PendingTelegramTurn {
   const firstMessage = options.messages[0];
   if (!firstMessage) {
     throw new Error("Missing Telegram message for turn creation");
@@ -703,18 +726,8 @@ export async function buildTelegramPromptTurn(
         ),
       }),
     },
+    ...images,
   ];
-  for (const file of options.files) {
-    if (!file.isImage) continue;
-    const mediaType = file.mimeType || options.inferImageMimeType(file.path);
-    if (!mediaType) continue;
-    const buffer = await options.readBinaryFile(file.path);
-    content.push({
-      type: "image",
-      data: Buffer.from(buffer).toString("base64"),
-      mimeType: mediaType,
-    });
-  }
   if (options.voicePromptContribution?.trim()) {
     const textItem = content.find((c) => c.type === "text") as
       { type: "text"; text: string } | undefined;
@@ -757,6 +770,13 @@ export async function buildTelegramPromptTurn(
     // Voice tagging (used for preview suppression and prompt guidance)
     ...computeVoiceTurnFlags(voiceReplyMode, hasVoiceFile),
   };
+}
+
+export async function buildTelegramPromptTurn(
+  options: BuildTelegramPromptTurnOptions,
+): Promise<PendingTelegramTurn> {
+  const buildTurn = await prepareTelegramPromptTurn(options);
+  return buildTurn(options.queueOrder, options.historyTurns ?? []);
 }
 
 export async function buildTelegramPromptTurnRuntime(

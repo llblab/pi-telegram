@@ -480,6 +480,8 @@ Menu and reaction controls share the same canonical queue state. A menu Keep can
 
 Admission and planning validate lane contracts. Invalid lane/kind pairings fail predictably instead of being silently coerced.
 
+Prompt preparation completes downloads, inbound handlers, and binary image reads before synchronous final assembly and queue commit. Enqueue captures only intended abort-history identities before preparation; afterward it reads the current queue, folds surviving selected prompts using their current text and receipts, allocates the new turn's order, and appends without another asynchronous boundary. The handed-off head remains in place until `agent_start` consumes it, even if preparation finishes first. Concurrent arrivals, removals, and lane/reaction edits remain intact; preparation failure or stale-generation completion leaves intervening queue changes untouched.
+
 Dispatch requires:
 
 - No active Telegram turn.

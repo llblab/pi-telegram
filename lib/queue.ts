@@ -2349,16 +2349,18 @@ export interface TelegramControlQueueController<TContext> {
   ) => void;
 }
 
+export type TelegramPreparedPromptTurn = (
+  historyTurns: PendingTelegramTurn[],
+) => PendingTelegramTurn;
+
 export interface TelegramPromptEnqueueRuntimeDeps<
   TMessage,
   TContext = unknown,
 > extends TelegramQueueStore<TContext> {
+  hasPendingDispatch: () => boolean;
   getFoldQueuedPromptsIntoHistory: () => boolean;
   setFoldQueuedPromptsIntoHistory: (fold: boolean) => void;
-  createTurn: (
-    messages: TMessage[],
-    historyTurns: PendingTelegramTurn[],
-  ) => Promise<PendingTelegramTurn>;
+  prepareTurn: (messages: TMessage[]) => Promise<TelegramPreparedPromptTurn>;
   updateStatus: () => void;
   dispatchNextQueuedTelegramTurn: () => void;
   assertExecutionCurrent?: () => void;
@@ -2369,13 +2371,13 @@ export interface TelegramPromptEnqueueControllerDeps<
   TMessage,
   TContext = unknown,
 > extends TelegramQueueStore<TContext> {
+  hasPendingDispatch: () => boolean;
   getFoldQueuedPromptsIntoHistory: () => boolean;
   setFoldQueuedPromptsIntoHistory: (fold: boolean) => void;
-  createTurn: (
+  prepareTurn: (
     messages: TMessage[],
-    historyTurns: PendingTelegramTurn[],
     ctx: TContext,
-  ) => Promise<PendingTelegramTurn>;
+  ) => Promise<TelegramPreparedPromptTurn>;
   updateStatus: (ctx: TContext) => void;
   dispatchNextQueuedTelegramTurn: (ctx: TContext) => void;
   assertExecutionCurrent?: (messages: TMessage[]) => void;
@@ -2727,17 +2729,25 @@ export async function enqueueTelegramPromptTurnRuntime<
   messages: TMessage[],
   deps: TelegramPromptEnqueueRuntimeDeps<TMessage, TContext>,
 ): Promise<PendingTelegramTurn> {
-  const enqueuePlan = planTelegramPromptEnqueue(
+  deps.assertExecutionCurrent?.();
+  const historyOrders = new Set(planTelegramPromptEnqueue(
     deps.getQueuedItems(),
     deps.getFoldQueuedPromptsIntoHistory(),
-  );
-  deps.assertExecutionCurrent?.();
+  ).historyTurns.map((turn) => turn.queueOrder));
   deps.setFoldQueuedPromptsIntoHistory(false);
-  const turn = await deps.createTurn(messages, enqueuePlan.historyTurns);
+  const buildTurn = await deps.prepareTurn(messages);
   deps.assertExecutionCurrent?.();
-  deps.setQueuedItems(
-    appendTelegramQueueItem(enqueuePlan.remainingItems, turn),
-  );
+  // Preserve the Pi-owned head until agent_start, plus later arrivals and current edits/reactions.
+  const pendingDispatch = deps.hasPendingDispatch();
+  const historyTurns: PendingTelegramTurn[] = [];
+  const remainingItems = deps.getQueuedItems().filter((item, index) => {
+    if ((pendingDispatch && index === 0) || !isPendingTelegramTurn(item) ||
+        !historyOrders.has(item.queueOrder)) return true;
+    historyTurns.push(item);
+    return false;
+  });
+  const turn = buildTurn(historyTurns);
+  deps.setQueuedItems(appendTelegramQueueItem(remainingItems, turn));
   deps.onQueued?.(turn);
   deps.updateStatus();
   deps.dispatchNextQueuedTelegramTurn();
@@ -2754,8 +2764,7 @@ export function createTelegramPromptEnqueueController<
     enqueue: (messages, ctx, onQueued) =>
       enqueueTelegramPromptTurnRuntime(messages, {
         ...deps,
-        createTurn: (nextMessages, historyTurns) =>
-          deps.createTurn(nextMessages, historyTurns, ctx),
+        prepareTurn: (nextMessages) => deps.prepareTurn(nextMessages, ctx),
         updateStatus: () => deps.updateStatus(ctx),
         dispatchNextQueuedTelegramTurn: () =>
           deps.dispatchNextQueuedTelegramTurn(ctx),

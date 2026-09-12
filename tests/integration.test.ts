@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import { registerTelegramActivityHandler } from "../api/activity.ts";
 import { createTelegramActivityVerbosityRuntime } from "../lib/activity-verbosity.ts";
 import * as AgentMessages from "../lib/agent-messages.ts";
+import * as Bindings from "../lib/bindings.ts";
 import * as BusApi from "../lib/bus-api.ts";
 import * as BusFollower from "../lib/bus-follower.ts";
 import * as BusLeader from "../lib/bus-leader.ts";
@@ -31,6 +32,7 @@ import * as Bus from "../lib/bus.ts";
 import * as Delivery from "../lib/delivery.ts";
 import * as Routing from "../lib/routing.ts";
 import * as Threads from "../lib/threads.ts";
+import * as Turns from "../lib/turns.ts";
 import * as Journal from "../lib/journal.ts";
 import * as Locks from "../lib/locks.ts";
 import * as Queue from "../lib/queue.ts";
@@ -1596,6 +1598,185 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     await telegramConfig.restore();
   }
 });
+
+async function assertAsynchronousEnqueueProgress(foldHistory: boolean, deferAgentStart = false): Promise<void> {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-enqueue-race-"));
+  const owner = {
+    instanceId: `enqueue-${process.pid}`, processId: process.pid,
+    processBirthId: Bus.getTelegramProcessBirthIdentity(process.pid, "enqueue"),
+    sessionGeneration: 1,
+  };
+  const journal = Journal.createTelegramUpdateJournalStore({
+    path: join(dir, "inbox.json"),
+    botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "123:enqueue-race" }),
+    queueRuntimeIdentity: owner,
+  });
+  const store = Queue.createTelegramQueueStore<string>();
+  const activeTurn = Queue.createTelegramActiveTurnStore();
+  const entered = Promise.withResolvers<void>();
+  const processing = Promise.withResolvers<void>();
+  const callbacks: Array<() => void> = [];
+  const deferred = Queue.createTelegramDeferredQueueDispatchRuntime<string>({
+    setTimer(callback) {
+      callbacks.push(callback);
+      return { unref() {} } as ReturnType<typeof setTimeout>;
+    },
+    clearTimer: () => {},
+  });
+  deferred.bind("ctx");
+  const flushDispatch = () => { for (const callback of callbacks.splice(0)) callback(); };
+  let order = 0;
+  let idle = false;
+  let pending = false;
+  let compacting = false;
+  let piPending = false;
+  const sent: number[] = [];
+  const errors: string[] = [];
+  const message = (id: number) => ({
+    message_id: id, chat: { id: 7 }, pi_telegram_source_update_id: id,
+    ...(id === 4
+      ? { voice: { file_id: "voice-4", file_unique_id: "voice-4", duration: 1 } }
+      : { text: `prompt-${id}` }),
+  });
+  const prepareTurn = Turns.createTelegramPromptTurnRuntimePreparer<ReturnType<typeof message>, string>({
+    allocateQueueOrder: () => ++order,
+    getAdmissionScope: () => "enqueue-race",
+    getAdmissionJournalBinding: () => "enqueue-race",
+    downloadFile: async () => join(dir, "voice.ogg"),
+    async processAttachments(files, rawText) {
+      if (files.length > 0) {
+        entered.resolve();
+        await processing.promise;
+        rawText = "prompt-4";
+      }
+      return { rawText, promptFiles: files };
+    },
+  });
+  let folding = false;
+  const enqueue = Queue.createTelegramPromptEnqueueController<ReturnType<typeof message>, string>({
+    ...store, prepareTurn,
+    hasPendingDispatch: () => pending,
+    getFoldQueuedPromptsIntoHistory: () => folding,
+    setFoldQueuedPromptsIntoHistory: (value) => { folding = value; },
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: (ctx) => binding.dispatchNext(ctx),
+  });
+  const worker = Updates.createTelegramUpdateWorkerRuntime<string>({
+    journal, hasAuthority: () => true,
+    getQueueOwnerIdentity: () => owner,
+    getJournalBindingKey: () => "enqueue-race",
+    async executeUpdate(update, ctx) {
+      const turn = await enqueue.enqueue([update.message as ReturnType<typeof message>], ctx);
+      const receipt = turn.admissionReceipts!.find((entry) => entry.sourceUpdateIds.includes(update.update_id))!;
+      return { kind: "queued", ...receipt };
+    },
+    onQueueReceiptCommitted: () => deferred.request(binding.dispatchNext),
+  });
+  const settlement = Updates.createTelegramQueueAdmissionSettlementRuntime(worker);
+  const startAgentTurn = () => Queue.handleTelegramAgentStartRuntime({
+    queuedItems: store.getQueuedItems(), hasPendingDispatch: pending, hasActiveTurn: activeTurn.has(),
+    setQueuedItems: store.setQueuedItems, setActiveTurn: activeTurn.set,
+    clearDispatchPending: () => { pending = false; },
+    resetToolExecutions: () => {}, resetPendingModelSwitch: () => {},
+    setFoldQueuedPromptsIntoHistory: () => {}, createPreviewState: () => {},
+    startTypingLoop: () => {}, updateStatus: () => {},
+  });
+  const binding = Bindings.createTelegramQueueBindingRuntime({
+    store, activeTurn, deferredDispatch: deferred,
+    queue: { allocateItemOrder: () => ++order },
+    lifecycle: { isCompactionInProgress: () => compacting, hasDispatchPending: () => pending },
+    admission: { getSettlement: () => settlement, hasPendingQueueMutationForItem: () => false },
+    transportStamp: { isActive: () => true },
+    isIdle: () => idle, hasPendingMessages: () => piPending,
+    updateStatus: () => {}, sendTextReply: async () => undefined,
+    promptDispatch: {
+      startTypingLoop: () => {},
+      onPromptDispatchStart: () => { pending = true; },
+      onPromptDispatchFailure: (_ctx, error) => { errors.push(error); },
+    },
+    sendUserMessage() {
+      const head = store.getQueuedItems()[0]!;
+      assert.equal(settlement.isItemReady(head), false);
+      assert.equal(journal.read().entries.some((entry) => entry.updateId === head.replyToMessageId), false);
+      sent.push(head.replyToMessageId);
+      idle = false;
+      if (!deferAgentStart || sent.length > 1) startAgentTurn();
+    },
+    recordRuntimeEvent: (_category, error) => { errors.push(String(error)); },
+  });
+  try {
+    binding.watchdog.start("ctx");
+    journal.appendBatch([1, 2, 3].map((id) => ({ update_id: id, message: message(id) })));
+    worker.start("ctx");
+    await worker.waitForDrain();
+    flushDispatch();
+    assert.deepEqual(sent, []);
+    folding = foldHistory;
+    journal.appendBatch([{ update_id: 4, message: message(4) }]);
+    worker.signal();
+    await entered.promise;
+    idle = true;
+    binding.watchdog.poke();
+    assert.deepEqual(sent, [1]);
+    processing.resolve();
+    await worker.waitForDrain();
+    flushDispatch();
+    const remaining = foldHistory ? [4] : [2, 3, 4];
+    if (deferAgentStart) {
+      assert.equal(pending, true);
+      assert.deepEqual(store.getQueuedItems().map((item) => item.replyToMessageId), [1, ...remaining]);
+      startAgentTurn();
+      assert.equal(activeTurn.getReplyToMessageId(), 1);
+    }
+    assert.deepEqual(store.getQueuedItems().map((item) => item.replyToMessageId), remaining);
+    assert.deepEqual(store.getQueuedItems().flatMap((item) =>
+      item.admissionReceipts!.flatMap((receipt) => receipt.sourceUpdateIds)), [2, 3, 4]);
+    if (foldHistory) {
+      const text = getRuntimeHarnessTextBlock((store.getQueuedItems()[0] as Queue.PendingTelegramTurn).content).text!;
+      assert.match(text, /1\. prompt-2\n\n2\. prompt-3/);
+      assert.doesNotMatch(text, /prompt-1/);
+    }
+    assert.deepEqual(journal.read().entries.map((entry) => entry.updateId), [2, 3, 4]);
+    assert.equal(store.getQueuedItems().every(settlement.isItemReady), true);
+    assert.deepEqual(sent, [1]);
+    activeTurn.clear();
+    idle = true;
+    compacting = true;
+    deferred.request(binding.dispatchNext);
+    flushDispatch();
+    compacting = false;
+    piPending = true;
+    binding.watchdog.poke();
+    assert.deepEqual(sent, [1]);
+    piPending = false;
+    for (const id of remaining) {
+      activeTurn.clear();
+      idle = true;
+      if (id === 3) binding.watchdog.poke();
+      else { deferred.request(binding.dispatchNext); flushDispatch(); }
+      assert.equal(sent.at(-1), id);
+      await worker.waitForDrain();
+    }
+    binding.watchdog.poke();
+    assert.deepEqual(sent, [1, ...remaining]);
+    assert.deepEqual(store.getQueuedItems(), []);
+    assert.deepEqual(journal.read().entries, []);
+    assert.deepEqual(errors, []);
+  } finally {
+    processing.resolve();
+    binding.watchdog.stop();
+    deferred.unbind();
+    await worker.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("Asynchronous enqueue preserves receipt-owned FIFO progress across agent start and settlement", () =>
+  assertAsynchronousEnqueueProgress(false));
+test("Asynchronous enqueue folds only surviving history and committed receipts", () =>
+  assertAsynchronousEnqueueProgress(true));
+test("Asynchronous enqueue keeps the handed-off head until delayed agent_start", () =>
+  assertAsynchronousEnqueueProgress(true, true));
 
 test("Durable worker keeps a poison source while draining independent journal tail", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-poison-tail-"));
