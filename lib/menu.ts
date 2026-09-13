@@ -32,6 +32,7 @@ import {
   type ScopedTelegramModel,
   type ThinkingLevel,
 } from "./model.ts";
+import type { TelegramInputRichMessage } from "./telegram-api.ts";
 import {
   handleTelegramSectionCallback,
   handleTelegramSectionOpen,
@@ -223,6 +224,11 @@ export interface TelegramMenuCallbackRuntimeDeps<
     text: string,
     mode: "markdown" | "html" | "plain",
     replyMarkup: TelegramReplyMarkup,
+    options?: { target?: { chatId: number; threadId?: number } },
+  ) => Promise<number | undefined>;
+  sendSectionRichMessage?: (
+    chatId: number,
+    message: TelegramInputRichMessage,
     options?: { target?: { chatId: number; threadId?: number } },
   ) => Promise<number | undefined>;
   enqueueSectionPrompt?: (
@@ -478,6 +484,11 @@ export interface TelegramMenuCallbackRuntimeAdapterDeps<
     replyMarkup: TelegramReplyMarkup,
     options?: { target?: { chatId: number; threadId?: number } },
   ) => Promise<number | undefined>;
+  sendSectionRichMessage?: (
+    chatId: number,
+    message: TelegramInputRichMessage,
+    options?: { target?: { chatId: number; threadId?: number } },
+  ) => Promise<number | undefined>;
   enqueueSectionPrompt?: (
     prompt: string,
     ctx: TContext,
@@ -527,6 +538,7 @@ export function createTelegramMenuCallbackHandlerForContext<
     sectionRegistry: deps.sectionRegistry,
     editInteractiveMessage: deps.editInteractiveMessage,
     sendInteractiveMessage: deps.sendInteractiveMessage,
+    sendSectionRichMessage: deps.sendSectionRichMessage,
     enqueueSectionPrompt: deps.enqueueSectionPrompt,
     deleteMessage: deps.deleteMessage,
   });
@@ -591,6 +603,9 @@ export async function handleTelegramMenuCallbackRuntime<
                 deps.editInteractiveMessage ?? (async () => {}),
               sendInteractiveMessage:
                 deps.sendInteractiveMessage ?? (async () => undefined),
+              sendRichMessage: deps.sendSectionRichMessage ?? (async () => {
+                throw new Error("Rich Message delivery is unavailable");
+              }),
               enqueuePrompt: deps.enqueueSectionPrompt
                 ? (prompt: string) =>
                     deps.enqueueSectionPrompt!(prompt, ctx, target, query)
@@ -614,6 +629,9 @@ export async function handleTelegramMenuCallbackRuntime<
                   deps.editInteractiveMessage ?? (async () => {}),
                 sendInteractiveMessage:
                   deps.sendInteractiveMessage ?? (async () => undefined),
+                sendRichMessage: deps.sendSectionRichMessage ?? (async () => {
+                  throw new Error("Rich Message delivery is unavailable");
+                }),
                 enqueuePrompt: deps.enqueueSectionPrompt
                   ? (prompt: string) =>
                       deps.enqueueSectionPrompt!(prompt, ctx, target, query)
@@ -639,6 +657,9 @@ export async function handleTelegramMenuCallbackRuntime<
                 deps.editInteractiveMessage ?? (async () => {}),
               sendInteractiveMessage:
                 deps.sendInteractiveMessage ?? (async () => undefined),
+              sendRichMessage: deps.sendSectionRichMessage ?? (async () => {
+                throw new Error("Rich Message delivery is unavailable");
+              }),
               enqueuePrompt: deps.enqueueSectionPrompt
                 ? (prompt: string) =>
                     deps.enqueueSectionPrompt!(prompt, ctx, target, query)

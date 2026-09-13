@@ -3055,6 +3055,7 @@ export interface TelegramQueueDispatchControllerDeps<
 
 export interface TelegramQueueDispatchController<TContext = unknown> {
   dispatchNext: (ctx: TContext) => void;
+  requestNextDispatchAnnouncement: () => void;
 }
 
 export function executeTelegramQueueDispatchPlan<TContext = unknown>(
@@ -3123,7 +3124,13 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
   deps: TelegramQueueDispatchControllerDeps<TContext>,
 ): TelegramQueueDispatchController<TContext> {
   let controlDispatchPending = false;
+  let nextDispatchAnnouncementRequested = false;
+  let nextDispatchAnnouncementAnchor: TelegramQueueItem<TContext> | undefined;
   const controller: TelegramQueueDispatchController<TContext> = {
+    requestNextDispatchAnnouncement: () => {
+      nextDispatchAnnouncementRequested = true;
+      nextDispatchAnnouncementAnchor = undefined;
+    },
     dispatchNext: (ctx) => {
       if (deps.hasDispatchContext && !deps.hasDispatchContext()) return;
       if (controlDispatchPending) {
@@ -3151,6 +3158,10 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
       }
       if (droppedInactiveItemCount > 0) {
         deps.setQueuedItems(retainedItems);
+        if (retainedItems.length === 0) {
+          nextDispatchAnnouncementRequested = false;
+          nextDispatchAnnouncementAnchor = undefined;
+        }
         deps.recordRuntimeEvent?.(
           "dispatch",
           new Error(
@@ -3209,6 +3220,21 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
       }
       const dispatchableItems = activeItems.slice(nextActiveIndex);
       const nextItem = dispatchableItems[0];
+      if (nextDispatchAnnouncementRequested) {
+        if (nextDispatchAnnouncementAnchor) {
+          const anchorRetained = retainedItems.includes(nextDispatchAnnouncementAnchor);
+          const anchorTransportActive =
+            deps.isQueueItemTransportActive?.(nextDispatchAnnouncementAnchor) !== false;
+          if (!anchorRetained || !anchorTransportActive) {
+            nextDispatchAnnouncementRequested = false;
+            nextDispatchAnnouncementAnchor = undefined;
+          }
+        } else if (nextItem) {
+          nextDispatchAnnouncementAnchor = nextItem;
+        } else if (retainedItems.length === 0) {
+          nextDispatchAnnouncementRequested = false;
+        }
+      }
       if (
         nextItem &&
         deps.hasPendingInboundQueueMutationForItem?.(nextItem)
@@ -3224,17 +3250,49 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
         deps.updateStatus(ctx);
         return;
       }
+      const dispatchBasisItems = deps.getQueuedItems();
       const dispatchPlan = planNextTelegramQueueAction(
         dispatchableItems,
         canDispatch,
       );
-      if (dispatchPlan.kind !== "none") {
+      const commitDispatchPlan = (): boolean => {
+        if (dispatchPlan.kind === "none") return true;
+        const currentItems = deps.getQueuedItems();
+        if (dispatchPlan.kind === "prompt") {
+          const queueDrifted =
+            currentItems.length !== dispatchBasisItems.length ||
+            currentItems.some((item, index) => item !== dispatchBasisItems[index]);
+          const dispatchEligibilityDrifted =
+            !deps.canDispatch(ctx) ||
+            deps.hasPendingInboundQueueMutationForItem?.(dispatchPlan.item) === true ||
+            (deps.isQueueItemAdmissionReady?.(dispatchPlan.item) === false) ||
+            (deps.isQueueItemTransportActive?.(dispatchPlan.item) === false);
+          if (queueDrifted || dispatchEligibilityDrifted) {
+            const selectedItemRetained = currentItems.includes(dispatchPlan.item);
+            const selectedTransportActive =
+              deps.isQueueItemTransportActive?.(dispatchPlan.item) !== false;
+            nextDispatchAnnouncementRequested =
+              selectedItemRetained && selectedTransportActive;
+            nextDispatchAnnouncementAnchor = nextDispatchAnnouncementRequested
+              ? dispatchPlan.item
+              : undefined;
+            deps.updateStatus(ctx);
+            if (nextDispatchAnnouncementRequested && queueDrifted && !dispatchEligibilityDrifted) {
+              controller.dispatchNext(ctx);
+            }
+            return false;
+          }
+        }
         deps.setQueuedItems([
           ...dispatchPlan.remainingItems,
           ...protectedInactiveItems,
         ]);
-      }
-      executeTelegramQueueDispatchPlan(dispatchPlan, {
+        nextDispatchAnnouncementAnchor = undefined;
+        return true;
+      };
+      const executePlan = (): void => {
+        if (!commitDispatchPlan()) return;
+        executeTelegramQueueDispatchPlan(dispatchPlan, {
         executeControlItem: (item) => {
           controlDispatchPending = true;
           const dispatchGeneration = deps.getDispatchGeneration?.();
@@ -3280,6 +3338,32 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
           deps.updateStatus(ctx);
         },
       });
+      };
+      if (dispatchPlan.kind === "prompt" && nextDispatchAnnouncementRequested) {
+        nextDispatchAnnouncementRequested = false;
+        controlDispatchPending = true;
+        const dispatchGeneration = deps.getDispatchGeneration?.();
+        deps.updateStatus(ctx);
+        void deps.sendTextReply(
+          dispatchPlan.item.chatId,
+          dispatchPlan.item.replyToMessageId,
+          "<b>⏩ Dispatching next queued turn.</b>",
+          { target: dispatchPlan.item.target },
+        ).catch((error) => {
+          deps.recordRuntimeEvent?.("dispatch", error, { phase: "next-announcement" });
+        }).finally(() => {
+          controlDispatchPending = false;
+          if (deps.hasDispatchContext && !deps.hasDispatchContext()) return;
+          if (
+            dispatchGeneration !== undefined &&
+            deps.isDispatchGenerationActive &&
+            !deps.isDispatchGenerationActive(dispatchGeneration)
+          ) return;
+          executePlan();
+        });
+        return;
+      }
+      executePlan();
     },
   };
   return controller;

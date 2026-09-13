@@ -50,6 +50,7 @@ type TelegramAgentMessageRouter = NonNullable<
 export interface TelegramQueueBindingRuntime<TContext> {
   mutation: Queue.TelegramQueueMutationController<TContext>;
   dispatchNext: (ctx: TContext) => void;
+  requestNextDispatchAnnouncement: () => void;
   watchdog: Queue.TelegramQueueDispatchWatchdogRuntime<TContext>;
 }
 
@@ -122,7 +123,7 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     updateStatus: deps.updateStatus,
     recordRuntimeEvent: deps.recordRuntimeEvent,
   });
-  const dispatchNext = Queue.createTelegramQueueDispatchRuntime({
+  const dispatch = Queue.createTelegramQueueDispatchRuntime({
     ...deps.store,
     isCompactionInProgress: deps.lifecycle.isCompactionInProgress,
     hasActiveTurn: deps.activeTurn.has,
@@ -162,13 +163,14 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     recordRuntimeEvent: deps.recordRuntimeEvent,
     ...deps.promptDispatch,
     sendUserMessage: deps.sendUserMessage,
-  }).dispatchNext;
+  });
   return {
     mutation,
-    dispatchNext,
+    dispatchNext: dispatch.dispatchNext,
+    requestNextDispatchAnnouncement: dispatch.requestNextDispatchAnnouncement,
     watchdog: Queue.createTelegramQueueDispatchWatchdogRuntime({
       hasQueuedItems: deps.store.hasQueuedItems,
-      dispatchNextQueuedTelegramTurn: dispatchNext,
+      dispatchNextQueuedTelegramTurn: dispatch.dispatchNext,
       recordRuntimeEvent: deps.recordRuntimeEvent,
     }),
   };

@@ -629,8 +629,12 @@ export default function (pi: Pi.ExtensionAPI) {
     getAssistantRenderingMode: configControls.getAssistantRenderingMode,
     editMessage: editTelegramMessageText,
   });
-  const { replyTransport, editInteractiveMessage, sendInteractiveMessage } =
-    replyRuntime;
+  const {
+    replyTransport,
+    editInteractiveMessage,
+    sendInteractiveMessage,
+    sendSectionRichMessage,
+  } = replyRuntime;
   const deliveryTargetPolicyRuntime =
     Delivery.createTelegramDeliveryTargetPolicyRuntime({
       ownsDirect: lockRuntime.owns,
@@ -744,6 +748,7 @@ export default function (pi: Pi.ExtensionAPI) {
   const {
     mutation: queueMutationRuntime,
     dispatchNext: dispatchNextQueuedTelegramTurn,
+    requestNextDispatchAnnouncement,
     watchdog: queueDispatchWatchdogRuntime,
   } = Bindings.createTelegramQueueBindingRuntime({
     store: telegramQueueStore,
@@ -964,6 +969,7 @@ export default function (pi: Pi.ExtensionAPI) {
     openSettingsMenu: settingsMenuRuntime.openSettingsMenu,
     settingsMenuCallbackHandler: settingsMenuRuntime.handleCallbackQuery,
     sectionRegistry,
+    sendSectionRichMessage,
     buttonActionStore,
     invokeBoundButtonAction: invokeGenerativeAppBoundButtonAction,
     inboundHandlerRuntime,
@@ -972,6 +978,7 @@ export default function (pi: Pi.ExtensionAPI) {
     updateStatus,
     isContextActive: telegramSessionContextStore.isCurrent,
     dispatchNextQueuedTelegramTurn,
+    requestNextDispatchAnnouncement,
     requestDeferredDispatchNextQueuedTelegramTurn:
       deferredQueueDispatchRuntime.request,
     hasDeferredDispatchContext: deferredQueueDispatchRuntime.isBound,

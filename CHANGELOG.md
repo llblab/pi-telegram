@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.45.9: Rich sections and exact queue continuation
+
+- `Extension Sections`: Public section contexts now expose `openRich(message)` for one standalone Telegram Native Rich Message routed to the exact callback chat/thread with normal message-ownership recording and scoped callback diagnostics. Companion extensions can reuse native `details`/`pre` disclosure without raw bot access; `👁` is the canonical read-only inspection marker.
+- `/next` ordering: Active interruption settles before continuation is announced. The notice is bound to the exact selected queued item and revalidates queue identity, readiness, admission, pending mutations, and transport authority before dispatch; removal, clear, reordering, concurrent append, or transport loss cannot transfer stale intent to unrelated work.
+
 ## 0.45.8: Follower Forwarding Hotfix
 
 - `Follower Forwarding`: Message-ownership lookups now project the matching live registration's protocol identity before forwarding. Voice/message and edit retries, message-only callbacks, and reactions no longer stall on an incomplete cached owner after a rejection or re-registration. Exact generation, binding, protocol, and durable-receipt checks remain enforced.

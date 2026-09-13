@@ -37,6 +37,7 @@ function stubDeps(
     answerCallbackQuery: async () => {},
     editInteractiveMessage: async () => {},
     sendInteractiveMessage: async () => undefined,
+    sendRichMessage: async () => undefined,
     enqueuePrompt: async () => {},
     deleteMessage: async () => {},
     ...overrides,
@@ -600,6 +601,38 @@ test("handleTelegramSectionSettingsOpen handles section without settings gracefu
   );
   assert.equal(handled, true);
   assert.ok(answeredText.includes("no longer available"));
+});
+
+test("Section callback openRich sends one native message to the exact target", async () => {
+  const registry = createTelegramExtensionSectionRegistry();
+  const richMessage = {
+    blocks: [{ type: "details" as const, summary: "Effective", blocks: [{ type: "pre" as const, text: "{}", language: "json" }] }],
+    skip_entity_detection: true,
+  };
+  registry.register(stubSection("@test/state", "State", {
+    handleCallback: async (ctx) => {
+      await ctx.openRich(richMessage);
+      return "handled" as const;
+    },
+  }));
+  const sent: unknown[] = [];
+  await handleTelegramSectionCallback(
+    registry,
+    "0",
+    "inspect",
+    "effective",
+    42,
+    9,
+    "query",
+    stubDeps({
+      target: { chatId: 42, threadId: 7 },
+      sendRichMessage: async (...args) => {
+        sent.push(args);
+        return 10;
+      },
+    }),
+  );
+  assert.deepEqual(sent, [[42, richMessage, { target: { chatId: 42, threadId: 7 } }]]);
 });
 
 // --- Integration: menu-status rows ---

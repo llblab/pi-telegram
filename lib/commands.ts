@@ -1147,6 +1147,7 @@ export interface TelegramCommandRuntimeDeps<
   updateStatus: (ctx: TContext) => void;
   isContextActive?: (ctx: TContext) => boolean;
   dispatchNextQueuedTelegramTurn: (ctx: TContext) => void;
+  requestNextDispatchAnnouncement?: () => void;
   requestDeferredDispatchNextQueuedTelegramTurn?: (
     dispatch: (ctx: TContext) => void,
   ) => void;
@@ -1416,6 +1417,7 @@ export async function handleTelegramNextCommand(deps: {
   clearPendingModelSwitch: () => void;
   abortCurrentTurn: () => void;
   dispatchNextQueuedTurn: () => void;
+  requestNextDispatchAnnouncement?: () => void;
   clearFoldForDispatch: () => void;
   updateStatus: () => void;
   sendTextReply: (
@@ -1435,19 +1437,10 @@ export async function handleTelegramNextCommand(deps: {
     return;
   }
   if (!deps.isIdle() && deps.hasAbortHandler()) {
-    const activeTurnReply = deps.getActiveTurnReply?.();
     deps.clearFoldForDispatch();
+    deps.requestNextDispatchAnnouncement?.();
     deps.abortCurrentTurn();
     deps.updateStatus();
-    const notice = formatTelegramInformationHeading(
-      "⏩",
-      "Dispatching next queued turn.",
-    );
-    if (activeTurnReply) {
-      await activeTurnReply(notice, { parseMode: "HTML" });
-    } else {
-      await deps.sendTextReply(notice, { parseMode: "HTML" });
-    }
     return;
   }
   if (!deps.isIdle()) {
@@ -1460,12 +1453,9 @@ export async function handleTelegramNextCommand(deps: {
     );
     return;
   }
+  deps.requestNextDispatchAnnouncement?.();
   deps.dispatchNextQueuedTurn();
   deps.updateStatus();
-  await deps.sendTextReply(
-    formatTelegramInformationHeading("▶️", "Dispatching next queued turn."),
-    { parseMode: "HTML" },
-  );
 }
 
 export async function handleTelegramContinueCommand<TMessage, TContext>(
@@ -2029,6 +2019,7 @@ async function handleTelegramCommandRuntime<
           abortCurrentTurn: deps.abortCurrentTurn,
           dispatchNextQueuedTurn: () =>
             deps.dispatchNextQueuedTelegramTurn(commandCtx),
+          requestNextDispatchAnnouncement: deps.requestNextDispatchAnnouncement,
           clearFoldForDispatch: () =>
             deps.setFoldQueuedPromptsIntoHistory(false),
           updateStatus: updateStatusFor(commandCtx),
