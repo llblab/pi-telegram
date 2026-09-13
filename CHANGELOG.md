@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.45.8: Follower Forwarding Hotfix
+
+- `Follower Forwarding`: Message-ownership lookups now project the matching live registration's protocol identity before forwarding. Voice/message and edit retries, message-only callbacks, and reactions no longer stall on an incomplete cached owner after a rejection or re-registration. Exact generation, binding, protocol, and durable-receipt checks remain enforced.
+
 ## 0.45.7: Queue Enqueue Race Hotfix
 
 - `Queue Enqueue`: Asynchronous voice/file preparation no longer restores consumed prompts or overwrites newer queue changes, preventing a settled phantom head from blocking accepted work. Final assembly uses current queue state and allocates order at commit; abort-history folding retains only surviving intended prompts and receipts while preserving a handed-off head until `agent_start`.

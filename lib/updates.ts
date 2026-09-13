@@ -14,6 +14,7 @@ import {
 import type {
   TelegramBusEnvelope,
   TelegramBusFollowerView,
+  TelegramBusForwardOwnership,
   TelegramBusForeignUpdateSettlement,
   TelegramProcessLiveness,
 } from "./bus.ts";
@@ -345,22 +346,14 @@ export function getAuthorizedTelegramGuestMessage(
 
 // --- Flow ---
 
-export interface TelegramMessageOwnershipView {
-  instanceId: string;
-  ownerGeneration?: string;
-  recipientBindingKey?: string;
-}
+export type TelegramMessageOwnershipView = TelegramBusForwardOwnership;
 
 export type TelegramMessageOwnershipLookup = (
   chatId: number,
   messageId: number,
 ) => TelegramMessageOwnershipView | undefined;
 
-export interface TelegramTargetOwnershipView {
-  instanceId: string;
-  ownerGeneration?: string;
-  recipientBindingKey?: string;
-}
+export type TelegramTargetOwnershipView = TelegramBusForwardOwnership;
 
 export type TelegramTargetOwnershipLookup = (
   target: TelegramTarget,

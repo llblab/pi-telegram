@@ -403,6 +403,14 @@ test("Extension composition stays free of local runtime adapters", () => {
   );
 });
 
+test("Inbound composition projects live forwarding authority instead of raw message-cache records", () => {
+  const source = stripSourceTextAndComments(
+    readFileSync(join(PROJECT_ROOT, "lib/extension.ts"), "utf8"),
+  );
+  assert.match(source, /getMessageOwnership:\s*messageOwnershipRuntime\.getForwardOwnership/u);
+  assert.doesNotMatch(source, /getMessageOwnership:\s*messageOwnershipRuntime\.store\.get/u);
+});
+
 test("Visible thread identity never falls back directly to bare slot labels", () => {
   const forbiddenPatterns: Array<[RegExp, string]> = [
     [/\bthreadName\s*\?\?\s*slot\b/g, "threadName ?? slot"],
