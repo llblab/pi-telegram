@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.45.10: Rich headings and state-scope markers
+
+- `Rich section headings`: Public Rich Message block types now include native headings, allowing companion sections to place a fixed title above sibling disclosures instead of wrapping the entire view in another collapsible block.
+- `State-scope markers`: Registers 🌐 Global, 📂 CWD, 💬 Session, and 🧬 Effective as canonical state-scope semantics for chooser buttons and selected-scope headings, with composition flowing Global → CWD → Session → Effective.
+
 ## 0.45.9: Rich sections and exact queue continuation
 
 - `Extension Sections`: Public section contexts now expose `openRich(message)` for one standalone Telegram Native Rich Message routed to the exact callback chat/thread with normal message-ownership recording and scoped callback diagnostics. Companion extensions can reuse native `details`/`pre` disclosure without raw bot access; `👁` is the canonical read-only inspection marker.
