@@ -35,6 +35,7 @@ import * as Threads from "../lib/threads.ts";
 import * as Turns from "../lib/turns.ts";
 import * as Journal from "../lib/journal.ts";
 import * as Locks from "../lib/locks.ts";
+import * as Ownership from "../lib/ownership.ts";
 import * as Queue from "../lib/queue.ts";
 import * as Polling from "../lib/polling.ts";
 import * as Sync from "../lib/sync.ts";
@@ -422,6 +423,189 @@ test("Cross-instance agent turns route in both leader and follower directions", 
     "local:42:Birch",
   ]);
 });
+
+for (const scenario of [
+  { carrier: "message", cached: false, replace: true, threaded: true },
+  { carrier: "edited_message", cached: false, replace: false, threaded: true },
+  { carrier: "callback_query", cached: true, replace: false, threaded: true },
+  { carrier: "callback_query", cached: true, replace: true, threaded: false },
+  { carrier: "message_reaction", cached: true, replace: true, threaded: false },
+] as const) {
+  test(`Cached forwarding retries ${scenario.carrier} (${scenario.threaded ? "threaded" : "message-only"}) through durable admission`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-telegram-cached-forward-"));
+    const socketPath = join(dir, "receiver.sock");
+    const target = { chatId: 7, threadId: 11 };
+    const registry = Bus.createTelegramBusFollowerRegistry();
+    const registration = {
+      instanceId: "follower",
+      profileKey: "manual:recipient",
+      registrationGeneration: "g1",
+      connectedAtMs: 1,
+      target,
+      protocol: Bus.createTelegramBusProtocolIdentity({
+        runtimeBuild: "fixture",
+        capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION],
+      }),
+    };
+    registry.register(registration);
+    const ownership = Ownership.createTelegramBusMessageOwnershipRuntime({
+      instanceId: "leader",
+      getProfileKey: () => "default",
+      listFollowers: registry.list,
+    });
+    if (scenario.cached) ownership.recordFollower({
+      chatId: target.chatId, messageId: 9, target, follower: registration,
+    });
+    const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({
+      botToken: "123:cached-forward-fixture",
+    });
+    let now = 1_000;
+    const leaderJournal = Journal.createTelegramUpdateJournalStore({
+      path: join(dir, "leader.json"), botIdentity, getNowMs: () => now,
+    });
+    const followerJournal = Journal.createTelegramUpdateJournalStore({
+      path: join(dir, "follower.json"), botIdentity, getNowMs: () => now,
+    });
+    const message = {
+      message_id: 9, chat: { id: 7, type: "private" },
+      from: { id: 7, is_bot: false },
+      ...(scenario.threaded ? { message_thread_id: 11 } : {}),
+      voice: { file_id: "fixture-voice", file_unique_id: "fixture-voice", duration: 1 },
+    };
+    const source: Updates.TelegramUpdateFlow & Journal.TelegramJournaledUpdate = {
+      update_id: 100,
+      ...(scenario.carrier === "callback_query"
+        ? { callback_query: { id: "fixture-callback", from: message.from, message } }
+        : scenario.carrier === "message_reaction"
+          ? { message_reaction: { chat: message.chat, user: message.from,
+              message_id: 9, old_reaction: [], new_reaction: [{ type: "emoji", emoji: "👍" }] } }
+          : { [scenario.carrier]: message }),
+    };
+    const received: Bus.TelegramBusEnvelope[] = [];
+    const durableAdmission = BusFollower.createTelegramBusFollowerDurableAdmissionRuntime<string>({
+      journal: followerJournal,
+      signalWorker: () => {},
+    });
+    let admissionFailures = scenario.replace ? 1 : 2;
+    const receiver = BusFollower.createTelegramBusForwardedUpdateReceiverRuntime({
+      socketPath, instanceId: registration.instanceId,
+      getAuthSecret: () => "fixture-auth",
+      getRegistrationGeneration: () => scenario.replace ? "g2" : "g1",
+      getRecipientBindingKey: () => registration.profileKey,
+      getContext: () => "follower-ctx",
+      durableAdmission: {
+        async admit(envelope, ctx) {
+          received.push(envelope);
+          if (admissionFailures-- > 0) throw new Error("Fixture admission unavailable.");
+          return durableAdmission.admit(envelope, ctx);
+        },
+      },
+    });
+    let requests = 0;
+    const attempts: Bus.TelegramBusForwardOwnership[] = [];
+    const rejectedDeliveryIds: string[] = [];
+    const validate = Bus.createTelegramBusForwardOwnershipValidator(registry);
+    const forwarder = Bus.createTelegramBusForeignOwnedUpdateForwarder<
+      string, Updates.TelegramMessageReactionUpdated, Updates.TelegramCallbackQuery, Updates.TelegramUpdateMessage
+    >({
+      socketPath, createRequestId: () => `fixture:${++requests}`,
+      getAuthSecret: () => "fixture-auth",
+      recordRuntimeEvent(_category, _error, details) {
+        if (typeof details?.deliveryId === "string") rejectedDeliveryIds.push(details.deliveryId);
+      },
+      validateForwardOwnership(snapshot) {
+        attempts.push(snapshot);
+        return validate(snapshot);
+      },
+    });
+    const noLocalExecution = () => assert.fail("Foreign input must not execute on the leader");
+    const runtime = Updates.createTelegramUpdateRuntime<string>({
+      getAllowedUserId: () => 7,
+      getCurrentInstanceId: () => "leader",
+      getMessageOwnership: ownership.getForwardOwnership,
+      getTargetOwnership: (requested) => Bus.getTelegramFollowerTargetOwnership({
+        target: requested, followers: registry.list(),
+      }),
+      recordMessageOwnership: ownership.recordRouted,
+      foreignOwnedUpdateForwarder: forwarder,
+      removePendingMediaGroupMessages: noLocalExecution,
+      removeQueuedTelegramTurnsByMessageIds: noLocalExecution,
+      applyQueuedTelegramTurnReactionByMessageId: noLocalExecution,
+      pairTelegramUserIfNeeded: noLocalExecution,
+      answerCallbackQuery: async () => {},
+      answerGuestQuery: noLocalExecution,
+      handleAuthorizedTelegramCallbackQuery: noLocalExecution,
+      sendTextReply: noLocalExecution,
+      handleAuthorizedTelegramMessage: noLocalExecution,
+      handleAuthorizedTelegramEditedMessage: noLocalExecution,
+      handleUnboundTelegramTopicMessage: noLocalExecution,
+    });
+    const worker = Updates.createTelegramUpdateWorkerRuntime<string>({
+      journal: leaderJournal, hasAuthority: () => true, getNowMs: () => now,
+      scheduleRetry: () => 0, cancelRetry: () => {},
+      async executeUpdate(update, ctx) {
+        await runtime.handleUpdate(Updates.bindTelegramUpdateAdmissionSource(
+          update as Updates.TelegramUpdateFlow & Journal.TelegramJournaledUpdate, noLocalExecution,
+        ), ctx);
+        return { kind: "complete" };
+      },
+    });
+    try {
+      await receiver.start();
+      leaderJournal.appendBatch([source]);
+      worker.start("leader-ctx");
+      for (let failureCount = 1; failureCount <= 2; failureCount++) {
+        await worker.waitForDrain();
+        const entry = leaderJournal.read().entries[0]!;
+        assert.equal(entry.state, "retry-wait");
+        assert.equal(entry.failure?.attemptCount, failureCount);
+        assert.equal(entry.failure?.failureClass, "acknowledgement-rejected");
+        assert.deepEqual(entry.update, source);
+        assert.deepEqual(followerJournal.read().entries, []);
+        assert.equal(ownership.store.get(7, 9)?.recipientBindingKey, registration.profileKey);
+        if (failureCount === 1 && scenario.replace) {
+          assert.match(entry.failure!.summary, /Stale Telegram bus follower registration generation/);
+          registry.register({ ...registration, registrationGeneration: "g2", connectedAtMs: 2 });
+        }
+        now = entry.nextRetryAtMs!;
+        worker.signal();
+      }
+      await worker.waitForDrain();
+      assert.deepEqual(leaderJournal.read().entries, []);
+      assert.equal(attempts.length, 3);
+      assert.deepEqual(attempts.map((attempt) => attempt.ownerGeneration),
+        scenario.replace ? ["g1", "g2", "g2"] : ["g1", "g1", "g1"]);
+      assert.equal(attempts.every((attempt) =>
+        JSON.stringify(attempt.protocolIdentity) === JSON.stringify(registration.protocol)), true);
+      const admitted = followerJournal.read().entries;
+      assert.deepEqual(admitted.map((entry) => entry.updateId), [source.update_id]);
+      assert.deepEqual(admitted[0]!.update[scenario.carrier], {
+        ...source[scenario.carrier],
+        ...(scenario.carrier === "callback_query" ? { message: {
+          ...message, pi_telegram_source_update_id: source.update_id,
+        } } : {}),
+        pi_telegram_source_update_id: source.update_id,
+      });
+      const kind = scenario.carrier === "message" ? "leader.forwardMessage"
+        : scenario.carrier === "edited_message" ? "leader.forwardEditedMessage"
+          : scenario.carrier === "callback_query" ? "leader.forwardCallback" : "leader.forwardReaction";
+      const delivery = Bus.createTelegramBusFollowerDeliveryIdentity({
+        kind, recipientBindingKey: registration.profileKey, sourceUpdateId: source.update_id,
+      });
+      assert.deepEqual(rejectedDeliveryIds, [delivery.deliveryId, delivery.deliveryId]);
+      assert.equal(received.length, scenario.replace ? 2 : 3);
+      for (const envelope of received) {
+        assert.equal(envelope.kind, kind);
+        assert.ok("delivery" in envelope);
+        assert.deepEqual(envelope.delivery, delivery);
+      }
+    } finally {
+      await worker.stop();
+      await receiver.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 async function flushMicrotasks(iterations = 10): Promise<void> {
   for (let i = 0; i < iterations; i++) {

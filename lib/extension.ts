@@ -934,7 +934,7 @@ export default function (pi: Pi.ExtensionAPI) {
     },
     getAdmissionScope: getTelegramUpdateAdmissionScope,
     getAdmissionJournalBinding: getTelegramQueueJournalBinding,
-    getMessageOwnership: messageOwnershipRuntime.store.get,
+    getMessageOwnership: messageOwnershipRuntime.getForwardOwnership,
     recordMessageOwnership: messageOwnershipRuntime.recordRouted,
     ...inboundBusProjectionRuntime,
     getDisplayTitle: getThreadDisplayTitle,

@@ -1,9 +1,14 @@
 /**
  * Telegram message ownership helpers
  * Zones: telegram routing, multi-instance bus, in-memory coordination
- * Owns live message-id ownership lookup so callbacks/reactions can resolve a Telegram UI surface back to the instance/target that produced it
+ * Owns message-id ownership and live forwarding projections so inbound updates resolve back to the instance/target that owns them
  */
 
+import {
+  TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
+  type TelegramBusFollowerView,
+  type TelegramBusForwardOwnership,
+} from "./bus.ts";
 import { getTelegramTargetKey, type TelegramTarget } from "./target.ts";
 
 export interface TelegramMessageOwnershipRecord {
@@ -44,15 +49,17 @@ export interface TelegramMessageOwnershipStore {
   clear: () => void;
 }
 
-export interface TelegramFollowerOwnershipView {
-  instanceId: string;
-  connectedAtMs: number;
-  profileKey?: string;
-  registrationGeneration?: string;
-}
+export type TelegramFollowerOwnershipView = Pick<
+  TelegramBusFollowerView,
+  "instanceId" | "connectedAtMs" | "profileKey" | "registrationGeneration" | "protocol"
+>;
 
 export interface TelegramBusMessageOwnershipRuntime {
   store: TelegramMessageOwnershipStore;
+  getForwardOwnership(
+    chatId: number,
+    messageId: number,
+  ): TelegramBusForwardOwnership | undefined;
   recordLocal(input: {
     chatId: number;
     messageId: number;
@@ -137,6 +144,20 @@ export function createTelegramBusMessageOwnershipRuntime(deps: {
   };
   return {
     store,
+    getForwardOwnership(chatId, messageId) {
+      const record = store.get(chatId, messageId);
+      if (!record?.ownerGeneration || !record.recipientBindingKey) return record;
+      const follower = deps.listFollowers().find((candidate) =>
+        candidate.instanceId === record.instanceId &&
+        candidate.registrationGeneration === record.ownerGeneration &&
+        candidate.profileKey === record.recipientBindingKey,
+      );
+      // Protocol is live registration authority, not message-cache history.
+      // Keep an incomplete known owner foreign so the forwarder fails closed.
+      return follower?.protocol?.capabilities.includes(
+        TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
+      ) ? { ...record, protocolIdentity: follower.protocol } : record;
+    },
     recordLocal(input) {
       return store.record({ ...input, instanceId: deps.instanceId });
     },

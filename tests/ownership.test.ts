@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import * as Bus from "../lib/bus.ts";
 import {
   createTelegramBusMessageOwnershipRuntime,
   createTelegramMessageOwnershipStore,
@@ -72,6 +73,129 @@ test("Bus ownership runtime rebinds stable follower authority to a replacement g
     }),
     true,
   );
+});
+
+test("Forward ownership projects current protocol without caching it across registration changes", () => {
+  const registry = Bus.createTelegramBusFollowerRegistry();
+  let profileKey = "default";
+  const runtime = createTelegramBusMessageOwnershipRuntime({
+    instanceId: "leader", getProfileKey: () => profileKey, listFollowers: registry.list,
+  });
+  const validate = Bus.createTelegramBusForwardOwnershipValidator(registry);
+  const registration = {
+    instanceId: "follower", connectedAtMs: 1, profileKey: "manual:recipient",
+    registrationGeneration: "g1",
+    protocol: Bus.createTelegramBusProtocolIdentity({
+      runtimeBuild: "fixture",
+      capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION],
+    }),
+  };
+  registry.register(registration);
+  runtime.recordRouted({ chatId: 7, messageId: 9, instanceId: "follower" });
+  const initial = runtime.getForwardOwnership(7, 9)!;
+  assert.equal(validate(initial), true);
+  assert.deepEqual(initial.protocolIdentity, registration.protocol);
+  assert.equal("protocolIdentity" in runtime.store.get(7, 9)!, false);
+  const upgraded = Bus.createTelegramBusProtocolIdentity({
+    runtimeBuild: "fixture-upgrade",
+    capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
+      Bus.TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE],
+  });
+  registry.register({ ...registration, protocol: upgraded });
+  const current = runtime.getForwardOwnership(7, 9)!;
+  assert.equal(validate(initial), false);
+  assert.equal(validate(current), true);
+  assert.deepEqual(current.protocolIdentity, upgraded);
+  assert.deepEqual(initial.protocolIdentity, registration.protocol);
+  registry.register({ ...registration, instanceId: "replacement", registrationGeneration: "g2" });
+  const replacement = runtime.getForwardOwnership(7, 9)!;
+  assert.equal(validate(current), false);
+  assert.equal(validate(replacement), true);
+  assert.equal(replacement.instanceId, "replacement");
+  assert.equal(replacement.ownerGeneration, "g2");
+  assert.equal(replacement.recipientBindingKey, registration.profileKey);
+  assert.deepEqual(replacement.protocolIdentity, registration.protocol);
+  assert.equal("protocolIdentity" in runtime.store.get(7, 9)!, false);
+  registry.remove("replacement");
+  assert.equal(validate(replacement), false);
+  assert.equal(runtime.getForwardOwnership(7, 9), undefined);
+  assert.equal(runtime.store.entries().length, 1);
+  registry.register(registration);
+  assert.equal(validate(runtime.getForwardOwnership(7, 9)!), true);
+  profileKey = "other-bot";
+  assert.equal(runtime.getForwardOwnership(7, 9), undefined);
+  const local = runtime.recordLocal({ chatId: 7, messageId: 9 });
+  assert.deepEqual(runtime.getForwardOwnership(7, 9), local);
+  assert.equal(runtime.getForwardOwnership(7, 10), undefined);
+});
+
+test("Forward ownership leaves incomplete or mismatched registrations fail-closed", () => {
+  const registration = {
+    instanceId: "follower", connectedAtMs: 1, profileKey: "manual:recipient",
+    registrationGeneration: "g1",
+    protocol: Bus.createTelegramBusProtocolIdentity({
+      runtimeBuild: "fixture",
+      capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION],
+    }),
+  };
+  const cases: Array<[string, Partial<Bus.TelegramBusInstanceRegistration>]> = [
+    ["changed binding", { profileKey: "manual:other" }],
+    ["missing binding", { profileKey: undefined }],
+    ["missing generation", { registrationGeneration: undefined }],
+    ["missing protocol", { protocol: undefined }],
+    ["missing capability", { protocol: Bus.createTelegramBusProtocolIdentity({
+      runtimeBuild: "fixture", capabilities: [],
+    }) }],
+  ];
+  for (const [name, override] of cases) {
+    const registry = Bus.createTelegramBusFollowerRegistry();
+    registry.register(registration);
+    const runtime = createTelegramBusMessageOwnershipRuntime({
+      instanceId: "leader", getProfileKey: () => "default", listFollowers: registry.list,
+    });
+    runtime.recordFollower({ chatId: 7, messageId: 9, follower: registration });
+    registry.register({ ...registration, ...override });
+    const snapshot = runtime.getForwardOwnership(7, 9);
+    assert.ok(snapshot, `${name}: retain known foreign ownership`);
+    assert.equal(snapshot.instanceId, "follower", name);
+    assert.equal(snapshot.recipientBindingKey, "manual:recipient", name);
+    assert.equal(snapshot.protocolIdentity, undefined, name);
+    assert.equal(Bus.createTelegramBusForwardOwnershipValidator(registry)(snapshot), false, name);
+  }
+});
+
+test("Registration replacement during cache lookup rejects that snapshot but permits a fresh retry", () => {
+  const registry = Bus.createTelegramBusFollowerRegistry();
+  const registration = {
+    instanceId: "follower", connectedAtMs: 1, profileKey: "manual:recipient",
+    registrationGeneration: "g1",
+    protocol: Bus.createTelegramBusProtocolIdentity({
+      runtimeBuild: "fixture",
+      capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION],
+    }),
+  };
+  registry.register(registration);
+  let replace = false;
+  const runtime = createTelegramBusMessageOwnershipRuntime({
+    instanceId: "leader", getProfileKey: () => "default",
+    listFollowers() {
+      const followers = registry.list();
+      if (replace) {
+        replace = false;
+        registry.register({ ...registration, registrationGeneration: "g2" });
+      }
+      return followers;
+    },
+  });
+  runtime.recordRouted({ chatId: 7, messageId: 9, instanceId: "follower" });
+  replace = true;
+  const stale = runtime.getForwardOwnership(7, 9)!;
+  const validate = Bus.createTelegramBusForwardOwnershipValidator(registry);
+  assert.equal(stale.ownerGeneration, "g1");
+  assert.equal(validate(stale), false);
+  const current = runtime.getForwardOwnership(7, 9)!;
+  assert.equal(current.ownerGeneration, "g2");
+  assert.equal(validate(current), true);
 });
 
 test("Message ownership records default private targets", () => {
