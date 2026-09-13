@@ -4,6 +4,8 @@
  * Exposes the stable managed Telegram menu-section surface while keeping registry internals package-private
  */
 
+export type { TelegramInputRichBlock, TelegramInputRichMessage, TelegramRichText } from "../lib/telegram-api.ts";
+
 export {
   getTelegramSectionDiagnostics,
   registerTelegramSection,

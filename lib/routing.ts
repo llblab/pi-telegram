@@ -19,6 +19,7 @@ import * as Queue from "./queue.ts";
 import * as Replies from "./replies.ts";
 import type { TelegramBridgeRuntime } from "./runtime.ts";
 import type { TelegramSectionRegistry } from "./sections.ts";
+import type { TelegramInputRichMessage } from "./telegram-api.ts";
 import * as TextGroups from "./text-groups.ts";
 import * as ThreadNaming from "./thread-naming.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
@@ -625,6 +626,7 @@ export interface TelegramInboundRouteRuntimeDeps<
   updateStatus: (ctx: TContext, error?: string) => void;
   isContextActive?: (ctx: TContext) => boolean;
   dispatchNextQueuedTelegramTurn: (ctx: TContext) => void;
+  requestNextDispatchAnnouncement?: () => void;
   requestDeferredDispatchNextQueuedTelegramTurn?: (
     dispatch: (ctx: TContext) => void,
   ) => void;
@@ -706,6 +708,11 @@ export interface TelegramInboundRouteRuntimeDeps<
     details?: Record<string, unknown>,
   ) => void;
   sectionRegistry?: TelegramSectionRegistry;
+  sendSectionRichMessage?: (
+    chatId: number,
+    message: TelegramInputRichMessage,
+    options?: { target?: { chatId: number; threadId?: number } },
+  ) => Promise<number | undefined>;
 }
 
 const TELEGRAM_OWNED_CALLBACK_PREFIXES = [
@@ -1013,6 +1020,7 @@ export function createTelegramInboundRouteRuntime<
     sectionRegistry: deps.sectionRegistry,
     editInteractiveMessage: deps.editInteractiveMessage,
     sendInteractiveMessage: deps.sendInteractiveMessage,
+    sendSectionRichMessage: deps.sendSectionRichMessage,
     deleteMessage: deps.deleteMessage,
     enqueueSectionPrompt: async (
       prompt: string,
@@ -2171,6 +2179,7 @@ export function createTelegramInboundRouteRuntime<
     updateStatus: deps.updateStatus,
     isContextActive: deps.isContextActive,
     dispatchNextQueuedTelegramTurn: deps.dispatchNextQueuedTelegramTurn,
+    requestNextDispatchAnnouncement: deps.requestNextDispatchAnnouncement,
     requestDeferredDispatchNextQueuedTelegramTurn:
       deps.requestDeferredDispatchNextQueuedTelegramTurn,
     startTypingLoop: deps.startTypingLoop,

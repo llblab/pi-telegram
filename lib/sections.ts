@@ -8,6 +8,7 @@ import {
   assertTelegramCallbackData,
   type TelegramInlineKeyboardMarkup,
 } from "./keyboard.ts";
+import type { TelegramInputRichMessage } from "./telegram-api.ts";
 
 const SECTION_REGISTRY_KEY = "__piTelegramSectionRegistry__";
 
@@ -66,6 +67,7 @@ export interface TelegramSectionContext {
   answerCallback(text?: string): Promise<void>;
   edit(view: TelegramSectionView): Promise<void>;
   open(view: TelegramSectionView): Promise<void>;
+  openRich(message: TelegramInputRichMessage): Promise<void>;
   enqueuePrompt(prompt: string): Promise<void>;
   callbackData(action: string, payload?: string): string;
   /** Delete the message that triggered this callback (dialog cleanup) */
@@ -81,6 +83,7 @@ export interface TelegramSectionCallbackContext {
   answerCallback(text?: string): Promise<void>;
   edit(view: TelegramSectionView): Promise<void>;
   open(view: TelegramSectionView): Promise<void>;
+  openRich(message: TelegramInputRichMessage): Promise<void>;
   enqueuePrompt(prompt: string): Promise<void>;
   callbackData(action: string, payload?: string): string;
   /** Delete the message that triggered this callback (dialog cleanup) */
@@ -160,6 +163,11 @@ export interface TelegramSectionRuntimeDeps {
     replyMarkup: TelegramInlineKeyboardMarkup,
     options?: { target?: TelegramSectionTarget },
   ) => Promise<number | undefined>;
+  sendRichMessage: (
+    chatId: number,
+    message: TelegramInputRichMessage,
+    options?: { target?: TelegramSectionTarget },
+  ) => Promise<number | undefined>;
   enqueuePrompt: (prompt: string) => Promise<void>;
   deleteMessage: (chatId: number, messageId: number) => Promise<void>;
 }
@@ -202,6 +210,12 @@ function buildTelegramSectionContext(
           deps.target ? { target: deps.target } : undefined,
         )
         .then(() => {}),
+    openRich: (message) =>
+      deps.sendRichMessage(
+        chatId,
+        message,
+        deps.target ? { target: deps.target } : undefined,
+      ).then(() => {}),
     enqueuePrompt: deps.enqueuePrompt,
     callbackData: (action, payload) =>
       buildTelegramSectionCallbackData(token, action, payload),
@@ -251,6 +265,12 @@ function buildTelegramSectionCallbackContext(
           deps.target ? { target: deps.target } : undefined,
         )
         .then(() => {}),
+    openRich: (message) =>
+      deps.sendRichMessage(
+        chatId,
+        message,
+        deps.target ? { target: deps.target } : undefined,
+      ).then(() => {}),
     enqueuePrompt: deps.enqueuePrompt,
     callbackData: (action, payload) =>
       buildTelegramSectionCallbackData(token, action, payload),
@@ -524,6 +544,11 @@ export interface TelegramSectionCallbackHandlerDeps {
     text: string,
     mode: "markdown" | "html" | "plain",
     replyMarkup: TelegramInlineKeyboardMarkup,
+    options?: { target?: TelegramSectionTarget },
+  ) => Promise<number | undefined>;
+  sendRichMessage: (
+    chatId: number,
+    message: TelegramInputRichMessage,
     options?: { target?: TelegramSectionTarget },
   ) => Promise<number | undefined>;
   enqueuePrompt: (prompt: string) => Promise<void>;

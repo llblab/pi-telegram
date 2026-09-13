@@ -262,6 +262,8 @@ interface TelegramSectionContext {
   edit(view: TelegramSectionView): Promise<void>;
   /** Send a standalone chat message without auto-navigation */
   open(view: TelegramSectionView): Promise<void>;
+  /** Send one standalone Telegram Native Rich Message without exposing transport */
+  openRich(message: TelegramInputRichMessage): Promise<void>;
   /** Enqueue a plain-text prompt turn */
   enqueuePrompt(prompt: string): Promise<void>;
   /** Build a section-namespaced callback_data string */
@@ -285,12 +287,19 @@ interface TelegramSectionCallbackContext {
   answerCallback(text?: string): Promise<void>;
   edit(view: TelegramSectionView): Promise<void>;
   open(view: TelegramSectionView): Promise<void>;
+  openRich(message: TelegramInputRichMessage): Promise<void>;
   enqueuePrompt(prompt: string): Promise<void>;
   callbackData(action: string, payload?: string): string;
   /** Delete the message that triggered this callback */
   deleteMessage(): Promise<void>;
 }
 ```
+
+### `openRich` semantics
+
+`ctx.openRich(message)` sends exactly one standalone Telegram Native Rich Message to the callback's exact chat/thread target. It accepts the public `TelegramInputRichMessage` tree (`details` and `pre` blocks) used by native tool evidence, records message ownership, and routes through the active direct/follower transport. It adds no menu navigation and exposes no raw bot client or arbitrary API method.
+
+Use it when disclosure behavior is part of the document, such as one selected read-only state or evidence tree. Do not imitate nested disclosure with HTML or Markdown when the native tree is required.
 
 ### `enqueuePrompt` semantics
 

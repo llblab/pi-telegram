@@ -5391,6 +5391,289 @@ test("Queue dispatch controller plans prompts and reports dispatch failures", ()
   assert.equal(queuedItems.length, 1);
 });
 
+test("Queue dispatch announces the exact selected prompt before one dispatch", async () => {
+  const events: string[] = [];
+  let queuedItems: TelegramQueueItem<string>[] = [createQueueTestPromptTurn({
+    chatId: 42,
+    target: { chatId: 42, threadId: 7 },
+    replyToMessageId: 99,
+    content: [{ type: "text", text: "next prompt" }],
+  })];
+  const controller = createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => {
+      queuedItems = items;
+      events.push(`items:${items.length}`);
+    },
+    canDispatch: () => true,
+    updateStatus: () => events.push("status"),
+    sendTextReply: async (chatId, replyToMessageId, text, options) => {
+      events.push(`notice:${chatId}:${replyToMessageId}:${options?.target?.threadId}:${text}`);
+      return 100;
+    },
+    onPromptDispatchStart: () => events.push("start"),
+    sendUserMessage: () => events.push("send"),
+    onPromptDispatchFailure: () => events.push("failure"),
+  });
+  controller.requestNextDispatchAnnouncement();
+  controller.dispatchNext("ctx");
+  assert.deepEqual(events, [
+    "status",
+    "notice:42:99:7:<b>⏩ Dispatching next queued turn.</b>",
+  ]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [
+    "status",
+    "notice:42:99:7:<b>⏩ Dispatching next queued turn.</b>",
+    "items:1",
+    "start",
+    "send",
+  ]);
+});
+
+test("Queue dispatch does not start an announced prompt cleared while its notice is pending", async () => {
+  const events: string[] = [];
+  let releaseNotice!: () => void;
+  const notice = new Promise<void>((resolve) => { releaseNotice = resolve; });
+  let queuedItems: TelegramQueueItem<string>[] = [createQueueTestPromptTurn({
+    chatId: 42,
+    replyToMessageId: 99,
+    content: [{ type: "text", text: "next prompt" }],
+  })];
+  const controller = createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => { queuedItems = items; },
+    canDispatch: () => true,
+    updateStatus: () => events.push("status"),
+    sendTextReply: async () => { events.push("notice"); await notice; return 100; },
+    onPromptDispatchStart: () => events.push("start"),
+    sendUserMessage: () => events.push("send"),
+    onPromptDispatchFailure: () => events.push("failure"),
+  });
+  controller.requestNextDispatchAnnouncement();
+  controller.dispatchNext("ctx");
+  assert.equal(queuedItems.length, 1);
+  queuedItems = [];
+  releaseNotice();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["status", "notice", "status"]);
+});
+
+test("Queue dispatch binds a blocked announcement request to its selected item", () => {
+  for (const clearBeforeReplacement of [false, true]) {
+    const first = createQueueTestPromptTurn({ replyToMessageId: 1 });
+    const second = createQueueTestPromptTurn({ replyToMessageId: 2 });
+    const replacement = createQueueTestPromptTurn({ replyToMessageId: 3 });
+    let queuedItems: TelegramQueueItem<string>[] = [first, second];
+    let firstReady = false;
+    const notices: number[] = [];
+    let dispatches = 0;
+    const controller = createTelegramQueueDispatchController<string>({
+      getQueuedItems: () => queuedItems,
+      setQueuedItems: (items) => { queuedItems = items; },
+      canDispatch: () => true,
+      isQueueItemAdmissionReady: (item) => item !== first || firstReady,
+      updateStatus: () => {},
+      sendTextReply: async (_chatId, replyToMessageId) => {
+        notices.push(replyToMessageId);
+        return 100;
+      },
+      onPromptDispatchStart: () => {},
+      sendUserMessage: () => { dispatches += 1; },
+      onPromptDispatchFailure: () => {},
+    });
+    controller.requestNextDispatchAnnouncement();
+    controller.dispatchNext("ctx");
+    assert.deepEqual(notices, []);
+    queuedItems = clearBeforeReplacement ? [] : [second];
+    controller.dispatchNext("ctx");
+    if (clearBeforeReplacement) {
+      queuedItems = [replacement];
+      controller.dispatchNext("ctx");
+    }
+    assert.deepEqual(notices, []);
+    assert.equal(dispatches, 1);
+    firstReady = true;
+  }
+});
+
+test("Queue dispatch revalidates readiness after its notice settles", async () => {
+  let releaseNotice!: () => void;
+  const notice = new Promise<void>((resolve) => { releaseNotice = resolve; });
+  const item = createQueueTestPromptTurn();
+  let queuedItems: TelegramQueueItem<string>[] = [item];
+  let canDispatch = true;
+  let mutationPending = false;
+  let notices = 0;
+  let dispatches = 0;
+  const controller = createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => { queuedItems = items; },
+    canDispatch: () => canDispatch,
+    hasPendingInboundQueueMutationForItem: () => mutationPending,
+    updateStatus: () => {},
+    sendTextReply: async () => { notices += 1; await notice; return 100; },
+    onPromptDispatchStart: () => {},
+    sendUserMessage: () => { dispatches += 1; },
+    onPromptDispatchFailure: () => {},
+  });
+  controller.requestNextDispatchAnnouncement();
+  controller.dispatchNext("ctx");
+  canDispatch = false;
+  mutationPending = true;
+  releaseNotice();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(dispatches, 0);
+  assert.deepEqual(queuedItems, [item]);
+  canDispatch = true;
+  mutationPending = false;
+  controller.dispatchNext("ctx");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(notices, 2);
+  assert.equal(dispatches, 1);
+});
+
+test("Queue dispatch does not transfer a notice across an inactive transport drop", async () => {
+  let releaseNotice!: () => void;
+  const notice = new Promise<void>((resolve) => { releaseNotice = resolve; });
+  const first = createQueueTestPromptTurn({ replyToMessageId: 1 });
+  const second = createQueueTestPromptTurn({ replyToMessageId: 2 });
+  let queuedItems: TelegramQueueItem<string>[] = [first];
+  let firstTransportActive = true;
+  const notices: number[] = [];
+  let dispatches = 0;
+  const controller = createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => { queuedItems = items; },
+    canDispatch: () => true,
+    isQueueItemTransportActive: (item) => item !== first || firstTransportActive,
+    updateStatus: () => {},
+    sendTextReply: async (_chatId, replyToMessageId) => {
+      notices.push(replyToMessageId);
+      await notice;
+      return 100;
+    },
+    onPromptDispatchStart: () => {},
+    sendUserMessage: () => { dispatches += 1; },
+    onPromptDispatchFailure: () => {},
+  });
+  controller.requestNextDispatchAnnouncement();
+  controller.dispatchNext("ctx");
+  firstTransportActive = false;
+  releaseNotice();
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.dispatchNext("ctx");
+  assert.deepEqual(queuedItems, []);
+  queuedItems = [second];
+  controller.dispatchNext("ctx");
+  assert.deepEqual(notices, [1]);
+  assert.equal(dispatches, 1);
+});
+
+test("Queue dispatch does not transfer a notice from an inactive head to retained work", async () => {
+  for (const protectedByReceipt of [false, true]) {
+    let releaseNotice!: () => void;
+    const notice = new Promise<void>((resolve) => { releaseNotice = resolve; });
+    const first = createQueueTestPromptTurn({
+      replyToMessageId: 1,
+      admissionReceipts: protectedByReceipt ? [{
+        queueKind: "prompt",
+        receiptId: "receipt-1",
+        sourceUpdateIds: [1],
+      }] : undefined,
+    });
+    const second = createQueueTestPromptTurn({ replyToMessageId: 2 });
+    let queuedItems: TelegramQueueItem<string>[] = [first, second];
+    let firstTransportActive = true;
+    const notices: number[] = [];
+    let dispatches = 0;
+    const controller = createTelegramQueueDispatchController<string>({
+      getQueuedItems: () => queuedItems,
+      setQueuedItems: (items) => { queuedItems = items; },
+      canDispatch: () => true,
+      isQueueItemTransportActive: (item) => item !== first || firstTransportActive,
+      updateStatus: () => {},
+      sendTextReply: async (_chatId, replyToMessageId) => {
+        notices.push(replyToMessageId);
+        await notice;
+        return 100;
+      },
+      onPromptDispatchStart: () => {},
+      sendUserMessage: () => { dispatches += 1; },
+      onPromptDispatchFailure: () => {},
+    });
+    controller.requestNextDispatchAnnouncement();
+    controller.dispatchNext("ctx");
+    firstTransportActive = false;
+    releaseNotice();
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.dispatchNext("ctx");
+    assert.deepEqual(notices, [1]);
+    assert.equal(dispatches, 1);
+  }
+});
+
+test("Queue dispatch does not overwrite work appended while its notice is pending", async () => {
+  let releaseNotice!: () => void;
+  const notice = new Promise<void>((resolve) => { releaseNotice = resolve; });
+  const first = createQueueTestPromptTurn({ content: [{ type: "text", text: "first" }] });
+  const appended = createQueueTestPromptTurn({ content: [{ type: "text", text: "appended" }] });
+  let queuedItems: TelegramQueueItem<string>[] = [first];
+  let dispatches = 0;
+  let notices = 0;
+  const controller = createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => { queuedItems = items; },
+    canDispatch: () => true,
+    updateStatus: () => {},
+    sendTextReply: async () => { notices += 1; await notice; return 100; },
+    onPromptDispatchStart: () => {},
+    sendUserMessage: () => { dispatches += 1; },
+    onPromptDispatchFailure: () => {},
+  });
+  controller.requestNextDispatchAnnouncement();
+  controller.dispatchNext("ctx");
+  queuedItems = [first, appended];
+  releaseNotice();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(notices, 2);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(notices, 2);
+  assert.equal(dispatches, 1);
+  assert.deepEqual(queuedItems, [first, appended]);
+});
+
+test("Queue dispatch re-announces a reordered head before dispatch", async () => {
+  let releaseFirstNotice!: () => void;
+  const firstNotice = new Promise<void>((resolve) => { releaseFirstNotice = resolve; });
+  const first = createQueueTestPromptTurn({ replyToMessageId: 1 });
+  const second = createQueueTestPromptTurn({ replyToMessageId: 2 });
+  let queuedItems: TelegramQueueItem<string>[] = [first, second];
+  const notices: number[] = [];
+  const dispatched: number[] = [];
+  const controller = createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => { queuedItems = items; },
+    canDispatch: () => true,
+    updateStatus: () => {},
+    sendTextReply: async (_chatId, replyToMessageId) => {
+      notices.push(replyToMessageId);
+      if (notices.length === 1) await firstNotice;
+      return 100;
+    },
+    onPromptDispatchStart: () => {},
+    sendUserMessage: () => { dispatched.push(2); },
+    onPromptDispatchFailure: () => {},
+  });
+  controller.requestNextDispatchAnnouncement();
+  controller.dispatchNext("ctx");
+  queuedItems = [second, first];
+  releaseFirstNotice();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(notices, [1, 2]);
+  assert.equal(dispatched.length, 1);
+});
+
 test("Queue dispatch waits for durable admission without dropping the head item", () => {
   const events: string[] = [];
   let ready = false;

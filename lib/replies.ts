@@ -730,6 +730,24 @@ export async function sendTelegramNativeMarkdownReply<TReplyMarkup = unknown>(
   return lastMessageId;
 }
 
+export async function sendTelegramNativeRichMessage(
+  chatId: number,
+  richMessage: TelegramInputRichMessage,
+  deps: {
+    recordOwnership?: TelegramReplyOwnershipRecorder["record"];
+    sendRichMessage: (body: TelegramSendRichMessageBody) => Promise<TelegramSentMessage>;
+  },
+  options?: TelegramReplyTargetOptions,
+): Promise<number> {
+  const sent = await deps.sendRichMessage({
+    chat_id: chatId,
+    rich_message: richMessage,
+    ...(options?.target ? getTelegramTargetThreadParams(options.target) : {}),
+  });
+  deps.recordOwnership?.({ chatId, messageId: sent.message_id, target: options?.target });
+  return sent.message_id;
+}
+
 // UI/compat regular-message runtime for bridge-owned text and interactive
 // surfaces. Assistant and guest Markdown delivery bypass this path and use
 // native Rich Message helpers above.
@@ -775,6 +793,11 @@ export interface TelegramRenderedMessageRuntime<TReplyMarkup> {
     replyMarkup: TReplyMarkup,
     options?: TelegramReplyTargetOptions,
   ) => Promise<number | undefined>;
+  sendSectionRichMessage: (
+    chatId: number,
+    message: TelegramInputRichMessage,
+    options?: TelegramReplyTargetOptions,
+  ) => Promise<number>;
 }
 
 export interface TelegramRenderedMessageDeliveryRuntime<
@@ -891,6 +914,11 @@ export function createTelegramRenderedMessageRuntime<TReplyMarkup>(
         },
       );
     },
+    sendSectionRichMessage: (chatId, message, options) =>
+      sendTelegramNativeRichMessage(chatId, message, {
+        recordOwnership: deps.recordOwnership,
+        sendRichMessage: deps.sendRichMessage,
+      }, options),
   };
 }
 

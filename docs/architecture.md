@@ -507,7 +507,7 @@ Immediate controls:
 - `/start` opens the main inline application menu.
 - `/model`, `/thinking`, `/queue`, and `/settings` are hidden shortcuts to menu sections.
 - `/compact` opens an inline confirmation dialog and then runs compaction when the bridge is idle.
-- `/next` dispatches the next queued turn, aborting Pi first when needed. When an active Telegram turn is aborted, its single Pi-aligned informational notice replies to a pre-abort snapshot of that turn; otherwise the command message is the fallback target. Aborted pending assistant text is not projected as a second reply, while already completed intermediate output remains visible.
+- `/next` dispatches the next queued turn, aborting Pi first when needed. Active-turn settlement delivers its abort notice to the interrupted prompt before queue dispatch continues. The queue owner then emits `Dispatching next queued turn.` against the exact selected prompt's chat/thread/reply id before its one model dispatch; skipped, inactive, pending-mutation, and admission-blocked candidates never receive it. The `/next` command itself is never a lifecycle-notice reply target. Aborted pending assistant text is not projected as a second reply, while already completed intermediate output remains visible.
 - `/abort` aborts active work while preserving queued items. Abort-history preservation is enabled only for Telegram-owned active turns; later local/non-Telegram agent starts clear stale abort-history mode so the next Telegram prompt appends instead of absorbing old queued turns as history.
 - `/stop` aborts and clears waiting Telegram queue items.
 
