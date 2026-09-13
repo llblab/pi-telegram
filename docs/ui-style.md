@@ -37,10 +37,6 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `🧠` | Model thinking controls | Thinking menus and status rows | Thinking activity quotes omit this icon and their header entirely to minimize chat height. |
 | `📎` | Attachment | Attachment summaries, queue rows for attachment-only turns | Not for thread binding. |
 | `👁` | Read-only inspection | State/detail viewers and inspection entrypoints | Opens evidence without mutating the inspected object; do not use for edit or refresh actions. |
-| `🌐` | Global state scope | State-scope chooser and selected-scope heading | Cross-project memory composed first. |
-| `📂` | Current-working-directory state scope | State-scope chooser and selected-scope heading | Project-local memory composed after Global. |
-| `💬` | Session state scope | State-scope chooser and selected-scope heading | Conversation-branch memory composed after CWD. |
-| `🧬` | Effective composed state | State-scope chooser and selected-scope heading | The resulting Global → CWD → Session projection. |
 
 ### Command And Control Actions
 

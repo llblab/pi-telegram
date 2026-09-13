@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.45.11: Consumer-owned companion semantics
+
+- `Extension boundaries`: Removes consumer-specific state-scope emoji from the Telegram UI registry. The bridge continues to own generic Rich Message headings and inspection semantics, while companion extensions independently own their domain labels, composition rules, and presentation through the public section API.
+
 ## 0.45.10: Rich headings and state-scope markers
 
 - `Rich section headings`: Public Rich Message block types now include native headings, allowing companion sections to place a fixed title above sibling disclosures instead of wrapping the entire view in another collapsible block.
