@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.46.0: Session-aware Workspace Threads
+
+- `Session-aware Thread binding`: Workspace identity restored session-qualified bindings from Pi's stable public session identity, so reopening, resuming, or replacing a process reclaims the same Telegram Thread and letter while distinct sessions in one directory keep independent targets. Strict legacy cwd-only records remain inert and coexist safely; protocol v2 rejects mixed 0.45.x peers before provisioning, and exact-session cleanup, displacement, rename, promotion, and slot-pressure fences are preserved.
+
 ## 0.45.11: Consumer-owned companion semantics
 
 - `Extension boundaries`: Removes consumer-specific state-scope emoji from the Telegram UI registry. The bridge continues to own generic Rich Message headings and inspection semantics, while companion extensions independently own their domain labels, composition rules, and presentation through the public section API.

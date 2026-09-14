@@ -52,6 +52,10 @@ export interface TelegramThreadNameInput {
 export interface TelegramWorkspaceBindingIdentity {
   cwd: string;
   workspaceKey: string;
+  /** Exact durable Pi session identity; absent only on legacy cwd-only bindings. */
+  sessionId?: string;
+  /** Full SHA-256 index component for session-qualified bindings. */
+  sessionKey?: string;
   /** Immutable legacy binding-key component, not the displayed global letter. */
   instanceSlot: string;
   bindingKey: string;
@@ -60,6 +64,27 @@ export interface TelegramWorkspaceBindingIdentity {
 }
 
 const TELEGRAM_WORKSPACE_KEY_MAX_LENGTH = 180;
+const TELEGRAM_SESSION_ID_MAX_LENGTH = 256;
+
+export function normalizeTelegramSessionId(
+  sessionId: string,
+): string | undefined {
+  if (typeof sessionId !== "string") return undefined;
+  const normalized = sessionId.trim();
+  return normalized && Buffer.byteLength(normalized, "utf8") <=
+      TELEGRAM_SESSION_ID_MAX_LENGTH
+    ? normalized
+    : undefined;
+}
+
+export function createTelegramSessionKey(
+  sessionId: string,
+): string | undefined {
+  const normalized = normalizeTelegramSessionId(sessionId);
+  return normalized
+    ? createHash("sha256").update(normalized).digest("hex")
+    : undefined;
+}
 
 export function normalizeTelegramWorkspacePath(
   cwd: string,
@@ -116,21 +141,39 @@ function createTelegramWorkspaceBindingIdentityWithKey(
   cwd: string,
   workspaceKey: string,
   ordinal: number,
+  sessionId?: string,
 ): TelegramWorkspaceBindingIdentity | undefined {
   const instanceSlot = createTelegramWorkspaceInstanceSlot(ordinal);
   if (!instanceSlot) return undefined;
+  const normalizedSessionId = sessionId === undefined
+    ? undefined
+    : normalizeTelegramSessionId(sessionId);
+  const sessionKey = normalizedSessionId
+    ? createTelegramSessionKey(normalizedSessionId)
+    : undefined;
+  if (sessionId !== undefined && (!normalizedSessionId || !sessionKey)) {
+    return undefined;
+  }
+  const legacyBindingKey = instanceSlot === "a"
+    ? workspaceKey
+    : `${workspaceKey}${instanceSlot}`;
   return {
     cwd,
     workspaceKey,
+    ...(normalizedSessionId && sessionKey
+      ? { sessionId: normalizedSessionId, sessionKey }
+      : {}),
     instanceSlot,
-    bindingKey:
-      instanceSlot === "a" ? workspaceKey : `${workspaceKey}${instanceSlot}`,
+    bindingKey: sessionKey
+      ? `${legacyBindingKey}-s-${sessionKey}`
+      : legacyBindingKey,
   };
 }
 
 export function createTelegramWorkspaceBindingIdentity(
   cwd: string,
   ordinal = 0,
+  sessionId?: string,
 ): TelegramWorkspaceBindingIdentity | undefined {
   const normalized = normalizeTelegramWorkspacePath(cwd);
   const workspaceKey = normalized
@@ -141,6 +184,7 @@ export function createTelegramWorkspaceBindingIdentity(
     normalized,
     workspaceKey,
     ordinal,
+    sessionId,
   );
 }
 
@@ -249,6 +293,10 @@ export interface TelegramThreadIdentityRecord {
 export interface TelegramWorkspaceThreadBinding {
   cwd: string;
   workspaceKey: string;
+  /** Exact durable Pi session identity; absent only on legacy cwd-only bindings. */
+  sessionId?: string;
+  /** Full SHA-256 index component for session-qualified bindings. */
+  sessionKey?: string;
   instanceSlot: string;
   bindingKey: string;
   target: TelegramTarget & { threadId: number };
@@ -453,7 +501,8 @@ export interface TelegramTopicTargetStore {
   ) => Promise<boolean>;
   commitInactiveWorkspaceCleanup: (
     expected: TelegramWorkspaceThreadBinding | {
-      cwd: string; workspaceKey: string; instanceSlot: string; slot: string; bindingKey: string;
+      cwd: string; workspaceKey: string; sessionId?: string; sessionKey?: string;
+      instanceSlot: string; slot: string; bindingKey: string;
       target: { chatId: number; threadId: number }; inactiveSinceMs: number; bindingUpdatedAtMs: number;
     },
     isCurrent: () => boolean,
@@ -465,7 +514,7 @@ export interface TelegramTopicTargetStore {
     ) => TelegramWorkspaceExternalProtectionEvidence,
     options?: { expectedRetirement?: TelegramWorkspaceRetirementIntent },
   ) => TelegramWorkspaceSlotOccupancySnapshot;
-  hasWorkspaceBinding: (cwd: string) => boolean;
+  hasWorkspaceBinding: (cwd: string, sessionId?: string) => boolean;
   setWorkspaceDisplayTitle: (
     expected: TelegramWorkspaceThreadBinding,
     title: string,
@@ -478,6 +527,7 @@ export interface TelegramTopicTargetStore {
   getWorkspaceBinding: (
     cwd: string,
     instanceSlot?: string,
+    sessionId?: string,
   ) => TelegramWorkspaceThreadBinding | undefined;
   claimWorkspaceIdentity: (
     cwd: string,
@@ -485,6 +535,7 @@ export interface TelegramTopicTargetStore {
     previousInstanceId?: string,
     options?: {
       existingBindingOnly?: boolean;
+      sessionId?: string;
       onCapacityUnavailable?: () => void;
     },
   ) => TelegramWorkspaceBindingIdentity | undefined;
@@ -1124,9 +1175,12 @@ function cloneIdentityRecord(
 }
 
 function getWorkspaceBindingMapKey(
-  binding: Pick<TelegramWorkspaceThreadBinding, "cwd" | "instanceSlot">,
+  binding: Pick<
+    TelegramWorkspaceThreadBinding,
+    "cwd" | "instanceSlot" | "sessionId"
+  >,
 ): string {
-  return `${binding.cwd}\u0000${binding.instanceSlot}`;
+  return `${binding.cwd}\u0000${binding.sessionId ?? ""}\u0000${binding.instanceSlot}`;
 }
 
 function normalizeWorkspaceBindingRecord(
@@ -1145,15 +1199,30 @@ function normalizeWorkspaceBindingRecord(
     return undefined;
   }
   const cwd = normalizeTelegramWorkspacePath(record.cwd);
+  const sessionId = typeof record.sessionId === "string"
+    ? normalizeTelegramSessionId(record.sessionId)
+    : undefined;
+  const sessionKey = typeof record.sessionKey === "string"
+    ? record.sessionKey
+    : undefined;
+  const hasSessionFields = record.sessionId !== undefined ||
+    record.sessionKey !== undefined;
+  const expectedSessionKey = sessionId
+    ? createTelegramSessionKey(sessionId)
+    : undefined;
+  const legacyBindingKey = record.instanceSlot === "a"
+    ? record.workspaceKey
+    : `${record.workspaceKey}${record.instanceSlot}`;
+  const expectedBindingKey = expectedSessionKey
+    ? `${legacyBindingKey}-s-${expectedSessionKey}`
+    : legacyBindingKey;
   if (
     !cwd ||
     cwd !== record.cwd ||
     !record.workspaceKey ||
     !/^[a-z]+$/u.test(record.instanceSlot) ||
-    record.bindingKey !==
-      (record.instanceSlot === "a"
-        ? record.workspaceKey
-        : `${record.workspaceKey}${record.instanceSlot}`)
+    (hasSessionFields && (!sessionId || sessionKey !== expectedSessionKey)) ||
+    record.bindingKey !== expectedBindingKey
   ) {
     return undefined;
   }
@@ -1191,6 +1260,7 @@ function normalizeWorkspaceBindingRecord(
   return {
     cwd,
     workspaceKey: record.workspaceKey,
+    ...(sessionId && sessionKey ? { sessionId, sessionKey } : {}),
     instanceSlot: record.instanceSlot,
     bindingKey: record.bindingKey,
     ...(record.showSlotSuffix === true ? { showSlotSuffix: true } : {}),
@@ -1684,7 +1754,10 @@ export function createTelegramTopicTargetStore(
   );
   let workspaceClaims = new Map<
     string,
-    { identity: TelegramWorkspaceBindingIdentity; instanceId: string }
+    {
+      identity: TelegramWorkspaceBindingIdentity;
+      instanceId: string;
+    }
   >();
   let reservations: TelegramThreadReservation[] = [];
   let pendingProvisions: TelegramThreadPendingProvision[] = [];
@@ -2404,8 +2477,16 @@ export function createTelegramTopicTargetStore(
       if (workspaceRetirementCommitInFlight || !isCurrent()) return false;
       const cleanupSnapshot = "bindingUpdatedAtMs" in expected ? expected : undefined;
       const normalized = cleanupSnapshot ? undefined : normalizeWorkspaceBindingRecord(expected);
+      const cleanupSessionId = cleanupSnapshot?.sessionId === undefined
+        ? undefined
+        : normalizeTelegramSessionId(cleanupSnapshot.sessionId);
+      const cleanupSessionKey = cleanupSessionId
+        ? createTelegramSessionKey(cleanupSessionId)
+        : undefined;
       if (cleanupSnapshot && (!cleanupSnapshot.cwd || !cleanupSnapshot.workspaceKey ||
           !cleanupSnapshot.instanceSlot || !cleanupSnapshot.slot || !cleanupSnapshot.bindingKey ||
+          ((cleanupSnapshot.sessionId !== undefined || cleanupSnapshot.sessionKey !== undefined) &&
+            (!cleanupSessionId || cleanupSnapshot.sessionKey !== cleanupSessionKey)) ||
           !Number.isSafeInteger(cleanupSnapshot.inactiveSinceMs) ||
           !Number.isSafeInteger(cleanupSnapshot.bindingUpdatedAtMs) ||
           !Number.isSafeInteger(cleanupSnapshot.target.chatId) ||
@@ -2416,6 +2497,7 @@ export function createTelegramTopicTargetStore(
       if (!binding) return isCurrent();
       const exact = cleanupSnapshot ? binding.cwd === cleanupSnapshot.cwd &&
         binding.workspaceKey === cleanupSnapshot.workspaceKey &&
+        binding.sessionId === cleanupSessionId && binding.sessionKey === cleanupSessionKey &&
         binding.instanceSlot === cleanupSnapshot.instanceSlot && binding.slot === cleanupSnapshot.slot &&
         binding.bindingKey === cleanupSnapshot.bindingKey && targetMatches(binding.target, cleanupSnapshot.target) &&
         binding.inactiveSinceMs === cleanupSnapshot.inactiveSinceMs &&
@@ -2612,10 +2694,17 @@ export function createTelegramTopicTargetStore(
         : [...localReservedSlots, "invalid"];
       return { bindings, reservedSlots };
     },
-    hasWorkspaceBinding(cwd) {
+    hasWorkspaceBinding(cwd, sessionId) {
       const normalizedCwd = normalizeTelegramWorkspacePath(cwd);
-      return !!normalizedCwd && Array.from(workspaceBindings.values()).some(
-        (binding) => binding.cwd === normalizedCwd,
+      const normalizedSessionId = sessionId === undefined
+        ? undefined
+        : normalizeTelegramSessionId(sessionId);
+      if (!normalizedCwd || (sessionId !== undefined && !normalizedSessionId)) {
+        return false;
+      }
+      return Array.from(workspaceBindings.values()).some(
+        (binding) => binding.cwd === normalizedCwd &&
+          binding.sessionId === normalizedSessionId,
       );
     },
     setWorkspaceDisplayTitle(expected, title) {
@@ -2651,18 +2740,29 @@ export function createTelegramTopicTargetStore(
       }
       return false;
     },
-    getWorkspaceBinding(cwd, instanceSlot = "a") {
+    getWorkspaceBinding(cwd, instanceSlot = "a", sessionId) {
       const normalizedCwd = normalizeTelegramWorkspacePath(cwd);
-      if (!normalizedCwd || !/^[a-z]+$/u.test(instanceSlot)) return undefined;
-      const binding = workspaceBindings.get(
-        getWorkspaceBindingMapKey({ cwd: normalizedCwd, instanceSlot }),
-      );
+      const normalizedSessionId = sessionId === undefined
+        ? undefined
+        : normalizeTelegramSessionId(sessionId);
+      if (!normalizedCwd || !/^[a-z]+$/u.test(instanceSlot) ||
+          (sessionId !== undefined && !normalizedSessionId)) return undefined;
+      const mapKey = getWorkspaceBindingMapKey({
+        cwd: normalizedCwd,
+        instanceSlot,
+        ...(normalizedSessionId ? { sessionId: normalizedSessionId } : {}),
+      });
+      const binding = workspaceBindings.get(mapKey);
       return binding ? cloneWorkspaceBinding(binding) : undefined;
     },
     claimWorkspaceIdentity(cwd, instanceId, previousInstanceId, options) {
       if (workspaceRetirementCommitInFlight) return undefined;
       const normalizedCwd = normalizeTelegramWorkspacePath(cwd);
+      const normalizedSessionId = options?.sessionId === undefined
+        ? undefined
+        : normalizeTelegramSessionId(options.sessionId);
       if (!normalizedCwd || !instanceId ||
+          (options?.sessionId !== undefined && !normalizedSessionId) ||
           hasWorkspaceRetirementConflict({ cwd: normalizedCwd })) return undefined;
       const externalReservedSlots = captureExternalReservedSlots();
       if (!externalReservedSlots) {
@@ -2674,7 +2774,9 @@ export function createTelegramTopicTargetStore(
       );
       for (const claim of workspaceClaims.values()) {
         if (claim.instanceId !== instanceId) continue;
-        if (claim.identity.cwd !== normalizedCwd || !claim.identity.slot ||
+        if (claim.identity.cwd !== normalizedCwd ||
+            claim.identity.sessionId !== normalizedSessionId ||
+            !claim.identity.slot ||
             externalReservedSlotKeys.includes(claim.identity.slot.toLowerCase())) {
           return undefined;
         }
@@ -2686,11 +2788,13 @@ export function createTelegramTopicTargetStore(
       }
       const workspaceKey = resolveWorkspaceKey(normalizedCwd);
       if (!workspaceKey) return undefined;
-      let legacyRecord = findLegacyWorkspaceMigrationRecord(
-        normalizedCwd,
-        instanceId,
-        previousInstanceId,
-      );
+      let legacyRecord = normalizedSessionId
+        ? undefined
+        : findLegacyWorkspaceMigrationRecord(
+            normalizedCwd,
+            instanceId,
+            previousInstanceId,
+          );
       const legacyTarget = legacyRecord?.target;
       const targetBinding = legacyTarget
         ? Array.from(workspaceBindings.values()).find(
@@ -2772,12 +2876,16 @@ export function createTelegramTopicTargetStore(
         }
         if (!slot || !/^[A-Z]$/u.test(slot)) return undefined;
         const claimedIdentity = { ...identity, slot };
-        workspaceClaims.set(mapKey, { identity: claimedIdentity, instanceId });
+        workspaceClaims.set(mapKey, {
+          identity: claimedIdentity,
+          instanceId,
+        });
         return { ...claimedIdentity };
       };
       if (options?.existingBindingOnly) {
         const candidates = Array.from(workspaceBindings.values())
-          .filter((binding) => binding.cwd === normalizedCwd)
+          .filter((binding) => binding.cwd === normalizedCwd &&
+            binding.sessionId === normalizedSessionId)
           .sort((left, right) =>
             left.instanceSlot.length - right.instanceSlot.length ||
             left.instanceSlot.localeCompare(right.instanceSlot),
@@ -2786,6 +2894,9 @@ export function createTelegramTopicTargetStore(
           const claimed = claimIdentity({
             cwd: binding.cwd,
             workspaceKey: binding.workspaceKey,
+            ...(binding.sessionId && binding.sessionKey
+              ? { sessionId: binding.sessionId, sessionKey: binding.sessionKey }
+              : {}),
             instanceSlot: binding.instanceSlot,
             bindingKey: binding.bindingKey,
           });
@@ -2811,6 +2922,7 @@ export function createTelegramTopicTargetStore(
           normalizedCwd,
           workspaceKey,
           ordinal,
+          normalizedSessionId,
         );
         if (!identity) return undefined;
         const mapKey = getWorkspaceBindingMapKey(identity);
@@ -2850,6 +2962,8 @@ export function createTelegramTopicTargetStore(
       const next = normalizeWorkspaceBindingRecord(binding);
       if (next && hasWorkspaceRetirementConflict(next)) return undefined;
       if (!next) return undefined;
+      const nextMapKey = getWorkspaceBindingMapKey(next);
+      const claim = workspaceClaims.get(nextMapKey);
       if (next.slot && Array.from(workspaceBindings.values()).some((existing) =>
         existing.bindingKey !== next.bindingKey && existing.slot === next.slot,
       )) return undefined;
@@ -2861,9 +2975,11 @@ export function createTelegramTopicTargetStore(
           return undefined;
         }
       }
-      const nextMapKey = getWorkspaceBindingMapKey(next);
       const previous = workspaceBindings.get(nextMapKey);
       if (previous?.showSlotSuffix) next.showSlotSuffix = true;
+      if (previous?.threadName && !next.threadName) {
+        next.threadName = previous.threadName;
+      }
       if (previous?.manualThreadName && !next.manualThreadName) {
         next.manualThreadName = previous.manualThreadName;
       }
@@ -2884,7 +3000,6 @@ export function createTelegramTopicTargetStore(
         if (previous.displayTitle) next.displayTitle = previous.displayTitle;
         if (previous.inactiveSinceMs !== undefined) next.inactiveSinceMs = previous.inactiveSinceMs;
       }
-      const claim = workspaceClaims.get(nextMapKey);
       if (claimInstanceId) {
         if (claim?.instanceId !== claimInstanceId) return undefined;
         if (next.slot !== undefined && claim.identity.slot !== next.slot) return undefined;
@@ -3460,6 +3575,7 @@ export interface TelegramPromoteFollowerBindingToLeaderDeps {
   store: TelegramTopicTargetStore;
   instanceId: string;
   cwd?: string;
+  sessionId?: string;
   telegramProfile?: string;
   target?: TelegramTarget;
   slot?: string;
@@ -3483,11 +3599,15 @@ export async function promoteTelegramFollowerBindingToLeader(
     );
   const workspaceIdentity = deps.cwd
     ? deps.store.claimWorkspaceIdentity(deps.cwd, deps.instanceId,
-        existing?.instanceId, { existingBindingOnly: true })
+        existing?.instanceId, {
+          existingBindingOnly: true,
+          sessionId: deps.sessionId,
+        })
     : undefined;
   const workspaceBinding = workspaceIdentity
     ? deps.store.getWorkspaceBinding(
         workspaceIdentity.cwd, workspaceIdentity.instanceSlot,
+        workspaceIdentity.sessionId,
       )
     : undefined;
   const exactWorkspaceBinding = workspaceBinding &&

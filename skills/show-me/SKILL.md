@@ -10,7 +10,7 @@ Help the user understand the current topic. Skip the preamble and keep prose bri
 - Infer the subject from the conversation and honor an explicitly requested format. With plain `show me`, choose the form that best explains the subject.
 - Markdown in the reply is a complete output format for both chat and terminal surfaces. Use headings, emphasis, lists, and focused code blocks to explain outcomes, comparisons, and reasoning; add a diagram when relationships need one.
 - `Show me markdown` requests a rendered Markdown reply. Create a Markdown file only when the user asks for a saved document or file artifact.
-- `Show me html` requests a focused HTML file. Save file artifacts in the project or filesystem as appropriate and deliver them through the active environment's file-delivery mechanism; open locally when that is the requested surface.
+- `Show me html` requests a focused HTML file. Prefer an accessible, art-directed interactive infographic when timelines, comparisons, layers, or progressive disclosure clarify the subject; otherwise stay static. Preserve truthful labels and reduced motion. Save and deliver the artifact through the active environment; open it locally when requested.
 
 ### Surface Routing
 

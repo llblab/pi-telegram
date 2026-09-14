@@ -90,6 +90,7 @@ function createTelegramBusFollowerRegistrationRuntime<TContext extends {
 ) {
   const { protocolIdentity = TEST_BUS_PROTOCOL_IDENTITY, ...ports } = deps;
   return createRawTelegramBusFollowerRegistrationRuntime({
+    getSessionId: () => "test-session",
     ...ports,
     protocolIdentity,
   });
@@ -189,7 +190,7 @@ test("Bus follower promotion handler transfers binding only after leadership acq
   const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
   const events: unknown[] = [];
   store.upsertWorkspaceBinding({
-    ...createTelegramWorkspaceBindingIdentity("/repo")!,
+    ...createTelegramWorkspaceBindingIdentity("/repo", 0, "session-a")!,
     target: { chatId: 42, threadId: 11 }, slot: "E", threadName: "Ember",
     displayTitle: "repo_e", updatedAtMs: 100,
   });
@@ -198,6 +199,7 @@ test("Bus follower promotion handler transfers binding only after leadership acq
     topicTargetStore: store,
     instanceId: "inst-a",
     getActiveProfileName: () => "work",
+    getSessionId: () => "session-a",
     startLeader: async (ctx: { cwd: string }, _election, onAcquired) => {
       events.push(`acquired:${ctx.cwd}`);
       await onAcquired();
@@ -221,8 +223,9 @@ test("Bus follower promotion handler transfers binding only after leadership acq
     );
     assert.equal(store.list()[0]?.profileKey, "profile:work:cwd:/repo");
     assert.equal(store.list()[0]?.owner?.kind, "leader");
-    assert.equal(store.getWorkspaceBinding("/repo")?.threadName, "Ember");
-    assert.equal(store.getWorkspaceBinding("/repo")?.displayTitle, "repo_e");
+    assert.equal(store.getWorkspaceBinding("/repo"), undefined);
+    assert.equal(store.getWorkspaceBinding("/repo", "a", "session-a")?.threadName, "Ember");
+    assert.equal(store.getWorkspaceBinding("/repo", "a", "session-a")?.displayTitle, "repo_e");
     assert.equal(events[0], "acquired:/repo");
     assert.deepEqual(events[1], {
       category: "bus",
@@ -2019,6 +2022,7 @@ test("Bus follower assembly wires receiver, recovery, and registration", async (
       getFollowerBusSocketPath: () => followerSocketPath,
       getLeaderSocketPath: () => leaderSocketPath,
       createRequestId: () => `inst-a:${++requestSequence}`,
+      getSessionId: () => "session-a",
     },
   });
   try {
@@ -2158,7 +2162,8 @@ test("Restore-only registration carries its acknowledged title before the first 
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-display-auto-connect-"));
   const socketPath = join(dir, "bus.sock");
   const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
-  store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo")!,
+  store.upsertWorkspaceBinding({
+    ...createTelegramWorkspaceBindingIdentity("/repo", 0, "test-session")!,
     target: { chatId: 7, threadId: 42 }, slot: "A", threadName: "Anchor",
     displayTitle: "repo_a", updatedAtMs: 1 });
   const calls: string[] = [];
@@ -2558,6 +2563,7 @@ test("Bus follower registration runtime registers and explicitly disconnects", a
     getNowMs: () => 1000,
     getPid: () => 123,
     getProcessBirthId: () => "123:start:abc",
+    getSessionId: () => "session-a",
     getSessionGeneration: () => 4,
   });
   try {
@@ -2574,6 +2580,7 @@ test("Bus follower registration runtime registers and explicitly disconnects", a
       profileKey: "cwd:/repo",
       threadName: "repo",
       cwd: "/repo",
+      sessionId: "session-a",
       pid: 123,
       processBirthId: "123:start:abc",
       sessionGeneration: 4,
@@ -2644,7 +2651,7 @@ test("Bus follower rejects an acknowledgement without protocol identity", async 
   }
 });
 
-test("Bus follower rejects a leader without its required durable capability", async () => {
+test("Bus follower rejects a pre-session protocol leader", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-follower-capability-"));
   const socketPath = join(dir, "bus.sock");
   const server = createTelegramBusLocalServer({
@@ -2653,7 +2660,11 @@ test("Bus follower rejects a leader without its required durable capability", as
       kind: "bus.ack",
       requestId: envelope.requestId,
       ok: true,
-      protocol: createTelegramBusProtocolIdentity({ runtimeBuild: "0.28.0" }),
+      protocol: {
+        protocolVersion: 1,
+        runtimeBuild: "0.45.11",
+        capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION],
+      },
     }),
   });
   const state = createTelegramBusFollowerRegistrationState();
@@ -2668,13 +2679,10 @@ test("Bus follower rejects a leader without its required durable capability", as
   });
   try {
     await server.start();
-    await assert.rejects(
-      follower.registerWithLeader(
-        { cwd: "/repo" },
-        { busSocketPath: socketPath },
-      ),
-      /missing-capability/u,
-    );
+    await assert.rejects(follower.registerWithLeader(
+      { cwd: "/repo" },
+      { busSocketPath: socketPath },
+    ), /version-mismatch/u);
     assert.equal(state.isRegistered(), false);
   } finally {
     follower.stop();

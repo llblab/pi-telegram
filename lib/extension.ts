@@ -1124,6 +1124,7 @@ export default function (pi: Pi.ExtensionAPI) {
       topicTargetStore: threadStore,
       instanceId: telegramInstanceId,
       getActiveProfileName: configStore.getActiveProfileName,
+      getSessionId: Pi.getExtensionContextSessionId,
       getWorkspaceAdmission: workspaceAdmissionRuntime.resolve,
       async startLeader(ctx, election, onAcquired): Promise<boolean> {
         const result = await lockedPollingRuntime.start(ctx, {
@@ -1202,6 +1203,7 @@ export default function (pi: Pi.ExtensionAPI) {
         getProcessBirthId() {
           return telegramQueueProcessBirthId;
         },
+        getSessionId: Pi.getExtensionContextSessionId,
         getSessionGeneration: telegramSessionContextStore.getGeneration,
         async onRegistered(ctx) {
           await followerAdmissionLifecycleRuntime.onTransportChanged(ctx);
@@ -1318,6 +1320,7 @@ export default function (pi: Pi.ExtensionAPI) {
       getAllowedUserId: configStore.getAllowedUserId,
       instanceId: telegramInstanceId,
       getCwd: Pi.getExtensionContextCwd,
+      getSessionId: Pi.getExtensionContextSessionId,
       getTelegramProfile: configStore.getActiveProfileName,
       getThreadDisplayMode() {
         return Config.resolveTelegramThreadDisplayMode(configStore.get());
@@ -1412,7 +1415,10 @@ export default function (pi: Pi.ExtensionAPI) {
         });
       },
       hasRememberedWorkspaceBinding(ctx) {
-        return threadStore.hasWorkspaceBinding(Pi.getExtensionContextCwd(ctx));
+        return threadStore.hasWorkspaceBinding(
+          Pi.getExtensionContextCwd(ctx),
+          Pi.getExtensionContextSessionId(ctx),
+        );
       },
       suspendLiveThreadTarget: telegramBusLeaderState.clear,
       stopFollowerRegistration: telegramBusFollowerRegistration.stop,

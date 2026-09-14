@@ -17,6 +17,8 @@ import type { TelegramWorkspaceDeletionPermit,
 export interface TelegramThreadCleanupBindingSnapshot {
   cwd: string;
   workspaceKey: string;
+  sessionId?: string;
+  sessionKey?: string;
   instanceSlot: string;
   slot?: string;
   bindingKey: string;
@@ -40,6 +42,8 @@ export interface TelegramThreadCleanupCandidate {
   bindingKey: string;
   cwd: string;
   workspaceKey: string;
+  sessionId?: string;
+  sessionKey?: string;
   instanceSlot: string;
   slot: string;
   target: { chatId: number; threadId: number };
@@ -54,6 +58,21 @@ function targetKey(target: { chatId: number; threadId: number }): string {
 function validTarget(target: { chatId: number; threadId: number }): boolean {
   return Number.isSafeInteger(target.chatId) && Number.isSafeInteger(target.threadId) &&
     target.threadId > 0;
+}
+
+function validSessionIdentity(value: {
+  sessionId?: unknown;
+  sessionKey?: unknown;
+}): boolean {
+  if (value.sessionId === undefined && value.sessionKey === undefined) return true;
+  if (typeof value.sessionId !== "string" || !value.sessionId ||
+      value.sessionId !== value.sessionId.trim() ||
+      Buffer.byteLength(value.sessionId, "utf8") > 256 ||
+      typeof value.sessionKey !== "string" || !/^[a-f0-9]{64}$/u.test(value.sessionKey)) {
+    return false;
+  }
+  return createHash("sha256").update(value.sessionId).digest("hex") ===
+    value.sessionKey;
 }
 
 /** Returns no candidates when any identity/evidence ambiguity exists. */
@@ -72,7 +91,7 @@ export function planTelegramInactiveThreadCleanup(input: {
     const key = targetKey(binding.target);
     const slot = binding.slot;
     if (!binding.bindingKey || !binding.cwd || !binding.workspaceKey || !binding.instanceSlot ||
-        typeof slot !== "string" || !slot ||
+        typeof slot !== "string" || !slot || !validSessionIdentity(binding) ||
         !validTarget(binding.target) || bindingKeys.has(binding.bindingKey) || bindingTargets.has(key)) return [];
     bindingKeys.add(binding.bindingKey);
     bindingTargets.add(key);
@@ -101,8 +120,11 @@ export function planTelegramInactiveThreadCleanup(input: {
         evidence.liveOwner !== "clear" || evidence.acceptedWork !== "clear" ||
         evidence.deliveryAuthority !== "clear" || competing.has(targetKey(binding.target))) continue;
     candidates.push({ profileName: input.profileName, bindingKey: binding.bindingKey,
-      cwd: binding.cwd, workspaceKey: binding.workspaceKey, instanceSlot: binding.instanceSlot,
-      slot, target: { ...binding.target }, inactiveSinceMs,
+      cwd: binding.cwd, workspaceKey: binding.workspaceKey,
+      ...(binding.sessionId && binding.sessionKey
+        ? { sessionId: binding.sessionId, sessionKey: binding.sessionKey }
+        : {}),
+      instanceSlot: binding.instanceSlot, slot, target: { ...binding.target }, inactiveSinceMs,
       bindingUpdatedAtMs: binding.updatedAtMs });
   }
   return candidates.sort((left, right) => left.bindingKey.localeCompare(right.bindingKey));
@@ -124,7 +146,11 @@ export function captureTelegramInactiveThreadCleanupEvidence<
 }): Parameters<typeof planTelegramInactiveThreadCleanup>[0] {
   const sourceBindings = input.listBindings();
   const bindings = sourceBindings.map(binding => ({
-    cwd: binding.cwd, workspaceKey: binding.workspaceKey, instanceSlot: binding.instanceSlot,
+    cwd: binding.cwd, workspaceKey: binding.workspaceKey,
+    ...(binding.sessionId && binding.sessionKey
+      ? { sessionId: binding.sessionId, sessionKey: binding.sessionKey }
+      : {}),
+    instanceSlot: binding.instanceSlot,
     ...(binding.slot === undefined ? {} : { slot: binding.slot }), bindingKey: binding.bindingKey, target: { ...binding.target },
     ...(binding.inactiveSinceMs === undefined ? {} : { inactiveSinceMs: binding.inactiveSinceMs }),
     updatedAtMs: binding.updatedAtMs,
@@ -237,16 +263,20 @@ function validateWorkSet(value: unknown, profileName: string): TelegramThreadCle
   const createdAtMs = value.createdAtMs as number;
   const entries = value.entries.map(raw => {
     if (!isObject(raw) || !onlyKeys(raw, ["profileName", "bindingKey", "cwd", "workspaceKey",
-      "instanceSlot", "slot", "target", "inactiveSinceMs", "bindingUpdatedAtMs", "state", "updatedAtMs",
+      "sessionId", "sessionKey", "instanceSlot", "slot", "target", "inactiveSinceMs", "bindingUpdatedAtMs", "state", "updatedAtMs",
       "issuedAtMs", "permitOperationId", "permitIntentId", "permitLeaderEpoch", "deletedAtMs"]) || raw.profileName !== profileName || typeof raw.bindingKey !== "string" ||
       !raw.bindingKey || typeof raw.cwd !== "string" || !raw.cwd || typeof raw.workspaceKey !== "string" ||
-      !raw.workspaceKey || typeof raw.instanceSlot !== "string" || !raw.instanceSlot ||
+      !raw.workspaceKey || !validSessionIdentity(raw) ||
+      typeof raw.instanceSlot !== "string" || !raw.instanceSlot ||
       typeof raw.slot !== "string" || !raw.slot || !isObject(raw.target) ||
       !onlyKeys(raw.target, ["chatId", "threadId"]) || !validTarget(raw.target as unknown as { chatId: number; threadId: number }) ||
       !safeTime(raw.inactiveSinceMs) || !safeTime(raw.bindingUpdatedAtMs) ||
       (raw.bindingUpdatedAtMs as number) < (raw.inactiveSinceMs as number) || !safeTime(raw.updatedAtMs))
       throw new Error("Telegram Thread cleanup entry schema is invalid.");
     const base = { profileName, bindingKey: raw.bindingKey, cwd: raw.cwd, workspaceKey: raw.workspaceKey,
+      ...(typeof raw.sessionId === "string" && typeof raw.sessionKey === "string"
+        ? { sessionId: raw.sessionId, sessionKey: raw.sessionKey }
+        : {}),
       instanceSlot: raw.instanceSlot, slot: raw.slot, target: { chatId: raw.target.chatId as number,
         threadId: raw.target.threadId as number }, inactiveSinceMs: raw.inactiveSinceMs as number,
       bindingUpdatedAtMs: raw.bindingUpdatedAtMs as number, updatedAtMs: raw.updatedAtMs as number };

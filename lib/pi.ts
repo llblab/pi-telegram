@@ -260,6 +260,10 @@ export function getExtensionContextCwd(ctx: ExtensionContext): string {
   return ctx.cwd;
 }
 
+export function getExtensionContextSessionId(ctx: ExtensionContext): string {
+  return ctx.sessionManager.getSessionId();
+}
+
 export function isExtensionContextIdle(ctx: ExtensionContext): boolean {
   return ctx.isIdle();
 }

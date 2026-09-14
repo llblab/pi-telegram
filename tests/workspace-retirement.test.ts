@@ -55,10 +55,12 @@ function addBinding(
   store: ReturnType<typeof createTelegramTopicTargetStore>,
   index: number,
   inactiveSinceMs: number,
+  sessionId?: string,
 ): void {
   const slot = String.fromCharCode("A".charCodeAt(0) + index);
   store.upsertWorkspaceBinding({
-    ...createTelegramWorkspaceBindingIdentity(`/repo/${index}`)!,
+    ...createTelegramWorkspaceBindingIdentity(
+      `/repo/${index}`, 0, sessionId)!,
     target: { chatId: 7, threadId: 40 + index },
     slot,
     threadName: `Workspace${index}`,
@@ -842,7 +844,8 @@ test("Pressure preparation persists the oldest eligible exact intent and resumes
   try {
     const store = createTelegramTopicTargetStore({ path, getNowMs: () => 1000 });
     for (let index = 0; index < 26; index++) {
-      addBinding(store, index, index === 5 ? 10 : 20 + index);
+      addBinding(store, index, index === 5 ? 10 : 20 + index,
+        index === 5 ? "session-a" : undefined);
     }
     await store.persist();
     const deps = {
@@ -858,6 +861,7 @@ test("Pressure preparation persists the oldest eligible exact intent and resumes
     assert.equal(prepared.intent.binding.cwd, "/repo/5");
     assert.equal(prepared.intent.binding.slot, "F");
     assert.equal(prepared.intent.binding.inactiveSinceMs, 10);
+    assert.equal(prepared.intent.binding.sessionId, "session-a");
     assert.equal(prepared.intent.profileKey, "default");
     assert.equal(prepared.intent.leaderEpoch, "leader:1");
     assert.deepEqual(await prepareTelegramWorkspaceRetirement(deps), prepared);
@@ -865,7 +869,9 @@ test("Pressure preparation persists the oldest eligible exact intent and resumes
     const restored = createTelegramTopicTargetStore({ path });
     await restored.load();
     assert.deepEqual(restored.listWorkspaceRetirementIntents(), [prepared.intent]);
-    assert.equal(restored.getWorkspaceBinding("/repo/5")?.slot, "F");
+    assert.equal(restored.getWorkspaceBinding("/repo/5"), undefined);
+    assert.equal(restored.getWorkspaceBinding(
+      "/repo/5", "a", "session-a")?.slot, "F");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

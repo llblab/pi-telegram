@@ -5,6 +5,7 @@
 
 import { mkdtemp, mkdir, readdir, rm, symlink } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,14 @@ import { createTelegramWorkspaceAdmissionLedger } from "../lib/workspace-admissi
 const binding = {
   cwd: "/repo/a", workspaceKey: "workspace:a", instanceSlot: "a", slot: "A", bindingKey: "binding:a",
   target: { chatId: -1001, threadId: 7 }, inactiveSinceMs: 10, updatedAtMs: 20,
+};
+const sessionId = "session-a";
+const sessionKey = createHash("sha256").update(sessionId).digest("hex");
+const sessionBinding = {
+  ...binding,
+  sessionId,
+  sessionKey,
+  bindingKey: `binding:a-s-${sessionKey}`,
 };
 const execFileAsync = promisify(execFile);
 const test = process.platform === "win32" ? nodeTest.skip : nodeTest;
@@ -48,6 +57,23 @@ test("Cleanup planner admits only exact fully-clear inactive bindings", () => {
   assert.deepEqual(planTelegramInactiveThreadCleanup({
     profileName: "work", bindings: [binding],
     protection: [{ ...clear, liveOwner: "unknown" }],
+  }), []);
+});
+
+test("Cleanup planner preserves exact session identity and rejects partial or mismatched identity", () => {
+  const protection = [{ ...clear, bindingKey: sessionBinding.bindingKey }];
+  const planned = planTelegramInactiveThreadCleanup({
+    profileName: "work", bindings: [sessionBinding], protection,
+  });
+  assert.equal(planned[0]?.sessionId, sessionId);
+  assert.equal(planned[0]?.sessionKey, sessionKey);
+  assert.deepEqual(planTelegramInactiveThreadCleanup({
+    profileName: "work", bindings: [{ ...sessionBinding, sessionKey: "f".repeat(64) }],
+    protection,
+  }), []);
+  assert.deepEqual(planTelegramInactiveThreadCleanup({
+    profileName: "work", bindings: [{ ...sessionBinding, sessionKey: undefined }],
+    protection,
   }), []);
 });
 
@@ -80,7 +106,8 @@ test("Cleanup review durably prepares one canonical work-set under admission", a
       profileName: "work", tokenSha256: "a".repeat(64) });
     let admissions = 0;
     const runtime = createTelegramInactiveThreadCleanupReviewRuntime({
-      getProfileName: () => "work", listBindings: () => [binding], getProtection: () => clear,
+      getProfileName: () => "work", listBindings: () => [sessionBinding],
+      getProtection: () => ({ ...clear, bindingKey: sessionBinding.bindingKey }),
       listReservations: () => [], listPendingProvisions: () => [], listPendingCleanups: () => [],
       getWorkStore: () => store,
       async runWorkspaceOperation(_input, operation) { admissions += 1; return operation(); },
@@ -91,6 +118,8 @@ test("Cleanup review durably prepares one canonical work-set under admission", a
     assert.equal(first.count, 1);
     assert.equal(admissions, 2);
     assert.equal(store.list().length, 1);
+    assert.equal(store.list()[0]?.entries[0]?.sessionId, sessionId);
+    assert.equal(store.list()[0]?.entries[0]?.sessionKey, sessionKey);
     assert.match(first.operationId!, /^thread-cleanup:[a-f0-9]{32}$/u);
     assert.equal(store.list()[0]!.operationId, first.operationId);
   } finally { await rm(dir, { recursive: true, force: true }); }

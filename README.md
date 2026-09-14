@@ -6,7 +6,7 @@
 
 `pi-telegram` turns a private Telegram DM into a mobile operator surface for Pi. It accepts prompts, queues work, streams readable previews, delivers final replies and files, exposes safe controls, and lets companion extensions add Telegram-native capabilities without owning a second bot loop.
 
-It is a **runtime adapter**, not a remote terminal. Start or supervise work in the Pi TUI, then continue from Telegram while away from the keyboard. Each Telegram destination follows a running Pi instance and sends prompts into that instance's currently active session; it is not permanently bound to one session file or session identity. The bridge preserves Pi session semantics instead of pretending Telegram is a PTY, shell, process launcher, or session browser. That boundary is the product: Telegram gets safe runtime handles, not raw terminal power.
+It is a **runtime adapter**, not a remote terminal. Start or supervise work in the Pi TUI, then continue from Telegram while away from the keyboard. In Threaded Mode, a durable Workspace binding uses Pi's stable public session identity to restore the same Telegram Thread when that session resumes; live instance ownership and the exact Telegram target still authorize routing. The bridge preserves Pi session semantics instead of pretending Telegram is a PTY, shell, process launcher, or session browser. That boundary is the product: Telegram gets safe runtime handles, not raw terminal power.
 
 Every completed intermediate commentary block from a Telegram-originated turn is delivered once as its own message before the existing final reply. While Telegram is connected, local, autonomous, and unclassified extension follow-up work also projects visible checkpoints and the final answer to the authorized Telegram target once and in order, preserving assistant-authored `telegram_button` comments as interactive prompt buttons. This connected companion projection is always active rather than configurable. Neither path mirrors local prompts, thinking, tool traffic, token deltas, or stale-generation work. The separate `Activity` setting defaults to `verbose` so new installations discover collapsed provider-exposed thinking and tool evidence immediately; operators can narrow it to one class or choose `quiet`. See [Outbound](docs/outbound.md#public-assistant-output) and the [configuration reference](docs/public-api.md#configuration-api).
 
@@ -55,7 +55,7 @@ Paste the bot token. If `~/.pi/agent/telegram.json` already contains a saved tok
 /telegram-connect
 ```
 
-The connected Pi instance owns Telegram polling. Use `/telegram-connect <profile>` to activate a named profile, and optionally append `as=Name` to name a fresh Workspace Thread. Each profile is a parallel bot runtime with isolated polling, diagnostics, Threaded Mode state, and local bus transport; the `default` profile keeps unsuffixed runtime paths. In classic mode each profile uses a singleton lock. When Telegram private-chat Threaded Mode is available, one live instance becomes the profile's leader and later visible Pi instances register as followers. A reopened follower Workspace with a remembered Thread reconnects automatically at session startup; a new Workspace still requires explicit `/telegram-connect`.
+The connected Pi instance owns Telegram polling. Use `/telegram-connect <profile>` to activate a named profile, and optionally append `as=Name` to name a fresh Workspace Thread. Each profile is a parallel bot runtime with isolated polling, diagnostics, Threaded Mode state, and local bus transport; the `default` profile keeps unsuffixed runtime paths. In classic mode each profile uses a singleton lock. When Telegram private-chat Threaded Mode is available, one live instance becomes the profile's leader and later visible Pi instances register as followers. Reopening or resuming the same Pi session restores its remembered Thread at session startup; a distinct session in the same directory has its own binding and still requires explicit `/telegram-connect` when no remembered binding exists.
 
 After an unclean computer shutdown, `/telegram-connect` detects truncated or structurally invalid temporary ownership/routing files, quarantines only the damaged files under `tmp/telegram/recovery/`, and retries once. A journal snapshot removed by older broad temp cleanup is rebuilt when its complete segment history proves an empty result, while a revisionless snapshot is repaired from the first surviving segment's exact predecessor when the reconstructed tail validates. Otherwise the snapshot and segments are quarantined as recovery evidence, a fresh journal is published, and startup continues with an informational diagnostic instead of requiring manual JSON repair. Unsupported journal versions block recovery without rewriting or quarantining the retained files; use a compatible runtime rather than deleting journals. Saved `telegram.json` configuration and runtime diagnostics remain intact. Recovery never replaces a verifiable live owner; if safe automatic recovery cannot complete, the command gives one explicit Pi-restart instruction instead of requiring deletion of the whole `tmp/` directory.
 
@@ -236,7 +236,7 @@ Classic private DM mode is the base product mode. When Telegram private-chat Thr
 - Followers are visible Pi processes started by the operator.
 - Each connected instance gets a Telegram thread target.
 - Queued work for a live follower transfers through authenticated exact-journal handoff rather than replaying under the transport owner.
-- Follower session replacement preserves registration, and a reopened follower Workspace with a remembered Thread reconnects automatically without allocating a Thread for an unremembered Workspace.
+- Reopening, resuming, or replacing the process for the same Pi session restores its remembered Thread; distinct sessions in one directory keep independent bindings and letter slots.
 - Unknown threads are preserved and offered explicit reroute/restore choices.
 - Telegram never launches hidden Pi processes.
 
@@ -245,7 +245,7 @@ In Threaded Mode, open Settings → **🧵 Thread display** to choose **Letters*
 | Mode | Best for | Runtime shape |
 | --- | --- | --- |
 | Classic DM | One running Pi instance and its active session controlled from one private bot chat | One polling owner, one queue/runtime surface |
-| Threaded Mode | Several visible Pi instances sharing one bot | One leader owns transport; each named private-chat thread follows its assigned instance and current session |
+| Threaded Mode | Several visible Pi sessions sharing one bot | One leader owns transport; each private-chat Thread retains one session-qualified Workspace binding |
 
 ## Environment Configuration
 
