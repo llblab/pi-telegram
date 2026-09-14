@@ -113,6 +113,7 @@ export interface TelegramBusLeaderTargetProvisionerDeps<TContext> {
   getAllowedUserId: () => number | undefined;
   instanceId: string;
   getCwd?: (ctx: TContext) => string | undefined;
+  getSessionId?: (ctx: TContext) => string | undefined;
   getTelegramProfile?: () => string | undefined;
   shouldForceFreshUnnamed?: () => boolean;
   getRequestedThreadName?: () => string | undefined;
@@ -234,6 +235,7 @@ export interface TelegramBusLeaderRuntimeAssemblyDeps<TContext> {
   getAllowedUserId: () => number | undefined;
   instanceId: string;
   getCwd?: (ctx: TContext) => string | undefined;
+  getSessionId?: (ctx: TContext) => string | undefined;
   getTelegramProfile?: () => string | undefined;
   shouldForceFreshUnnamed?: () => boolean;
   getRequestedThreadName?: () => string | undefined;
@@ -413,6 +415,7 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
     ...provisionerPorts,
     instanceId: deps.instanceId,
     getCwd: deps.getCwd,
+    getSessionId: deps.getSessionId,
     getTelegramProfile: deps.getTelegramProfile,
     shouldForceFreshUnnamed: deps.shouldForceFreshUnnamed,
     getRequestedThreadName: deps.getRequestedThreadName,
@@ -908,6 +911,7 @@ export function createTelegramBusFollowerTargetProvisioner(
           {
             existingBindingOnly:
               options?.existingWorkspaceBindingOnly === true,
+            sessionId: registration.sessionId,
             onCapacityUnavailable() {
               capacityUnavailable = true;
             },
@@ -925,6 +929,7 @@ export function createTelegramBusFollowerTargetProvisioner(
       ? deps.topicTargetStore.getWorkspaceBinding(
           workspaceIdentity.cwd,
           workspaceIdentity.instanceSlot,
+          workspaceIdentity.sessionId,
         )
       : undefined;
     const provision = Threads.createTelegramTopicTargetProvisioner({
@@ -1567,6 +1572,7 @@ export function createTelegramBusLeaderTargetProvisioner<TContext>(
         getAllowedUserId: deps.getAllowedUserId,
         instanceId: deps.instanceId,
         cwd: normalizedCwd,
+        sessionId: deps.getSessionId?.(ctx),
         telegramProfile: deps.getTelegramProfile?.(),
         forceFreshUnnamed: deps.shouldForceFreshUnnamed?.(),
         requestedThreadName: deps.getRequestedThreadName?.(),
@@ -2101,6 +2107,8 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
           );
         if (
           !compatibility.compatible || !displayCompatible() ||
+          (envelope.registration.cwd !== undefined &&
+            envelope.registration.sessionId === undefined) ||
           (restoringWorkspace && !supportsWorkspaceAutoConnect)
         ) {
           return {
@@ -2110,7 +2118,11 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
             protocol: deps.protocolIdentity,
             error: { code: "incompatible-protocol" as const },
             message: `Incompatible Telegram bus protocol: ${
-              compatibility.reason ?? "missing-capability"
+              compatibility.reason ??
+                (envelope.registration.cwd !== undefined &&
+                  envelope.registration.sessionId === undefined
+                  ? "missing-session-identity"
+                  : "missing-capability")
             }.`,
           };
         }

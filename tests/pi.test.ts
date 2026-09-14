@@ -13,6 +13,7 @@ import {
   createScopedModelPatternPersister,
   type ExtensionContext,
   getExtensionContextCwd,
+  getExtensionContextSessionId,
   formatPollingStartBlockedByRunMode,
   getExtensionContextMode,
   getExtensionContextModel,
@@ -54,6 +55,16 @@ test("Pi context mode helpers feature-detect passive run modes", () => {
     formatPollingStartBlockedByRunMode({ mode: "json" }),
     "Telegram polling is unavailable in Pi json mode. Use /telegram-connect from a long-lived Pi session.",
   );
+});
+
+test("Pi session identity adapter is lifecycle-alias agnostic", () => {
+  const sessionManager = { getSessionId: () => "stable-session" };
+  for (const lifecycleAlias of ["restart", "reload", "resume", "continue-recent"]) {
+    const ctx = { sessionManager, lifecycleAlias } as unknown as ExtensionContext;
+    assert.equal(getExtensionContextSessionId(ctx), "stable-session");
+  }
+  const forked = { sessionManager: { getSessionId: () => "forked-session" } } as ExtensionContext;
+  assert.notEqual(getExtensionContextSessionId(forked), "stable-session");
 });
 
 test("Pi API runtime ports bind methods without losing receiver context", async () => {

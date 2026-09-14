@@ -836,14 +836,18 @@ function createRuntimeTelegramApiErrorResponse(
   } as Response;
 }
 
+let runtimeExtensionContextSequence = 0;
+
 function createRuntimeExtensionContext(
   overrides: Record<string, unknown> = {},
 ) {
+  const sessionId = `integration-session-${++runtimeExtensionContextSequence}`;
   return {
     hasUI: true,
     cwd: process.cwd(),
     model: undefined,
     signal: undefined,
+    sessionManager: { getSessionId: () => sessionId },
     ui: {
       theme: {
         fg: (_token: string, text: string) => text,
@@ -1202,6 +1206,7 @@ test("Graceful follower disconnect persists intent and deletes through its live 
       runtimeBuild: "test",
     }),
     getLeaderAuthSecret: (leader) => leader.busSecret,
+    getSessionId: () => "session-a",
     getNowMs: () => 2000,
     registrationTimeoutMs: 5_000,
   });
@@ -4369,7 +4374,10 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
     await writeRuntimeTelegramLocks({});
     (await getRuntimeTelegramExtension())(pi);
     const idleCtx = createRuntimeExtensionContext();
-    const activeCtx = createRuntimeExtensionContext({ isIdle: () => false });
+    const activeCtx = createRuntimeExtensionContext({
+      sessionManager: idleCtx.sessionManager,
+      isIdle: () => false,
+    });
     await handlers.get("session_start")?.({}, idleCtx);
     await commands.get("telegram-connect")?.handler("", idleCtx);
     await waitForCondition(() => dispatched);
@@ -4522,6 +4530,7 @@ test("Extension runtime clears queued follow-ups after a Telegram stop", async (
     const idleCtx = createRuntimeExtensionContext();
     let aborted = false;
     const activeCtx = createRuntimeExtensionContext({
+      sessionManager: idleCtx.sessionManager,
       isIdle: () => false,
       abort: () => {
         aborted = true;

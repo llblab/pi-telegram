@@ -220,7 +220,7 @@ export function createTelegramBusAuthSecret(): string {
   return randomBytes(32).toString("base64url");
 }
 
-export const TELEGRAM_BUS_PROTOCOL_VERSION = 1 as const;
+export const TELEGRAM_BUS_PROTOCOL_VERSION = 2 as const;
 export const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION =
   "durable-follower-admission-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF =
@@ -369,6 +369,7 @@ export interface TelegramBusInstanceRegistration {
   threadName?: string;
   slot?: string;
   cwd?: string;
+  sessionId?: string;
   pid?: number;
   target?: TelegramTarget;
   busSocketPath?: string;
@@ -2991,6 +2992,12 @@ function parseRegistration(
     registration.slot = value.slot;
   }
   if (typeof value.cwd === "string") registration.cwd = value.cwd;
+  if (value.sessionId !== undefined) {
+    if (typeof value.sessionId !== "string" || !value.sessionId ||
+        value.sessionId !== value.sessionId.trim() ||
+        Buffer.byteLength(value.sessionId, "utf8") > 256) return undefined;
+    registration.sessionId = value.sessionId;
+  }
   if (typeof value.pid === "number") registration.pid = value.pid;
   if (typeof value.busSocketPath === "string") {
     registration.busSocketPath = value.busSocketPath;

@@ -217,6 +217,25 @@ test("Workspace identities use readable cwd keys and deterministic concurrent su
   );
   assert.equal(createTelegramWorkspaceBindingIdentity("", 0), undefined);
   assert.equal(createTelegramWorkspaceBindingIdentity(cwd, -1), undefined);
+  const sessionA = createTelegramWorkspaceBindingIdentity(cwd, 0, "session-a");
+  const sessionARepeat = createTelegramWorkspaceBindingIdentity(
+    cwd,
+    0,
+    " session-a ",
+  );
+  const sessionB = createTelegramWorkspaceBindingIdentity(cwd, 0, "session-b");
+  assert.ok(sessionA);
+  assert.deepEqual(sessionARepeat, sessionA);
+  assert.equal(sessionA.sessionId, "session-a");
+  assert.match(sessionA.sessionKey!, /^[a-f0-9]{64}$/u);
+  assert.equal(sessionA.bindingKey,
+    `${sessionA.workspaceKey}-s-${sessionA.sessionKey}`);
+  assert.notEqual(sessionB?.bindingKey, sessionA.bindingKey);
+  assert.equal(createTelegramWorkspaceBindingIdentity(cwd, 0, ""), undefined);
+  assert.equal(
+    createTelegramWorkspaceBindingIdentity(cwd, 0, "x".repeat(257)),
+    undefined,
+  );
 });
 
 test("Workspace directory keys stay bounded and collision-verifiable by exact cwd", () => {
@@ -387,6 +406,51 @@ test("Thread store persists dormant workspace bindings with exact cwd", async ()
   }
 });
 
+test("Thread store persists distinct same-cwd session bindings without legacy aliasing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-session-workspaces-"));
+  const path = join(dir, "state.json");
+  const first = createTelegramWorkspaceBindingIdentity("/repo", 0, "session-a")!;
+  const second = createTelegramWorkspaceBindingIdentity("/repo", 0, "session-b")!;
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    assert.ok(store.upsertWorkspaceBinding({ ...first,
+      target: { chatId: 7, threadId: 41 }, slot: "A", updatedAtMs: 1 }));
+    assert.equal(store.hasWorkspaceBinding("/repo"), false);
+    assert.ok(store.upsertWorkspaceBinding({ ...second,
+      target: { chatId: 7, threadId: 42 }, slot: "B", updatedAtMs: 2 }));
+    assert.equal(store.hasWorkspaceBinding("/repo", "session-a"), true);
+    assert.equal(store.hasWorkspaceBinding("/repo", "session-b"), true);
+    assert.equal(store.hasWorkspaceBinding("/repo", "session-c"), false);
+    await store.persist();
+    const restored = createTelegramTopicTargetStore({ path });
+    await restored.load();
+    assert.equal(restored.getWorkspaceBinding("/repo", "a"), undefined);
+    assert.equal(
+      restored.getWorkspaceBinding("/repo", "a", "session-a")?.target.threadId,
+      41,
+    );
+    assert.equal(
+      restored.getWorkspaceBinding("/repo", "a", "session-b")?.target.threadId,
+      42,
+    );
+    const malformed = JSON.parse(await readFile(path, "utf8"));
+    malformed.workspaceBindings[0].sessionKey = "f".repeat(64);
+    await writeFile(path, JSON.stringify(malformed));
+    const rejected = createTelegramTopicTargetStore({ path });
+    await rejected.load();
+    assert.equal(
+      rejected.getWorkspaceBinding("/repo", "a", "session-a"),
+      undefined,
+    );
+    assert.equal(
+      rejected.getWorkspaceBinding("/repo", "a", "session-b")?.target.threadId,
+      42,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("Acknowledged display titles persist separately and cannot cross target replacement", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-workspace-title-"));
   const path = join(dir, "state.json");
@@ -473,6 +537,31 @@ test("Inactive Workspace cleanup commit removes only one exact unprotected bindi
     const reopened = createTelegramTopicTargetStore({ path });
     await reopened.load();
     assert.equal(reopened.getWorkspaceBinding("/cleanup"), undefined);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Inactive Workspace cleanup cannot cross same-cwd session identity", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-session-cleanup-"));
+  const path = join(dir, "state.json");
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    const first = { ...createTelegramWorkspaceBindingIdentity("/cleanup", 0, "session-a")!,
+      target: { chatId: 7, threadId: 41 }, slot: "A", inactiveSinceMs: 10, updatedAtMs: 20 };
+    const second = { ...createTelegramWorkspaceBindingIdentity("/cleanup", 0, "session-b")!,
+      target: { chatId: 7, threadId: 42 }, slot: "B", inactiveSinceMs: 11, updatedAtMs: 21 };
+    store.upsertWorkspaceBinding(first);
+    store.upsertWorkspaceBinding(second);
+    await store.persist();
+    const snapshot = { cwd: first.cwd, workspaceKey: first.workspaceKey,
+      sessionId: first.sessionId, sessionKey: first.sessionKey,
+      instanceSlot: first.instanceSlot, slot: first.slot, bindingKey: first.bindingKey,
+      target: first.target, inactiveSinceMs: first.inactiveSinceMs,
+      bindingUpdatedAtMs: first.updatedAtMs };
+    assert.equal(await store.commitInactiveWorkspaceCleanup({ ...snapshot,
+      sessionId: "session-b" }, () => true), false);
+    assert.equal(await store.commitInactiveWorkspaceCleanup(snapshot, () => true), true);
+    assert.equal(store.getWorkspaceBinding("/cleanup", "a", "session-a"), undefined);
+    assert.equal(store.getWorkspaceBinding("/cleanup", "a", "session-b")?.target.threadId, 42);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -624,8 +713,9 @@ test("Workspace retirement intents persist an exact binding and protect it until
   const path = join(dir, "state.json");
   try {
     const store = createTelegramTopicTargetStore({ path });
-    const binding = { ...createTelegramWorkspaceBindingIdentity("/repo")!,
-      target: { chatId: 7, threadId: 41 }, slot: "A", threadName: "Anchor",
+    const binding = { ...createTelegramWorkspaceBindingIdentity(
+      "/repo", 0, "session-a",
+    )!, target: { chatId: 7, threadId: 41 }, slot: "A", threadName: "Anchor",
       inactiveSinceMs: 100, updatedAtMs: 200 };
     store.upsertWorkspaceBinding(binding);
     const intent = { id: "retire:repo:a:100", reason: "pressure" as const,
@@ -637,10 +727,11 @@ test("Workspace retirement intents persist an exact binding and protect it until
     const restored = createTelegramTopicTargetStore({ path });
     await restored.load();
     assert.deepEqual(restored.listWorkspaceRetirementIntents(), [intent]);
-    assert.equal(restored.claimWorkspaceIdentity("/repo", "returning"), undefined);
+    assert.equal(restored.claimWorkspaceIdentity("/repo", "returning", undefined,
+      { sessionId: "session-a" }), undefined);
     assert.equal(restored.setWorkspaceDisplayTitle(binding, "Changed"), false);
     assert.equal(restored.markWorkspaceBindingActiveByTarget(binding.target), false);
-    assert.equal(restored.getWorkspaceBinding("/repo")?.inactiveSinceMs, 100);
+    assert.equal(restored.getWorkspaceBinding("/repo", "a", "session-a")?.inactiveSinceMs, 100);
     const clearExternal = () => ({ liveOwner: "clear" as const,
       acceptedWork: "clear" as const, deliveryAuthority: "clear" as const });
     assert.equal(restored.captureWorkspaceSlotOccupancy(clearExternal).bindings[0]?.protection, "protected");
@@ -651,10 +742,10 @@ test("Workspace retirement intents persist an exact binding and protect it until
     const listed = restored.listWorkspaceRetirementIntents()[0]!;
     listed.binding.target.threadId = 99;
     assert.equal(restored.listWorkspaceRetirementIntents()[0]?.binding.target.threadId, 41);
-    const current = restored.getWorkspaceBinding("/repo")!;
+    const current = restored.getWorkspaceBinding("/repo", "a", "session-a")!;
     const changed = { ...current, threadName: "Navigator", updatedAtMs: 400 };
     assert.equal(restored.upsertWorkspaceBinding(changed), undefined);
-    assert.equal(restored.getWorkspaceBinding("/repo")?.threadName, "Anchor");
+    assert.equal(restored.getWorkspaceBinding("/repo", "a", "session-a")?.threadName, "Anchor");
     const replacement = { ...intent, binding: changed, requestedAtMs: 500 };
     assert.equal(restored.upsertWorkspaceRetirementIntent(replacement), false);
     assert.equal(restored.removeWorkspaceRetirementIntent(replacement), false);
@@ -744,6 +835,35 @@ test("Workspace claims allocate deterministic concurrent slots and release them"
     store.claimWorkspaceIdentity("/another/workspace", "instance-c"),
     undefined,
   );
+});
+
+test("Workspace claims keep same-cwd sessions stable and independently slotted", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const first = store.claimWorkspaceIdentity("/repo", "instance-a", undefined,
+    { sessionId: "session-a" });
+  const repeated = store.claimWorkspaceIdentity("/repo", "instance-a", undefined,
+    { sessionId: " session-a " });
+  const second = store.claimWorkspaceIdentity("/repo", "instance-b", undefined,
+    { sessionId: "session-b" });
+  assert.ok(first);
+  assert.deepEqual(repeated, first);
+  assert.ok(second);
+  assert.equal(first.instanceSlot, "a");
+  assert.equal(second.instanceSlot, "a");
+  assert.equal(first.slot, "A");
+  assert.equal(second.slot, "B");
+  assert.notEqual(first.bindingKey, second.bindingKey);
+  assert.equal(store.claimWorkspaceIdentity("/repo", "instance-a", undefined,
+    { sessionId: "session-b" }), undefined);
+  assert.equal(store.claimWorkspaceIdentity("/repo", "invalid", undefined,
+    { sessionId: "" }), undefined);
+  assert.ok(store.upsertWorkspaceBinding({ ...first,
+    target: { chatId: 7, threadId: 41 }, updatedAtMs: 1 }, "instance-a"));
+  assert.ok(store.upsertWorkspaceBinding({ ...second,
+    target: { chatId: 7, threadId: 42 }, updatedAtMs: 2 }, "instance-b"));
+  assert.equal(store.getWorkspaceBinding("/repo", "a", "session-a")?.slot, "A");
+  assert.equal(store.getWorkspaceBinding("/repo", "a", "session-b")?.slot, "B");
+  assert.equal(store.getWorkspaceBinding("/repo"), undefined);
 });
 
 test("Workspace claims reserve global letters across directories and fence slot commits", () => {
@@ -948,6 +1068,72 @@ test("Workspace restore-only claims reuse bindings without allocating new identi
     legacyStore.getWorkspaceBinding("/legacy")?.target,
     { chatId: 7, threadId: 43 },
   );
+});
+
+test("Session claim treats the legacy cwd-only binding as a distinct identity", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const legacy = { ...createTelegramWorkspaceBindingIdentity("/repo")!,
+    target: { chatId: 7, threadId: 41 }, slot: "C", threadName: "Cedar",
+    updatedAtMs: 1 };
+  store.upsertWorkspaceBinding(legacy);
+  assert.equal(store.hasWorkspaceBinding("/repo"), true);
+  assert.equal(store.hasWorkspaceBinding("/repo", "session-a"), false);
+  assert.equal(store.hasWorkspaceBinding("/repo", " bad-session "), false);
+  assert.equal(store.claimWorkspaceIdentity("/repo", "resume", undefined, {
+    existingBindingOnly: true, sessionId: "session-a",
+  }), undefined);
+  const session = store.claimWorkspaceIdentity("/repo", "resume", undefined, {
+    sessionId: "session-a",
+  });
+  assert.ok(session);
+  assert.notEqual(session.slot, "C");
+  assert.notEqual(session.bindingKey, legacy.bindingKey);
+  assert.equal(store.getWorkspaceBinding("/repo")?.target.threadId, 41);
+});
+
+test("Legacy and session bindings coexist across reload and stale snapshot persistence", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-session-adoption-reload-"));
+  const path = join(dir, "state.json");
+  try {
+    const seed = createTelegramTopicTargetStore({ path });
+    const legacy = { ...createTelegramWorkspaceBindingIdentity("/repo")!,
+      target: { chatId: 7, threadId: 41 }, slot: "C", threadName: "Cedar",
+      updatedAtMs: 1 };
+    seed.upsertWorkspaceBinding(legacy);
+    await seed.persist();
+
+    const stale = createTelegramTopicTargetStore({ path });
+    const adopter = createTelegramTopicTargetStore({ path });
+    await stale.load();
+    await adopter.load();
+    const identity = adopter.claimWorkspaceIdentity("/repo", "resume", undefined,
+      { sessionId: "session-a" })!;
+    assert.ok(adopter.upsertWorkspaceBinding({ ...identity,
+      target: { chatId: 7, threadId: 42 }, updatedAtMs: 2 }, "resume"));
+    await adopter.persist();
+
+    stale.setStatusSnapshot({ runtime: { busRole: "follower" } });
+    await stale.persist();
+    const reopened = createTelegramTopicTargetStore({ path });
+    await reopened.load();
+    assert.equal(reopened.listWorkspaceBindings().length, 2);
+    assert.equal(reopened.getWorkspaceBinding("/repo")?.slot, "C");
+    assert.equal(reopened.getWorkspaceBinding(
+      "/repo", identity.instanceSlot, "session-a")?.target.threadId, 42);
+    assert.equal(reopened.claimWorkspaceIdentity("/repo", "same", undefined, {
+      existingBindingOnly: true, sessionId: "session-a",
+    })?.slot, identity.slot);
+    assert.equal(reopened.claimWorkspaceIdentity("/repo", "other", undefined, {
+      existingBindingOnly: true, sessionId: "session-b",
+    }), undefined);
+    const fresh = reopened.claimWorkspaceIdentity("/repo", "other", undefined,
+      { sessionId: "session-b" });
+    assert.ok(fresh);
+    assert.notEqual(fresh.slot, "C");
+    assert.notEqual(fresh.bindingKey, identity.bindingKey);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("Explicit same-cwd claims skip a live leader binding without migrating its target", () => {
@@ -2405,6 +2591,33 @@ test("Workspace rename preserves non-named display titles and fences a concurren
       assert.equal(edits, mode === "names" ? 1 : 0);
     }
   }
+});
+
+test("Workspace rename cannot cross same-cwd session identity", async () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const first = createTelegramWorkspaceBindingIdentity("/repo", 0, "session-a")!;
+  const second = createTelegramWorkspaceBindingIdentity("/repo", 0, "session-b")!;
+  const firstTarget = { chatId: 7, threadId: 41 };
+  store.upsert({ profileKey: "session-a", target: firstTarget,
+    instanceId: "leader", slot: "A", threadName: "Atlas", status: "active",
+    createdAtMs: 1, updatedAtMs: 1 });
+  store.upsertWorkspaceBinding({ ...first, target: firstTarget, slot: "A",
+    threadName: "Atlas", updatedAtMs: 1 });
+  store.upsertWorkspaceBinding({ ...second, target: { chatId: 7, threadId: 42 },
+    slot: "B", threadName: "Beacon", updatedAtMs: 1 });
+  const rename = createTelegramTopicTargetRenamer({
+    store,
+    shouldRenameDisplayedTitle: () => true,
+    async callApi<TResponse>() { return true as TResponse; },
+  });
+  assert.equal((await rename({ target: firstTarget,
+    threadName: "Arrow", slot: "A" }))?.manualThreadName, "Arrow");
+  assert.equal(store.getWorkspaceBinding(
+    "/repo", "a", "session-a")?.manualThreadName, "Arrow");
+  assert.equal(store.getWorkspaceBinding(
+    "/repo", "a", "session-b")?.manualThreadName, undefined);
+  assert.equal(store.getWorkspaceBinding(
+    "/repo", "a", "session-b")?.threadName, "Beacon");
 });
 
 test("Workspace target replacement preserves its manual Thread display name", () => {

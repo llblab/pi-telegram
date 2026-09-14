@@ -89,16 +89,19 @@ function createTelegramBusLeaderEnvelopeHandler(
     protocolIdentity,
   });
   return async (envelope: Parameters<typeof handle>[0]) => {
-    const injectProtocol =
-      envelope.kind === "follower.register" &&
-      !envelope.registration.protocol;
+    const isRegistration = envelope.kind === "follower.register" ||
+      envelope.kind === "follower.restoreWorkspace";
+    const injectProtocol = isRegistration && !envelope.registration.protocol;
     const response = await handle(
-      injectProtocol && envelope.kind === "follower.register"
+      isRegistration
         ? {
             ...envelope,
             registration: {
               ...envelope.registration,
-              protocol: protocolIdentity,
+              ...(envelope.registration.cwd && !envelope.registration.sessionId
+                ? { sessionId: "test-session" }
+                : {}),
+              ...(injectProtocol ? { protocol: protocolIdentity } : {}),
             },
           }
         : envelope,
@@ -1247,7 +1250,8 @@ test("Bus leader follower target provisioner creates thread and announces connec
   });
   try {
     assert.deepEqual(
-      await provision({ instanceId: "follower-a", connectedAtMs: 0 }),
+      await provision({ instanceId: "follower-a", cwd: "/repo",
+        sessionId: "session-a", connectedAtMs: 0 }),
       { chatId: 7, threadId: 12, slot: "A", threadName: "Atlas" },
     );
     assert.equal(provisioning, 0);
@@ -1274,6 +1278,62 @@ test("Bus leader follower target provisioner creates thread and announces connec
         lastReconcileAction: "follower-register",
       },
     });
+    assert.equal(
+      store.getWorkspaceBinding("/repo", "a", "session-a")?.target.threadId,
+      12,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus leader replaces only the stale session-qualified follower target", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-session-target-replace-"));
+  const store = createTelegramTopicTargetStore({
+    path: join(dir, "state.json"),
+    getNowMs: () => 1000,
+  });
+  store.upsertWorkspaceBinding({
+    ...createTelegramWorkspaceBindingIdentity("/repo", 0, "session-a")!,
+    target: { chatId: 7, threadId: 12 },
+    slot: "A", threadName: "Atlas", updatedAtMs: 500,
+  });
+  store.upsertWorkspaceBinding({
+    ...createTelegramWorkspaceBindingIdentity("/repo", 1, "session-b")!,
+    target: { chatId: 7, threadId: 20 },
+    slot: "B", threadName: "Beacon", updatedAtMs: 500,
+  });
+  await store.persist();
+  const provision = createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7,
+    topicTargetStore: store,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      if (method === "sendMessage" && body.message_thread_id === 12) {
+        throw new Error("Bad Request: TOPIC_ID_INVALID");
+      }
+      if (method === "createForumTopic") {
+        return { message_thread_id: 13 } as TResponse;
+      }
+      return { ok: true } as TResponse;
+    },
+    getSyncState: () => ({}),
+    setSyncState: () => undefined,
+    recordRuntimeEvent() {},
+    getNowMs: () => 1000,
+  });
+  try {
+    assert.deepEqual(await provision({
+      instanceId: "follower-a", cwd: "/repo", sessionId: "session-a",
+      target: { chatId: 7, threadId: 12 }, connectedAtMs: 1000,
+    }), { chatId: 7, threadId: 13, slot: "A", threadName: "Atlas" });
+    assert.equal(
+      store.getWorkspaceBinding("/repo", "a", "session-a")?.target.threadId,
+      13,
+    );
+    assert.equal(
+      store.getWorkspaceBinding("/repo", "b", "session-b")?.target.threadId,
+      20,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1877,7 +1937,7 @@ test("Bus leader visibility-probes and reclaims a dormant Workspace Thread", asy
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-leader-workspace-"));
   const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
   const workspaceIdentity = createTelegramWorkspaceBindingIdentity(
-    "/repo/workspace",
+    "/repo/workspace", 0, "session-a",
   );
   assert.ok(workspaceIdentity);
   store.upsertWorkspaceBinding({
@@ -1893,6 +1953,7 @@ test("Bus leader visibility-probes and reclaims a dormant Workspace Thread", asy
     getAllowedUserId: () => 7,
     instanceId: "leader-new",
     getCwd: (ctx: { cwd: string }) => ctx.cwd,
+    getSessionId: () => "session-a",
     topicTargetStore: store,
     async callApi<TResponse>(method: string, body: Record<string, unknown>) {
       calls.push({ method, body });
@@ -1931,8 +1992,9 @@ test("Bus leader visibility-probes and reclaims a dormant Workspace Thread", asy
       store.getByProfileKey("cwd:/repo/workspace")?.instanceId,
       "leader-new",
     );
+    assert.equal(store.getWorkspaceBinding("/repo/workspace"), undefined);
     assert.equal(
-      store.getWorkspaceBinding("/repo/workspace")?.target.threadId,
+      store.getWorkspaceBinding("/repo/workspace", "a", "session-a")?.target.threadId,
       42,
     );
   } finally {
@@ -2119,7 +2181,8 @@ test("Display-mode follower creation and stale replacement acknowledge the initi
       const path = join(dir, "state.json");
       const store = createTelegramTopicTargetStore({ path });
       if (replacing) store.upsertWorkspaceBinding({
-        ...createTelegramWorkspaceBindingIdentity("/repo/extensions")!,
+        ...createTelegramWorkspaceBindingIdentity(
+          "/repo/extensions", 0, "session-a")!,
         target: { chatId: 7, threadId: 41 }, slot: "A", threadName: "Anchor",
         displayTitle: "previous-title", showSlotSuffix: true, updatedAtMs: 1,
       });
@@ -2149,7 +2212,8 @@ test("Display-mode follower creation and stale replacement acknowledge the initi
         const response = await sendTelegramBusLocalEnvelope({ socketPath, envelope: {
           kind: "follower.register", requestId: "register:1",
           registration: { instanceId: "follower", registrationGeneration: "follower:1",
-            cwd: "/repo/extensions", threadName: "Anchor", connectedAtMs: Date.now(), protocol },
+            cwd: "/repo/extensions", sessionId: "session-a",
+            threadName: "Anchor", connectedAtMs: Date.now(), protocol },
         } });
         assert.equal(response?.kind, "bus.ack");
         if (response?.kind !== "bus.ack") throw new Error("missing ACK");
@@ -2168,8 +2232,10 @@ test("Display-mode follower creation and stale replacement acknowledge the initi
         assert.equal(calls.filter((call) => call.method === "editForumTopic").length, 0);
         const restored = createTelegramTopicTargetStore({ path });
         await restored.load();
-        assert.equal(restored.getWorkspaceBinding("/repo/extensions")?.displayTitle, expected);
-        assert.equal(restored.getWorkspaceBinding("/repo/extensions")?.threadName, "Anchor");
+        assert.equal(restored.getWorkspaceBinding(
+          "/repo/extensions", "a", "session-a")?.displayTitle, expected);
+        assert.equal(restored.getWorkspaceBinding(
+          "/repo/extensions", "a", "session-a")?.threadName, "Anchor");
         assert.deepEqual(errors, []);
       } finally {
         await runtime.stopPolling();
@@ -2426,6 +2492,7 @@ test("Bus leader envelope handler registers and heartbeats followers", async () 
       registration: {
         instanceId: "inst-a",
         cwd: "/repo",
+        sessionId: "session-a",
         connectedAtMs: 1000,
         registrationGeneration: "inst-a:1",
         slot: "C",
@@ -2440,6 +2507,7 @@ test("Bus leader envelope handler registers and heartbeats followers", async () 
     lastHeartbeatMs: 2000,
     registrationGeneration: "inst-a:1",
     protocol: TEST_BUS_PROTOCOL_IDENTITY,
+    sessionId: "session-a",
     target: undefined,
     slot: "C",
   });
@@ -2577,8 +2645,8 @@ test("Bus leader rejects incompatible protocol before follower provisioning", as
       instanceId: "future",
       registrationGeneration: "future:1",
       protocol: {
-        protocolVersion: 2,
-        runtimeBuild: "0.29.0",
+        protocolVersion: 3,
+        runtimeBuild: "future",
         capabilities: [],
       },
       connectedAtMs: 1000,
@@ -2635,6 +2703,40 @@ test("Bus leader rejects incompatible protocol before follower provisioning", as
   assert.equal(provisions, 1);
 });
 
+test("Session-native leader rejects a pre-session protocol follower", async () => {
+  const registry = createTelegramBusFollowerRegistry();
+  let provisionedSessionId: string | undefined = "not-called";
+  const handleEnvelope = createRawTelegramBusLeaderEnvelopeHandler({
+    followerRegistry: registry,
+    protocolIdentity: TEST_BUS_PROTOCOL_IDENTITY,
+    provisionFollowerTarget(registration) {
+      provisionedSessionId = registration.sessionId;
+      return { chatId: 7, threadId: 42, slot: "A" };
+    },
+  });
+  const legacyProtocol = {
+    protocolVersion: 1,
+    runtimeBuild: "0.45.11",
+    capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION],
+  };
+  const response = await handleEnvelope({
+    kind: "follower.register",
+    requestId: "legacy:1",
+    registration: {
+      instanceId: "legacy",
+      registrationGeneration: "legacy:1",
+      protocol: legacyProtocol,
+      cwd: "/repo",
+      connectedAtMs: 1000,
+    },
+  });
+  assert.equal(response.kind === "bus.ack" ? response.ok : true, false);
+  assert.match(response.kind === "bus.ack" ? response.message ?? "" : "",
+    /version-mismatch/u);
+  assert.equal(provisionedSessionId, "not-called");
+  assert.equal(registry.get("legacy"), undefined);
+});
+
 test("Non-default display modes reject incompatible followers before provisioning and live publication", async () => {
   const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "test",
     capabilities: [...TEST_BUS_PROTOCOL_IDENTITY.capabilities, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE] });
@@ -2654,7 +2756,8 @@ test("Non-default display modes reject incompatible followers before provisionin
     const response = await handler({
       kind: "follower.register", requestId: "legacy:1",
       registration: { instanceId: "legacy", registrationGeneration: "legacy:1",
-        cwd: "/repo", connectedAtMs: 1, protocol: TEST_BUS_PROTOCOL_IDENTITY },
+        cwd: "/repo", sessionId: "session-a", connectedAtMs: 1,
+        protocol: TEST_BUS_PROTOCOL_IDENTITY },
     });
     assert.ok(response.kind === "bus.ack");
     assert.equal(response.ok, scenario === "names", scenario);
@@ -4114,7 +4217,8 @@ test("Leader assembly serializes follower provisioning through its shared Worksp
     const registration = sendTelegramBusLocalEnvelope({ socketPath, envelope: {
       kind: "follower.register", requestId: "follower:1",
       registration: { instanceId: "follower", registrationGeneration: "follower:1",
-        cwd: "/repo", connectedAtMs: 1, protocol: TEST_BUS_PROTOCOL_IDENTITY },
+        cwd: "/repo", sessionId: "session-a", connectedAtMs: 1,
+        protocol: TEST_BUS_PROTOCOL_IDENTITY },
     } });
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(calls.length, 0);
@@ -4163,7 +4267,8 @@ test("Follower provisioning reports pressure without deleting or reusing retaine
       const response = await sendTelegramBusLocalEnvelope({ socketPath, envelope: {
         kind: "follower.register", requestId: `pressure:${instanceId}`,
         registration: { instanceId, registrationGeneration: `${instanceId}:1`,
-          ...(cwd ? { cwd } : {}), connectedAtMs: 1, protocol: TEST_BUS_PROTOCOL_IDENTITY },
+          ...(cwd ? { cwd, sessionId: "session-a" } : {}), connectedAtMs: 1,
+          protocol: TEST_BUS_PROTOCOL_IDENTITY },
       } });
       assert.ok(response?.kind === "bus.ack");
       assert.equal(response.ok, false);

@@ -293,6 +293,7 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<
   getNowMs?: () => number;
   getPid?: () => number;
   getProcessBirthId?: () => string;
+  getSessionId?: (ctx: TContext) => string | undefined;
   getSessionGeneration?: () => number;
   timeoutMs?: number;
   registrationTimeoutMs?: number;
@@ -374,6 +375,7 @@ export function createTelegramBusFollowerPromotionHandler<
   topicTargetStore: Threads.TelegramTopicTargetStore;
   instanceId: string;
   getActiveProfileName: () => string | undefined;
+  getSessionId?: (ctx: TContext) => string | undefined;
   startLeader: (
     ctx: TContext,
     election: TelegramBusFollowerElection,
@@ -400,6 +402,7 @@ export function createTelegramBusFollowerPromotionHandler<
             store: input.topicTargetStore,
             instanceId: input.instanceId,
             cwd: ctx.cwd,
+            sessionId: input.getSessionId?.(ctx),
             telegramProfile: input.getActiveProfileName(),
             target: binding.target,
             slot: binding.slot,
@@ -1771,6 +1774,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
             ? { slot: deps.registrationState?.getSlot() ?? lastKnownSlot }
             : {}),
           cwd: ctx.cwd,
+          sessionId: deps.getSessionId?.(ctx),
           pid: getPid(),
           processBirthId: deps.getProcessBirthId?.(),
           sessionGeneration: deps.getSessionGeneration?.(),

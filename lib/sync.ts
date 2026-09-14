@@ -46,6 +46,7 @@ export interface TelegramLeaderThreadSyncDeps {
   getAllowedUserId: () => number | undefined;
   instanceId: string;
   cwd?: string;
+  sessionId?: string;
   telegramProfile?: string;
   forceFreshUnnamed?: boolean;
   requestedThreadName?: string;
@@ -654,6 +655,7 @@ export async function ensureTelegramLeaderThreadBinding(
         normalizedLeaderCwd,
         deps.instanceId,
         legacyLeaderRecord?.instanceId,
+        { sessionId: deps.sessionId },
       )
     : undefined;
   if (deps.cwd && !workspaceIdentity) {
@@ -715,6 +717,7 @@ export async function ensureTelegramLeaderThreadBinding(
     ? deps.topicTargetStore.getWorkspaceBinding(
         workspaceIdentity.cwd,
         workspaceIdentity.instanceSlot,
+        workspaceIdentity.sessionId,
       )
     : undefined;
   const legacyWorkspaceBinding =
