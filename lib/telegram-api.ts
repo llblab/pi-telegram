@@ -964,12 +964,23 @@ export function isTelegramApiMethodRetrySafe(method: string): boolean {
   return TELEGRAM_RETRY_SAFE_METHODS.has(method);
 }
 
-function isRetryableTelegramApiError(error: unknown): boolean {
+export function isRetryableTelegramApiError(error: unknown): boolean {
   return (
     error instanceof TelegramApiHttpError &&
     (error.status === 429 ||
       (error.status !== undefined && error.status >= 500))
   );
+}
+
+export function getTelegramApiRetryAfterMs(error: unknown): number | undefined {
+  return error instanceof TelegramApiHttpError && error.retryAfterSeconds !== undefined
+    ? Math.max(0, error.retryAfterSeconds * 1000)
+    : undefined;
+}
+
+export function isTelegramMessageUnavailableError(error: unknown): boolean {
+  return error instanceof TelegramApiHttpError && error.status === 400 &&
+    /Bad Request: (message to edit not found|message not found|message_id_invalid)/iu.test(error.message);
 }
 
 function getTelegramRetryDelayMs(

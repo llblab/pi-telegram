@@ -237,5 +237,6 @@ test("Package metadata publishes the bundled skill root", async () => {
   ) as { files?: string[]; pi?: { skills?: string[] } };
 
   assert.ok(manifest.files?.includes("skills/"));
-  assert.deepEqual(manifest.pi?.skills, ["./skills"]);
+  assert.ok(manifest.files?.includes("dist/"));
+  assert.deepEqual(manifest.pi?.skills, ["./dist/skills"]);
 });

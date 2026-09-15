@@ -1,6 +1,6 @@
 # Generative Apps Runtime For Telegram
 
-_Status: incremental implementation. Canonical installation and explicit transactional replacement, agent-side method invocation, state/history commits, partial-tail recovery, cross-process transition locking with dead-owner recovery, installation-generation plus revision rejection for direct app-output controls, lifecycle-cancelled worker-isolated methods, the bounded non-shell process port, strict bound-action parsing, pre-model-queue `tgbtn` dispatch, new-message default views, and opt-in in-place bound-action edits with explicit-action send fallback are implemented locally. Agent-mediated initial-surface revision capture, process-birth lock proof, voice delivery, automatic refresh scheduling, removal, and complete lifecycle diagnostics remain open in the backlog._
+_Status: incremental implementation. Canonical installation and explicit transactional replacement, agent-side method invocation, state/history commits, partial-tail recovery, cross-process transition locking with dead-owner recovery, installation-generation plus revision rejection for direct app-output controls, lifecycle-cancelled worker-isolated methods, the bounded non-shell process port, strict bound-action parsing, pre-model-queue `tgbtn` dispatch, new-message default views, opt-in in-place bound-action edits with explicit-action send fallback, and memory-only live dashboards with bounded scheduling, same-handle action rescheduling, Delivery failure classification, exact routed-target retention, unavailable-message invalidation, and lifecycle cancellation are implemented locally. Agent-mediated initial-surface revision capture, process-birth lock proof, voice delivery, and removal remain open in the backlog._
 
 ## Purpose
 
@@ -188,12 +188,13 @@ interface GenerativeAppResult {
   state?: JsonValue;
   output: string;
   viewMode?: "new" | "edit";
+  refreshAfterMs?: number;
 }
 ```
 
 `output` is ordinary assistant Markdown plus existing top-level voice/button markup. It passes through the established outbound planner rather than defining a second rendering language. Omitted `viewMode` defaults to `"new"`: the result arrives as a fresh message and the clicked button remains visibly selected on its prior surface. `viewMode: "edit"` opts one result into replacing the callback message and keyboard in place when Telegram permits it; edit failure after that explicit action may fall back to one new message.
 
-Returning `state` requests a committed transition. Omitting `state` makes the method output-only, which supports inspection and live refresh without appending duplicate history. Invalid, oversized, non-serializable, or malformed results fail before state or Telegram effects commit.
+Returning `state` requests a committed transition. Omitting `state` makes the method output-only, which supports inspection and live refresh without appending duplicate history. `refreshAfterMs` is an optional finite positive integer scheduling hint: on a successfully delivered explicit frame it opens or reschedules that logical surface, while omission closes any existing schedule for that surface. The exported `refresh` method itself must be output-only; returning `state` from `refresh` fails before state or Telegram effects commit. Invalid, oversized, non-serializable, or malformed results fail before state or Telegram effects commit.
 
 ## Current State And State Timeline
 
@@ -246,7 +247,7 @@ A generic `exec(arbitrary-shell-command)` Generative App is forbidden. It would 
 
 A Generative App sends a new message after a successful bound user action by default. This simple mode preserves prior surfaces and their visibly selected buttons, is robust across ordinary Telegram constraints, and remains a first-class behavior rather than a fallback to eliminate. A method may opt into `viewMode: "edit"` to replace the callback message and keyboard in place; if that explicit action cannot edit a deleted or otherwise unavailable message, it may send one fresh view because the click itself supplies recreation authority.
 
-Automatic refresh is not implemented in the current runtime. The intended future contract uses an exported `refresh` method and a bounded scheduling hint; applications must not return or rely on that hint until the backlog item is complete:
+The memory-only scheduler kernel is implemented, including non-overlap, digest suppression, lifecycle checks, cancellation, and bounded retry timing. Session shutdown synchronously cancels and forgets every live surface before the composed transport lifecycle stops; replacement of the registered runtime does the same. A successful explicit `telegram_bind` delivery with `refreshAfterMs` now attaches its generation-fenced logical Delivery handle to that scheduler, starts a production timer, plans each changed refresh through the complete outbound Markdown/button planner, and edits through Delivery. Omission of the next hint renders the final changed frame and then closes the schedule. Bound-action rescheduling, Delivery edit-failure classification, lifecycle cancellation, direct classic/leader/authenticated-follower routed-target regressions, and known unavailable-message invalidation with bounded classified diagnostics are implemented. Bot API assessment found no applicable ordinary private-message deletion update. The broader package regression suite now passes with the live-view invariants below, so live dashboards are locally release-complete within that platform boundary:
 
 ```js
 export async function refresh({ state, run }) {
@@ -259,18 +260,19 @@ export async function refresh({ state, run }) {
 
 The runtime contract is:
 
-- Missing `refreshAfterMs` stops automatic refresh.
-- Values below two seconds clamp to two seconds.
-- The next interval starts only after the prior refresh and Telegram edit settle; calls never overlap or accumulate.
-- One refresh schedule exists per app, profile, target, and logical surface.
-- An unchanged normalized frame digest causes no Telegram edit.
-- Telegram `retry_after`, bounded backoff, lifecycle cancellation, target authority, and execution generation remain authoritative.
-- Refresh is session-bound and does not silently resume after process replacement until the surface is opened again.
-- Output-only refresh does not change `state.json` or append `states.jsonl`.
+- A successfully delivered explicit app frame with `refreshAfterMs` opens one live surface and replaces any older live surface for the same `{ app, profile, target }`; surface identity is the exact delivery generation and Telegram message handle, not app state or a durable manifest.
+- The installed module must export `refresh`. The scheduler invokes only that named method with the latest committed state and expected installation generation/revision; `refresh` is output-only and cannot advance the state timeline.
+- A missing hint on an explicit action or refresh result closes that surface. A malformed, non-finite, non-positive, or non-integer hint rejects the method result. Values below two seconds clamp to two seconds; values above 24 hours clamp to 24 hours.
+- The next timer starts only after the prior method, planning, and Telegram edit settle. One in-flight tick exists per surface; ticks never overlap, queue, or catch up.
+- The frame digest covers normalized planned Markdown plus the normalized inline keyboard, including both in-body and footer `telegram_button` controls. An unchanged digest performs no Telegram call but still honors the returned next hint.
+- An explicit bound action on the current live-surface message cancels its pending timer and takes surface ownership before invocation. Any refresh continuation returning after that take, cancellation, or same-key replacement is identity-fenced before planning or editing and cannot cancel the replacement. A successful action result carrying a hint edits and reschedules that same logical surface regardless of `viewMode`; omission closes it. Actions on other messages retain the ordinary `viewMode` contract and may open a replacement live surface only after successful delivery.
+- Telegram flood-control `retry_after` delays the same pending frame without re-invoking app code. Other retryable edit failures use `2s → 4s → 8s → 16s → 32s → 60s` bounded exponential backoff with one retained latest frame; no retry may outlive surface authority. Ambiguous edit outcomes are diagnosed and stop the surface rather than replaying blindly.
+- Known message-not-found/deleted failures, app replacement/removal, target/profile/session generation loss, runtime shutdown, or execution-fence loss cancel and forget the surface. Refresh is memory-only and never resumes after process replacement until an explicit frame opens it again.
+- Direct-leader and authenticated-follower delivery use the existing routed transport authority. The surface owner stores no bot token/client and checks exact profile, target, transport generation, app installation generation, state revision, and runtime generation immediately before invocation and edit.
 
-The runtime retains the latest `TelegramDeliveryHandle` in memory for each live app surface. The first frame sends a logical view; later app actions and refreshes edit that same view rather than creating message traffic.
+The runtime retains one private live-surface record per `{ app, profile, target }`: handle, app generation/revision, runtime and transport fences, normalized frame digest, next due time, retry state, and cancellation controller. This registry belongs to the Generative Apps runtime; the composition root supplies narrow plan/edit/classify-error ports. It reuses the logical delivery-handle contract but does not make surfaces durable or move scheduling into the general Delivery API.
 
-Telegram does not reliably report deletion of every ordinary private bot message. When a supported deletion update identifies the handle, the runtime invalidates it immediately. When edit returns a known message-not-found result, the runtime forgets the handle and stops refresh. It never recreates a user-deleted view automatically; the next explicit user action or app opening may create a fresh view.
+Telegram's Bot API `Update` exposes deletion only as `deleted_business_messages` for messages from a connected business account; it exposes no deletion update for ordinary private bot messages. Generative App surfaces therefore cannot safely wire proactive deletion invalidation in the supported private-DM runtime. When an edit returns a known message-not-found result, the runtime records one bounded event with phase, app, and classified outcome, forgets the handle, and stops refresh without re-invoking app code. It never recreates a user-deleted view automatically; the next explicit user action or app opening may create a fresh view.
 
 ## Lifecycle And Safety
 

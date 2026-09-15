@@ -504,14 +504,23 @@ function parseTelegramAdaptiveActionPayloadRows(
     return undefined;
   };
 
+  const parseVerticalSequence = (): Record<string, unknown>[][] | undefined => {
+    const rows: Record<string, unknown>[][] = [];
+    while (offset < source.length) {
+      skipWhitespace();
+      if (source[offset] !== "{") break;
+      const cell = parseCell();
+      if (!cell) return undefined;
+      rows.push([cell]);
+      if (!consumeOptionalSeparator()) return undefined;
+    }
+    return rows.length > 0 ? rows : undefined;
+  };
+
   skipWhitespace();
-  let rows: Record<string, unknown>[][] | undefined;
-  if (source[offset] === "{") {
-    const cell = parseCell();
-    rows = cell ? [[cell]] : undefined;
-  } else {
-    rows = parseMatrix();
-  }
+  const rows = source[offset] === "{"
+    ? parseVerticalSequence()
+    : parseMatrix();
   if (!rows) return undefined;
   skipWhitespace();
   if (!options.allowTrailing && offset !== source.length) return undefined;

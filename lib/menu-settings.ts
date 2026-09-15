@@ -23,6 +23,7 @@ export type TelegramSettingsMenuReplyMarkup = TelegramInlineKeyboardMarkup;
 
 export interface TelegramSettingsStateDeps {
   getThreadDisplayMode?: () => TelegramThreadDisplayMode | undefined;
+  getThreadDisplayPreview?: (mode: TelegramThreadDisplayMode) => readonly string[];
   areDraftPreviewsEnabled: () => boolean;
   getAssistantRenderingMode: () => TelegramAssistantRenderingMode;
   getActivityVerbosity: () => TelegramActivityVerbosity;
@@ -175,7 +176,15 @@ export function buildTelegramSettingsMenuText(): string {
   return SETTINGS_MENU_TITLE;
 }
 
-export function buildThreadDisplaySettingsText(mode: TelegramThreadDisplayMode): string {
+function escapeThreadDisplayPreview(text: string): string {
+  return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+export function buildThreadDisplaySettingsText(
+  mode: TelegramThreadDisplayMode,
+  preview: readonly string[] = [],
+): string {
+  const visiblePreview = preview.slice(0, 5).map(escapeThreadDisplayPreview);
   return [
     `${THREAD_DISPLAY_SETTINGS_TITLE} <code>${mode}</code>`,
     "",
@@ -183,7 +192,10 @@ export function buildThreadDisplaySettingsText(mode: TelegramThreadDisplayMode):
     "",
     "<code>-</code> <code>letters</code> (default): show the unique slot, such as <b><i>A</i></b> or <b><i>B</i></b>.",
     "<code>-</code> <code>names</code>: show the generated dictionary name for the slot, such as <b><i>Anchor</i></b> or <b><i>Briar</i></b>.",
-    "<code>-</code> <code>directories</code>: show the directory, such as <b><i>extensions</i></b>; shared Workspaces keep slot suffixes, such as <b><i>extensions_a</i></b> and <b><i>extensions_c</i></b>.",
+    "<code>-</code> <code>directories</code>: legacy directory formatting retained without automatic migration.",
+    "<code>-</code> <code>directory-snake</code>: normalize the distinguishing directory path, such as <b><i>api_tools</i></b> or <b><i>frontend_extensions_a</i></b>.",
+    "<code>-</code> <code>directory-title</code>: humanize the distinguishing directory path, such as <b><i>Api Tools</i></b> or <b><i>Frontend / Extensions · A</i></b>.",
+    ...(visiblePreview.length ? ["", `<b>Live preview:</b> ${visiblePreview.map((label) => `<code>${label}</code>`).join(", ")}${preview.length > visiblePreview.length ? `, +${preview.length - visiblePreview.length} more` : ""}`] : []),
   ].join("\n");
 }
 
@@ -414,7 +426,7 @@ export async function openTelegramSettingsMenu<
 export function buildThreadDisplaySettingsReplyMarkup(mode: TelegramThreadDisplayMode): TelegramSettingsMenuReplyMarkup {
   return { inline_keyboard: [
     [{ text: "⬆️ Back", callback_data: "settings:list" }],
-    ...(["letters", "names", "directories"] as const).map((value) => [{
+    ...(["letters", "names", "directories", "directory-snake", "directory-title"] as const).map((value) => [{
       text: `${mode === value ? "🟢 " : ""}${value}`,
       callback_data: `settings:set:thread-display:${value}`,
     }]),
@@ -630,7 +642,8 @@ export async function handleTelegramSettingsMenuCallbackAction(
     }
     if (data.startsWith("settings:set:thread-display:")) {
       const mode = data.slice("settings:set:thread-display:".length);
-      if (mode !== "letters" && mode !== "names" && mode !== "directories") {
+      if (mode !== "letters" && mode !== "names" && mode !== "directories" &&
+          mode !== "directory-snake" && mode !== "directory-title") {
         await deps.answerCallbackQuery(callbackQueryId, "Unknown Thread display mode.");
         return true;
       }
@@ -647,7 +660,7 @@ export async function handleTelegramSettingsMenuCallbackAction(
       return true;
     }
     await deps.updateSettingsMessage(
-      buildThreadDisplaySettingsText(mode),
+      buildThreadDisplaySettingsText(mode, deps.getThreadDisplayPreview?.(mode)),
       buildThreadDisplaySettingsReplyMarkup(mode),
     );
     await deps.answerCallbackQuery(callbackQueryId);
@@ -863,6 +876,7 @@ export function createTelegramSettingsMenuRuntime<
           getTimeInjectionMode: deps.getTimeInjectionMode,
           isAutomaticThreadCleanupEnabled: deps.isAutomaticThreadCleanupEnabled,
           getThreadDisplayMode: deps.getThreadDisplayMode,
+          getThreadDisplayPreview: deps.getThreadDisplayPreview,
           sendSettingsMenu: (state, text, replyMarkup) =>
             deps.sendInteractiveMessage(
               state.chatId,
@@ -887,6 +901,7 @@ export function createTelegramSettingsMenuRuntime<
           getTimeInjectionMode: deps.getTimeInjectionMode,
           isAutomaticThreadCleanupEnabled: deps.isAutomaticThreadCleanupEnabled,
           getThreadDisplayMode: deps.getThreadDisplayMode,
+          getThreadDisplayPreview: deps.getThreadDisplayPreview,
           updateSettingsMessage: (text, replyMarkup) =>
             deps.editInteractiveMessage(
               state.chatId,
@@ -931,6 +946,7 @@ export function createTelegramSettingsMenuRuntime<
         getTimeInjectionMode: deps.getTimeInjectionMode,
         isAutomaticThreadCleanupEnabled: deps.isAutomaticThreadCleanupEnabled,
         getThreadDisplayMode: deps.getThreadDisplayMode,
+        getThreadDisplayPreview: deps.getThreadDisplayPreview,
         setThreadDisplayMode: deps.setThreadDisplayMode,
         setDraftPreviewsEnabled: deps.setDraftPreviewsEnabled,
         setAssistantRenderingMode: deps.setAssistantRenderingMode,

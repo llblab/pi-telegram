@@ -230,6 +230,8 @@ export const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE =
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME =
   "workspace-thread-rename-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE = "thread-display-mode-v1" as const;
+export const TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT =
+  "directory-display-format-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT =
   "workspace-follower-auto-connect-v1" as const;
 
@@ -1027,7 +1029,8 @@ export function parseTelegramBusEnvelope(
     case "follower.setThreadDisplayMode":
       if (typeof value.instanceId === "string" &&
           typeof value.registrationGeneration === "string" &&
-          (value.mode === "letters" || value.mode === "names" || value.mode === "directories")) {
+          (value.mode === "letters" || value.mode === "names" || value.mode === "directories" ||
+      value.mode === "directory-snake" || value.mode === "directory-title")) {
         envelope = { kind, requestId, instanceId: value.instanceId,
           registrationGeneration: value.registrationGeneration, mode: value.mode };
       }

@@ -97,7 +97,7 @@ ordinary prompt          → model-mediated interpretation or explanation
 - Keep credentials and unrelated private state out of source, state, output, and diagnostics.
 - Route consequences requiring contextual judgment through an ordinary model prompt.
 - Fail closed on unavailable owners, stale actions, malformed state, absent methods, process failures, or uncertain effects.
-- Do not claim automatic refresh, removal, voice output, or other behavior still marked incomplete in the runtime document.
+- Treat `refreshAfterMs` validation, output-only `refresh`, scheduling after a successful hinted explicit `telegram_bind` delivery, same-handle rescheduling after a current-surface bound action, Delivery edit-failure classification, known unavailable-message invalidation with bounded classified diagnostics, session/runtime live-surface cancellation, and exact direct classic/leader/authenticated-follower target retention as implemented. The Bot API has no ordinary private-message deletion update; `deleted_business_messages` is limited to connected business accounts. Do not claim removal, voice output, proactive deletion-update invalidation, or other behavior still marked incomplete in the runtime document.
 
 ## Validation
 

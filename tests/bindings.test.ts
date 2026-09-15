@@ -15,6 +15,7 @@ import {
   createTelegramAssistantOutputBindingRuntime,
   createTelegramQueueBindingRuntime,
   createTelegramGenerativeAppBoundButtonActionInvoker,
+  createTelegramGenerativeAppLiveSurfaceBinding,
   registerTelegramCommandsAndTools,
   registerTelegramLifecycleRuntimeHooks,
 } from "../lib/bindings.ts";
@@ -67,6 +68,18 @@ function createBindingApiHarness() {
   } as unknown as ExtensionAPI;
   return { api, handlers, tools, commands, messages };
 }
+
+test("Generative App live-surface binding shuts down and clears session authority", () => {
+  const binding = createTelegramGenerativeAppLiveSurfaceBinding();
+  let shutdowns = 0;
+  binding.set({ shutdown: () => { shutdowns += 1; } } as unknown as GenerativeApps.GenerativeAppLiveSurfaceRuntime<GenerativeApps.TelegramBindLiveHandle>);
+
+  binding.shutdown();
+  binding.shutdown();
+
+  assert.equal(shutdowns, 1);
+  assert.equal(binding.get(), undefined);
+});
 
 test("Generative App bound-button composition rejects a retained stale revision before delivery", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-telegram-binding-app-"));
@@ -157,6 +170,99 @@ export function increment({ state }) {
     );
     assert.deepEqual(edited, ["next"]);
     assert.deepEqual(sent, ["next"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Generative App bound action edits and reschedules the exact live surface", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-binding-app-"));
+  const agentDir = join(root, "agent");
+  const script = join(root, "dashboard.mjs");
+  const timers: Array<() => void> = [];
+  const deliveryEdits: string[] = [];
+  let legacyEdits = 0;
+  try {
+    await writeFile(script, `
+export function init() { return { state: { count: 0 }, output: "ready" }; }
+export function increment({ state }) {
+  return { state: { count: state.count + 1 }, output: "next", viewMode: "edit", refreshAfterMs: 2000 };
+}
+export function refresh() { return { output: "later" }; }
+`, "utf8");
+    const installed = await GenerativeApps.installGenerativeApp({
+      agentDir,
+      app: "dashboard",
+      script,
+    });
+    const runtime = GenerativeApps.createGenerativeAppLiveSurfaceRuntime<
+      GenerativeApps.TelegramBindLiveHandle
+    >({
+      agentDir,
+      isCurrent: () => true,
+      plan: (result, handle) => ({
+        digest: result.output,
+        handle: { ...handle, view: { text: result.output, parseMode: "markdown" } },
+      }),
+      async edit(frame) {
+        deliveryEdits.push(frame.handle.view!.text);
+        return frame.handle;
+      },
+      setTimer(callback) {
+        timers.push(callback);
+        return { unref() {} } as ReturnType<typeof setTimeout>;
+      },
+      clearTimer: () => undefined,
+    });
+    runtime.open({
+      app: "dashboard",
+      appGeneration: installed.generation,
+      appRevision: installed.revision,
+      handle: {
+        delivery: {
+          target: { chatId: 1, threadId: 3 },
+          messageIds: [2],
+          generation: "delivery-1",
+        },
+      },
+      initialDigest: "ready",
+      key: GenerativeApps.getTelegramBindLiveSurfaceKey(
+        "dashboard",
+        "work",
+        { chatId: 1, threadId: 3 },
+      ),
+      refreshAfterMs: 2000,
+    });
+    const invoke = createTelegramGenerativeAppBoundButtonActionInvoker({
+      agentDir,
+      assertExecutionCurrent: () => undefined,
+      getExecutionFence: () => undefined,
+      getActiveProfileName: () => "work",
+      getLiveSurfaceRuntime: () => runtime,
+      planOutput: Outbound.createTelegramOutboundReplyPlanner(
+        Outbound.createTelegramButtonActionStore(),
+      ),
+      sendMarkdownReply: async () => undefined,
+      editInteractiveMessage: async () => { legacyEdits += 1; },
+      recordRuntimeEvent: () => undefined,
+    });
+    assert.equal(await invoke(
+      {
+        binding: { generation: installed.generation, app: "dashboard", revision: 0 },
+        prompt: "dashboard::increment",
+        text: "Next",
+      },
+      { message: { chat: { id: 1 }, message_id: 2, message_thread_id: 3 } },
+    ), "edit");
+    assert.deepEqual(deliveryEdits, ["next"]);
+    assert.equal(legacyEdits, 0);
+    assert.equal(timers.length, 2);
+    assert.equal(runtime.take(GenerativeApps.getTelegramBindLiveSurfaceKey(
+      "dashboard",
+      "work",
+      { chatId: 1, threadId: 3 },
+    ))?.appRevision, 1);
+    runtime.shutdown();
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1218,6 +1324,9 @@ test("Lifecycle binding disconnects only graceful quit and preserves cleanup aft
       events.push("disconnect-on-quit");
       if (disconnectFails) throw new Error("cleanup unavailable");
     },
+    shutdownGenerativeAppLiveSurfaces: () => {
+      events.push("live-surfaces-shutdown");
+    },
     resolveAutomaticThreadCleanupEnabled: async () =>
       automaticCleanupEnabled,
     buttonActionStore: { register: () => "button-action" },
@@ -1272,12 +1381,16 @@ test("Lifecycle binding disconnects only graceful quit and preserves cleanup aft
   );
 
   assert.deepEqual(events, [
+    "live-surfaces-shutdown",
     "composed-shutdown",
+    "live-surfaces-shutdown",
     "disconnect-on-quit",
     "composed-shutdown",
+    "live-surfaces-shutdown",
     "disconnect-on-quit",
     "runtime:automatic-disconnect-on-quit",
     "composed-shutdown",
+    "live-surfaces-shutdown",
     "composed-shutdown",
   ]);
 });

@@ -63,6 +63,45 @@ test("Fenced button blocks use the shared grammar in place, independently of foo
   assert.equal(queued, true);
 });
 
+test("Fenced top-level button sequences are vertical aliases for explicit matrices", () => {
+  const sources = [
+    '{First|one}\n{Second|two}',
+    '{"label":"First","prompt":"one"}\n{"label":"Second","prompt":"two"}',
+    '[{First|one}{Second|two}]',
+  ];
+  for (const source of sources) {
+    const actions: unknown[] = [];
+    const plan = planTelegramButtonReply(`\`\`\`telegram_button\n${source}\n\`\`\``, {
+      registerAction: (action) => {
+        actions.push(action);
+        return `tgbtn:${actions.length}`;
+      },
+    });
+    assert.deepEqual(actions, [
+      { text: "First", prompt: "one" },
+      { text: "Second", prompt: "two" },
+    ]);
+    assert.equal((plan.markdown.match(/<tg-button-row>/g) ?? []).length, 2);
+  }
+  const horizontal = planTelegramButtonReply(
+    '```telegram_button\n[[{First|one}{Second|two}]]\n```',
+    { registerAction: () => "tgbtn:test" },
+  );
+  assert.equal((horizontal.markdown.match(/<tg-button-row>/g) ?? []).length, 1);
+  assert.equal((horizontal.markdown.match(/<tg-button /g) ?? []).length, 2);
+  for (const source of [
+    '{Valid|one}\n{"label":"Broken","prompt":}',
+    '{Valid|one}\n{Broken|}',
+    '{Valid|one} trailing',
+  ]) {
+    const plan = planTelegramButtonReply(`\`\`\`telegram_button\n${source}\n\`\`\``, {
+      registerAction: () => assert.fail("Malformed sequence registered callbacks"),
+    });
+    assert.equal(plan.markdown, "");
+    assert.equal(plan.replyMarkup, undefined);
+  }
+});
+
 test("Fenced singleton JSON/CML cells are equivalent and labels cannot inject Rich markup", () => {
   for (const payload of ['{Run|do-it}', '{"label":"Run","prompt":"do-it"}']) {
     const plan = planTelegramButtonReply(`\`\`\`telegram_button\n${payload}\n\`\`\``, {

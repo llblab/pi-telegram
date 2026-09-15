@@ -60,7 +60,7 @@ Every enabled button has a self-contained prompt and an optional selection style
 - `{label|prompt}` separates visible label from queued prompt.
 - `{label|prompt|selected_style}` and `{|prompt|selected_style}` accept `primary`, `success`, or `danger`.
 - Fourth-position `1`/`true` disables, `0`/`false` enables; omission means enabled. JSON uses boolean `disabled`. `{|Next||1}` omits label/style; `{Next|||1}` omits prompt/style; `{|||1}` is blank (Telegram receives a non-breaking space). Prefer meaningful labels and retain a useful enabled action. Enabled CML requires a prompt. Disabled controls stay visible but have no callback, queued prompt, or bound-method invocation.
-- Top-level cells form vertical rows; one nested row groups horizontal peers.
+- Top-level cells form vertical rows; inside a fenced block, adjacent top-level JSON/CML objects may omit the outer array and commas. One nested row groups horizontal peers.
 - Prefer one matrix per related group. Fenced blocks stay in place in Rich mode; HTML compatibility moves them to the footer. Native rows allow eight buttons. Malformed/oversized/unclosed blocks activate nothing; drafts hide them. Outer code fences and quoted/indented examples remain literal.
 - Both placements share prompt/app routing. In-body clicks acknowledge without recoloring; selected-style highlighting remains footer-only.
 

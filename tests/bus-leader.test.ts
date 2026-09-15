@@ -36,6 +36,7 @@ import {
   TELEGRAM_BUS_FOLLOWER_STALE_AFTER_MS,
   type TelegramBusLeaderRuntimeDeps,
 } from "../lib/bus-leader.ts";
+import type { TelegramThreadDisplayMode } from "../lib/config.ts";
 import {
   createTelegramTopicTargetStore,
   createTelegramTopicTargetProvisioner,
@@ -2741,7 +2742,7 @@ test("Non-default display modes reject incompatible followers before provisionin
   const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "test",
     capabilities: [...TEST_BUS_PROTOCOL_IDENTITY.capabilities, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE] });
   for (const scenario of ["names", "letters", "directories", "switching"] as const) {
-    let mode: "names" | "letters" | "directories" = scenario === "switching" ? "names" : scenario;
+    let mode: TelegramThreadDisplayMode = scenario === "switching" ? "names" : scenario;
     const registry = createTelegramBusFollowerRegistry();
     let provisions = 0;
     const handler = createRawTelegramBusLeaderEnvelopeHandler({
@@ -4107,7 +4108,7 @@ test("Leader assembly blocks Workspace mutations behind a retained retirement fe
     retirementRequestedAtMs: 1,
   });
   assert.equal(fence.kind, "acquired");
-  let mode: "letters" | "names" | "directories" = "names";
+  let mode: TelegramThreadDisplayMode = "names";
   let mutationRan = false;
   let apiCalls = 0;
   const runtime = createTelegramBusLeaderRuntimeAssembly({
@@ -4321,7 +4322,7 @@ test("Leader assembly applies display titles and publishes them through heartbea
     threadName: "Beacon", slot: "B",
   });
   const titles: unknown[] = [];
-  let displayMode: "letters" | "names" | "directories" = "letters";
+  let displayMode: TelegramThreadDisplayMode = "letters";
   const runtime = createTelegramBusLeaderRuntimeAssembly({
     runtime: { socketPath, followerRegistry: registry, protocolIdentity: TEST_BUS_PROTOCOL_IDENTITY,
       startPolling() {}, stopPolling() {} },
@@ -4496,7 +4497,7 @@ test("Same-cwd followers keep sticky directory labels until manual rename overri
   registry.register({ instanceId: "follower", target: { chatId: 7, threadId: 42 },
     registrationGeneration: "follower:1", connectedAtMs: 1, protocol: followerProtocol,
     slot: followerIdentity.slot, threadName: "Briar" });
-  let mode: "names" | "letters" | "directories" = "names";
+  let mode: TelegramThreadDisplayMode = "names";
   const titles: string[] = [];
   const runtime = createTelegramBusLeaderRuntimeAssembly({
     runtime: { socketPath, followerRegistry: registry, protocolIdentity: TEST_BUS_PROTOCOL_IDENTITY,
@@ -4589,7 +4590,7 @@ test("Leader display application retains acknowledged partial progress and retri
     protocol: createTelegramBusProtocolIdentity({ runtimeBuild: "test",
       capabilities: [...TEST_BUS_PROTOCOL_IDENTITY.capabilities, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE] }),
     threadName: "Beacon", slot: "B" });
-  let mode: "names" | "letters" | "directories" = "names";
+  let mode: TelegramThreadDisplayMode = "names";
   let rejectFollower = true;
   const calls: string[] = [];
   const runtime = createTelegramBusLeaderRuntimeAssembly({
@@ -4638,7 +4639,7 @@ test("Leader display application fences late profile and follower-generation cha
       registrationGeneration: "follower:1", connectedAtMs: 1, protocol,
       threadName: "Beacon", slot: "B" });
     let profile = "work";
-    let mode: "names" | "letters" | "directories" = "names";
+    let mode: TelegramThreadDisplayMode = "names";
     let releaseEdit: (() => void) | undefined;
     let announceEdit: (() => void) | undefined;
     const editStarted = new Promise<void>((resolve) => { announceEdit = resolve; });

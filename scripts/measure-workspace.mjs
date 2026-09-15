@@ -1,4 +1,11 @@
-// Measures isolated Thread-store work; never reads configured profiles or calls Telegram.
+/**
+ * Measures isolated Thread-store filesystem work at representative sizes.
+ * Usage: node --experimental-strip-types scripts/measure-workspace.mjs
+ *
+ * This assertion-backed fixture uses and removes its own temporary directory.
+ * It never reads configured profiles, calls Telegram, or measures latency.
+ */
+
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";

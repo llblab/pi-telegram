@@ -9,6 +9,7 @@ import * as Sync from "./sync.ts";
 import {
   createTelegramThreadDisplayReconciler,
   resolveTelegramInitialWorkspaceDisplayName,
+  resolveTelegramLiveWorkspaceBindingKeys,
 } from "./thread-display.ts";
 import type { TelegramThreadDisplayMode } from "./config.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
@@ -40,6 +41,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
+  TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT,
 } from "./bus.ts";
 import { getTelegramBusTransportRetryPolicy } from "./bus-transport.ts";
 import type { TelegramQueueHandoffPayload } from "./queue.ts";
@@ -309,6 +311,13 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
         });
       },
     }).run;
+  const captureLiveBindingKeys = (
+    bindings: readonly Threads.TelegramWorkspaceThreadBinding[],
+  ): ReadonlySet<string> => resolveTelegramLiveWorkspaceBindingKeys(
+    bindings,
+    deps.topicTargetStore.getActiveByInstanceId(deps.instanceId)?.target,
+    deps.runtime.followerRegistry.list(),
+  );
   const provisionerPorts = {
     getAllowedUserId: deps.getAllowedUserId,
     topicTargetStore: deps.topicTargetStore,
@@ -327,6 +336,9 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
               bindings: deps.topicTargetStore.listWorkspaceBindings(),
               binding,
               mode: deps.getThreadDisplayMode!(),
+              liveBindingKeys: captureLiveBindingKeys(
+                deps.topicTargetStore.listWorkspaceBindings(),
+              ),
             });
           },
         }
@@ -339,6 +351,7 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
     getMode: deps.getThreadDisplayMode,
     getProfileKey: () => deps.getTelegramProfile?.() ?? "default",
     getLeaderEpoch: () => deps.getCurrentLeaderEpoch?.(),
+    captureLiveBindingKeys,
     captureBindingAuthority(binding) {
       const matches = (target: TelegramTarget | undefined) =>
         target?.chatId === binding.target.chatId && target?.threadId === binding.target.threadId;
@@ -392,8 +405,11 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
           throw new Error("Telegram Thread display setting requires current leader authority.");
         }
         const assertDisplayPeers = () => {
+          const requiredCapability = mode === "directory-snake" || mode === "directory-title"
+            ? TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT
+            : TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE;
           if (mode !== "names" && deps.runtime.followerRegistry.list().some((follower) =>
-            !hasTelegramBusCapability(follower.protocol, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE),
+            !hasTelegramBusCapability(follower.protocol, requiredCapability),
           )) throw new Error("Update or restart all connected followers before changing Thread display mode.");
         };
         assertDisplayPeers();
@@ -597,14 +613,17 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
       );
       return binding?.displayTitle ?? binding?.threadName;
     },
-    onFollowerDisconnected: (follower) => runWorkspaceOperation(
-      {
-        operationId: createTelegramWorkspaceAdmissionOperationId(),
-        operationKind: "workspace.disconnect-follower",
-        scopes: [{ kind: "profile" }],
-      },
-      () => disconnectFollower(follower),
-    ),
+    onFollowerDisconnected: async (follower) => {
+      await runWorkspaceOperation(
+        {
+          operationId: createTelegramWorkspaceAdmissionOperationId(),
+          operationKind: "workspace.disconnect-follower",
+          scopes: [{ kind: "profile" }],
+        },
+        () => disconnectFollower(follower),
+      );
+      scheduleDisplay();
+    },
     async renameFollowerThread(follower, threadName) {
       return runWorkspaceOperation({
         operationId: createTelegramWorkspaceAdmissionOperationId(),
@@ -692,14 +711,17 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
         });
       },
     ),
-    onFollowerConfirmedDead: (follower) => runWorkspaceOperation(
-      {
-        operationId: createTelegramWorkspaceAdmissionOperationId(),
-        operationKind: "workspace.cleanup-dead-follower",
-        scopes: [{ kind: "profile" }],
-      },
-      () => cleanupConfirmedDeadFollower(follower),
-    ),
+    onFollowerConfirmedDead: async (follower) => {
+      await runWorkspaceOperation(
+        {
+          operationId: createTelegramWorkspaceAdmissionOperationId(),
+          operationKind: "workspace.cleanup-dead-follower",
+          scopes: [{ kind: "profile" }],
+        },
+        () => cleanupConfirmedDeadFollower(follower),
+      );
+      scheduleDisplay();
+    },
     provisionFollowerTarget: (registration, options) => runWorkspaceOperation(
       {
         operationId: `follower-provision:${registration.instanceId}:${registration.registrationGeneration}`,
@@ -2243,9 +2265,12 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
         const current = () => epoch !== undefined && deps.getCurrentLeaderEpoch?.() === epoch &&
           deps.followerRegistry.get(envelope.instanceId)?.registrationGeneration === envelope.registrationGeneration;
         const follower = deps.followerRegistry.get(envelope.instanceId);
+        const requiredCapability = envelope.mode === "directory-snake" || envelope.mode === "directory-title"
+          ? TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT
+          : TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE;
         if (!current() || !follower?.registrationGeneration || !deps.applyThreadDisplayMode ||
-            !hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE) ||
-            !hasTelegramBusCapability(follower.protocol, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE)) {
+            !hasTelegramBusCapability(deps.protocolIdentity, requiredCapability) ||
+            !hasTelegramBusCapability(follower.protocol, requiredCapability)) {
           return { kind: "bus.ack", requestId: envelope.requestId, ok: false,
             message: "Thread display settings require current registration and compatible leader authority." };
         }
