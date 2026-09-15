@@ -36,7 +36,7 @@
     "audit": "npm audit --omit=peer",
     "audit:host": "npm audit",
     "pack:check": "npm pack --dry-run",
-    "validate": "npm run typecheck && npm test && npm run audit && npm run build && npm run check && npm run pack:check"
+    "validate": "npm run build && npm run typecheck && npm test && npm run audit && npm run check && npm run pack:check"
   },
   "files": [
     "index.ts",
