@@ -2305,14 +2305,14 @@ test("Follower display setting requests negotiate capability and reject lost lea
   try {
     await server.start();
     await follower.registerWithLeader({ cwd: "/repo" }, { busSocketPath: socketPath });
-    await follower.setThreadDisplayMode?.("directories");
-    assert.deepEqual(modes, ["directories"]);
+    await follower.setThreadDisplayMode?.("letters");
+    assert.deepEqual(modes, ["letters"]);
     await assert.rejects(follower.setThreadDisplayMode!("names"), /stale registration/);
     state.setRegistered(true, state.getTarget(), {
       generation: state.getGeneration(), leaderProtocol: TEST_BUS_PROTOCOL_IDENTITY,
     });
     await assert.rejects(follower.setThreadDisplayMode!("letters"), /do not support/);
-    assert.deepEqual(modes, ["directories", "names"]);
+    assert.deepEqual(modes, ["letters", "names"]);
   } finally {
     follower.stop(); await server.stop(); rmSync(dir, { recursive: true, force: true });
   }

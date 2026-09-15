@@ -711,6 +711,14 @@ export function createTelegramBridgeStatusRuntime<
       const hasPendingModelSwitch = deps.hasPendingModelSwitch();
       const activeToolExecutions = deps.getActiveToolExecutions();
       const compactionInProgress = deps.isCompactionInProgress();
+      const activeWorkCount =
+        hasActiveTurn ||
+        hasPendingModelSwitch ||
+        activeToolExecutions > 0 ||
+        compactionInProgress ||
+        (hasPendingDispatch && queuedItemCount === 0)
+          ? 1
+          : 0;
       const localBus = deps.getLocalBus?.();
       return {
         hasBotToken: config.botHasToken ?? Boolean(config.botToken),
@@ -735,7 +743,10 @@ export function createTelegramBridgeStatusRuntime<
           activeToolExecutions,
           queuedItems: queuedItemCount,
         }),
-        queuedStatus: deps.formatQueuedStatus(queuedItems),
+        queuedStatus:
+          activeWorkCount + queuedItemCount > 0
+            ? ` +${activeWorkCount + queuedItemCount}`
+            : "",
         pollingStopReason: deps.getPollingState?.().stopReason,
         error,
       };
@@ -937,24 +948,16 @@ export function buildTelegramStatusBarText(
   if (!state.pollingActive && state.busRole !== "follower")
     return `${theme.fg("accent", "telegram")} ${theme.fg("dim", "disconnected")}${queued}`;
   if (state.error) {
-    return `${label} ${theme.fg("error", "error")}`;
+    return `${label} ${theme.fg("error", "error")}${queued}`;
   }
   if (state.busRole === "follower" && state.followerRegistered === false) {
     return `${label} ${theme.fg("warning", "reconnecting")}${queued}`;
   }
-  if (state.processing) {
-    const processingStatus = state.queuedStatus
-      ? "active"
-      : (state.processingStatus ?? "processing");
-    const processingToken =
-      processingStatus === "active" ? "warning" : "accent";
-    return `${label} ${theme.fg(processingToken, processingStatus)}${queued}`;
-  }
   if (state.busRole === "follower")
     return `${label} ${theme.fg("success", "follower")}${queued}`;
   if (state.busRole === "leader")
-    return `${label} ${theme.fg("success", "leader")}`;
-  return `${label} ${theme.fg("success", "connected")}`;
+    return `${label} ${theme.fg("success", "leader")}${queued}`;
+  return `${label} ${theme.fg("success", "connected")}${queued}`;
 }
 
 function formatTelegramBridgeBotStatus(

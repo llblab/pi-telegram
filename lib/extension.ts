@@ -866,18 +866,6 @@ export default function (pi: Pi.ExtensionAPI) {
         return threadStore.getBotState().threadMode === "enabled"
           ? Config.resolveTelegramThreadDisplayMode(configStore.get()) : undefined;
       },
-      getThreadDisplayPreview(mode) {
-        const bindings = threadStore.listWorkspaceBindings();
-        return [...ThreadDisplay.resolveTelegramWorkspaceDisplayNames(
-          bindings,
-          mode,
-          ThreadDisplay.resolveTelegramLiveWorkspaceBindingKeys(
-            bindings,
-            threadStore.getActiveByInstanceId(telegramInstanceId)?.target,
-            telegramBusFollowerRegistry.list(),
-          ),
-        ).values()];
-      },
       async setThreadDisplayMode(mode) {
         try {
           await ThreadDisplay.applyTelegramThreadDisplaySetting(mode, {

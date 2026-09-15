@@ -1223,7 +1223,7 @@ test("Named setup preserves a display preference changed while the token form wa
         async editor() {
           const other = Config.createTelegramConfigStore({ agentDir: dir, configPath });
           await other.load(); other.activateProfile("work");
-          await Config.setTelegramThreadDisplayMode(other, "directories", () => true);
+          await Config.setTelegramThreadDisplayMode(other, "directory-snake", () => true);
           return "new-token";
         },
         async input() { return "new-token"; }, notify() {},
@@ -1231,7 +1231,7 @@ test("Named setup preserves a display preference changed while the token form wa
     } as unknown as ExtensionContext);
     const saved = await Config.readTelegramConfig(configPath);
     assert.equal(saved.profiles?.work.botToken, "new-token");
-    assert.equal(saved.profiles?.work.threadDisplayMode, "directories");
+    assert.equal(saved.profiles?.work.threadDisplayMode, "directory-snake");
     assert.equal(store.getActiveProfileName(), "work");
   } finally {
     await rm(dir, { recursive: true, force: true });

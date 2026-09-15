@@ -2,6 +2,8 @@
 
 Living index of project documentation in `/docs`.
 
+> Developer note: Pi executes the generated `dist/pi-telegram/index.js` entrypoint. After any project edit, run `npm run build` before `/reload`, restart, or live verification; otherwise the runtime can continue using stale compiled output.
+
 `public-api.md` is the canonical entrypoint for stable extension surfaces. Focused documents exist only when a surface has enough runtime rules to need a dedicated standard.
 
 ## Documents

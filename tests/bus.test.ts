@@ -649,11 +649,12 @@ test("Bus contract encodes and parses explicit follower disconnect envelopes", (
 });
 
 test("Bus contract validates exact-generation Thread display setting envelopes", () => {
-  for (const mode of ["letters", "names", "directories"] as const) {
+  for (const mode of ["letters", "names", "directory-snake", "directory-title"] as const) {
     const envelope = { kind: "follower.setThreadDisplayMode" as const,
       requestId: "one", instanceId: "follower", registrationGeneration: "generation", mode };
     assert.deepEqual(parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()), envelope);
     assert.equal(getTelegramBusEnvelopeTrafficClass(envelope), "generation-fenced");
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, mode: "directories" })), undefined);
     assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, mode: "invalid" })), undefined);
     assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, registrationGeneration: undefined })), undefined);
   }

@@ -132,7 +132,7 @@ export function resolveTelegramWorkspaceDisplayNames(
         : (liveDirectoryCounts.get(binding.cwd) ?? 0) > 1;
       if (showSuffix && !slot) continue;
       const suffix = !showSuffix ? "" : mode === "directory-title"
-        ? ` · ${slot}`
+        ? ` ${slot}`
         : `_${slot!.toLowerCase()}`;
       labels.set(binding.bindingKey, boundedLabel(base, suffix));
     }
@@ -161,7 +161,7 @@ export function resolveTelegramWorkspaceDisplayNames(
         continue;
       }
       labels.set(binding.bindingKey, boundedLabel(bases.get(binding.bindingKey)!,
-        mode === "directory-title" ? ` · ${binding.slot}` : `_${binding.slot.toLowerCase()}`));
+        mode === "directory-title" ? ` ${binding.slot}` : `_${binding.slot.toLowerCase()}`));
     }
   }
   const counts = new Map<string, number>();

@@ -144,7 +144,7 @@ export type TelegramThreadDisplayMode =
   | "directory-title";
 
 const TELEGRAM_THREAD_DISPLAY_MODES: readonly TelegramThreadDisplayMode[] = [
-  "letters", "names", "directories", "directory-snake", "directory-title",
+  "letters", "names", "directory-snake", "directory-title",
 ];
 
 export function resolveTelegramThreadDisplayMode(

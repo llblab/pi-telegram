@@ -1029,7 +1029,7 @@ export function parseTelegramBusEnvelope(
     case "follower.setThreadDisplayMode":
       if (typeof value.instanceId === "string" &&
           typeof value.registrationGeneration === "string" &&
-          (value.mode === "letters" || value.mode === "names" || value.mode === "directories" ||
+          (value.mode === "letters" || value.mode === "names" ||
       value.mode === "directory-snake" || value.mode === "directory-title")) {
         envelope = { kind, requestId, instanceId: value.instanceId,
           registrationGeneration: value.registrationGeneration, mode: value.mode };

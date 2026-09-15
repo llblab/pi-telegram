@@ -26,7 +26,7 @@ Use this reference only when Show Me is responding through Telegram or preparing
 - Build mobile-first for roughly phone-width reading, then let the same document expand cleanly in a system or desktop browser. Text must wrap; diagrams must scroll or reflow without clipping.
 - Use semantic headings, sufficient contrast, non-color status meaning, comfortable touch targets, and no hover-only information.
 - Preserve real labels, values, ordering, and uncertainty. An attractive reconstruction must not invent runtime state or imply that a proposed interaction exists.
-- Include a compact provenance line when state matters, such as `Local patch · validated · not released · not live`.
+- Include a compact provenance line when state matters, such as `Local patch - validated - not released - not live`.
 - When rendering tools are available, inspect at least one narrow viewport and one wider viewport. Report what was inspected; static source review is not visual proof.
 - Deliver the file through the active Telegram attachment mechanism. Do not expose local paths as if the user could open them remotely.
 

@@ -3634,6 +3634,7 @@ test(`Extension runtime preserves accepted work and fences delivery after ${loss
 test("Extension runtime ignores the retired proactive opt-out while Telegram is connected", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentBodies: Array<Record<string, unknown>> = [];
+  const typingBodies: Array<Record<string, unknown>> = [];
   const { handlers, commands, pi, getActiveTools } = createRuntimePiHarness();
   const restoreFetch = setRuntimeTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
@@ -3646,6 +3647,10 @@ test("Extension runtime ignores the retired proactive opt-out while Telegram is 
     if (method === "sendMessage" || method === "sendRichMessage") {
       sentBodies.push(parseJsonRequestBody(init) ?? {});
       return createRuntimeTelegramApiResponse({ message_id: 100 });
+    }
+    if (method === "sendChatAction") {
+      typingBodies.push(parseJsonRequestBody(init) ?? {});
+      return createRuntimeTelegramApiResponse(true);
     }
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
@@ -3679,6 +3684,8 @@ test("Extension runtime ignores the retired proactive opt-out while Telegram is 
       ctx,
     );
     await handlers.get("agent_start")?.({}, ctx);
+    await waitForCondition(() => typingBodies.length === 1);
+    assert.deepEqual(typingBodies[0], { chat_id: 77, action: "typing" });
     const assistantMessage = {
       role: "assistant",
       content: [{ type: "text", text: "Local **done**" }],

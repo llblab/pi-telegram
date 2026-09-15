@@ -187,7 +187,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processing: true,
       queuedStatus: " +1",
     }),
-    "<accent>telegram</accent> <warning>active</warning><success> +1</success>",
+    "<accent>telegram</accent> <success>connected</success><success> +1</success>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -199,7 +199,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processingStatus: "dispatching",
       queuedStatus: " +1",
     }),
-    "<accent>telegram</accent> <warning>active</warning><success> +1</success>",
+    "<accent>telegram</accent> <success>connected</success><success> +1</success>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -211,7 +211,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processingStatus: "active",
       queuedStatus: "",
     }),
-    "<accent>telegram</accent> <warning>active</warning>",
+    "<accent>telegram</accent> <success>connected</success>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -234,7 +234,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processingStatus: "active",
       queuedStatus: "",
     }),
-    "<accent>telegram</accent> <warning>active</warning>",
+    "<accent>telegram</accent> <success>connected</success>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -299,7 +299,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processingStatus: "active",
       queuedStatus: "",
     }),
-    "<accent>Amber</accent> <warning>active</warning>",
+    "<accent>Amber</accent> <success>follower</success>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -388,10 +388,10 @@ test("Status bar text renders bridge connection and queue states", () => {
       paired: true,
       busRole: "leader",
       compactionInProgress: false,
-      processing: false,
-      queuedStatus: "",
+      processing: true,
+      queuedStatus: " +1",
     }),
-    "<accent>telegram</accent> <success>leader</success>",
+    "<accent>telegram</accent> <success>leader</success><success> +1</success>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -708,7 +708,7 @@ test("Status bar processing labels prefer the most specific live state", () => {
   );
 });
 
-test("Bridge status runtime stays active while tools run after queue changes", () => {
+test("Bridge status runtime keeps stable identity and counts active tools", () => {
   const events: string[] = [];
   const runtime = createTelegramBridgeStatusRuntime({
     getConfig: () => ({
@@ -739,7 +739,7 @@ test("Bridge status runtime stays active while tools run after queue changes", (
   });
   assert.equal(
     events[0],
-    "telegram:<accent>telegram</accent> <warning>active</warning>",
+    "telegram:<accent>telegram</accent> <success>connected</success><success> +1</success>",
   );
 });
 
@@ -845,7 +845,7 @@ test("Bridge status runtime builds status state from live ports", () => {
   });
   assert.equal(
     events[0],
-    "telegram:<accent>telegram</accent> <warning>active</warning><success> +1</success>",
+    "telegram:<accent>telegram</accent> <success>connected</success><success> +2</success>",
   );
   assert.deepEqual(runtime.getStatusLines(), [
     "connection:",
