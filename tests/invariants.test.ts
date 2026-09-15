@@ -83,8 +83,10 @@ test("Release CI validates exact tags and publishes through npm Trusted Publishe
     releaseWorkflowSource,
     /npm pack "\$PACKAGE_NAME@\$VERSION" --dry-run --json/,
   );
-  assert.match(releaseWorkflowSource, /\.\/index\.ts/);
-  assert.match(releaseWorkflowSource, /skills\/telegram-bridge\/SKILL\.md/);
+  assert.match(releaseWorkflowSource, /\.\/dist\/pi-telegram\/index\.js/);
+  assert.match(releaseWorkflowSource, /\.\/dist\/skills/);
+  assert.match(releaseWorkflowSource, /dist\/index\.d\.ts/);
+  assert.match(releaseWorkflowSource, /dist\/skills\/telegram-bridge\/SKILL\.md/);
   assert.match(
     releaseWorkflowSource,
     /gh release view[\s\S]*gh release edit[\s\S]*gh release create/,
