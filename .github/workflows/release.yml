@@ -152,16 +152,17 @@ jobs:
           if (published.version !== process.env.VERSION || published.gitHead !== process.env.TAG_COMMIT) {
             throw new Error(`Published npm identity does not match the release tag: ${JSON.stringify(published)}.`);
           }
-          if (!published.pi?.extensions?.includes("./index.ts") ||
-              !published.pi?.skills?.includes("./skills")) {
-            throw new Error("Published npm metadata is missing the Pi extension or skill manifest.");
+          if (!published.pi?.extensions?.includes("./dist/pi-telegram/index.js") ||
+              !published.pi?.skills?.includes("./dist/skills")) {
+            throw new Error("Published npm metadata is missing the built Pi extension or skill manifest.");
           }
           const packed = JSON.parse(readFileSync("npm-pack.json", "utf8"))[0];
           const paths = new Set((packed?.files ?? []).map((file) => file.path));
           if (packed?.name !== process.env.PACKAGE_NAME || packed?.version !== process.env.VERSION ||
-              !paths.has("index.ts") || !paths.has("skills/telegram-bridge/SKILL.md") ||
-              !paths.has("package.json")) {
-            throw new Error("Published npm tarball is missing the expected package identity or runtime manifests.");
+              !paths.has("dist/index.js") || !paths.has("dist/index.d.ts") ||
+              !paths.has("dist/pi-telegram/index.js") ||
+              !paths.has("dist/skills/telegram-bridge/SKILL.md") || !paths.has("package.json")) {
+            throw new Error("Published npm tarball is missing the expected built runtime or manifests.");
           }
           NODE
             then
