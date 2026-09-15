@@ -804,7 +804,9 @@ export function createTelegramActivityPublicationRuntime(): TelegramActivityPubl
 
 export interface TelegramAssistantOutputRuntime {
   start: () => void;
+  beginTurn: () => void;
   accept: (event: TelegramAssistantSegmentEvent) => void;
+  hasAdmittedTelegramIntermediate: (text: string) => boolean;
   waitForIdle: () => Promise<void>;
   stop: () => void;
 }
@@ -834,6 +836,7 @@ export function createTelegramAssistantOutputRuntime<TAuthority = undefined>(dep
   let running = false;
   let tail: Promise<void> = Promise.resolve();
   const admitted = new Set<string>();
+  const admittedTelegramIntermediateText = new Set<string>();
   const isEligibleEvent = (event: TelegramAssistantSegmentEvent): boolean =>
     (event.source === "telegram" && event.placement === "intermediate") ||
     event.source === "local" ||
@@ -845,13 +848,20 @@ export function createTelegramAssistantOutputRuntime<TAuthority = undefined>(dep
       generation += 1;
       running = true;
       admitted.clear();
+      admittedTelegramIntermediateText.clear();
       tail = Promise.resolve();
+    },
+    beginTurn() {
+      admittedTelegramIntermediateText.clear();
     },
     accept(event) {
       if (!running || !isEligibleEvent(event) || !event.text.trim()) return;
       const key = `${event.activityId}:${event.sequence}`;
       if (admitted.has(key)) return;
       admitted.add(key);
+      if (event.source === "telegram" && event.placement === "intermediate") {
+        admittedTelegramIntermediateText.add(event.text.trim());
+      }
       const admittedGeneration = generation;
       const admittedAuthority = deps.captureAuthority?.();
       const preparation = deps.prepareSend?.(event);
@@ -877,6 +887,9 @@ export function createTelegramAssistantOutputRuntime<TAuthority = undefined>(dep
         }
       }).finally(() => preparation?.settle());
     },
+    hasAdmittedTelegramIntermediate(text) {
+      return admittedTelegramIntermediateText.has(text.trim());
+    },
     waitForIdle() {
       return tail;
     },
@@ -884,6 +897,7 @@ export function createTelegramAssistantOutputRuntime<TAuthority = undefined>(dep
       generation += 1;
       running = false;
       admitted.clear();
+      admittedTelegramIntermediateText.clear();
     },
   };
 }

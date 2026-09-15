@@ -788,6 +788,10 @@ test("Assistant output projection admits all public local blocks once and in ord
   runtime.accept(
     assistantSegment(2, { source: "telegram", placement: "intermediate" }),
   );
+  assert.equal(runtime.hasAdmittedTelegramIntermediate("segment-2"), true);
+  assert.equal(runtime.hasAdmittedTelegramIntermediate(" segment-2 "), true);
+  runtime.beginTurn();
+  assert.equal(runtime.hasAdmittedTelegramIntermediate("segment-2"), false);
   runtime.accept(
     assistantSegment(3, { source: "telegram", placement: "final" }),
   );
@@ -818,6 +822,8 @@ test("Assistant output projection admits all public local blocks once and in ord
     "segment-11",
   ]);
   assert.deepEqual(failures, ["failed"]);
+  runtime.stop();
+  assert.equal(runtime.hasAdmittedTelegramIntermediate("segment-2"), false);
 });
 
 test("Assistant output projection preserves follower order and admission authority", async () => {

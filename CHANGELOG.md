@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.48.3: Assistant publication identity hotfix
+
+- `Thread restore display identity`: Restoring or reclaiming a Thread now renames the destination from its current Workspace display title when available, rather than leaking the internal baked slot name such as `Moss` into directory-title mode.
+- `Assistant publication identity`: An empty terminal assistant message may recover an earlier preserved answer, but it no longer republishes that text when the same Telegram intermediate output was already admitted; the pre-send turn fence also prevents lost-acknowledgement retries while allowing later turns.
+
 ## 0.48.2: Follower promotion recovery
 
 - `Follower promotion recovery`: A failed follower-to-leader promotion, including unavailable Thread slot authority, is now contained as a retryable bus recovery event instead of escaping a detached heartbeat recovery promise and terminating Pi.

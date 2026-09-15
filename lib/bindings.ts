@@ -835,7 +835,7 @@ interface TelegramLifecycleBindingDeps {
   activityVerbosityRuntime?: ActivityVerbosity.TelegramActivityVerbosityRuntime;
   assistantOutputRuntime: Pick<
     Activity.TelegramAssistantOutputRuntime,
-    "start" | "waitForIdle" | "stop"
+    "start" | "beginTurn" | "hasAdmittedTelegramIntermediate" | "waitForIdle" | "stop"
   >;
   sessionLifecycleRuntime: Pick<
     Lifecycle.TelegramLifecycleRegistrationDeps,
@@ -1136,7 +1136,10 @@ export function registerTelegramLifecycleRuntimeHooks({
     clearDispatchPending: lifecycle.clearDispatchPending,
     setFoldQueuedPromptsIntoHistory: lifecycle.setFoldQueuedPromptsIntoHistory,
     setActiveTurn: activeTurnRuntime.set,
-    onPromptHandedOff,
+    onPromptHandedOff: (turn, ctx) => {
+      assistantOutputRuntime.beginTurn();
+      onPromptHandedOff?.(turn, ctx);
+    },
     createPreviewState: previewRuntime.resetState,
     startTypingLoop: (ctx) => {
       const turn = activeTurnRuntime.get();
@@ -1148,6 +1151,8 @@ export function registerTelegramLifecycleRuntimeHooks({
     getActiveTurn: activeTurnRuntime.get,
     loadConfig: configStore.load,
     extractAssistant: Replies.extractRunAssistantMessage,
+    isRecoveredAssistantAlreadyPublished: (assistant) =>
+      !!assistant.text && assistantOutputRuntime.hasAdmittedTelegramIntermediate(assistant.text),
     getFoldQueuedPromptsIntoHistory:
       lifecycle.shouldFoldQueuedPromptsIntoHistory,
     resetRuntimeState: agentEndResetter,

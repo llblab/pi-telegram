@@ -191,6 +191,7 @@ export function extractRunAssistantMessage(
   text?: string;
   stopReason?: string;
   errorMessage?: string;
+  recoveredFromEarlier?: boolean;
 } {
   const latest = extractLatestAssistantMessageText(messages);
   if (latest.text || latest.stopReason !== "stop") return latest;
@@ -213,6 +214,7 @@ export function extractRunAssistantMessage(
       stopReason: typeof rawStopReason === "string" ? rawStopReason : undefined,
       errorMessage:
         typeof rawErrorMessage === "string" ? rawErrorMessage : undefined,
+      recoveredFromEarlier: true,
     };
   }
   return latest;

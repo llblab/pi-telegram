@@ -83,6 +83,7 @@ test("Run assistant extraction keeps the preserved answer when the final message
     text: "preserved answer",
     stopReason: "stop",
     errorMessage: undefined,
+    recoveredFromEarlier: true,
   });
 });
 

@@ -1560,7 +1560,9 @@ export function createTelegramInboundRouteRuntime<
           await deps.callApi("editForumTopic", {
             chat_id: sourceTarget.chatId,
             message_thread_id: sourceTarget.threadId,
-            name: Threads.getTelegramTopicTitleForThreadName(threadName, slot),
+            name:
+              deps.getDisplayTitle?.(sourceTarget) ??
+              Threads.getTelegramTopicTitleForThreadName(threadName, slot),
           });
           assertExecutionCurrent();
         } catch (renameError) {
@@ -1717,7 +1719,9 @@ export function createTelegramInboundRouteRuntime<
           await deps.callApi("editForumTopic", {
             chat_id: sourceTarget.chatId,
             message_thread_id: sourceTarget.threadId,
-            name: Threads.getTelegramTopicTitleForThreadName(threadName, slot),
+            name:
+              deps.getDisplayTitle?.(sourceTarget) ??
+              Threads.getTelegramTopicTitleForThreadName(threadName, slot),
           });
           assertExecutionCurrent();
         } catch (renameError) {
