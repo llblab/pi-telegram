@@ -1370,6 +1370,51 @@ test("Bus follower heartbeat recovery passes current binding into promotion", as
   ]);
 });
 
+test("Bus follower recovery contains promotion authority failure and schedules retry", async () => {
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(
+    true,
+    { chatId: 42, threadId: 10 },
+    { threadName: "Fjord" },
+  );
+  let scheduledRetry: (() => void) | undefined;
+  const events: Array<{ error: unknown; phase?: unknown }> = [];
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({
+      registerWithLeader: async () => false,
+      setContext: () => undefined,
+      stop: () => undefined,
+    }),
+    getLeaderState: () => ({ kind: "inactive" }),
+    setLifecyclePhase: () => undefined,
+    updateStatus: () => undefined,
+    promoteToLeader: async () => {
+      throw new Error("Telegram follower promotion slot authority is unavailable.");
+    },
+    scheduleRetry: (retry) => {
+      scheduledRetry = retry;
+    },
+    promotionGraceMs: 0,
+    recordRuntimeEvent: (_category, error, details) => {
+      events.push({ error, phase: details?.phase });
+    },
+  });
+
+  await handler(new Error("leader disconnected"), "ctx");
+
+  assert.equal(typeof scheduledRetry, "function");
+  assert.equal(
+    events.some(
+      (event) =>
+        event.phase === "follower-promotion-failed" &&
+        event.error instanceof Error &&
+        /promotion slot authority is unavailable/u.test(event.error.message),
+    ),
+    true,
+  );
+});
+
 test("Bus follower election defers a higher slot to the lowest live candidate", async () => {
   const registrationState = createTelegramBusFollowerRegistrationState();
   registrationState.setRegistered(
