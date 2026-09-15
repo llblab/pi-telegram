@@ -1496,8 +1496,8 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
     if (promotionPending) return;
     promotionPending = true;
     deps.registrationState.beginRecovery();
+    const initialBinding = carriedBinding ?? snapshotBinding();
     try {
-      const initialBinding = carriedBinding ?? snapshotBinding();
       const state = deps.getLeaderState();
       if (state.kind === "active-elsewhere") {
         clearRegisteredState(ctx);
@@ -1563,7 +1563,10 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
         });
         return;
       }
-      throw promotionError;
+      deps.recordRuntimeEvent("bus", promotionError, {
+        phase: "follower-promotion-failed",
+      });
+      scheduleRecovery(promotionError, ctx, initialBinding);
     } finally {
       promotionPending = false;
     }

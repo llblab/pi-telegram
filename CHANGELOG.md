@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.48.2: Follower promotion recovery
+
+- `Follower promotion recovery`: A failed follower-to-leader promotion, including unavailable Thread slot authority, is now contained as a retryable bus recovery event instead of escaping a detached heartbeat recovery promise and terminating Pi.
+
 ## 0.48.1: Truthful terminal queue count hotfix
 
 - `Terminal queue status`: The yellow `+N` suffix now counts only executable prompts still waiting in the Telegram queue. The current agent run never contributes—whether it started from Telegram, the terminal, or autonomous continuation—and a dispatched Telegram prompt leaves the visible count before its run settles.
