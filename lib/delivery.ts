@@ -18,7 +18,10 @@ import {
   type TelegramTarget,
 } from "./target.ts";
 import {
+  getTelegramApiRetryAfterMs,
+  isRetryableTelegramApiError,
   isTelegramApiCommitUnknownError,
+  isTelegramMessageUnavailableError,
   type TelegramBridgeApiRuntime,
 } from "./telegram-api.ts";
 
@@ -60,6 +63,9 @@ export type TelegramDeliveryFailureReason =
   | "stale-handle"
   | "invalid-view"
   | "commit-unknown"
+  | "message-unavailable"
+  | "rate-limited"
+  | "transport-retryable"
   | "transport-failed";
 
 export type TelegramDeliveryResult<T> =
@@ -68,6 +74,8 @@ export type TelegramDeliveryResult<T> =
       ok: false;
       reason: TelegramDeliveryFailureReason;
       message: string;
+      /** Exact Telegram flood-control delay when supplied by the API. */
+      retryAfterMs?: number;
       /** Successfully materialized state that callers may edit or delete to recover. */
       partial?: T;
     };
@@ -246,10 +254,26 @@ function failure<T>(
   reason: TelegramDeliveryFailureReason,
   message: string,
   partial?: T,
+  retryAfterMs?: number,
 ): TelegramDeliveryResult<T> {
+  const retry = retryAfterMs === undefined ? {} : { retryAfterMs };
   return partial === undefined
-    ? { ok: false, reason, message }
-    : { ok: false, reason, message, partial };
+    ? { ok: false, reason, message, ...retry }
+    : { ok: false, reason, message, partial, ...retry };
+}
+
+export function classifyTelegramDeliveryTransportError(error: unknown): {
+  reason: Extract<TelegramDeliveryFailureReason,
+    "commit-unknown" | "message-unavailable" | "rate-limited" |
+    "transport-retryable" | "transport-failed">;
+  retryAfterMs?: number;
+} {
+  if (isTelegramApiCommitUnknownError(error)) return { reason: "commit-unknown" };
+  if (isTelegramMessageUnavailableError(error)) return { reason: "message-unavailable" };
+  const retryAfterMs = getTelegramApiRetryAfterMs(error);
+  if (retryAfterMs !== undefined) return { reason: "rate-limited", retryAfterMs };
+  if (isRetryableTelegramApiError(error)) return { reason: "transport-retryable" };
+  return { reason: "transport-failed" };
 }
 
 /** @internal */
@@ -479,14 +503,14 @@ export function createTelegramDeliveryRuntime(
     if (error instanceof TelegramDeliveryTransportGenerationError) {
       return inactive();
     }
+    const classified = classifyTelegramDeliveryTransportError(error);
     return failure(
-      isTelegramApiCommitUnknownError(error)
-        ? "commit-unknown"
-        : "transport-failed",
-      isTelegramApiCommitUnknownError(error)
+      classified.reason,
+      classified.reason === "commit-unknown"
         ? `Telegram delivery ${operation} may have committed before transport failed.`
         : `Telegram delivery ${operation} failed.`,
       partial,
+      classified.retryAfterMs,
     );
   };
   const createHandle = (
@@ -835,6 +859,14 @@ export function clearTelegramDeliveryRuntime(): void {
   const registry = getTelegramDeliveryRuntimeRegistry();
   registry.runtime?.shutdown();
   registry.runtime = undefined;
+}
+
+/** @internal */
+export function isTelegramDeliveryHandleCurrent(
+  handle: TelegramDeliveryHandle,
+): boolean {
+  const runtime = getTelegramDeliveryRuntimeRegistry().runtime;
+  return runtime !== undefined && runtime.generation === handle.generation;
 }
 
 export async function sendTelegramView(

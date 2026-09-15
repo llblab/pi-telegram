@@ -15,6 +15,9 @@ import { promisify } from "node:util";
 
 import {
   bindGenerativeApp,
+  createGenerativeAppLiveSurfaceRuntime,
+  GENERATIVE_APP_MAX_REFRESH_AFTER_MS,
+  GENERATIVE_APP_MIN_REFRESH_AFTER_MS,
   formatDisplayedGenerativeAppToolOutput,
   formatGenerativeAppToolError,
   formatGenerativeAppToolOutput,
@@ -26,6 +29,14 @@ import {
   resolveGenerativeAppDir,
   resolveGenerativeAppModulePath,
 } from "../lib/generative-apps.ts";
+import {
+  bindTelegramDeliveryRuntime,
+  createTelegramBridgeDeliveryRuntime,
+  createTelegramDeliveryTargetPolicyRuntime,
+  editTelegramView,
+  isTelegramDeliveryHandleCurrent,
+  sendTelegramView,
+} from "../lib/delivery.ts";
 import type { ExtensionAPI } from "../lib/pi.ts";
 
 const execFileAsync = promisify(execFile);
@@ -50,6 +61,14 @@ export function inspect({ state }) {
 }
 export function invalid_view() {
   return { output: "invalid", viewMode: "replace" };
+}
+export function scheduled({ argument }) {
+  return { output: "scheduled", refreshAfterMs: argument };
+}
+export function refresh({ state, argument }) {
+  return argument === "stateful"
+    ? { output: "invalid refresh", state }
+    : { output: "refreshed", refreshAfterMs: argument };
 }
 `;
 
@@ -147,6 +166,45 @@ test("Generative App install initializes state and later methods commit or remai
       /viewMode must be new or edit/,
     );
     assert.equal(await readFile(journalPath, "utf8"), beforeInspect);
+
+    const minimumRefresh = await invokeGenerativeApp({
+      agentDir,
+      argument: 1,
+      method: "scheduled",
+      app: "counter",
+    });
+    assert.equal(minimumRefresh.refreshAfterMs, GENERATIVE_APP_MIN_REFRESH_AFTER_MS);
+    const maximumRefresh = await invokeGenerativeApp({
+      agentDir,
+      argument: GENERATIVE_APP_MAX_REFRESH_AFTER_MS + 1,
+      method: "refresh",
+      app: "counter",
+    });
+    assert.equal(maximumRefresh.refreshAfterMs, GENERATIVE_APP_MAX_REFRESH_AFTER_MS);
+    assert.equal(maximumRefresh.stateChanged, false);
+    assert.equal(await readFile(journalPath, "utf8"), beforeInspect);
+    for (const invalidHint of [0, -1, 1.5, Number.POSITIVE_INFINITY, "2000"]) {
+      await assert.rejects(
+        invokeGenerativeApp({
+          agentDir,
+          argument: invalidHint,
+          method: "scheduled",
+          app: "counter",
+        }),
+        /refreshAfterMs must be a finite positive integer/,
+      );
+    }
+    await assert.rejects(
+      invokeGenerativeApp({
+        agentDir,
+        argument: "stateful",
+        method: "refresh",
+        app: "counter",
+      }),
+      /refresh must be output-only/,
+    );
+    assert.equal(await readFile(journalPath, "utf8"), beforeInspect);
+
     const reset = await bindGenerativeApp({
       agentDir,
       argument: { count: 9 },
@@ -688,6 +746,237 @@ export async function mutate({ run }) {
   }
 });
 
+test("Generative App live surfaces suppress unchanged frames, remain non-overlapping, and close on omitted hints", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
+  const agentDir = join(root, "agent");
+  const timers: Array<() => void> = [];
+  const edits: string[] = [];
+  try {
+    const script = await writeApp(
+      root,
+      "dashboard",
+      `
+export function init() { return { state: { tick: 0 }, output: "same", refreshAfterMs: 2000 }; }
+export async function refresh() {
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  return { output: "same", refreshAfterMs: 2000 };
+}
+`,
+    );
+    const installed = await installGenerativeApp({ agentDir, app: "dashboard", script });
+    const runtime = createGenerativeAppLiveSurfaceRuntime<string>({
+      agentDir,
+      isCurrent: () => true,
+      plan: (result, handle) => ({ digest: result.output, handle }),
+      edit: async (frame) => {
+        edits.push(frame.digest);
+        return frame.handle;
+      },
+      setTimer(callback) {
+        timers.push(callback);
+        return { unref() {} } as ReturnType<typeof setTimeout>;
+      },
+      clearTimer: () => undefined,
+    });
+    runtime.open({
+      app: "dashboard",
+      appGeneration: installed.generation,
+      appRevision: installed.revision,
+      handle: "message-1",
+      initialDigest: "same",
+      key: "dashboard/default/1",
+      refreshAfterMs: installed.refreshAfterMs!,
+    });
+    assert.equal(timers.length, 1);
+    await Promise.all([
+      runtime.refreshNow("dashboard/default/1"),
+      runtime.refreshNow("dashboard/default/1"),
+    ]);
+    assert.deepEqual(edits, []);
+    assert.equal(timers.length, 2);
+    const taken = runtime.take("dashboard/default/1");
+    assert.equal(taken?.handle, "message-1");
+    assert.equal(taken?.appRevision, installed.revision);
+    assert.equal(runtime.take("dashboard/default/1"), undefined);
+    runtime.open({
+      ...taken!,
+      appRevision: installed.revision + 1,
+      initialDigest: "action-frame",
+    });
+    assert.equal(timers.length, 3);
+    runtime.cancel("dashboard/default/1");
+    await runtime.refreshNow("dashboard/default/1");
+    assert.deepEqual(edits, []);
+    runtime.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Generative App live surfaces fence a cancelled in-flight refresh from its replacement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
+  const agentDir = join(root, "agent");
+  const edits: string[] = [];
+  let plans = 0;
+  try {
+    const script = await writeApp(root, "handoff-dashboard", `
+export function init() { return { state: {}, output: "initial", refreshAfterMs: 2000 }; }
+export async function refresh() {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  return { output: "stale-refresh", refreshAfterMs: 3000 };
+}
+`);
+    const installed = await installGenerativeApp({ agentDir, app: "handoff-dashboard", script });
+    const runtime = createGenerativeAppLiveSurfaceRuntime<string>({
+      agentDir,
+      isCurrent: () => true,
+      plan: (result, handle) => {
+        plans += 1;
+        return { digest: result.output, handle };
+      },
+      edit: async (frame) => {
+        edits.push(frame.digest);
+        return frame.handle;
+      },
+      setTimer: () => ({ unref() {} }) as ReturnType<typeof setTimeout>,
+      clearTimer: () => undefined,
+    });
+    const key = "handoff-dashboard/default/1";
+    const original = {
+      app: "handoff-dashboard",
+      appGeneration: installed.generation,
+      appRevision: installed.revision,
+      handle: "message-1",
+      initialDigest: "initial",
+      key,
+      refreshAfterMs: installed.refreshAfterMs!,
+    };
+    runtime.open(original);
+    const refresh = runtime.refreshNow(key);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(runtime.take(key)?.handle, "message-1");
+    runtime.open({ ...original, handle: "message-2", initialDigest: "action-frame" });
+    await refresh;
+    assert.equal(plans, 0);
+    assert.deepEqual(edits, []);
+    assert.equal(runtime.take(key)?.handle, "message-2");
+    runtime.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Generative App live surfaces retry one retained frame without re-invoking refresh", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
+  const agentDir = join(root, "agent");
+  const timers: Array<{ callback: () => void; delayMs: number }> = [];
+  let plans = 0;
+  let edits = 0;
+  try {
+    const script = await writeApp(root, "retry-dashboard", `
+export function init() { return { state: {}, output: "initial", refreshAfterMs: 2000 }; }
+export function refresh() { return { output: "changed", refreshAfterMs: 3000 }; }
+`);
+    const installed = await installGenerativeApp({ agentDir, app: "retry-dashboard", script });
+    const runtime = createGenerativeAppLiveSurfaceRuntime<string>({
+      agentDir,
+      isCurrent: () => true,
+      plan: (result, handle) => {
+        plans += 1;
+        return { digest: result.output, handle };
+      },
+      edit: async (frame) => {
+        edits += 1;
+        if (edits === 1) throw Object.assign(new Error("limited"), { retryAfterMs: 7000 });
+        return frame.handle;
+      },
+      classifyEditError: (error) => ({
+        kind: "retry",
+        retryAfterMs: (error as { retryAfterMs: number }).retryAfterMs,
+      }),
+      setTimer(callback, delayMs) {
+        timers.push({ callback, delayMs });
+        return { unref() {} } as ReturnType<typeof setTimeout>;
+      },
+      clearTimer: () => undefined,
+    });
+    runtime.open({
+      app: "retry-dashboard",
+      appGeneration: installed.generation,
+      appRevision: installed.revision,
+      handle: "message-1",
+      initialDigest: "initial",
+      key: "retry-dashboard/default/1",
+      refreshAfterMs: installed.refreshAfterMs!,
+    });
+    await runtime.refreshNow("retry-dashboard/default/1");
+    assert.equal(timers.at(-1)?.delayMs, 7000);
+    await runtime.refreshNow("retry-dashboard/default/1");
+    assert.equal(plans, 1);
+    assert.equal(edits, 2);
+    assert.equal(timers.at(-1)?.delayMs, 3000);
+    runtime.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Generative App live surfaces invalidate unavailable deliveries with bounded diagnostics", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
+  const agentDir = join(root, "agent");
+  const events: Array<{ category: string; details?: Record<string, unknown> }> = [];
+  let plans = 0;
+  try {
+    const script = await writeApp(root, "deleted-dashboard", `
+export function init() { return { state: {}, output: "initial", refreshAfterMs: 2000 }; }
+export function refresh() { return { output: "changed", refreshAfterMs: 3000 }; }
+`);
+    const installed = await installGenerativeApp({ agentDir, app: "deleted-dashboard", script });
+    const runtime = createGenerativeAppLiveSurfaceRuntime<string>({
+      agentDir,
+      isCurrent: () => true,
+      plan: (result, handle) => {
+        plans += 1;
+        return { digest: result.output, handle };
+      },
+      edit: async () => {
+        throw new Error("message to edit not found");
+      },
+      classifyEditError: () => ({ kind: "unavailable" }),
+      recordRuntimeEvent(category, _error, details) {
+        events.push({ category, details });
+      },
+      setTimer: () => ({ unref() {} }) as ReturnType<typeof setTimeout>,
+      clearTimer: () => undefined,
+    });
+    const key = "deleted-dashboard/default/1";
+    runtime.open({
+      app: "deleted-dashboard",
+      appGeneration: installed.generation,
+      appRevision: installed.revision,
+      handle: "message-1",
+      initialDigest: "initial",
+      key,
+      refreshAfterMs: installed.refreshAfterMs!,
+    });
+    await runtime.refreshNow(key);
+    await runtime.refreshNow(key);
+    assert.equal(plans, 1);
+    assert.equal(runtime.take(key), undefined);
+    assert.deepEqual(events, [{
+      category: "generative-app",
+      details: {
+        phase: "live-surface-refresh",
+        app: "deleted-dashboard",
+        outcome: "unavailable",
+      },
+    }]);
+    runtime.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("telegram_bind Tool output contributes exactly one leading newline", () => {
   assert.equal(formatGenerativeAppToolOutput("ready"), "\nready");
   assert.equal(formatGenerativeAppToolOutput("\n\nready"), "\nready");
@@ -728,9 +1017,16 @@ test("telegram_bind displays app output directly in an active Telegram turn", as
         });
         return { markdown: `planned:${markdown}`, replyMarkup: { inline_keyboard: [] } };
       },
-      async sendMarkdownReply(...args) {
+      async sendView(...args) {
         deliveries.push(args);
-        return 654;
+        return {
+          ok: true as const,
+          value: {
+            target: { chatId: 123, threadId: 789 },
+            messageIds: [654],
+            generation: "delivery-1",
+          },
+        };
       },
     });
     const installed = await tool!.execute("call-1", {
@@ -745,16 +1041,196 @@ test("telegram_bind displays app output directly in an active Telegram turn", as
     assert.match(installed.content[0]?.text ?? "", /Do not repeat/u);
     assert.doesNotMatch(installed.content[0]?.text ?? "", /ready/u);
     assert.deepEqual(deliveries, [[
-      123,
-      456,
-      "planned:ready",
       {
+        text: "planned:ready",
+        parseMode: "markdown",
         replyMarkup: { inline_keyboard: [] },
-        target: { chatId: 123, threadId: 789 },
+      },
+      {
+        scope: { kind: "active-turn" },
+        replyToMessageId: 456,
       },
     ]]);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("telegram_bind attaches hinted successful delivery to the live-surface scheduler", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
+  const agentDir = join(root, "agent");
+  let tool: { execute: (id: string, params: Record<string, unknown>) => Promise<unknown> } | undefined;
+  const timers: Array<() => void> = [];
+  const edits: string[] = [];
+  const pi = { registerTool(definition: typeof tool) { tool = definition; } } as unknown as ExtensionAPI;
+  try {
+    const script = await writeApp(root, "dashboard", `
+export function init() { return { state: {}, output: "initial", refreshAfterMs: 2000 }; }
+export function refresh() { return { output: "updated" }; }
+`);
+    registerTelegramBindTool(pi, {
+      agentDir,
+      getActiveProfileName: () => "work",
+      getActiveTurn: () => ({ chatId: 123, replyToMessageId: 456 }),
+      isDeliveryHandleCurrent: () => true,
+      planOutput: (markdown) => ({ markdown: `planned:${markdown}` }),
+      sendView: async () => ({
+        ok: true,
+        value: { target: { chatId: 123 }, messageIds: [654], generation: "delivery-1" },
+      }),
+      editView: async (handle, view) => {
+        edits.push(view.text);
+        return { ok: true, value: handle };
+      },
+      liveSurfaceSetTimer(callback) {
+        timers.push(callback);
+        return { unref() {} } as ReturnType<typeof setTimeout>;
+      },
+      liveSurfaceClearTimer: () => undefined,
+    });
+    await tool!.execute("call-1", { app: "dashboard", script });
+    assert.equal(timers.length, 1);
+    timers[0]!();
+    for (let attempt = 0; attempt < 20 && edits.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.deepEqual(edits, ["planned:updated"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("telegram_bind classifies Delivery message-unavailable live edits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
+  const agentDir = join(root, "agent");
+  let tool: { execute: (id: string, params: Record<string, unknown>) => Promise<unknown> } | undefined;
+  const timers: Array<() => void> = [];
+  const outcomes: unknown[] = [];
+  const pi = { registerTool(definition: typeof tool) { tool = definition; } } as unknown as ExtensionAPI;
+  try {
+    const script = await writeApp(root, "missing-dashboard", `
+export function init() { return { state: {}, output: "initial", refreshAfterMs: 2000 }; }
+export function refresh() { return { output: "updated", refreshAfterMs: 3000 }; }
+`);
+    registerTelegramBindTool(pi, {
+      agentDir,
+      getActiveTurn: () => ({ chatId: 123, replyToMessageId: 456 }),
+      isDeliveryHandleCurrent: () => true,
+      planOutput: (markdown) => ({ markdown }),
+      sendView: async () => ({
+        ok: true,
+        value: { target: { chatId: 123 }, messageIds: [654], generation: "delivery-1" },
+      }),
+      editView: async () => ({
+        ok: false,
+        reason: "message-unavailable",
+        message: "message to edit not found",
+      }),
+      recordRuntimeEvent: (_category, _error, details) => outcomes.push(details?.outcome),
+      liveSurfaceSetTimer(callback) {
+        timers.push(callback);
+        return { unref() {} } as ReturnType<typeof setTimeout>;
+      },
+      liveSurfaceClearTimer: () => undefined,
+    });
+    await tool!.execute("call-1", { app: "missing-dashboard", script });
+    timers[0]!();
+    for (let attempt = 0; attempt < 20 && outcomes.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.deepEqual(outcomes, ["unavailable"]);
+    assert.equal(timers.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("telegram_bind live surfaces retain classic, leader, and follower delivery targets", async () => {
+  const cases = [
+    { name: "classic", ownsDirect: true, follower: false, active: { chatId: 123 } },
+    { name: "leader", ownsDirect: true, follower: false, active: { chatId: 123, threadId: 7 } },
+    { name: "follower", ownsDirect: false, follower: true, active: { chatId: 123, threadId: 8 } },
+  ] as const;
+  for (const entry of cases) {
+    const root = await mkdtemp(join(tmpdir(), `pi-telegram-generative-app-${entry.name}-`));
+    const agentDir = join(root, "agent");
+    let tool: { execute: (id: string, params: Record<string, unknown>) => Promise<unknown> } | undefined;
+    const timers: Array<() => void> = [];
+    const sends: Array<Record<string, unknown>> = [];
+    const edits: Array<Record<string, unknown>> = [];
+    const policy = createTelegramDeliveryTargetPolicyRuntime({
+      ownsDirect: () => entry.ownsDirect,
+      isFollowerRegistered: () => entry.follower,
+      getAllowedChatId: () => 123,
+      getFollowerTarget: () => entry.follower ? entry.active : undefined,
+      getLeaderTarget: () => entry.name === "leader" ? entry.active : undefined,
+      listThreadRecords: () => "threadId" in entry.active ? [{ target: entry.active }] : [],
+      getActiveTurnTarget: () => entry.active,
+      getActiveGuestQueryId: () => undefined,
+    });
+    const runtime = createTelegramBridgeDeliveryRuntime({
+      generation: `delivery-${entry.name}`,
+      getTargetPolicyView: policy.getTargetPolicyView,
+      getActiveTurnTarget: policy.getActiveTurnTarget,
+      api: {
+        async sendMessage(body) { sends.push(body); return { message_id: 654 }; },
+        async editMessageText(body) { edits.push(body); return "edited"; },
+        async deleteMessage() {},
+        async sendChatAction() { return true; },
+      },
+      recordOwnership: () => undefined,
+    });
+    const unbind = bindTelegramDeliveryRuntime(runtime);
+    try {
+      const script = await writeApp(root, "dashboard", `
+export function init() { return { state: {}, output: "initial", refreshAfterMs: 2000 }; }
+export function refresh() { return { output: "updated" }; }
+`);
+      const pi = { registerTool(definition: typeof tool) { tool = definition; } } as unknown as ExtensionAPI;
+      registerTelegramBindTool(pi, {
+        agentDir,
+        getActiveProfileName: () => "work",
+        getActiveTurn: () => ({
+          chatId: entry.active.chatId,
+          replyToMessageId: 456,
+          target: entry.active,
+        }),
+        isDeliveryHandleCurrent: isTelegramDeliveryHandleCurrent,
+        planOutput: (markdown) => ({ markdown }),
+        sendView: (view, options) => sendTelegramView(
+          view as Parameters<typeof sendTelegramView>[0],
+          options,
+        ),
+        editView: (handle, view) => editTelegramView(
+          handle,
+          view as Parameters<typeof editTelegramView>[1],
+        ),
+        liveSurfaceSetTimer(callback) {
+          timers.push(callback);
+          return { unref() {} } as ReturnType<typeof setTimeout>;
+        },
+        liveSurfaceClearTimer: () => undefined,
+      });
+      await tool!.execute("call-1", { app: "dashboard", script });
+      assert.equal(sends.length, 1, entry.name);
+      assert.equal(sends[0]?.chat_id, entry.active.chatId, entry.name);
+      assert.equal(
+        sends[0]?.message_thread_id,
+        "threadId" in entry.active ? entry.active.threadId : undefined,
+        entry.name,
+      );
+      timers[0]!();
+      for (let attempt = 0; attempt < 20 && edits.length === 0; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.equal(edits.length, 1, entry.name);
+      assert.equal(edits[0]?.chat_id, entry.active.chatId, entry.name);
+      assert.equal(edits[0]?.message_id, 654, entry.name);
+    } finally {
+      unbind();
+      runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 

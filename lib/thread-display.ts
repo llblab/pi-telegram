@@ -26,30 +26,88 @@ function boundedLabel(base: string, suffix = ""): string {
   return `${prefix}${suffix}`;
 }
 
-function directoryLabel(cwd: string, directories: readonly string[]): string {
-  const parts = cwd.split("/").filter(Boolean);
-  if (!parts.length) return "/";
+function directorySegments(cwd: string): string[] {
+  return cwd.split("/").filter(Boolean);
+}
+
+function distinguishingDirectorySegments(cwd: string, directories: readonly string[]): string[] {
+  const parts = directorySegments(cwd);
+  if (!parts.length) return [];
   for (let depth = 1; depth <= parts.length; depth++) {
     const candidate = labelText(parts.slice(-depth).join("/"));
     const collides = directories.some((other) => other !== cwd &&
-      labelText(other.split("/").filter(Boolean).slice(-depth).join("/")).toLowerCase() ===
+      labelText(directorySegments(other).slice(-depth).join("/")).toLowerCase() ===
         candidate.toLowerCase(),
     );
-    if (!collides) return candidate;
+    if (!collides) return parts.slice(-depth);
   }
-  return labelText(cwd);
+  return parts;
+}
+
+function directoryLabel(cwd: string, directories: readonly string[]): string {
+  const parts = distinguishingDirectorySegments(cwd, directories);
+  return parts.length ? labelText(parts.join("/")) : "/";
+}
+
+/** Pure directory tokenization shared by previews, initial titles, and reconciliation. */
+export function tokenizeTelegramDirectorySegment(segment: string): string[] {
+  return segment
+    .replace(/([\p{Ll}\p{N}])(\p{Lu})/gu, "$1\u0000$2")
+    .replace(/(\p{Lu})(\p{Lu}\p{Ll})/gu, "$1\u0000$2")
+    .split(/[^\p{L}\p{N}]+|\u0000/gu)
+    .filter(Boolean);
+}
+
+function formatDirectoryLabel(
+  cwd: string,
+  directories: readonly string[],
+  mode: "directory-snake" | "directory-title",
+): string {
+  const segments = distinguishingDirectorySegments(cwd, directories);
+  if (!segments.length) return "/";
+  const formatted = segments.map((segment) => {
+    const tokens = tokenizeTelegramDirectorySegment(segment);
+    if (!tokens.length) return "";
+    if (mode === "directory-snake") return tokens.map((token) => token.toLowerCase()).join("_");
+    return tokens.map((token) => /\p{L}/u.test(token) && token === token.toUpperCase()
+      ? token
+      : `${token.slice(0, 1).toUpperCase()}${token.slice(1).toLowerCase()}`).join(" ");
+  }).filter(Boolean);
+  if (!formatted.length) return directoryLabel(cwd, directories);
+  return formatted.join(mode === "directory-snake" ? "_" : " / ");
+}
+
+/** Maps one leader-captured authenticated owner roster onto retained binding identities. */
+export function resolveTelegramLiveWorkspaceBindingKeys(
+  bindings: readonly TelegramWorkspaceThreadBinding[],
+  leaderTarget: { chatId: number; threadId?: number } | undefined,
+  followers: readonly { target?: { chatId: number; threadId?: number } }[],
+): ReadonlySet<string> {
+  const targets = new Set<string>();
+  const add = (target: { chatId: number; threadId?: number } | undefined) => {
+    if (target && typeof target.threadId === "number") {
+      targets.add(`${target.chatId}:${target.threadId}`);
+    }
+  };
+  add(leaderTarget);
+  for (const follower of followers) add(follower.target);
+  return new Set(bindings.filter((binding) =>
+    targets.has(`${binding.target.chatId}:${binding.target.threadId}`),
+  ).map((binding) => binding.bindingKey));
 }
 
 /** Missing or ambiguous metadata yields no label rather than inventing identity. */
 export function resolveTelegramWorkspaceDisplayNames(
   bindings: readonly TelegramWorkspaceDisplayBinding[],
   mode: TelegramThreadDisplayMode,
+  liveBindingKeys: ReadonlySet<string> = new Set(),
 ): Map<string, string> {
   const labels = new Map<string, string>();
   const directories = Array.from(new Set(bindings.map((binding) => binding.cwd)));
-  const directoryCounts = new Map<string, number>();
+  const liveDirectoryCounts = new Map<string, number>();
   for (const binding of bindings) {
-    directoryCounts.set(binding.cwd, (directoryCounts.get(binding.cwd) ?? 0) + 1);
+    if (!liveBindingKeys.has(binding.bindingKey)) continue;
+    liveDirectoryCounts.set(binding.cwd, (liveDirectoryCounts.get(binding.cwd) ?? 0) + 1);
   }
   const bases = new Map<string, string>();
   for (const binding of bindings) {
@@ -65,18 +123,27 @@ export function resolveTelegramWorkspaceDisplayNames(
       const name = binding.threadName ? labelText(binding.threadName) : slot;
       if (name) labels.set(binding.bindingKey, boundedLabel(name));
     } else {
-      const base = directoryLabel(binding.cwd, directories);
+      const base = mode === "directories"
+        ? directoryLabel(binding.cwd, directories)
+        : formatDirectoryLabel(binding.cwd, directories, mode);
       bases.set(binding.bindingKey, base);
-      const showSuffix = binding.showSlotSuffix ||
-        (directoryCounts.get(binding.cwd) ?? 0) > 1;
+      const showSuffix = mode === "directories"
+        ? binding.showSlotSuffix || bindings.filter((candidate) => candidate.cwd === binding.cwd).length > 1
+        : (liveDirectoryCounts.get(binding.cwd) ?? 0) > 1;
       if (showSuffix && !slot) continue;
-      labels.set(binding.bindingKey, boundedLabel(base, showSuffix ? `_${slot!.toLowerCase()}` : ""));
+      const suffix = !showSuffix ? "" : mode === "directory-title"
+        ? ` · ${slot}`
+        : `_${slot!.toLowerCase()}`;
+      labels.set(binding.bindingKey, boundedLabel(base, suffix));
     }
   }
   // Long or whitespace-normalized paths can collide even after qualification.
-  if (mode === "directories") {
+  if (mode === "directories" || mode === "directory-snake" || mode === "directory-title") {
     const counts = new Map<string, number>();
-    for (const label of labels.values()) {
+    for (const binding of bindings) {
+      const label = labels.get(binding.bindingKey);
+      if (!label || ((mode === "directory-snake" || mode === "directory-title") &&
+          !liveBindingKeys.has(binding.bindingKey))) continue;
       const key = label.toLowerCase();
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
@@ -84,16 +151,24 @@ export function resolveTelegramWorkspaceDisplayNames(
       const label = labels.get(binding.bindingKey);
       if (binding.manualThreadName || !label ||
           (counts.get(label.toLowerCase()) ?? 0) < 2) continue;
+      if ((mode === "directory-snake" || mode === "directory-title") &&
+          (liveDirectoryCounts.get(binding.cwd) ?? 0) < 2) {
+        labels.delete(binding.bindingKey);
+        continue;
+      }
       if (!binding.slot || !/^[A-Z]$/u.test(binding.slot)) {
         labels.delete(binding.bindingKey);
         continue;
       }
       labels.set(binding.bindingKey, boundedLabel(bases.get(binding.bindingKey)!,
-        `_${binding.slot.toLowerCase()}`));
+        mode === "directory-title" ? ` · ${binding.slot}` : `_${binding.slot.toLowerCase()}`));
     }
   }
   const counts = new Map<string, number>();
-  for (const label of labels.values()) {
+  for (const binding of bindings) {
+    const label = labels.get(binding.bindingKey);
+    if (!label || ((mode === "directory-snake" || mode === "directory-title") &&
+        !liveBindingKeys.has(binding.bindingKey))) continue;
     const key = label.toLowerCase();
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
@@ -108,6 +183,7 @@ export function resolveTelegramInitialWorkspaceDisplayName(input: {
   binding: TelegramWorkspaceDisplayBinding;
   mode: TelegramThreadDisplayMode;
   preserveRetainedManualName?: boolean;
+  liveBindingKeys?: ReadonlySet<string>;
 }): string | undefined {
   const retained = input.bindings.find((binding) =>
     binding.bindingKey === input.binding.bindingKey,
@@ -126,7 +202,7 @@ export function resolveTelegramInitialWorkspaceDisplayName(input: {
       candidate.bindingKey !== binding.bindingKey,
     ),
     binding,
-  ], input.mode).get(binding.bindingKey);
+  ], input.mode, new Set([...(input.liveBindingKeys ?? []), binding.bindingKey])).get(binding.bindingKey);
 }
 
 export async function applyTelegramThreadDisplaySetting(
@@ -155,6 +231,7 @@ export interface TelegramThreadDisplayReconcilerDeps {
   getProfileKey(): string;
   getLeaderEpoch(): string | number | undefined;
   captureBindingAuthority(binding: TelegramWorkspaceThreadBinding): (() => boolean) | undefined;
+  captureLiveBindingKeys(bindings: readonly TelegramWorkspaceThreadBinding[]): ReadonlySet<string>;
   callApi<TResponse>(
     method: string,
     body: Record<string, unknown>,
@@ -179,7 +256,8 @@ export function createTelegramThreadDisplayReconciler(
     };
     assertAuthority();
     const bindings = deps.store.listWorkspaceBindings();
-    const titles = resolveTelegramWorkspaceDisplayNames(bindings, mode);
+    const liveBindingKeys = deps.captureLiveBindingKeys(bindings);
+    const titles = resolveTelegramWorkspaceDisplayNames(bindings, mode, liveBindingKeys);
     let changed = 0;
     for (const binding of bindings) {
       const isBindingCurrent = deps.captureBindingAuthority(binding);

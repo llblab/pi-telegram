@@ -150,8 +150,8 @@ For `telegram_button` hidden comments and fenced blocks:
 - Positional `{label|prompt|selected_style|1}` is equivalent to JSON `{"label":"label","prompt":"prompt","selected_style":"selected_style","disabled":true}` with a valid selected style; `{|prompt||1}` is equivalent to `{"prompt":"prompt","disabled":true}`. Fourth-position `0` or `false` matches `disabled: false`; `true` is equivalent to `1`.
 - `{label|||1}` matches JSON `{"label":"label","disabled":true}`; `{|||1}` matches `{"disabled":true}`. Disabled cells require no prompt and do not retain action or selected-style semantics.
 - Disabled buttons serialize as `{ text, disabled: {} }`, without `callback_data`; they neither enqueue prompts nor invoke bound app methods. Enabled controls keep existing selection and callback behavior.
-- Top-level cells become full-width rows.
-- Nested rows become horizontal keyboard rows.
+- Top-level cells become full-width rows. Inside a fenced block, a whitespace-separated sequence of top-level JSON/CML objects is an alias for the same objects inside an outer matrix, so vertical rows need neither brackets nor commas.
+- Nested rows become horizontal keyboard rows; horizontal intent still requires the explicit nested array.
 - Invalid payloads are stripped with their recognized action comment and register no callbacks.
 
 The wrapper selects placement without changing cell semantics. A hidden `telegram_button` HTML comment builds the footer keyboard. A standalone column-zero fenced block opened by exactly three backticks plus `telegram_button` renders rows between paragraphs in Native Rich Markdown. A singleton JSON/CML object needs no array in either wrapper. Fenced content must be one complete payload without trailing envelope text. Larger outer fences and ordinary code blocks remain literal examples; unclosed action fences are withheld. Native Rich rows support at most eight buttons and must fit one message chunk; these are renderer constraints, not grammar limits. HTML compatibility places fenced controls in the footer. See [Outbound](./outbound.md) for delivery and callback behavior.
@@ -160,7 +160,14 @@ The wrapper selects placement without changing cell semantics. A hidden `telegra
 Description.
 
 ```telegram_button
-[{Details|Explain this section.}[{Choose|Choose this option.}{Unavailable|||true}]]
+{Details|Explain this section.}
+{"label":"More","prompt":"Show more context."}
+```
+
+Horizontal peers remain explicit:
+
+```telegram_button
+[[{Choose|Choose this option.}{Unavailable|||true}]]
 ```
 
 Next paragraph.

@@ -64,6 +64,7 @@ const telegramBusProtocolIdentity =
     Bus.TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
     Bus.TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
     Bus.TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
+    Bus.TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT,
   ]);
 
 // --- Extension Runtime ---
@@ -672,11 +673,15 @@ export default function (pi: Pi.ExtensionAPI) {
       getHandlers: configStore.getOutboundHandlers,
       recordRuntimeEvent,
     });
+  const generativeAppLiveSurfaceBinding =
+    Bindings.createTelegramGenerativeAppLiveSurfaceBinding();
   const invokeGenerativeAppBoundButtonAction =
     Bindings.createTelegramGenerativeAppBoundButtonActionInvoker({
       agentDir: Paths.resolveAgentDir(),
       assertExecutionCurrent: Updates.assertTelegramUpdateExecutionCurrent,
       getExecutionFence: Updates.getTelegramUpdateExecutionFence,
+      getActiveProfileName: configStore.getActiveProfileName,
+      getLiveSurfaceRuntime: generativeAppLiveSurfaceBinding.get,
       planOutput: planGenerativeAppOutput,
       sendMarkdownReply,
       editInteractiveMessage,
@@ -860,6 +865,18 @@ export default function (pi: Pi.ExtensionAPI) {
       getThreadDisplayMode() {
         return threadStore.getBotState().threadMode === "enabled"
           ? Config.resolveTelegramThreadDisplayMode(configStore.get()) : undefined;
+      },
+      getThreadDisplayPreview(mode) {
+        const bindings = threadStore.listWorkspaceBindings();
+        return [...ThreadDisplay.resolveTelegramWorkspaceDisplayNames(
+          bindings,
+          mode,
+          ThreadDisplay.resolveTelegramLiveWorkspaceBindingKeys(
+            bindings,
+            threadStore.getActiveByInstanceId(telegramInstanceId)?.target,
+            telegramBusFollowerRegistry.list(),
+          ),
+        ).values()];
       },
       async setThreadDisplayMode(mode) {
         try {
@@ -1803,6 +1820,7 @@ export default function (pi: Pi.ExtensionAPI) {
     getDefaultChatId: proactivePushChatIdGetter,
     getDefaultTarget: proactivePushTargetGetter,
     ...agentMessageToolRoutingRuntime,
+    setGenerativeAppLiveSurfaceRuntime: generativeAppLiveSurfaceBinding.set,
     updateStatus,
     recordRuntimeEvent,
   });
@@ -1831,6 +1849,7 @@ export default function (pi: Pi.ExtensionAPI) {
     deferredQueueDispatchRuntime,
     modelContextAvailabilityRuntime,
     disconnectOnQuit: cleanupTelegramThreadForSessionRestart,
+    shutdownGenerativeAppLiveSurfaces: generativeAppLiveSurfaceBinding.shutdown,
     resolveAutomaticThreadCleanupEnabled:
       configControls.resolveAutomaticThreadCleanupEnabled,
     buttonActionStore,

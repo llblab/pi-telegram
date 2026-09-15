@@ -136,16 +136,23 @@ export interface ResolvedTelegramTimeConfig {
   timezone: string;
 }
 
-export type TelegramThreadDisplayMode = "letters" | "names" | "directories";
+export type TelegramThreadDisplayMode =
+  | "letters"
+  | "names"
+  | "directories"
+  | "directory-snake"
+  | "directory-title";
+
+const TELEGRAM_THREAD_DISPLAY_MODES: readonly TelegramThreadDisplayMode[] = [
+  "letters", "names", "directories", "directory-snake", "directory-title",
+];
 
 export function resolveTelegramThreadDisplayMode(
   config: Pick<TelegramConfig, "threadDisplayMode">,
 ): TelegramThreadDisplayMode {
-  return config.threadDisplayMode === "names"
-    ? "names"
-    : config.threadDisplayMode === "directories"
-      ? "directories"
-      : "letters";
+  return TELEGRAM_THREAD_DISPLAY_MODES.includes(config.threadDisplayMode as TelegramThreadDisplayMode)
+    ? config.threadDisplayMode as TelegramThreadDisplayMode
+    : "letters";
 }
 
 export async function setTelegramThreadDisplayMode(
@@ -153,7 +160,7 @@ export async function setTelegramThreadDisplayMode(
   mode: TelegramThreadDisplayMode,
   isCurrent: () => boolean,
 ): Promise<void> {
-  if (!["letters", "names", "directories"].includes(mode)) {
+  if (!TELEGRAM_THREAD_DISPLAY_MODES.includes(mode)) {
     throw new Error("Invalid Telegram Thread display mode.");
   }
   const profile = store.getActiveProfileName();

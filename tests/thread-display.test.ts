@@ -5,6 +5,7 @@ import {
   createTelegramThreadDisplayReconciler,
   resolveTelegramInitialWorkspaceDisplayName,
   resolveTelegramWorkspaceDisplayNames,
+  tokenizeTelegramDirectorySegment,
 } from "../lib/thread-display.ts";
 import { createTelegramTopicTargetStore, createTelegramWorkspaceBindingIdentity } from "../lib/threads.ts";
 import type { TelegramThreadDisplayMode } from "../lib/config.ts";
@@ -27,6 +28,26 @@ test("Three modes project the same stable bindings without changing named identi
   assert.deepEqual([...resolveTelegramWorkspaceDisplayNames(bindings, "names").values()],
     ["Anchor", "Briar", "Cedar"]);
   assert.deepEqual(bindings, before);
+});
+
+test("New directory modes share deterministic Unicode-aware tokenization and suffix projection", () => {
+  assert.deepEqual(tokenizeTelegramDirectorySegment("apiPRDServer-42.tools"),
+    ["api", "PRD", "Server", "42", "tools"]);
+  const peers = [
+    { ...bindings[0], cwd: "/repo/frontend/API tools" },
+    { ...bindings[1], cwd: "/repo/backend/API tools" },
+  ];
+  assert.deepEqual([...resolveTelegramWorkspaceDisplayNames(peers, "directory-snake").values()],
+    ["frontend_api_tools", "backend_api_tools"]);
+  assert.deepEqual([...resolveTelegramWorkspaceDisplayNames(peers, "directory-title").values()],
+    ["Frontend / API Tools", "Backend / API Tools"]);
+  const sameDirectory = [
+    { ...bindings[0], cwd: "/repo/apiPRDServer" },
+    { ...bindings[2], cwd: "/repo/apiPRDServer" },
+  ];
+  assert.deepEqual([...resolveTelegramWorkspaceDisplayNames(
+    sameDirectory, "directory-title", new Set(["one", "three"]),
+  ).values()], ["Api PRD Server · A", "Api PRD Server · C"]);
 });
 
 test("Manual names override every automatic display mode", () => {
@@ -64,12 +85,22 @@ test("Initial titles project the candidate before Telegram creates the Thread", 
   }), "wasd_123!?+$@");
 });
 
-test("Singleton directories hide the suffix until sticky exposure has been recorded", () => {
+test("Legacy suffixes remain sticky while new directory modes use only live ownership", () => {
   assert.equal(resolveTelegramWorkspaceDisplayNames([bindings[0]], "directories").get("one"),
     "extensions");
   assert.equal(resolveTelegramWorkspaceDisplayNames([
     { ...bindings[0], showSlotSuffix: true },
   ], "directories").get("one"), "extensions_a");
+  assert.equal(resolveTelegramWorkspaceDisplayNames([
+    { ...bindings[0], showSlotSuffix: true },
+  ], "directory-title").get("one"), "Extensions");
+  const sameDirectory = [bindings[0], bindings[2]];
+  assert.deepEqual([...resolveTelegramWorkspaceDisplayNames(
+    sameDirectory, "directory-snake", new Set(["one"]),
+  ).values()], ["extensions", "extensions"]);
+  assert.deepEqual([...resolveTelegramWorkspaceDisplayNames(
+    sameDirectory, "directory-snake", new Set(["one", "three"]),
+  ).values()], ["extensions_a", "extensions_c"]);
 });
 
 test("Equal basenames from distinct paths use the shortest distinguishing parent suffix", () => {
@@ -140,6 +171,9 @@ function harness() {
     getMode: () => state.mode,
     getProfileKey: () => state.profile,
     getLeaderEpoch: () => state.epoch,
+    captureLiveBindingKeys(currentBindings) {
+      return new Set(state.active ? currentBindings.map((binding) => binding.bindingKey) : []);
+    },
     captureBindingAuthority() {
       if (!state.active) return undefined;
       const generation = state.registrationGeneration;

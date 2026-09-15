@@ -257,20 +257,20 @@ test("Preview domain stays independent from UI/compat rendering", () => {
 test("Package exports expose only stable public domains", () => {
   const packageJson = JSON.parse(
     readFileSync(join(PROJECT_ROOT, "package.json"), "utf8"),
-  ) as { exports?: Record<string, string> };
+  ) as { exports?: Record<string, { types: string; default: string }> };
 
   assert.deepEqual(packageJson.exports, {
-    ".": "./index.ts",
-    "./inbound": "./api/inbound.ts",
-    "./outbound": "./api/outbound.ts",
-    "./delivery": "./api/delivery.ts",
-    "./activity": "./api/activity.ts",
-    "./updates": "./api/updates.ts",
-    "./commands": "./api/commands.ts",
-    "./sections": "./api/sections.ts",
-    "./status": "./api/status.ts",
-    "./voice": "./api/voice.ts",
-    "./keyboard": "./api/keyboard.ts",
+    ".": { types: "./dist/index.d.ts", default: "./dist/index.js" },
+    "./inbound": { types: "./dist/api/inbound.d.ts", default: "./dist/api/inbound.js" },
+    "./outbound": { types: "./dist/api/outbound.d.ts", default: "./dist/api/outbound.js" },
+    "./delivery": { types: "./dist/api/delivery.d.ts", default: "./dist/api/delivery.js" },
+    "./activity": { types: "./dist/api/activity.d.ts", default: "./dist/api/activity.js" },
+    "./updates": { types: "./dist/api/updates.d.ts", default: "./dist/api/updates.js" },
+    "./commands": { types: "./dist/api/commands.d.ts", default: "./dist/api/commands.js" },
+    "./sections": { types: "./dist/api/sections.d.ts", default: "./dist/api/sections.js" },
+    "./status": { types: "./dist/api/status.d.ts", default: "./dist/api/status.js" },
+    "./voice": { types: "./dist/api/voice.d.ts", default: "./dist/api/voice.js" },
+    "./keyboard": { types: "./dist/api/keyboard.d.ts", default: "./dist/api/keyboard.js" },
   });
 });
 

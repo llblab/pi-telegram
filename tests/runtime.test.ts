@@ -201,6 +201,46 @@ test("Typing loop retargets chat-level activity into the active thread", async (
   assert.equal(Runtime.stopTelegramTypingLoop(state), true);
 });
 
+test("Typing keepalive retargets queued work without leaking ticks across threads", async (ctx) => {
+  ctx.mock.timers.enable({ apis: ["setInterval"] });
+  const state = Runtime.createTelegramBridgeRuntimeState();
+  const actions: string[] = [];
+  const createDeps = (threadId: number): Runtime.TelegramTypingLoopDeps => ({
+    chatId: 42,
+    target: createTelegramThreadTarget(42, threadId),
+    intervalMs: 1000,
+    sendTypingAction: async (_chatId, options) => {
+      actions.push(`thread:${options?.message_thread_id ?? "all"}`);
+    },
+    sendAggregateTypingAction: async () => {
+      actions.push("aggregate");
+    },
+  });
+
+  assert.equal(Runtime.startTelegramTypingLoop(state, createDeps(7)), true);
+  await flushMicrotasks();
+  ctx.mock.timers.tick(1000);
+  await flushMicrotasks();
+  assert.deepEqual(actions, ["thread:7", "aggregate", "thread:7", "aggregate"]);
+
+  assert.equal(Runtime.startTelegramTypingLoop(state, createDeps(9)), true);
+  await flushMicrotasks();
+  ctx.mock.timers.tick(2000);
+  await flushMicrotasks();
+  assert.deepEqual(actions, [
+    "thread:7",
+    "aggregate",
+    "thread:7",
+    "aggregate",
+    "thread:9",
+    "aggregate",
+    "thread:9",
+    "aggregate",
+  ]);
+  assert.equal(Runtime.stopTelegramTypingLoop(state), true);
+  ctx.mock.timers.reset();
+});
+
 test("Typing loop sends chat actions into thread target and aggregate surface", async () => {
   const state = Runtime.createTelegramBridgeRuntimeState();
   const typingActions: Array<{

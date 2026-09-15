@@ -1,4 +1,11 @@
-// Counts isolated registry work without sockets, configured profiles, or Telegram calls.
+/**
+ * Counts isolated synchronous bus-registry work at representative sizes.
+ * Usage: node --experimental-strip-types scripts/measure-bus.mjs
+ *
+ * This assertion-backed fixture instruments Map operations only. It does not
+ * open sockets, read configured profiles, call Telegram, or measure latency.
+ */
+
 import assert from "node:assert/strict";
 import { createTelegramBusFollowerRegistry, createTelegramBusProtocolIdentity } from "../lib/bus.ts";
 

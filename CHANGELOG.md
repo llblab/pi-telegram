@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+## 0.47.0: Built runtime and live surfaces
+
+- `Startup`: npm installs now load a compiled JavaScript extension from a nested `dist/pi-telegram` entrypoint while source checkouts retain `index.ts`. Stable public subpath exports ship compiled JavaScript plus declarations, packaged Skills follow the distributive root, and validation checks the built extension import.
+- `Button authoring`: Native `telegram_button` fences now accept adjacent top-level JSON/CML objects without an outer array or commas as vertical singleton rows. Explicit outer matrices remain equivalent, nested arrays still own horizontal layout, and malformed sequences activate no controls.
+- `Activity`: Native typing remains continuously re-armed during agent/message work, pauses only for local UI prompts, resumes for unsettled agent or compaction work, and retargets queued turns without leaking keepalive ticks across Threads; transport and session fences still suppress stale actions.
+- `Live views`: Validated `refreshAfterMs` drives non-overlapping timers after hinted `telegram_bind` delivery. Refreshes and current-surface actions edit one generation-fenced Delivery handle through the Markdown/button planner across classic, leader, and follower targets; hints reschedule and omission closes. Retryable failures retain one frame; unavailable messages invalidate with a bounded diagnostic. Take, shutdown, and replacement fence late refreshes and cancel memory-only surfaces.
+- `Thread display`: Adds explicit `directory-snake` and `directory-title` profile modes with shared Unicode-aware path tokenization, uppercase-abbreviation preservation, live Settings previews, initial/reconciled title projection, and negotiated peer capability fencing. Their slot suffixes now follow authenticated concurrent live same-directory ownership and disappear after disconnect or confirmed-dead pruning; dormant bindings and sticky legacy metadata are ignored. Retained `directories` stays unchanged.
+
 ## 0.46.0: Session-aware Workspace Threads
 
 - `Session-aware Thread binding`: Workspace identity restored session-qualified bindings from Pi's stable public session identity, so reopening, resuming, or replacing a process reclaims the same Telegram Thread and letter while distinct sessions in one directory keep independent targets. Strict legacy cwd-only records remain inert and coexist safely; protocol v2 rejects mixed 0.45.x peers before provisioning, and exact-session cleanup, displacement, rename, promotion, and slot-pressure fences are preserved.

@@ -137,10 +137,9 @@ test("Command helpers expose Telegram bot command definitions", () => {
   ]) {
     assert.match(TELEGRAM_APP_MENU_INTRO_HTML, new RegExp(` /${command} —`));
   }
-  assert.match(TELEGRAM_APP_MENU_INTRO_HTML, / \/name Name —/);
   assert.doesNotMatch(
     TELEGRAM_APP_MENU_INTRO_HTML,
-    /<code>\/(?:start|compact|next|continue|abort|stop|name)<\/code>/,
+    /<code>\/(?:start|name|compact|next|continue|abort|stop|name)<\/code>/,
   );
   const expectedBuiltins = [
     {

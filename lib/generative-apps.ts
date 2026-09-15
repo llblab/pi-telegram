@@ -4,7 +4,7 @@
  * Owns Generative App identity, installation, invocation, state history, and telegram_bind
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   appendFile,
   copyFile,
@@ -33,6 +33,8 @@ const GENERATIVE_APP_LOCK_WAIT_MS = 12_000;
 const GENERATIVE_APP_RUN_MAX_TIMEOUT_MS = 30_000;
 const GENERATIVE_APP_RUN_MAX_ARGS = 64;
 const GENERATIVE_APP_RUN_MAX_STREAM_BYTES = 64 * 1024;
+export const GENERATIVE_APP_MIN_REFRESH_AFTER_MS = 2_000;
+export const GENERATIVE_APP_MAX_REFRESH_AFTER_MS = 24 * 60 * 60 * 1_000;
 
 export type GenerativeAppJsonValue =
   | null
@@ -66,6 +68,7 @@ export interface GenerativeAppMethodContext {
 
 export interface GenerativeAppMethodResult {
   output: string;
+  refreshAfterMs?: number;
   state?: GenerativeAppJsonValue;
   viewMode?: "new" | "edit";
 }
@@ -82,6 +85,7 @@ export interface GenerativeAppInvocationResult {
   output: string;
   app: string;
   revision: number;
+  refreshAfterMs?: number;
   stateChanged: boolean;
   viewMode: "new" | "edit";
 }
@@ -104,7 +108,89 @@ export interface GenerativeAppRuntimeOptions {
   methodTimeoutMs?: number;
 }
 
+export interface GenerativeAppLiveSurfaceFrame<THandle> {
+  digest: string;
+  handle: THandle;
+}
+
+export interface GenerativeAppLiveSurface<THandle> {
+  app: string;
+  appGeneration: string;
+  appRevision: number;
+  handle: THandle;
+  initialDigest: string;
+  key: string;
+  refreshAfterMs: number;
+}
+
+export interface GenerativeAppLiveSurfaceRuntime<THandle> {
+  open: (surface: GenerativeAppLiveSurface<THandle>) => void;
+  cancel: (key: string) => void;
+  take: (key: string) => GenerativeAppLiveSurface<THandle> | undefined;
+  resume: (
+    surface: GenerativeAppLiveSurface<THandle>,
+    result: GenerativeAppInvocationResult,
+  ) => Promise<void>;
+  refreshNow: (key: string) => Promise<void>;
+  shutdown: () => void;
+}
+
+export interface GenerativeAppLiveSurfaceRuntimeDeps<THandle> {
+  agentDir: string;
+  isCurrent: (surface: GenerativeAppLiveSurface<THandle>) => boolean;
+  plan: (
+    result: GenerativeAppInvocationResult,
+    handle: THandle,
+  ) => GenerativeAppLiveSurfaceFrame<THandle>;
+  edit: (
+    frame: GenerativeAppLiveSurfaceFrame<THandle>,
+  ) => Promise<THandle>;
+  classifyEditError?: (error: unknown) =>
+    | { kind: "retry"; retryAfterMs?: number }
+    | { kind: "terminal" | "unavailable" | "unknown" };
+  recordRuntimeEvent?: (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
+  setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+  clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+}
+
+export interface TelegramBindDeliveryHandle {
+  readonly target: { chatId: number; threadId?: number };
+  readonly messageIds: readonly number[];
+  readonly generation: string;
+}
+
+export interface TelegramBindLiveHandle {
+  delivery: TelegramBindDeliveryHandle;
+  view?: { text: string; parseMode: "markdown"; replyMarkup?: unknown };
+}
+
+export function getTelegramBindLiveSurfaceKey(
+  app: string,
+  profile: string,
+  target: { chatId: number; threadId?: number },
+): string {
+  return `${app}/${profile}/${target.chatId}/${target.threadId ?? 0}`;
+}
+
 export interface TelegramBindToolRegistrationDeps extends GenerativeAppRuntimeOptions {
+  getActiveProfileName?: () => string | undefined;
+  liveSurfaceSetTimer?: GenerativeAppLiveSurfaceRuntimeDeps<unknown>["setTimer"];
+  liveSurfaceClearTimer?: GenerativeAppLiveSurfaceRuntimeDeps<unknown>["clearTimer"];
+  setLiveSurfaceRuntime?: (
+    runtime: GenerativeAppLiveSurfaceRuntime<TelegramBindLiveHandle> | undefined,
+  ) => void;
+  isDeliveryHandleCurrent?: (handle: TelegramBindDeliveryHandle) => boolean;
+  editView?: (
+    handle: TelegramBindDeliveryHandle,
+    view: { text: string; parseMode: "markdown"; replyMarkup?: unknown },
+  ) => Promise<
+    | { ok: true; value: TelegramBindDeliveryHandle }
+    | { ok: false; reason: string; message: string; retryAfterMs?: number }
+  >;
   getActiveTurn?: () =>
     | {
         chatId: number;
@@ -125,6 +211,13 @@ export interface TelegramBindToolRegistrationDeps extends GenerativeAppRuntimeOp
       target?: { chatId: number; threadId?: number };
     },
   ) => Promise<number | undefined>;
+  sendView?: (
+    view: { text: string; parseMode: "markdown"; replyMarkup?: unknown },
+    options: { scope: { kind: "active-turn" }; replyToMessageId: number },
+  ) => Promise<
+    | { ok: true; value: TelegramBindDeliveryHandle }
+    | { ok: false; reason?: string; message: string }
+  >;
   recordRuntimeEvent?: (
     category: string,
     error: unknown,
@@ -365,8 +458,24 @@ function normalizeMethodResult(value: unknown): GenerativeAppMethodResult {
   if (viewMode !== "new" && viewMode !== "edit") {
     throw new Error("Generative App viewMode must be new or edit.");
   }
+  let refreshAfterMs: number | undefined;
+  if (Object.hasOwn(result, "refreshAfterMs")) {
+    if (
+      typeof result.refreshAfterMs !== "number" ||
+      !Number.isFinite(result.refreshAfterMs) ||
+      !Number.isInteger(result.refreshAfterMs) ||
+      result.refreshAfterMs <= 0
+    ) {
+      throw new Error("Generative App refreshAfterMs must be a finite positive integer.");
+    }
+    refreshAfterMs = Math.min(
+      GENERATIVE_APP_MAX_REFRESH_AFTER_MS,
+      Math.max(GENERATIVE_APP_MIN_REFRESH_AFTER_MS, result.refreshAfterMs),
+    );
+  }
   return {
     output: result.output,
+    ...(refreshAfterMs !== undefined ? { refreshAfterMs } : {}),
     ...(Object.hasOwn(result, "state")
       ? { state: assertJsonValue(result.state, "Generative App state") }
       : {}),
@@ -595,6 +704,9 @@ async function invokeMethod(options: {
   if (options.method === "init" && result.state === undefined) {
     throw new Error("Generative App init must return state.");
   }
+  if (options.method === "refresh" && result.state !== undefined) {
+    throw new Error("Generative App refresh must be output-only.");
+  }
   let nextRevision = revision;
   if (result.state !== undefined) {
     options.execution?.assertCurrent();
@@ -623,6 +735,9 @@ async function invokeMethod(options: {
     output: result.output,
     app: options.app,
     revision: nextRevision,
+    ...(result.refreshAfterMs !== undefined
+      ? { refreshAfterMs: result.refreshAfterMs }
+      : {}),
     stateChanged: result.state !== undefined,
     viewMode: result.viewMode ?? "new",
   };
@@ -848,6 +963,154 @@ export async function bindGenerativeApp(options: GenerativeAppRuntimeOptions & {
       });
 }
 
+export function createGenerativeAppLiveSurfaceRuntime<THandle>(
+  deps: GenerativeAppLiveSurfaceRuntimeDeps<THandle>,
+): GenerativeAppLiveSurfaceRuntime<THandle> {
+  interface Record {
+    surface: GenerativeAppLiveSurface<THandle>;
+    digest?: string;
+    timer?: ReturnType<typeof setTimeout>;
+    inFlight: boolean;
+    retryDelayMs: number;
+    pending?: {
+      frame: GenerativeAppLiveSurfaceFrame<THandle>;
+      result: GenerativeAppInvocationResult;
+    };
+  }
+  const records = new Map<string, Record>();
+  const setTimer: NonNullable<GenerativeAppLiveSurfaceRuntimeDeps<THandle>["setTimer"]> =
+    deps.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+  const clearTimer: NonNullable<GenerativeAppLiveSurfaceRuntimeDeps<THandle>["clearTimer"]> =
+    deps.clearTimer ?? ((timer) => clearTimeout(timer));
+  let active = true;
+
+  const clearRecordTimer = (record: Record): void => {
+    if (record.timer !== undefined) clearTimer(record.timer);
+    record.timer = undefined;
+  };
+  const take = (key: string): GenerativeAppLiveSurface<THandle> | undefined => {
+    const record = records.get(key);
+    if (!record) return undefined;
+    clearRecordTimer(record);
+    records.delete(key);
+    return { ...record.surface };
+  };
+  const cancel = (key: string): void => {
+    take(key);
+  };
+  const ownsRecord = (key: string, record: Record): boolean =>
+    active && records.get(key) === record;
+  const schedule = (record: Record, delayMs: number): void => {
+    clearRecordTimer(record);
+    if (!active || records.get(record.surface.key) !== record) return;
+    const timer = setTimer(() => void refreshNow(record.surface.key), delayMs);
+    record.timer = timer;
+    timer.unref?.();
+  };
+  const refreshNow = async (key: string): Promise<void> => {
+    const record = records.get(key);
+    if (!active || !record || record.inFlight) return;
+    clearRecordTimer(record);
+    if (!deps.isCurrent(record.surface)) {
+      cancel(key);
+      return;
+    }
+    record.inFlight = true;
+    try {
+      let pending = record.pending;
+      if (!pending) {
+        const result = await invokeGenerativeApp({
+          agentDir: deps.agentDir,
+          expectedGeneration: record.surface.appGeneration,
+          expectedRevision: record.surface.appRevision,
+          method: "refresh",
+          app: record.surface.app,
+        });
+        if (!ownsRecord(key, record) || !deps.isCurrent(record.surface)) {
+          if (records.get(key) === record) cancel(key);
+          return;
+        }
+        const frame = deps.plan(result, record.surface.handle);
+        pending = { frame, result };
+        if (frame.digest !== record.digest) record.pending = pending;
+      }
+      const { frame, result } = pending;
+      if (!ownsRecord(key, record)) return;
+      if (frame.digest !== record.digest) {
+        record.surface.handle = await deps.edit(frame);
+        if (!ownsRecord(key, record)) return;
+        record.digest = frame.digest;
+        record.pending = undefined;
+      }
+      if (result.refreshAfterMs === undefined) {
+        cancel(key);
+        return;
+      }
+      record.retryDelayMs = GENERATIVE_APP_MIN_REFRESH_AFTER_MS;
+      record.surface.appRevision = result.revision;
+      record.surface.refreshAfterMs = result.refreshAfterMs;
+      schedule(record, result.refreshAfterMs);
+    } catch (error) {
+      const classification = deps.classifyEditError?.(error) ?? { kind: "unknown" as const };
+      if (!ownsRecord(key, record)) return;
+      deps.recordRuntimeEvent?.("generative-app", error, {
+        phase: "live-surface-refresh",
+        app: record.surface.app,
+        outcome: classification.kind,
+      });
+      if (classification.kind !== "retry" || !deps.isCurrent(record.surface)) {
+        cancel(key);
+        return;
+      }
+      const delay = classification.retryAfterMs === undefined
+        ? record.retryDelayMs
+        : Math.max(GENERATIVE_APP_MIN_REFRESH_AFTER_MS, classification.retryAfterMs);
+      record.retryDelayMs = Math.min(60_000, Math.max(4_000, delay * 2));
+      schedule(record, delay);
+    } finally {
+      record.inFlight = false;
+    }
+  };
+  const open = (surface: GenerativeAppLiveSurface<THandle>): void => {
+    cancel(surface.key);
+    if (!active) return;
+    const record: Record = {
+      surface: { ...surface },
+      digest: surface.initialDigest,
+      inFlight: false,
+      retryDelayMs: GENERATIVE_APP_MIN_REFRESH_AFTER_MS,
+    };
+    records.set(surface.key, record);
+    schedule(record, surface.refreshAfterMs);
+  };
+  return {
+    open,
+    cancel,
+    take,
+    async resume(surface, result) {
+      if (!active || !deps.isCurrent(surface)) return;
+      const frame = deps.plan(result, surface.handle);
+      const handle = frame.digest === surface.initialDigest
+        ? surface.handle
+        : await deps.edit(frame);
+      if (result.refreshAfterMs === undefined || !deps.isCurrent({ ...surface, handle })) return;
+      open({
+        ...surface,
+        appGeneration: result.generation,
+        appRevision: result.revision,
+        handle,
+        initialDigest: frame.digest,
+        refreshAfterMs: result.refreshAfterMs,
+      });
+    },
+    refreshNow,
+    shutdown() {
+      active = false;
+      for (const key of [...records.keys()]) cancel(key);
+    },
+  };
+}
+
 export function formatGenerativeAppToolOutput(output: string): string {
   const normalized = output.replace(/^\n+/u, "");
   return `\n${normalized || "(Generative App returned no output)"}`;
@@ -884,6 +1147,72 @@ export function registerTelegramBindTool(
   pi: ExtensionAPI,
   deps: TelegramBindToolRegistrationDeps,
 ): void {
+  const planFrame = (
+    result: GenerativeAppInvocationResult,
+    handle: TelegramBindLiveHandle,
+  ): GenerativeAppLiveSurfaceFrame<TelegramBindLiveHandle> => {
+    const planned = deps.planOutput!(result.output, {
+      binding: {
+        generation: result.generation,
+        app: result.app,
+        revision: result.revision,
+      },
+    });
+    const view = {
+      text: planned.markdown,
+      parseMode: "markdown" as const,
+      ...(planned.replyMarkup !== undefined ? { replyMarkup: planned.replyMarkup } : {}),
+    };
+    return {
+      digest: createHash("sha256").update(JSON.stringify(view)).digest("hex"),
+      handle: { delivery: handle.delivery, view },
+    };
+  };
+  const liveSurfaces = deps.planOutput && deps.editView && deps.isDeliveryHandleCurrent
+    ? createGenerativeAppLiveSurfaceRuntime<TelegramBindLiveHandle>({
+        agentDir: deps.agentDir,
+        isCurrent: (surface) => deps.isDeliveryHandleCurrent!(surface.handle.delivery),
+        plan: planFrame,
+        async edit(frame) {
+          const view = frame.handle.view;
+          if (!view) throw new Error("Generative App live frame is missing its planned view.");
+          const edited = await deps.editView!(frame.handle.delivery, view);
+          if (!edited.ok) throw Object.assign(new Error(edited.message), {
+            deliveryFailureReason: edited.reason,
+            ...(edited.retryAfterMs === undefined ? {} : { retryAfterMs: edited.retryAfterMs }),
+          });
+          return { delivery: edited.value, view };
+        },
+        classifyEditError(error) {
+          const failure = error as {
+            deliveryFailureReason?: string;
+            retryAfterMs?: number;
+          };
+          if (failure.deliveryFailureReason === "rate-limited") {
+            return { kind: "retry", retryAfterMs: failure.retryAfterMs };
+          }
+          if (failure.deliveryFailureReason === "transport-retryable") {
+            return { kind: "retry" };
+          }
+          if (failure.deliveryFailureReason === "message-unavailable") {
+            return { kind: "unavailable" };
+          }
+          return {
+            kind: failure.deliveryFailureReason === "commit-unknown" ? "unknown" : "terminal",
+          };
+        },
+        recordRuntimeEvent: deps.recordRuntimeEvent,
+        ...(deps.liveSurfaceSetTimer ? { setTimer: deps.liveSurfaceSetTimer } : {}),
+        ...(deps.liveSurfaceClearTimer ? { clearTimer: deps.liveSurfaceClearTimer } : {}),
+      })
+    : undefined;
+  deps.setLiveSurfaceRuntime?.(liveSurfaces);
+  const surfaceKey = (app: string, handle: TelegramBindDeliveryHandle): string =>
+    getTelegramBindLiveSurfaceKey(
+      app,
+      deps.getActiveProfileName?.() ?? "default",
+      handle.target,
+    );
   pi.registerTool({
     name: "telegram_bind",
     label: "Telegram Bind",
@@ -919,7 +1248,7 @@ export function registerTelegramBindTool(
         const activeTurn = params.display === false
           ? undefined
           : deps.getActiveTurn?.();
-        if (activeTurn && deps.planOutput && deps.sendMarkdownReply) {
+        if (activeTurn && deps.planOutput && (deps.sendView || deps.sendMarkdownReply)) {
           try {
             const planned = deps.planOutput(result.output, {
               binding: {
@@ -928,17 +1257,54 @@ export function registerTelegramBindTool(
                 revision: result.revision,
               },
             });
-            const messageId = await deps.sendMarkdownReply(
-              activeTurn.chatId,
-              activeTurn.replyToMessageId,
-              planned.markdown,
-              {
-                ...(planned.replyMarkup !== undefined
-                  ? { replyMarkup: planned.replyMarkup }
-                  : {}),
-                ...(activeTurn.target ? { target: activeTurn.target } : {}),
-              },
-            );
+            let messageId: number | undefined;
+            if (deps.sendView) {
+              const delivered = await deps.sendView(
+                {
+                  text: planned.markdown,
+                  parseMode: "markdown",
+                  ...(planned.replyMarkup !== undefined
+                    ? { replyMarkup: planned.replyMarkup }
+                    : {}),
+                },
+                {
+                  scope: { kind: "active-turn" },
+                  replyToMessageId: activeTurn.replyToMessageId,
+                },
+              );
+              if (!delivered.ok) throw new Error(delivered.message);
+              messageId = delivered.value.messageIds[0];
+              if (liveSurfaces) {
+                const key = surfaceKey(result.app, delivered.value);
+                if (result.refreshAfterMs === undefined) {
+                  liveSurfaces.cancel(key);
+                } else {
+                  const handle = { delivery: delivered.value };
+                  const frame = planFrame(result, handle);
+                  liveSurfaces.open({
+                    app: result.app,
+                    appGeneration: result.generation,
+                    appRevision: result.revision,
+                    handle,
+                    initialDigest: frame.digest,
+                    key,
+                    refreshAfterMs: result.refreshAfterMs,
+                  });
+                }
+              }
+            } else {
+              messageId = await deps.sendMarkdownReply!(
+                activeTurn.chatId,
+                activeTurn.replyToMessageId,
+                planned.markdown,
+                {
+                  ...(planned.replyMarkup !== undefined
+                    ? { replyMarkup: planned.replyMarkup }
+                    : {}),
+                  ...(activeTurn.target ? { target: activeTurn.target } : {}),
+                },
+              );
+            }
             return {
               content: [{ type: "text", text: formatDisplayedGenerativeAppToolOutput() }],
               details: { ...result, displayed: true, messageId },

@@ -65,7 +65,7 @@ import {
   runTelegramSetup,
 } from "../lib/setup.ts";
 
-test("Thread display mode keeps all three modes and maps invalid values to letters", () => {
+test("Thread display mode keeps every supported mode and maps invalid values to letters", () => {
   for (const mode of [undefined, "invalid", null]) {
     assert.equal(resolveTelegramThreadDisplayMode(legacyConfig({
       threadDisplayMode: mode,
@@ -74,6 +74,8 @@ test("Thread display mode keeps all three modes and maps invalid values to lette
   assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "names" }), "names");
   assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "letters" }), "letters");
   assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "directories" }), "directories");
+  assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "directory-snake" }), "directory-snake");
+  assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "directory-title" }), "directory-title");
 });
 
 test("Thread display mode persists per profile and survives effective config updates", async () => {
@@ -82,24 +84,24 @@ test("Thread display mode persists per profile and survives effective config upd
   const store = createTelegramConfigStore({ agentDir, configPath, initialConfig: {
     profiles: {
       default: { botToken: "token-default", threadDisplayMode: "letters" },
-      work: { botToken: "token-work", threadDisplayMode: "directories" },
+      work: { botToken: "token-work", threadDisplayMode: "directory-title" },
     },
   } });
   try {
     assert.equal(resolveTelegramThreadDisplayMode(store.get()), "letters");
     store.activateProfile("work");
-    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directories");
+    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directory-title");
     store.update((config) => { config.assistant = { rendering: "html" }; });
     await store.persist();
     const saved = await readTelegramConfig(configPath);
     assert.equal(saved.threadDisplayMode, undefined);
     assert.equal(saved.profiles?.default.threadDisplayMode, "letters");
-    assert.equal(saved.profiles?.work.threadDisplayMode, "directories");
+    assert.equal(saved.profiles?.work.threadDisplayMode, "directory-title");
     const restored = createTelegramConfigStore({ agentDir, configPath });
     await restored.load();
     assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "letters");
     restored.activateProfile("work");
-    assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "directories");
+    assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "directory-title");
     restored.update((config) => { config.threadDisplayMode = "names"; });
     await restored.persist();
     assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "names");

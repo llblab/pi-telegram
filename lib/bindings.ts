@@ -10,6 +10,7 @@ import * as ChannelPosts from "./channel-posts.ts";
 import * as CommandTemplates from "./command-templates.ts";
 import * as Commands from "./commands.ts";
 import * as Config from "./config.ts";
+import * as Delivery from "./delivery.ts";
 import * as Keyboard from "./keyboard.ts";
 import * as Lifecycle from "./lifecycle.ts";
 import * as Locks from "./locks.ts";
@@ -176,14 +177,47 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
   };
 }
 
+export interface TelegramGenerativeAppLiveSurfaceBinding {
+  get: () =>
+    | GenerativeApps.GenerativeAppLiveSurfaceRuntime<GenerativeApps.TelegramBindLiveHandle>
+    | undefined;
+  set: (
+    runtime: GenerativeApps.GenerativeAppLiveSurfaceRuntime<GenerativeApps.TelegramBindLiveHandle>
+      | undefined,
+  ) => void;
+  shutdown: () => void;
+}
+
+export function createTelegramGenerativeAppLiveSurfaceBinding():
+TelegramGenerativeAppLiveSurfaceBinding {
+  let current:
+    | GenerativeApps.GenerativeAppLiveSurfaceRuntime<GenerativeApps.TelegramBindLiveHandle>
+    | undefined;
+  return {
+    get() { return current; },
+    set(runtime) {
+      current?.shutdown();
+      current = runtime;
+    },
+    shutdown() {
+      current?.shutdown();
+      current = undefined;
+    },
+  };
+}
+
 export function createTelegramGenerativeAppBoundButtonActionInvoker<
   TQuery extends {
-    message?: { chat?: { id?: number }; message_id?: number };
+    message?: { chat?: { id?: number }; message_id?: number; message_thread_id?: number };
   },
 >(deps: {
   agentDir: string;
   assertExecutionCurrent: (query: TQuery) => void;
   getExecutionFence: (query: TQuery) => GenerativeApps.GenerativeAppExecutionFence | undefined;
+  getActiveProfileName?: () => string | undefined;
+  getLiveSurfaceRuntime?: () =>
+    | GenerativeApps.GenerativeAppLiveSurfaceRuntime<GenerativeApps.TelegramBindLiveHandle>
+    | undefined;
   planOutput: ReturnType<typeof OutboundHandlers.createTelegramOutboundReplyPlanner>;
   sendMarkdownReply: (
     chatId: number,
@@ -205,10 +239,29 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker<
 ) => Promise<false | "new" | "edit"> {
   return async (action, query) => {
     let boundAction: GenerativeApps.GenerativeAppBoundAction | undefined;
+    let handedOff:
+      | GenerativeApps.GenerativeAppLiveSurface<GenerativeApps.TelegramBindLiveHandle>
+      | undefined;
     try {
       boundAction = GenerativeApps.parseGenerativeAppBoundAction(action.prompt);
       if (!boundAction) return false;
       deps.assertExecutionCurrent(query);
+      const chatId = query.message?.chat?.id;
+      const messageId = query.message?.message_id;
+      if (typeof chatId !== "number" || typeof messageId !== "number") {
+        throw new Error("Generative App callback target is unavailable.");
+      }
+      const liveSurfaces = deps.getLiveSurfaceRuntime?.();
+      handedOff = liveSurfaces?.take(GenerativeApps.getTelegramBindLiveSurfaceKey(
+        boundAction.app,
+        deps.getActiveProfileName?.() ?? "default",
+        {
+          chatId,
+          ...(query.message?.message_thread_id !== undefined
+            ? { threadId: query.message.message_thread_id }
+            : {}),
+        },
+      ));
       const result = await GenerativeApps.invokeGenerativeApp({
         agentDir: deps.agentDir,
         ...(deps.getExecutionFence(query)
@@ -227,11 +280,6 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker<
         app: boundAction.app,
       });
       deps.assertExecutionCurrent(query);
-      const chatId = query.message?.chat?.id;
-      const messageId = query.message?.message_id;
-      if (typeof chatId !== "number" || typeof messageId !== "number") {
-        throw new Error("Generative App callback target is unavailable.");
-      }
       const reply = deps.planOutput(result.output, {
         binding: {
           generation: result.generation,
@@ -239,6 +287,19 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker<
           revision: result.revision,
         },
       });
+      if (handedOff && liveSurfaces) {
+        try {
+          await liveSurfaces.resume(handedOff, result);
+          deps.assertExecutionCurrent(query);
+          return "edit";
+        } catch (error) {
+          deps.recordRuntimeEvent("generative-app", error, {
+            phase: "bound-action-live-edit-fallback",
+            app: boundAction.app,
+            method: boundAction.method,
+          });
+        }
+      }
       if (result.viewMode === "edit" && deps.editInteractiveMessage) {
         let editFailed = false;
         try {
@@ -267,6 +328,7 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker<
       deps.assertExecutionCurrent(query);
       return "new";
     } catch (error) {
+      if (handedOff) deps.getLiveSurfaceRuntime?.()?.open(handedOff);
       deps.recordRuntimeEvent("generative-app", error, {
         phase: "bound-action",
         ...(boundAction
@@ -534,6 +596,10 @@ interface TelegramCommandsAndToolsBindingDeps {
   resolveAgentTarget?: OutboundAttachments.TelegramOutboundMessageToolRegistrationDeps["resolveAgentTarget"];
   routeAgentMessage?: OutboundAttachments.TelegramOutboundMessageToolRegistrationDeps["routeAgentMessage"];
   canSendDirect: () => boolean;
+  setGenerativeAppLiveSurfaceRuntime?: (
+    runtime: GenerativeApps.GenerativeAppLiveSurfaceRuntime<GenerativeApps.TelegramBindLiveHandle>
+      | undefined,
+  ) => void;
   updateStatus: TelegramBridgeStatusUpdater;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }
@@ -565,17 +631,31 @@ export function registerTelegramCommandsAndTools({
   resolveAgentTarget,
   routeAgentMessage,
   canSendDirect,
+  setGenerativeAppLiveSurfaceRuntime,
   recordRuntimeEvent,
   updateStatus,
 }: TelegramCommandsAndToolsBindingDeps): void {
   GenerativeApps.registerTelegramBindTool(pi, {
     agentDir,
+    getActiveProfileName: configStore.getActiveProfileName,
     getActiveTurn: activeTurnRuntime.get,
+    ...(setGenerativeAppLiveSurfaceRuntime
+      ? { setLiveSurfaceRuntime: setGenerativeAppLiveSurfaceRuntime }
+      : {}),
+    isDeliveryHandleCurrent: Delivery.isTelegramDeliveryHandleCurrent,
+    editView: (handle, view) => Delivery.editTelegramView(
+      handle as Delivery.TelegramDeliveryHandle,
+      view as Delivery.TelegramDeliveryView,
+    ),
     planOutput: OutboundHandlers.createTelegramOutboundReplyPlanner(
       buttonActionStore,
       Config.createTelegramConfigControls(configStore).getAssistantRenderingMode,
     ),
     sendMarkdownReply,
+    sendView: (view, options) => Delivery.sendTelegramView(
+      view as Delivery.TelegramDeliveryView,
+      options,
+    ),
     recordRuntimeEvent,
   });
   ChannelPosts.registerTelegramChannelPostMutationTool(pi, { mutate: mutateChannelPost });
@@ -782,6 +862,7 @@ interface TelegramLifecycleBindingDeps {
   deferredQueueDispatchRuntime: Queue.TelegramDeferredQueueDispatchRuntime<Pi.ExtensionContext>;
   modelContextAvailabilityRuntime: Prompts.TelegramModelContextAvailabilityRuntime;
   disconnectOnQuit?: () => Promise<unknown>;
+  shutdownGenerativeAppLiveSurfaces?: () => void;
   resolveAutomaticThreadCleanupEnabled?: () => boolean | Promise<boolean>;
   buttonActionStore: OutboundHandlers.TelegramButtonActionStore;
   callMultipart: OutboundHandlers.TelegramVoiceReplySenderDeps["sendMultipart"];
@@ -871,6 +952,7 @@ export function registerTelegramLifecycleRuntimeHooks({
   deferredQueueDispatchRuntime,
   modelContextAvailabilityRuntime,
   disconnectOnQuit,
+  shutdownGenerativeAppLiveSurfaces,
   resolveAutomaticThreadCleanupEnabled,
   buttonActionStore,
   callMultipart,
@@ -1194,6 +1276,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     },
     async onSessionShutdown(event, ctx) {
       if (!isSessionContextActive(ctx)) return;
+      shutdownGenerativeAppLiveSurfaces?.();
       agentLifecycleHooks.clearRetainedAgentEnd();
       activityRuntime.onSessionShutdown();
       activityVerbosityRuntime?.reset();

@@ -43,6 +43,7 @@ import {
   type TelegramBusSocketPathSource,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
+  TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT,
 } from "./bus.ts";
 import type { TelegramConfigStore, TelegramThreadDisplayMode } from "./config.ts";
 import {
@@ -1914,9 +1915,12 @@ export function createTelegramBusFollowerRegistrationRuntime<
       if (!socketPath || !generation || !deps.registrationState?.isRegistered()) {
         throw new Error("Telegram follower is not registered with the leader.");
       }
-      if (!hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE) ||
-          !hasTelegramBusCapability(deps.registrationState.getLeaderProtocol(), TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE)) {
-        throw new Error("The Telegram peers do not support Thread display settings. Update or restart both instances.");
+      const requiredCapability = mode === "directory-snake" || mode === "directory-title"
+        ? TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT
+        : TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE;
+      if (!hasTelegramBusCapability(deps.protocolIdentity, requiredCapability) ||
+          !hasTelegramBusCapability(deps.registrationState.getLeaderProtocol(), requiredCapability)) {
+        throw new Error("The Telegram peers do not support this Thread display setting. Update or restart both instances.");
       }
       const requestId = deps.createRequestId();
       const response = await sendTelegramBusLocalEnvelope({
