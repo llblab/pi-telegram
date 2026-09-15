@@ -200,7 +200,7 @@ Messages sent while Pi is busy become queued turns. Queue controls let you inspe
 
 Queue policy:
 
-- One prompt is one queue object with exactly one current lane and one current position; it never reserves a shadow place in the other lane.
+- One prompt is one queue object with exactly one current lane and one current position; it never reserves a shadow place in the other lane. The terminal's yellow `+N` suffix counts only executable prompts still waiting, never the current run; a dispatched Telegram prompt stops contributing before that run settles.
 - Priority and Normal are separate FIFO lanes; Priority dispatches first.
 - Moving `Normal → Priority` removes the prompt from Normal and places it at the Priority tail. Moving `Priority → Normal` removes it from Priority and places it at the Normal tail; no former position is restored.
 - Keep/Skip never changes lane position. Skip preserves durable authority while waiting so Keep remains reversible, then settles that authority and drops the prompt without a model turn when dispatch reaches it. Skipped prompts stay visible at their physical queue position with a struck-through ordinal, but are excluded immediately from the executable queue count shown in both the Pi status bar and Telegram main menu. Graceful session shutdown discards all remaining queued authority, so a new session starts empty.

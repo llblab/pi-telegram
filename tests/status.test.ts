@@ -187,7 +187,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processing: true,
       queuedStatus: " +1",
     }),
-    "<accent>telegram</accent> <success>connected</success><success> +1</success>",
+    "<accent>telegram</accent> <success>connected</success><warning> +1</warning>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -199,7 +199,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processingStatus: "dispatching",
       queuedStatus: " +1",
     }),
-    "<accent>telegram</accent> <success>connected</success><success> +1</success>",
+    "<accent>telegram</accent> <success>connected</success><warning> +1</warning>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -247,7 +247,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processingStatus: "queued",
       queuedStatus: " +2",
     }),
-    "<accent>telegram</accent> <dim>disconnected</dim><success> +2</success>",
+    "<accent>telegram</accent> <dim>disconnected</dim><warning> +2</warning>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -259,7 +259,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       queuedStatus: " +2",
       error: "Telegram bus follower is not registered.",
     }),
-    "<accent>telegram</accent> <dim>disconnected</dim><success> +2</success>",
+    "<accent>telegram</accent> <dim>disconnected</dim><warning> +2</warning>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -285,7 +285,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processing: false,
       queuedStatus: " +1",
     }),
-    "<accent>Haven</accent> <warning>reconnecting</warning><success> +1</success>",
+    "<accent>Haven</accent> <warning>reconnecting</warning><warning> +1</warning>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -391,7 +391,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processing: true,
       queuedStatus: " +1",
     }),
-    "<accent>telegram</accent> <success>leader</success><success> +1</success>",
+    "<accent>telegram</accent> <success>leader</success><warning> +1</warning>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -416,7 +416,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processingStatus: "queued",
       queuedStatus: " +1",
     }),
-    "<accent>telegram</accent> <warning>awaiting pairing</warning><success> +1</success>",
+    "<accent>telegram</accent> <warning>awaiting pairing</warning><warning> +1</warning>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -708,7 +708,7 @@ test("Status bar processing labels prefer the most specific live state", () => {
   );
 });
 
-test("Bridge status runtime keeps stable identity and counts active tools", () => {
+test("Bridge status runtime excludes active work from the waiting count", () => {
   const events: string[] = [];
   const runtime = createTelegramBridgeStatusRuntime({
     getConfig: () => ({
@@ -723,7 +723,7 @@ test("Bridge status runtime keeps stable identity and counts active tools", () =
     isCompactionInProgress: () => false,
     getActiveToolExecutions: () => 1,
     hasPendingModelSwitch: () => false,
-    getQueuedItems: () => [],
+    getQueuedItems: () => [{ queueLane: "default" as const }],
     formatQueuedStatus: () => "",
     getRecentRuntimeEvents: () => [],
   });
@@ -739,7 +739,7 @@ test("Bridge status runtime keeps stable identity and counts active tools", () =
   });
   assert.equal(
     events[0],
-    "telegram:<accent>telegram</accent> <success>connected</success><success> +1</success>",
+    "telegram:<accent>telegram</accent> <success>connected</success><warning> +1</warning>",
   );
 });
 
@@ -845,7 +845,7 @@ test("Bridge status runtime builds status state from live ports", () => {
   });
   assert.equal(
     events[0],
-    "telegram:<accent>telegram</accent> <success>connected</success><success> +2</success>",
+    "telegram:<accent>telegram</accent> <success>connected</success>",
   );
   assert.deepEqual(runtime.getStatusLines(), [
     "connection:",

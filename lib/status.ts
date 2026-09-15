@@ -705,20 +705,14 @@ export function createTelegramBridgeStatusRuntime<
     getStatusBarState: (_ctx, error) => {
       const config = deps.getConfig();
       const queuedItems = deps.getQueuedItems();
-      const queuedItemCount = deps.getQueuedItemCount?.(queuedItems) ?? queuedItems.length;
-      const hasActiveTurn = deps.hasActiveTurn();
       const hasPendingDispatch = deps.hasDispatchPending();
+      const waitingItems = hasPendingDispatch ? queuedItems.slice(1) : queuedItems;
+      const queuedItemCount =
+        deps.getQueuedItemCount?.(waitingItems) ?? waitingItems.length;
+      const hasActiveTurn = deps.hasActiveTurn();
       const hasPendingModelSwitch = deps.hasPendingModelSwitch();
       const activeToolExecutions = deps.getActiveToolExecutions();
       const compactionInProgress = deps.isCompactionInProgress();
-      const activeWorkCount =
-        hasActiveTurn ||
-        hasPendingModelSwitch ||
-        activeToolExecutions > 0 ||
-        compactionInProgress ||
-        (hasPendingDispatch && queuedItemCount === 0)
-          ? 1
-          : 0;
       const localBus = deps.getLocalBus?.();
       return {
         hasBotToken: config.botHasToken ?? Boolean(config.botToken),
@@ -743,10 +737,7 @@ export function createTelegramBridgeStatusRuntime<
           activeToolExecutions,
           queuedItems: queuedItemCount,
         }),
-        queuedStatus:
-          activeWorkCount + queuedItemCount > 0
-            ? ` +${activeWorkCount + queuedItemCount}`
-            : "",
+        queuedStatus: queuedItemCount > 0 ? ` +${queuedItemCount}` : "",
         pollingStopReason: deps.getPollingState?.().stopReason,
         error,
       };
@@ -935,7 +926,7 @@ export function buildTelegramStatusBarText(
 ): string {
   const label = theme.fg("accent", getTelegramStatusBarLabel(state));
   const queued = state.queuedStatus
-    ? theme.fg("success", state.queuedStatus)
+    ? theme.fg("warning", state.queuedStatus)
     : "";
   if (!state.hasBotToken)
     return `${label} ${theme.fg("muted", "not configured")}${queued}`;

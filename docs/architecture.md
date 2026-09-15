@@ -452,7 +452,9 @@ Long-text split recovery remains conservative: only human text at or above the n
 
 ### Queue And Dispatch Safety
 
-The bridge keeps its own Telegram queue. Queue items have two explicit dimensions:
+The bridge keeps its own Telegram queue. The Pi status bar's yellow `+N` suffix projects only executable prompts still waiting: current agent work from Telegram, terminal, or autonomous sources never contributes, and the dispatched Telegram head is subtracted while it remains retained pending `agent_start` consumption.
+
+Queue items have two explicit dimensions:
 
 - `kind`: `prompt` or `control`.
 - `queueLane`: `control`, `priority`, or `default`.

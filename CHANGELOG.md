@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.48.1: Truthful terminal queue count hotfix
+
+- `Terminal queue status`: The yellow `+N` suffix now counts only executable prompts still waiting in the Telegram queue. The current agent run never contributes—whether it started from Telegram, the terminal, or autonomous continuation—and a dispatched Telegram prompt leaves the visible count before its run settles.
+
 ## 0.48.0: Unified activity and Thread display
 
 - `Unified activity`: The terminal keeps its stable `connected`, `leader`, or `follower` identity while work runs. Active work uses the same green Queue count as queued items, while Telegram typing projects every agent run—including local or autonomous work—into the assigned Thread and aggregate `All` target.
