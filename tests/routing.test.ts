@@ -4216,6 +4216,8 @@ test("Routing runtime retries failed follower restore delivery before cleanup", 
     const { events, routeRuntime, telegramQueueStore } = createRouteHarness({
       threadStore,
       getLiveThreadTargets: () => threadStore.list().map((record) => record.target),
+      getDisplayTitle: (target) =>
+        target.threadId === 42 ? "Ailluseum Tg M" : undefined,
       callApi: async (method, body) => {
         apiCalls.push({ method, body });
         if (method === "deleteForumTopic" && deleteAttempts++ === 0) {
@@ -4351,7 +4353,7 @@ test("Routing runtime retries failed follower restore delivery before cleanup", 
       },
       {
         method: "editForumTopic",
-        body: { chat_id: 100, message_thread_id: 42, name: "Beta" },
+        body: { chat_id: 100, message_thread_id: 42, name: "Ailluseum Tg M" },
       },
       {
         method: "closeForumTopic",

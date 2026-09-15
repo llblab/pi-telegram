@@ -1474,6 +1474,7 @@ export interface TelegramAgentEndAssistantResult {
   text?: string;
   stopReason?: string;
   errorMessage?: string;
+  recoveredFromEarlier?: boolean;
 }
 
 export interface TelegramAgentEndOutboundVoiceReply {
@@ -1592,6 +1593,7 @@ export interface TelegramAgentEndHookRuntimeDeps<
   extractAssistant: (
     messages: readonly TMessage[],
   ) => TelegramAgentEndAssistantResult;
+  isRecoveredAssistantAlreadyPublished?: (assistant: TelegramAgentEndAssistantResult) => boolean;
   getFoldQueuedPromptsIntoHistory: () => boolean;
   resetRuntimeState: () => void;
   isSessionActive?: (ctx: TContext) => boolean;
@@ -1736,7 +1738,11 @@ export function createTelegramAgentEndHook<
   ): Promise<void> => {
     if (deps.isSessionActive?.(ctx) === false) return;
     const turn = deps.getActiveTurn();
-    const assistant = assistantOverride ?? (turn ? deps.extractAssistant(event.messages) : {});
+    const extractedAssistant = assistantOverride ?? (turn ? deps.extractAssistant(event.messages) : {});
+    const assistant = extractedAssistant.recoveredFromEarlier &&
+        deps.isRecoveredAssistantAlreadyPublished?.(extractedAssistant)
+      ? { stopReason: extractedAssistant.stopReason }
+      : extractedAssistant;
     const hasPublication = !!assistant.text || assistant.stopReason === "error" || !!turn?.queuedAttachments.length;
     const reservation = turn && !turn.guestQueryId && hasPublication ? deps.reserveActiveTurnDelivery?.() : undefined;
     const scheduleDelivery = reservation?.schedule ?? deps.scheduleActiveTurnDelivery;
