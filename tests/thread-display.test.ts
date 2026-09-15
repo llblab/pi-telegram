@@ -47,7 +47,7 @@ test("New directory modes share deterministic Unicode-aware tokenization and suf
   ];
   assert.deepEqual([...resolveTelegramWorkspaceDisplayNames(
     sameDirectory, "directory-title", new Set(["one", "three"]),
-  ).values()], ["Api PRD Server · A", "Api PRD Server · C"]);
+  ).values()], ["Api PRD Server A", "Api PRD Server C"]);
 });
 
 test("Manual names override every automatic display mode", () => {

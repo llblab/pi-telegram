@@ -4,13 +4,19 @@
 
 ## Unreleased
 
+## 0.48.0: Unified activity and Thread display
+
+- `Unified activity`: The terminal keeps its stable `connected`, `leader`, or `follower` identity while work runs. Active work uses the same green Queue count as queued items, while Telegram typing projects every agent run—including local or autonomous work—into the assigned Thread and aggregate `All` target.
+- `Thread display`: Settings now present the exact profile configuration values `letters`, `names`, `directory-title`, and `directory-snake`, place title case first, and omit the redundant live-preview block. Concurrent `directory-title` slot suffixes use one plain space instead of a middle-dot separator.
+- `Session-aware Thread binding`: Operator live smoke confirmed same-session restoration and distinct concurrent sessions in one directory without duplicate Threads or letter slots, completing the remaining acceptance gate.
+
 ## 0.47.0: Built runtime and live surfaces
 
 - `Startup`: npm installs now load a compiled JavaScript extension from a nested `dist/pi-telegram` entrypoint while source checkouts retain `index.ts`. Stable public subpath exports ship compiled JavaScript plus declarations, packaged Skills follow the distributive root, and validation checks the built extension import.
 - `Button authoring`: Native `telegram_button` fences now accept adjacent top-level JSON/CML objects without an outer array or commas as vertical singleton rows. Explicit outer matrices remain equivalent, nested arrays still own horizontal layout, and malformed sequences activate no controls.
 - `Activity`: Native typing remains continuously re-armed during agent/message work, pauses only for local UI prompts, resumes for unsettled agent or compaction work, and retargets queued turns without leaking keepalive ticks across Threads; transport and session fences still suppress stale actions.
 - `Live views`: Validated `refreshAfterMs` drives non-overlapping timers after hinted `telegram_bind` delivery. Refreshes and current-surface actions edit one generation-fenced Delivery handle through the Markdown/button planner across classic, leader, and follower targets; hints reschedule and omission closes. Retryable failures retain one frame; unavailable messages invalidate with a bounded diagnostic. Take, shutdown, and replacement fence late refreshes and cancel memory-only surfaces.
-- `Thread display`: Adds explicit `directory-snake` and `directory-title` profile modes with shared Unicode-aware path tokenization, uppercase-abbreviation preservation, live Settings previews, initial/reconciled title projection, and negotiated peer capability fencing. Their slot suffixes now follow authenticated concurrent live same-directory ownership and disappear after disconnect or confirmed-dead pruning; dormant bindings and sticky legacy metadata are ignored. Retained `directories` stays unchanged.
+- `Thread display`: Adds `directory-snake` and `directory-title` with Unicode-aware path tokenization, uppercase-abbreviation preservation, live previews, title projection, and peer capability fencing. Slot suffixes now follow authenticated concurrent same-directory ownership; dormant bindings and sticky legacy metadata are ignored. The retired `directories` key resolves to Letters and is omitted from Settings, leaving exactly Letters, Names, Directory Snake, and Directory Title.
 
 ## 0.46.0: Session-aware Workspace Threads
 

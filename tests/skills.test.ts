@@ -121,7 +121,7 @@ test("Telegram extension contributes focused bundled skills", async () => {
   assert.match(showMe, /references\/telegram-surfaces\.md/u);
   assert.match(showMe, /retained diff, status, and validation evidence/u);
   assert.match(showMe, /Do not infer that an affordance is clickable/u);
-  assert.match(showMe, /State: locally implemented · validated · not released · not live/u);
+  assert.match(showMe, /State: locally implemented \| validated \| not released \| not live/u);
   const telegramSurfaces = await readSkillReference(
     "show-me",
     "telegram-surfaces.md",

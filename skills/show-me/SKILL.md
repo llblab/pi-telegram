@@ -29,7 +29,7 @@ Help the user understand the current topic. Skip the preamble and keep prose bri
 A compact state line is enough when provenance matters:
 
 ```text
-State: locally implemented · validated · not released · not live
+State: locally implemented | validated | not released | not live
 ```
 
 ### Visual Forms

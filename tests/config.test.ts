@@ -73,7 +73,7 @@ test("Thread display mode keeps every supported mode and maps invalid values to 
   }
   assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "names" }), "names");
   assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "letters" }), "letters");
-  assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "directories" }), "directories");
+  assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "directories" }), "letters");
   assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "directory-snake" }), "directory-snake");
   assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "directory-title" }), "directory-title");
 });
@@ -119,16 +119,16 @@ test("Thread display preference writes fence authority inside the config transac
     initialConfig: { profiles: { default: { botToken: "token" } } } });
   try {
     await store.persist();
-    await setTelegramThreadDisplayMode(store, "directories", () => true);
-    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directories");
+    await setTelegramThreadDisplayMode(store, "directory-snake", () => true);
+    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directory-snake");
     let current = true;
     const pending = store.persist({ ...store.get(), threadDisplayMode: "letters" }, {
       isCurrent: () => current,
     });
     current = false;
     await assert.rejects(pending, /originating authority/);
-    assert.equal((await readTelegramConfig(configPath)).profiles?.default.threadDisplayMode, "directories");
-    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directories");
+    assert.equal((await readTelegramConfig(configPath)).profiles?.default.threadDisplayMode, "directory-snake");
+    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directory-snake");
     await assert.rejects(
       setTelegramThreadDisplayMode(store, "names", () => false),
       /lost authority/,

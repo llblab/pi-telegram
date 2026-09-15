@@ -38,7 +38,7 @@ Keep each fact in one authoritative layer:
 
 ## 3. Repository Topology And Local Skills
 
-- `/index.ts`: Thin package entrypoint re-exporting the default extension.
+- `/index.ts`: Thin source entrypoint re-exporting the default extension. The installed/runtime entrypoint is generated under `/dist/pi-telegram`; after every project change, run `npm run build` before reload, restart, or live verification so Pi does not execute stale compiled output.
 - `/lib/extension.ts`: Sole extension composition root.
 - `/api/*.ts`: Stable public package membranes documented in `docs/public-api.md`.
 - `/lib/*.ts`: Flat, cohesive runtime domains; package-private unless re-exported through `/api`.
@@ -99,7 +99,7 @@ Use the relevant local skill before non-trivial work in its domain. Keep skill o
 - `preview` owns streaming lifecycle only, not assistant rendering. Finalization waits for active preview flushes and must not issue pre/post-final draft-clear calls that create transient Telegram draft UI. Turns that already answer as one atomic reply (voice replies, Guest Mode queries) never stream previews.
 - Native `sendChatAction(typing)` is the automatic activity signal for unsettled agent and compaction work while Telegram transport is authorized. Extension-owned blocking UI prompts pause it and completion resumes it while either work owner remains active. Do not invent extra in-chat work indicators or emit activity for startup/connect/reload/recovery alone.
 - Public activity handlers and connected companion delivery are asynchronous, target-bound, generation-fenced surfaces. Connected companion projection has no independent opt-out: disconnect or authority loss is its boundary. Token deltas, hidden reasoning, unknown sources, and stale authority never enter public projection.
-- Thread display defaults to the profile-scoped Letters strategy, with Names and Directories as the other automatic choices; Names projects the generated dictionary name for the slot. A durable manual Thread display name retained on its Workspace binding overrides any automatic projection until exact reset; keep generated/recovery identity separate from manual and acknowledged display fields. UI labels, emoji semantics, navigation, settings controls, callback namespaces, voice behavior, command templates, and assistant markup follow the linked `/docs` contracts. Generated human-readable prompt-button labels use `emoji + space + text`; emoji-free text is only a reasoned no-semantic-marker fallback. Non-spatial generated controls default to top-level vertical cells, with nested rows reserved for unmistakably compact peers. Do not restate other evolving UI details here.
+- Thread display defaults to the profile-scoped Letters strategy, with Names, Directory Snake, and Directory Title as the other automatic choices; Names projects the generated dictionary name for the slot. Unsupported retained display keys resolve to Letters without rewriting persisted configuration. A durable manual Thread display name retained on its Workspace binding overrides any automatic projection until exact reset; keep generated/recovery identity separate from manual and acknowledged display fields. UI labels, emoji semantics, navigation, settings controls, callback namespaces, voice behavior, command templates, and assistant markup follow the linked `/docs` contracts. Generated human-readable prompt-button labels use `emoji + space + text`; emoji-free text is only a reasoned no-semantic-marker fallback. Non-spatial generated controls default to top-level vertical cells, with nested rows reserved for unmistakably compact peers. Do not restate other evolving UI details here.
 
 ## 5. Domain Ownership Index
 
@@ -148,12 +148,14 @@ Before non-trivial work:
 While working:
 
 - Keep changes inside this repository; updating an installed Pi checkout is a separate operator action.
+- Rebuild the package with `npm run build` after edits. Pi loads `dist/pi-telegram/index.js`, so source-only changes are not live and `/reload` or process restart alone will reload stale compiled output.
 - Read large artifacts search-first and range-bounded. For `CHANGELOG.md`, inspect only the current release section unless older history is relevant.
 - Keep successful validation output compact; inspect focused failure tails. Prefer focused tests/typecheck during iteration and broad validation at a stable gate.
 - Preserve unrelated work and do not commit, publish, tag, deploy, or perform external actions without explicit authorization.
 
 Before completion:
 
+- Run `npm run build` after the final edit and before any `/reload`, restart, live check, or handoff; never report a source change as live while `/dist` is stale.
 - Run the smallest decisive validation for the affected closure. Queue/rendering/lifecycle changes normally require `npm run typecheck` and `npm test` at the stable gate.
 - For Domain DAG changes, run `SKILL_DIR=.agents/skills/domain-dag bash .agents/skills/domain-dag/scripts/validate-domain-dag.sh --root .`.
 - Keep strict unused-local/parameter checking. Validate queue dispatch around abort, compaction, pending dispatch, and Pi pending-message guards; validate rendering around literal code, nesting, and long-message chunks.

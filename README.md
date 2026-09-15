@@ -240,7 +240,7 @@ Classic private DM mode is the base product mode. When Telegram private-chat Thr
 - Unknown threads are preserved and offered explicit reroute/restore choices.
 - Telegram never launches hidden Pi processes.
 
-In Threaded Mode, open Settings → **🧵 Thread display** to choose **Letters** (default), **Names**, **directory-snake**, or **directory-title** for this bot profile; a retained **directories** value remains available as an unchanged legacy presentation. The Settings detail shows a bounded live preview computed from current Workspace bindings. Fresh tabs are created with the active mode's title instead of being visibly renamed afterward. Telegram tab titles, Pi terminal status, live Thread choosers/notices, prompt attribution, and named `telegram_message` targeting use the same acknowledged display name; target IDs and live registrations still own routing. Names shows the generated dictionary name chosen for the slot, such as `Anchor` for slot `A`; the directory formats produce `api_tools` or `Api Tools` and append `_a` or ` · A` only while two or more authenticated live instances share that exact directory. Dormant retained bindings do not keep those suffixes visible. `/name` sets a manual Thread display name; **Reset to automatic** restores the selected automatic projection. Switching preserves Thread IDs, slots, generated recovery identity, and queue ownership. Partial application reports an error and can be retried without recreating Threads.
+In Threaded Mode, open Settings → **🧵 Thread display** to choose `letters` (default), `names`, `directory-title`, or `directory-snake` for this bot profile; a retained **directories** value remains available as an unchanged legacy presentation. Fresh tabs are created with the active mode's title instead of being visibly renamed afterward. Telegram tab titles, Pi terminal status, live Thread choosers/notices, prompt attribution, and named `telegram_message` targeting use the same acknowledged display name; target IDs and live registrations still own routing. Names shows the generated dictionary name chosen for the slot, such as `Anchor` for slot `A`; the directory formats produce `api_tools` or `Api Tools` and append `_a` or ` A` only while two or more authenticated live instances share that exact directory. Dormant retained bindings do not keep those suffixes visible. `/name` sets a manual Thread display name; **Reset to automatic** restores the selected automatic projection. Switching preserves Thread IDs, slots, generated recovery identity, and queue ownership. Partial application reports an error and can be retried without recreating Threads.
 
 | Mode | Best for | Runtime shape |
 | --- | --- | --- |
@@ -316,7 +316,10 @@ The docs index lives at [docs/README.md](./docs/README.md).
 
 ## Development
 
+Pi loads the compiled `dist/pi-telegram/index.js` entrypoint. After every project change, run `npm run build` before `/reload`, restart, or live verification; reloading source without rebuilding can leave the running extension on stale compiled code.
+
 ```bash
+npm run build
 npm run typecheck
 npm test
 npm run audit
