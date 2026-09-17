@@ -197,7 +197,7 @@ The token is an implementation detail. Section authors **never** write `section:
 1. Telegram update arrives through the single `pi-telegram` polling loop
 2. Update handlers observe/consume (raw update interception)
 3. Button action store (`tgbtn:*`)
-4. Compact confirmation callbacks (`compact:*`)
+4. New-session and compact confirmation callbacks (`new:*`, `compact:*`)
 5. Queue menu callbacks (`queue:*`)
 6. Settings menu callbacks (`settings:*`)
 7. Section callbacks (`section:*`)
@@ -372,7 +372,7 @@ section:0:settings:open          → open settings root
 section:0:<action>:<payload>     → forwarded to handleCallback
 ```
 
-`section:` is listed in `TELEGRAM_OWNED_CALLBACK_PREFIXES` alongside `compact:`, `menu:`, `model:`, `settings:`, `status:`, `tgbtn:`, `thinking:`, `queue:`. Layered extensions must not use this prefix.
+`section:` is listed in `TELEGRAM_OWNED_CALLBACK_PREFIXES` alongside `compact:`, `new:`, `menu:`, `model:`, `settings:`, `status:`, `tgbtn:`, `thinking:`, `queue:`. Layered extensions must not use this prefix.
 
 ### Inline keyboard layout
 

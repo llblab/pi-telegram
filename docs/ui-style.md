@@ -48,7 +48,7 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `▶️` | Play / continue immediately | Idle `/next` result, `/continue` command, and matching menu action | Means work can start or resume directly without first aborting an active turn. |
 | `⏹️` | Abort current Pi work | `/abort` command description and active `/stop` result | Stops active work; accompanying copy states separately when queued work is cleared. |
 | `🟥` | Destructive stop command | `/stop` command description | Strong warning at the command/action entrypoint; standalone results use the more precise idle or abort state icon. |
-| `🆕` | New session / fresh start | Reserved visible extension command example for `/new`-like flows | Same-thread Telegram `/new` is currently blocked by Pi core API; keep this meaning reserved. |
+| `🆕` | New session / fresh start | `/new`, session replacement notices | `/new` replaces the active Pi session while preserving the current classic chat or Thread target; use it only for a real session reset. |
 | `🔄` | Refresh | Queue refresh row and future refresh buttons | Re-fetch/re-render current surface, not transport reconnect. |
 | `↪️` | Reroute to an existing target | Thread chooser buttons that send a captured command/message from one thread to another live thread | Curved arrow means the message arrived here but bends to another target. |
 | `🔁` | Replace/restore mode | Thread replace/restore chooser entrypoints | Opens a second step for moving a Pi instance binding to the current source thread. |
@@ -228,6 +228,7 @@ Rules:
 - Format standalone notices as one fully bold line: relevant emoji, one space, concise sentence, and terminal period. Menu or chooser headings use the same fully bold form but end in a colon when controls or detail follow. Empty-queue headings are the deliberate exception: fully bold, with no trailing period or colon.
 - Keep the emoji and complete sentence or heading inside the single bold span; do not bold only a fragment. A material name or phrase may receive nested italic emphasis without breaking the outer bold hierarchy—for example `<b>📡 Instance <i>Cedar</i> connected.</b>`.
 - Apply the same hierarchy to success, progress, empty, busy, unavailable, cancellation, and failure notices.
+- Once an action has settled, describe only the completed result in completed-state language. Do not append transitional copy such as “returning” or “starting”; use a separate progress surface only while work is genuinely still pending.
 - Callback alerts remain plain text because Telegram does not support rich text there, but still keep the relevant emoji and concise sentence.
 - Setting detail cards may include an emoji in the heading, then a colon and the current value in `<code>`.
 - Explain what the setting does and what the options mean only as much as needed.

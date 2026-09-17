@@ -20,7 +20,7 @@ myext:page:2
 
 - Use a stable extension-owned namespace, preferably the package or extension name without scope punctuation.
 - Keep the namespace lowercase ASCII: `a-z`, `0-9`, `_`, `-`.
-- Do not use `pi-telegram` owned prefixes: `compact:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `settings:`, `section:`. Current app navigation uses `menu:`; `status:` remains reserved for legacy/owned status callbacks but is not emitted by current UI. `compact:` is owned by the manual compaction confirmation dialog. `section:` is owned by the Extension Sections platform (0.10.0+), documented in [Extension Sections](./sections.md). `settings:` is owned for the built-in Settings submenu.
+- Do not use `pi-telegram` owned prefixes: `compact:`, `new:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `settings:`, `section:`. Current app navigation uses `menu:`; `status:` remains reserved for legacy/owned status callbacks but is not emitted by current UI. `compact:` and `new:` are owned by their destructive-action confirmation dialogs. `section:` is owned by the Extension Sections platform (0.10.0+), documented in [Extension Sections](./sections.md). `settings:` is owned for the built-in Settings submenu.
 - Keep the full `callback_data` within Telegram's 64-byte limit.
 - Put only opaque ids or small enum values in payloads; do not store secrets, full prompts, or large state.
 - Treat callbacks as untrusted input. Validate namespace, action, and payload before executing side effects.

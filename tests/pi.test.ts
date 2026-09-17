@@ -101,6 +101,9 @@ test("Pi API runtime ports bind methods without losing receiver context", async 
       this.events.push(`model:${getHarnessModelId(model)}`);
       return true;
     },
+    registerCommand(name) {
+      this.events.push(`command:${name}`);
+    },
   };
   const runtime = createExtensionApiRuntimePorts(api);
   runtime.sendUserMessage("hello", { deliverAs: "followUp" });
@@ -116,6 +119,10 @@ test("Pi API runtime ports bind methods without losing receiver context", async 
   assert.deepEqual(runtime.getActiveTools(), ["read"]);
   runtime.setActiveTools(["read", "telegram_attach"]);
   assert.equal(await runtime.setModel(createHarnessModel("gpt-5")), true);
+  runtime.registerCommand("telegram-session-action", {
+    description: "internal",
+    handler: async () => {},
+  });
   assert.deepEqual(api.events, [
     "send:hello:followUp",
     "exec:cmd:arg",
@@ -125,6 +132,7 @@ test("Pi API runtime ports bind methods without losing receiver context", async 
     "get-tools",
     "set-tools:read,telegram_attach",
     "model:gpt-5",
+    "command:telegram-session-action",
   ]);
 });
 

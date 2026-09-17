@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+## 0.49.0: Unified fresh-session continuity
+
+- `/new`: Classic and Threaded Mode now share one confirmed fresh-session flow. The settled callback deletes its dialog and publishes an expiring exact-target intent; a same- or cross-process successor preserves the classic chat or re-keys the Thread/slot/name, atomically claims once, then sends one terminal result. Identity mismatches fail closed.
+- `Command menus`: Both Telegram command menus now keep the primary sequence `/start`, `/compact`, `/new`, `/continue`, `/next`; the niche `/name` command remains available but moves out of menus into the Thread display Settings guidance.
+- `Classic Settings`: Hides both Thread display and Thread cleanup controls when Threaded Mode is unavailable, rather than exposing only half of the Thread-specific surface.
+- `Thread display`: A current Thread with a manual `/name` override now appears as `custom` on the Settings row and detail heading; choosing any automatic mode clears the current Thread's override, reapplies that projection, and selects it again. Successful interactive rename/reset now settles its source before asynchronously publishing the result, so immediate `/new` cannot replay the consumed name after replacement; cancellation reports only its completed result.
+
 ## 0.48.3: Assistant publication identity hotfix
 
 - `Thread restore display identity`: Restoring or reclaiming a Thread now renames the destination from its current Workspace display title when available, rather than leaking the internal baked slot name such as `Moss` into directory-title mode.

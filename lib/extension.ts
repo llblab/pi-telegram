@@ -77,6 +77,7 @@ export default function (pi: Pi.ExtensionAPI) {
     getCommands,
     getThinkingLevel,
     sendUserMessage,
+    registerCommand,
     setActiveTools,
     setModel,
     setThinkingLevel,
@@ -237,6 +238,26 @@ export default function (pi: Pi.ExtensionAPI) {
     canReset: lockRuntime.owns,
     commitReset: lockRuntime.commitIfOwned,
   });
+  const sessionActionAssembly = Commands.createTelegramSessionActionAssembly({
+    registerCommand,
+    sendUserMessage,
+    store: threadStore,
+    getProfileName: configStore.getActiveProfileName,
+    ownsPersistence: lockRuntime.owns,
+    async sendResult(target, html) {
+      const delivery = await Delivery.sendTelegramView(
+        { text: html, parseMode: "html", replyMarkup: { inline_keyboard: [] } },
+        { scope: { kind: "target", target } },
+      );
+      return delivery.ok ? { ok: true } : { ok: false,
+        retryable: delivery.reason === "runtime-unavailable" ||
+          delivery.reason === "target-unavailable" ||
+          delivery.reason === "transport-retryable" };
+    },
+    handoffTtlMs: Threads.TELEGRAM_LEADER_SESSION_HANDOFF_TTL_MS,
+    recordRuntimeEvent,
+  });
+  const sessionActionsRuntime = sessionActionAssembly.action;
   const lockOwnershipGuard =
     Locks.createTelegramLockOwnershipGuard(lockRuntime);
   const getCurrentLeaderEpoch = lockRuntime.getOwnedLeaderEpoch;
@@ -851,6 +872,24 @@ export default function (pi: Pi.ExtensionAPI) {
     updateStatusMessage: menuActions.updateStatusMessage,
     updateStatus,
   });
+  const threadDisplaySettingsRuntime =
+    ThreadDisplay.createTelegramThreadDisplaySettingsRuntime({
+      getTarget() {
+        return telegramBusFollowerRegistrationState.getTarget() ??
+          telegramBusLeaderState.getTarget();
+      },
+      getBinding(target) { return threadStore.getWorkspaceBindingByTarget(target); },
+      apply(mode) {
+        return ThreadDisplay.applyTelegramThreadDisplaySetting(mode, {
+          getProfileKey: configStore.getActiveProfileName,
+          ownsLeader() { return getCurrentLeaderEpoch() !== undefined; },
+          getLeaderSetter() { return telegramBusLeaderRuntime.setThreadDisplayMode; },
+          getFollowerSetter() { return telegramBusFollowerRegistration.setThreadDisplayMode; },
+          reloadConfig: configStore.load,
+        });
+      },
+      reset(target) { return telegramThreadDisplayNameResetBinding.reset(target); },
+    });
   const settingsMenuRuntime = MenuSettings.createTelegramSettingsMenuRuntime(
     {
       reloadConfig: configStore.load,
@@ -866,16 +905,10 @@ export default function (pi: Pi.ExtensionAPI) {
         return threadStore.getBotState().threadMode === "enabled"
           ? Config.resolveTelegramThreadDisplayMode(configStore.get()) : undefined;
       },
+      isThreadDisplayCustom: threadDisplaySettingsRuntime.isCustom,
       async setThreadDisplayMode(mode) {
-        try {
-          await ThreadDisplay.applyTelegramThreadDisplaySetting(mode, {
-            getProfileKey: configStore.getActiveProfileName,
-            ownsLeader() { return getCurrentLeaderEpoch() !== undefined; },
-            getLeaderSetter() { return telegramBusLeaderRuntime.setThreadDisplayMode; },
-            getFollowerSetter() { return telegramBusFollowerRegistration.setThreadDisplayMode; },
-            reloadConfig: configStore.load,
-          });
-        } catch (error) {
+        try { await threadDisplaySettingsRuntime.setMode(mode); }
+        catch (error) {
           recordRuntimeEvent("bus", error, { phase: "thread-display-setting" });
           throw error;
         }
@@ -959,6 +992,36 @@ export default function (pi: Pi.ExtensionAPI) {
     foreignOwnedUpdateForwarder,
     replaceFollowerThreadTarget: restoreFollowerThreadTarget,
     bridgeRuntime,
+    requestNewSession(source) {
+      const updateId = Updates.getTelegramUpdateExecutionFence(source)?.updateId;
+      if (updateId === undefined) {
+        throw new Error("Telegram session replacement requires durable update authority.");
+      }
+      const callbackMessage = source && typeof source === "object" && "message" in source
+        ? (source as { message?: unknown }).message
+        : source;
+      const messageTarget = callbackMessage as {
+        chat?: { id?: unknown };
+        message_id?: unknown;
+        message_thread_id?: unknown;
+      } | undefined;
+      const target = typeof messageTarget?.chat?.id === "number" &&
+          typeof messageTarget.message_id === "number"
+        ? {
+            chatId: messageTarget.chat.id,
+            messageId: messageTarget.message_id,
+            ...(typeof messageTarget.message_thread_id === "number"
+              ? { threadId: messageTarget.message_thread_id }
+              : {}),
+          }
+        : undefined;
+      if (!target) {
+        throw new Error("Telegram session replacement target is unavailable.");
+      }
+      if (!sessionActionsRuntime.scheduleAfterUpdate(updateId, target)) {
+        throw new Error("A Telegram session replacement is already pending.");
+      }
+    },
     activeTurnRuntime,
     mediaGroupRuntime,
     textGroupRuntime,
@@ -1066,6 +1129,7 @@ export default function (pi: Pi.ExtensionAPI) {
       dispatchNext: dispatchNextQueuedTelegramTurn,
       requestQueueHandoffReconciliation:
         queueHandoffReconciliationBinding.request,
+      afterUpdateCompleted: sessionActionsRuntime.onUpdateCompleted,
     },
     worker: {
       defaultHandle: inboundRouteRuntime.handleUpdate,
@@ -1638,6 +1702,7 @@ export default function (pi: Pi.ExtensionAPI) {
       }
     },
   }.reset);
+  sessionActionsRuntime.register();
   Bindings.registerTelegramCommandsAndTools({
     pi,
     agentDir: Paths.resolveAgentDir(),
@@ -1840,6 +1905,9 @@ export default function (pi: Pi.ExtensionAPI) {
     shutdownGenerativeAppLiveSurfaces: generativeAppLiveSurfaceBinding.shutdown,
     resolveAutomaticThreadCleanupEnabled:
       configControls.resolveAutomaticThreadCleanupEnabled,
+    onSessionStarted(_event, ctx) {
+      sessionActionAssembly.settlement.onSessionStart(ctx);
+    },
     buttonActionStore,
     callMultipart,
     sendChatAction,

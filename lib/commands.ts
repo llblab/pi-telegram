@@ -1,7 +1,7 @@
 /**
  * Telegram command routing helpers
  * Zones: telegram controls, pi agent commands, queue controls
- * Owns Telegram slash-command normalization, bot command metadata, and pi-side command registration behind runtime ports
+ * Owns Telegram slash-command normalization, bot command metadata, pi-side command registration, and command-initiated session replacement orchestration behind runtime ports
  */
 
 import {
@@ -9,9 +9,11 @@ import {
   type TelegramConfigStore,
   TELEGRAM_DEFAULT_PROFILE_NAME,
 } from "./config.ts";
+import type * as Pi from "./pi.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
 import { escapeHtml } from "./rendering.ts";
 import type { TelegramBridgeStatusLineOptions } from "./status.ts";
+import type { TelegramSessionReplacementIntent } from "./threads.ts";
 import {
   createTelegramControlItemBuilder,
   createTelegramControlQueueController,
@@ -172,6 +174,7 @@ export const TELEGRAM_COMMAND_EMOJI = {
   abort: "⏹️",
   stop: "🟥",
   name: "🏷️",
+  new: "🆕",
 } as const;
 
 export type TelegramCommandEmojiName = keyof typeof TELEGRAM_COMMAND_EMOJI;
@@ -259,13 +262,6 @@ export const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinitio
       ),
     },
     {
-      command: "name",
-      description: formatTelegramBotCommandDescription(
-        "name",
-        "Rename this thread",
-      ),
-    },
-    {
       command: "compact",
       description: formatTelegramBotCommandDescription(
         "compact",
@@ -273,10 +269,10 @@ export const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinitio
       ),
     },
     {
-      command: "next",
+      command: "new",
       description: formatTelegramBotCommandDescription(
-        "next",
-        "Force next turn",
+        "new",
+        "Start a new session",
       ),
     },
     {
@@ -284,6 +280,13 @@ export const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinitio
       description: formatTelegramBotCommandDescription(
         "continue",
         "Queue continue prompt",
+      ),
+    },
+    {
+      command: "next",
+      description: formatTelegramBotCommandDescription(
+        "next",
+        "Force next turn",
       ),
     },
     {
@@ -331,17 +334,17 @@ export async function registerTelegramBotCommands(
     await deps.setMyCommands(TELEGRAM_BOT_COMMANDS);
     return;
   }
-  const compactCommandIndex = TELEGRAM_BOT_COMMANDS.findIndex(
-    (command) => command.command === "compact",
+  const nextCommandIndex = TELEGRAM_BOT_COMMANDS.findIndex(
+    (command) => command.command === "next",
   );
-  if (compactCommandIndex === -1) {
+  if (nextCommandIndex === -1) {
     await deps.setMyCommands([...TELEGRAM_BOT_COMMANDS, ...extensionCommands]);
     return;
   }
   await deps.setMyCommands([
-    ...TELEGRAM_BOT_COMMANDS.slice(0, compactCommandIndex + 1),
+    ...TELEGRAM_BOT_COMMANDS.slice(0, nextCommandIndex + 1),
     ...extensionCommands,
-    ...TELEGRAM_BOT_COMMANDS.slice(compactCommandIndex + 1),
+    ...TELEGRAM_BOT_COMMANDS.slice(nextCommandIndex + 1),
   ]);
 }
 
@@ -658,6 +661,7 @@ export function registerTelegramBridgeCommands(
 export const TELEGRAM_RESERVED_COMMAND_NAMES = [
   "stop",
   "name",
+  "new",
   "abort",
   "next",
   "continue",
@@ -691,6 +695,7 @@ export type TelegramCommandAction =
   | { kind: "ignore"; executionMode: "ignored" }
   | { kind: "stop"; executionMode: "immediate" }
   | { kind: "name"; executionMode: "immediate" }
+  | { kind: "new"; executionMode: "immediate" }
   | { kind: "abort"; executionMode: "immediate" }
   | { kind: "next"; executionMode: "immediate" }
   | { kind: "continue"; executionMode: "immediate" }
@@ -711,6 +716,7 @@ export type TelegramCommandExecutionMode = "ignored" | "immediate";
 export interface TelegramCommandActionDeps<TMessage, TContext> {
   handleStop: (message: TMessage, ctx: TContext) => Promise<void>;
   handleName: (message: TMessage, ctx: TContext, name: string) => Promise<void>;
+  handleNew: (message: TMessage, ctx: TContext) => Promise<void>;
   handleAbort: (message: TMessage, ctx: TContext) => Promise<void>;
   handleNext: (message: TMessage, ctx: TContext) => Promise<void>;
   handleContinue: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -796,6 +802,23 @@ export interface TelegramCompactConfirmationCallbackQuery {
     message_id?: number;
     message_thread_id?: number;
   };
+}
+
+export interface TelegramNewConfirmationCallbackDeps<TContext> {
+  ctx: TContext;
+  answerCallbackQuery: (
+    callbackQueryId: string,
+    text?: string,
+  ) => Promise<void>;
+  editInteractiveMessage: (
+    chatId: number,
+    messageId: number,
+    text: string,
+    mode: "markdown" | "html" | "plain",
+    replyMarkup: TelegramCompactConfirmationReplyMarkup,
+  ) => Promise<void>;
+  deleteMessage: (chatId: number, messageId: number) => Promise<void>;
+  runNew: (ctx: TContext) => Promise<void>;
 }
 
 export interface TelegramCompactConfirmationCallbackDeps<TContext> {
@@ -1158,6 +1181,7 @@ export interface TelegramCommandRuntimeDeps<
   ) => void;
   stopTypingLoop?: () => void;
   enqueueContinueTurn: (message: TMessage, ctx: TContext) => Promise<void>;
+  requestNewSession?: (message: TMessage) => void;
   compact: (
     ctx: TContext,
     callbacks: { onComplete: () => void; onError: (error: unknown) => void },
@@ -1205,10 +1229,10 @@ export const TELEGRAM_APP_MENU_INTRO_HTML = [
   "<b>Pi Telegram</b>",
   "",
   `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
-  `${formatTelegramCommandEmojiPrefix("name")}/name — Rename this thread`,
   `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
-  `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
+  `${formatTelegramCommandEmojiPrefix("new")}/new — Start a new session`,
   `${formatTelegramCommandEmojiPrefix("continue")}/continue — Queue continue prompt`,
+  `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
   `${formatTelegramCommandEmojiPrefix("abort")}/abort — Abort Pi`,
   `${formatTelegramCommandEmojiPrefix("stop")}/stop — Abort Pi & Clear queue`,
 ].join("\n");
@@ -1246,11 +1270,11 @@ function buildTelegramAppMenuIntroHtml(): string {
     "<b>Pi Telegram</b>",
     "",
     `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
-    `${formatTelegramCommandEmojiPrefix("name")}/name — Rename this thread`,
     `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
-    ...extensionLines,
-    `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
+    `${formatTelegramCommandEmojiPrefix("new")}/new — Start a new session`,
     `${formatTelegramCommandEmojiPrefix("continue")}/continue — Queue continue prompt`,
+    `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
+    ...extensionLines,
     `${formatTelegramCommandEmojiPrefix("abort")}/abort — Abort Pi`,
     `${formatTelegramCommandEmojiPrefix("stop")}/stop — Abort Pi & Clear queue`,
   ].join("\n");
@@ -1316,6 +1340,7 @@ export function parseTelegramCommand(
 export const TELEGRAM_COMMAND_ACTIONS = {
   stop: { kind: "stop", executionMode: "immediate" },
   name: { kind: "name", executionMode: "immediate" },
+  new: { kind: "new", executionMode: "immediate" },
   abort: { kind: "abort", executionMode: "immediate" },
   next: { kind: "next", executionMode: "immediate" },
   continue: { kind: "continue", executionMode: "immediate" },
@@ -1484,6 +1509,64 @@ function dispatchNextQueuedTelegramTurnAfterCompact(
   deps.dispatchNextQueuedTelegramTurn();
 }
 
+export function buildTelegramNewConfirmationReplyMarkup(): TelegramCompactConfirmationReplyMarkup {
+  return {
+    inline_keyboard: [
+      [
+        { text: "🆕 Yes, start new", callback_data: "new:confirm" },
+        { text: "❌ No", callback_data: "new:cancel" },
+      ],
+    ],
+  };
+}
+
+export function getTelegramNewConfirmationHtml(): string {
+  return "<b>Start a new session?</b>";
+}
+
+export async function openTelegramNewConfirmation(
+  target: TelegramCommandMessageTarget,
+  deps: TelegramCompactConfirmationDeps,
+): Promise<void> {
+  await deps.sendInteractiveMessage(
+    target.chatId,
+    getTelegramNewConfirmationHtml(),
+    "html",
+    buildTelegramNewConfirmationReplyMarkup(),
+    target.threadId !== undefined
+      ? { target: { chatId: target.chatId, threadId: target.threadId } }
+      : undefined,
+  );
+}
+
+export async function handleTelegramNewConfirmationCallback<TContext>(
+  query: TelegramCompactConfirmationCallbackQuery,
+  deps: TelegramNewConfirmationCallbackDeps<TContext>,
+): Promise<boolean> {
+  if (query.data !== "new:confirm" && query.data !== "new:cancel") return false;
+  const chatId = query.message?.chat?.id;
+  const messageId = query.message?.message_id;
+  if (typeof chatId !== "number" || typeof messageId !== "number") {
+    await deps.answerCallbackQuery(query.id, "⌛ Interactive message expired.");
+    return true;
+  }
+  if (query.data === "new:cancel") {
+    await deps.editInteractiveMessage(
+      chatId,
+      messageId,
+      "<b>🚫 New session cancelled.</b>",
+      "html",
+      { inline_keyboard: [] },
+    );
+    await deps.answerCallbackQuery(query.id);
+    return true;
+  }
+  await deps.answerCallbackQuery(query.id);
+  await deps.deleteMessage(chatId, messageId);
+  await deps.runNew(deps.ctx);
+  return true;
+}
+
 export function buildTelegramCompactConfirmationReplyMarkup(): TelegramCompactConfirmationReplyMarkup {
   return {
     inline_keyboard: [
@@ -1555,6 +1638,53 @@ export async function handleTelegramCompactConfirmationCallback<TContext>(
     typeof threadId === "number" ? { chatId, threadId } : { chatId },
   );
   return true;
+}
+
+export interface TelegramNewCommandDeps extends TelegramRuntimeEventRecorderPort {
+  isIdle: () => boolean;
+  hasPendingMessages: () => boolean;
+  hasActiveTelegramTurn: () => boolean;
+  hasDispatchPending: () => boolean;
+  hasQueuedTelegramItems: () => boolean;
+  isCompactionInProgress: () => boolean;
+  requestNewSession?: () => void;
+  sendTextReply: (
+    text: string,
+    options?: { parseMode?: "HTML" },
+  ) => Promise<void>;
+}
+
+export async function handleTelegramNewCommand(
+  deps: TelegramNewCommandDeps,
+): Promise<void> {
+  if (
+    !deps.isIdle() ||
+    deps.hasPendingMessages() ||
+    deps.hasActiveTelegramTurn() ||
+    deps.hasDispatchPending() ||
+    deps.hasQueuedTelegramItems() ||
+    deps.isCompactionInProgress()
+  ) {
+    await deps.sendTextReply(
+      formatTelegramInformationHeading(
+        "⏳",
+        "Cannot start a new session while Pi or the Telegram queue is busy. Wait for queued turns to finish or send /abort first.",
+      ),
+      { parseMode: "HTML" },
+    );
+    return;
+  }
+  if (!deps.requestNewSession) {
+    await deps.sendTextReply(
+      formatTelegramInformationHeading(
+        "🚫",
+        "Session replacement is unavailable in this Pi runtime.",
+      ),
+      { parseMode: "HTML" },
+    );
+    return;
+  }
+  deps.requestNewSession();
 }
 
 export async function handleTelegramCompactCommand(
@@ -1673,6 +1803,9 @@ export async function executeTelegramCommandAction<TMessage, TContext>(
     case "name":
       await deps.handleName(message, ctx, commandArgs);
       return true;
+    case "new":
+      await deps.handleNew(message, ctx);
+      return true;
     case "abort":
       await deps.handleAbort(message, ctx);
       return true;
@@ -1776,6 +1909,7 @@ export function createTelegramCommandHandlerTargetRuntime<
     stopTypingLoop: deps.stopTypingLoop,
     enqueueContinueTurn: deps.enqueueContinueTurn,
     compact: deps.compact,
+    requestNewSession: deps.requestNewSession,
     sendInteractiveMessage: deps.sendInteractiveMessage,
     enqueueControlItem: commandTargetRuntime.enqueueControlItem,
     showStatus: commandTargetRuntime.showStatus,
@@ -2042,6 +2176,28 @@ async function handleTelegramCommandRuntime<
           assertExecutionCurrentFor(nextMessage),
         );
       },
+      handleNew: async (nextMessage, commandCtx) => {
+        if (deps.sendInteractiveMessage) {
+          await openTelegramNewConfirmation(
+            getTelegramCommandMessageTarget(nextMessage),
+            { sendInteractiveMessage: deps.sendInteractiveMessage },
+          );
+          return;
+        }
+        await handleTelegramNewCommand({
+          isIdle: () => deps.isIdle(commandCtx),
+          hasPendingMessages: () => deps.hasPendingMessages(commandCtx),
+          hasActiveTelegramTurn: deps.hasActiveTelegramTurn,
+          hasDispatchPending: deps.hasDispatchPending,
+          hasQueuedTelegramItems: deps.hasQueuedTelegramItems,
+          isCompactionInProgress: deps.isCompactionInProgress,
+          requestNewSession: deps.requestNewSession
+            ? () => deps.requestNewSession!(nextMessage)
+            : undefined,
+          sendTextReply: sendReplyFor(nextMessage),
+          recordRuntimeEvent: deps.recordRuntimeEvent,
+        });
+      },
       handleCompact: async (nextMessage, commandCtx) => {
         if (deps.sendInteractiveMessage) {
           await openTelegramCompactConfirmation(
@@ -2177,4 +2333,293 @@ async function handleTelegramCommandRuntime<
     },
     commandArgs,
   );
+}
+
+export const TELEGRAM_SESSION_ACTION_COMMAND_NAME = "telegram-session-action";
+export const TELEGRAM_SESSION_ACTION_COMMAND_DESCRIPTION =
+  "(internal) replace the current Pi session after Telegram settlement";
+
+export function delayTelegramSessionAction(delayMs: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
+
+export interface TelegramSessionActionRuntimeDeps {
+  registerCommand: Pi.ExtensionAPI["registerCommand"];
+  sendUserMessage: Pi.ExtensionAPI["sendUserMessage"];
+  notifyResult: (
+    target: { chatId: number; threadId?: number; messageId: number },
+    result: "success" | "cancelled" | "failure",
+  ) => Promise<void>;
+  prepareReplacement?: (
+    ctx: Pi.ExtensionCommandContext,
+    updateId: number,
+    target: { chatId: number; threadId?: number; messageId: number },
+  ) => Promise<void>;
+  recordRuntimeEvent?: (category: string, error: unknown) => void;
+}
+
+export interface TelegramSessionReplacementSettlementDeps {
+  getIntent: () => Promise<TelegramSessionReplacementIntent | undefined>;
+  hasSuccessorContinuity: (intent: TelegramSessionReplacementIntent) => boolean;
+  editSuccess: (intent: TelegramSessionReplacementIntent) =>
+    Promise<{ ok: boolean; retryable?: boolean; message?: string }>;
+  clearIntent: (intent: TelegramSessionReplacementIntent) => Promise<boolean>;
+  profileName: string | undefined;
+  cwd: string;
+  sessionId: string;
+  now?: () => number;
+  sleep?: (delayMs: number) => Promise<void>;
+  isCurrent?: () => boolean;
+}
+
+export async function settleTelegramSessionReplacement(
+  deps: TelegramSessionReplacementSettlementDeps,
+): Promise<"none" | "settled" | "expired" | "failed" | "stale"> {
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? ((delayMs) =>
+    new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+  while (deps.isCurrent?.() !== false) {
+    const intent = await deps.getIntent();
+    if (!intent || intent.sourceSessionId === deps.sessionId) return "none";
+    if (intent.profileName !== deps.profileName || intent.cwd !== deps.cwd) return "stale";
+    if (now() >= intent.expiresAtMs) return "expired";
+    if (!deps.hasSuccessorContinuity(intent)) {
+      await sleep(100);
+      continue;
+    }
+    if (!await deps.clearIntent(intent)) return "failed";
+    do {
+      const delivered = await deps.editSuccess(intent);
+      if (delivered.ok) return "settled";
+      if (!delivered.retryable) return "failed";
+      await sleep(100);
+    } while (deps.isCurrent?.() !== false && now() < intent.expiresAtMs);
+    return "failed";
+  }
+  return "stale";
+}
+
+export function createTelegramSessionReplacementSettlementRuntime<TContext>(deps: {
+  resolve: (ctx: TContext) => TelegramSessionReplacementSettlementDeps | undefined;
+  onResult?: (result: "none" | "settled" | "expired" | "failed" | "stale") => void;
+  onError?: (error: unknown) => void;
+}): { onSessionStart: (ctx: TContext) => void } {
+  let generation = 0;
+  return {
+    onSessionStart(ctx) {
+      const currentGeneration = ++generation;
+      const resolved = deps.resolve(ctx);
+      if (!resolved) return;
+      void settleTelegramSessionReplacement({
+        ...resolved,
+        isCurrent: () => currentGeneration === generation &&
+          resolved.isCurrent?.() !== false,
+      }).then(deps.onResult, deps.onError);
+    },
+  };
+}
+
+export interface TelegramSessionActionAssemblyDeps {
+  registerCommand: Pi.ExtensionAPI["registerCommand"];
+  sendUserMessage: Pi.ExtensionAPI["sendUserMessage"];
+  store: {
+    load: () => Promise<void>;
+    refresh?: () => Promise<void>;
+    getWorkspaceBindingByTarget: (
+      target: { chatId: number; threadId?: number },
+      sessionId?: string,
+    ) => {
+      cwd: string; sessionId?: string; slot?: string; threadName?: string;
+      manualThreadName?: string; target: { chatId: number; threadId: number };
+    } | undefined;
+    getSessionReplacementIntent: () => TelegramSessionReplacementIntent | undefined;
+    commitSessionReplacementIntent: (
+      intent: TelegramSessionReplacementIntent,
+      isCurrent: () => boolean,
+    ) => Promise<boolean>;
+    removeSessionReplacementIntent: (
+      intent: TelegramSessionReplacementIntent,
+      isCurrent: () => boolean,
+    ) => Promise<boolean>;
+  };
+  getProfileName: () => string | undefined;
+  ownsPersistence: () => boolean;
+  sendResult: (
+    target: { chatId: number; threadId?: number },
+    html: string,
+  ) => Promise<{ ok: boolean; retryable?: boolean }>;
+  handoffTtlMs: number;
+  now?: () => number;
+  recordRuntimeEvent?: (category: string, error: unknown) => void;
+}
+
+export function createTelegramSessionActionAssembly(
+  deps: TelegramSessionActionAssemblyDeps,
+): {
+  action: TelegramSessionActionRuntime;
+  settlement: { onSessionStart: (ctx: Pi.ExtensionContext) => void };
+} {
+  const now = deps.now ?? Date.now;
+  const report = (error: unknown): void => deps.recordRuntimeEvent?.("new-session", error);
+  const sendTerminalResult = async (
+    target: { chatId: number; threadId?: number },
+    result: "success" | "cancelled" | "failure",
+  ): Promise<void> => {
+    const text = result === "success" ? "<b>🆕 New session started.</b>"
+      : result === "cancelled" ? "<b>🚫 New session cancelled.</b>"
+      : "<b>⚠️ New session failed.</b>";
+    const deadline = now() + 10_000;
+    do {
+      const delivery = await deps.sendResult(target, text);
+      if (delivery.ok) return;
+      if (!delivery.retryable) break;
+      await delayTelegramSessionAction(100);
+    } while (now() < deadline);
+    report(new Error("Telegram new-session result delivery failed."));
+  };
+  const action = createTelegramSessionActionRuntime({
+    registerCommand: deps.registerCommand,
+    sendUserMessage: deps.sendUserMessage,
+    notifyResult(target, result) { return sendTerminalResult(target, result); },
+    async prepareReplacement(ctx, updateId, target) {
+      await deps.store.load();
+      const sessionId = ctx.sessionManager.getSessionId();
+      const binding = typeof target.threadId === "number"
+        ? deps.store.getWorkspaceBindingByTarget(target)
+        : undefined;
+      if (typeof target.threadId === "number" &&
+          (!binding || binding.cwd !== ctx.cwd || binding.sessionId !== sessionId)) {
+        throw new Error("Telegram session replacement binding is unavailable.");
+      }
+      const createdAtMs = now();
+      if (!await deps.store.commitSessionReplacementIntent({
+        continuity: binding ? "workspace-thread" : "classic-chat",
+        cwd: binding?.cwd ?? ctx.cwd,
+        profileName: deps.getProfileName() ?? "default",
+        sourceSessionId: sessionId,
+        sourceUpdateId: updateId,
+        target: binding ? { ...binding.target } : { chatId: target.chatId },
+        messageId: target.messageId,
+        ...(binding?.slot ? { slot: binding.slot } : {}),
+        ...(binding?.manualThreadName ?? binding?.threadName
+          ? { threadName: binding.manualThreadName ?? binding.threadName } : {}),
+        createdAtMs,
+        expiresAtMs: createdAtMs + deps.handoffTtlMs,
+      }, deps.ownsPersistence)) {
+        throw new Error("Telegram session replacement intent was not persisted.");
+      }
+    },
+    recordRuntimeEvent: deps.recordRuntimeEvent,
+  });
+  const settlement = createTelegramSessionReplacementSettlementRuntime<Pi.ExtensionContext>({
+    resolve(ctx) {
+      const sessionId = ctx.sessionManager?.getSessionId?.();
+      if (!sessionId) return undefined;
+      return {
+        async getIntent() { await deps.store.refresh?.(); return deps.store.getSessionReplacementIntent(); },
+        hasSuccessorContinuity(intent) {
+          return intent.continuity === "classic-chat" ||
+            deps.store.getWorkspaceBindingByTarget(intent.target, sessionId)?.cwd === intent.cwd;
+        },
+        editSuccess(intent) { return deps.sendResult(intent.target, "<b>🆕 New session started.</b>"); },
+        clearIntent(intent) { return deps.store.removeSessionReplacementIntent(intent, deps.ownsPersistence); },
+        profileName: deps.getProfileName() ?? "default",
+        cwd: ctx.cwd,
+        sessionId,
+      };
+    },
+    onResult(result) {
+      if (result === "expired" || result === "failed") {
+        report(new Error(`Telegram session replacement successor settlement ${result}.`));
+      }
+    },
+    onError: report,
+  });
+  return { action, settlement };
+}
+
+export interface TelegramSessionActionRuntime {
+  register: () => void;
+  scheduleAfterUpdate: (
+    updateId: number,
+    target: { chatId: number; threadId?: number; messageId: number },
+  ) => boolean;
+  onUpdateCompleted: (updateId: number) => void;
+  hasPending: () => boolean;
+}
+
+export function createTelegramSessionActionRuntime(
+  deps: TelegramSessionActionRuntimeDeps,
+): TelegramSessionActionRuntime {
+  let pendingUpdateId: number | undefined;
+  let pendingTarget: {
+    chatId: number;
+    threadId?: number;
+    messageId: number;
+  } | undefined;
+  let commandPending = false;
+  let commandUpdateId: number | undefined;
+  let registered = false;
+
+  const reportFailure = (error: unknown): void => {
+    try {
+      deps.recordRuntimeEvent?.("new-session", error);
+    } catch {
+      // Diagnostics cannot make a completed durable update retryable.
+    }
+  };
+
+  return {
+    register() {
+      if (registered) return;
+      registered = true;
+      deps.registerCommand(TELEGRAM_SESSION_ACTION_COMMAND_NAME, {
+        description: TELEGRAM_SESSION_ACTION_COMMAND_DESCRIPTION,
+        handler: async (_args, ctx) => {
+          if (!commandPending) return;
+          commandPending = false;
+          const target = pendingTarget;
+          const updateId = commandUpdateId;
+          pendingTarget = undefined;
+          commandUpdateId = undefined;
+          if (!target || updateId === undefined) return;
+          try {
+            await deps.prepareReplacement?.(ctx, updateId, target);
+            const result = await ctx.newSession();
+            if (result.cancelled) await deps.notifyResult(target, "cancelled");
+          } catch (error) {
+            reportFailure(error);
+            await deps.notifyResult(target, "failure");
+          }
+        },
+      });
+    },
+    scheduleAfterUpdate(updateId, target) {
+      if (pendingUpdateId !== undefined || commandPending) return false;
+      pendingUpdateId = updateId;
+      pendingTarget = { ...target };
+      return true;
+    },
+    onUpdateCompleted(updateId) {
+      if (pendingUpdateId !== updateId) return;
+      pendingUpdateId = undefined;
+      commandUpdateId = updateId;
+      commandPending = true;
+      void Promise.resolve()
+        .then(() =>
+          deps.sendUserMessage(`/${TELEGRAM_SESSION_ACTION_COMMAND_NAME}`, {
+            expandPromptTemplates: true,
+          }),
+        )
+        .catch((error) => {
+          commandPending = false;
+          commandUpdateId = undefined;
+          pendingTarget = undefined;
+          reportFailure(error);
+        });
+    },
+    hasPending() {
+      return pendingUpdateId !== undefined || commandPending;
+    },
+  };
 }

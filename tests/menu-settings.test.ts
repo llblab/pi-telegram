@@ -166,6 +166,14 @@ test("Thread display detail follows the setting-card style and marks only the cu
       labels.map((value, index) => `${mode === values[index] ? "🟢 " : ""}${value}`));
     assert.ok(rows.every((row) => row.length === 1));
   }
+  const customText = buildThreadDisplaySettingsText("directory-title", true);
+  assert.ok(customText.startsWith("<b>🧵 Thread display:</b> <code>custom</code>\n"));
+  assert.match(customText, /Set a manual name for the current Thread with \/name <code>Name<\/code>\./u);
+  assert.deepEqual(
+    buildThreadDisplaySettingsReplyMarkup("directory-title", true).inline_keyboard
+      .slice(1).map((row) => row[0].text),
+    labels,
+  );
 });
 
 test("Draft preview settings identify on as the default without changing the current state label", () => {
@@ -197,7 +205,6 @@ test("Settings menu text and reply markup expose built-in controls", () => {
       "settings:open:voice-reply",
       "settings:open:activity-verbosity",
       "settings:open:time-injection",
-      "settings:open:automatic-thread-cleanup",
     ],
   );
   assert.equal(
@@ -211,7 +218,21 @@ test("Settings menu text and reply markup expose built-in controls", () => {
   );
   assert.equal(markup.inline_keyboard[4]?.[0]?.text, "🔬 Activity: quiet");
   assert.equal(markup.inline_keyboard[5]?.[0]?.text, "🕒 Time injection: hidden");
-  assert.equal(markup.inline_keyboard[6]?.[0]?.text, "🧹 Thread cleanup: on");
+  assert.equal(markup.inline_keyboard.length, 6);
+  const customMarkup = buildTelegramSettingsMenuReplyMarkup(
+    false,
+    "rich",
+    "manual",
+    "hidden",
+    undefined,
+    true,
+    true,
+    "quiet",
+    "directory-title",
+    true,
+  );
+  assert.equal(customMarkup.inline_keyboard.at(-2)?.[0]?.text, "🧹 Thread cleanup: on");
+  assert.equal(customMarkup.inline_keyboard.at(-1)?.[0]?.text, "🧵 Thread display: custom");
 });
 
 test("Settings detail markups show active values", () => {

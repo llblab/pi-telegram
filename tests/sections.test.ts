@@ -708,11 +708,10 @@ test("buildTelegramSettingsMenuReplyMarkup injects extension settings rows", asy
       "👄 Voice reply: manual",
       "🔬 Activity: quiet",
       "🕒 Time injection: hidden",
-      "🧹 Thread cleanup: on",
       "🧪 Core (Alpha)",
       "🔧 Core (Beta)",
     ],
   );
+  assert.ok(rows[6][0].callback_data?.startsWith("section:"));
   assert.ok(rows[7][0].callback_data?.startsWith("section:"));
-  assert.ok(rows[8][0].callback_data?.startsWith("section:"));
 });

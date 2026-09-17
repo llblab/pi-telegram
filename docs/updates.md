@@ -150,7 +150,7 @@ This means:
 
 - Extensions can claim callback namespaces that `pi-telegram` would otherwise forward as `[callback] <data>` text.
 - Extensions can observe updates by always returning `"pass"`.
-- Extensions must not consume updates that belong to `pi-telegram`'s own prefixes (`compact:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `settings:`, `section:`) unless they are deliberately replacing that behavior.
+- Extensions must not consume updates that belong to `pi-telegram`'s own prefixes (`compact:`, `new:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `settings:`, `section:`) unless they are deliberately replacing that behavior.
 
 ## Ownership semantics
 

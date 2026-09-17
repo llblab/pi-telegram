@@ -1437,9 +1437,10 @@ test("Routing consumes the exact-target name dialog without agent dispatch", asy
       message: { message_id: 99, message_thread_id: 42,
         chat: { id: 100, type: "private" } },
     } }, { cwd: "/repo" });
+    assert.equal(editedDialogs.includes("<b>✖ Rename cancelled.</b>"), true);
     assert.equal(
-      editedDialogs.some((text) => text.includes("Returning to normal agent mode")),
-      true,
+      editedDialogs.some((text) => /Returning|Starting/u.test(text)),
+      false,
     );
     await routeRuntime.handleUpdate(unboundTopicUpdate("ordinary prompt"), { cwd: "/repo" });
     assert.equal(renamed.includes("ordinary prompt"), false);

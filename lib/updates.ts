@@ -5517,6 +5517,7 @@ export interface TelegramUpdateWorkerOwnerRuntimeDeps<TContext> {
   isContextCurrent: (ctx: TContext) => boolean;
   dispatchNext: (ctx: TContext) => void;
   requestQueueHandoffReconciliation: (ctx: TContext) => void;
+  afterUpdateCompleted?: (updateId: number) => void;
 }
 
 export function createTelegramUpdateWorkerOwnerRuntime<TContext>(
@@ -5536,8 +5537,10 @@ export function createTelegramUpdateWorkerOwnerRuntime<TContext>(
       deps.dispatchNext(ctx);
       deps.requestQueueHandoffReconciliation(ctx);
     },
-    onUpdateCompleted(_updateId, ctx) {
-      if (deps.isContextCurrent(ctx)) deps.dispatchNext(ctx);
+    onUpdateCompleted(updateId, ctx) {
+      if (!deps.isContextCurrent(ctx)) return;
+      deps.dispatchNext(ctx);
+      deps.afterUpdateCompleted?.(updateId);
     },
   };
 }

@@ -32,6 +32,11 @@ import {
   createTelegramCommandOrPromptRuntime,
   createTelegramCommandTargetQueueRuntime,
   createTelegramCommandTargetRuntime,
+  createTelegramSessionActionAssembly,
+  createTelegramSessionActionRuntime,
+  settleTelegramSessionReplacement,
+  TELEGRAM_SESSION_ACTION_COMMAND_NAME,
+  type TelegramSessionActionRuntimeDeps,
   executeTelegramCommandAction,
   getTelegramCommandExecutionMode,
   getTelegramCommandMessageTarget,
@@ -41,6 +46,9 @@ import {
   handleTelegramCompactCommand,
   handleTelegramCompactConfirmationCallback,
   handleTelegramModelCommand,
+  handleTelegramNewCommand,
+  handleTelegramNewConfirmationCallback,
+  openTelegramNewConfirmation,
   handleTelegramNextCommand,
   handleTelegramStatusCommand,
   handleTelegramStopCommand,
@@ -56,6 +64,7 @@ import {
   TELEGRAM_RESERVED_COMMAND_NAMES,
 } from "../lib/commands.ts";
 import { runTelegramPollLoop } from "../lib/polling.ts";
+import { createTelegramTopicTargetStore } from "../lib/threads.ts";
 import { createTelegramPollingStartRecoveryHandler } from "../lib/recovery.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "../lib/pi.ts";
 
@@ -128,6 +137,7 @@ test("Command helpers expose Telegram bot command definitions", () => {
     "<code>/telegram-connect &lt;profile&gt;</code>",
   );
   for (const command of [
+    "new",
     "start",
     "compact",
     "next",
@@ -146,18 +156,15 @@ test("Command helpers expose Telegram bot command definitions", () => {
       command: "start",
       description: "🟢 Open menu / Pair bridge",
     },
-    {
-      command: "name",
-      description: "🏷️ Rename this thread",
-    },
     { command: "compact", description: "🗜 Compact current session" },
-    {
-      command: "next",
-      description: "⏩ Force next turn",
-    },
+    { command: "new", description: "🆕 Start a new session" },
     {
       command: "continue",
       description: "▶️ Queue continue prompt",
+    },
+    {
+      command: "next",
+      description: "⏩ Force next turn",
     },
     {
       command: "abort",
@@ -212,7 +219,7 @@ test("Command helpers coalesce concurrent bot command sync", async () => {
 test("Command helpers keep extension Telegram bot commands hidden by default", async () => {
   clearTelegramExtensionCommands();
   const dispose = registerTelegramCommand({
-    name: "new",
+    name: "fresh",
     description: "Start fresh",
     handler: async () => {},
   });
@@ -230,7 +237,7 @@ test("Command helpers keep extension Telegram bot commands hidden by default", a
 test("Command helpers register extension Telegram bot commands when visible", async () => {
   clearTelegramExtensionCommands();
   const dispose = registerTelegramCommand({
-    name: "new",
+    name: "fresh",
     description: "Start fresh",
     showInMenu: true,
     emoji: "🆕",
@@ -244,9 +251,9 @@ test("Command helpers register extension Telegram bot commands when visible", as
   });
   assert.deepEqual(calls, [
     [
-      ...TELEGRAM_BOT_COMMANDS.slice(0, 3),
-      { command: "new", description: "🆕 Start fresh" },
-      ...TELEGRAM_BOT_COMMANDS.slice(3),
+      ...TELEGRAM_BOT_COMMANDS.slice(0, 5),
+      { command: "fresh", description: "🆕 Start fresh" },
+      ...TELEGRAM_BOT_COMMANDS.slice(5),
     ],
   ]);
   dispose();
@@ -258,7 +265,7 @@ test("Command helpers reject visible extension commands without emoji", () => {
   assert.throws(
     () =>
       registerTelegramCommand({
-        name: "new",
+        name: "fresh",
         showInMenu: true,
         handler: () => {},
       }),
@@ -283,16 +290,16 @@ test("Command helpers reject invalid and built-in extension command names", () =
 test("Command helpers register disposable extension commands", () => {
   clearTelegramExtensionCommands();
   const dispose = registerTelegramCommand({
-    name: "/new",
+    name: "/fresh",
     handler: () => {},
   });
-  assert.equal(findTelegramExtensionCommand("new")?.name, "new");
+  assert.equal(findTelegramExtensionCommand("fresh")?.name, "fresh");
   assert.throws(
-    () => registerTelegramCommand({ name: "new", handler: () => {} }),
+    () => registerTelegramCommand({ name: "fresh", handler: () => {} }),
     /already registered/,
   );
   dispose();
-  assert.equal(findTelegramExtensionCommand("new"), undefined);
+  assert.equal(findTelegramExtensionCommand("fresh"), undefined);
   clearTelegramExtensionCommands();
 });
 
@@ -1405,6 +1412,57 @@ test("Command helpers guard and complete compact command flow", async () => {
   ]);
 });
 
+test("Command helpers confirm new sessions before requesting replacement", async () => {
+  const events: string[] = [];
+  await openTelegramNewConfirmation(
+    { chatId: 42, threadId: 123, replyToMessageId: 99 },
+    {
+      sendInteractiveMessage: async (chatId, text, mode, markup, options) => {
+        events.push(`${chatId}:${mode}:${text}`);
+        events.push(JSON.stringify(markup.inline_keyboard));
+        events.push(JSON.stringify(options));
+        return 77;
+      },
+    },
+  );
+  assert.deepEqual(events, [
+    "42:html:<b>Start a new session?</b>",
+    '[[{"text":"🆕 Yes, start new","callback_data":"new:confirm"},{"text":"❌ No","callback_data":"new:cancel"}]]',
+    '{"target":{"chatId":42,"threadId":123}}',
+  ]);
+  events.length = 0;
+  assert.equal(await handleTelegramNewConfirmationCallback(
+    { id: "cancel", data: "new:cancel", message: { chat: { id: 42 }, message_id: 77 } },
+    {
+      ctx: {},
+      answerCallbackQuery: async (id) => { events.push(`answer:${id}`); },
+      editInteractiveMessage: async (_chatId, _messageId, text, _mode, markup) => {
+        events.push(text);
+        events.push(JSON.stringify(markup.inline_keyboard));
+      },
+      deleteMessage: async () => { events.push("unexpected:delete"); },
+      runNew: async () => { events.push("unexpected:run"); },
+    },
+  ), true);
+  assert.deepEqual(events, ["<b>🚫 New session cancelled.</b>", "[]", "answer:cancel"]);
+  events.length = 0;
+  assert.equal(await handleTelegramNewConfirmationCallback(
+    { id: "confirm", data: "new:confirm", message: { chat: { id: 42 }, message_id: 77 } },
+    {
+      ctx: { id: "ctx" },
+      answerCallbackQuery: async (id) => { events.push(`answer:${id}`); },
+      editInteractiveMessage: async (_chatId, _messageId, text) => { events.push(text); },
+      deleteMessage: async (chatId, messageId) => { events.push(`delete:${chatId}:${messageId}`); },
+      runNew: async (ctx) => { events.push(`run:${(ctx as { id: string }).id}`); },
+    },
+  ), true);
+  assert.deepEqual(events, [
+    "answer:confirm",
+    "delete:42:77",
+    "run:ctx",
+  ]);
+});
+
 test("Command helpers open compact confirmation and handle callbacks", async () => {
   const events: string[] = [];
   const message = { chat: { id: 42 }, message_id: 99, message_thread_id: 123 };
@@ -1710,7 +1768,7 @@ test("Command helpers build the unified app menu from commands and status", () =
     `${TELEGRAM_APP_MENU_INTRO_HTML}\n\n🧩 /review\n\n<b>Status:</b> <code>idle</code>`,
   );
   const dispose = registerTelegramCommand({
-    name: "new",
+    name: "fresh",
     description: "Start fresh",
     showInMenu: true,
     emoji: "🆕",
@@ -1718,7 +1776,7 @@ test("Command helpers build the unified app menu from commands and status", () =
   });
   const menuWithExtensionCommand = TELEGRAM_APP_MENU_INTRO_HTML.replace(
     "⏩ /next — Force next turn",
-    "🆕 /new — Start fresh\n⏩ /next — Force next turn",
+    "⏩ /next — Force next turn\n🆕 /fresh — Start fresh",
   );
   assert.equal(
     buildTelegramAppMenuHtml("<b>Status:</b> <code>idle</code>"),
@@ -1771,6 +1829,9 @@ test("Command handler target runtime binds command targets into command handling
       calls.push(`continue:${ctx}`);
     },
     compact: () => {},
+    requestNewSession: () => {
+      calls.push("new-session");
+    },
     allocateItemOrder: () => 0,
     allocateControlOrder: () => 0,
     appendControlItem: (item, ctx) => {
@@ -1845,6 +1906,10 @@ test("Command handler target runtime binds command targets into command handling
     ),
     true,
   );
+  assert.equal(
+    await handleCommand("new", { chat: { id: 7 }, message_id: 15 }, "ctx"),
+    true,
+  );
   assert.deepEqual(calls, [
     "show:ctx",
     "rename:Navigator",
@@ -1853,6 +1918,7 @@ test("Command handler target runtime binds command targets into command handling
     "reply:<b>✅ Automatic Thread display name restored as <i>A</i>.</b>",
     "name-dialog",
     "show:ctx",
+    "new-session",
   ]);
 });
 
@@ -2298,6 +2364,9 @@ test("Command helpers execute command actions through provided handlers", async 
     handleQueue: async () => {
       events.push("queue");
     },
+    handleNew: async () => {
+      events.push("new");
+    },
   };
   assert.equal(
     await executeTelegramCommandAction(
@@ -2329,6 +2398,15 @@ test("Command helpers execute command actions through provided handlers", async 
   );
   assert.equal(
     await executeTelegramCommandAction(
+      { kind: "new", executionMode: "immediate" },
+      {},
+      {},
+      deps,
+    ),
+    true,
+  );
+  assert.equal(
+    await executeTelegramCommandAction(
       { kind: "help", commandName: "start", executionMode: "immediate" },
       {},
       {},
@@ -2336,5 +2414,318 @@ test("Command helpers execute command actions through provided handlers", async 
     ),
     true,
   );
-  assert.deepEqual(events, ["stop", "name:Navigator", "help:start"]);
+  assert.deepEqual(events, ["stop", "name:Navigator", "new", "help:start"]);
+});
+
+function createNewSessionCommandDeps(
+  overrides: Partial<Parameters<typeof handleTelegramNewCommand>[0]> = {},
+) {
+  const replies: string[] = [];
+  const runtimeEvents: unknown[] = [];
+  let requests = 0;
+  const deps = {
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    hasActiveTelegramTurn: () => false,
+    hasDispatchPending: () => false,
+    hasQueuedTelegramItems: () => false,
+    isCompactionInProgress: () => false,
+    requestNewSession: () => {
+      requests += 1;
+    },
+    sendTextReply: async (text: string) => {
+      replies.push(text);
+    },
+    recordRuntimeEvent: (_category: string, error: unknown) => {
+      runtimeEvents.push(error);
+    },
+    ...overrides,
+  };
+  return { deps, replies, runtimeEvents, get requests() { return requests; } };
+}
+
+test("New session command gates on busy state and schedules without a false result notice", async () => {
+  const busy = createNewSessionCommandDeps({ isIdle: () => false });
+  await handleTelegramNewCommand(busy.deps);
+  assert.equal(busy.replies.length, 1);
+  assert.match(busy.replies[0]!, /⏳/);
+  assert.match(busy.replies[0]!, /Cannot start a new session while Pi or the Telegram queue is busy\./);
+
+  const unavailable = createNewSessionCommandDeps({
+    requestNewSession: undefined,
+  });
+  await handleTelegramNewCommand(unavailable.deps);
+  assert.equal(unavailable.replies.length, 1);
+  assert.match(unavailable.replies[0]!, /🚫/);
+
+  const started = createNewSessionCommandDeps();
+  await handleTelegramNewCommand(started.deps);
+  assert.deepEqual(started.replies, []);
+  assert.equal(started.requests, 1);
+  assert.deepEqual(started.runtimeEvents, []);
+});
+type RegisteredCommand = {
+  description?: string;
+  handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+};
+
+function createRuntimeHarness() {
+  const commands = new Map<string, RegisteredCommand>();
+  const dispatched: string[] = [];
+  const failures: unknown[] = [];
+  const results: string[] = [];
+  const prepared: number[] = [];
+  const api = {
+    registerCommand: (name: string, definition: RegisteredCommand) => {
+      commands.set(name, definition);
+    },
+    sendUserMessage: async (content: string) => {
+      dispatched.push(content);
+    },
+    notifyResult: async (_target: unknown, result: string) => {
+      results.push(result);
+    },
+    prepareReplacement: async (_ctx: unknown, updateId: number) => {
+      prepared.push(updateId);
+    },
+    recordRuntimeEvent: (_category: string, error: unknown) => {
+      failures.push(error);
+    },
+  } as unknown as TelegramSessionActionRuntimeDeps;
+  const runtime = createTelegramSessionActionRuntime(api);
+  runtime.register();
+  return { commands, dispatched, failures, prepared, results, runtime };
+}
+
+function createCommandContext(
+  newSession: (options?: { withSession?: () => Promise<void> }) => Promise<{ cancelled: boolean }>,
+): ExtensionCommandContext {
+  return { newSession } as unknown as ExtensionCommandContext;
+}
+
+const target = { chatId: 7, threadId: 8, messageId: 9 };
+
+test("Successor settlement claims once before retrying terminal delivery", async () => {
+  const intent = { continuity: "workspace-thread" as const,
+    cwd: "/repo", profileName: "default", sourceSessionId: "old",
+    sourceUpdateId: 1, target: { chatId: 7, threadId: 8 }, messageId: 9,
+    createdAtMs: 1000, expiresAtMs: 2000 };
+  let reads = 0;
+  let edits = 0;
+  let clears = 0;
+  const result = await settleTelegramSessionReplacement({
+    getIntent: async () => { reads += 1; return intent; },
+    hasSuccessorContinuity: () => reads > 1,
+    editSuccess: async () => { edits += 1; return edits === 1
+      ? { ok: false, retryable: true } : { ok: true }; },
+    clearIntent: async () => { clears += 1; return true; },
+    profileName: "default", cwd: "/repo", sessionId: "new", now: () => 1000,
+    sleep: async () => {},
+  });
+  assert.equal(result, "settled");
+  assert.equal(edits, 2);
+  assert.equal(clears, 1);
+  assert.equal(await settleTelegramSessionReplacement({
+    getIntent: async () => undefined, hasSuccessorContinuity: () => false,
+    editSuccess: async () => ({ ok: true }), clearIntent: async () => true,
+    profileName: "default", cwd: "/repo", sessionId: "new",
+  }), "none");
+});
+
+test("Successor settlement rejects mismatches, expiry, and lost cleanup acknowledgement", async () => {
+  const intent = { continuity: "workspace-thread" as const,
+    cwd: "/repo", profileName: "default", sourceSessionId: "old",
+    sourceUpdateId: 1, target: { chatId: 7, threadId: 8 }, messageId: 9,
+    createdAtMs: 1000, expiresAtMs: 2000 };
+  const base = { getIntent: async () => intent, hasSuccessorContinuity: () => true,
+    editSuccess: async () => ({ ok: true }), clearIntent: async () => true,
+    profileName: "default", cwd: "/repo", sessionId: "new", now: () => 1000 };
+  assert.equal(await settleTelegramSessionReplacement({ ...base, cwd: "/other" }), "stale");
+  assert.equal(await settleTelegramSessionReplacement({ ...base, now: () => 2000 }), "expired");
+  let deliveredWithoutClaim = false;
+  assert.equal(await settleTelegramSessionReplacement({ ...base,
+    editSuccess: async () => { deliveredWithoutClaim = true; return { ok: true }; },
+    clearIntent: async () => false }), "failed");
+  assert.equal(deliveredWithoutClaim, false);
+});
+
+test("Classic session action publishes chat continuity without a Workspace binding", async () => {
+  const commands = new Map<string, RegisteredCommand>();
+  const intents: unknown[] = [];
+  let workspaceLookups = 0;
+  const assembly = createTelegramSessionActionAssembly({
+    registerCommand: (name, definition) => { commands.set(name, definition as RegisteredCommand); },
+    sendUserMessage: async () => {},
+    store: {
+      load: async () => {}, refresh: async () => {},
+      getWorkspaceBindingByTarget: () => { workspaceLookups += 1; return undefined; },
+      getSessionReplacementIntent: () => undefined,
+      commitSessionReplacementIntent: async (intent) => { intents.push(intent); return true; },
+      removeSessionReplacementIntent: async () => true,
+    },
+    getProfileName: () => undefined,
+    ownsPersistence: () => true,
+    sendResult: async () => ({ ok: true }),
+    handoffTtlMs: 30_000,
+    now: () => 1000,
+  });
+  assembly.action.register();
+  assert.equal(assembly.action.scheduleAfterUpdate(41, { chatId: 7, messageId: 9 }), true);
+  assembly.action.onUpdateCompleted(41);
+  await Promise.resolve();
+  await commands.get(TELEGRAM_SESSION_ACTION_COMMAND_NAME)!.handler("", {
+    cwd: "/repo",
+    sessionManager: { getSessionId: () => "session-old" },
+    newSession: async () => ({ cancelled: false }),
+  } as unknown as ExtensionCommandContext);
+  assert.equal(workspaceLookups, 0);
+  assert.deepEqual(intents, [{
+    continuity: "classic-chat", cwd: "/repo", profileName: "default",
+    sourceSessionId: "session-old", sourceUpdateId: 41,
+    target: { chatId: 7 }, messageId: 9, createdAtMs: 1000, expiresAtMs: 31_000,
+  }]);
+});
+
+test("Classic successor settles once across same-process and process-replacement startup", async () => {
+  for (const replaceProcess of [false, true]) {
+    const dir = mkdtempSync(join(tmpdir(), "pi-telegram-classic-new-"));
+    const path = join(dir, "targets.json");
+    try {
+      const sourceStore = createTelegramTopicTargetStore({ path, getNowMs: () => 1000 });
+      const commands = new Map<string, RegisteredCommand>();
+      const source = createTelegramSessionActionAssembly({
+        registerCommand: (name, definition) => { commands.set(name, definition as RegisteredCommand); },
+        sendUserMessage: async () => {}, store: sourceStore,
+        getProfileName: () => undefined, ownsPersistence: () => true,
+        sendResult: async () => { throw new Error("source must not publish success"); },
+        handoffTtlMs: 30_000, now: () => 1000,
+      });
+      source.action.register();
+      source.action.scheduleAfterUpdate(41, { chatId: 7, messageId: 9 });
+      source.action.onUpdateCompleted(41);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await commands.get(TELEGRAM_SESSION_ACTION_COMMAND_NAME)!.handler("", {
+        cwd: "/repo", sessionManager: { getSessionId: () => "session-old" },
+        newSession: async () => ({ cancelled: false }),
+      } as unknown as ExtensionCommandContext);
+      assert.equal(sourceStore.getSessionReplacementIntent()?.continuity, "classic-chat");
+
+      const successorStore = replaceProcess
+        ? createTelegramTopicTargetStore({ path, getNowMs: () => 2000 })
+        : sourceStore;
+      const deliveries: Array<{ target: unknown; html: string }> = [];
+      let delivered!: () => void;
+      const delivery = new Promise<void>((resolve) => { delivered = resolve; });
+      const settle = () => settleTelegramSessionReplacement({
+        async getIntent() {
+          await successorStore.refresh?.();
+          return successorStore.getSessionReplacementIntent();
+        },
+        hasSuccessorContinuity: (intent) => intent.continuity === "classic-chat",
+        editSuccess: async (intent) => {
+          deliveries.push({ target: intent.target,
+            html: "<b>🆕 New session started.</b>" });
+          delivered();
+          return { ok: true };
+        },
+        clearIntent: (intent) => successorStore.removeSessionReplacementIntent(
+          intent, () => true,
+        ),
+        profileName: "default", cwd: "/repo", sessionId: "session-new",
+        now: () => 2000, sleep: async () => {},
+      });
+      assert.equal(await settle(), "settled");
+      await delivery;
+      assert.deepEqual(deliveries, [{
+        target: { chatId: 7 }, html: "<b>🆕 New session started.</b>",
+      }]);
+      await successorStore.refresh?.();
+      assert.equal(successorStore.getSessionReplacementIntent(), undefined);
+      assert.equal(await settle(), "none");
+      assert.equal(deliveries.length, 1);
+      assert.deepEqual(successorStore.listWorkspaceBindings(), []);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test("Session action dispatch waits for the exact durable update completion", async () => {
+  const harness = createRuntimeHarness();
+  assert.equal(harness.runtime.scheduleAfterUpdate(41, target), true);
+  harness.runtime.onUpdateCompleted(40);
+  await Promise.resolve();
+  assert.deepEqual(harness.dispatched, []);
+  harness.runtime.onUpdateCompleted(41);
+  await Promise.resolve();
+  assert.deepEqual(harness.dispatched, [`/${TELEGRAM_SESSION_ACTION_COMMAND_NAME}`]);
+});
+
+test("Session action leaves terminal success exclusively to successor settlement", async () => {
+  const harness = createRuntimeHarness();
+  assert.equal(harness.runtime.scheduleAfterUpdate(7, target), true);
+  assert.equal(harness.runtime.scheduleAfterUpdate(8, target), false);
+  harness.runtime.onUpdateCompleted(7);
+  await Promise.resolve();
+  assert.equal(harness.runtime.hasPending(), true);
+  let calls = 0;
+  const command = harness.commands.get(TELEGRAM_SESSION_ACTION_COMMAND_NAME);
+  assert.ok(command);
+  await command.handler("", createCommandContext(async (options) => {
+    calls += 1;
+    assert.equal(options, undefined);
+    return { cancelled: false };
+  }));
+  await command.handler("", createCommandContext(async () => {
+    calls += 1;
+    return { cancelled: false };
+  }));
+  assert.equal(calls, 1);
+  assert.deepEqual(harness.prepared, [7]);
+  assert.deepEqual(harness.results, []);
+  assert.equal(harness.runtime.hasPending(), false);
+});
+
+test("Session action does not replace before durable preparation succeeds", async () => {
+  const harness = createRuntimeHarness();
+  harness.runtime.scheduleAfterUpdate(8, target);
+  harness.runtime.onUpdateCompleted(8);
+  await Promise.resolve();
+  let replacements = 0;
+  const command = harness.commands.get(TELEGRAM_SESSION_ACTION_COMMAND_NAME)!;
+  const original = (harness as unknown as { prepared: number[] }).prepared;
+  original.splice(0);
+  // The injected preparation failure is represented through a dedicated runtime.
+  const failing = createTelegramSessionActionRuntime({
+    registerCommand: (_name, definition) => harness.commands.set("failing", definition as RegisteredCommand),
+    sendUserMessage: async () => {},
+    prepareReplacement: async () => { throw new Error("persist failed"); },
+    notifyResult: async (_target, result) => { harness.results.push(result); },
+    recordRuntimeEvent: (_category, error) => { harness.failures.push(error); },
+  } as TelegramSessionActionRuntimeDeps);
+  failing.register();
+  failing.scheduleAfterUpdate(18, target);
+  failing.onUpdateCompleted(18);
+  await Promise.resolve();
+  await harness.commands.get("failing")!.handler("", createCommandContext(async () => {
+    replacements += 1;
+    return { cancelled: false };
+  }));
+  assert.equal(replacements, 0);
+  assert.equal(harness.results.at(-1), "failure");
+  assert.match(String(harness.failures.at(-1)), /persist failed/);
+  assert.ok(command);
+});
+
+test("Session action contains failures and emits a terminal failure result", async () => {
+  const harness = createRuntimeHarness();
+  harness.runtime.scheduleAfterUpdate(9, target);
+  harness.runtime.onUpdateCompleted(9);
+  await Promise.resolve();
+  const command = harness.commands.get(TELEGRAM_SESSION_ACTION_COMMAND_NAME);
+  await command!.handler("", createCommandContext(async () => {
+    throw new Error("replacement failed");
+  }));
+  assert.deepEqual(harness.results, ["failure"]);
+  assert.equal(harness.failures.length, 1);
+  assert.match(String(harness.failures[0]), /replacement failed/);
+  assert.equal(harness.runtime.hasPending(), false);
 });

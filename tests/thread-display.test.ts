@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createTelegramThreadDisplayReconciler,
+  createTelegramThreadDisplaySettingsRuntime,
   resolveTelegramInitialWorkspaceDisplayName,
   resolveTelegramWorkspaceDisplayNames,
   tokenizeTelegramDirectorySegment,
@@ -272,4 +273,20 @@ test("Concurrent reconciliation is serialized and uses the committed title", asy
   release();
   assert.deepEqual(await Promise.all([first, second]), [{ changed: 1 }, { changed: 0 }]);
   assert.deepEqual(fixture.state.calls, ["A"]);
+});
+
+test("Thread display settings owner clears a retained manual override after mode application", async () => {
+  const target = { chatId: 7, threadId: 42 };
+  const calls: string[] = [];
+  let manualThreadName: string | undefined = "Custom";
+  const runtime = createTelegramThreadDisplaySettingsRuntime({
+    getTarget: () => target,
+    getBinding: () => ({ manualThreadName }),
+    apply: async (mode) => { calls.push(`apply:${mode}`); },
+    reset: async () => { calls.push("reset"); manualThreadName = undefined; return { ok: true }; },
+  });
+  assert.equal(runtime.isCustom(), true);
+  await runtime.setMode("names");
+  assert.deepEqual(calls, ["apply:names", "reset"]);
+  assert.equal(runtime.isCustom(), false);
 });

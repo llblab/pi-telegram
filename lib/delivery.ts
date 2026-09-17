@@ -878,6 +878,21 @@ export async function sendTelegramView(
   return runDeliveryOperation((runtime) => runtime.sendView(view, options));
 }
 
+/** @internal Edit an exact Telegram message through the currently bound runtime generation. */
+export async function editTelegramTargetView(
+  target: TelegramDeliveryTarget,
+  messageId: number,
+  view: TelegramDeliveryView,
+): Promise<TelegramDeliveryResult<TelegramDeliveryHandle>> {
+  const invalid = validateView<TelegramDeliveryHandle>(view);
+  if (invalid) return invalid;
+  return runDeliveryOperation((runtime) => runtime.editView({
+    target: { ...target },
+    messageIds: [messageId],
+    generation: runtime.generation,
+  }, view));
+}
+
 export async function editTelegramView(
   handle: TelegramDeliveryHandle,
   view: TelegramDeliveryView,

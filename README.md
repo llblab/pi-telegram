@@ -164,6 +164,7 @@ Use these in the bot DM.
 | --- | --- |
 | `/start` | Pair when needed and open the main operator menu |
 | `/name [Name]` | Set a manual Thread title immediately, or open rename/reset controls when Name is omitted |
+| `/new` | Start a new Pi session in the current classic chat or Thread after confirming the bridge is idle |
 | `/compact` | Confirm and run session compaction when safe |
 | `/next` | Dispatch the next queued turn, aborting first if needed |
 | `/continue` | Enqueue a priority continuation prompt |

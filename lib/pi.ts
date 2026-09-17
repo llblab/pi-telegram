@@ -138,6 +138,7 @@ export interface PiExtensionApiRuntimePorts {
   getActiveTools: ExtensionAPI["getActiveTools"];
   setActiveTools: ExtensionAPI["setActiveTools"];
   setModel: ExtensionAPI["setModel"];
+  registerCommand: ExtensionAPI["registerCommand"];
 }
 
 export function createExtensionApiRuntimePorts(
@@ -151,6 +152,7 @@ export function createExtensionApiRuntimePorts(
     | "getActiveTools"
     | "setActiveTools"
     | "setModel"
+    | "registerCommand"
   >,
 ): PiExtensionApiRuntimePorts {
   return {
@@ -163,6 +165,7 @@ export function createExtensionApiRuntimePorts(
     getActiveTools: () => api.getActiveTools(),
     setActiveTools: (names) => api.setActiveTools(names),
     setModel: (model) => api.setModel(model),
+    registerCommand: (name, options) => api.registerCommand(name, options),
   };
 }
 

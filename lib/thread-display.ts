@@ -239,6 +239,36 @@ export interface TelegramThreadDisplayReconcilerDeps {
   ): Promise<TResponse>;
 }
 
+export function createTelegramThreadDisplaySettingsRuntime(deps: {
+  getTarget(): { chatId: number; threadId?: number } | undefined;
+  getBinding(target: { chatId: number; threadId?: number }):
+    { manualThreadName?: string } | undefined;
+  apply(mode: TelegramThreadDisplayMode): Promise<void>;
+  reset(target: { chatId: number; threadId?: number }):
+    Promise<{ ok: boolean; message?: string }>;
+}): {
+  isCustom(): boolean;
+  setMode(mode: TelegramThreadDisplayMode): Promise<void>;
+} {
+  return {
+    isCustom() {
+      const target = deps.getTarget();
+      return !!target && typeof deps.getBinding(target)?.manualThreadName === "string";
+    },
+    async setMode(mode) {
+      const target = deps.getTarget();
+      const hadManualName = !!target &&
+        typeof deps.getBinding(target)?.manualThreadName === "string";
+      await deps.apply(mode);
+      if (!hadManualName || !target) return;
+      const reset = await deps.reset(target);
+      if (!reset.ok) {
+        throw new Error(reset.message ?? "Telegram Thread display override reset failed.");
+      }
+    },
+  };
+}
+
 /** Caller owns triggering and reporting; no timer or background retry is created. */
 export function createTelegramThreadDisplayReconciler(
   deps: TelegramThreadDisplayReconcilerDeps,

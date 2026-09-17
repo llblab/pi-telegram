@@ -358,6 +358,20 @@ export interface TelegramBotStateSnapshot {
   lastReconcileAction?: string;
 }
 
+export interface TelegramSessionReplacementIntent {
+  continuity: "workspace-thread" | "classic-chat";
+  cwd: string;
+  profileName: string;
+  sourceSessionId: string;
+  sourceUpdateId: number;
+  target: TelegramTarget;
+  messageId: number;
+  slot?: string;
+  threadName?: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+}
+
 export interface TelegramTopicTargetFile {
   version: 1;
   source: "snapshot";
@@ -370,6 +384,7 @@ export interface TelegramTopicTargetFile {
   identities?: TelegramThreadIdentityRecord[];
   workspaceBindings?: TelegramWorkspaceThreadBinding[];
   workspaceRetirements?: TelegramWorkspaceRetirementIntent[];
+  sessionReplacement?: TelegramSessionReplacementIntent;
   reservations?: TelegramThreadReservation[];
   pendingProvisions?: TelegramThreadPendingProvision[];
   pendingCleanups?: TelegramThreadCleanupIntent[];
@@ -478,6 +493,19 @@ export interface TelegramTopicTargetStore {
   ) => TelegramThreadIdentityRecord | undefined;
   forgetIdentityByProfileKey: (profileKey: string) => boolean;
   listWorkspaceBindings: () => TelegramWorkspaceThreadBinding[];
+  getWorkspaceBindingByTarget: (
+    target: TelegramTarget,
+    sessionId?: string,
+  ) => TelegramWorkspaceThreadBinding | undefined;
+  getSessionReplacementIntent: () => TelegramSessionReplacementIntent | undefined;
+  commitSessionReplacementIntent: (
+    intent: TelegramSessionReplacementIntent,
+    isCurrent: () => boolean,
+  ) => Promise<boolean>;
+  removeSessionReplacementIntent: (
+    expected: TelegramSessionReplacementIntent,
+    isCurrent: () => boolean,
+  ) => Promise<boolean>;
   listWorkspaceRetirementIntents: () => TelegramWorkspaceRetirementIntent[];
   commitWorkspaceJournalEvidence: (
     expected: TelegramWorkspaceThreadBinding,
@@ -1289,6 +1317,56 @@ function cloneWorkspaceBinding(
   return { ...binding, target: { ...binding.target } };
 }
 
+function cloneSessionReplacementIntent(
+  intent: TelegramSessionReplacementIntent,
+): TelegramSessionReplacementIntent {
+  return { ...intent, target: { ...intent.target } };
+}
+
+function normalizeSessionReplacementIntent(
+  value: unknown,
+): TelegramSessionReplacementIntent | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const target = record.target as Record<string, unknown> | undefined;
+  if (
+    typeof record.cwd !== "string" || !normalizeTelegramWorkspacePath(record.cwd) ||
+    typeof record.profileName !== "string" || !record.profileName ||
+    typeof record.sourceSessionId !== "string" || !normalizeTelegramSessionId(record.sourceSessionId) ||
+    typeof record.sourceUpdateId !== "number" || !Number.isSafeInteger(record.sourceUpdateId) ||
+    !target || typeof target.chatId !== "number" ||
+    (target.threadId !== undefined &&
+      (typeof target.threadId !== "number" || !Number.isSafeInteger(target.threadId))) ||
+    typeof record.messageId !== "number" || !Number.isSafeInteger(record.messageId) ||
+    typeof record.createdAtMs !== "number" || !Number.isSafeInteger(record.createdAtMs) ||
+    typeof record.expiresAtMs !== "number" || !Number.isSafeInteger(record.expiresAtMs) ||
+    record.expiresAtMs <= record.createdAtMs
+  ) return undefined;
+  const continuity = record.continuity === "workspace-thread" ||
+      record.continuity === "classic-chat"
+    ? record.continuity
+    : target.threadId !== undefined ? "workspace-thread" : "classic-chat";
+  if ((continuity === "workspace-thread") !== (target.threadId !== undefined)) {
+    return undefined;
+  }
+  return {
+    continuity,
+    cwd: normalizeTelegramWorkspacePath(record.cwd)!,
+    profileName: record.profileName,
+    sourceSessionId: normalizeTelegramSessionId(record.sourceSessionId)!,
+    sourceUpdateId: record.sourceUpdateId,
+    target: {
+      chatId: target.chatId,
+      ...(typeof target.threadId === "number" ? { threadId: target.threadId } : {}),
+    },
+    messageId: record.messageId,
+    ...(typeof record.slot === "string" ? { slot: record.slot } : {}),
+    ...(typeof record.threadName === "string" ? { threadName: record.threadName } : {}),
+    createdAtMs: record.createdAtMs,
+    expiresAtMs: record.expiresAtMs,
+  };
+}
+
 function normalizeWorkspaceRetirementIntent(
   value: unknown,
 ): TelegramWorkspaceRetirementIntent | undefined {
@@ -1596,6 +1674,7 @@ function parseTopicTargetFile(value: unknown): TelegramTopicTargetFile {
           return normalized ? [normalized] : [];
         })
       : [],
+    sessionReplacement: normalizeSessionReplacementIntent(file.sessionReplacement),
     reservations: Array.isArray(file.reservations)
       ? file.reservations.flatMap((reservation) => {
           const normalized = normalizeReservation(reservation);
@@ -1740,6 +1819,7 @@ export function createTelegramTopicTargetStore(
   let identities = new Map<string, TelegramThreadIdentityRecord>();
   let workspaceBindings = new Map<string, TelegramWorkspaceThreadBinding>();
   let workspaceRetirements: TelegramWorkspaceRetirementIntent[] = [];
+  let sessionReplacement: TelegramSessionReplacementIntent | undefined;
   let workspaceRetirementCommitInFlight = false;
   const hasWorkspaceRetirementConflict = (input: {
     bindingKey?: string;
@@ -1906,6 +1986,7 @@ export function createTelegramTopicTargetStore(
     identities = new Map();
     workspaceBindings = new Map();
     workspaceRetirements = [];
+    sessionReplacement = undefined;
     workspaceRetirementCommitInFlight = false;
     workspaceClaims = new Map();
     reservations = [];
@@ -1928,6 +2009,7 @@ export function createTelegramTopicTargetStore(
       identities = new Map();
       workspaceBindings = new Map();
       workspaceRetirements = [];
+      sessionReplacement = undefined;
       workspaceRetirementCommitInFlight = false;
       reservations = [];
       pendingProvisions = [];
@@ -1976,6 +2058,9 @@ export function createTelegramTopicTargetStore(
     workspaceRetirements = (file.workspaceRetirements ?? []).map(
       cloneWorkspaceRetirementIntent,
     );
+    sessionReplacement = file.sessionReplacement
+      ? cloneSessionReplacementIntent(file.sessionReplacement)
+      : undefined;
     reconcileWorkspaceSuffixExposure();
     for (const record of records.values()) rememberIdentity(record);
     const nowMs = getNowMs();
@@ -2070,6 +2155,9 @@ export function createTelegramTopicTargetStore(
           workspaceRetirements: workspaceRetirements.map(
             cloneWorkspaceRetirementIntent,
           ),
+          ...(sessionReplacement
+            ? { sessionReplacement: cloneSessionReplacementIntent(sessionReplacement) }
+            : {}),
           reservations: reservations.map((reservation) => ({ ...reservation })),
           pendingProvisions: pendingProvisions.map((provision) => ({
             ...provision,
@@ -2365,6 +2453,38 @@ export function createTelegramTopicTargetStore(
     },
     listWorkspaceBindings() {
       return Array.from(workspaceBindings.values()).map(cloneWorkspaceBinding);
+    },
+    getWorkspaceBindingByTarget(target, sessionId) {
+      const binding = Array.from(workspaceBindings.values()).find((candidate) =>
+        targetMatches(candidate.target, target) &&
+        (sessionId === undefined || candidate.sessionId === sessionId)
+      );
+      return binding ? cloneWorkspaceBinding(binding) : undefined;
+    },
+    getSessionReplacementIntent() {
+      return sessionReplacement
+        ? cloneSessionReplacementIntent(sessionReplacement)
+        : undefined;
+    },
+    async commitSessionReplacementIntent(intent, isCurrent) {
+      const next = normalizeSessionReplacementIntent(intent);
+      if (!next || !isCurrent()) return false;
+      await loadFromDisk();
+      if (!isCurrent()) return false;
+      const existing = sessionReplacement;
+      if (existing && existing.expiresAtMs > getNowMs() &&
+          !isDeepStrictEqual(existing, next)) return false;
+      sessionReplacement = cloneSessionReplacementIntent(next);
+      markDirty();
+      return await persistSnapshot() && isCurrent();
+    },
+    async removeSessionReplacementIntent(expected, isCurrent) {
+      await loadFromDisk();
+      if (!isCurrent() || !sessionReplacement ||
+          !isDeepStrictEqual(sessionReplacement, expected)) return false;
+      sessionReplacement = undefined;
+      markDirty();
+      return await persistSnapshot() && isCurrent();
     },
     listWorkspaceRetirementIntents() {
       return workspaceRetirements.map(cloneWorkspaceRetirementIntent);
@@ -2764,6 +2884,47 @@ export function createTelegramTopicTargetStore(
       if (!normalizedCwd || !instanceId ||
           (options?.sessionId !== undefined && !normalizedSessionId) ||
           hasWorkspaceRetirementConflict({ cwd: normalizedCwd })) return undefined;
+      let replacementPreviousInstanceId: string | undefined;
+      const replacement = sessionReplacement;
+      if (
+        replacement?.continuity === "workspace-thread" && normalizedSessionId &&
+        replacement.expiresAtMs > getNowMs() &&
+        replacement.profileName === (getTelegramProfile() ?? "default") &&
+        replacement.cwd === normalizedCwd &&
+        replacement.sourceSessionId !== normalizedSessionId
+      ) {
+        const sourceEntry = Array.from(workspaceBindings.entries()).find(([, binding]) =>
+          binding.cwd === normalizedCwd &&
+          binding.sessionId === replacement.sourceSessionId &&
+          targetMatches(binding.target, replacement.target)
+        );
+        if (sourceEntry) {
+          const [sourceKey, sourceBinding] = sourceEntry;
+          const replacementIdentity = Array.from({ length: TELEGRAM_WORKSPACE_SLOTS.length })
+            .map((_, ordinal) => createTelegramWorkspaceBindingIdentityWithKey(
+              sourceBinding.cwd,
+              sourceBinding.workspaceKey,
+              ordinal,
+              normalizedSessionId,
+            ))
+            .find((identity) => identity?.instanceSlot === sourceBinding.instanceSlot);
+          if (replacementIdentity &&
+              replacementIdentity.instanceSlot === sourceBinding.instanceSlot) {
+            const existingTargetRecord = Array.from(records.values()).find((record) =>
+              targetMatches(record.target, replacement.target)
+            );
+            replacementPreviousInstanceId = existingTargetRecord?.instanceId;
+            workspaceBindings.delete(sourceKey);
+            workspaceBindings.set(getWorkspaceBindingMapKey(replacementIdentity), {
+              ...sourceBinding,
+              ...replacementIdentity,
+              updatedAtMs: getNowMs(),
+            });
+            markDirty();
+          }
+        }
+      }
+      const effectivePreviousInstanceId = previousInstanceId ?? replacementPreviousInstanceId;
       const externalReservedSlots = captureExternalReservedSlots();
       if (!externalReservedSlots) {
         options?.onCapacityUnavailable?.();
@@ -2810,9 +2971,15 @@ export function createTelegramTopicTargetStore(
         const mapKey = getWorkspaceBindingMapKey(identity);
         const existingClaim = workspaceClaims.get(mapKey);
         if (existingClaim) {
-          return existingClaim.instanceId === instanceId
-            ? { ...existingClaim.identity }
-            : undefined;
+          if (existingClaim.instanceId === instanceId) {
+            return { ...existingClaim.identity };
+          }
+          if (existingClaim.instanceId !== effectivePreviousInstanceId) return undefined;
+          workspaceClaims.set(mapKey, {
+            identity: existingClaim.identity,
+            instanceId,
+          });
+          return { ...existingClaim.identity };
         }
         const binding = workspaceBindings.get(mapKey);
         const liveRecord = binding
@@ -2821,7 +2988,7 @@ export function createTelegramTopicTargetStore(
         if (
           liveRecord &&
           liveRecord.instanceId !== instanceId &&
-          liveRecord.instanceId !== previousInstanceId
+          liveRecord.instanceId !== effectivePreviousInstanceId
         ) {
           return undefined;
         }
@@ -2963,9 +3130,35 @@ export function createTelegramTopicTargetStore(
       if (next && hasWorkspaceRetirementConflict(next)) return undefined;
       if (!next) return undefined;
       const nextMapKey = getWorkspaceBindingMapKey(next);
-      const claim = workspaceClaims.get(nextMapKey);
+      let claim = workspaceClaims.get(nextMapKey);
+      const replacedTargetBinding = Array.from(workspaceBindings.values()).find(
+        (existing) =>
+          existing.bindingKey !== next.bindingKey &&
+          targetMatches(existing.target, next.target),
+      );
+      if (
+        claimInstanceId && claim?.instanceId === claimInstanceId &&
+        replacedTargetBinding?.slot
+      ) {
+        claim = {
+          ...claim,
+          identity: { ...claim.identity, slot: replacedTargetBinding.slot },
+        };
+        workspaceClaims.set(nextMapKey, claim);
+        next.slot = replacedTargetBinding.slot;
+        if (replacedTargetBinding.threadName && !next.threadName) {
+          next.threadName = replacedTargetBinding.threadName;
+        }
+        if (replacedTargetBinding.manualThreadName && !next.manualThreadName) {
+          next.manualThreadName = replacedTargetBinding.manualThreadName;
+        }
+        if (replacedTargetBinding.displayTitle && !next.displayTitle) {
+          next.displayTitle = replacedTargetBinding.displayTitle;
+        }
+      }
       if (next.slot && Array.from(workspaceBindings.values()).some((existing) =>
-        existing.bindingKey !== next.bindingKey && existing.slot === next.slot,
+        existing.bindingKey !== next.bindingKey && existing.slot === next.slot &&
+        !targetMatches(existing.target, next.target),
       )) return undefined;
       for (const existing of workspaceBindings.values()) {
         if (

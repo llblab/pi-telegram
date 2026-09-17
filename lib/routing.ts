@@ -698,6 +698,7 @@ export interface TelegramInboundRouteRuntimeDeps<
   ) => void;
   isIdle: (ctx: TContext) => boolean;
   hasPendingMessages: (ctx: TContext) => boolean;
+  requestNewSession?: (source: unknown) => void;
   compact: (
     ctx: TContext,
     callbacks: { onComplete: () => void; onError: (error: unknown) => void },
@@ -721,6 +722,7 @@ const TELEGRAM_OWNED_CALLBACK_PREFIXES = [
   "compact:",
   "menu:",
   "model:",
+  "new:",
   "queue:",
   "section:",
   "settings:",
@@ -1970,7 +1972,7 @@ export function createTelegramInboundRouteRuntime<
         await deps.editInteractiveMessage?.(
           chatId,
           dialogMessageId,
-          "<b>✖ Rename cancelled. Returning to normal agent mode.</b>",
+          "<b>✖ Rename cancelled.</b>",
           "html",
           { inline_keyboard: [] },
         );
@@ -2005,6 +2007,42 @@ export function createTelegramInboundRouteRuntime<
       }
       return;
     }
+    const handledByNew =
+      await Commands.handleTelegramNewConfirmationCallback(query, {
+        ctx,
+        answerCallbackQuery: deps.answerCallbackQuery,
+        editInteractiveMessage: deps.editInteractiveMessage ?? (async () => {}),
+        deleteMessage: deps.deleteMessage ?? (async () => {}),
+        runNew: async (newCtx) => {
+          await Commands.handleTelegramNewCommand({
+            isIdle: () => deps.isIdle(newCtx),
+            hasPendingMessages: () => deps.hasPendingMessages(newCtx),
+            hasActiveTelegramTurn: deps.activeTurnRuntime.has,
+            hasDispatchPending: deps.bridgeRuntime.lifecycle.hasDispatchPending,
+            hasQueuedTelegramItems: deps.telegramQueueStore.hasQueuedItems,
+            isCompactionInProgress:
+              deps.bridgeRuntime.lifecycle.isCompactionInProgress,
+            requestNewSession: deps.requestNewSession
+              ? () => deps.requestNewSession!(query)
+              : undefined,
+            sendTextReply: async (text) => {
+              const chatId = query.message?.chat?.id;
+              const messageId = query.message?.message_id;
+              if (typeof chatId !== "number" || typeof messageId !== "number") return;
+              await deps.editInteractiveMessage?.(
+                chatId,
+                messageId,
+                text,
+                "html",
+                { inline_keyboard: [] },
+              );
+            },
+            recordRuntimeEvent: deps.recordRuntimeEvent,
+          });
+        },
+      });
+    assertExecutionCurrent();
+    if (handledByNew) return;
     const handledByCompact =
       await Commands.handleTelegramCompactConfirmationCallback(query, {
         ctx,
@@ -2190,6 +2228,7 @@ export function createTelegramInboundRouteRuntime<
     stopTypingLoop: deps.stopTypingLoop,
     enqueueContinueTurn,
     compact: deps.compact,
+    requestNewSession: deps.requestNewSession,
     allocateItemOrder: deps.bridgeRuntime.queue.allocateItemOrder,
     allocateControlOrder: deps.bridgeRuntime.queue.allocateControlOrder,
     appendControlItem: deps.queueMutationRuntime.append,
@@ -2519,17 +2558,31 @@ export function createTelegramInboundRouteRuntime<
             dialogMessageId: candidate.dialogMessageId,
           });
         }
+        const replyText = result.ok && !result.message
+          ? Commands.formatTelegramAutomaticThreadDisplayNameRestoredHeading(
+            result.threadName ?? name,
+          )
+          : Commands.formatTelegramInformationHeading(
+            result.ok ? "✅" : "⚠️",
+            result.message ?? "Thread display name reset failed.",
+          );
+        if (result.ok) {
+          Updates.assertTelegramUpdateExecutionCurrent(message);
+          Updates.reportTelegramUpdateCompleted(message);
+          void deps.sendTextReply(
+            target.chatId,
+            message.message_id,
+            replyText,
+            { parseMode: "HTML", target },
+          ).catch((error) => deps.recordRuntimeEvent?.("telegram-command", error, {
+            command: "name", phase: "reset-result",
+          }));
+          return true;
+        }
         await deps.sendTextReply(
           target.chatId,
           message.message_id,
-          result.ok && !result.message
-            ? Commands.formatTelegramAutomaticThreadDisplayNameRestoredHeading(
-              result.threadName ?? name,
-            )
-            : Commands.formatTelegramInformationHeading(
-              result.ok ? "✅" : "⚠️",
-              result.message ?? "Thread display name reset failed.",
-            ),
+          replyText,
           { parseMode: "HTML", target },
         );
         return true;
@@ -2561,17 +2614,31 @@ export function createTelegramInboundRouteRuntime<
           dialogMessageId: candidate.dialogMessageId,
         });
       }
+      const replyText = result?.ok && !result.message
+        ? Commands.formatTelegramThreadDisplayNameSavedHeading(
+          result.threadName ?? consumed.name,
+        )
+        : Commands.formatTelegramInformationHeading(
+          result?.ok ? "✅" : "⚠️",
+          result?.message ?? "Thread display name update failed.",
+        );
+      if (result?.ok) {
+        Updates.assertTelegramUpdateExecutionCurrent(message);
+        Updates.reportTelegramUpdateCompleted(message);
+        void deps.sendTextReply(
+          target.chatId,
+          message.message_id,
+          replyText,
+          { parseMode: "HTML", target },
+        ).catch((error) => deps.recordRuntimeEvent?.("telegram-command", error, {
+          command: "name", phase: "rename-result",
+        }));
+        return true;
+      }
       await deps.sendTextReply(
         target.chatId,
         message.message_id,
-        result?.ok && !result.message
-          ? Commands.formatTelegramThreadDisplayNameSavedHeading(
-            result.threadName ?? consumed.name,
-          )
-          : Commands.formatTelegramInformationHeading(
-            result?.ok ? "✅" : "⚠️",
-            result?.message ?? "Thread display name update failed.",
-          ),
+        replyText,
         { parseMode: "HTML", target },
       );
       return true;
