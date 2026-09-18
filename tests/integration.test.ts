@@ -1397,6 +1397,17 @@ test("Verbose activity reaches classic transport before the final assistant answ
       },
       ctx,
     );
+    await handlers.get("message_update")?.(
+      {
+        message: {},
+        assistantMessageEvent: {
+          type: "thinking_end",
+          contentIndex: 0,
+          content: "provider-exposed reasoning",
+        },
+      },
+      ctx,
+    );
     for (const [toolCallId, toolName] of [
       ["one", "read"],
       ["two", "exec"],
@@ -1585,6 +1596,13 @@ test("Verbose activity uses follower transport and loses stale registration auth
   runtime.accept({
     ...base,
     sequence: 3,
+    type: "reasoning-end",
+    contentIndex: 0,
+    text: "follower reasoning",
+  });
+  runtime.accept({
+    ...base,
+    sequence: 4,
     type: "tool-end",
     toolCallId: "tool-1",
     toolName: "read",
@@ -1605,7 +1623,7 @@ test("Verbose activity uses follower transport and loses stale registration auth
   followerGeneration = "follower-2";
   runtime.accept({
     ...base,
-    sequence: 4,
+    sequence: 5,
     type: "tool-end",
     toolCallId: "tool-2",
     toolName: "exec",

@@ -67,6 +67,7 @@ function createHarness(
     refreshedMode?: ActivityMode;
     refreshError?: Error;
     richSendError?: Error;
+    fakeReasoningTimers?: boolean;
   } = {},
 ) {
   let mode = options.mode ?? "verbose";
@@ -75,6 +76,7 @@ function createHarness(
   const sends: TelegramSendMessageBody[] = [];
   const richSends: TelegramSendRichMessageBody[] = [];
   const edits: TelegramEditMessageTextBody[] = [];
+  const reasoningTimers: Array<() => void> = [];
   const runtime = createTelegramActivityVerbosityRuntime({
     getActivityMode: () => mode,
     refreshActivityMode: async () => {
@@ -82,6 +84,17 @@ function createHarness(
       if (options.refreshedMode) mode = options.refreshedMode;
     },
     getNowMs: () => nowMs,
+    ...(options.fakeReasoningTimers
+      ? {
+          setReasoningTimeout: (callback: () => void) => {
+            reasoningTimers.push(callback);
+            return { unref() {} } as ReturnType<typeof setTimeout>;
+          },
+          clearReasoningTimeout: () => {
+            reasoningTimers.shift();
+          },
+        }
+      : {}),
     resolveTarget: (activity) => activity.target,
     captureAuthority: () => authority,
     isAuthorityActive: (captured) => captured === authority,
@@ -112,6 +125,9 @@ function createHarness(
     },
     replaceAuthority() {
       authority += 1;
+    },
+    flushReasoningTimer() {
+      reasoningTimers.shift()?.();
     },
   };
 }
@@ -159,7 +175,7 @@ for (const outcome of ["resolve", "reject"] as const) {
       sendMessage: async (body) => {
         const id = ++nextId;
         effects.push(body);
-        if (id === 1 && stage === "reasoning-end") await pause();
+        if (id === 1 && (stage === "reasoning-end" || stage === "agent-end")) await pause();
         return { message_id: id };
       },
       editMessageText: async (body) => {
@@ -189,9 +205,7 @@ for (const outcome of ["resolve", "reject"] as const) {
       }
       if (stage === "reasoning-end") accept("old", { type: "reasoning-end", contentIndex: 0, text: "old reasoning" });
       if (stage === "agent-end") {
-        accept("old", { type: "reasoning-delta", contentIndex: 0, delta: "old reasoning" });
-        await runtime.waitForIdle();
-        accept("old", { type: "reasoning-delta", contentIndex: 0, delta: " more" });
+        accept("old", { type: "reasoning-delta", contentIndex: 0, delta: "old reasoning more" });
         accept("old", { type: "agent-end" });
       }
       oldIdle = runtime.waitForIdle();
@@ -221,7 +235,7 @@ for (const outcome of ["resolve", "reject"] as const) {
       assert.equal(later[0]?.chat_id, 8);
       assert.doesNotMatch(JSON.stringify(later), /old (?:result|reasoning)/);
       assert.equal(nextId, stage === "refresh" ? 1 : 2);
-      if (stage !== "refresh") assert.equal(later[0]?.message_id, 2);
+      if (stage !== "refresh" && !thinking) assert.equal(later[0]?.message_id, 2);
       assert.ok(JSON.stringify(later).includes(thinking ? "new reasoning extra" : "must-survive.txt"));
     } finally {
       release();
@@ -489,13 +503,9 @@ test("reasoning uses a persistent target-bound expandable HTML message", async (
     harness.sends[0]?.text ?? "",
     /^<blockquote expandable>/,
   );
-  assert.equal(harness.edits.length, 1);
-  assert.match(harness.edits[0]?.text ?? "", /Checking <b>state<\/b>/);
-  assert.equal(harness.edits[0]?.parse_mode, "HTML");
-  assert.deepEqual(harness.edits[0]?.link_preview_options, {
-    is_disabled: true,
-  });
-  assert.equal(harness.edits[0]?.rich_message, undefined);
+  assert.equal(harness.edits.length, 0);
+  assert.match(harness.sends[0]?.text ?? "", /Checking <b>state<\/b>/);
+  assert.equal(harness.sends[0]?.parse_mode, "HTML");
 });
 
 test("agent end leaves an already current thinking message unchanged", async () => {
@@ -790,7 +800,7 @@ test("parallel tool completion preserves tool-start order", async () => {
 });
 
 test("reasoning and tool updates retain bounded latest evidence", async () => {
-  const harness = createHarness();
+  const harness = createHarness({ fakeReasoningTimers: true });
   harness.runtime.accept(event(1, { type: "agent-start" }));
   harness.runtime.accept(
     event(2, {
@@ -799,6 +809,8 @@ test("reasoning and tool updates retain bounded latest evidence", async () => {
       delta: `old-marker-${"x".repeat(TELEGRAM_REASONING_BUFFER_MAX_CHARS)}latest-marker`,
     }),
   );
+  await harness.runtime.waitForIdle();
+  harness.flushReasoningTimer();
   harness.runtime.accept(
     event(3, {
       type: "tool-start",
@@ -838,8 +850,8 @@ test("reasoning and tool updates retain bounded latest evidence", async () => {
   assert.match(tool, /update-6/);
 });
 
-test("reasoning edits are throttled to a minimum interval between frames", async () => {
-  const harness = createHarness({ mode: "thinking" });
+test("reasoning waits for an accumulated first frame and throttles later edits", async () => {
+  const harness = createHarness({ mode: "thinking", fakeReasoningTimers: true });
   harness.runtime.accept(event(1, { type: "agent-start" }));
   harness.runtime.accept(
     event(2, {
@@ -849,7 +861,7 @@ test("reasoning edits are throttled to a minimum interval between frames", async
     }),
   );
   await harness.runtime.waitForIdle();
-  assert.equal(harness.sends.length, 1);
+  assert.equal(harness.sends.length, 0, "opening frame remains buffered");
   harness.runtime.accept(
     event(3, {
       type: "reasoning-delta",
@@ -858,8 +870,11 @@ test("reasoning edits are throttled to a minimum interval between frames", async
     }),
   );
   await harness.runtime.waitForIdle();
-  assert.equal(harness.edits.length, 0, "within interval no edit");
+  assert.equal(harness.sends.length, 0, "opening deltas accumulate together");
   harness.advanceNow(2_000);
+  harness.flushReasoningTimer();
+  await harness.runtime.waitForIdle();
+  assert.equal(harness.sends.length, 1, "first frame publishes after two seconds");
   harness.runtime.accept(
     event(4, {
       type: "reasoning-delta",
@@ -868,7 +883,11 @@ test("reasoning edits are throttled to a minimum interval between frames", async
     }),
   );
   await harness.runtime.waitForIdle();
-  assert.equal(harness.edits.length, 1, "after interval edit fires");
+  assert.equal(harness.edits.length, 0, "next frame is scheduled, not immediate");
+  harness.advanceNow(2_000);
+  harness.flushReasoningTimer();
+  await harness.runtime.waitForIdle();
+  assert.equal(harness.edits.length, 1, "next frame publishes after its interval");
   harness.runtime.accept(
     event(5, {
       type: "reasoning-delta",
@@ -922,7 +941,7 @@ test("reset drops accepted events that have not started processing", async () =>
   });
   runtime.accept(event(1, { type: "agent-start" }));
   runtime.accept(
-    event(2, { type: "reasoning-delta", contentIndex: 0, delta: "working" }),
+    event(2, { type: "reasoning-end", contentIndex: 0, text: "working" }),
   );
   await new Promise<void>((resolve) => setImmediate(resolve));
   runtime.accept(

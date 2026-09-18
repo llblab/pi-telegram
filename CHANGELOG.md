@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.50.0: Internal lifecycle gateway and thinking cadence
+
+- `Internal lifecycle gateway`: Replaces the session-specific technical command with one `/telegram-internal` gateway for runtime-armed typed actions. Manual invocation performs no action and explains that the command cannot be run manually; settled `/new` replacement retains the same lifecycle and terminal-result guarantees.
+- `Thinking cadence`: Thinking now follows the same cadence as answer drafts: it accumulates the opening frame for two seconds, then updates at most once every two seconds while still flushing buffered reasoning when the block completes.
+
 ## 0.49.0: Unified fresh-session continuity
 
 - `/new`: Classic and Threaded Mode now share one confirmed fresh-session flow. The settled callback deletes its dialog and publishes an expiring exact-target intent; a same- or cross-process successor preserves the classic chat or re-keys the Thread/slot/name, atomically claims once, then sends one terminal result. Identity mismatches fail closed.

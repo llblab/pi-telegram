@@ -35,7 +35,8 @@ import {
   createTelegramSessionActionAssembly,
   createTelegramSessionActionRuntime,
   settleTelegramSessionReplacement,
-  TELEGRAM_SESSION_ACTION_COMMAND_NAME,
+  TELEGRAM_INTERNAL_COMMAND_NAME,
+  TELEGRAM_INTERNAL_MANUAL_USE_MESSAGE,
   type TelegramSessionActionRuntimeDeps,
   executeTelegramCommandAction,
   getTelegramCommandExecutionMode,
@@ -2499,8 +2500,12 @@ function createRuntimeHarness() {
 
 function createCommandContext(
   newSession: (options?: { withSession?: () => Promise<void> }) => Promise<{ cancelled: boolean }>,
+  notices: string[] = [],
 ): ExtensionCommandContext {
-  return { newSession } as unknown as ExtensionCommandContext;
+  return {
+    newSession,
+    ui: { notify: (message: string) => { notices.push(message); } },
+  } as unknown as ExtensionCommandContext;
 }
 
 const target = { chatId: 7, threadId: 8, messageId: 9 };
@@ -2573,7 +2578,7 @@ test("Classic session action publishes chat continuity without a Workspace bindi
   assert.equal(assembly.action.scheduleAfterUpdate(41, { chatId: 7, messageId: 9 }), true);
   assembly.action.onUpdateCompleted(41);
   await Promise.resolve();
-  await commands.get(TELEGRAM_SESSION_ACTION_COMMAND_NAME)!.handler("", {
+  await commands.get(TELEGRAM_INTERNAL_COMMAND_NAME)!.handler("", {
     cwd: "/repo",
     sessionManager: { getSessionId: () => "session-old" },
     newSession: async () => ({ cancelled: false }),
@@ -2604,7 +2609,7 @@ test("Classic successor settles once across same-process and process-replacement
       source.action.scheduleAfterUpdate(41, { chatId: 7, messageId: 9 });
       source.action.onUpdateCompleted(41);
       await new Promise<void>((resolve) => setImmediate(resolve));
-      await commands.get(TELEGRAM_SESSION_ACTION_COMMAND_NAME)!.handler("", {
+      await commands.get(TELEGRAM_INTERNAL_COMMAND_NAME)!.handler("", {
         cwd: "/repo", sessionManager: { getSessionId: () => "session-old" },
         newSession: async () => ({ cancelled: false }),
       } as unknown as ExtensionCommandContext);
@@ -2656,7 +2661,7 @@ test("Session action dispatch waits for the exact durable update completion", as
   assert.deepEqual(harness.dispatched, []);
   harness.runtime.onUpdateCompleted(41);
   await Promise.resolve();
-  assert.deepEqual(harness.dispatched, [`/${TELEGRAM_SESSION_ACTION_COMMAND_NAME}`]);
+  assert.deepEqual(harness.dispatched, [`/${TELEGRAM_INTERNAL_COMMAND_NAME}`]);
 });
 
 test("Session action leaves terminal success exclusively to successor settlement", async () => {
@@ -2667,18 +2672,20 @@ test("Session action leaves terminal success exclusively to successor settlement
   await Promise.resolve();
   assert.equal(harness.runtime.hasPending(), true);
   let calls = 0;
-  const command = harness.commands.get(TELEGRAM_SESSION_ACTION_COMMAND_NAME);
+  const command = harness.commands.get(TELEGRAM_INTERNAL_COMMAND_NAME);
   assert.ok(command);
   await command.handler("", createCommandContext(async (options) => {
     calls += 1;
     assert.equal(options, undefined);
     return { cancelled: false };
   }));
+  const notices: string[] = [];
   await command.handler("", createCommandContext(async () => {
     calls += 1;
     return { cancelled: false };
-  }));
+  }, notices));
   assert.equal(calls, 1);
+  assert.deepEqual(notices, [TELEGRAM_INTERNAL_MANUAL_USE_MESSAGE]);
   assert.deepEqual(harness.prepared, [7]);
   assert.deepEqual(harness.results, []);
   assert.equal(harness.runtime.hasPending(), false);
@@ -2690,7 +2697,7 @@ test("Session action does not replace before durable preparation succeeds", asyn
   harness.runtime.onUpdateCompleted(8);
   await Promise.resolve();
   let replacements = 0;
-  const command = harness.commands.get(TELEGRAM_SESSION_ACTION_COMMAND_NAME)!;
+  const command = harness.commands.get(TELEGRAM_INTERNAL_COMMAND_NAME)!;
   const original = (harness as unknown as { prepared: number[] }).prepared;
   original.splice(0);
   // The injected preparation failure is represented through a dedicated runtime.
@@ -2720,7 +2727,7 @@ test("Session action contains failures and emits a terminal failure result", asy
   harness.runtime.scheduleAfterUpdate(9, target);
   harness.runtime.onUpdateCompleted(9);
   await Promise.resolve();
-  const command = harness.commands.get(TELEGRAM_SESSION_ACTION_COMMAND_NAME);
+  const command = harness.commands.get(TELEGRAM_INTERNAL_COMMAND_NAME);
   await command!.handler("", createCommandContext(async () => {
     throw new Error("replacement failed");
   }));

@@ -24,7 +24,9 @@ export const TELEGRAM_ACTIVITY_MESSAGE_MAX_CHARS = 3_900;
 export const TELEGRAM_ACTIVITY_MESSAGE_MAX_TOOLS = 6;
 export const TELEGRAM_REASONING_MESSAGE_MAX_FRAMES = 24;
 export const TELEGRAM_REASONING_BUFFER_MAX_CHARS = 1_200;
-export const TELEGRAM_REASONING_MIN_INTERVAL_MS = 1_200;
+// Match native answer drafts: accumulate the opening frame for one full
+// interval, then publish at most one updated frame per interval.
+export const TELEGRAM_REASONING_MIN_INTERVAL_MS = 2_000;
 export const TELEGRAM_TOOL_UPDATE_MAX_ENTRIES = 4;
 
 interface ToolActivity {
@@ -325,6 +327,11 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
   getActivityMode: () => "quiet" | "thinking" | "tools" | "verbose";
   refreshActivityMode?: () => Promise<void>;
   getNowMs?: () => number;
+  setReasoningTimeout?: (
+    callback: () => void,
+    delayMs: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearReasoningTimeout?: (timer: ReturnType<typeof setTimeout>) => void;
   resolveTarget: (event: TelegramActivityEvent) => TelegramTarget | undefined;
   captureAuthority: () => TAuthority;
   isAuthorityActive: (authority: TAuthority) => boolean;
@@ -360,11 +367,18 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
   let reasoningMessage: ReasoningMessage | undefined;
   let reasoningBlocked = false;
   let lastReasoningPublishMs = 0;
+  let reasoningFlushTimer: ReturnType<typeof setTimeout> | undefined;
   let toolMessage: ToolMessage | undefined;
   const tools = new Map<string, ToolActivity>();
   const toolOrder: string[] = [];
 
+  const clearReasoningFlushTimer = () => {
+    if (!reasoningFlushTimer) return;
+    (deps.clearReasoningTimeout ?? clearTimeout)(reasoningFlushTimer);
+    reasoningFlushTimer = undefined;
+  };
   const clearActivity = () => {
+    clearReasoningFlushTimer();
     activityId = undefined;
     authority = undefined;
     target = undefined;
@@ -465,6 +479,33 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
         error,
       );
     }
+  };
+  const scheduleReasoningPublish = (
+    event: TelegramActivityEvent,
+    acceptedGeneration: number,
+  ) => {
+    if (reasoningFlushTimer || reasoningBlocked) return;
+    const elapsed = reasoningMessageFrames === 0
+      ? 0
+      : getNowMs() - lastReasoningPublishMs;
+    const delayMs = Math.max(0, TELEGRAM_REASONING_MIN_INTERVAL_MS - elapsed);
+    const schedule = deps.setReasoningTimeout ?? setTimeout;
+    reasoningFlushTimer = schedule(() => {
+      reasoningFlushTimer = undefined;
+      const admittedAuthority = authority;
+      const task = async () => {
+        if (
+          !isCurrent(acceptedGeneration, admittedAuthority) ||
+          reasoningChars <= lastReasoningMessageChars
+        ) return;
+        await publishReasoning(event, acceptedGeneration);
+      };
+      const enqueue = deps.enqueue ?? ((next: () => Promise<void>) => tail.then(next));
+      tail = enqueue(task).catch((error) => {
+        deps.recordFailure?.("reasoning-send", event, error);
+      });
+    }, delayMs) as ReturnType<typeof setTimeout>;
+    reasoningFlushTimer?.unref?.();
   };
   const publishTool = async (
     event: TelegramActivityEvent,
@@ -602,13 +643,8 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
       reasoningBuffer = `${reasoningBuffer}${event.delta}`.slice(
         -TELEGRAM_REASONING_BUFFER_MAX_CHARS,
       );
-      if (reasoningMessageFrames < TELEGRAM_REASONING_MESSAGE_MAX_FRAMES &&
-        (reasoningMessageFrames === 0 ||
-          (getNowMs() - lastReasoningPublishMs >=
-            TELEGRAM_REASONING_MIN_INTERVAL_MS &&
-            reasoningChars - lastReasoningMessageChars >= 160))
-      ) {
-        await publishReasoning(event, acceptedGeneration);
+      if (reasoningMessageFrames < TELEGRAM_REASONING_MESSAGE_MAX_FRAMES) {
+        scheduleReasoningPublish(event, acceptedGeneration);
       }
       return;
     }
@@ -620,6 +656,7 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
           -TELEGRAM_REASONING_BUFFER_MAX_CHARS,
         );
       }
+      clearReasoningFlushTimer();
       if (
         reasoningChars > 0 &&
         reasoningChars > lastReasoningMessageChars &&
@@ -687,8 +724,8 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
       return;
     }
     if (event.type === "agent-end" || event.type === "agent-settled") {
+      clearReasoningFlushTimer();
       if (
-        reasoningMessage &&
         reasoningChars > lastReasoningMessageChars &&
         !reasoningBlocked
       ) {
