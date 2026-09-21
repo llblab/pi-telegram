@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+## 0.50.1: Queue, lifecycle, and Workspace hotfixes
+
+- `Workspace slot recovery`: Uses the canonical binding returned by target-deduplicating Workspace commit for the live leader record and connection result, preventing a provisional recovery slot from consuming a second letter and falsely blocking follower registration at A–Z capacity.
+- `Guest queue Skip`: Lets the leader discard a waiting Guest Mode prompt directly from the queue menu while other work is active. Guest callbacks use stable queue identity, settle durable admission before removal, stop placeholder rotation, and visually clear the inline globe placeholder without starting a model turn.
+- `Internal lifecycle safety`: Binds each armed `/telegram-internal` lifecycle action to an unpredictable one-use token, so manual, mismatched, and replayed calls cannot consume or execute it.
+- `Command surface`: Uses Pi-style argument-first autocomplete hints, keeps descriptions concise and punctuation-consistent, uses `profile` consistently, describes `/telegram-internal` as a manual-use warning, and removes Workspace Thread naming from `/telegram-connect`; Thread names remain configurable from Telegram.
+
 ## 0.50.0: Internal lifecycle gateway and thinking cadence
 
 - `Internal lifecycle gateway`: Replaces the session-specific technical command with one `/telegram-internal` gateway for runtime-armed typed actions. Manual invocation performs no action and explains that the command cannot be run manually; settled `/new` replacement retains the same lifecycle and terminal-result guarantees.

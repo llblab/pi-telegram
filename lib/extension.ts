@@ -871,6 +871,7 @@ export default function (pi: Pi.ExtensionAPI) {
     storeModelMenuState: modelMenuRuntime.storeState,
     updateStatusMessage: menuActions.updateStatusMessage,
     updateStatus,
+    dismissGuestPlaceholder: guestPlaceholderRuntime.dismiss,
   });
   const threadDisplaySettingsRuntime =
     ThreadDisplay.createTelegramThreadDisplaySettingsRuntime({
@@ -1730,14 +1731,6 @@ export default function (pi: Pi.ExtensionAPI) {
       const record = findCurrentThreadRecord();
       if (!record?.target.threadId) return undefined;
       return record.threadName ?? "current Telegram thread";
-    },
-    setRequestedThreadNameForPollingStart:
-      telegramThreadCapabilityState.setRequestedThreadName,
-    validateThreadName(threadName) {
-      return Threads.getTelegramTopicThreadNameValidationError(
-        threadName,
-        undefined,
-      );
     },
     onTransportChanged() {
       deliveryLifecycleRuntime.onSessionStart();

@@ -917,58 +917,6 @@ test("Command binding does not expose a thread rename tool", () => {
   assert.equal(harness.tools.has("telegram_rename_thread"), false);
 });
 
-test("Command binding scopes a requested Thread name to one polling start", async () => {
-  const harness = createBindingApiHarness();
-  let requestedThreadName: string | undefined;
-  const observed: Array<string | undefined> = [];
-  registerTelegramCommandsAndTools({
-    pi: harness.api,
-    configStore: {
-      get: () => ({ botToken: "token" }),
-      getStoredConfig: () => ({ botToken: "token" }),
-      getActiveProfileName: () => undefined,
-      activateProfile: () => true,
-      getAllowedUserId: () => 840585,
-      getOutboundHandlers: () => [],
-      hasBotToken: () => true,
-      load: async () => {},
-      persist: async () => {},
-      set: () => {},
-    },
-    setup: { start: () => true, finish: () => {} },
-    activeTurnRuntime: { get: () => undefined },
-    lockedPollingRuntime: {
-      start: async () => {
-        observed.push(requestedThreadName);
-        return { ok: true };
-      },
-      stop: async () => undefined,
-    },
-    setRequestedThreadNameForPollingStart(threadName: string | undefined) {
-      requestedThreadName = threadName;
-    },
-    getStatusLines: () => [],
-    buttonActionStore: { register: () => "button-action" },
-    sendMarkdownReply: async () => 1,
-    callMultipart: async () => ({ ok: true }),
-    getDefaultChatId: () => 840585,
-    canSendDirect: () => true,
-    updateStatus: () => {},
-    recordRuntimeEvent: () => {},
-  } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
-  const connect = harness.commands.get("telegram-connect") as {
-    handler: (args: string, ctx: ExtensionContext) => Promise<void>;
-  };
-
-  await connect.handler("as=Navigator", {
-    cwd: "/repo",
-    ui: { notify: () => undefined },
-  } as unknown as ExtensionContext);
-
-  assert.deepEqual(observed, ["Navigator"]);
-  assert.equal(requestedThreadName, undefined);
-});
-
 test("Command binding rejects a missing profile without stopping active polling", async () => {
   const harness = createBindingApiHarness();
   const events: string[] = [];

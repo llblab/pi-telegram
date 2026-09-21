@@ -865,9 +865,10 @@ test("Queue mutation controller binds queue accessors to runtime mutations", () 
       ...promptItem,
       replyToMessageId: 12,
       sourceMessageIds: [12],
-      queueOrder: 2,
+      queueOrder: 4,
       laneOrder: 2,
       statusSummary: "appended",
+      guestQueryId: "guest-appended",
     },
     "append",
   );
@@ -895,7 +896,11 @@ test("Queue mutation controller binds queue accessors to runtime mutations", () 
   );
   assert.equal(nextLaneOrder, 9);
   assert.equal(controller.removeByMessageIds([11], "d"), 1);
-  assert.equal(controller.clear("e"), 2);
+  assert.equal(
+    controller.removeGuestPromptByQueueOrder?.(4, "guest-skip"),
+    true,
+  );
+  assert.equal(controller.clear("e"), 1);
   assert.deepEqual(queuedItems, []);
   assert.deepEqual(events, [
     "a",
@@ -904,9 +909,37 @@ test("Queue mutation controller binds queue accessors to runtime mutations", () 
     "c",
     "discard:d:prompt",
     "d",
-    "discard:e:control,appended",
+    "discard:guest-skip:appended",
+    "guest-skip",
+    "discard:e:control",
     "e",
   ]);
+});
+
+test("Queue order discard retains a guest prompt when durable settlement fails", () => {
+  const item = createQueueTestPromptTurn({
+    queueOrder: 17,
+    guestQueryId: "guest-1",
+    guestInlineMessageId: "inline-1",
+  });
+  let queuedItems: TelegramQueueItem<string>[] = [item];
+  const controller = createTelegramQueueMutationController<string>({
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => {
+      queuedItems = items;
+    },
+    allocateLaneOrder: () => 1,
+    onItemsDiscarded: () => {
+      throw new Error("durable settlement failed");
+    },
+    updateStatus: () => {},
+  });
+
+  assert.throws(
+    () => controller.removeGuestPromptByQueueOrder?.(17, "ctx"),
+    /durable settlement failed/,
+  );
+  assert.deepEqual(queuedItems, [item]);
 });
 
 test("Queue clear retains live items when durable discard fails", () => {

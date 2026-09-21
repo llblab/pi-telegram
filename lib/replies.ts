@@ -1018,6 +1018,10 @@ export const TELEGRAM_GUEST_PLACEHOLDER_FRAMES = [
   "<b>🌏 Working on it...</b>",
 ] as const;
 
+// Telegram does not expose deletion for inline messages. This non-printing,
+// non-empty edit visually clears a guest placeholder after its query is skipped.
+export const TELEGRAM_DISMISSED_GUEST_PLACEHOLDER_TEXT = "\u2063";
+
 export function buildTelegramGuestPlaceholderFrame(step: number): string {
   const frames: readonly string[] = TELEGRAM_GUEST_PLACEHOLDER_FRAMES;
   const index = ((step % frames.length) + frames.length) % frames.length;
@@ -1052,6 +1056,8 @@ export interface TelegramGuestPlaceholderRuntime {
   stop: (inlineMessageId: string) => Promise<void>;
   /** Cancels every loop without waiting for in-flight edits (session shutdown). */
   stopAll: () => void;
+  /** Stops rotation and visually clears the inline placeholder. */
+  dismiss: (inlineMessageId: string) => Promise<void>;
 }
 
 interface TelegramGuestPlaceholderSession {
@@ -1201,6 +1207,19 @@ export function createTelegramGuestPlaceholderRuntime(
         if (session.timer !== undefined) clearTimer(session.timer);
       }
       sessions.clear();
+    },
+    async dismiss(inlineMessageId) {
+      await stop(inlineMessageId);
+      try {
+        await deps.editGuestInlineMessage(inlineMessageId, {
+          text: TELEGRAM_DISMISSED_GUEST_PLACEHOLDER_TEXT,
+          parseMode: "HTML",
+        });
+      } catch (error) {
+        deps.recordRuntimeEvent?.("guest", error, {
+          phase: "guest-placeholder-dismiss",
+        });
+      }
     },
   };
 }

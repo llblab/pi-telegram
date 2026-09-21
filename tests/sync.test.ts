@@ -652,6 +652,58 @@ test("Leader thread sync reuses same-process legacy leader topic across reload",
   }
 });
 
+test("Leader Workspace recovery publishes the canonical retained slot after target deduplication", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-leader-canonical-slot-"));
+  const store = createTelegramTopicTargetStore({
+    path: join(dir, "telegram-targets.json"),
+    getNowMs: () => 2000,
+  });
+  try {
+    const retained = createTelegramWorkspaceBindingIdentity("/repo", 0, "old-session")!;
+    store.upsertWorkspaceBinding({
+      ...retained,
+      target: { chatId: 7, threadId: 41 },
+      threadName: "Xylem",
+      slot: "X",
+      updatedAtMs: 1,
+    });
+    store.upsert({
+      profileKey: "leader:42:1",
+      owner: { kind: "leader", cwd: "/repo", instanceId: "42:1" },
+      target: { chatId: 7, threadId: 41 },
+      status: "active",
+      createdAtMs: 1,
+      updatedAtMs: 1,
+      instanceId: "42:1",
+      threadName: "Xylem",
+      slot: "X",
+    });
+    await store.persist();
+
+    const result = await ensureTelegramLeaderThreadBinding({
+      getAllowedUserId: () => 7,
+      instanceId: "42:2",
+      cwd: "/repo",
+      sessionId: "new-session",
+      topicTargetStore: store,
+      async callApi<TResponse>() {
+        assert.fail("same-process recovery must not call Telegram");
+        return {} as TResponse;
+      },
+      recordEvent() {},
+    });
+
+    assert.equal(result?.target.threadId, 41);
+    assert.equal(result?.slot, "X");
+    assert.equal(result?.threadName, "Xylem");
+    assert.equal(store.getByProfileKey("cwd:/repo")?.slot, "X");
+    assert.equal(store.list().find((record) => record.instanceId === "42:2")?.slot, "X");
+    assert.equal(store.allocateSlot("manual:follower"), "Y");
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
 test("Leader Workspace recovery commits claim-assigned legacy slots before activation", async () => {
   for (const duplicate of [false, true]) {
     const dir = await mkdtemp(join(tmpdir(), "pi-telegram-leader-slot-migration-"));

@@ -33,6 +33,7 @@ import {
   sendTelegramPlainReply,
   sendTelegramRenderedChunks,
   splitTelegramNativeMarkdown,
+  TELEGRAM_DISMISSED_GUEST_PLACEHOLDER_TEXT,
   TELEGRAM_GUEST_PLACEHOLDER_FRAME_MS,
   TELEGRAM_GUEST_PLACEHOLDER_FRAMES,
   TELEGRAM_GUEST_PLACEHOLDER_MAX_MS,
@@ -1219,6 +1220,26 @@ test("Guest placeholder runtime edits the inline message once per interval", asy
   assert.deepEqual(edits[2], ["inline-1", "<b>🌎 Working on it..</b>"]);
   await runtime.stop("inline-1");
   assert.equal(timers.pendingCount(), 0);
+});
+
+test("Guest placeholder dismissal stops rotation and visually clears the inline message", async () => {
+  const edits: Array<[string, string, string]> = [];
+  const timers = createGuestPlaceholderTimers();
+  const runtime = createTelegramGuestPlaceholderRuntime({
+    editGuestInlineMessage: async (inlineMessageId, content) => {
+      edits.push([inlineMessageId, content.text, content.parseMode]);
+    },
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  });
+  runtime.start("inline-1");
+  await runtime.dismiss("inline-1");
+  assert.equal(timers.pendingCount(), 0);
+  assert.deepEqual(edits, [[
+    "inline-1",
+    TELEGRAM_DISMISSED_GUEST_PLACEHOLDER_TEXT,
+    "HTML",
+  ]]);
 });
 
 test("Guest placeholder rotation completes whole cycles for at least 20 seconds and holds the final frame", async () => {

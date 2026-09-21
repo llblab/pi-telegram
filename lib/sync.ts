@@ -684,7 +684,14 @@ export async function ensureTelegramLeaderThreadBinding(
     assertLeaderEpoch("before-workspace-persist");
     await deps.topicTargetStore.persist();
     assertLeaderEpoch("after-workspace-persist");
-    return { ...result, ...(committed.displayTitle ? { displayTitle: committed.displayTitle } : {}) };
+    const { target: _target, slot: _slot, threadName: _threadName, displayTitle: _displayTitle, ...rest } = result;
+    return {
+      ...rest,
+      target: { ...committed.target },
+      slot: committed.slot ?? result.slot,
+      ...(committed.threadName ? { threadName: committed.threadName } : {}),
+      ...(committed.displayTitle ? { displayTitle: committed.displayTitle } : {}),
+    };
   };
   try {
   const unavailableTargetKeys = new Set([

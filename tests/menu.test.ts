@@ -2060,6 +2060,129 @@ test("Queue item Keep and Skip selectors share deferred-removal state", async ()
   assert.equal(queuedItems.length, 1);
 });
 
+test("Queue menu discards the selected guest prompt by queue order and dismisses its placeholder", async () => {
+  const state = createMenuState(2);
+  let queuedItems: TelegramQueueItem<string>[] = [
+    {
+      kind: "prompt",
+      chatId: 0,
+      replyToMessageId: 0,
+      queueOrder: 21,
+      queueLane: "default",
+      laneOrder: 1,
+      statusSummary: "first guest",
+      sourceMessageIds: [],
+      queuedAttachments: [],
+      content: [{ type: "text", text: "first guest" }],
+      historyText: "",
+      guestQueryId: "guest-1",
+      guestInlineMessageId: "inline-1",
+    },
+    {
+      kind: "prompt",
+      chatId: 0,
+      replyToMessageId: 0,
+      queueOrder: 22,
+      queueLane: "default",
+      laneOrder: 2,
+      statusSummary: "second guest",
+      sourceMessageIds: [],
+      queuedAttachments: [],
+      content: [{ type: "text", text: "second guest" }],
+      historyText: "",
+      guestQueryId: "guest-2",
+      guestInlineMessageId: "inline-2",
+    },
+  ];
+  const markups: TelegramInlineKeyboardMarkup[] = [];
+  const notices: Array<string | undefined> = [];
+  const dismissed: string[] = [];
+  const discardedOrders: number[] = [];
+  const runtime = createTelegramQueueMenuRuntime<string>({
+    telegramQueueStore: {
+      getQueuedItems: () => queuedItems,
+      setQueuedItems: (items) => {
+        queuedItems = items;
+      },
+      hasQueuedItems: () => queuedItems.length > 0,
+    },
+    queueMutationRuntime: {
+      append: () => {},
+      reorder: () => {},
+      clear: () => 0,
+      removeByMessageIds: () => 0,
+      removeGuestPromptByQueueOrder: (queueOrder) => {
+        const item = queuedItems.find((entry) => {
+          return entry.kind === "prompt" && entry.queueOrder === queueOrder;
+        });
+        if (!item) return false;
+        discardedOrders.push(queueOrder);
+        queuedItems = queuedItems.filter((entry) => entry !== item);
+        return true;
+      },
+      applyReactionByMessageId: () => false,
+    },
+    sendInteractiveMessage: async (_chatId, _text, _mode, replyMarkup) => {
+      markups.push(replyMarkup);
+      return 2;
+    },
+    editInteractiveMessage: async (
+      _chatId,
+      _messageId,
+      _text,
+      _mode,
+      replyMarkup,
+    ) => {
+      markups.push(replyMarkup);
+    },
+    answerCallbackQuery: async (_id, text) => {
+      notices.push(text);
+    },
+    getModelMenuState: async () => state,
+    getStoredModelMenuState: () => state,
+    storeModelMenuState: () => {},
+    updateStatusMessage: async () => {},
+    updateStatus: () => {},
+    dismissGuestPlaceholder: async (inlineMessageId) => {
+      dismissed.push(inlineMessageId);
+    },
+  });
+
+  await runtime.openQueueMenu(1, 10, "ctx");
+  assert.equal(
+    markups[0]?.inline_keyboard[2]?.[0]?.callback_data,
+    "queue:guest-pick:21",
+  );
+  assert.equal(
+    markups[0]?.inline_keyboard[3]?.[0]?.callback_data,
+    "queue:guest-pick:22",
+  );
+  assert.equal(await runtime.handleCallbackQuery(
+    {
+      id: "pick-second-guest",
+      data: "queue:guest-pick:22",
+      message: { chat: { id: 1 }, message_id: 2 },
+    },
+    "ctx",
+  ), true);
+  assert.deepEqual(markups[1]?.inline_keyboard[1], [
+    { text: "🔴 Skip", callback_data: "queue:guest-skip:22" },
+  ]);
+
+  assert.equal(await runtime.handleCallbackQuery(
+    {
+      id: "skip-second-guest",
+      data: "queue:guest-skip:22",
+      message: { chat: { id: 1 }, message_id: 2 },
+    },
+    "ctx",
+  ), true);
+  assert.deepEqual(discardedOrders, [22]);
+  assert.deepEqual(dismissed, ["inline-2"]);
+  assert.deepEqual(queuedItems.map((item) => item.queueOrder), [21]);
+  assert.equal(notices.at(-1), "Guest prompt skipped.");
+});
+
 test("Queue refresh rotates empty queue title", async () => {
   const state = createMenuState(2);
   const texts: string[] = [];

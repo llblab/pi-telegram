@@ -563,10 +563,6 @@ interface TelegramCommandsAndToolsBindingDeps {
   stopPolling?: () => Promise<void | string>;
   recoverPollingStart?: Commands.TelegramBridgeCommandRegistrationDeps["recoverPollingStart"];
   getDisconnectThreadName?: () => string | undefined;
-  setRequestedThreadNameForPollingStart?: (
-    threadName: string | undefined,
-  ) => void;
-  validateThreadName?: Commands.TelegramBridgeCommandRegistrationDeps["validateThreadName"];
   onTransportChanged?: () => Promise<void> | void;
   getStatusLines: (
     options?: Status.TelegramBridgeStatusLineOptions,
@@ -615,8 +611,6 @@ export function registerTelegramCommandsAndTools({
   stopPolling,
   recoverPollingStart,
   getDisconnectThreadName,
-  setRequestedThreadNameForPollingStart,
-  validateThreadName,
   onTransportChanged,
   getStatusLines,
   buttonActionStore,
@@ -785,20 +779,16 @@ export function registerTelegramCommandsAndTools({
     hasBotToken: configStore.hasBotToken,
     getBotTokenDiagnostic: configStore.getBotTokenDiagnostic,
     startPolling: async (ctx, options) => {
-      setRequestedThreadNameForPollingStart?.(options?.requestedThreadName);
       try {
         return await lockedPollingRuntime.start(ctx, options);
       } catch (error) {
         recordRuntimeEvent("recovery", error, { phase: "polling-start" });
         throw error;
-      } finally {
-        setRequestedThreadNameForPollingStart?.(undefined);
       }
     },
     stopPolling: stopPolling ?? lockedPollingRuntime.stop,
     recoverPollingStart,
     getDisconnectThreadName,
-    validateThreadName,
     queueAgentConnectionContext,
     updateStatus,
     getProfileNames: () =>

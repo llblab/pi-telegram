@@ -922,6 +922,28 @@ export function removeTelegramQueueItemsByMessageIds<TContext = unknown>(
   };
 }
 
+export function removeTelegramQueuedGuestPromptByOrder<TContext = unknown>(
+  items: TelegramQueueItem<TContext>[],
+  queueOrder: number,
+): {
+  items: TelegramQueueItem<TContext>[];
+  removedItems: PendingTelegramTurn[];
+  removedCount: number;
+} {
+  const index = items.findIndex((item) => {
+    return isPendingTelegramTurn(item) &&
+      item.guestQueryId !== undefined &&
+      item.queueOrder === queueOrder;
+  });
+  if (index < 0) return { items, removedItems: [], removedCount: 0 };
+  const removedItem = items[index] as PendingTelegramTurn;
+  return {
+    items: [...items.slice(0, index), ...items.slice(index + 1)],
+    removedItems: [removedItem],
+    removedCount: 1,
+  };
+}
+
 export function applyTelegramQueuePromptReactionDisposition<
   TContext = unknown,
 >(
@@ -2331,6 +2353,10 @@ export interface TelegramQueueMutationController<TContext> {
     ctx: TContext,
     scope?: TelegramQueueMessageScope,
   ) => number;
+  removeGuestPromptByQueueOrder?: (
+    queueOrder: number,
+    ctx: TContext,
+  ) => boolean;
   applyReactionByMessageId: (
     messageId: number,
     disposition: TelegramQueueReactionDisposition,
@@ -2604,6 +2630,11 @@ export function createTelegramQueueMutationController<TContext>(
         buildRuntimeDeps(ctx),
         scope,
       ),
+    removeGuestPromptByQueueOrder: (queueOrder, ctx) =>
+      removeTelegramQueuedGuestPromptByOrderRuntime(
+        queueOrder,
+        buildRuntimeDeps(ctx),
+      ),
     applyReactionByMessageId: (messageId, disposition, ctx, scope) =>
       applyTelegramQueuePromptReactionDispositionRuntime(
         messageId,
@@ -2682,6 +2713,21 @@ export function removeTelegramQueueItemsByMessageIdsRuntime<TContext>(
   }
   updateTelegramQueueStatusRuntime(deps);
   return removedCount;
+}
+
+export function removeTelegramQueuedGuestPromptByOrderRuntime<TContext>(
+  queueOrder: number,
+  deps: TelegramQueueMutationRuntimeDeps<TContext>,
+): boolean {
+  const { items, removedItems, removedCount } =
+    removeTelegramQueuedGuestPromptByOrder(deps.getQueuedItems(), queueOrder);
+  if (removedCount === 0) return false;
+  // A menu Skip means permanent discard, so settle durable admission before
+  // removing the live item. A failed settlement keeps the prompt retryable.
+  deps.onItemsDiscarded?.(removedItems, deps.ctx);
+  deps.setQueuedItems(items);
+  updateTelegramQueueStatusRuntime(deps);
+  return true;
 }
 
 export function applyTelegramQueuePromptReactionDispositionRuntime<TContext>(

@@ -4,6 +4,8 @@
  * Owns Telegram slash-command normalization, bot command metadata, pi-side command registration, and command-initiated session replacement orchestration behind runtime ports
  */
 
+import { randomUUID } from "node:crypto";
+
 import {
   pairTelegramUserIfNeeded,
   type TelegramConfigStore,
@@ -366,7 +368,6 @@ export function createTelegramBotCommandRegistrar(
 export interface TelegramBridgeCommandStartPollingOptions {
   force?: boolean;
   forceFreshLeaderThread?: boolean;
-  requestedThreadName?: string;
 }
 
 export interface TelegramBridgeCommandStartPollingResult {
@@ -407,7 +408,6 @@ export interface TelegramBridgeCommandRegistrationDeps {
     ctx: ExtensionCommandContext,
     profileName: string,
   ) => Promise<boolean>;
-  validateThreadName?: (threadName: string) => string | undefined;
 }
 
 export type TelegramThreadDisplayNameRenamePort = (
@@ -466,17 +466,6 @@ function parseTelegramProfileArg(args: string): string | undefined {
   return word === TELEGRAM_DEFAULT_PROFILE_NAME ? undefined : word;
 }
 
-export function parseTelegramRequestedThreadName(
-  args: string,
-): string | undefined {
-  const token = args
-    .trim()
-    .split(/\s+/)
-    .find((word) => /^as=/i.test(word));
-  const value = token?.slice(3).trim();
-  return value || undefined;
-}
-
 function formatTelegramTakeoverTitle(ctx: ExtensionCommandContext): string {
   return ctx.ui.theme.fg("accent", "pi-telegram");
 }
@@ -498,7 +487,7 @@ export function registerTelegramBridgeCommands(
   deps: TelegramBridgeCommandRegistrationDeps,
 ): void {
   pi.registerCommand("telegram-setup", {
-    description: "Configure Telegram bot token. Use /telegram-setup <name> for named profiles.",
+    description: "<profile> — Configure Telegram bot token",
     handler: async (args, ctx) => {
       await deps.promptForConfig(ctx, parseTelegramProfileArg(args));
     },
@@ -513,28 +502,17 @@ export function registerTelegramBridgeCommands(
     },
   });
   pi.registerCommand("telegram-connect", {
-    description:
-      "Start the Telegram bridge. Use /telegram-connect <profile> and optional as=Name for a fresh Workspace Thread.",
+    description: "<profile> — Start Telegram bridge",
     handler: async (args, ctx) => {
-      const profileName = parseTelegramProfileArg(args);
-      const requestedNameTokens = args
-        .trim()
-        .split(/\s+/)
-        .filter((word) => /^as=/i.test(word));
-      const requestedThreadName = parseTelegramRequestedThreadName(args);
-      const requestedNameError =
-        requestedNameTokens.length > 1
-          ? "Specify at most one as=Name Workspace Thread name."
-          : requestedNameTokens.length === 1 && !requestedThreadName
-            ? "Usage: /telegram-connect [profile] as=Flightprice"
-            : requestedThreadName
-              ? deps.validateThreadName?.(requestedThreadName)
-              : undefined;
-      if (requestedNameError) {
-        ctx.ui.notify(requestedNameError, "warning");
+      if (args.trim().split(/\s+/).some((word) => /^as=/i.test(word))) {
+        ctx.ui.notify(
+          "Thread names are configured from Telegram, not from Pi commands.",
+          "warning",
+        );
         deps.updateStatus(ctx);
         return;
       }
+      const profileName = parseTelegramProfileArg(args);
       if (profileName && deps.activateProfileConfig) {
         const ok = await deps.activateProfileConfig(ctx, profileName);
         if (!ok) {
@@ -597,7 +575,6 @@ export function registerTelegramBridgeCommands(
       };
       let result = await startWithRecovery({
         forceFreshLeaderThread: true,
-        ...(requestedThreadName ? { requestedThreadName } : {}),
       });
       if (result && !result.ok && result.canTakeover) {
         const confirmed = await ctx.ui.confirm(
@@ -612,7 +589,6 @@ export function registerTelegramBridgeCommands(
         result = await startWithRecovery({
           force: true,
           forceFreshLeaderThread: true,
-          ...(requestedThreadName ? { requestedThreadName } : {}),
         });
       }
       if (result?.message) {
@@ -625,8 +601,7 @@ export function registerTelegramBridgeCommands(
     },
   });
   pi.registerCommand("telegram-disconnect", {
-    description:
-      "Stop Telegram; in Threaded Mode, delete this instance's current thread",
+    description: "Stop Telegram and delete current thread in Threaded Mode",
     handler: async (_args, ctx) => {
       const threadName = deps.getDisconnectThreadName?.();
       if (threadName) {
@@ -2337,7 +2312,7 @@ async function handleTelegramCommandRuntime<
 
 export const TELEGRAM_INTERNAL_COMMAND_NAME = "telegram-internal";
 export const TELEGRAM_INTERNAL_COMMAND_DESCRIPTION =
-  "(internal) dispatch one settled Telegram lifecycle action";
+  "Internal Telegram command cannot be run manually";
 export const TELEGRAM_INTERNAL_MANUAL_USE_MESSAGE =
   "This internal Telegram command cannot be run manually.";
 
@@ -2542,6 +2517,7 @@ export function createTelegramSessionActionAssembly(
 
 type TelegramPendingInternalAction = {
   kind: "replace-session";
+  token: string;
   updateId: number;
   target: { chatId: number; threadId?: number; messageId: number };
 };
@@ -2582,9 +2558,9 @@ export function createTelegramSessionActionRuntime(
       registered = true;
       deps.registerCommand(TELEGRAM_INTERNAL_COMMAND_NAME, {
         description: TELEGRAM_INTERNAL_COMMAND_DESCRIPTION,
-        handler: async (_args, ctx) => {
+        handler: async (args, ctx) => {
           const action = pendingAction;
-          if (!action) {
+          if (!action || args.trim() !== action.token) {
             ctx.ui.notify(TELEGRAM_INTERNAL_MANUAL_USE_MESSAGE, "warning");
             return;
           }
@@ -2616,10 +2592,11 @@ export function createTelegramSessionActionRuntime(
       const target = pendingTarget;
       pendingTarget = undefined;
       if (!target) return;
-      pendingAction = { kind: "replace-session", updateId, target };
+      const token = randomUUID();
+      pendingAction = { kind: "replace-session", token, updateId, target };
       void Promise.resolve()
         .then(() =>
-          deps.sendUserMessage(`/${TELEGRAM_INTERNAL_COMMAND_NAME}`, {
+          deps.sendUserMessage(`/${TELEGRAM_INTERNAL_COMMAND_NAME} ${token}`, {
             expandPromptTemplates: true,
           }),
         )
