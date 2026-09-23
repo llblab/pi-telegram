@@ -28,6 +28,7 @@ import {
   getAgentMessageText,
   isAssistantAgentMessage,
   normalizeTelegramNativeMarkdown,
+  preserveTransportReplyDedupOnNextReset,
   resetTransportReplyDedup,
   sendTelegramNativeMarkdownReply,
   sendTelegramPlainReply,
@@ -965,6 +966,8 @@ for (const unknownAck of [false, true]) {
       assert.equal(parameters?.message_id, 21);
       throw error;
     }), (caught) => caught === error);
+    preserveTransportReplyDedupOnNextReset(7, 21);
+    resetTransportReplyDedup();
     const anchors: Array<number | undefined> = [];
     for (const text of ["Fallback", "Following answer"]) {
       await sendTelegramNativeMarkdownReply(7, 21, text, {
@@ -1072,6 +1075,22 @@ test("Transport reply dedup scopes repeated prompt message ids by chat and threa
   );
   resetTransportReplyDedup();
   assert.deepEqual(buildTelegramReplyParameters(1, 42), {
+    message_id: 42,
+    allow_sending_without_reply: true,
+  });
+});
+
+test("Transport reply dedup preserves a dispatch notice through one agent-start reset", () => {
+  const target = { chatId: 1, threadId: 10 };
+  assert.deepEqual(buildTelegramReplyParameters(1, 42, target), {
+    message_id: 42,
+    allow_sending_without_reply: true,
+  });
+  preserveTransportReplyDedupOnNextReset(1, 42, target);
+  resetTransportReplyDedup();
+  assert.equal(buildTelegramReplyParameters(1, 42, target), undefined);
+  resetTransportReplyDedup();
+  assert.deepEqual(buildTelegramReplyParameters(1, 42, target), {
     message_id: 42,
     allow_sending_without_reply: true,
   });

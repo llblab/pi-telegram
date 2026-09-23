@@ -1163,6 +1163,9 @@ test("Command helpers run stop command side effects", async () => {
     clearPendingModelSwitch: () => {
       events.push("clear");
     },
+    cancelNextTransitionAnnouncements: () => {
+      events.push("cancel-next");
+    },
     clearQueuedTelegramItems: () => {
       events.push("clear-queue:2");
       return 2;
@@ -1185,6 +1188,9 @@ test("Command helpers run stop command side effects", async () => {
     clearPendingModelSwitch: () => {
       events.push("clear");
     },
+    cancelNextTransitionAnnouncements: () => {
+      events.push("cancel-next");
+    },
     clearQueuedTelegramItems: () => {
       events.push("clear-queue:1");
       return 1;
@@ -1204,11 +1210,13 @@ test("Command helpers run stop command side effects", async () => {
   });
   assert.deepEqual(events, [
     "clear",
+    "cancel-next",
     "clear-queue:2",
     "fold:false",
     "status",
     "reply:<b>💤 No active turn. Cleared 2 queued turns.</b>",
     "clear",
+    "cancel-next",
     "clear-queue:1",
     "fold:false",
     "abort",
@@ -1248,6 +1256,10 @@ test("Next command defers its announcement to queue dispatch before aborting", a
     abortCurrentTurn: () => events.push("abort"),
     dispatchNextQueuedTurn: () => events.push("dispatch"),
     requestNextDispatchAnnouncement: () => events.push("request-announcement"),
+    markActiveTurnNextAbortAnnouncement: () => {
+      events.push("mark-abort-announcement");
+      return true;
+    },
     clearFoldForDispatch: () => events.push("clear-fold"),
     updateStatus: () => events.push("status"),
     sendTextReply: async () => {
@@ -1261,7 +1273,13 @@ test("Next command defers its announcement to queue dispatch before aborting", a
     },
   });
 
-  assert.deepEqual(events, ["clear-fold", "request-announcement", "abort", "status"]);
+  assert.deepEqual(events, [
+    "clear-fold",
+    "request-announcement",
+    "mark-abort-announcement",
+    "abort",
+    "status",
+  ]);
 });
 
 test("Idle Next requests a prompt-owned announcement before dispatch", async () => {
@@ -1290,6 +1308,9 @@ test("Command helpers scope abort history preservation to Telegram-owned turns",
     clearPendingModelSwitch: () => {
       events.push("clear");
     },
+    cancelNextTransitionAnnouncements: () => {
+      events.push("cancel-next");
+    },
     abortCurrentTurn: () => {
       events.push("abort");
     },
@@ -1313,11 +1334,13 @@ test("Command helpers scope abort history preservation to Telegram-owned turns",
   });
   assert.deepEqual(events, [
     "clear",
+    "cancel-next",
     "fold:true",
     "abort",
     "status",
     "reply:<b>⏹️ Aborted current turn.</b>",
     "clear",
+    "cancel-next",
     "fold:false",
     "abort",
     "status",
@@ -1786,6 +1809,8 @@ test("Command helpers build the unified app menu from commands and status", () =
 
 test("Command handler target runtime binds command targets into command handling", async () => {
   const calls: string[] = [];
+  let busy = false;
+  let queued = false;
   const handleCommand = createTelegramCommandHandlerTargetRuntime<
     {
       chat: { id: number; type?: string };
@@ -1794,13 +1819,19 @@ test("Command handler target runtime binds command targets into command handling
     },
     string
   >({
-    hasAbortHandler: () => false,
+    hasAbortHandler: () => busy,
     clearPendingModelSwitch: () => {},
-    hasQueuedTelegramItems: () => false,
-    clearQueuedTelegramItems: () => 0,
+    hasQueuedTelegramItems: () => queued,
+    clearQueuedTelegramItems: () => {
+      const count = queued ? 1 : 0;
+      queued = false;
+      return count;
+    },
     setFoldQueuedPromptsIntoHistory: () => {},
-    abortCurrentTurn: () => {},
-    isIdle: () => true,
+    abortCurrentTurn: () => {
+      calls.push("abort");
+    },
+    isIdle: () => !busy,
     hasPendingMessages: () => false,
     hasActiveTelegramTurn: () => false,
     hasDispatchPending: () => false,
@@ -1809,6 +1840,16 @@ test("Command handler target runtime binds command targets into command handling
     updateStatus: () => {},
     dispatchNextQueuedTelegramTurn: (ctx) => {
       calls.push(`dispatch:${ctx}`);
+    },
+    requestNextDispatchAnnouncement: () => {
+      calls.push("request-next-notice");
+    },
+    markActiveTurnNextAbortAnnouncement: () => {
+      calls.push("mark-next-abort");
+      return true;
+    },
+    cancelNextTransitionAnnouncements: () => {
+      calls.push("cancel-next-notices");
     },
     enqueueContinueTurn: async (_message, ctx) => {
       calls.push(`continue:${ctx}`);
@@ -1895,6 +1936,16 @@ test("Command handler target runtime binds command targets into command handling
     await handleCommand("new", { chat: { id: 7 }, message_id: 15 }, "ctx"),
     true,
   );
+  busy = true;
+  queued = true;
+  assert.equal(
+    await handleCommand("next", { chat: { id: 7 }, message_id: 16 }, "ctx"),
+    true,
+  );
+  assert.equal(
+    await handleCommand("stop", { chat: { id: 7 }, message_id: 17 }, "ctx"),
+    true,
+  );
   assert.deepEqual(calls, [
     "show:ctx",
     "rename:Navigator",
@@ -1904,6 +1955,12 @@ test("Command handler target runtime binds command targets into command handling
     "name-dialog",
     "show:ctx",
     "new-session",
+    "request-next-notice",
+    "mark-next-abort",
+    "abort",
+    "cancel-next-notices",
+    "abort",
+    "reply:<b>⏹️ Aborted current turn. Cleared 1 queued turn.</b>",
   ]);
 });
 

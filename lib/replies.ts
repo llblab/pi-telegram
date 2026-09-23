@@ -68,6 +68,7 @@ export function createReplyDedupRuntime(): ReplyDedupRuntime {
 // --- Transport-level dedup ---
 
 const lastRepliedToMessageIdByTarget = new Map<string, number>();
+const replyDedupPreservedOnNextReset = new Map<string, number>();
 let replyDedupGeneration = 0;
 
 function getReplyDedupTargetKey(
@@ -83,6 +84,23 @@ function getReplyDedupTargetKey(
 export function resetTransportReplyDedup(): void {
   replyDedupGeneration += 1;
   lastRepliedToMessageIdByTarget.clear();
+  for (const [key, messageId] of replyDedupPreservedOnNextReset) {
+    lastRepliedToMessageIdByTarget.set(key, messageId);
+  }
+  replyDedupPreservedOnNextReset.clear();
+}
+
+/** Keeps a successfully published transition notice as the first reply of the
+ * next agent turn. The following agent-start reset consumes this one-shot
+ * preservation, so later messages in that turn do not repeat the reply header. */
+export function preserveTransportReplyDedupOnNextReset(
+  chatId: number,
+  messageId: number,
+  target?: TelegramTarget,
+): void {
+  const key = getReplyDedupTargetKey(chatId, target);
+  if (lastRepliedToMessageIdByTarget.get(key) !== messageId) return;
+  replyDedupPreservedOnNextReset.set(key, messageId);
 }
 
 export function buildTelegramReplyParameters(

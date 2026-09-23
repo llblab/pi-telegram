@@ -230,8 +230,17 @@ test("Active turn store owns active turn state helpers", () => {
   assert.deepEqual(store.getTarget(), { chatId: 7, threadId: 70 });
   assert.equal(store.getReplyToMessageId(), 8);
   assert.deepEqual(store.getSourceMessageIds(), [8, 9]);
+  const storedTurn = store.get();
+  assert.equal(store.markNextAbortAnnouncement(), true);
+  assert.equal(store.get(), storedTurn);
+  assert.equal(store.get()?.announceNextAbortOnEnd, true);
+  assert.equal(store.clearNextAbortAnnouncement(), true);
+  assert.equal(store.get(), storedTurn);
+  assert.equal(store.get()?.announceNextAbortOnEnd, undefined);
+  assert.equal(store.clearNextAbortAnnouncement(), false);
   store.clear();
   assert.equal(store.has(), false);
+  assert.equal(store.markNextAbortAnnouncement(), false);
   assert.equal(store.getChatId(), undefined);
   assert.equal(store.getTarget(), undefined);
 });
@@ -3919,6 +3928,109 @@ test("Agent end runtime renders the operation-aborted error as HTML", async () =
   ]);
 });
 
+test("Next settlement announces an explicit aborted stop before the selected queued prompt", async () => {
+  const events: string[] = [];
+  const next = createQueueTestPromptTurn({
+    chatId: 42,
+    target: { chatId: 42, threadId: 7 },
+    replyToMessageId: 99,
+    content: [{ type: "text", text: "next prompt" }],
+  });
+  let queuedItems: TelegramQueueItem<string>[] = [next];
+  const dispatch = createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => {
+      queuedItems = items;
+      events.push(`items:${items.length}`);
+    },
+    canDispatch: () => true,
+    updateStatus: () => events.push("queue-status"),
+    sendTextReply: async (_chatId, replyToMessageId, text) => {
+      events.push(`next:${replyToMessageId}:${text}`);
+      return 100;
+    },
+    onPromptDispatchStart: () => events.push("start"),
+    sendUserMessage: () => events.push("send"),
+    onPromptDispatchFailure: () => events.push("failure"),
+  });
+  dispatch.requestNextDispatchAnnouncement();
+  await handleTelegramAgentEndRuntime({
+    turn: createQueueTestPromptTurn({
+      chatId: 42,
+      replyToMessageId: 98,
+      announceNextAbortOnEnd: true,
+    }),
+    assistant: { stopReason: "aborted" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => events.push("reset"),
+    updateStatus: () => events.push("turn-status"),
+    dispatchNextQueuedTelegramTurn: () => dispatch.dispatchNext("ctx"),
+    clearPreview: async () => {
+      events.push("clear");
+    },
+    setPreviewPendingText: () => events.push("unexpected:preview"),
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => events.push("unexpected:markdown"),
+    sendTextReply: async (_chatId, replyToMessageId, text, options) => {
+      events.push(`stop:${replyToMessageId}:${text}:${options?.parseMode ?? "plain"}`);
+    },
+    sendQueuedAttachments: async () => {},
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [
+    "reset",
+    "turn-status",
+    "clear",
+    "stop:98:<b>⏹️ This operation was aborted.</b>:HTML",
+    "queue-status",
+    "next:99:<b>⏩ Dispatching next queued turn.</b>",
+    "items:1",
+    "start",
+    "send",
+  ]);
+});
+
+for (const [label, assistant] of [
+  ["explicit aborted stop", { stopReason: "aborted" }],
+  ["legacy abort error", { stopReason: "error", errorMessage: "This operation was aborted" }],
+] as const) {
+  test(`Next settlement continues dispatch when its ${label} notice fails`, async () => {
+    const events: string[] = [];
+    await handleTelegramAgentEndRuntime({
+      turn: createQueueTestPromptTurn({ announceNextAbortOnEnd: true }),
+      assistant,
+      foldQueuedPromptsIntoHistory: false,
+      resetRuntimeState: () => events.push("reset"),
+      updateStatus: () => events.push("status"),
+      dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+      clearPreview: async () => {
+        events.push("clear");
+      },
+      setPreviewPendingText: () => {},
+      finalizeMarkdownPreview: async () => false,
+      sendMarkdownReply: async () => {},
+      sendTextReply: async () => {
+        events.push("abort-notice");
+        throw new Error("Telegram unavailable");
+      },
+      sendQueuedAttachments: async () => {},
+      recordRuntimeEvent: (category, error, details) => {
+        events.push(
+          `${category}:${details?.phase}:${error instanceof Error ? error.message : String(error)}`,
+        );
+      },
+    });
+    assert.deepEqual(events, [
+      "reset",
+      "status",
+      "clear",
+      "abort-notice",
+      "dispatch:next-abort-announcement:Telegram unavailable",
+      "dispatch",
+    ]);
+  });
+}
+
 test("Agent end plan classifies turn outcomes correctly", () => {
   const noTurnPlan = buildTelegramAgentEndPlan({
     hasTurn: false,
@@ -3938,6 +4050,17 @@ test("Agent end plan classifies turn outcomes correctly", () => {
   assert.equal(abortedPlan.kind, "aborted");
   assert.equal(abortedPlan.shouldClearPreview, true);
   assert.equal(abortedPlan.shouldDispatchNext, false);
+  assert.equal(abortedPlan.shouldSendAbortMessage, false);
+  const nextAbortedPlan = buildTelegramAgentEndPlan({
+    hasTurn: true,
+    stopReason: "aborted",
+    foldQueuedPromptsIntoHistory: false,
+    hasFinalText: false,
+    hasQueuedAttachments: false,
+    announceNextAbortOnEnd: true,
+  });
+  assert.equal(nextAbortedPlan.shouldDispatchNext, true);
+  assert.equal(nextAbortedPlan.shouldSendAbortMessage, true);
   const errorPlan = buildTelegramAgentEndPlan({
     hasTurn: true,
     stopReason: "error",
@@ -5501,6 +5624,9 @@ test("Queue dispatch announces the exact selected prompt before one dispatch", a
     onPromptDispatchStart: () => events.push("start"),
     sendUserMessage: () => events.push("send"),
     onPromptDispatchFailure: () => events.push("failure"),
+    reconcileNextDispatchAnnouncementReplyOwnership: (item) => {
+      events.push(`claim:${item.replyToMessageId}`);
+    },
   });
   controller.requestNextDispatchAnnouncement();
   controller.dispatchNext("ctx");
@@ -5512,10 +5638,69 @@ test("Queue dispatch announces the exact selected prompt before one dispatch", a
   assert.deepEqual(events, [
     "status",
     "notice:42:99:7:<b>⏩ Dispatching next queued turn.</b>",
+    "claim:99",
     "items:1",
     "start",
     "send",
   ]);
+});
+
+test("Queue dispatch cancellation removes only the pending next announcement", async () => {
+  const events: string[] = [];
+  let queuedItems: TelegramQueueItem<string>[] = [createQueueTestPromptTurn()];
+  const controller = createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => {
+      queuedItems = items;
+      events.push(`items:${items.length}`);
+    },
+    canDispatch: () => true,
+    updateStatus: () => events.push("status"),
+    sendTextReply: async () => {
+      events.push("notice");
+      return 100;
+    },
+    onPromptDispatchStart: () => events.push("start"),
+    sendUserMessage: () => events.push("send"),
+    onPromptDispatchFailure: () => events.push("failure"),
+  });
+  controller.requestNextDispatchAnnouncement();
+  controller.cancelNextDispatchAnnouncement();
+  controller.dispatchNext("ctx");
+  assert.deepEqual(events, ["items:1", "start", "send"]);
+});
+
+test("Queue dispatch cancellation fences an in-flight next announcement", async () => {
+  let releaseNotice!: () => void;
+  const noticePending = new Promise<void>((resolve) => {
+    releaseNotice = resolve;
+  });
+  const events: string[] = [];
+  let queuedItems: TelegramQueueItem<string>[] = [createQueueTestPromptTurn()];
+  const controller = createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => {
+      queuedItems = items;
+      events.push(`items:${items.length}`);
+    },
+    canDispatch: () => true,
+    updateStatus: () => events.push("status"),
+    sendTextReply: async () => {
+      events.push("notice");
+      await noticePending;
+      return 100;
+    },
+    onPromptDispatchStart: () => events.push("start"),
+    sendUserMessage: () => events.push("send"),
+    onPromptDispatchFailure: () => events.push("failure"),
+  });
+  controller.requestNextDispatchAnnouncement();
+  controller.dispatchNext("ctx");
+  controller.cancelNextDispatchAnnouncement();
+  releaseNotice();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["status", "notice"]);
+  assert.equal(queuedItems.length, 1);
 });
 
 test("Queue dispatch does not start an announced prompt cleared while its notice is pending", async () => {

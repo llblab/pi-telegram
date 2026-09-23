@@ -126,6 +126,8 @@ export interface PendingTelegramTurn extends TelegramQueueItemBase {
   historyText: string;
   priorityEmoji?: string;
   reactionSuppressionEmoji?: string;
+  /** Emit the explicit aborted-turn notice when /next settles this active turn. */
+  announceNextAbortOnEnd?: boolean;
 
   /** Turn should preferably be delivered as voice (mirror mode + user sent voice) */
   voiceReplyPreferred?: boolean;
@@ -235,6 +237,8 @@ export interface TelegramActiveTurnStore<
   has: () => boolean;
   set: (turn: TTurn) => void;
   clear: () => void;
+  markNextAbortAnnouncement: () => boolean;
+  clearNextAbortAnnouncement: () => boolean;
   getChatId: () => number | undefined;
   getTarget: () => TelegramQueueTarget | undefined;
   getReplyToMessageId: () => number | undefined;
@@ -460,6 +464,16 @@ export function createTelegramActiveTurnStore<
     },
     clear: () => {
       activeTurn = undefined;
+    },
+    markNextAbortAnnouncement: () => {
+      if (!activeTurn) return false;
+      activeTurn.announceNextAbortOnEnd = true;
+      return true;
+    },
+    clearNextAbortAnnouncement: () => {
+      if (!activeTurn?.announceNextAbortOnEnd) return false;
+      delete activeTurn.announceNextAbortOnEnd;
+      return true;
     },
     getChatId: () => activeTurn?.chatId,
     getTarget: () =>
@@ -1488,6 +1502,7 @@ export interface TelegramAgentEndPlan {
   kind: "no-turn" | "aborted" | "error" | "text" | "attachments-only" | "empty";
   shouldClearPreview: boolean;
   shouldDispatchNext: boolean;
+  shouldSendAbortMessage: boolean;
   shouldSendErrorMessage: boolean;
   shouldSendAttachmentNotice: boolean;
 }
@@ -1680,6 +1695,7 @@ export function buildTelegramAgentEndPlan(options: {
   hasFinalText: boolean;
   hasQueuedAttachments: boolean;
   foldQueuedPromptsIntoHistory: boolean;
+  announceNextAbortOnEnd?: boolean;
 }): TelegramAgentEndPlan {
   const shouldDispatchNext = shouldDispatchAfterTelegramAgentEnd({
     hasTurn: options.hasTurn,
@@ -1691,6 +1707,7 @@ export function buildTelegramAgentEndPlan(options: {
       kind: "no-turn",
       shouldClearPreview: false,
       shouldDispatchNext,
+      shouldSendAbortMessage: false,
       shouldSendErrorMessage: false,
       shouldSendAttachmentNotice: false,
     };
@@ -1700,6 +1717,7 @@ export function buildTelegramAgentEndPlan(options: {
       kind: "aborted",
       shouldClearPreview: true,
       shouldDispatchNext,
+      shouldSendAbortMessage: options.announceNextAbortOnEnd === true,
       shouldSendErrorMessage: false,
       shouldSendAttachmentNotice: false,
     };
@@ -1709,6 +1727,7 @@ export function buildTelegramAgentEndPlan(options: {
       kind: "error",
       shouldClearPreview: true,
       shouldDispatchNext,
+      shouldSendAbortMessage: false,
       shouldSendErrorMessage: true,
       shouldSendAttachmentNotice: false,
     };
@@ -1718,6 +1737,7 @@ export function buildTelegramAgentEndPlan(options: {
       kind: "text",
       shouldClearPreview: false,
       shouldDispatchNext,
+      shouldSendAbortMessage: false,
       shouldSendErrorMessage: false,
       shouldSendAttachmentNotice: false,
     };
@@ -1727,6 +1747,7 @@ export function buildTelegramAgentEndPlan(options: {
       kind: "attachments-only",
       shouldClearPreview: true,
       shouldDispatchNext,
+      shouldSendAbortMessage: false,
       shouldSendErrorMessage: false,
       shouldSendAttachmentNotice: true,
     };
@@ -1735,6 +1756,7 @@ export function buildTelegramAgentEndPlan(options: {
     kind: "empty",
     shouldClearPreview: true,
     shouldDispatchNext,
+    shouldSendAbortMessage: false,
     shouldSendErrorMessage: false,
     shouldSendAttachmentNotice: false,
   };
@@ -1891,6 +1913,7 @@ export async function handleTelegramAgentEndRuntime<
     hasFinalText: !!finalText || hasOutboundArtifacts,
     hasQueuedAttachments: (turn?.queuedAttachments.length ?? 0) > 0,
     foldQueuedPromptsIntoHistory: deps.foldQueuedPromptsIntoHistory,
+    announceNextAbortOnEnd: turn?.announceNextAbortOnEnd === true,
   });
   if (!turn) {
     if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
@@ -2017,22 +2040,29 @@ export async function handleTelegramAgentEndRuntime<
       await clearTurnPreview();
       if (!isDeliveryActive()) return;
     }
-    if (endPlan.shouldSendErrorMessage) {
+    if (endPlan.shouldSendAbortMessage || endPlan.shouldSendErrorMessage) {
       const errorMessage = assistant.errorMessage ||
         "Telegram bridge: Pi failed while processing the request.";
-      const isOperationAborted = errorMessage.trim().replace(/\.$/, "") ===
-        "This operation was aborted";
-      await deps.sendTextReply(
-        turn.chatId,
-        turn.replyToMessageId,
-        isOperationAborted
-          ? "<b>⏹️ This operation was aborted.</b>"
-          : errorMessage,
-        {
-          target: turn.target,
-          ...(isOperationAborted ? { parseMode: "HTML" as const } : {}),
-        },
-      );
+      const isOperationAborted = endPlan.shouldSendAbortMessage ||
+        errorMessage.trim().replace(/\.$/, "") === "This operation was aborted";
+      try {
+        await deps.sendTextReply(
+          turn.chatId,
+          turn.replyToMessageId,
+          isOperationAborted
+            ? "<b>⏹️ This operation was aborted.</b>"
+            : errorMessage,
+          {
+            target: turn.target,
+            ...(isOperationAborted ? { parseMode: "HTML" as const } : {}),
+          },
+        );
+      } catch (error) {
+        if (!isOperationAborted) throw error;
+        deps.recordRuntimeEvent?.("dispatch", error, {
+          phase: "next-abort-announcement",
+        });
+      }
       if (!isDeliveryActive()) return;
       if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
       return;
@@ -2180,7 +2210,7 @@ export async function handleTelegramAgentEndRuntime<
   };
   if (
     deps.scheduleActiveTurnDelivery &&
-    (endPlan.kind === "text" || endPlan.kind === "attachments-only" || endPlan.shouldSendErrorMessage || endPlan.shouldClearPreview)
+    (endPlan.kind === "text" || endPlan.kind === "attachments-only" || endPlan.shouldSendAbortMessage || endPlan.shouldSendErrorMessage || endPlan.shouldClearPreview)
   ) {
     deps.scheduleActiveTurnDelivery(deliverActiveTurn);
     return;
@@ -3092,6 +3122,9 @@ export interface TelegramQueueDispatchControllerDeps<
   ) => boolean;
   sendUserMessage: TelegramDispatchRuntimeDeps<TContext>["sendUserMessage"];
   onPromptDispatchFailure: (ctx: TContext, message: string) => void;
+  reconcileNextDispatchAnnouncementReplyOwnership?: (
+    item: PendingTelegramTurn,
+  ) => void;
   isQueueItemTransportActive?: (item: TelegramQueueItem<TContext>) => boolean;
   hasPendingInboundQueueMutationForItem?: (
     item: TelegramQueueItem<TContext>,
@@ -3107,6 +3140,7 @@ export interface TelegramQueueDispatchControllerDeps<
 export interface TelegramQueueDispatchController<TContext = unknown> {
   dispatchNext: (ctx: TContext) => void;
   requestNextDispatchAnnouncement: () => void;
+  cancelNextDispatchAnnouncement: () => void;
 }
 
 export function executeTelegramQueueDispatchPlan<TContext = unknown>(
@@ -3161,6 +3195,8 @@ export function createTelegramQueueDispatchRuntime<TContext = unknown>(
     commitPromptDispatch: deps.commitPromptDispatch,
     sendUserMessage: deps.sendUserMessage,
     onPromptDispatchFailure: deps.onPromptDispatchFailure,
+    reconcileNextDispatchAnnouncementReplyOwnership:
+      deps.reconcileNextDispatchAnnouncementReplyOwnership,
     isQueueItemTransportActive: deps.isQueueItemTransportActive,
     hasPendingInboundQueueMutationForItem:
       deps.hasPendingInboundQueueMutationForItem,
@@ -3176,10 +3212,17 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
 ): TelegramQueueDispatchController<TContext> {
   let controlDispatchPending = false;
   let nextDispatchAnnouncementRequested = false;
+  let nextDispatchAnnouncementGeneration = 0;
   let nextDispatchAnnouncementAnchor: TelegramQueueItem<TContext> | undefined;
   const controller: TelegramQueueDispatchController<TContext> = {
     requestNextDispatchAnnouncement: () => {
+      nextDispatchAnnouncementGeneration += 1;
       nextDispatchAnnouncementRequested = true;
+      nextDispatchAnnouncementAnchor = undefined;
+    },
+    cancelNextDispatchAnnouncement: () => {
+      nextDispatchAnnouncementGeneration += 1;
+      nextDispatchAnnouncementRequested = false;
       nextDispatchAnnouncementAnchor = undefined;
     },
     dispatchNext: (ctx) => {
@@ -3393,6 +3436,7 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
       if (dispatchPlan.kind === "prompt" && nextDispatchAnnouncementRequested) {
         nextDispatchAnnouncementRequested = false;
         controlDispatchPending = true;
+        const announcementGeneration = nextDispatchAnnouncementGeneration;
         const dispatchGeneration = deps.getDispatchGeneration?.();
         deps.updateStatus(ctx);
         void deps.sendTextReply(
@@ -3401,8 +3445,19 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
           "<b>⏩ Dispatching next queued turn.</b>",
           { target: dispatchPlan.item.target },
         ).catch((error) => {
-          deps.recordRuntimeEvent?.("dispatch", error, { phase: "next-announcement" });
+          deps.recordRuntimeEvent?.("dispatch", error, {
+            phase: "next-announcement",
+          });
         }).finally(() => {
+          try {
+            deps.reconcileNextDispatchAnnouncementReplyOwnership?.(
+              dispatchPlan.item,
+            );
+          } catch (error) {
+            deps.recordRuntimeEvent?.("dispatch", error, {
+              phase: "next-announcement-reply-ownership",
+            });
+          }
           controlDispatchPending = false;
           if (deps.hasDispatchContext && !deps.hasDispatchContext()) return;
           if (
@@ -3410,6 +3465,10 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
             deps.isDispatchGenerationActive &&
             !deps.isDispatchGenerationActive(dispatchGeneration)
           ) return;
+          if (announcementGeneration !== nextDispatchAnnouncementGeneration) {
+            if (nextDispatchAnnouncementRequested) controller.dispatchNext(ctx);
+            return;
+          }
           executePlan();
         });
         return;

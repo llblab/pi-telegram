@@ -52,6 +52,7 @@ export interface TelegramQueueBindingRuntime<TContext> {
   mutation: Queue.TelegramQueueMutationController<TContext>;
   dispatchNext: (ctx: TContext) => void;
   requestNextDispatchAnnouncement: () => void;
+  cancelNextDispatchAnnouncement: () => void;
   watchdog: Queue.TelegramQueueDispatchWatchdogRuntime<TContext>;
 }
 
@@ -96,6 +97,9 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
   updateStatus: (ctx: TContext, error?: string) => void;
   sendTextReply: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendTextReply"];
   sendUserMessage: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendUserMessage"];
+  reconcileNextDispatchAnnouncementReplyOwnership?: (
+    item: Queue.PendingTelegramTurn,
+  ) => void;
   recordRuntimeEvent?: TelegramRuntimeEventRecorder;
 }): TelegramQueueBindingRuntime<TContext> {
   const settleDiscardedItems = (
@@ -159,6 +163,8 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     },
     updateStatus: deps.updateStatus,
     sendTextReply: deps.sendTextReply,
+    reconcileNextDispatchAnnouncementReplyOwnership:
+      deps.reconcileNextDispatchAnnouncementReplyOwnership,
     recordRuntimeEvent: deps.recordRuntimeEvent,
     ...deps.promptDispatch,
     sendUserMessage: deps.sendUserMessage,
@@ -167,6 +173,7 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     mutation,
     dispatchNext: dispatch.dispatchNext,
     requestNextDispatchAnnouncement: dispatch.requestNextDispatchAnnouncement,
+    cancelNextDispatchAnnouncement: dispatch.cancelNextDispatchAnnouncement,
     watchdog: Queue.createTelegramQueueDispatchWatchdogRuntime({
       hasQueuedItems: deps.store.hasQueuedItems,
       dispatchNextQueuedTelegramTurn: dispatch.dispatchNext,

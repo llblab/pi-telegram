@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.51.1: Queue transitions and follower heartbeat stability
+
+- `/next lifecycle notices`: Target command composition now forwards request, exact-turn marker, and cancellation ports. Busy `/next` orders abort then selected-prompt dispatch notices; failures cannot block dispatch, and `/abort`/`/stop` cancel stale notices. A successful dispatch notice keeps first-reply ownership through agent start, so later answer messages do not repeat the queued-prompt reply. Rapid ordinary messages remain distinct turns.
+- `Follower heartbeat stability`: Follower heartbeats now use a dedicated eight-second response deadline aligned with leader stale-liveness policy instead of the generic one-second local-RPC default. Ordinary multi-second TUI/event-loop stalls therefore retain registration and stable `follower` status rather than destroying the socket, producing leader EPIPE noise, and entering repeated reconnect cycles.
+
 ## 0.51.0: Safe Workspace rotation and follower readiness
 
 - `Workspace slot rotation`: Fresh allocation reclaims the oldest proven inactive slot only at full A–Z pressure. Exact grouped receipts may be journal-CAS discarded only after complete source inspection proves every process-birth owner dead. Live/unknown owners, partial groups, handoffs and unrelated work stay protected. Fresh protection precedes Thread/history deletion and slot reuse. Pi sessions/files/memory/journals remain; restore-only never evicts; ambiguous deletion never replays.
