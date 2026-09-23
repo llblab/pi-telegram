@@ -820,6 +820,7 @@ export default function (pi: Pi.ExtensionAPI) {
     mutation: queueMutationRuntime,
     dispatchNext: dispatchNextQueuedTelegramTurn,
     requestNextDispatchAnnouncement,
+    cancelNextDispatchAnnouncement,
     watchdog: queueDispatchWatchdogRuntime,
   } = Bindings.createTelegramQueueBindingRuntime({
     store: telegramQueueStore,
@@ -835,6 +836,13 @@ export default function (pi: Pi.ExtensionAPI) {
     updateStatus,
     sendTextReply,
     sendUserMessage,
+    reconcileNextDispatchAnnouncementReplyOwnership(item) {
+      Replies.preserveTransportReplyDedupOnNextReset(
+        item.chatId,
+        item.replyToMessageId,
+        item.target,
+      );
+    },
     recordRuntimeEvent,
   });
   const { finalizeMarkdownPreview, preparePreviewDelivery } =
@@ -1093,6 +1101,7 @@ export default function (pi: Pi.ExtensionAPI) {
     isContextActive: telegramSessionContextStore.isCurrent,
     dispatchNextQueuedTelegramTurn,
     requestNextDispatchAnnouncement,
+    cancelNextDispatchAnnouncement,
     requestDeferredDispatchNextQueuedTelegramTurn:
       deferredQueueDispatchRuntime.request,
     hasDeferredDispatchContext: deferredQueueDispatchRuntime.isBound,

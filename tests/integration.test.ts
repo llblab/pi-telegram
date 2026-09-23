@@ -33,6 +33,7 @@ import * as BusLeader from "../lib/bus-leader.ts";
 import * as Bus from "../lib/bus.ts";
 import * as Media from "../lib/media.ts";
 import * as Config from "../lib/config.ts";
+import * as Commands from "../lib/commands.ts";
 import * as WorkspaceAdmission from "../lib/workspace-admission.ts";
 import * as Delivery from "../lib/delivery.ts";
 import * as Routing from "../lib/routing.ts";
@@ -1111,6 +1112,205 @@ function createRuntimePiHarness(options: RuntimePiHarnessOptions = {}) {
     pi: pi as never,
     getActiveTools: () => [...activeTools],
   };
+}
+
+function createIntegrationQueueTurn(
+  replyToMessageId: number,
+): Queue.PendingTelegramTurn {
+  return {
+    kind: "prompt",
+    chatId: 42,
+    target: { chatId: 42, threadId: 7 },
+    replyToMessageId,
+    queueOrder: replyToMessageId,
+    queueLane: "default",
+    laneOrder: replyToMessageId,
+    statusSummary: `turn ${replyToMessageId}`,
+    sourceMessageIds: [replyToMessageId],
+    queuedAttachments: [],
+    content: [{ type: "text", text: `turn ${replyToMessageId}` }],
+    historyText: `turn ${replyToMessageId}`,
+  };
+}
+
+test("Busy Next continues into the selected prompt when its abort notice fails", async () => {
+  const events: string[] = [];
+  const activeTurnStore = Queue.createTelegramActiveTurnStore();
+  const interrupted = createIntegrationQueueTurn(10);
+  const next = createIntegrationQueueTurn(11);
+  activeTurnStore.set(interrupted);
+  let queuedItems: Queue.TelegramQueueItem<string>[] = [next];
+  const dispatch = Queue.createTelegramQueueDispatchController<string>({
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => {
+      queuedItems = items;
+    },
+    canDispatch: () => true,
+    updateStatus: () => {},
+    sendTextReply: async (_chatId, replyToMessageId, text) => {
+      events.push(`next-notice:${replyToMessageId}:${text}`);
+      return 100;
+    },
+    onPromptDispatchStart: () => events.push("next-start"),
+    sendUserMessage: () => events.push("next-send"),
+    onPromptDispatchFailure: () => events.push("next-failure"),
+  });
+  await Commands.handleTelegramNextCommand({
+    hasAbortHandler: () => true,
+    isIdle: () => false,
+    hasQueuedItems: () => queuedItems.length > 0,
+    clearPendingModelSwitch: () => {},
+    abortCurrentTurn: () => events.push("abort"),
+    dispatchNextQueuedTurn: () => dispatch.dispatchNext("ctx"),
+    requestNextDispatchAnnouncement: dispatch.requestNextDispatchAnnouncement,
+    markActiveTurnNextAbortAnnouncement:
+      activeTurnStore.markNextAbortAnnouncement,
+    clearFoldForDispatch: () => {},
+    updateStatus: () => {},
+    sendTextReply: async () => {},
+  });
+  const settledTurn = activeTurnStore.get();
+  await Queue.handleTelegramAgentEndRuntime({
+    turn: settledTurn,
+    assistant: { stopReason: "aborted" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: activeTurnStore.clear,
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => dispatch.dispatchNext("ctx"),
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {
+      events.push("abort-notice");
+      throw new Error("Telegram unavailable");
+    },
+    sendQueuedAttachments: async () => {},
+    recordRuntimeEvent: (_category, _error, details) => {
+      events.push(`contained:${details?.phase}`);
+    },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [
+    "abort",
+    "abort-notice",
+    "contained:next-abort-announcement",
+    "next-notice:11:<b>⏩ Dispatching next queued turn.</b>",
+    "next-start",
+    "next-send",
+  ]);
+});
+
+for (const supersedingCommand of ["abort", "stop"] as const) {
+  test(`Busy Next drops transition notices when superseded by /${supersedingCommand}`, async () => {
+    const events: string[] = [];
+    const activeTurnStore = Queue.createTelegramActiveTurnStore();
+    activeTurnStore.set(createIntegrationQueueTurn(20));
+    let queuedItems: Queue.TelegramQueueItem<string>[] = [
+      createIntegrationQueueTurn(21),
+    ];
+    let foldQueuedPromptsIntoHistory = false;
+    const dispatch = Queue.createTelegramQueueDispatchController<string>({
+      getQueuedItems: () => queuedItems,
+      setQueuedItems: (items) => {
+        queuedItems = items;
+      },
+      canDispatch: () => true,
+      updateStatus: () => {},
+      sendTextReply: async (_chatId, _replyToMessageId, text) => {
+        events.push(`queue-notice:${text}`);
+        return 100;
+      },
+      onPromptDispatchStart: () => events.push("next-start"),
+      sendUserMessage: () => events.push("next-send"),
+      onPromptDispatchFailure: () => events.push("next-failure"),
+    });
+    const cancelNextTransitionAnnouncements = () => {
+      activeTurnStore.clearNextAbortAnnouncement();
+      dispatch.cancelNextDispatchAnnouncement();
+    };
+    await Commands.handleTelegramNextCommand({
+      hasAbortHandler: () => true,
+      isIdle: () => false,
+      hasQueuedItems: () => queuedItems.length > 0,
+      clearPendingModelSwitch: () => {},
+      abortCurrentTurn: () => events.push("next-abort"),
+      dispatchNextQueuedTurn: () => dispatch.dispatchNext("ctx"),
+      requestNextDispatchAnnouncement: dispatch.requestNextDispatchAnnouncement,
+      markActiveTurnNextAbortAnnouncement:
+        activeTurnStore.markNextAbortAnnouncement,
+      clearFoldForDispatch: () => {
+        foldQueuedPromptsIntoHistory = false;
+      },
+      updateStatus: () => {},
+      sendTextReply: async () => {},
+    });
+    if (supersedingCommand === "abort") {
+      await Commands.handleTelegramAbortCommand({
+        hasAbortHandler: () => true,
+        hasActiveTelegramTurn: activeTurnStore.has,
+        clearPendingModelSwitch: () => {},
+        cancelNextTransitionAnnouncements,
+        abortCurrentTurn: () => events.push("superseding-abort"),
+        setFoldQueuedPromptsIntoHistory: (fold) => {
+          foldQueuedPromptsIntoHistory = fold;
+        },
+        updateStatus: () => {},
+        sendTextReply: async (text) => {
+          events.push(`command-notice:${text}`);
+        },
+      });
+    } else {
+      await Commands.handleTelegramStopCommand({
+        hasAbortHandler: () => true,
+        clearPendingModelSwitch: () => {},
+        cancelNextTransitionAnnouncements,
+        clearQueuedTelegramItems: () => {
+          const count = queuedItems.length;
+          queuedItems = [];
+          return count;
+        },
+        setFoldQueuedPromptsIntoHistory: (fold) => {
+          foldQueuedPromptsIntoHistory = fold;
+        },
+        abortCurrentTurn: () => events.push("superseding-abort"),
+        updateStatus: () => {},
+        sendTextReply: async (text) => {
+          events.push(`command-notice:${text}`);
+        },
+      });
+    }
+    const settledTurn = activeTurnStore.get();
+    await Queue.handleTelegramAgentEndRuntime({
+      turn: settledTurn,
+      assistant: { stopReason: "aborted" },
+      foldQueuedPromptsIntoHistory,
+      resetRuntimeState: activeTurnStore.clear,
+      updateStatus: () => {},
+      dispatchNextQueuedTelegramTurn: () => dispatch.dispatchNext("ctx"),
+      clearPreview: async () => {},
+      setPreviewPendingText: () => {},
+      finalizeMarkdownPreview: async () => false,
+      sendMarkdownReply: async () => {},
+      sendTextReply: async () => {
+        events.push("unexpected-lifecycle-notice");
+      },
+      sendQueuedAttachments: async () => {},
+    });
+    if (queuedItems.length === 0) {
+      queuedItems = [createIntegrationQueueTurn(22)];
+    }
+    dispatch.dispatchNext("ctx");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(
+      events.some((event) => event.includes("Dispatching next queued turn")),
+      false,
+    );
+    assert.equal(events.includes("unexpected-lifecycle-notice"), false);
+    assert.equal(events.filter((event) => event.startsWith("command-notice:")).length, 1);
+    assert.equal(events.includes("next-start"), true);
+    assert.equal(events.includes("next-send"), true);
+  });
 }
 
 test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-connect ownership", async () => {
@@ -5635,6 +5835,285 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
 });
 
 }
+
+test("Extension runtime preserves both busy Next notices through follower queue admission", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const sentMessages: RuntimeHarnessMessage[] = [];
+  const secondUpdates = createRuntimeDeferredResponse();
+  const thirdUpdates = createRuntimeDeferredResponse();
+  const fourthUpdates = createRuntimeDeferredResponse();
+  let idle = true;
+  let abortCount = 0;
+  const { handlers, commands, pi } = createRuntimePiHarness({
+    sendUserMessage: (content) => {
+      sentMessages.push(content);
+    },
+  });
+  let getUpdatesCalls = 0;
+  const sendTexts: string[] = [];
+  const sendBodies: Array<Record<string, unknown>> = [];
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    const body = parseJsonRequestBody(init);
+    if (method === "deleteWebhook") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "getUpdates") {
+      getUpdatesCalls += 1;
+      if (getUpdatesCalls === 1) {
+        return createRuntimeTelegramApiResponse([
+          {
+            _: "other",
+            update_id: 1,
+            message: {
+              message_id: 10,
+              chat: { id: 99, type: "private" },
+              from: { id: 77, is_bot: false, first_name: "Test" },
+              text: "first request",
+            },
+          },
+        ]);
+      }
+      if (getUpdatesCalls === 2) return secondUpdates.promise;
+      if (getUpdatesCalls === 3) return thirdUpdates.promise;
+      if (getUpdatesCalls === 4) return fourthUpdates.promise;
+      throw new DOMException("stop", "AbortError");
+    }
+    if (method === "sendMessage" || method === "sendRichMessage") {
+      if (!body) throw new Error("Telegram send body is unavailable.");
+      sendTexts.push(getRuntimeTelegramApiText(body));
+      sendBodies.push(body);
+      return createRuntimeTelegramApiResponse({
+        message_id: 100 + sendTexts.length,
+      });
+    }
+    if (method === "sendChatAction") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+    });
+    (await getRuntimeTelegramExtension())(pi);
+    const ctx = createRuntimeExtensionContext({
+      isIdle: () => idle,
+      abort: () => {
+        abortCount += 1;
+      },
+    });
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    await waitForCondition(() => sentMessages.length === 1);
+    idle = false;
+    await handlers.get("agent_start")?.({}, ctx);
+    secondUpdates.resolve(
+      createRuntimeTelegramApiResponse([
+        {
+          _: "other",
+          update_id: 2,
+          message: {
+            message_id: 11,
+            chat: { id: 99, type: "private" },
+            from: { id: 77, is_bot: false, first_name: "Test" },
+            text: "follow up",
+          },
+        },
+      ]),
+    );
+    await waitForCondition(() => getUpdatesCalls >= 3);
+    await waitForTimeout(1_200);
+    thirdUpdates.resolve(
+      createRuntimeTelegramApiResponse([
+        {
+          _: "other",
+          update_id: 3,
+          message: {
+            message_id: 12,
+            chat: { id: 99, type: "private" },
+            from: { id: 77, is_bot: false, first_name: "Test" },
+            text: "/next",
+          },
+        },
+      ]),
+    );
+    await waitForCondition(() => abortCount === 1);
+    idle = true;
+    const abortedMessage = {
+      role: "assistant",
+      stopReason: "aborted",
+      content: [{ type: "text", text: "" }],
+    };
+    await handlers.get("agent_end")?.({ messages: [abortedMessage] }, ctx);
+    await handlers.get("agent_settled")?.({}, ctx);
+    await waitForCondition(() => sentMessages.length === 2);
+    await waitForCondition(() =>
+      sendTexts.includes("<b>⏹️ This operation was aborted.</b>")
+    );
+    const lifecycleNotices = sendTexts.filter((text) =>
+      text === "<b>⏹️ This operation was aborted.</b>" ||
+      text === "<b>⏩ Dispatching next queued turn.</b>"
+    );
+    assert.deepEqual(lifecycleNotices, [
+      "<b>⏹️ This operation was aborted.</b>",
+      "<b>⏩ Dispatching next queued turn.</b>",
+    ]);
+    assert.equal(
+      getRuntimeHarnessMessageText(sentMessages[1]!),
+      "[telegram] follow up",
+    );
+    await handlers.get("agent_start")?.({}, ctx);
+    const completedMessage = {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "follow-up answer" }],
+    };
+    await handlers.get("message_end")?.({ message: completedMessage }, ctx);
+    await handlers.get("agent_end")?.({ messages: [completedMessage] }, ctx);
+    await handlers.get("agent_settled")?.({}, ctx);
+    await waitForCondition(() => sendTexts.includes("follow-up answer"));
+    const dispatchBody = sendBodies.find((body) =>
+      getRuntimeTelegramApiText(body) ===
+        "<b>⏩ Dispatching next queued turn.</b>"
+    );
+    const finalBody = sendBodies.find((body) =>
+      getRuntimeTelegramApiText(body) === "follow-up answer"
+    );
+    assert.deepEqual(dispatchBody?.reply_parameters, {
+      message_id: 11,
+      allow_sending_without_reply: true,
+    });
+    assert.equal(finalBody?.reply_parameters, undefined);
+    fourthUpdates.resolve(createRuntimeTelegramApiResponse([]));
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    restoreFetch();
+    await telegramConfig.restore();
+  }
+});
+
+test("Extension runtime keeps rapid ordinary messages as distinct queued turns", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const sentMessages: RuntimeHarnessMessage[] = [];
+  const rapidUpdates = createRuntimeDeferredResponse();
+  const finalUpdates = createRuntimeDeferredResponse();
+  let idle = true;
+  const { handlers, commands, pi } = createRuntimePiHarness({
+    sendUserMessage: (content) => {
+      sentMessages.push(content);
+    },
+  });
+  let getUpdatesCalls = 0;
+  const restoreFetch = setRuntimeTestFetch(async (input) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "deleteWebhook") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "getUpdates") {
+      getUpdatesCalls += 1;
+      if (getUpdatesCalls === 1) {
+        return createRuntimeTelegramApiResponse([
+          {
+            _: "other",
+            update_id: 1,
+            message: {
+              message_id: 20,
+              chat: { id: 99, type: "private" },
+              from: { id: 77, is_bot: false, first_name: "Test" },
+              text: "first request",
+            },
+          },
+        ]);
+      }
+      if (getUpdatesCalls === 2) return rapidUpdates.promise;
+      if (getUpdatesCalls === 3) return finalUpdates.promise;
+      throw new DOMException("stop", "AbortError");
+    }
+    if (method === "sendChatAction") {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+    });
+    (await getRuntimeTelegramExtension())(pi);
+    const ctx = createRuntimeExtensionContext({ isIdle: () => idle });
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    await waitForCondition(() => sentMessages.length === 1);
+    idle = false;
+    await handlers.get("agent_start")?.({}, ctx);
+    rapidUpdates.resolve(
+      createRuntimeTelegramApiResponse([
+        {
+          _: "other",
+          update_id: 2,
+          message: {
+            message_id: 21,
+            chat: { id: 99, type: "private" },
+            from: { id: 77, is_bot: false, first_name: "Test" },
+            text: "rapid second",
+          },
+        },
+        {
+          _: "other",
+          update_id: 3,
+          message: {
+            message_id: 22,
+            chat: { id: 99, type: "private" },
+            from: { id: 77, is_bot: false, first_name: "Test" },
+            text: "rapid third",
+          },
+        },
+      ]),
+    );
+    await waitForCondition(() => getUpdatesCalls >= 3);
+    await flushMicrotasks(20);
+    const emptyCompletion = {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "" }],
+    };
+    idle = true;
+    await handlers.get("agent_end")?.({ messages: [emptyCompletion] }, ctx);
+    await handlers.get("agent_settled")?.({}, ctx);
+    await waitForCondition(() => sentMessages.length === 2);
+    assert.equal(
+      getRuntimeHarnessMessageText(sentMessages[1]!),
+      "[telegram] rapid second",
+    );
+    idle = false;
+    await handlers.get("agent_start")?.({}, ctx);
+    idle = true;
+    await handlers.get("agent_end")?.({ messages: [emptyCompletion] }, ctx);
+    await handlers.get("agent_settled")?.({}, ctx);
+    await waitForCondition(() => sentMessages.length === 3);
+    assert.equal(
+      getRuntimeHarnessMessageText(sentMessages[2]!),
+      "[telegram] rapid third",
+    );
+    assert.equal(
+      sentMessages.some((message) =>
+        getRuntimeHarnessMessageText(message).includes(
+          "rapid second\n\nrapid third",
+        )
+      ),
+      false,
+    );
+    finalUpdates.resolve(createRuntimeTelegramApiResponse([]));
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    restoreFetch();
+    await telegramConfig.restore();
+  }
+});
 
 test("Extension runtime clears queued follow-ups after a Telegram stop", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();

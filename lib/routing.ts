@@ -627,6 +627,7 @@ export interface TelegramInboundRouteRuntimeDeps<
   isContextActive?: (ctx: TContext) => boolean;
   dispatchNextQueuedTelegramTurn: (ctx: TContext) => void;
   requestNextDispatchAnnouncement?: () => void;
+  cancelNextDispatchAnnouncement?: () => void;
   requestDeferredDispatchNextQueuedTelegramTurn?: (
     dispatch: (ctx: TContext) => void,
   ) => void;
@@ -2222,6 +2223,10 @@ export function createTelegramInboundRouteRuntime<
     isContextActive: deps.isContextActive,
     dispatchNextQueuedTelegramTurn: deps.dispatchNextQueuedTelegramTurn,
     requestNextDispatchAnnouncement: deps.requestNextDispatchAnnouncement,
+    cancelNextTransitionAnnouncements: () => {
+      deps.activeTurnRuntime.clearNextAbortAnnouncement();
+      deps.cancelNextDispatchAnnouncement?.();
+    },
     requestDeferredDispatchNextQueuedTelegramTurn:
       deps.requestDeferredDispatchNextQueuedTelegramTurn,
     startTypingLoop: deps.startTypingLoop,
@@ -2297,6 +2302,8 @@ export function createTelegramInboundRouteRuntime<
     },
     getPromptTemplateCommands,
     sendTextReply: deps.sendTextReply,
+    markActiveTurnNextAbortAnnouncement:
+      deps.activeTurnRuntime.markNextAbortAnnouncement,
     getActiveTurnReply: () => {
       const activeTurn = deps.activeTurnRuntime.get();
       if (!activeTurn) return undefined;

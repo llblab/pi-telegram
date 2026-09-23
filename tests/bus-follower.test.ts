@@ -32,6 +32,7 @@ import {
   getTelegramFollowerSessionHandoff,
   prepareTelegramBusFollowerJournaledUpdateForExecution,
   setTelegramFollowerSessionHandoff,
+  TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_MS,
 } from "../lib/bus-follower.ts";
 import {
   createTelegramBusFollowerDeliveryIdentity,
@@ -50,6 +51,7 @@ import {
 } from "../lib/bus.ts";
 import { getTelegramBusTransportKind } from "../lib/bus-transport.ts";
 import { createTelegramConfigStore } from "../lib/config.ts";
+import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS } from "../lib/locks.ts";
 import { createTelegramUpdateJournalBotIdentity, createTelegramUpdateJournalStore } from "../lib/journal.ts";
 import {
   createTelegramBusFollowerTargetProvisioner,
@@ -2838,6 +2840,63 @@ test("Bus follower registration runtime accepts explicit manual profile keys", a
     );
     assert.equal(registry.get("inst-a")?.profileKey, "manual:inst-a");
   } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus follower heartbeat tolerates one delayed leader acknowledgement without flapping", async () => {
+  assert.equal(
+    TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_MS,
+    TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
+  );
+  const dir = mkdtempSync(
+    join(tmpdir(), "pi-telegram-bus-follower-heartbeat-delay-"),
+  );
+  const socketPath = join(dir, "bus.sock");
+  const state = createTelegramBusFollowerRegistrationState();
+  const failures: unknown[] = [];
+  let heartbeatCalls = 0;
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    async handleEnvelope(envelope) {
+      if (envelope.kind === "follower.heartbeat") {
+        heartbeatCalls += 1;
+        if (heartbeatCalls === 2) {
+          await new Promise((resolve) => setTimeout(resolve, 1_500));
+        }
+      }
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: true,
+      };
+    },
+  });
+  let requestSequence = 0;
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    instanceId: "inst-a",
+    createRequestId: () => `inst-a:${++requestSequence}`,
+    registrationState: state,
+    heartbeatMs: 5,
+    onHeartbeatFailure(error) {
+      failures.push(error);
+    },
+  });
+  try {
+    await server.start();
+    assert.equal(
+      await follower.registerWithLeader(
+        { cwd: "/repo" },
+        { busSocketPath: socketPath },
+      ),
+      true,
+    );
+    await waitForCondition(() => heartbeatCalls >= 3, 2_500);
+    assert.deepEqual(failures, []);
+    assert.equal(state.isRegistered(), true);
+  } finally {
+    follower.stop();
     await server.stop();
     rmSync(dir, { recursive: true, force: true });
   }

@@ -11,7 +11,11 @@ import { basename } from "node:path";
 import * as Sync from "./sync.ts";
 import * as Threads from "./threads.ts";
 import { parseTelegramUpdateJournalQueueOwner, type TelegramUpdateJournalStoreOptions } from "./journal.ts";
-import type { TelegramLockEntry, TelegramLockState } from "./locks.ts";
+import {
+  TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
+  type TelegramLockEntry,
+  type TelegramLockState,
+} from "./locks.ts";
 import type {
   TelegramQueueHandoffPayload,
   TelegramQueueHandoffStageResult,
@@ -60,6 +64,8 @@ export const TELEGRAM_BUS_FOLLOWER_PROMOTION_GRACE_MS = 2_500;
 export const TELEGRAM_FOLLOWER_SESSION_HANDOFF_TTL_MS = 30_000;
 export const TELEGRAM_BUS_FOLLOWER_CLIENT_TIMEOUT_MS = 30_000;
 export const TELEGRAM_BUS_FOLLOWER_REGISTRATION_WAIT_MS = 30_000;
+export const TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_MS =
+  TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS;
 export const TELEGRAM_BUS_FOLLOWER_REGISTRATION_RETRY_ATTEMPTS =
   TELEGRAM_BUS_REGISTRATION_RETRY.attempts;
 export const TELEGRAM_BUS_FOLLOWER_REGISTRATION_RETRY_DELAY_MS =
@@ -301,6 +307,7 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<
   registrationRetryAttempts?: number;
   registrationRetryDelayMs?: number;
   heartbeatMs?: number;
+  heartbeatTimeoutMs?: number;
   recordRuntimeEvent?: (
     category: string,
     error: unknown,
@@ -1619,6 +1626,10 @@ export function createTelegramBusFollowerRegistrationRuntime<
   const getNowMs = deps.getNowMs ?? Date.now;
   const getPid = deps.getPid ?? (() => process.pid);
   const heartbeatMs = deps.heartbeatMs ?? 1000;
+  const heartbeatTimeoutMs =
+    deps.heartbeatTimeoutMs ??
+    deps.timeoutMs ??
+    TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_MS;
   const registrationTimeoutMs =
     deps.registrationTimeoutMs ?? deps.timeoutMs ?? 30000;
   const registrationRetryAttempts =
@@ -1679,7 +1690,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
     try {
       const response = await sendTelegramBusLocalEnvelope({
         socketPath: leaderSocketPath,
-        timeoutMs: deps.timeoutMs,
+        timeoutMs: heartbeatTimeoutMs,
         retry: getTelegramBusTransportRetryPolicy({
           endpoint: leaderSocketPath,
           operation: "operation",
