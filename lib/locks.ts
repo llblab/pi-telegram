@@ -739,7 +739,8 @@ export function isProcessAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return (error as { code?: string }).code === "EPERM";
+    // Only an absent PID proves death; permission and unexpected failures do not.
+    return (error as { code?: string }).code !== "ESRCH";
   }
 }
 
@@ -1126,6 +1127,7 @@ export interface TelegramLockedPollingRuntime<
   ) => Promise<TelegramLockedPollingStartResult>;
   stop: () => Promise<string>;
   suspend: () => Promise<void>;
+  isSuspended: () => boolean;
   onPersistentConflict: (ctx: TContext, count: number) => Promise<void>;
   onSessionStart: (_event: unknown, ctx: TContext) => Promise<void>;
   registerFollowerWithOwner?: (
@@ -1190,6 +1192,9 @@ export function createTelegramLockedPollingRuntime<
   let takeoverCandidate: TelegramLockEntry | undefined;
   let sessionAutoStartRun: Promise<void> | undefined;
   let pollingGeneration = 0;
+  let suspendedGeneration: number | undefined;
+  let suspensionsInFlight = 0;
+  let startupsInFlight = 0;
   const ownershipCheckMs =
     deps.ownershipCheckMs ?? TELEGRAM_OWNERSHIP_CHECK_MS;
   const ownershipRefreshMs =
@@ -1201,20 +1206,29 @@ export function createTelegramLockedPollingRuntime<
     ownershipRefreshInterval = undefined;
   };
   const suspendPolling = async () => {
-    pollingGeneration += 1;
-    activeContext = undefined;
-    deps.transportMonitor?.stop();
-    deps.stopFollowerRegistration?.();
-    stopOwnershipWatcher();
-    if (sessionAutoStartRun) {
-      await sessionAutoStartRun;
+    const generation = ++pollingGeneration;
+    suspensionsInFlight += 1;
+    try {
+      activeContext = undefined;
+      deps.transportMonitor?.stop();
       deps.stopFollowerRegistration?.();
+      stopOwnershipWatcher();
+      if (sessionAutoStartRun) {
+        await sessionAutoStartRun;
+        deps.stopFollowerRegistration?.();
+      }
+      if (ownershipStop) {
+        await ownershipStop;
+        return;
+      }
+      await deps.stopPolling();
+      // Unsettled starts, overlapping stops or stale completion cannot certify quiescence.
+      if (generation === pollingGeneration && suspensionsInFlight === 1 && startupsInFlight === 0) {
+        suspendedGeneration = generation;
+      }
+    } finally {
+      suspensionsInFlight -= 1;
     }
-    if (ownershipStop) {
-      await ownershipStop;
-      return;
-    }
-    await deps.stopPolling();
   };
   const stopAfterOwnershipLoss = () => {
     if (ownershipStop) return;
@@ -1261,6 +1275,7 @@ export function createTelegramLockedPollingRuntime<
     if (!isCurrent()) return false;
     activeContext = ctx;
     startOwnershipWatcher(ctx);
+    startupsInFlight += 1;
     try {
       if (!deps.lock.refresh(snapshotLockContext(ctx))) {
         stopOwnershipWatcher();
@@ -1283,6 +1298,8 @@ export function createTelegramLockedPollingRuntime<
       deps.lock.release();
       deps.onTransportAvailabilityChanged?.();
       throw error;
+    } finally {
+      startupsInFlight -= 1;
     }
     if (!isCurrent()) return false;
     if (deps.lock.owns(ctx)) {
@@ -1421,6 +1438,8 @@ export function createTelegramLockedPollingRuntime<
       return "Telegram bridge disconnected.";
     },
     suspend: suspendPolling,
+    isSuspended: () => suspendedGeneration === pollingGeneration &&
+      suspensionsInFlight === 0 && startupsInFlight === 0 && !sessionAutoStartRun && !ownershipStop,
     onPersistentConflict: async (ctx, count) => {
       if (activeContext === undefined || ownershipStop) return;
       if (!(deps.isContextCurrent?.(ctx) ?? activeContext === ctx)) return;

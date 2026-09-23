@@ -11,6 +11,7 @@ import {
   readFile,
   readdir,
   readlink,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -22,6 +23,7 @@ import testRoot, { mock, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
+import { runNodeEval } from "./fixtures/node-eval.ts";
 import { createTelegramActivityVerbosityRuntime } from "../lib/activity-verbosity.ts";
 import * as AgentMessages from "../lib/agent-messages.ts";
 import * as Bindings from "../lib/bindings.ts";
@@ -29,6 +31,9 @@ import * as BusApi from "../lib/bus-api.ts";
 import * as BusFollower from "../lib/bus-follower.ts";
 import * as BusLeader from "../lib/bus-leader.ts";
 import * as Bus from "../lib/bus.ts";
+import * as Media from "../lib/media.ts";
+import * as Config from "../lib/config.ts";
+import * as WorkspaceAdmission from "../lib/workspace-admission.ts";
 import * as Delivery from "../lib/delivery.ts";
 import * as Routing from "../lib/routing.ts";
 import * as Threads from "../lib/threads.ts";
@@ -331,6 +336,124 @@ async function getRuntimeTelegramExtension(): Promise<RuntimeTelegramExtension> 
   runtimeTelegramExtension = (await import("../index.ts")).default;
   return runtimeTelegramExtension;
 }
+
+test("Storage reference preparation rejects historical aliases without redirecting accepted work or leases", async () => {
+  // A child isolates cwd/env; only explicitly created fixtures may be discovered.
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import * as fs from "node:fs";
+    import { tmpdir } from "node:os";
+    import { join } from "node:path";
+    import * as Paths from ${JSON.stringify(new URL("../lib/paths.ts", import.meta.url).href)};
+    import * as Config from ${JSON.stringify(new URL("../lib/config.ts", import.meta.url).href)};
+    import * as Journal from ${JSON.stringify(new URL("../lib/journal.ts", import.meta.url).href)};
+    import * as Admission from ${JSON.stringify(new URL("../lib/workspace-admission.ts", import.meta.url).href)};
+    const originalCwd = process.cwd();
+    const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "pi-telegram-reference-")));
+    const snapshot = (directory) => fs.readdirSync(directory, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map(entry => [entry.name, entry.isDirectory() ? snapshot(join(directory, entry.name))
+        : fs.readFileSync(join(directory, entry.name)).toString("hex")]);
+    try {
+      const agentDir = join(root, "agent");
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      const config = Config.createTelegramConfigStore({ agentDir, initialConfig: { profiles: {
+        default: { botToken: "7:fixture-default", allowedUserId: 7 },
+        work: { botToken: "7:fixture-work", allowedUserId: 7 },
+      } } });
+      await config.persist();
+      const owner = { processId: process.pid, processBirthId: process.pid + ":fixture-birth" };
+      const queueOwner = { ...owner, instanceId: "fixture-instance", sessionGeneration: 1 };
+      const leaseInput = { operationId: "retained", operationKind: "fixture", scope: { kind: "profile" } };
+      const compose = (checked) => {
+        const admission = Admission.createTelegramWorkspaceAdmissionRuntimeBinding({
+          getProfileName: config.getActiveProfileName, getBotToken: config.getBotToken,
+          owner, getProcessLiveness: () => "alive",
+          getPath(profileName) {
+            // Reconstruct the historical defective callback shape without changing its fixture bytes.
+            const selected = Paths.resolveTelegramWorkspaceAdmissionPath(profileName);
+            return checked ? Paths.requireTelegramStoragePathReference(selected,
+              Paths.resolveTelegramWorkspaceAdmissionPath(undefined, profileName)) : selected;
+          },
+        });
+        const journals = Journal.createTelegramUpdateJournalBindingRuntime({
+          base: { getProfileName: config.getActiveProfileName, getBotToken: config.getBotToken,
+            getBotId: () => 7, getWorkspaceAdmission: admission.resolve,
+            getQueueRuntimeIdentity: () => ({ ...owner, instanceId: queueOwner.instanceId }),
+            onRecovery() { assert.fail("Reference preparation must not recover journals"); } },
+          getLeaderJournalPath(profileName) {
+            const selected = Paths.resolveTelegramUpdateJournalPath(profileName);
+            return checked ? Paths.requireTelegramStoragePathReference(selected,
+              Paths.resolveTelegramUpdateJournalPath(undefined, profileName)) : selected;
+          },
+          getFollowerJournalPath(bindingKey, profileName) {
+            const selected = Paths.resolveTelegramFollowerJournalPath(bindingKey, undefined, profileName);
+            return checked ? Paths.requireTelegramStoragePathReference(selected,
+              Paths.resolveTelegramFollowerJournalPath(bindingKey, agentDir, profileName)) : selected;
+          },
+          getActiveFollowerBindingKey: () => "fixture-recipient", isFollowerRegistered: () => false,
+        });
+        return { admission, journals };
+      };
+      const legacy = compose(false);
+      const checked = compose(true);
+      // The unchanged default wiring remains usable under the reference preflight.
+      checked.journals.resolveLeader().journal.appendBatch([{ update_id: 90 }]);
+      assert.equal(checked.admission.resolve().acquireAdmission(leaseInput).kind, "acquired");
+      assert.equal(config.activateProfile("work"), true);
+      const references = [];
+      for (const [index, cwdName] of ["cwd-a", "cwd-b"].entries()) {
+        const cwd = join(root, cwdName);
+        fs.mkdirSync(cwd);
+        process.chdir(cwd);
+        const binding = legacy.journals.resolveLeader();
+        const updateId = index + 1;
+        binding.journal.appendBatch([{ update_id: updateId }]);
+        binding.journal.markQueued({ queueKind: "prompt", receiptId: "retained-queue",
+          sourceUpdateIds: [updateId], owner: queueOwner });
+        const ledger = legacy.admission.resolve();
+        assert.equal(ledger.acquireAdmission(leaseInput).kind, "acquired");
+        assert.equal(binding.journal.read().entries[0].state, "queued");
+        assert.equal(ledger.read().leases.length, 1);
+        references.push({ runtimeKey: binding.runtimeKey, recoveryKey: binding.recoveryKey });
+        assert.equal(JSON.parse(binding.runtimeKey).path, join("work", "tmp", "telegram", "inbox.json"));
+        assert.ok(fs.existsSync(join(cwd, "work", "tmp", "telegram", "inbox.json")));
+        assert.ok(fs.existsSync(join(cwd, "work", "tmp", "telegram", "workspace-admission.json")));
+        const before = snapshot(root);
+        const denied = /Telegram storage reference does not match its approved absolute path/;
+        assert.throws(() => checked.admission.resolve().acquireAdmission({ ...leaseInput,
+          operationId: "must-not-write" }), denied);
+        assert.throws(() => checked.journals.resolveLeader().journal.appendBatch([{ update_id: 99 }]), denied);
+        // A correctly placed follower file cannot bypass the mismatched admission reference.
+        assert.throws(() => checked.journals.resolveFollower().journal.appendBatch([{ update_id: 99 }]), denied);
+        assert.throws(() => checked.journals.createRecipientResolver("other-recipient")()
+          .journal.appendBatch([{ update_id: 99 }]), denied);
+        assert.deepEqual(snapshot(root), before, "No file, segment, staging directory, receipt or lease changed");
+      }
+      // Opaque raw-relative keys alone cannot distinguish two physical source locations.
+      assert.deepEqual(references[0], references[1]);
+      assert.equal(fs.existsSync(Paths.resolveTelegramUpdateJournalPath(undefined, "work")), false);
+      assert.equal(fs.existsSync(Paths.resolveTelegramWorkspaceAdmissionPath(undefined, "work")), false);
+      if (fs.constants.O_NOFOLLOW && fs.constants.O_NONBLOCK) {
+        const before = snapshot(root);
+        const census = Journal.inspectTelegramProfileJournalNamespace({
+          directory: Paths.resolveTelegramTempDir(), profile: "work",
+          botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: config.getBotToken(), botId: 7 }),
+          limits: { maxDirectoryEntries: 32, maxFiles: 32, maxBytes: 100000, maxEntries: 32, maxWork: 1000 },
+        });
+        assert.equal(census.sources.length, 1);
+        assert.equal(census.sources[0].evidence.kind, "absent");
+        assert.deepEqual(snapshot(root), before, "Canonical absence is not historical reference closure");
+      }
+      console.log("reference-preparation-ok");
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  `);
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+  assert.equal(result.stdout.trim(), "reference-preparation-ok");
+}, 10_000);
 
 test("Cross-instance agent turns route in both leader and follower directions", async () => {
   const followerRegistry = Bus.createTelegramBusFollowerRegistry();
@@ -1137,6 +1260,63 @@ test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-c
   }
 }, 60_000);
 
+test("Graceful preserved leader quit publishes inactivity and restores its intact Workspace", async () => {
+  const config = await createRuntimeTelegramConfigFixture();
+  const { handlers, commands, pi } = createRuntimePiHarness();
+  const methods: string[] = [];
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    methods.push(method);
+    if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
+    if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: 42 });
+    if (method === "getUpdates") return await new Promise<Response>((_resolve, reject) => {
+      if (init?.signal?.aborted) reject(new DOMException("stop", "AbortError"));
+      else init?.signal?.addEventListener("abort", () => reject(new DOMException("stop", "AbortError")), { once: true });
+    });
+    if (["deleteWebhook", "setMyCommands", "sendMessage", "editForumTopic"].includes(method)) {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  const ctx = createRuntimeExtensionContext({ cwd: "/repo/preserved-leader" });
+  try {
+    await config.write({ botToken: "123:abc", botId: 123, allowedUserId: 77,
+      threads: { automaticCleanup: false } });
+    await writeRuntimeTelegramLocks({});
+    await stageRuntimeV02712Artifacts();
+    (await getRuntimeTelegramExtension())(pi);
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    const dir = join(await ensureRuntimeAgentDir(), "tmp", "telegram");
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+    const saved = Threads.createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+    await saved.load();
+    assert.equal(saved.list().length, 0);
+    const binding = saved.listWorkspaceBindings()[0]!;
+    assert.ok(binding);
+    assert.equal(binding.target.threadId, 42);
+    assert.equal(typeof binding.inactiveSinceMs, "number");
+    assert.equal(saved.listSyncObservations().some((entry) => entry.syncStatus === "deleted"), false);
+    const owners = JSON.parse(await readFile(join(dir, "owners.json"), "utf8"));
+    assert.equal(owners.default?.pid, process.pid);
+    assert.equal(owners.default?.cwd, ctx.cwd);
+    assert.equal(methods.includes("deleteForumTopic"), false);
+    assert.equal(methods.includes("closeForumTopic"), false);
+    await handlers.get("session_start")?.({}, ctx);
+    await waitForAsyncCondition(async () => {
+      await saved.refresh!();
+      return saved.list().length === 1 && saved.listWorkspaceBindings()[0]?.inactiveSinceMs === undefined;
+    }, 10_000);
+    assert.equal(saved.listWorkspaceBindings()[0]?.target.threadId, 42);
+    assert.equal(saved.listWorkspaceBindings()[0]?.slot, binding.slot);
+    assert.equal(methods.filter((method) => method === "createForumTopic").length, 1);
+  } finally {
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+    restoreFetch();
+    await config.restore();
+  }
+}, 20_000);
+
 test("Graceful follower disconnect persists intent and deletes through its live leader", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-follower-cleanup-integration-"));
   const socketPath = join(dir, "bus.sock");
@@ -1805,6 +1985,967 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     await telegramConfig.restore();
   }
 });
+
+for (const outcome of ["unchanged", "offered", "transferred", "discarded", "cancelled",
+  "offered-without-wake", "observation-failed", "prompt-unchanged", "prompt-race",
+  "prompt-completion-lost-ack", "discard-completion-lost-ack"] as const) {
+strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome})`, async () => {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-donor-projection-")));
+  const configPath = join(dir, "telegram.json");
+  const botToken = "123:fixture-donor-projection";
+  const owner = { instanceId: "donor", processId: process.pid,
+    processBirthId: `${process.pid}:fixture-donor`, sessionGeneration: 1 };
+  const recipient = { instanceId: "recipient", processId: process.pid + 1,
+    processBirthId: `${process.pid + 1}:fixture-recipient`, sessionGeneration: 1 };
+  let shutdown: (() => Promise<void>) | undefined;
+  try {
+    await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
+    const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
+    await config.load(); config.activateProfile("work");
+    const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
+    const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({
+      path: join(dir, "workspace-admission.json"), profileKey: "fixture:work", owner,
+      getProcessLiveness: () => "alive" });
+    const options: Journal.TelegramInputJournalStoreOptions = {
+      path: join(dir, "inbox.work.json"), profileName: "work", botIdentity,
+      queueRuntimeIdentity: owner, workspaceAdmission: ledger,
+      sourceAccess: { directory: dir, limits: {
+        maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
+      withSourceSerialization: config.withSourceSerialization,
+      withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
+      getInputContext: () => ({ owner, recipientBindingKey: "workspace:donor" }),
+    };
+    const source = Journal.createTelegramInputJournalStore(options);
+    const isPrompt = outcome.startsWith("prompt-");
+    source.appendBatch([{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }], 3);
+    const input = source.acquireInput({ updateId: 1, recipientBindingKey: "workspace:donor" });
+    source.startInput(input.receipt);
+    const grouped = source.acquireInput({ updateId: 3, recipientBindingKey: "workspace:donor" });
+    source.startInput(grouped.receipt);
+    const queued = source.queueInputs({ queueKind: isPrompt ? "prompt" : "control", receiptId: "donor-receipt",
+      receipts: [grouped.receipt, input.receipt] }).queueReceipt;
+    assert.deepEqual(queued.sourceUpdateIds, [1, 3]);
+    const independent = source.acquireInput({ updateId: 2, recipientBindingKey: "workspace:donor" });
+    source.startInput(independent.receipt);
+    const unrelated = source.queueInputs({ queueKind: "control", receiptId: "unrelated",
+      receipts: [independent.receipt] }).queueReceipt;
+    let readUnavailable = false;
+    // Inject only unavailable observation / a lost return after the native durable completion.
+    const boundSource: Journal.TelegramInputJournalStore = { ...source,
+      read() {
+        if (readUnavailable) throw new Error("fixture observation unavailable");
+        return source.read();
+      },
+      completeQueued(receipts) {
+        const result = source.completeQueued(receipts);
+        if (outcome.endsWith("completion-lost-ack")) throw new Error("fixture completion ACK lost");
+        return result;
+      },
+    };
+    const journalBindingKey = Journal.createTelegramUpdateJournalBindingKey(options);
+    const handoff = { queueKind: queued.queueKind, receiptId: queued.receiptId,
+      sourceUpdateIds: queued.sourceUpdateIds, expectedOwner: queued.queueOwner, recipientOwner: recipient,
+      handoffToken: Journal.createTelegramUpdateQueueHandoffToken() };
+    const resolveBinding = Updates.createTelegramInputCustodyLifecycleBindingResolver({
+      isEnabled: () => true,
+      resolveInputJournal: () => ({ runtimeKey: "donor-runtime", recoveryKey: journalBindingKey, journal: boundSource }),
+      getRecipientBindingKey: () => "workspace:donor",
+    });
+    let transport = true;
+    const admission = Updates.createTelegramUpdateAdmissionRuntimeBinding<string>({ isFollowerRegistered: () => false });
+    const assembly = Updates.createTelegramUpdateAdmissionLifecycleAssembly({ runtimeBinding: admission,
+      worker: { getQueueOwnerIdentity: () => owner, isContextCurrent: (ctx: string) => ctx === "ctx",
+        async defaultHandle() { assert.fail("Queued input must not replay its raw handler"); } },
+      leader: { resolveBinding, hasAuthority: () => transport },
+      follower: { resolveBinding: () => undefined, isRegistered: () => false,
+        getGeneration: () => undefined, prepareUpdateForExecution: update => update },
+    });
+    shutdown = admission.onSessionShutdown;
+    const store = Queue.createTelegramQueueStore<string>();
+    const deferredDispatch = Queue.createTelegramDeferredQueueDispatchRuntime<string>();
+    deferredDispatch.bind("ctx");
+    const effects: string[] = [];
+    const binding = Bindings.createTelegramQueueBindingRuntime({ store, admission, deferredDispatch,
+      queue: { allocateItemOrder: () => 1 }, activeTurn: { has: () => false },
+      lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => false },
+      transportStamp: { isActive: () => true }, isIdle: () => true, hasPendingMessages: () => false,
+      updateStatus: () => {}, sendTextReply: async () => undefined,
+      sendUserMessage: () => { effects.push("prompt"); },
+      promptDispatch: { startTypingLoop: () => {}, onPromptDispatchFailure: () => {},
+        onPromptDispatchStart: () => {
+          if (outcome === "prompt-race") assembly.leader.offerQueueReceiptHandoff(handoff);
+        } },
+    });
+    const base = { chatId: 7, replyToMessageId: 1, queueOrder: 1, laneOrder: 1,
+      statusSummary: "retained work", admissionReceipts: [{ ...queued, journalBindingKey }] };
+    const item: Queue.TelegramQueueItem<string> = isPrompt
+      ? { ...base, kind: "prompt", queueLane: "default", sourceMessageIds: [1], queuedAttachments: [],
+        content: [{ type: "text", text: "retained prompt" }], historyText: "" }
+      : { ...base, kind: "control", controlType: "status", queueLane: "control",
+        async execute() { effects.push("control"); } };
+    binding.mutation.append(item, "ctx");
+    await assembly.leader.onSessionStart("ctx");
+    await new Promise<void>(done => setImmediate(done));
+    assert.equal(admission.getSettlement()!.isItemReady(item), true);
+    // Transport loss cannot revoke otherwise valid accepted local work.
+    transport = false;
+    assembly.leader.signal();
+    await new Promise<void>(done => setImmediate(done));
+    assert.equal(assembly.leader.getState()?.blockedReason, "authority-lost");
+    if (outcome === "discarded") assembly.leader.discardQueueReceipt(handoff);
+    else if (outcome === "offered-without-wake") {
+      Journal.createTelegramInputJournalStore(options).offerQueuedHandoff(handoff);
+    } else if (outcome === "offered" || outcome === "cancelled" || outcome === "transferred") {
+      assembly.leader.offerQueueReceiptHandoff(handoff);
+      if (outcome === "cancelled") assembly.leader.cancelQueueReceiptHandoff(handoff);
+      if (outcome === "transferred") {
+        const receiver = Journal.createTelegramInputJournalStore({ ...options, queueRuntimeIdentity: recipient,
+          getInputContext: () => ({ owner: recipient, recipientBindingKey: "workspace:recipient" }) });
+        receiver.acceptQueuedHandoff(handoff);
+        // Retain donor memory, as after a lost acceptance acknowledgement.
+      }
+    }
+    const settlement = admission.getSettlement()!;
+    if (outcome === "observation-failed") {
+      const before = source.read();
+      readUnavailable = true;
+      assert.equal(settlement.isItemReady(item), false);
+      assert.equal(settlement.getQueueReceiptOwner(item.admissionReceipts![0]!), undefined);
+      assert.throws(() => binding.dispatchNext("ctx"), /observation unavailable/);
+      assert.deepEqual(effects, []);
+      assert.equal(store.getQueuedItems().length, 1);
+      assert.deepEqual(source.read(), before);
+      readUnavailable = false;
+      // A fresh observation restores unchanged accepted work without transport reacquisition or raw drain.
+      assert.equal(settlement.isItemReady(item), true);
+    }
+    const before = source.read();
+    if (outcome === "discard-completion-lost-ack") {
+      assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
+    } else binding.dispatchNext("ctx");
+    await new Promise<void>(done => setImmediate(done));
+    const executable = outcome === "unchanged" || outcome === "cancelled" ||
+      outcome === "observation-failed" || outcome === "prompt-unchanged";
+    assert.deepEqual(effects, executable ? [isPrompt ? "prompt" : "control"] : [],
+      "Durable revocation or missing completion ACK must precede effects");
+    if (!executable) {
+      assert.equal(store.getQueuedItems().length, 1);
+      assert.equal(settlement.isItemReady(item), false);
+      assert.equal(settlement.getQueueReceiptOwner(item.admissionReceipts![0]!), undefined);
+      if (outcome === "prompt-race") assert.ok(source.read().entries[0]!.queueHandoff);
+      else if (outcome.endsWith("completion-lost-ack")) {
+        assert.deepEqual(source.read().entries.map(entry => entry.updateId), [2]);
+      } else assert.deepEqual(source.read(), before);
+      const retained = source.read();
+      assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
+      assert.equal(store.getQueuedItems().length, 1);
+      assert.deepEqual(source.read(), retained);
+    } else assert.deepEqual(source.read().entries.map(entry => entry.updateId), [2]);
+    assert.equal(settlement.isItemReady({ admissionReceipts: [{ ...unrelated, journalBindingKey }] }), true);
+    if (outcome === "prompt-unchanged") {
+      const receipt = item.admissionReceipts![0]!;
+      const ids = receipt.sourceUpdateIds;
+      receipt.sourceUpdateIds = [1];
+      assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
+      receipt.sourceUpdateIds = ids;
+      item.admissionReceipts = [{ ...receipt }];
+      assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
+      item.admissionReceipts = [receipt];
+      // Confirmed completion permits local cleanup only, even after worker replacement.
+      const retained = source.read();
+      await assembly.leader.onTransportChanged("ctx");
+      await new Promise<void>(done => setImmediate(done));
+      binding.dispatchNext("ctx");
+      assert.deepEqual(effects, ["prompt"]);
+      assert.equal(binding.mutation.clear("ctx"), 1);
+      assert.deepEqual(source.read(), retained);
+    }
+    assert.deepEqual(ledger.read().leases, []);
+  } finally { await shutdown?.(); await rm(dir, { recursive: true, force: true }); }
+});
+}
+
+for (const outcome of ["accepted", "rejected", "lost-ack"] as const) {
+strictFileTest(`Control reconciliation uses native serial handoff custody (${outcome})`, async () => {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-control-reconciliation-")));
+  const botToken = "123:fixture-control-reconciliation";
+  const configPath = join(dir, "telegram.json");
+  const donorOwner = { instanceId: "donor", processId: process.pid,
+    processBirthId: `${process.pid}:fixture-donor`, sessionGeneration: 1 };
+  const recipientOwner = { instanceId: "recipient", processId: process.pid + 1,
+    processBirthId: `${process.pid + 1}:fixture-recipient`, sessionGeneration: 1 };
+  const target = { chatId: 7, threadId: 42 };
+  const lifecycles: Array<Updates.TelegramUpdateAdmissionLifecycleRuntime<string>> = [];
+  try {
+    await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
+    const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
+    await config.load(); config.activateProfile("work");
+    const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
+    const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({ path: join(dir, "admission.json"),
+      profileKey: "fixture:work", owner: donorOwner, getProcessLiveness: () => "alive" });
+    const options: Journal.TelegramInputJournalStoreOptions = {
+      path: join(dir, "inbox.work.json"), profileName: "work", botIdentity, queueRuntimeIdentity: donorOwner,
+      workspaceAdmission: ledger, sourceAccess: { directory: dir, limits: {
+        maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
+      withSourceSerialization: config.withSourceSerialization,
+      withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
+      getInputContext: () => ({ owner: donorOwner, recipientBindingKey: "workspace:donor" }),
+    };
+    const donor = Journal.createTelegramInputJournalStore(options);
+    const recipient = Journal.createTelegramInputJournalStore({ ...options, queueRuntimeIdentity: recipientOwner,
+      getInputContext: () => ({ owner: recipientOwner, recipientBindingKey: "workspace:recipient" }) });
+    const key = Journal.createTelegramUpdateJournalBindingKey(options);
+    donor.appendBatch([{ update_id: 1, message: { message_id: 11, chat: { id: 7, type: "private" },
+      from: { id: 7, is_bot: false }, text: "/status" } }], 1);
+    const input = donor.acquireInput({ updateId: 1, recipientBindingKey: "workspace:donor" });
+    donor.startInput(input.receipt);
+    const queued = donor.queueInputs({ queueKind: "control", receiptId: "fixture-control", receipts: [input.receipt] }).queueReceipt;
+    const original = donor.read().entries;
+    const createLifecycle = (journal: Journal.TelegramInputJournalStore, owner: typeof donorOwner, recipientBindingKey: string) => {
+      const lifecycle = Updates.createTelegramUpdateAdmissionLifecycleRuntime<string>({
+        resolveBinding: Updates.createTelegramInputCustodyLifecycleBindingResolver({ isEnabled: () => true,
+          resolveInputJournal: () => ({ runtimeKey: owner.instanceId, recoveryKey: key, journal }),
+          getRecipientBindingKey: () => recipientBindingKey }),
+        createWorker: (port, binding) => Updates.createTelegramUpdateAdmissionWorkerRuntime({
+          journal: port, inputCustody: binding.journal.inputCustody,
+          getJournalBindingKey: () => key, getRecipientBindingKey: () => recipientBindingKey,
+          getQueueOwnerIdentity: () => owner, hasAuthority: () => true,
+          defaultHandle: async () => { assert.fail("Queued control must not replay raw input"); },
+        }),
+      });
+      lifecycles.push(lifecycle);
+      return lifecycle;
+    };
+    const donorLifecycle = createLifecycle(donor, donorOwner, "workspace:donor");
+    const recipientLifecycle = createLifecycle(recipient, recipientOwner, "workspace:recipient");
+    const donorQueue = Queue.createTelegramQueueStore<string>();
+    const recipientQueue = Queue.createTelegramQueueStore<string>();
+    const effects: string[] = [];
+    const item: Queue.PendingTelegramControlItem<string> = { kind: "control", controlType: "status", chatId: 7,
+      target, transportStamp: { profile: "work", generation: "fixture" }, replyToMessageId: 11,
+      queueOrder: 1, queueLane: "control", laneOrder: 1, statusSummary: "status",
+      admissionReceipts: [{ ...queued, journalBindingKey: key }], execute: async () => { effects.push("donor"); } };
+    donorQueue.setQueuedItems([item]);
+    const deferredDispatch = Queue.createTelegramDeferredQueueDispatchRuntime<string>();
+    deferredDispatch.bind("recipient");
+    const queueBinding = Bindings.createTelegramQueueBindingRuntime({ store: recipientQueue, deferredDispatch,
+      admission: { getSettlement: () => recipientLifecycle,
+        hasPendingQueueMutationForItem: recipientLifecycle.hasPendingQueueMutationForItem },
+      queue: { allocateItemOrder: () => 2 }, activeTurn: { has: () => false },
+      lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => false },
+      transportStamp: { isActive: () => true }, isIdle: () => true, hasPendingMessages: () => false,
+      updateStatus: () => {}, sendTextReply: async () => undefined,
+      promptDispatch: { startTypingLoop: () => {}, onPromptDispatchFailure: () => {}, onPromptDispatchStart: () => {} },
+      sendUserMessage: () => { assert.fail("Control handoff must not start a model turn"); },
+    });
+    const accept = Updates.createTelegramQueueHandoffRecipientRuntime({
+      staging: Queue.createTelegramQueueHandoffStagingRuntime({ liveStore: recipientQueue,
+        createControlExecution: Updates.createTelegramQueueHandoffControlExecutionFactory({
+          isContextCurrent: ctx => ctx === "recipient", showStatus: async () => { effects.push("recipient"); },
+          openModelMenu: async () => { assert.fail("Wrong control reconstructed"); },
+        }) }),
+      getRecipientOwner: () => recipientOwner, getLifecycleForBinding: binding => binding === key ? recipientLifecycle : undefined,
+      isTransportStampActive: () => true, dispatchNext: queueBinding.dispatchNext,
+    });
+    let transfers = 0;
+    const reconcile = Updates.createTelegramQueueHandoffReconciler<string>({
+      ownsDirect: () => true, isFollowerRegistered: () => false, isBusEnabled: () => true,
+      listFollowers: () => [{ instanceId: "recipient", pid: recipientOwner.processId,
+        processBirthId: recipientOwner.processBirthId, sessionGeneration: 1, registrationGeneration: "g1",
+        connectedAtMs: 1, lastHeartbeatMs: 1, profileKey: "recipient", target }],
+      createRecipientJournalBindingKey: () => key, getQueuedItems: donorQueue.getQueuedItems,
+      getReceiptOwner: donorLifecycle.getQueueReceiptOwner, getLifecycleForReceipt: () => donorLifecycle,
+      donorInstanceId: "donor", createHandoffToken: Journal.createTelegramUpdateQueueHandoffToken,
+      createRequestId: () => "fixture-handoff", stageThroughFollower: async () => { throw Error("Wrong route"); },
+      async routeThroughLeader(envelope) {
+        transfers++;
+        assert.equal("execute" in envelope.payload, false);
+        const payload = structuredClone(envelope.payload);
+        const decoded = Bus.parseTelegramBusEnvelope(Bus.encodeTelegramBusEnvelope({
+          ...envelope, kind: "leader.offerQueueHandoff", payload,
+        }));
+        assert.ok(decoded?.kind === "leader.offerQueueHandoff", "The serial payload must survive the real wire codec");
+        if (outcome === "rejected") return { kind: "bus.ack", requestId: envelope.requestId, ok: false };
+        const result = await accept(decoded, "recipient");
+        if (outcome === "lost-ack") throw new Error("fixture lost acceptance ACK");
+        return { kind: "bus.ack", requestId: envelope.requestId, ok: true, result };
+      },
+      removeDonorItem: receipt => Queue.removeTelegramQueueItemByReceipt({ receipt, store: donorQueue }),
+    });
+    await donorLifecycle.onSessionStart("donor");
+    await recipientLifecycle.onSessionStart("recipient");
+    await new Promise<void>(done => setImmediate(done));
+    await reconcile("donor");
+    await new Promise<void>(done => setImmediate(done));
+    assert.equal(transfers, 1);
+    assert.deepEqual(effects, outcome === "rejected" ? [] : ["recipient"]);
+    assert.deepEqual(donorQueue.getQueuedItems(), outcome === "accepted" ? [] : [item]);
+    assert.deepEqual(recipientQueue.getQueuedItems(), []);
+    assert.deepEqual(donor.read().entries, outcome === "rejected" ? original : []);
+    assert.equal(donorLifecycle.isItemReady(item), outcome === "rejected");
+    if (outcome === "lost-ack") {
+      await reconcile("donor");
+      assert.equal(transfers, 1, "Unknown post-effect outcome must not replay transport or the control");
+      assert.deepEqual(effects, ["recipient"]);
+    }
+    assert.deepEqual(ledger.read().leases, []);
+  } finally {
+    for (const lifecycle of lifecycles) await lifecycle.onSessionShutdown();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+}
+
+for (const stopped of [false, true]) {
+strictFileTest(`Deferred media enqueue keeps custody behind its execution fence (${stopped ? "stopped" : "active"})`, async () => {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-deferred-custody-")));
+  const botToken = "123:fixture-deferred-custody";
+  const configPath = join(dir, "telegram.json");
+  const owner = { instanceId: "deferred", processId: process.pid,
+    processBirthId: `${process.pid}:fixture-deferred`, sessionGeneration: 1 };
+  const entered = Promise.withResolvers<void>();
+  const downloaded = Promise.withResolvers<void>();
+  const references = Journal.createTelegramUpdateJournalReferenceRegistry({ maxActive: 1 });
+  let shutdown: (() => Promise<void>) | undefined;
+  let clearMedia: (() => void) | undefined;
+  try {
+    await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
+    await writeFile(join(dir, "fixture.txt"), "fixture attachment");
+    const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
+    await config.load(); config.activateProfile("work");
+    const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
+    const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({ path: join(dir, "admission.json"),
+      profileKey: "fixture:work", owner, getProcessLiveness: () => "alive" });
+    const options: Journal.TelegramInputJournalStoreOptions = {
+      path: join(dir, "inbox.work.json"), profileName: "work", botIdentity, queueRuntimeIdentity: owner,
+      workspaceAdmission: ledger, sourceAccess: { directory: dir, limits: {
+        maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
+      withSourceSerialization: config.withSourceSerialization,
+      withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
+      getInputContext: () => ({ owner, recipientBindingKey: "workspace:deferred" }),
+    };
+    const source = Journal.createTelegramInputJournalStore(options);
+    const bindingKey = Journal.createTelegramUpdateJournalBindingKey(options);
+    let queuedReports = 0;
+    let queueCommits = 0;
+    let completionCommits = 0;
+    const boundSource: Journal.TelegramInputJournalStore = { ...source,
+      queueInputs(input) {
+        queueCommits++;
+        assert.equal(references.list().length, 1, "Custody transition must have a participating reference");
+        return source.queueInputs(input);
+      },
+      completeInput(input) {
+        completionCommits++;
+        assert.equal(references.list().length, 1);
+        return source.completeInput(input);
+      },
+    };
+    const message = { message_id: 11, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+      media_group_id: "fixture-album", caption: "deferred attachment",
+      document: { file_id: "fixture", file_unique_id: "fixture", file_name: "fixture.txt" } };
+    const store = Queue.createTelegramQueueStore<string>();
+    const prepareTurn = Turns.createTelegramPromptTurnRuntimePreparer<typeof message, string>({
+      allocateQueueOrder: () => 1, getAdmissionScope: () => "fixture", getAdmissionJournalBinding: () => bindingKey,
+      async downloadFile() { entered.resolve(); await downloaded.promise; return join(dir, "fixture.txt"); },
+    });
+    const enqueue = Queue.createTelegramPromptEnqueueController<typeof message, string>({
+      ...store, prepareTurn, hasPendingDispatch: () => false,
+      getFoldQueuedPromptsIntoHistory: () => false, setFoldQueuedPromptsIntoHistory: () => {},
+      assertExecutionCurrent: messages => Updates.assertTelegramUpdateExecutionCurrent(messages[0]),
+      updateStatus: () => {}, dispatchNextQueuedTelegramTurn: () => {},
+    });
+    const groups = Media.createTelegramMediaGroupController<typeof message, string>({
+      setTimer: () => ({ unref() {} }) as ReturnType<typeof setTimeout>, clearTimer: () => {},
+    });
+    clearMedia = groups.clear;
+    const media = Media.createTelegramMediaGroupDispatchRuntime({ mediaGroups: groups,
+      onDeferredMessage: Updates.reportTelegramUpdateDeferred,
+      async dispatchMessages(messages: typeof message[], ctx: string) {
+        await enqueue.enqueue(messages, ctx, turn => {
+          queuedReports++;
+          Updates.reportTelegramQueueAdmission(messages, turn.admissionReceipts ?? []);
+        });
+      },
+    });
+    const admission = Updates.createTelegramUpdateAdmissionRuntimeBinding<string>({ isFollowerRegistered: () => false });
+    const assembly = Updates.createTelegramUpdateAdmissionLifecycleAssembly({ runtimeBinding: admission,
+      acquireSourceReference: (_role, binding) => references.acquire({
+        referenceClass: "leader-lifecycle", recoveryKey: binding.recoveryKey }),
+      worker: { getQueueOwnerIdentity: () => owner,
+        defaultHandle: async (update: Updates.TelegramUpdateFlow, ctx: string) => {
+          await media.handleMessage(update.message as typeof message, ctx);
+        } },
+      leader: { hasAuthority: () => true,
+        resolveBinding: Updates.createTelegramInputCustodyLifecycleBindingResolver({ isEnabled: () => true,
+          resolveInputJournal: () => ({ runtimeKey: "fixture", recoveryKey: bindingKey, journal: boundSource }),
+          getRecipientBindingKey: () => "workspace:deferred" }) },
+      follower: { resolveBinding: () => undefined, isRegistered: () => false,
+        getGeneration: () => undefined, prepareUpdateForExecution: update => update },
+    });
+    shutdown = admission.onSessionShutdown;
+    source.appendBatch([{ update_id: 1, message }], 1);
+    await assembly.leader.onSessionStart("ctx");
+    await new Promise<void>(done => setImmediate(done));
+    assert.equal(assembly.leader.getState()?.deferredClaimCount, 1);
+    const retained = source.read();
+    assert.equal(retained.entries[0]?.inputClaim?.phase, "running");
+    const flushing = groups.flushMessage(11).then(value => ({ value }), error => ({ error }));
+    await entered.promise;
+    if (stopped) { groups.clear(); await assembly.leader.onSessionShutdown(); }
+    downloaded.resolve();
+    const result = await flushing;
+    await new Promise<void>(done => setImmediate(done));
+    assert.equal(completionCommits, 0);
+    if (stopped) {
+      assert.ok("error" in result && result.error instanceof Error && result.error.name === "AbortError");
+      assert.deepEqual(store.getQueuedItems(), []);
+      assert.deepEqual(source.read(), retained, "Expired preparation must not settle outcome-unknown custody");
+      assert.deepEqual([queuedReports, queueCommits], [0, 0]);
+      assert.deepEqual(references.list(), []);
+    } else {
+      assert.deepEqual(result, { value: true });
+      assert.deepEqual([queuedReports, queueCommits], [1, 1]);
+      assert.equal(source.read().entries[0]?.state, "queued");
+      assert.equal(admission.getSettlement()?.isItemReady(store.getQueuedItems()[0]!), true);
+      assert.equal(references.list().length, 1);
+    }
+    assert.deepEqual(ledger.read().leases, []);
+  } finally {
+    downloaded.resolve(); clearMedia?.(); await shutdown?.(); await rm(dir, { recursive: true, force: true });
+  }
+});
+}
+
+for (const outcome of ["ready", "context-replaced", "preparation-failed", "context-refresh", "same-context-refresh", "refresh-failed"] as const) {
+strictFileTest(`Follower registration fences native binding readiness (${outcome})`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-registration-readiness-"));
+  const ctx = { cwd: "/fixture" };
+  const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken: "123:fixture-readiness" });
+  const oldJournal = Journal.createTelegramUpdateJournalStore({ path: join(dir, "old.json"), botIdentity });
+  const nextJournal = Journal.createTelegramUpdateJournalStore({ path: join(dir, "next.json"), botIdentity });
+  oldJournal.appendBatch([{ update_id: 1 }]);
+  let selected = oldJournal;
+  let releaseHandler!: () => void;
+  const heldHandler = new Promise<void>(resolve => { releaseHandler = resolve; });
+  let executions = 0;
+  const executionContexts: typeof ctx[] = [];
+  let activeCtx = ctx;
+  let sessionGeneration = 1;
+  // A prior generation's real unsettled handler keeps the replacement stop pending.
+  let authority = true;
+  const blockedLifecycle = Updates.createTelegramUpdateAdmissionLifecycleRuntime<typeof ctx>({
+    resolveBinding: () => ({ runtimeKey: selected === oldJournal ? "old" : "next",
+      recoveryKey: selected === oldJournal ? "old" : "next", journal: selected }),
+    createWorker: journal => Updates.createTelegramUpdateWorkerRuntime({ journal,
+      hasAuthority: () => authority,
+      executeUpdate: async (_update, current) => {
+        executions++; executionContexts.push(current); await heldHandler; return { kind: "complete" };
+      },
+    }),
+  });
+  const registrationState = BusFollower.createTelegramBusFollowerRegistrationState();
+  const protocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "fixture",
+    capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] });
+  const leaderPath = join(dir, "leader.sock");
+  const followerPath = join(dir, "follower.sock");
+  const leader = Bus.createTelegramBusLocalServer({ socketPath: leaderPath,
+    handleEnvelope: BusLeader.createTelegramBusLeaderEnvelopeHandler({
+      authSecret: "fixture", protocolIdentity: protocol, followerRegistry: Bus.createTelegramBusFollowerRegistry(),
+      provisionFollowerTarget: () => ({ chatId: 7, threadId: 42, slot: "A" }),
+    }),
+  });
+  let enteredRegistration!: () => void;
+  const registrationEntered = new Promise<void>(resolve => { enteredRegistration = resolve; });
+  let sequence = 0;
+  let contextActive = true;
+  let failRefresh = false;
+  const assembly = BusFollower.createTelegramBusFollowerRuntimeAssembly({ instanceId: "fixture-follower", registrationState,
+    recordRuntimeEvent: () => {},
+    receiver: { socketPath: followerPath, getAuthSecret: () => "fixture", getContext: () => activeCtx,
+      getRecipientBindingKey: () => "fixture:recipient",
+      durableAdmission: BusFollower.createTelegramBusFollowerDurableAdmissionRuntime({
+        journal: blockedLifecycle, signalWorker: () => blockedLifecycle.signal(),
+      }),
+    },
+    targetReplacement: { topicTargetStore: { load: async () => {}, list: () => [], markStaleByTarget: () => false,
+      upsert: record => record, persist: async () => {} }, getManualFollowerProfileKey: () => "fixture:recipient",
+      manualFollowerOwnerId: "fixture", getSyncState: () => ({}), setSyncState: () => {}, updateStatus: () => {} },
+    recovery: { getLeaderState: () => ({ kind: "inactive" }), setLifecyclePhase: () => {},
+      updateStatus: () => {}, promoteToLeader: async () => false },
+    registration: { protocolIdentity: protocol, getFollowerBusSocketPath: () => followerPath,
+      createRequestId: () => `fixture:${++sequence}`, getProfileKey: () => "fixture:recipient",
+      getSessionId: () => "fixture-session", getSessionGeneration: () => sessionGeneration,
+      isContextActive: current => current === activeCtx && contextActive,
+      async onRegistered(current) {
+        const replacement = blockedLifecycle.onTransportChanged(current);
+        enteredRegistration();
+        await replacement;
+        if (outcome === "preparation-failed" || failRefresh) throw new Error("fixture binding preparation failed");
+      },
+    },
+  });
+  let registration: Promise<boolean> | undefined;
+  try {
+    await blockedLifecycle.onSessionStart(ctx);
+    await new Promise<void>(done => setImmediate(done));
+    assert.equal(executions, 1);
+    await blockedLifecycle.onSessionShutdown();
+    await blockedLifecycle.onSessionStart(ctx);
+    await new Promise<void>(done => setImmediate(done));
+    assert.equal(blockedLifecycle.getState()?.blockedReason, "prior-generation-executing");
+    selected = nextJournal;
+    authority = false;
+    await leader.start();
+    registration = assembly.registration.registerWithLeader(ctx, { busSocketPath: leaderPath, busSecret: "fixture" });
+    await registrationEntered;
+    const generation = registrationState.getGeneration()!;
+    assert.ok(generation);
+    const send = (sourceUpdateId = 2) => Bus.sendTelegramBusLocalEnvelope({ socketPath: followerPath, timeoutMs: 1000,
+      envelope: { kind: "leader.forwardMessage", requestId: `delivery:${++sequence}`, auth: "fixture",
+        recipientInstanceId: "fixture-follower", recipientRegistrationGeneration: generation,
+        delivery: Bus.createTelegramBusFollowerDeliveryIdentity({ kind: "leader.forwardMessage",
+          recipientBindingKey: "fixture:recipient", sourceUpdateId }),
+        message: { message_id: sourceUpdateId, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+          text: "new binding only", pi_telegram_source_update_id: sourceUpdateId }, sentAtMs: 1 },
+    });
+    const before = oldJournal.read();
+    const pending = await send();
+    assert.equal(pending?.kind === "bus.ack" && pending.ok, false,
+      "Published registration must not admit work into a retained old binding");
+    assert.deepEqual(oldJournal.read(), before);
+    assert.deepEqual(nextJournal.read().entries, []);
+    if (outcome === "context-replaced") contextActive = false;
+    releaseHandler();
+    const prepared = outcome !== "context-replaced" && outcome !== "preparation-failed";
+    if (outcome === "preparation-failed") {
+      await assert.rejects(registration, /fixture binding preparation failed/);
+      assert.equal(registrationState.getGeneration(), undefined);
+    } else if (outcome === "context-replaced") {
+      assert.equal(await registration, false);
+      assert.equal(registrationState.getGeneration(), undefined);
+    } else {
+      assert.equal(await registration, true);
+      const ready = await send();
+      assert.equal(ready?.kind === "bus.ack" && ready.ok, prepared);
+    }
+    assert.deepEqual(oldJournal.read(), before);
+    assert.deepEqual(nextJournal.read().entries.map(entry => entry.updateId), prepared ? [2] : []);
+    assert.equal(executions, 1);
+    if (outcome === "context-refresh" || outcome === "same-context-refresh" || outcome === "refresh-failed") {
+      await blockedLifecycle.onSessionShutdown();
+      if (outcome !== "same-context-refresh") activeCtx = { cwd: ctx.cwd };
+      sessionGeneration++;
+      const retained = nextJournal.read();
+      const early = await send(3);
+      assert.equal(early?.kind === "bus.ack" && early.ok, false,
+        "An unchanged registration cannot admit into a stopped previous-session worker");
+      assert.deepEqual(nextJournal.read(), retained);
+      const refreshErrors: unknown[] = [];
+      const refresh = BusFollower.createTelegramBusFollowerSessionRefreshHook({ registrationState,
+        registrationRuntime: assembly.registration, getLeaderState: () => ({ kind: "inactive" }),
+        isSessionActive: current => current === activeCtx, updateStatus: () => {},
+        recordRuntimeEvent: (_category, value) => { if (value instanceof Error) refreshErrors.push(value); } });
+      if (outcome === "refresh-failed") {
+        failRefresh = true;
+        await refresh({}, activeCtx);
+        assert.equal(refreshErrors.length, 1);
+        assert.equal(registrationState.getGeneration(), generation);
+        const refused = await send(3);
+        assert.equal(refused?.kind === "bus.ack" && refused.ok, false);
+        assert.deepEqual(nextJournal.read(), retained);
+        failRefresh = false;
+      }
+      await refresh({}, activeCtx);
+      assert.equal(registrationState.getGeneration(), generation, "Session refresh must preserve bus membership");
+      assert.notEqual(blockedLifecycle.getState()?.phase, "stopped", "Refresh must prepare the current worker");
+      const after = await send(3);
+      assert.equal(after?.kind === "bus.ack" && after.ok, true);
+      authority = true; blockedLifecycle.signal();
+      await new Promise<void>(done => setImmediate(done));
+      assert.deepEqual(nextJournal.read().entries, []);
+      assert.deepEqual(executionContexts, [ctx, activeCtx, activeCtx]);
+    }
+  } finally {
+    releaseHandler();
+    await registration?.catch(() => undefined);
+    assembly.registration.stop();
+    await assembly.receiver.stop(); await leader.stop();
+    await blockedLifecycle.onSessionShutdown();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+}
+
+for (const scenario of ["business-same-chat", "business-other-chat", "business-discard-failure",
+  "reaction-held", "reaction-failed", "reaction-excluded", "reaction-excluded-repaired", "source-reference-released", "handoff-cancel-after-stop", "handoff-cancel-reference-denied",
+  "handoff-accepted-lost-ack-after-stop", "denial-completion-active", "denial-completion-stopped"] as const) {
+  strictFileTest(`Prepared pending mutations preserve namespace and accepted work (${scenario})`, async () => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-pending-mutation-")));
+    const configPath = join(dir, "telegram.json");
+    const botToken = "123:fixture-pending-mutation";
+    const owner = { instanceId: "pending", processId: process.pid,
+      processBirthId: `${process.pid}:fixture-pending`, sessionGeneration: 1 };
+    let shutdown: (() => Promise<void>) | undefined;
+    let releaseReaction!: () => void;
+    const heldReaction = new Promise<void>(resolve => { releaseReaction = resolve; });
+    let businessObserved = 0;
+    const unregister = Updates.registerTelegramUpdateHandler(update => {
+      if (update && typeof update === "object" && "deleted_business_messages" in update) businessObserved++;
+    });
+    try {
+      await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
+      const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
+      await config.load(); config.activateProfile("work");
+      const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
+      const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({
+        path: join(dir, "workspace-admission.json"), profileKey: "fixture:work", owner,
+        getProcessLiveness: () => "alive" });
+      const options: Journal.TelegramInputJournalStoreOptions = {
+        path: join(dir, "inbox.work.json"), profileName: "work", botIdentity,
+        queueRuntimeIdentity: owner, workspaceAdmission: ledger,
+        sourceAccess: { directory: dir, limits: {
+          maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
+        withSourceSerialization: config.withSourceSerialization,
+        withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
+        getInputContext: () => ({ owner, recipientBindingKey: "workspace:pending" }),
+      };
+      const source = Journal.createTelegramInputJournalStore(options);
+      const journalBindingKey = Journal.createTelegramUpdateJournalBindingKey(options);
+      source.appendBatch([1, 2].map(update_id => ({ update_id, message: {
+        chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, message_id: update_id + 10,
+        text: update_id === 1 ? "governed" : "independent",
+      } })), 2);
+      const items = [1, 2].map(id => {
+        const input = source.acquireInput({ updateId: id, recipientBindingKey: "workspace:pending" });
+        source.startInput(input.receipt);
+        const receipt = source.queueInputs({ queueKind: "prompt", receiptId: `pending-${id}`,
+          receipts: [input.receipt] }).queueReceipt;
+        const item: Queue.PendingTelegramTurn = {
+          kind: "prompt", chatId: 7, replyToMessageId: id + 10, sourceMessageIds: [id + 10],
+          queueOrder: id, queueLane: id === 1 ? "default" : "priority", laneOrder: id,
+          statusSummary: id === 1 ? "governed" : "independent", queuedAttachments: [], historyText: "",
+          content: [{ type: "text", text: id === 1 ? "governed" : "independent" }],
+          admissionReceipts: [{ ...receipt, journalBindingKey }],
+        };
+        return item;
+      });
+      const queuedEntries = source.read().entries;
+      const completionAttempts: number[][] = [];
+      const references = Journal.createTelegramUpdateJournalReferenceRegistry({ maxActive: 1 });
+      let refuseObservation = false;
+      let observationReads = 0;
+      let cancellationCalls = 0;
+      let nativeCancellationCalls = 0;
+      const rawCompletionReferences: number[] = [];
+      const boundSource: Journal.TelegramInputJournalStore = { ...source,
+        read() {
+          if (scenario === "source-reference-released") {
+            assert.equal(references.list().length, 1, "Every actual source read needs a live participating reference");
+            observationReads++;
+            if (refuseObservation) throw new Error("fixture observation unavailable");
+          }
+          return source.read();
+        },
+        cancelQueuedHandoff(input) {
+          if (scenario.startsWith("handoff-")) {
+            cancellationCalls++;
+            assert.equal(references.list().some(ref => ref.recoveryKey === journalBindingKey), true,
+              "Late donor cancellation must hold its source reference");
+          }
+          nativeCancellationCalls++;
+          return source.cancelQueuedHandoff(input);
+        },
+        completeInput(receipt) {
+          rawCompletionReferences.push(references.list().length);
+          return source.completeInput(receipt);
+        },
+        completeQueued(receipts) {
+          completionAttempts.push(receipts.flatMap(receipt => [...receipt.sourceUpdateIds]));
+          if (scenario === "business-discard-failure") throw new Error("fixture discard refused");
+          return source.completeQueued(receipts);
+        },
+      };
+      const resolveBinding = Updates.createTelegramInputCustodyLifecycleBindingResolver({
+        isEnabled: () => true,
+        resolveInputJournal: () => ({ runtimeKey: "pending-runtime", recoveryKey: journalBindingKey, journal: boundSource }),
+        getRecipientBindingKey: () => "workspace:pending",
+      });
+      const removalAttempts: number[][] = [];
+      let reactionCalls = 0;
+      let denialReplies = 0;
+      let binding!: Bindings.TelegramQueueBindingRuntime<string>;
+      const updates = Updates.createTelegramPairedUpdateRuntime<string>({
+        getAllowedUserId: config.getAllowedUserId, persistAllowedUserId: config.persistAllowedUserId,
+        updateStatus: () => {}, removePendingMediaGroupMessages: ids => { removalAttempts.push(ids); },
+        removeQueuedTelegramTurnsByMessageIds: (ids, ctx, scope) => {
+          removalAttempts.push(ids); return binding.mutation.removeByMessageIds(ids, ctx, scope);
+        },
+        applyQueuedTelegramTurnReactionByMessageId: (id, disposition, ctx, scope) =>
+          binding.mutation.applyReactionByMessageId(id, disposition, ctx, scope),
+        flushPendingMediaGroupMessage: async () => {
+          reactionCalls++; await heldReaction;
+          if (scenario === "reaction-failed") throw new Error("fixture mutation outcome unknown");
+          return false;
+        },
+        answerCallbackQuery: async () => {}, answerGuestQuery: async () => {},
+        handleAuthorizedTelegramCallbackQuery: async () => {},
+        sendTextReply: async () => { denialReplies++; await heldReaction; return undefined; },
+        handleAuthorizedTelegramMessage: async () => { assert.fail("Queued input must not replay"); },
+        handleAuthorizedTelegramEditedMessage: () => {},
+      });
+      let transport = true;
+      const admission = Updates.createTelegramUpdateAdmissionRuntimeBinding<string>({ isFollowerRegistered: () => false });
+      const assembly = Updates.createTelegramUpdateAdmissionLifecycleAssembly({ runtimeBinding: admission,
+        acquireSourceReference(role, binding) {
+          return references.acquire({ referenceClass: role === "leader" ? "leader-lifecycle" : "follower-lifecycle",
+            recoveryKey: binding.recoveryKey });
+        },
+        worker: { getQueueOwnerIdentity: () => owner, isContextCurrent: (ctx: string) => ctx === "ctx",
+          defaultHandle: updates.handleUpdate },
+        leader: { resolveBinding, hasAuthority: () => transport },
+        follower: { resolveBinding: () => undefined, isRegistered: () => false,
+          getGeneration: () => undefined, prepareUpdateForExecution: update => update },
+      });
+      shutdown = admission.onSessionShutdown;
+      const store = Queue.createTelegramQueueStore<string>();
+      const deferredDispatch = Queue.createTelegramDeferredQueueDispatchRuntime<string>();
+      deferredDispatch.bind("ctx");
+      const effects: string[] = [];
+      binding = Bindings.createTelegramQueueBindingRuntime({ store, admission, deferredDispatch,
+        queue: { allocateItemOrder: () => 3 }, activeTurn: { has: () => false },
+        lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => false },
+        transportStamp: { isActive: () => true }, isIdle: () => true, hasPendingMessages: () => false,
+        updateStatus: () => {}, sendTextReply: async () => undefined,
+        promptDispatch: { startTypingLoop: () => {}, onPromptDispatchFailure: () => {}, onPromptDispatchStart: () => {} },
+        sendUserMessage: content => {
+          effects.push(content.map(part => part.type === "text" ? part.text : "image").join(""));
+          // Simulate agent_start consuming only the successfully handed-off prompt.
+          store.setQueuedItems(store.getQueuedItems().filter(item => item.kind !== "prompt" || item.content !== content));
+        },
+      });
+      for (const item of items) binding.mutation.append(item, "ctx");
+      await assembly.leader.onSessionStart("ctx");
+      await new Promise<void>(done => setImmediate(done));
+      transport = false;
+      assembly.leader.signal();
+      await new Promise<void>(done => setImmediate(done));
+      if (scenario.startsWith("denial-completion-")) {
+        source.appendBatch([{ update_id: 3, message: { message_id: 13, chat: { id: 8, type: "private" },
+          from: { id: 8, is_bot: false }, text: "unauthorized" } }], 3);
+        transport = true; assembly.leader.signal();
+        await new Promise<void>(done => setImmediate(done));
+        assert.equal(denialReplies, 1, "The real denial branch must reach its awaited reply");
+        const retained = source.read();
+        const running = retained.entries.find(entry => entry.updateId === 3)!;
+        assert.equal(running.inputClaim?.phase, "running");
+        const stopped = scenario === "denial-completion-stopped";
+        if (stopped) {
+          await assembly.leader.onSessionShutdown();
+          assert.deepEqual(references.list(), []);
+        }
+        releaseReaction();
+        await new Promise<void>(done => setImmediate(done));
+        if (stopped) {
+          assert.deepEqual(source.read(), retained,
+            "An awaited denial returning after stop must not complete retained running custody");
+          assert.deepEqual(rawCompletionReferences, [], "No completion attempt may outlive execution authority");
+          await assembly.leader.onSessionStart("ctx");
+          await new Promise<void>(done => setImmediate(done));
+        } else {
+          assert.deepEqual(source.read().entries, queuedEntries);
+          assert.deepEqual(rawCompletionReferences, [1]);
+        }
+        transport = false; assembly.leader.signal();
+        await new Promise<void>(done => setImmediate(done));
+        binding.dispatchNext("ctx"); binding.dispatchNext("ctx");
+        assert.deepEqual(effects, ["independent", "governed"]);
+        assert.deepEqual(source.read().entries, stopped ? [running] : []);
+        assert.equal(denialReplies, 1, "Restart must not replay the interrupted denial");
+        return;
+      }
+      if (scenario.startsWith("handoff-")) {
+        const retainedItems = store.getQueuedItems();
+        const recipientOwner = { ...owner, instanceId: "recipient", processId: process.pid + 1,
+          processBirthId: `${process.pid + 1}:fixture-recipient` };
+        let rejectRemote!: (error: Error) => void;
+        const remote = new Promise<Queue.TelegramQueueHandoffStageResult>((_resolve, reject) => { rejectRemote = reject; });
+        const receipt = items[0]!.admissionReceipts![0]!;
+        const expectedOwner = assembly.leader.getQueueReceiptOwner(receipt)!;
+        assert.ok(expectedOwner);
+        const handoff = Updates.coordinateTelegramQueueHandoff({
+          item: { ...items[0]!, target: { chatId: 7, threadId: 42 },
+            transportStamp: { profile: "work", generation: "fixture" } },
+          expectedOwner, recipientOwner, handoffToken: Journal.createTelegramUpdateQueueHandoffToken(),
+          lifecycle: assembly.leader,
+          stageRemote(input) {
+            if (scenario === "handoff-accepted-lost-ack-after-stop") {
+              const recipient = Journal.createTelegramInputJournalStore({ ...options,
+                queueRuntimeIdentity: recipientOwner,
+                getInputContext: () => ({ owner: recipientOwner, recipientBindingKey: "workspace:recipient" }) });
+              recipient.acceptQueuedHandoff({ queueKind: receipt.queueKind, receiptId: receipt.receiptId,
+                sourceUpdateIds: receipt.sourceUpdateIds, expectedOwner, recipientOwner, handoffToken: input.handoffToken });
+            }
+            return remote;
+          },
+          removeDonorItem: () => { assert.fail("A rejected/lost ACK must retain donor memory"); },
+        });
+        await assembly.leader.onSessionShutdown();
+        assert.deepEqual(references.list(), []);
+        const retained = source.read();
+        const occupy = scenario === "handoff-cancel-reference-denied"
+          ? references.acquire({ referenceClass: "polling-cursor", recoveryKey: "fixture:other" }) : undefined;
+        rejectRemote(new Error("fixture remote ACK unavailable"));
+        const result = await handoff;
+        assert.equal(result.status, "retained");
+        assert.equal(result.status === "retained" && result.cancelled, scenario === "handoff-cancel-after-stop");
+        assert.equal(cancellationCalls, scenario === "handoff-cancel-reference-denied" ? 0 : 1);
+        assert.equal(nativeCancellationCalls, scenario === "handoff-cancel-reference-denied" ? 0 : 1,
+          "A retained post-accept result must come from the native CAS, not a swallowed reference assertion");
+        occupy?.();
+        assert.deepEqual(references.list(), []);
+        if (scenario === "handoff-cancel-after-stop") assert.deepEqual(source.read().entries, queuedEntries);
+        else assert.deepEqual(source.read(), retained, "Denied or post-accept cancellation cannot rewrite durable custody");
+        assert.deepEqual(store.getQueuedItems(), retainedItems);
+        assert.deepEqual(effects, []);
+        assert.equal(admission.getSettlement()?.isItemReady(items[0]!), false);
+        return;
+      }
+      if (scenario === "source-reference-released") {
+        await assembly.leader.onSessionShutdown();
+        assert.deepEqual(references.list(), []);
+        const stoppedReads = observationReads;
+        assert.equal(admission.getSettlement()?.isItemReady(items[0]!), false);
+        assert.equal(assembly.leader.getQueueReceiptOwner(items[0]!.admissionReceipts![0]!), undefined);
+        assert.equal(observationReads, stoppedReads, "Stopped receipt projections must not read a released source");
+        binding.dispatchNext("ctx");
+        assert.deepEqual(effects, [], "Observation cannot restore stopped execution authority");
+        assert.ok(observationReads > stoppedReads, "Actual queue dispatch observes pending mutations");
+        assert.deepEqual(references.list(), [], "A stopped-source observation releases its scoped reference");
+        const occupy = references.acquire({ referenceClass: "polling-cursor", recoveryKey: "fixture:other" });
+        const deniedReads = observationReads;
+        assert.throws(() => admission.hasPendingQueueMutationForItem(items[0]!), /reference registry is unavailable or full/);
+        assert.equal(observationReads, deniedReads, "Reference denial must precede source I/O");
+        occupy();
+        refuseObservation = true;
+        assert.throws(() => admission.hasPendingQueueMutationForItem(items[0]!), /fixture observation unavailable/);
+        assert.deepEqual(references.list(), [], "Failed observations also release their reference");
+        refuseObservation = false;
+        assert.equal(assembly.leader.getJournalEntryCount(), 2);
+        assert.deepEqual(source.read().entries, queuedEntries);
+        assert.deepEqual(references.list(), []);
+        transport = true;
+        await assembly.leader.onSessionStart("ctx");
+        await new Promise<void>(done => setImmediate(done));
+        transport = false;
+        assembly.leader.signal();
+        await new Promise<void>(done => setImmediate(done));
+        binding.dispatchNext("ctx");
+        binding.dispatchNext("ctx");
+        assert.deepEqual(effects, ["independent", "governed"], "Restart preserves accepted work across transport loss");
+        assert.deepEqual(source.read().entries, []);
+        await assembly.leader.onTransportChanged(undefined);
+        assert.deepEqual(references.list(), []);
+        const forgottenReads = observationReads;
+        assert.equal(admission.hasPendingQueueMutationForItem(items[0]!), false);
+        assert.throws(() => assembly.leader.getJournalEntryCount(), /worker is not active/);
+        assert.equal(observationReads, forgottenReads, "A forgotten source cannot be observed");
+        return;
+      }
+      const business = scenario.startsWith("business-");
+      const mutation = business
+        ? { update_id: 3, deleted_business_messages: { business_connection_id: "separate-business-account",
+          chat: { id: scenario === "business-other-chat" ? 8 : 7, type: "private" }, message_ids: [11] } }
+        : { update_id: 3, message_reaction: { chat: { id: 7, type: "private" }, user: { id: 7, is_bot: false },
+          message_id: 11, old_reaction: [], new_reaction: [{ type: "emoji", emoji: "👎" }] } };
+      const excluded = scenario === "reaction-excluded" || scenario === "reaction-excluded-repaired";
+      if (excluded) {
+        config.setProfile("work", { botToken });
+        await config.persist();
+        assert.equal(config.getAllowedUserId(), undefined);
+      }
+      source.appendBatch([mutation], 3);
+      if (excluded) {
+        const veto = source.read().entries.find(entry => entry.updateId === 3)!;
+        assert.equal(veto.preApprovalExcluded, true);
+        if (scenario === "reaction-excluded-repaired") {
+          assert.equal(await config.persistAllowedUserId(7), true);
+          source.appendBatch([mutation], 3);
+        }
+        const reopened = Journal.createTelegramInputJournalStore(options);
+        assert.deepEqual(reopened.read().entries.find(entry => entry.updateId === 3), veto,
+          "Re-pairing, duplicate append and reopening cannot turn an excluded mutation into intent");
+        const beforeMixedRemoval = source.read();
+        assert.throws(() => Updates.createTelegramInputCustodyWorkerJournalPort(source).removeCompleted([3, 1]));
+        assert.deepEqual(source.read(), beforeMixedRemoval, "A mixed request cannot partially remove the exclusion");
+        binding.dispatchNext("ctx");
+        binding.dispatchNext("ctx");
+        assert.deepEqual(effects, ["independent", "governed"],
+          "An immutable exclusion cannot strand previously accepted work after transport loss");
+        assert.equal(admission.hasPendingQueueMutationForItem(items[0]!), false);
+        assert.deepEqual(store.getQueuedItems(), []);
+        assert.deepEqual(source.read().entries, [veto], "Observation does not settle or rewrite the excluded input");
+        if (scenario === "reaction-excluded-repaired") await assembly.leader.onSessionShutdown();
+        transport = true;
+        if (scenario === "reaction-excluded-repaired") await assembly.leader.onSessionStart("ctx");
+        else assembly.leader.signal();
+        await new Promise<void>(done => setImmediate(done));
+        assert.deepEqual(source.read().entries, [], "Restoration or restart must drain excluded input without execution");
+        assert.equal(source.read().acceptedThroughUpdateId, 3);
+        assert.deepEqual(effects, ["independent", "governed"]);
+        assert.equal(reactionCalls, 0);
+        assert.deepEqual(ledger.read().leases, []);
+        return;
+      }
+      assert.equal(admission.hasPendingQueueMutationForItem(items[0]!), !business);
+      assert.equal(admission.hasPendingQueueMutationForItem(items[1]!), false);
+      if (!business) {
+        binding.dispatchNext("ctx");
+        binding.dispatchNext("ctx");
+        assert.deepEqual(effects, ["independent"], "Transport loss preserves unrelated accepted progress");
+        assert.equal(store.getQueuedItems().length, 1);
+      }
+      transport = true;
+      assembly.leader.signal();
+      if (business) {
+        await new Promise<void>(done => setImmediate(done));
+        assert.deepEqual({ removalAttempts, completionAttempts,
+          queued: store.getQueuedItems().map(item => item.queueOrder).sort(),
+          durable: source.read().entries.map(entry => entry.updateId),
+        }, { removalAttempts: [], completionAttempts: [], queued: [1, 2], durable: [1, 2] },
+        "Business deletion cannot govern an independent bot-chat namespace, even with equal chat/message IDs");
+        assert.deepEqual(source.read().entries, queuedEntries);
+        assert.equal(businessObserved, 1, "Raw companion handlers retain their observation surface");
+      } else {
+        await new Promise<void>(done => setImmediate(done));
+        assert.equal(reactionCalls, 1, "A newer explicit wake must survive an older authority-lost drain result");
+        assert.equal(source.read().entries.find(entry => entry.updateId === 3)?.inputClaim?.phase, "running");
+        binding.dispatchNext("ctx");
+        assert.deepEqual(effects, ["independent"]);
+        releaseReaction();
+        await new Promise<void>(done => setImmediate(done));
+        if (scenario === "reaction-held") {
+          assert.equal(admission.hasPendingQueueMutationForItem(items[0]!), false);
+          binding.dispatchNext("ctx");
+          assert.deepEqual(store.getQueuedItems(), []);
+          assert.deepEqual(source.read().entries, []);
+        } else {
+          assembly.leader.signal();
+          await new Promise<void>(done => setImmediate(done));
+          assert.equal(reactionCalls, 1, "Outcome-unknown mutation cannot be replayed");
+          assert.equal(admission.hasPendingQueueMutationForItem(items[0]!), true);
+          binding.dispatchNext("ctx");
+          assert.equal(store.getQueuedItems().length, 1);
+          assert.deepEqual(source.read().entries.map(entry => entry.updateId), [1, 3]);
+        }
+        assert.deepEqual(effects, ["independent"], "The governed prompt must not run after Skip or unknown intent");
+      }
+      assert.deepEqual(ledger.read().leases, []);
+    } finally {
+      releaseReaction(); unregister(); await shutdown?.(); await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 async function assertAsynchronousEnqueueProgress(foldHistory: boolean, deferAgentStart = false): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-enqueue-race-"));
@@ -4462,18 +5603,21 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       {
         message: finalMessage,
         assistantMessageEvent: {
-          type: "done",
-          reason: "stop",
-          message: finalMessage,
+          type: "toolcall_start",
+          contentIndex: 1,
+          partial: finalMessage,
         },
       },
       activeCtx,
     );
-    await handlers.get("agent_end")?.(
-      { messages: [finalMessage] },
-      activeCtx,
-    );
     await waitForCondition(() => deliveredMarkdown.length === 2);
+    await Promise.all([
+      handlers.get("agent_end")?.({ messages: [finalMessage] }, activeCtx),
+      handlers.get("agent_end")?.({ messages: [finalMessage] }, activeCtx),
+    ]);
+    await waitForCondition(() => deliveredMarkdown.length >= 2);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(deliveredMarkdown.length, 2, "One active Telegram turn may publish its final answer only once");
     assert.deepEqual(deliveredMarkdown, [
       "Checkpoint **visible**",
       "Final **answer**",

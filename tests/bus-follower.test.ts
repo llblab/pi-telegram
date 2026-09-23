@@ -2007,6 +2007,81 @@ test("Bus follower target replacement resolves named-profile fallback at call ti
   assert.equal(upserts[0]?.profileKey, "profile:work:manual-follower:owner-a");
 });
 
+for (const scenario of ["stable", "session-drift", "superseded", "stopped", "startup-drift", "refreshed-during-heartbeat"] as const) {
+test(`Registration response retains exact request/session authority (${scenario})`, { timeout: 5000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-registration-authority-"));
+  const socketPath = join(dir, "leader.sock");
+  const entered = Promise.withResolvers<void>();
+  const released = Promise.withResolvers<void>();
+  const state = createTelegramBusFollowerRegistrationState();
+  const ctx = { cwd: "/fixture" };
+  let sessionGeneration = 1;
+  let sequence = 0;
+  let receivingStops = 0;
+  const requests: Array<number | undefined> = [];
+  const prepared: number[] = [];
+  const server = createTelegramBusLocalServer({ socketPath, async handleEnvelope(envelope) {
+    if (envelope.kind === "follower.register") {
+      requests.push(envelope.registration.sessionGeneration);
+      if (requests.length === 1 && scenario !== "startup-drift" && scenario !== "refreshed-during-heartbeat") {
+        entered.resolve(); await released.promise;
+      }
+    }
+    if (envelope.kind === "follower.heartbeat" && scenario === "refreshed-during-heartbeat") {
+      entered.resolve(); await released.promise;
+    }
+    return { kind: "bus.ack", requestId: envelope.requestId, ok: true,
+      protocol: TEST_BUS_PROTOCOL_IDENTITY, result: { target: { chatId: 7, threadId: 42 }, slot: "A" } };
+  } });
+  const runtime = createTelegramBusFollowerRegistrationRuntime({ instanceId: "fixture",
+    registrationState: state, protocolIdentity: TEST_BUS_PROTOCOL_IDENTITY,
+    createRequestId: () => `fixture:${++sequence}`, getSessionGeneration: () => sessionGeneration,
+    isContextActive: current => current === ctx, heartbeatMs: 60_000,
+    async startReceiving() { if (scenario === "startup-drift") { entered.resolve(); await released.promise; } },
+    stopReceiving: async () => { receivingStops++; },
+    onRegistered: () => { prepared.push(sessionGeneration); },
+  });
+  let first: Promise<boolean> | undefined;
+  try {
+    await server.start();
+    first = runtime.registerWithLeader(ctx, { busSocketPath: socketPath });
+    await entered.promise;
+    if (scenario === "session-drift" || scenario === "startup-drift") sessionGeneration++;
+    if (scenario === "stopped") runtime.stop();
+    let newerGeneration: string | undefined;
+    if (scenario === "refreshed-during-heartbeat") {
+      sessionGeneration++;
+      await runtime.setContext(ctx);
+      newerGeneration = state.getGeneration();
+    }
+    if (scenario === "superseded") {
+      assert.equal(await runtime.registerWithLeader(ctx, { busSocketPath: socketPath }), true);
+      newerGeneration = state.getGeneration();
+    }
+    const stopsBeforeReply = receivingStops;
+    released.resolve();
+    assert.equal(await first, scenario === "stable", "A late response cannot mint authority for an expired request");
+    if (scenario === "superseded" || scenario === "refreshed-during-heartbeat") {
+      assert.equal(state.getGeneration(), newerGeneration);
+      assert.equal(receivingStops, stopsBeforeReply, "An obsolete request cannot stop the newer receiver");
+      assert.deepEqual(prepared, [1]);
+    } else {
+      assert.equal(state.isRegistered(), scenario === "stable");
+      assert.deepEqual(prepared, scenario === "stable" ? [1] : []);
+    }
+    assert.deepEqual(requests, scenario === "startup-drift" ? [] : scenario === "superseded" ? [1, 1] : [1]);
+    if (scenario === "session-drift") {
+      assert.equal(await runtime.registerWithLeader(ctx, { busSocketPath: socketPath }), true);
+      assert.deepEqual(prepared, [2]);
+      assert.deepEqual(requests, [1, 2]);
+    }
+  } finally {
+    released.resolve(); await first?.catch(() => undefined); runtime.stop();
+    await server.stop(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+}
+
 test("Bus follower assembly wires receiver, recovery, and registration", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-assembly-"));
   const leaderSocketPath = join(dir, "leader.sock");

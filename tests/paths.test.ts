@@ -5,10 +5,11 @@
 
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import test from "node:test";
 
 import {
+  requireTelegramStoragePathReference,
   getTelegramDiagnosticsDisplayPaths,
   getTelegramProfilePathSuffix,
   resolveAgentDir,
@@ -21,7 +22,29 @@ import {
   resolveTelegramChannelPostJournalPath,
   resolveTelegramThreadCleanupWorkPath,
   resolveTelegramUpdateJournalPath,
+  resolveTelegramUpdateJournalPathForProfile,
+  resolveTelegramWorkspaceAdmissionPath,
+  resolveTelegramWorkspaceAdmissionPathForProfile,
 } from "../lib/paths.ts";
+
+test("Storage path reference admission requires exact absolute spelling without repairing aliases", () => {
+  const agentDir = resolve("fixture-agent");
+  const expected = resolveTelegramUpdateJournalPath(agentDir, "work");
+  assert.equal(requireTelegramStoragePathReference(expected, expected), expected);
+  const relative = join("work", "tmp", "telegram", "inbox.json");
+  const alias = `${agentDir}${sep}unused${sep}..${sep}tmp${sep}telegram${sep}inbox.work.json`;
+  for (const [actual, approved] of [
+    [relative, expected], [relative, relative], [expected, relative],
+    [alias, expected], [expected, alias], [alias, alias],
+    [resolveTelegramUpdateJournalPath(agentDir), expected],
+    [resolveTelegramUpdateJournalPath(agentDir, "other"), expected],
+    [join(agentDir, "tmp", "telegram", "workspace-admission.work.json"), expected],
+    [expected, ""], [undefined, expected], [expected, null],
+  ]) {
+    assert.throws(() => requireTelegramStoragePathReference(actual as string, approved as string),
+      { message: "Telegram storage reference does not match its approved absolute path." });
+  }
+});
 
 await test("resolveAgentDir", async (t) => {
   await t.test("returns PI_CODING_AGENT_DIR when env is set", () => {
@@ -113,6 +136,26 @@ test("update journal paths are profile-scoped", () => {
   assert.equal(
     resolveTelegramUpdateJournalPath("/agent", "work"),
     join("/agent", "tmp", "telegram", "inbox.work.json"),
+  );
+});
+
+test("profile-only storage callbacks bind the configured agent directory", () => {
+  const agentDir = resolveAgentDir();
+  assert.equal(
+    resolveTelegramUpdateJournalPathForProfile("work"),
+    resolveTelegramUpdateJournalPath(agentDir, "work"),
+  );
+  assert.equal(
+    resolveTelegramWorkspaceAdmissionPathForProfile("work"),
+    resolveTelegramWorkspaceAdmissionPath(agentDir, "work"),
+  );
+  assert.notEqual(
+    resolveTelegramUpdateJournalPathForProfile("work"),
+    resolveTelegramUpdateJournalPath("work"),
+  );
+  assert.notEqual(
+    resolveTelegramWorkspaceAdmissionPathForProfile("work"),
+    resolveTelegramWorkspaceAdmissionPath("work"),
   );
 });
 

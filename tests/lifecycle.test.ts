@@ -8,6 +8,7 @@ import test from "node:test";
 
 import {
   appendTelegramLifecycleHooks,
+  createTelegramBridgeSessionLifecycleAssembly,
   createTelegramCompactionObserverRuntime,
   createTelegramSessionContextStore,
   createTelegramSessionGenerationFence,
@@ -69,6 +70,76 @@ test("Session generation fence ignores delayed shutdown from a replaced context"
   await runtime.onSessionShutdown({} as never, newContext);
   assert.equal(store.get(), undefined);
   assert.deepEqual(shutdowns, [newContext]);
+});
+
+test("Quit preservation runs only after quiescence and before the exact session context closes", async () => {
+  for (const scenario of ["quit", "reload", "new", "resume", "fork", "late-delivery", "late-queue", "late-session", "worker-error", "prepare-error", "preservation-error"] as const) {
+    const contexts = createTelegramSessionContextStore<ExtensionContext>();
+    const ctx = createLifecycleContext();
+    contexts.set(ctx);
+    const events: string[] = [];
+    let current: (() => boolean) | undefined;
+    const runtime = createTelegramBridgeSessionLifecycleAssembly({
+      contextStore: contexts,
+      queue: {
+        getCurrentModel: () => undefined, loadConfig: async () => {}, setQueuedItems() {},
+        setCurrentModel() {}, setPendingModelSwitch() {}, syncCounters() {}, syncFlags() {},
+        bindDeferredDispatchContext() {}, prepareTempDir: async () => {}, updateStatus() {},
+        unbindDeferredDispatchContext() {}, discardQueuedItems() {}, clearModelMenuState() {},
+        getActiveTurnChatId: () => undefined, clearPreview: async () => {}, clearActiveTurn() {}, clearAbort() {},
+      },
+      follower: {
+        registrationState: { getTarget: () => undefined, isRegistered: () => false },
+        registrationRuntime: {}, instanceId: "leader", getLeaderState: () => ({ kind: "unlocked" }),
+        suspendPolling: async () => {
+          events.push("polling");
+          if (scenario === "late-queue") contexts.set(ctx);
+        }, updateStatus() {},
+        recordRuntimeEvent(_category: string, _error: unknown, details?: { phase?: string }) {
+          events.push(String(details?.phase));
+        },
+      },
+      services: {
+        resumeGroupedInput() {}, suspendGroupedInput() {},
+        delivery: { onSessionStart: async () => {}, onSessionShutdown: async () => {
+          events.push("delivery");
+          if (scenario === "late-delivery") contexts.set(ctx);
+        } },
+        polling: { onSessionStart: async () => {} },
+        inboundWorker: { async onSessionShutdown() {
+          events.push("worker");
+          if (scenario === "worker-error") throw new Error("worker stop failed");
+          if (scenario === "late-session") contexts.set(ctx);
+        } },
+        capabilityMonitor: { start() {}, stop() {} }, queueWatchdog: { start() {}, stop() {} },
+        prepareThreadPreservationOnQuit(isCurrent: () => boolean) {
+          events.push("prepare");
+          if (scenario === "prepare-error") throw new Error("preparation unavailable");
+          current = isCurrent;
+          return async () => {
+            assert.equal(isCurrent(), true);
+            assert.deepEqual(events, ["prepare", "delivery", "polling", "worker"]);
+            events.push("preserve");
+            if (scenario === "preservation-error") throw new Error("publication failed");
+          };
+        },
+      },
+    } as unknown as Parameters<typeof createTelegramBridgeSessionLifecycleAssembly>[0]);
+    const reason = ["reload", "new", "resume", "fork"].includes(scenario) ? scenario : "quit";
+    const shutdown = runtime.onSessionShutdown({ type: "session_shutdown", reason } as never, ctx);
+    if (scenario === "worker-error") await assert.rejects(shutdown, /worker stop failed/);
+    else await shutdown;
+    assert.equal(events.includes("preserve"), scenario === "quit" || scenario === "preservation-error", scenario);
+    if (["reload", "new", "resume", "fork"].includes(scenario)) assert.equal(events.includes("prepare"), false);
+    if (scenario === "prepare-error" || scenario === "preservation-error") {
+      assert.ok(events.includes("preserve-thread-on-quit"));
+    }
+    if (scenario.startsWith("late-") || scenario === "worker-error") assert.equal(contexts.get(), ctx);
+    else assert.equal(contexts.get(), undefined);
+    if (scenario === "late-delivery") assert.equal(events.includes("polling"), false);
+    if (scenario === "late-delivery" || scenario === "late-queue") assert.equal(events.includes("worker"), false);
+    if (scenario !== "worker-error" && current) assert.equal(current(), false);
+  }
 });
 
 test("Session context store accepts only the current explicit session identity", () => {

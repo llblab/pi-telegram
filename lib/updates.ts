@@ -698,10 +698,9 @@ export function buildTelegramUpdateFlowAction<
   NonNullable<TUpdate["message"] | TUpdate["edited_message"]>,
   NonNullable<TUpdate["guest_message"]>
 > {
-  const deletedMessageIds = extractDeletedTelegramMessageIds(update);
-  if (deletedMessageIds.length > 0) {
-    return { kind: "deleted", messageIds: deletedMessageIds };
-  }
+  // Business chats are independent from bot chats even when chat/message IDs coincide.
+  // Raw handlers may own that namespace; the default DM runtime has no deletion authority.
+  if (update.deleted_business_messages !== undefined) return { kind: "ignore" };
   if (update.message_reaction) {
     return { kind: "reaction", reactionUpdate: update.message_reaction };
   }
@@ -1739,6 +1738,11 @@ export interface TelegramUpdateWorkerJournalSnapshot {
 
 export interface TelegramUpdateWorkerJournalPort {
   read: () => TelegramUpdateWorkerJournalSnapshot;
+  /** Optional strict observation; it must not recover, repair or grant new receipt authority. */
+  isQueueReceiptCurrent?: (
+    receipt: TelegramQueueAdmissionReceiptLike,
+    owner: TelegramUpdateJournalQueueOwner,
+  ) => boolean;
   markQueued: (receipt: {
     queueKind: "prompt" | "control";
     receiptId: string;
@@ -1858,7 +1862,7 @@ export interface TelegramUpdateWorkerRuntime<TContext> {
     receipts: readonly TelegramQueueAdmissionReceiptLike[];
     ctx: TContext;
     reason: TelegramQueueReceiptCompletionReason;
-  }) => void;
+  }) => boolean;
   stop: () => Promise<void>;
   waitForDrain: () => Promise<void>;
   getState: () => TelegramUpdateWorkerStateSnapshot;
@@ -2266,6 +2270,23 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
       });
     }
     return true;
+  };
+
+  const getCurrentQueueReceipt = (receipt: TelegramQueueAdmissionReceiptLike) => {
+    const committed = committedQueueReceipts.get(receipt.receiptId);
+    if (!committed || !areTelegramQueueAdmissionReceiptsEqual(
+      committed.receipt, normalizeQueueReceipt(receipt),
+    )) return undefined;
+    try {
+      if (deps.journal.isQueueReceiptCurrent &&
+          deps.journal.isQueueReceiptCurrent(committed.receipt, committed.queueOwner) !== true) {
+        return undefined;
+      }
+    } catch (error) {
+      recordRuntimeEvent(error, { phase: "queue-receipt-observation" });
+      return undefined;
+    }
+    return committed;
   };
 
   const clearRetryTimer = (): void => {
@@ -3023,11 +3044,9 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
         !expectedOwner.controller.signal.aborted
       ) {
         pendingSignal = false;
-        const result = await drain(expectedOwner);
-        if (result !== "idle") {
-          pendingSignal = false;
-          return;
-        }
+        // Keep newer wakes in this run so waitForDrain also covers them. A failure
+        // observed after signal() still keeps its latch; this loop never clears it.
+        await drain(expectedOwner);
       }
     };
     const operation = run();
@@ -3265,25 +3284,10 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
       }
       transition("queued", input.updateId);
     },
-    isQueueReceiptCommitted(receipt) {
-      const committed = committedQueueReceipts.get(receipt.receiptId);
-      return (
-        committed !== undefined &&
-        areTelegramQueueAdmissionReceiptsEqual(
-          committed.receipt,
-          normalizeQueueReceipt(receipt),
-        )
-      );
-    },
+    isQueueReceiptCommitted: receipt => getCurrentQueueReceipt(receipt) !== undefined,
     getQueueReceiptOwner(receipt) {
-      const committed = committedQueueReceipts.get(receipt.receiptId);
-      return committed &&
-        areTelegramQueueAdmissionReceiptsEqual(
-          committed.receipt,
-          normalizeQueueReceipt(receipt),
-        )
-        ? { ...committed.queueOwner }
-        : undefined;
+      const committed = getCurrentQueueReceipt(receipt);
+      return committed ? { ...committed.queueOwner } : undefined;
     },
     completeQueueReceipts(input) {
       const expectedOwner = owner;
@@ -3292,9 +3296,9 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
         expectedOwner.controller.signal.aborted ||
         !(deps.isContextCurrent?.(input.ctx) ?? expectedOwner.ctx === input.ctx)
       ) {
-        return;
+        return false;
       }
-      if (input.receipts.length === 0) return;
+      if (input.receipts.length === 0) return true;
       const normalizedReceipts = input.receipts.map(normalizeQueueReceipt);
       const receiptIds = new Set<string>();
       const sourceUpdateIds = new Set<number>();
@@ -3306,7 +3310,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
       }> = [];
       for (const receipt of normalizedReceipts) {
         const committed = committedQueueReceipts.get(receipt.receiptId);
-        if (!committed) continue;
+        if (!committed) return false;
         if (
           receiptIds.has(receipt.receiptId) ||
           !areTelegramQueueAdmissionReceiptsEqual(
@@ -3328,7 +3332,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
               `Telegram ${input.reason} requested invalid queue receipt ${receipt.receiptId}.`,
             ),
           );
-          return;
+          return false;
         }
         receiptIds.add(receipt.receiptId);
         queuedCompletions.push({
@@ -3339,7 +3343,6 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
           sourceUpdateIds.add(updateId);
         }
       }
-      if (receiptIds.size === 0) return;
       let removedUpdateIds: readonly number[];
       try {
         removedUpdateIds = deps.journal.completeQueued(
@@ -3351,7 +3354,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
           "queue-receipt-completion",
           error,
         );
-        return;
+        return false;
       }
       const removed = new Set(removedUpdateIds);
       if (
@@ -3365,8 +3368,11 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
             `Telegram ${input.reason} did not complete every receipt source.`,
           ),
         );
-        return;
+        return false;
       }
+      input.receipts.forEach((receipt, index) => {
+        acknowledgedQueueReceiptCompletions.set(receipt, normalizedReceipts[index]!);
+      });
       for (const updateId of sourceUpdateIds) claims.delete(updateId);
       for (const receiptId of receiptIds) {
         committedQueueReceipts.delete(receiptId);
@@ -3385,6 +3391,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
       notifyStateChange();
       pendingSignal = true;
       launchDrain();
+      return true;
     },
     async stop() {
       const expectedOwner = owner;
@@ -3676,9 +3683,17 @@ export function createTelegramInputCustodyWorkerJournalPort(
   };
   return {
     read: () => store.read() as unknown as TelegramUpdateWorkerJournalSnapshot,
+    isQueueReceiptCurrent(receipt, owner) {
+      const entries = store.read().entries.filter(entry => entry.queueReceiptId === receipt.receiptId);
+      return receipt.sourceUpdateIds.length > 0 && entries.length === receipt.sourceUpdateIds.length &&
+        entries.every((entry, index) => entry.updateId === receipt.sourceUpdateIds[index] &&
+          entry.state === "queued" && entry.queueKind === receipt.queueKind && !entry.queueHandoff &&
+          entry.queueOwner !== undefined && areTelegramUpdateJournalQueueOwnersEqual(entry.queueOwner, owner));
+    },
     markQueued: legacyMutation,
     markExecutionFailure: legacyMutation,
-    removeCompleted: legacyMutation,
+    // The common drain batches excluded IDs here; the store rejects all non-vetoed input atomically.
+    removeCompleted: updateIds => store.removeExcluded(updateIds),
     completeQueued: receipts => store.completeQueued(receipts),
     inputCustody: {
       acquireInput: store.acquireInput,
@@ -4511,13 +4526,20 @@ export function createTelegramInputCustodyLifecycleBindingResolver(deps: {
     journal: TelegramInputJournalStore } | undefined;
   getRecipientBindingKey(): string | undefined;
 }): () => TelegramUpdateAdmissionLifecycleJournalBinding | undefined {
+  // Stable per store, not per descriptor: a renewed source has new captured worker ports.
+  const ports = new WeakMap<TelegramInputJournalStore,
+    ReturnType<typeof createTelegramInputCustodyWorkerJournalPort>>();
   return () => {
     if (!deps.isEnabled()) return undefined;
     const source = deps.resolveInputJournal();
     const recipientBindingKey = deps.getRecipientBindingKey()?.trim();
     if (!source || !source.runtimeKey || !source.recoveryKey || !recipientBindingKey)
       return undefined;
-    const port = createTelegramInputCustodyWorkerJournalPort(source.journal);
+    let port = ports.get(source.journal);
+    if (!port) {
+      port = createTelegramInputCustodyWorkerJournalPort(source.journal);
+      ports.set(source.journal, port);
+    }
     return { runtimeKey: JSON.stringify({ source: source.runtimeKey, recipientBindingKey }),
       recoveryKey: source.recoveryKey,
       recipientBindingKey, journal: { ...port, appendBatch: source.journal.appendBatch,
@@ -4681,6 +4703,7 @@ export function createTelegramUpdateAdmissionHandle<
     try {
       execution.assertCurrent();
       await deps.defaultHandle(boundUpdate, ctx, execution);
+      execution.assertCurrent();
     } finally {
       immediate = false;
     }
@@ -4720,6 +4743,16 @@ export interface TelegramQueueAdmissionItemLike {
   admissionReceipts?: readonly TelegramQueueAdmissionReceiptLike[];
 }
 
+// A dispatched prompt can remain in memory until agent_start. Remember only acknowledged
+// removal of these exact receipt objects for later local discard, never for dispatch/replay.
+const acknowledgedQueueReceiptCompletions = new WeakMap<
+  TelegramQueueAdmissionReceiptLike, TelegramQueueAdmissionReceiptLike
+>();
+const isQueueReceiptCompletionAcknowledged = (receipt: TelegramQueueAdmissionReceiptLike): boolean => {
+  const acknowledged = acknowledgedQueueReceiptCompletions.get(receipt);
+  return acknowledged !== undefined && areTelegramQueueAdmissionReceiptsEqual(acknowledged, receipt);
+};
+
 export interface TelegramQueueAdmissionSettlementRuntime<TContext> {
   isItemReady: (item: TelegramQueueAdmissionItemLike) => boolean;
   getQueueReceiptOwner: (
@@ -4728,26 +4761,51 @@ export interface TelegramQueueAdmissionSettlementRuntime<TContext> {
   onPromptHandedOff: (
     item: TelegramQueueAdmissionItemLike,
     ctx: TContext,
-  ) => void;
+  ) => boolean;
   onControlSettled: (
     item: TelegramQueueAdmissionItemLike,
     ctx: TContext,
-  ) => void;
+  ) => boolean;
   onItemsDiscarded: (
     items: readonly TelegramQueueAdmissionItemLike[],
     ctx: TContext,
-  ) => void;
+  ) => boolean;
 }
 
 export function createTelegramQueueAdmissionSettlementMuxRuntime<TContext>(
   runtimes: readonly TelegramQueueAdmissionSettlementRuntime<TContext>[],
 ): TelegramQueueAdmissionSettlementRuntime<TContext> {
-  const settle = (
-    operation: (
-      runtime: TelegramQueueAdmissionSettlementRuntime<TContext>,
-    ) => void,
-  ): void => {
-    for (const runtime of runtimes) operation(runtime);
+  // Plan the whole request before mutation; unready is not an acknowledgement of completion.
+  const complete = (
+    items: readonly TelegramQueueAdmissionItemLike[],
+    ctx: TContext,
+    kind: "prompt" | "control" | "discard",
+  ): boolean => {
+    const plan = new Map<TelegramQueueAdmissionSettlementRuntime<TContext>, TelegramQueueAdmissionReceiptLike[]>();
+    for (const receipt of items.flatMap(item => item.admissionReceipts ?? [])) {
+      if (kind === "discard" && isQueueReceiptCompletionAcknowledged(receipt)) continue;
+      const candidates = runtimes.filter(runtime => runtime.isItemReady({ admissionReceipts: [receipt] }));
+      const selected = candidates[0];
+      if (!selected) return false;
+      if (candidates.length > 1) {
+        const owner = selected.getQueueReceiptOwner(receipt);
+        if (!owner || candidates.some(runtime => {
+          const candidate = runtime.getQueueReceiptOwner(receipt);
+          return !candidate || !areTelegramUpdateJournalQueueOwnersEqual(owner, candidate);
+        })) return false;
+      }
+      const receipts = plan.get(selected) ?? [];
+      receipts.push(receipt);
+      plan.set(selected, receipts);
+    }
+    for (const [runtime, receipts] of plan) {
+      const item = { admissionReceipts: receipts };
+      const completed = kind === "discard" ? runtime.onItemsDiscarded([item], ctx)
+        : kind === "prompt" ? runtime.onPromptHandedOff(item, ctx)
+        : runtime.onControlSettled(item, ctx);
+      if (completed !== true) return false;
+    }
+    return true;
   };
   return {
     isItemReady: (item) =>
@@ -4773,12 +4831,9 @@ export function createTelegramQueueAdmissionSettlementMuxRuntime<TContext>(
       }
       return owner ? { ...owner } : undefined;
     },
-    onPromptHandedOff: (item, ctx) =>
-      settle((runtime) => runtime.onPromptHandedOff(item, ctx)),
-    onControlSettled: (item, ctx) =>
-      settle((runtime) => runtime.onControlSettled(item, ctx)),
-    onItemsDiscarded: (items, ctx) =>
-      settle((runtime) => runtime.onItemsDiscarded(items, ctx)),
+    onPromptHandedOff: (item, ctx) => complete([item], ctx, "prompt"),
+    onControlSettled: (item, ctx) => complete([item], ctx, "control"),
+    onItemsDiscarded: (items, ctx) => complete(items, ctx, "discard"),
   };
 }
 
@@ -4789,12 +4844,14 @@ export function createTelegramQueueAdmissionSettlementRuntime<TContext>(
     items: readonly TelegramQueueAdmissionItemLike[],
     ctx: TContext,
     reason: TelegramQueueReceiptCompletionReason,
-  ): void => {
+  ): boolean => {
     const receipts: TelegramQueueAdmissionReceiptLike[] = [];
     for (const item of items) {
-      if (item.admissionReceipts) receipts.push(...item.admissionReceipts);
+      for (const receipt of item.admissionReceipts ?? []) {
+        if (reason !== "discard" || !isQueueReceiptCompletionAcknowledged(receipt)) receipts.push(receipt);
+      }
     }
-    worker.completeQueueReceipts({ receipts, ctx, reason });
+    return receipts.length === 0 || worker.completeQueueReceipts({ receipts, ctx, reason });
   };
   return {
     isItemReady: (item) =>
@@ -5322,10 +5379,6 @@ export function createTelegramQueueHandoffReconciler<TContext>(
       const recipientJournalBindingKey =
         deps.createRecipientJournalBindingKey(recipient);
       if (!recipientJournalBindingKey) continue;
-      const recipientItem = structuredClone(item);
-      recipientItem.admissionReceipts = [
-        { ...receipt, journalBindingKey: recipientJournalBindingKey },
-      ];
       const expectedOwner = deps.getReceiptOwner(receipt);
       const lifecycle = deps.getLifecycleForReceipt(receipt);
       if (
@@ -5350,11 +5403,11 @@ export function createTelegramQueueHandoffReconciler<TContext>(
         },
         handoffToken,
         lifecycle,
-        stageRemote: async () => {
-          const payload = createTelegramQueueHandoff({
-            handoffToken,
-            item: recipientItem,
-          }).payload;
+        stageRemote: async ({ payload: sourcePayload }) => {
+          const payload = {
+            ...sourcePayload,
+            admissionReceipts: [{ ...sourcePayload.admissionReceipts[0]!, journalBindingKey: recipientJournalBindingKey }],
+          };
           if (followerRegistered) {
             return deps.stageThroughFollower({
               recipient,
@@ -5637,11 +5690,25 @@ export function createTelegramUpdateAdmissionLifecycleRuntime<TContext>(
   let activeRuntimeKey: string | undefined;
   let journal: TelegramUpdateAdmissionLifecycleJournalBinding["journal"] | undefined;
   let worker: TelegramUpdateWorkerRuntime<TContext> | undefined;
+  let workerInputCustody: TelegramCustodyExecutionJournal | undefined;
   let settlement: TelegramQueueAdmissionSettlementRuntime<TContext> | undefined;
   let journalBindingKey: string | undefined;
   let operation: Promise<void> = Promise.resolve();
   let foreignQueueOwnerLiveness: TelegramProcessLiveness | undefined;
   let releaseSourceReference: (() => void) | undefined;
+  let sourceReferenceBinding: TelegramUpdateAdmissionLifecycleJournalBinding | undefined;
+
+  const withRetainedSourceReference = <T>(
+    operation: (source: TelegramUpdateAdmissionLifecycleJournalBinding["journal"]) => T,
+  ): T => {
+    if (!journal || !worker) throw new Error("Telegram update admission worker is not active.");
+    // Synchronous retained-source access needs a reference, not renewed execution authority.
+    const release = !releaseSourceReference && sourceReferenceBinding
+      ? deps.acquireSourceReference?.(sourceReferenceBinding) : undefined;
+    try { return operation(journal); } finally { release?.(); }
+  };
+  const readObservedJournal = (): TelegramUpdateWorkerJournalSnapshot =>
+    withRetainedSourceReference(source => source.read());
 
   const stopCurrent = async (forget: boolean): Promise<void> => {
     await worker?.stop();
@@ -5652,8 +5719,10 @@ export function createTelegramUpdateAdmissionLifecycleRuntime<TContext>(
         { phase: "source-reference-release" });
     }
     if (!forget) return;
+    sourceReferenceBinding = undefined;
     journal = undefined;
     worker = undefined;
+    workerInputCustody = undefined;
     settlement = undefined;
     journalBindingKey = undefined;
     activeRuntimeKey = undefined;
@@ -5665,7 +5734,8 @@ export function createTelegramUpdateAdmissionLifecycleRuntime<TContext>(
       await stopCurrent(true);
       return;
     }
-    if (replace || !worker || activeRuntimeKey !== binding.runtimeKey) {
+    if (replace || !worker || activeRuntimeKey !== binding.runtimeKey ||
+        workerInputCustody !== binding.journal.inputCustody) {
       const { runtimeKey, recoveryKey } = binding;
       await stopCurrent(true);
       binding = deps.resolveBinding();
@@ -5674,10 +5744,13 @@ export function createTelegramUpdateAdmissionLifecycleRuntime<TContext>(
         throw new Error("Telegram update source binding changed during startup.");
       }
       const release = deps.acquireSourceReference?.(binding);
+      const inputCustody = binding.journal.inputCustody;
       try {
         journal = binding.journal;
         worker = deps.createWorker(binding.journal, binding);
+        workerInputCustody = inputCustody;
         settlement = createTelegramQueueAdmissionSettlementRuntime(worker);
+        sourceReferenceBinding = { ...binding, journal };
         releaseSourceReference = release;
       } catch (error) {
         release?.();
@@ -5843,7 +5916,7 @@ export function createTelegramUpdateAdmissionLifecycleRuntime<TContext>(
           "Telegram update journal queue handoff cancellation is not available.",
         );
       }
-      const result = journal.cancelQueuedHandoff(input);
+      const result = withRetainedSourceReference(source => source.cancelQueuedHandoff!(input));
       worker.signal();
       return result;
     },
@@ -5897,21 +5970,15 @@ export function createTelegramUpdateAdmissionLifecycleRuntime<TContext>(
     ownsJournalBinding: (candidate) =>
       journalBindingKey !== undefined && journalBindingKey === candidate,
     getForeignQueueOwnerLiveness: () => foreignQueueOwnerLiveness,
-    getJournalEntryCount() {
-      if (!journal || !worker) {
-        throw new Error("Telegram update admission worker is not active.");
-      }
-      return journal.read().entries.length;
-    },
+    getJournalEntryCount: () => readObservedJournal().entries.length,
     hasPendingQueueMutationForItem(item) {
       return Boolean(
         journal &&
           worker &&
-          journal
-            .read()
-            .entries.some(
+          readObservedJournal().entries.some(
               (entry) =>
                 entry.state !== "queued" &&
+                entry.preApprovalExcluded !== true &&
                 isTelegramReactionDependencyForQueueItem(
                   entry.update,
                   item,
@@ -5934,11 +6001,11 @@ export function createTelegramUpdateAdmissionLifecycleRuntime<TContext>(
       settlement?.isItemReady(item) ??
       (item.admissionReceipts?.length ?? 0) === 0,
     onPromptHandedOff: (item, ctx) =>
-      settlement?.onPromptHandedOff(item, ctx),
+      settlement?.onPromptHandedOff(item, ctx) ?? false,
     onControlSettled: (item, ctx) =>
-      settlement?.onControlSettled(item, ctx),
+      settlement?.onControlSettled(item, ctx) ?? false,
     onItemsDiscarded: (items, ctx) =>
-      settlement?.onItemsDiscarded(items, ctx),
+      settlement?.onItemsDiscarded(items, ctx) ?? false,
   };
 }
 

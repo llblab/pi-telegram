@@ -69,12 +69,12 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
           onItemsDiscarded: (
             items: readonly Queue.TelegramQueueItem<TContext>[],
             ctx: TContext,
-          ) => void;
+          ) => boolean;
           isItemReady: (item: Queue.TelegramQueueItem<TContext>) => boolean;
           onPromptHandedOff?: (
             item: Queue.PendingTelegramTurn,
             ctx: TContext,
-          ) => void;
+          ) => boolean;
           onControlSettled: (
             item: Queue.PendingTelegramControlItem<TContext>,
             ctx: TContext,
@@ -108,8 +108,7 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     if (durableItems.length === 0) return true;
     const settlement = deps.admission.getSettlement();
     if (!settlement) return false;
-    settlement.onItemsDiscarded(durableItems, ctx);
-    return durableItems.every((item) => !settlement.isItemReady(item));
+    return settlement.onItemsDiscarded(durableItems, ctx) === true;
   };
   const mutation = Queue.createTelegramQueueMutationController({
     ...deps.store,
@@ -150,8 +149,7 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
       if ((item.admissionReceipts?.length ?? 0) === 0) return true;
       const settlement = deps.admission.getSettlement();
       if (!settlement?.onPromptHandedOff) return false;
-      settlement.onPromptHandedOff(item, ctx);
-      return !settlement.isItemReady(item);
+      return settlement.onPromptHandedOff(item, ctx) === true;
     },
     onControlSettled(item, ctx) {
       deps.admission.getSettlement()?.onControlSettled(item, ctx);
@@ -1143,7 +1141,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     getActiveTurn: activeTurnRuntime.get,
     loadConfig: configStore.load,
     extractAssistant: Replies.extractRunAssistantMessage,
-    isRecoveredAssistantAlreadyPublished: (assistant) =>
+    isAssistantAlreadyPublished: (assistant) =>
       !!assistant.text && assistantOutputRuntime.hasAdmittedTelegramIntermediate(assistant.text),
     getFoldQueuedPromptsIntoHistory:
       lifecycle.shouldFoldQueuedPromptsIntoHistory,

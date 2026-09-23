@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   existsSync,
   mkdtempSync,
+  readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -96,6 +97,77 @@ function isAdmissionError(
 ): boolean {
   return error instanceof TelegramWorkspaceAdmissionError && error.code === code;
 }
+
+test("Rejected retirement remains fenced until exact cancellation completion and cannot grant another permit", () => {
+  const temp = createTempPath();
+  let nowMs = 1000;
+  try {
+    const ledger = createLedger({ path: temp.path, getNowMs: () => nowMs });
+    const fenced = acquireFence(ledger);
+    assert.throws(() => ledger.confirmRetirementRejection(fenced));
+    const issued = ledger.issueDeletionPermit(fenced);
+    assert.equal(issued.kind, "issued");
+    if (issued.kind !== "issued") return;
+    assert.throws(() => ledger.completeRejectedRetirementFence(issued.fence));
+    assert.throws(() => ledger.confirmRetirementRejection({ ...issued.fence, target: { ...target, threadId: 11 } }));
+    nowMs = 2000;
+    const rejected = ledger.confirmRetirementRejection(issued.fence);
+    assert.equal(rejected.phase, "deletion-rejected");
+    nowMs = 3000;
+    assert.deepEqual(ledger.confirmRetirementRejection(issued.fence), rejected);
+    assert.deepEqual(ledger.issueDeletionPermit(rejected), { kind: "already-issued", fence: rejected });
+    assert.throws(() => ledger.confirmRetirementAbsence(rejected));
+    assert.throws(() => ledger.releaseUnissuedRetirementFence(rejected));
+    assert.throws(() => ledger.completeRetirementFence(rejected));
+    assert.deepEqual(ledger.acquireAdmission({ operationId: "blocked", operationKind: "workspace.register-follower",
+      scope: { kind: "profile" } }), { kind: "blocked", reason: "retirement-fenced" });
+    const successorOwner = { processId: 102, processBirthId: "102:successor" };
+    const successor = createLedger({ path: temp.path, owner: successorOwner });
+    assert.deepEqual(successor.read().fence, rejected);
+    assert.throws(() => successor.completeRejectedRetirementFence(rejected));
+    const adopted = successor.adoptRetirementFence(rejected, { owner: successorOwner, leaderEpoch: "epoch-two" });
+    assert.equal(adopted.phase, "deletion-rejected");
+    assert.equal(successor.completeRejectedRetirementFence(adopted), true);
+    assert.equal(successor.completeRejectedRetirementFence(adopted), false);
+    assert.equal(successor.read().fence, undefined);
+    const manual = successor.acquireThreadCleanupFence({ operationId: "manual", cleanupWorkSetId: "work-set",
+      bindingKey: "binding-one", slot: "A", target, leaderEpoch: 2, cleanupRequestedAtMs: 1000 });
+    assert.equal(manual.kind, "acquired");
+    if (manual.kind !== "acquired") return;
+    const manualIssued = successor.issueThreadCleanupDeletionPermit(manual.fence);
+    assert.throws(() => successor.confirmRetirementRejection(manualIssued.fence));
+    writeFileSync(temp.path, JSON.stringify({ version: 1, profileKey, leases: [],
+      fence: { ...manualIssued.fence, phase: "deletion-rejected", rejectionConfirmedAtMs: 3000 } }));
+    assert.throws(() => successor.read(), error => isAdmissionError(error, "invalid-state"));
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Rejection publication prefixes retain one-shot authority across reconstruction", () => {
+  for (const prefix of ["before-rename", "after-rename"] as const) {
+    const temp = createTempPath();
+    let fail = false;
+    try {
+      const ledger = createLedger({ path: temp.path, publishRename(source, destination) {
+        if (fail && JSON.parse(readFileSync(source, "utf8")).fence?.phase === "deletion-rejected") {
+          if (prefix === "after-rename") renameSync(source, destination);
+          throw new Error("interrupted rejection publication");
+        }
+        renameSync(source, destination);
+      } });
+      const issued = ledger.issueDeletionPermit(acquireFence(ledger));
+      fail = true;
+      assert.throws(() => ledger.confirmRetirementRejection(issued.fence));
+      const restored = createLedger({ path: temp.path });
+      const fence = restored.read().fence;
+      assert.ok(fence && fence.destructiveKind !== "journal-writer-closure");
+      assert.equal(fence.phase, prefix === "after-rename" ? "deletion-rejected" : "deletion-issued");
+      assert.equal(restored.issueDeletionPermit(fence).kind, "already-issued");
+      assert.deepEqual(restored.listReservedSlots(), ["A"]);
+      if (prefix === "after-rename") assert.deepEqual(restored.confirmRetirementRejection(issued.fence), fence);
+      else assert.throws(() => restored.completeRejectedRetirementFence(fence));
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  }
+});
 
 test("Workspace writer-closure fence codec accepts only identity payload", () => {
   const value = { destructiveKind: "journal-writer-closure", phase: "fenced",

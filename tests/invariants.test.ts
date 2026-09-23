@@ -348,6 +348,14 @@ test("Production journal writers remain scoped or lifecycle-owned", () => {
   assert.doesNotMatch(source, /createTelegram(?:Input|Update)JournalStore\(/u);
 });
 
+test("Production profile-only storage callbacks cannot reinterpret profile names as agent directories", () => {
+  const source = readFileSync(join(PROJECT_ROOT, "lib/extension.ts"), "utf8");
+  assert.match(source, /getPath: Paths\.resolveTelegramWorkspaceAdmissionPathForProfile/u);
+  assert.match(source, /getLeaderJournalPath: Paths\.resolveTelegramUpdateJournalPathForProfile/u);
+  assert.doesNotMatch(source, /getPath: Paths\.resolveTelegramWorkspaceAdmissionPath[,\n]/u);
+  assert.doesNotMatch(source, /getLeaderJournalPath: Paths\.resolveTelegramUpdateJournalPath[,\n]/u);
+});
+
 test("Production keeps custody cutover and operator authority disconnected", () => {
   const source = readFileSync(join(PROJECT_ROOT, "lib/extension.ts"), "utf8");
   for (const forbidden of [
@@ -522,6 +530,9 @@ test("Automatic Workspace retirement stays disconnected from production composit
     );
   });
   assert.deepEqual(productionConsumers, []);
+  assert.match(compositionSource, /workspaceRotation:\s*\{[\s\S]*?getAdmission:\s*workspaceAdmissionRuntime\.resolve,[\s\S]*?runExclusive:\s*telegramWorkspaceOperationRuntime\.runExclusive,[\s\S]*?deleteThread:\s*directTelegramApiRuntime\.deleteWorkspaceThread/u);
+  assert.match(busLeaderSource, /createTelegramWorkspaceSlotRotation\s*\(/u);
+  assert.match(busLeaderSource, /!restoringWorkspace && deps\.runWithWorkspaceCapacity/u);
 });
 
 test("Runtime state domain stays free of local domain imports", () => {

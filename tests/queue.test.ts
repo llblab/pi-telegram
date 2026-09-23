@@ -2120,7 +2120,7 @@ test("Agent end hook does not republish a recovered answer already admitted as a
   const hook = createTelegramAgentEndHook<PendingTelegramTurn, { id: string }, unknown>({
     getActiveTurn: () => turn,
     extractAssistant: extractRunAssistantMessage,
-    isRecoveredAssistantAlreadyPublished: (assistant) => assistant.text === "preserved answer",
+    isAssistantAlreadyPublished: (assistant) => assistant.text === "preserved answer",
     getFoldQueuedPromptsIntoHistory: () => false,
     resetRuntimeState: () => events.push("reset"),
     updateStatus: () => {},
@@ -2137,6 +2137,32 @@ test("Agent end hook does not republish a recovered answer already admitted as a
     { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "preserved answer" }] },
     { role: "custom", customType: "state-flow-validation" },
     { role: "assistant", stopReason: "stop", content: [] },
+  ] }, { id: "session" });
+  assert.equal(events.includes("unexpected:reply"), false);
+  assert.equal(events.includes("unexpected:text"), false);
+});
+
+test("Agent end hook does not duplicate an ordinary answer already admitted as an intermediate reply", async () => {
+  const events: string[] = [];
+  const turn = createQueueTestPromptTurn({ chatId: 7, replyToMessageId: 11 });
+  const hook = createTelegramAgentEndHook<PendingTelegramTurn, { id: string }, unknown>({
+    getActiveTurn: () => turn,
+    extractAssistant: extractRunAssistantMessage,
+    isAssistantAlreadyPublished: (assistant) => assistant.text === "same answer",
+    getFoldQueuedPromptsIntoHistory: () => false,
+    resetRuntimeState: () => events.push("reset"),
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    requestDeferredDispatchNextQueuedTelegramTurn: (dispatch) => dispatch({ id: "session" }),
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => false,
+    sendMarkdownReply: async () => { events.push("unexpected:reply"); },
+    sendTextReply: async () => { events.push("unexpected:text"); },
+    sendQueuedAttachments: async () => { events.push("unexpected:attachment"); },
+  });
+  await hook({ messages: [
+    { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "same answer" }] },
   ] }, { id: "session" });
   assert.equal(events.includes("unexpected:reply"), false);
   assert.equal(events.includes("unexpected:text"), false);

@@ -9,7 +9,7 @@
  */
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 export const TELEGRAM_DEFAULT_PROFILE_NAME = "default";
 
@@ -41,6 +41,20 @@ export function resolveAgentDir(
     return join(homedir(), ".omp", "agent");
   }
   return join(homedir(), ".pi", "agent");
+}
+
+/**
+ * Pure reference preflight against an independently approved resource path.
+ * Reject aliases; never repair relative historical references or redirect storage.
+ * Equality proves spelling only, not file identity, consumer closure or migration readiness.
+ */
+export function requireTelegramStoragePathReference(path: string, expectedPath: string): string {
+  if (typeof path !== "string" || typeof expectedPath !== "string" ||
+      !isAbsolute(path) || resolve(path) !== path ||
+      !isAbsolute(expectedPath) || resolve(expectedPath) !== expectedPath || path !== expectedPath) {
+    throw new Error("Telegram storage reference does not match its approved absolute path.");
+  }
+  return path;
 }
 
 /** Telegram bridge configuration file (<agentDir>/telegram.json). */
@@ -100,6 +114,13 @@ export function resolveTelegramWorkspaceAdmissionPath(
   );
 }
 
+/** Profile-only callback shape; binds storage to the configured agent directory. */
+export function resolveTelegramWorkspaceAdmissionPathForProfile(
+  profileName?: string,
+): string {
+  return resolveTelegramWorkspaceAdmissionPath(resolveAgentDir(), profileName);
+}
+
 /** Durable inactive Thread cleanup work-set journal. */
 export function resolveTelegramThreadCleanupWorkPath(
   agentDir = resolveAgentDir(),
@@ -127,6 +148,13 @@ export function resolveTelegramUpdateJournalPath(
     agentDir,
     profileName,
   );
+}
+
+/** Profile-only callback shape; binds storage to the configured agent directory. */
+export function resolveTelegramUpdateJournalPathForProfile(
+  profileName?: string,
+): string {
+  return resolveTelegramUpdateJournalPath(resolveAgentDir(), profileName);
 }
 
 /** Durable follower delivery journal, isolated by stable recipient binding. */

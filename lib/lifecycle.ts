@@ -244,7 +244,7 @@ export function createTelegramSessionGenerationFence(
       const generation = store.getGeneration();
       if (!store.isCurrent(ctx, generation)) return;
       await hooks.onSessionShutdown(event, ctx);
-      store.clear(ctx);
+      if (store.isCurrent(ctx, generation)) store.clear(ctx);
     },
   };
 }
@@ -266,6 +266,7 @@ export interface TelegramBridgeSessionServiceRuntime {
   capabilityMonitor: { start(ctx: ExtensionContext): void; stop(): void };
   queueWatchdog: { start(ctx: ExtensionContext): void; stop(): void };
   guestPlaceholder?: { stopAll(): void };
+  prepareThreadPreservationOnQuit?: (isSessionCurrent: () => boolean) => (() => Promise<void>) | undefined;
 }
 
 export interface TelegramBridgeSessionLifecycleAssemblyDeps<
@@ -322,6 +323,7 @@ export interface TelegramBridgeSessionLifecyclePorts<
     capabilityMonitor: TelegramBridgeSessionServiceRuntime["capabilityMonitor"];
     queueWatchdog: TelegramBridgeSessionServiceRuntime["queueWatchdog"];
     guestPlaceholder?: TelegramBridgeSessionServiceRuntime["guestPlaceholder"];
+    prepareThreadPreservationOnQuit?: TelegramBridgeSessionServiceRuntime["prepareThreadPreservationOnQuit"];
   };
 }
 
@@ -350,6 +352,7 @@ export function createTelegramBridgeSessionLifecycleDeps<
       capabilityMonitor: ports.services.capabilityMonitor,
       queueWatchdog: ports.services.queueWatchdog,
       guestPlaceholder: ports.services.guestPlaceholder,
+      prepareThreadPreservationOnQuit: ports.services.prepareThreadPreservationOnQuit,
     },
   };
 }
@@ -385,15 +388,31 @@ export function createTelegramBridgeSessionLifecycleAssembly<
       deps.services.queueWatchdog.start(ctx);
     },
     async onSessionShutdown(event, ctx) {
-      if (!isSessionActive(ctx)) return;
+      const generation = deps.contextStore.getGeneration();
+      const isCurrent = () => deps.contextStore.isCurrent(ctx, generation);
+      if (!isCurrent()) return;
+      let preserveThread: (() => Promise<void>) | undefined;
+      if (event.reason === "quit") {
+        try {
+          preserveThread = deps.services.prepareThreadPreservationOnQuit?.(isCurrent);
+        } catch (error) {
+          deps.follower.recordRuntimeEvent("session", error, { phase: "preserve-thread-on-quit" });
+        }
+      }
       deps.services.guestPlaceholder?.stopAll();
       await deps.services.delivery.onSessionShutdown();
-      if (!isSessionActive(ctx)) return;
+      if (!isCurrent()) return;
       deps.services.queueWatchdog.stop();
       deps.services.capabilityMonitor.stop();
       await queueLifecycle.onSessionShutdown(event, ctx);
-      if (!isSessionActive(ctx)) return;
+      if (!isCurrent()) return;
       await deps.services.inboundWorker.onSessionShutdown();
+      if (!isCurrent()) return;
+      try {
+        await preserveThread?.();
+      } catch (error) {
+        deps.follower.recordRuntimeEvent("session", error, { phase: "preserve-thread-on-quit" });
+      }
     },
   };
   const followerLifecycle = appendTelegramLifecycleHooks(

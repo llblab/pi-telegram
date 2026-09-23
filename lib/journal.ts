@@ -2428,6 +2428,7 @@ export interface TelegramUpdateJournalRuntimeBinding {
   runtimeKey: string;
   recoveryKey: string;
   journal: TelegramUpdateJournalStore;
+  readForProtection?: () => { entries: readonly TelegramUpdateJournalEntry[] };
 }
 
 export interface TelegramUpdateJournalRuntimeBindingResolverDeps {
@@ -2470,6 +2471,19 @@ export function createTelegramUpdateJournalRuntimeBindingResolver(
         profileName,
         botIdentity,
       }),
+      readForProtection() {
+        // Protection must never turn corruption/recovery into empty-work evidence.
+        const evidence = inspectTelegramUpdateJournalFamily({
+          directory: dirname(path), path, profile: profileName, botIdentity,
+          limits: {
+            maxFiles: 1024,
+            maxBytes: TELEGRAM_UPDATE_JOURNAL_MAX_BYTES * 2,
+            maxEntries: TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES,
+            maxWork: TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES * 1024,
+          },
+        });
+        return { entries: evidence.kind === "present" ? evidence.file.entries : [] };
+      },
       journal: createTelegramUpdateJournalStore({
         path,
         profileName,

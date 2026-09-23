@@ -104,7 +104,7 @@ export default function (pi: Pi.ExtensionAPI) {
     WorkspaceAdmission.createTelegramWorkspaceAdmissionRuntimeBinding({
       getProfileName: configStore.getActiveProfileName,
       getBotToken: configStore.getBotToken,
-      getPath: Paths.resolveTelegramWorkspaceAdmissionPath,
+      getPath: Paths.resolveTelegramWorkspaceAdmissionPathForProfile,
       owner: {
         processId: telegramProcessId,
         processBirthId: telegramQueueProcessBirthId,
@@ -187,7 +187,7 @@ export default function (pi: Pi.ExtensionAPI) {
         },
         getWorkspaceAdmission: workspaceAdmissionRuntime.resolve,
       },
-      getLeaderJournalPath: Paths.resolveTelegramUpdateJournalPath,
+      getLeaderJournalPath: Paths.resolveTelegramUpdateJournalPathForProfile,
       getFollowerJournalPath(bindingKey, profileName) {
         return Paths.resolveTelegramFollowerJournalPath(
           bindingKey,
@@ -385,6 +385,51 @@ export default function (pi: Pi.ExtensionAPI) {
         return telegramApiTargetActivityRuntime.hasPendingTarget(binding.target)
           ? "protected"
           : "clear";
+      },
+    });
+  const reclaimTelegramWorkspaceDeadOwnerQueue =
+    WorkspaceRetirement.createTelegramWorkspaceDeadOwnerQueueReclaimer({
+      getExternalProtection: captureWorkspaceExternalProtection,
+      getActiveTurnTarget: activeTurnRuntime.getTarget,
+      getQueuedItems: telegramQueueStore.getQueuedItems,
+      resolveLeaderJournal: resolveTelegramUpdateJournalBinding,
+      createFollowerJournalResolver:
+        telegramJournalBindingRuntime.createRecipientResolver,
+      discoverFollowerJournals() {
+        return Journal.discoverTelegramFollowerJournalPaths({
+          directory: Paths.resolveTelegramTempDir(),
+          profileName: configStore.getActiveProfileName(),
+        });
+      },
+      createJournalPathResolver: telegramJournalBindingRuntime.createPathResolver,
+      withJournalReference(binding, operation) {
+        if (!binding.recoveryKey) throw new Error(
+          "Telegram workspace journal reference identity is unavailable.",
+        );
+        return telegramJournalReferenceRegistry.withReference({
+          referenceClass: "workspace-retirement",
+          recoveryKey: binding.recoveryKey,
+        }, operation);
+      },
+      getRecoveryOwner() {
+        return {
+          instanceId: telegramInstanceId,
+          processId: telegramProcessId,
+          processBirthId: telegramQueueProcessBirthId,
+          sessionGeneration: telegramSessionContextStore.getGeneration(),
+        };
+      },
+      getQueueOwnerLiveness: Bus.getTelegramProcessLiveness,
+      onMutationError(error) {
+        recordRuntimeEvent("Telegram dead-owner queue reclamation was refused.", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+      isBindingCurrent(binding) {
+        return WorkspaceRetirement.isCurrentTelegramWorkspaceBinding(
+          threadStore,
+          binding,
+        );
       },
     });
   const inactiveThreadCleanupReviewRuntime =
@@ -1410,6 +1455,18 @@ export default function (pi: Pi.ExtensionAPI) {
       getWorkspaceAdmission: workspaceAdmissionRuntime.resolve,
       runWorkspaceOperation: telegramWorkspaceOperationRuntime.run,
       captureWorkspaceExternalProtection,
+      workspaceRotation: {
+        getAdmission: workspaceAdmissionRuntime.resolve,
+        runExclusive: telegramWorkspaceOperationRuntime.runExclusive,
+        deleteThread: directTelegramApiRuntime.deleteWorkspaceThread,
+        reclaimDeadOwnerQueuedWork(binding, isCurrent) {
+          return telegramWorkspaceOperationRuntime.run({
+            operationId: WorkspaceAdmission.createTelegramWorkspaceAdmissionOperationId(),
+            operationKind: "workspace.reclaim-dead-owner-queue",
+            scopes: [{ kind: "target", target: binding.target }],
+          }, reclaimTelegramWorkspaceDeadOwnerQueue.bind(undefined, binding, isCurrent));
+        },
+      },
       callApi(method, body, options) {
         return directTelegramApiRuntime.call(method, body, options);
       },
@@ -1545,6 +1602,15 @@ export default function (pi: Pi.ExtensionAPI) {
     recordRuntimeEvent,
     runWorkspaceOperation: telegramWorkspaceOperationRuntime.run,
   });
+  const prepareThreadPreservationOnQuit = Sync.createTelegramPreservedLeaderQuitHandler({
+    instanceId: telegramInstanceId,
+    topicTargetStore: threadStore,
+    getCurrentLeaderEpoch,
+    getProfileName: configStore.getActiveProfileName,
+    isPollingSuspended: lockedPollingRuntime.isSuspended,
+    resolveAutomaticThreadCleanupEnabled: configControls.resolveAutomaticThreadCleanupEnabled,
+    runWorkspaceOperation: telegramWorkspaceOperationRuntime.run,
+  });
   const telegramBridgeSessionLifecycleDeps =
     Lifecycle.createTelegramBridgeSessionLifecycleDeps({
       contextStore: telegramSessionContextStore,
@@ -1599,6 +1665,7 @@ export default function (pi: Pi.ExtensionAPI) {
         capabilityMonitor: telegramThreadCapabilityMonitor,
         queueWatchdog: queueDispatchWatchdogRuntime,
         guestPlaceholder: { stopAll: guestPlaceholderRuntime.stopAll },
+        prepareThreadPreservationOnQuit,
       },
     });
   const sessionLifecycleRuntime =

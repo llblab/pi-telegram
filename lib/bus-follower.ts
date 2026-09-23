@@ -126,7 +126,7 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
       restoreWorkspace?: boolean;
     },
   ) => Promise<boolean>;
-  setContext: (ctx: TContext) => void;
+  setContext: (ctx: TContext) => void | Promise<void>;
   disconnectFromLeader?: () => Promise<boolean>;
   renameThread?: (
     target: TelegramTarget & { threadId: number },
@@ -623,6 +623,22 @@ export function createTelegramBusFollowerRuntimeAssembly<
 >(
   ports: TelegramBusFollowerRuntimeAssemblyPorts<TContext>,
 ): TelegramBusFollowerRuntimeAssembly<TContext> {
+  // Binding startup needs registration identity before it can grant inbound authority.
+  let readyContext: { generation: string; ctx: TContext; sessionGeneration: number | undefined } | undefined;
+  const isReadyContext = (ctx?: TContext): boolean => Boolean(readyContext &&
+    (ctx === undefined || readyContext.ctx === ctx) &&
+    ports.registrationState.getGeneration() === readyContext.generation &&
+    ports.registration.getSessionGeneration?.() === readyContext.sessionGeneration &&
+    ports.registration.isContextActive?.(readyContext.ctx) !== false);
+  const prepareContext = async (ctx: TContext): Promise<void> => {
+    const generation = ports.registrationState.getGeneration();
+    const sessionGeneration = ports.registration.getSessionGeneration?.();
+    readyContext = undefined;
+    await ports.registration.onRegistered?.(ctx);
+    if (generation && ports.registrationState.getGeneration() === generation &&
+        ports.registration.getSessionGeneration?.() === sessionGeneration &&
+        ports.registration.isContextActive?.(ctx) !== false) readyContext = { generation, ctx, sessionGeneration };
+  };
   const sharedRuntimeDeps = {
     instanceId: ports.instanceId,
     registrationState: ports.registrationState,
@@ -632,7 +648,9 @@ export function createTelegramBusFollowerRuntimeAssembly<
     ...ports.receiver,
     instanceId: ports.instanceId,
     recordRuntimeEvent: ports.recordRuntimeEvent,
-    getRegistrationGeneration: ports.registrationState.getGeneration,
+    getRegistrationGeneration() {
+      return isReadyContext() ? readyContext?.generation : undefined;
+    },
     handleReplaceTarget: createTelegramBusFollowerTargetReplacementHandler({
       ...ports.targetReplacement,
       ...sharedRuntimeDeps,
@@ -650,8 +668,21 @@ export function createTelegramBusFollowerRuntimeAssembly<
     ...sharedRuntimeDeps,
     startReceiving: receiver.start,
     stopReceiving: receiver.stop,
+    onRegistered: prepareContext,
     onHeartbeatFailure: recovery,
   });
+  const baseRegistration = registration;
+  registration = {
+    ...baseRegistration,
+    async setContext(ctx) {
+      const sessionGeneration = ports.registration.getSessionGeneration?.();
+      if (ports.registration.isContextActive?.(ctx) === false) return;
+      await baseRegistration.setContext(ctx);
+      if (ports.registration.getSessionGeneration?.() !== sessionGeneration ||
+          ports.registration.isContextActive?.(ctx) === false) return;
+      if (!isReadyContext(ctx)) await prepareContext(ctx);
+    },
+  };
   return { receiver, registration };
 }
 
@@ -1194,7 +1225,13 @@ export function createTelegramBusFollowerSessionRefreshHook<TContext>(
     }
     if (!deps.registrationState.isRegistered()) return;
     if (deps.isSessionActive && !deps.isSessionActive(ctx)) return;
-    deps.registrationRuntime.setContext(ctx);
+    try {
+      await deps.registrationRuntime.setContext(ctx);
+    } catch (error) {
+      deps.recordRuntimeEvent("bus", error, { phase: "follower-session-refresh" });
+      return;
+    }
+    if (deps.isSessionActive && !deps.isSessionActive(ctx)) return;
     deps.updateStatus(ctx);
     deps.recordRuntimeEvent(
       "bus",
@@ -1596,6 +1633,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
   let activeLeaderSocketPath: string | undefined;
   let activeAuthSecret: string | undefined;
   let activeRegistrationGeneration: string | undefined;
+  let registrationAttempt: { ctx: TContext; sessionGeneration: number | undefined } | undefined;
   let activeContext: TContext | undefined;
   let lastKnownTarget: TelegramTarget | undefined;
   let lastKnownSlot: string | undefined;
@@ -1606,6 +1644,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
     heartbeatInterval = undefined;
   };
   const stop = () => {
+    registrationAttempt = undefined;
     stopHeartbeat();
     activeAuthSecret = undefined;
     activeRegistrationGeneration = undefined;
@@ -1729,6 +1768,24 @@ export function createTelegramBusFollowerRegistrationRuntime<
   };
   return {
     registerWithLeader: async (ctx, leader, options) => {
+      if (deps.isContextActive?.(ctx) === false) return false;
+      const sessionGeneration = deps.getSessionGeneration?.();
+      const attempt = { ctx, sessionGeneration };
+      registrationAttempt = attempt;
+      const isCurrentRequest = () => registrationAttempt === attempt &&
+        deps.getSessionGeneration?.() === sessionGeneration && deps.isContextActive?.(ctx) !== false;
+      const abandonOwnedRequest = async (): Promise<void> => {
+        if (registrationAttempt !== attempt) return;
+        registrationAttempt = undefined;
+        stopHeartbeat();
+        activeLeaderSocketPath = undefined;
+        activeAuthSecret = undefined;
+        activeRegistrationGeneration = undefined;
+        activeContext = undefined;
+        deps.registrationState?.setRegistered(false);
+        deps.setActiveAuthSecret?.(undefined);
+        await deps.stopReceiving?.();
+      };
       const pendingHandoff = options
         ? undefined
         : getTelegramFollowerSessionHandoff();
@@ -1750,6 +1807,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
         deps.getLeaderSocketPath?.() ??
         getTelegramBusSocketPath();
       await deps.startReceiving?.();
+      if (!isCurrentRequest()) { await abandonOwnedRequest(); return false; }
       activeAuthSecret = deps.getLeaderAuthSecret
         ? deps.getLeaderAuthSecret(leader)
         : leader?.busSecret;
@@ -1781,7 +1839,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
           sessionId: deps.getSessionId?.(ctx),
           pid: getPid(),
           processBirthId: deps.getProcessBirthId?.(),
-          sessionGeneration: deps.getSessionGeneration?.(),
+          sessionGeneration,
           target:
             registrationOptions?.target ??
             deps.registrationState?.getTarget() ??
@@ -1815,6 +1873,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
           },
         });
       } catch (error) {
+        if (!isCurrentRequest()) { await abandonOwnedRequest(); return false; }
         stopHeartbeat();
         activeLeaderSocketPath = undefined;
         activeAuthSecret = undefined;
@@ -1823,14 +1882,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
         await deps.stopReceiving?.();
         throw error;
       }
-      if (deps.isContextActive && !deps.isContextActive(ctx)) {
-        stopHeartbeat();
-        activeLeaderSocketPath = undefined;
-        activeAuthSecret = undefined;
-        deps.setActiveAuthSecret?.(undefined);
-        await deps.stopReceiving?.();
-        return false;
-      }
+      if (!isCurrentRequest()) { await abandonOwnedRequest(); return false; }
       const compatibility = getTelegramBusProtocolCompatibility({
         local: deps.protocolIdentity,
         remote: response?.kind === "bus.ack" ? response.protocol : undefined,
@@ -1880,6 +1932,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
         try {
           await deps.onRegistered?.(ctx);
         } catch (error) {
+          if (!isCurrentRequest()) { await abandonOwnedRequest(); return false; }
           stopHeartbeat();
           activeLeaderSocketPath = undefined;
           activeAuthSecret = undefined;
@@ -1889,7 +1942,9 @@ export function createTelegramBusFollowerRegistrationRuntime<
           await deps.stopReceiving?.();
           throw error;
         }
+        if (!isCurrentRequest()) { await abandonOwnedRequest(); return false; }
         await requestHeartbeat();
+        if (!isCurrentRequest()) { await abandonOwnedRequest(); return false; }
         startHeartbeat(leaderSocketPath);
         if (
           pendingHandoffOptions &&
@@ -1909,6 +1964,8 @@ export function createTelegramBusFollowerRegistrationRuntime<
       return false;
     },
     setContext(ctx) {
+      if (registrationAttempt && (registrationAttempt.ctx !== ctx ||
+          registrationAttempt.sessionGeneration !== deps.getSessionGeneration?.())) registrationAttempt = undefined;
       activeContext = ctx;
     },
     async setThreadDisplayMode(mode) {

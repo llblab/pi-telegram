@@ -2142,6 +2142,10 @@ export interface TelegramBusFollowerRegistry {
   list: () => TelegramBusFollowerView[];
   remove: (instanceId: string) => boolean;
   clear: () => void;
+  observeUnregistered: (follower: TelegramBusFollowerView) => {
+    isCurrent: () => boolean;
+    release: () => void;
+  };
   pruneStale: (
     nowMs: number,
     staleAfterMs: number,
@@ -2163,8 +2167,19 @@ export function createTelegramBusForwardOwnershipValidator(
   };
 }
 
+function hasTelegramBusFollowerIdentityOverlap(
+  first: TelegramBusInstanceRegistration,
+  second: TelegramBusInstanceRegistration,
+): boolean {
+  return first.instanceId === second.instanceId ||
+    (first.profileKey !== undefined && first.profileKey === second.profileKey) ||
+    (first.target !== undefined && first.target.chatId === second.target?.chatId &&
+      first.target.threadId === second.target.threadId);
+}
+
 export function createTelegramBusFollowerRegistry(): TelegramBusFollowerRegistry {
   const followers = new Map<string, TelegramBusFollowerView>();
+  const observations = new Set<{ follower: TelegramBusFollowerView; current: boolean }>();
   const clone = (
     follower: TelegramBusFollowerView,
   ): TelegramBusFollowerView => ({
@@ -2184,14 +2199,7 @@ export function createTelegramBusFollowerRegistry(): TelegramBusFollowerRegistry
       const existing = followers.get(registration.instanceId);
       for (const [instanceId, follower] of followers.entries()) {
         if (instanceId === registration.instanceId) continue;
-        const sameProfile =
-          registration.profileKey !== undefined &&
-          registration.profileKey === follower.profileKey;
-        const sameTarget =
-          registration.target !== undefined &&
-          follower.target?.chatId === registration.target.chatId &&
-          follower.target.threadId === registration.target.threadId;
-        if (sameProfile || sameTarget) followers.delete(instanceId);
+        if (hasTelegramBusFollowerIdentityOverlap(registration, follower)) followers.delete(instanceId);
       }
       const next: TelegramBusFollowerView = {
         ...registration,
@@ -2208,6 +2216,11 @@ export function createTelegramBusFollowerRegistry(): TelegramBusFollowerRegistry
           existing?.lastHeartbeatMs ?? registration.connectedAtMs,
       };
       followers.set(registration.instanceId, next);
+      for (const observation of observations) {
+        if (!hasTelegramBusFollowerIdentityOverlap(next, observation.follower)) continue;
+        observation.current = false;
+        observations.delete(observation);
+      }
       return clone(next);
     },
     heartbeat: (instanceId, nowMs) => {
@@ -2234,7 +2247,24 @@ export function createTelegramBusFollowerRegistry(): TelegramBusFollowerRegistry
     },
     list: () => [...followers.values()].map(clone),
     remove: (instanceId) => followers.delete(instanceId),
-    clear: () => followers.clear(),
+    clear: () => {
+      followers.clear();
+      for (const observation of observations) observation.current = false;
+      observations.clear();
+    },
+    observeUnregistered: (follower) => {
+      // This watches replacement, not process death or delivery authority.
+      const observation = { follower: clone(follower), current: ![...followers.values()]
+        .some((current) => hasTelegramBusFollowerIdentityOverlap(current, follower)) };
+      if (observation.current) observations.add(observation);
+      return {
+        isCurrent: () => observation.current,
+        release() {
+          observation.current = false;
+          observations.delete(observation);
+        },
+      };
+    },
     pruneStale: (nowMs, staleAfterMs) => {
       const removed: TelegramBusFollowerView[] = [];
       for (const [instanceId, follower] of followers.entries()) {

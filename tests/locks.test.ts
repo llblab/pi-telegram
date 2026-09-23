@@ -24,6 +24,7 @@ import {
   createTelegramLockedPollingRuntime,
   createTelegramLockKeyResolver,
   createTelegramLockRuntime,
+  isProcessAlive,
   readLocks,
   resolveTelegramLockKey,
   TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
@@ -34,6 +35,17 @@ import {
   writeLocks,
   type TelegramLockEntry,
 } from "../lib/locks.ts";
+
+test("Process absence requires ESRCH rather than an unknown liveness error", (t) => {
+  let code: string | undefined;
+  t.mock.method(process, "kill", () => {
+    if (code) throw Object.assign(new Error("liveness unavailable"), { code });
+    return true;
+  });
+  for (code of [undefined, "ESRCH", "EPERM", "EACCES", "EINVAL", "unknown"]) {
+    assert.equal(isProcessAlive(42), code !== "ESRCH", String(code));
+  }
+});
 
 function createTempLockPath(): { dir: string; path: string } {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-owners-"));
@@ -2252,6 +2264,76 @@ test("Locked polling runtime does not auto-start when run mode disallows polling
       cwd: "/repo",
     });
   } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Suspension proof requires completion in the current polling generation", async () => {
+  for (const race of ["none", "failure", "restart", "newer-suspend"] as const) {
+    const temp = createTempLockPath();
+    const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
+    let hold = true;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const runtime = createTelegramLockedPollingRuntime({
+      lock, hasBotToken: () => true, startPolling() {}, updateStatus() {},
+      async stopPolling() {
+        if (!hold) return;
+        await gate;
+        if (race === "failure") throw new Error("stop failed");
+      },
+    });
+    try {
+      assert.equal(runtime.isSuspended(), false);
+      await runtime.start({ cwd: "/repo" });
+      const stopping = runtime.suspend();
+      assert.equal(runtime.isSuspended(), false, "an issued stop is not completion");
+      if (race === "restart") await runtime.start({ cwd: "/repo" });
+      if (race === "newer-suspend") {
+        hold = false;
+        await runtime.suspend();
+        assert.equal(runtime.isSuspended(), false, "the older stop is still unsettled");
+      }
+      release();
+      if (race === "failure") await assert.rejects(stopping, /stop failed/);
+      else await stopping;
+      assert.equal(runtime.isSuspended(), race === "none", race);
+      assert.equal(lock.owns({ cwd: "/repo" }), true, "suspension retains restart ownership");
+    } finally {
+      hold = false;
+      release();
+      await runtime.suspend();
+      lock.release();
+      rmSync(temp.dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("An unfinished explicit startup cannot certify quiescence even after its stale completion", async () => {
+  const temp = createTempLockPath();
+  const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const runtime = createTelegramLockedPollingRuntime({
+    lock, hasBotToken: () => true, startPolling: async () => { await gate; },
+    async stopPolling() {}, updateStatus() {},
+  });
+  let starting: ReturnType<typeof runtime.start> | undefined;
+  try {
+    starting = runtime.start({ cwd: "/repo" });
+    await Promise.resolve();
+    await runtime.suspend();
+    assert.equal(runtime.isSuspended(), false);
+    release();
+    await starting;
+    assert.equal(runtime.isSuspended(), false, "a stale startup cannot revive an unproven stop");
+    await runtime.suspend();
+    assert.equal(runtime.isSuspended(), true);
+  } finally {
+    release();
+    await starting;
+    await runtime.suspend();
+    lock.release();
     rmSync(temp.dir, { recursive: true, force: true });
   }
 });

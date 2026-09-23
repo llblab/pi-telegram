@@ -1615,7 +1615,7 @@ export interface TelegramAgentEndHookRuntimeDeps<
   extractAssistant: (
     messages: readonly TMessage[],
   ) => TelegramAgentEndAssistantResult;
-  isRecoveredAssistantAlreadyPublished?: (assistant: TelegramAgentEndAssistantResult) => boolean;
+  isAssistantAlreadyPublished?: (assistant: TelegramAgentEndAssistantResult) => boolean;
   getFoldQueuedPromptsIntoHistory: () => boolean;
   resetRuntimeState: () => void;
   isSessionActive?: (ctx: TContext) => boolean;
@@ -1761,8 +1761,7 @@ export function createTelegramAgentEndHook<
     if (deps.isSessionActive?.(ctx) === false) return;
     const turn = deps.getActiveTurn();
     const extractedAssistant = assistantOverride ?? (turn ? deps.extractAssistant(event.messages) : {});
-    const assistant = extractedAssistant.recoveredFromEarlier &&
-        deps.isRecoveredAssistantAlreadyPublished?.(extractedAssistant)
+    const assistant = deps.isAssistantAlreadyPublished?.(extractedAssistant)
       ? { stopReason: extractedAssistant.stopReason }
       : extractedAssistant;
     const hasPublication = !!assistant.text || assistant.stopReason === "error" || !!turn?.queuedAttachments.length;

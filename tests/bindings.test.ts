@@ -342,8 +342,9 @@ test("Queue binding requires durable handoff for every burst item and fails clos
         const id = item.admissionReceipts![0]!.sourceUpdateIds[0]!;
         events.push(`commit:${id}`);
         if (mode === "success") committed.add(id);
+        return mode === "success";
       },
-      onItemsDiscarded: () => {}, onControlSettled: () => {},
+      onItemsDiscarded: () => false, onControlSettled: () => {},
     };
     const runtime = createTelegramQueueBindingRuntime({
       store, queue: { allocateItemOrder: () => 0 }, deferredDispatch,
@@ -411,11 +412,13 @@ test("Queue binding composes mutation, admission, dispatch, and watchdog ports",
       getSettlement: () => ({
         onItemsDiscarded: (items) => {
           events.push(`discard:${items.length}`);
+          return true;
         },
         isItemReady: () => admissionReady,
         onPromptHandedOff: () => {
           admissionReady = false;
           events.push("prompt-committed");
+          return true;
         },
         onControlSettled: () => {
           events.push("control-settled");

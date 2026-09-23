@@ -433,7 +433,12 @@ export function createTelegramThreadCleanupWorkStore(options: {
         publish(file); return { confirmed: true, entry: structuredClone(entry) };
       });
     },
-    list() { return structuredClone(read().workSets); },
+    list() {
+      return structuredClone(withTelegramFileTransaction(
+        `${options.path}.transaction`,
+        () => read().workSets,
+      ));
+    },
   };
 }
 
@@ -542,8 +547,11 @@ export function createTelegramThreadCleanupPermitRuntime(deps: {
     if (fence.leaderEpoch !== leaderEpoch || fence.owner.processId !== owner.processId ||
         fence.owner.processBirthId !== owner.processBirthId) {
       if (!deps.canAdoptFence(fence)) return undefined;
-      try { fence = deps.ledger.adoptThreadCleanupFence(fence,
-        { owner, leaderEpoch }); } catch { return undefined; }
+      try {
+        const adopted = deps.ledger.adoptThreadCleanupFence(fence, { owner, leaderEpoch });
+        if (adopted.destructiveKind !== "manual-thread-cleanup") return undefined;
+        fence = adopted;
+      } catch { return undefined; }
     }
     return deps.getLeaderEpoch() === leaderEpoch ? fence : undefined;
   };

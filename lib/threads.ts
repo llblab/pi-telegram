@@ -34,6 +34,7 @@ import * as ThreadReconciler from "./thread-reconciler.ts";
 import {
   planTelegramWorkspaceSlotAllocation,
   TELEGRAM_WORKSPACE_SLOTS,
+  TelegramWorkspaceSlotUnavailableError,
   type TelegramWorkspaceSlotOccupancy,
 } from "./workspace-slots.ts";
 import {
@@ -457,6 +458,11 @@ export interface TelegramTopicTargetStore {
     target: TelegramTarget,
     isCurrent: () => boolean,
     lastSyncError: string,
+  ) => Promise<boolean>;
+  /** Caller proves owner detachment; this does not assert Telegram Thread absence. */
+  detachTargetOwner: (
+    expected: TelegramTopicTargetRecord,
+    isCurrent: () => boolean,
   ) => Promise<boolean>;
   list: () => TelegramTopicTargetRecord[];
   getFollowerRecoveryHintByTarget?: (
@@ -2108,20 +2114,33 @@ export function createTelegramTopicTargetStore(
     mutationRevision += 1;
   };
 
-  const persistSnapshot = (invalidation?: {
+  const markWorkspaceBindingInactiveByTarget = (target: TelegramTarget, inactiveSinceMs = getNowMs()): boolean => {
+    if (!Number.isFinite(inactiveSinceMs) || inactiveSinceMs < 0) return false;
+    for (const [key, binding] of workspaceBindings) {
+      if (!targetMatches(binding.target, target) || binding.inactiveSinceMs !== undefined) continue;
+      workspaceBindings.set(key, { ...binding, inactiveSinceMs });
+      markDirty();
+      return true;
+    }
+    return false;
+  };
+
+  const persistSnapshot = (transition?: {
     target: TelegramTarget;
     isCurrent: () => boolean;
-    lastSyncError: string;
-  }): Promise<boolean> => {
+  } & (
+    | { kind: "invalidate"; lastSyncError: string }
+    | { kind: "detach"; owner: TelegramTopicTargetRecord }
+  )): Promise<boolean> => {
       const persist = persistQueue.then(async () => {
         const path = getPath();
         if (loadedPath !== path && !dirty) resetForPath(path);
         if (options.canPersist && !options.canPersist()) {
-          if (!invalidation) await loadFromDisk();
+          if (!transition) await loadFromDisk();
           return false;
         }
         if (!dirty || !loaded) await loadFromDisk();
-        if (invalidation && !invalidation.isCurrent()) return false;
+        if (transition && !transition.isCurrent()) return false;
         const nowMs = getNowMs();
         reservations = reservations.filter(
           (reservation) =>
@@ -2134,6 +2153,10 @@ export function createTelegramTopicTargetStore(
         const currentRecords = Array.from(records.values())
           .filter(isPersistedThreadRecord)
           .map(cloneRecord);
+        if (transition?.kind === "detach") {
+          const owners = currentRecords.filter((record) => targetMatches(record.target, transition.target));
+          if (owners.length !== 1 || !isDeepStrictEqual(normalizeRecord(owners[0]), transition.owner)) return false;
+        }
         records = new Map(
           currentRecords.map((record) => [
             getRecordOwnerKey(record),
@@ -2176,20 +2199,32 @@ export function createTelegramTopicTargetStore(
             return serialized;
           }),
         };
-        if (invalidation) {
-          const record = file.threads.find((record) => targetMatches(record.target, invalidation.target));
+        if (transition) {
+          const record = file.threads.find((record) => targetMatches(record.target, transition.target));
           if (!record) return false;
+          if (transition.kind === "detach") {
+            const bindings = file.workspaceBindings.filter((binding) => targetMatches(binding.target, record.target));
+            if (bindings.length !== 1 || !/^[A-Z]$/.test(record.slot ?? "") ||
+                bindings[0]!.slot !== record.slot) return false;
+          }
           file.threads = file.threads.filter((candidate) => candidate !== record);
-          file.syncObservations = file.syncObservations.filter((observation) => !targetMatches(observation.target, record.target));
-          file.syncObservations.push({
-            target: { ...record.target },
-            syncStatus: "deleted",
-            observedAtMs: nowMs,
-            ...(record.instanceId ? { instanceId: record.instanceId } : {}),
-            ...(record.slot ? { slot: record.slot } : {}),
-            lastSyncError: invalidation.lastSyncError,
-            lastReconcileAction: "mark-stale",
-          });
+          for (const binding of file.workspaceBindings) {
+            if (targetMatches(binding.target, transition.target) && binding.inactiveSinceMs === undefined) {
+              binding.inactiveSinceMs = nowMs;
+            }
+          }
+          if (transition.kind === "invalidate") {
+            file.syncObservations = file.syncObservations.filter((observation) => !targetMatches(observation.target, record.target));
+            file.syncObservations.push({
+              target: { ...record.target },
+              syncStatus: "deleted",
+              observedAtMs: nowMs,
+              ...(record.instanceId ? { instanceId: record.instanceId } : {}),
+              ...(record.slot ? { slot: record.slot } : {}),
+              lastSyncError: transition.lastSyncError,
+              lastReconcileAction: "mark-stale",
+            });
+          }
         }
         let persistedSemanticSnapshot: Record<string, unknown> | undefined;
         try {
@@ -2201,7 +2236,7 @@ export function createTelegramTopicTargetStore(
         }
         // Normalize optional fields to wire JSON; object key order is not a state change.
         if (
-          isDeepStrictEqual(
+          !transition && isDeepStrictEqual(
             persistedSemanticSnapshot,
             getTelegramStateSemanticSnapshot(JSON.parse(JSON.stringify(file))),
           ) &&
@@ -2221,17 +2256,20 @@ export function createTelegramTopicTargetStore(
         });
         await chmod(tempPath, 0o600);
         try {
-          if (invalidation) {
+          if (transition) {
             let applied = false;
             const commit = () => {
               if (getPath() !== path || mutationRevision !== persistedRevision ||
-                statusRevision !== persistedStatusRevision || !invalidation.isCurrent()) return;
+                statusRevision !== persistedStatusRevision || !transition.isCurrent()) return;
               // Fence and rename share one synchronous commit boundary. No stale
-              // invalidation enters the live projection before durable commit.
+              // transition enters the live projection before durable commit.
               renameSync(tempPath, path);
               loadedPath = path;
-              records = new Map(Array.from(records).filter(([, record]) => !targetMatches(record.target, invalidation.target)));
+              records = new Map(Array.from(records).filter(([, record]) => !targetMatches(record.target, transition.target)));
               syncObservations = file.syncObservations;
+              workspaceBindings = new Map(file.workspaceBindings.map((binding) => [
+                getWorkspaceBindingMapKey(binding), cloneWorkspaceBinding(binding),
+              ]));
               mutationRevision += 1;
               dirty = false;
               applied = true;
@@ -2283,7 +2321,12 @@ export function createTelegramTopicTargetStore(
       await persistSnapshot();
     },
     invalidateTarget(target, isCurrent, lastSyncError) {
-      return persistSnapshot({ target, isCurrent, lastSyncError });
+      return persistSnapshot({ kind: "invalidate", target, isCurrent, lastSyncError });
+    },
+    detachTargetOwner(expected, isCurrent) {
+      const owner = normalizeRecord(expected);
+      if (!owner) return Promise.resolve(false);
+      return persistSnapshot({ kind: "detach", owner, target: owner.target, isCurrent });
     },
     list() {
       return Array.from(records.values()).map(cloneRecord);
@@ -2838,16 +2881,7 @@ export function createTelegramTopicTargetStore(
       markDirty();
       return true;
     },
-    markWorkspaceBindingInactiveByTarget(target, inactiveSinceMs = getNowMs()) {
-      if (!Number.isFinite(inactiveSinceMs) || inactiveSinceMs < 0) return false;
-      for (const [key, binding] of workspaceBindings) {
-        if (!targetMatches(binding.target, target) || binding.inactiveSinceMs !== undefined) continue;
-        workspaceBindings.set(key, { ...binding, inactiveSinceMs });
-        markDirty();
-        return true;
-      }
-      return false;
-    },
+    markWorkspaceBindingInactiveByTarget,
     markWorkspaceBindingActiveByTarget(target) {
       if (hasWorkspaceRetirementConflict({ target })) return false;
       for (const [key, binding] of workspaceBindings) {
@@ -3274,7 +3308,10 @@ export function createTelegramTopicTargetStore(
         entry.target && targetMatches(entry.target, target),
       ) : undefined;
       const source = record ?? pending;
-      if (!source?.target) return false;
+      // Confirmed absence ends this binding's active target lifetime, even after
+      // an earlier stale observation already removed its live record.
+      const inactive = syncStatus === "deleted" && markWorkspaceBindingInactiveByTarget(target);
+      if (!source?.target) return inactive;
       syncObservations = syncObservations.filter((entry) => !targetMatches(entry.target, target));
       syncObservations.push({
         target: { ...source.target }, syncStatus, observedAtMs: getNowMs(),
@@ -4886,7 +4923,7 @@ export function createTelegramTopicTargetProvisioner(
     if (existing && isCurrentThreadRecord(existing)) {
       const slot = existing.slot ?? deps.store.allocateSlot(request.profileKey);
       if (!slot) {
-        throw new Error("Telegram Workspace slot reservation is unavailable.");
+        throw new TelegramWorkspaceSlotUnavailableError();
       }
       const occupied = listOccupiedTelegramThreadIdentities({
         records: deps.store.list(),
@@ -5015,7 +5052,7 @@ export function createTelegramTopicTargetProvisioner(
         request.workspaceBindingKey,
       );
     if (!slot) {
-      throw new Error("Telegram Workspace slot reservation is unavailable.");
+      throw new TelegramWorkspaceSlotUnavailableError();
     }
     const uniqueCandidate =
       candidateThreadName &&

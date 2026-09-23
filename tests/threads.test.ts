@@ -66,6 +66,7 @@ test("Stale-target invalidation fences the durable commit and preserves a replac
     const record = { profileKey: "cwd:/repo", owner: { kind: "leader" as const, cwd: "/repo", instanceId: "a" }, instanceId: "a", target, status: "active" as const, createdAtMs: 1, updatedAtMs: 1 };
     const store = createTelegramTopicTargetStore({
       path,
+      getNowMs: () => 1000,
       commitPersist: (commit) => {
         atCommit?.();
         if (!owns) return false;
@@ -75,9 +76,12 @@ test("Stale-target invalidation fences the durable commit and preserves a replac
     });
     try {
       store.upsert(record);
+      store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo")!,
+        target, slot: "A", updatedAtMs: 1 });
       await store.persist();
       atCommit = () => {
         assert.equal(store.list()[0]?.instanceId, "a", "invalidation must not publish before commit");
+        assert.equal(store.getWorkspaceBinding("/repo")?.inactiveSinceMs, undefined);
         if (race === "generation") generation++;
         if (race === "binding") store.upsert({ ...record, instanceId: "b", owner: { ...record.owner, instanceId: "b" }, updatedAtMs: 2 });
         if (race === "ownership") owns = false;
@@ -86,6 +90,8 @@ test("Stale-target invalidation fences the durable commit and preserves a replac
       assert.equal(applied, race === "none");
       const disk = JSON.parse(await readFile(path, "utf8"));
       assert.equal(disk.threads.length, race === "none" ? 0 : 1);
+      assert.equal(disk.workspaceBindings[0]?.inactiveSinceMs, race === "none" ? 1000 : undefined);
+      assert.equal(store.getWorkspaceBinding("/repo")?.inactiveSinceMs, race === "none" ? 1000 : undefined);
       assert.equal(store.list().length, race === "none" ? 0 : 1);
       assert.equal(store.listSyncObservations().some((entry) => entry.syncStatus === "deleted"), race === "none");
       if (race === "binding") {
@@ -97,6 +103,137 @@ test("Stale-target invalidation fences the durable commit and preserves a replac
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  }
+});
+
+test("Owner detachment publishes inactivity only with an exact fenced durable commit", async () => {
+  for (const race of ["none", "generation", "replacement", "ownership", "publication", "ack"] as const) {
+    const root = await mkdtemp(join(tmpdir(), "telegram-owner-detachment-"));
+    const path = join(root, "state.json");
+    let current = true;
+    let atCommit: (() => void) | undefined;
+    let owns = true;
+    let nowMs = 1000;
+    const target = { chatId: 7, threadId: 42 };
+    const store = createTelegramTopicTargetStore({ path, getNowMs: () => nowMs,
+      commitPersist(commit) {
+        atCommit?.();
+        if (!owns) return false;
+        commit();
+        if (atCommit && race === "ack") throw new Error("snapshot publication acknowledgement lost");
+        return true;
+      } });
+    try {
+      store.upsert({ profileKey: "manual:old", instanceId: "old", target,
+        status: "active", slot: "A", createdAtMs: 1, updatedAtMs: 1 });
+      store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo", 0, "session")!,
+        target, slot: "A", displayTitle: "Retained", journalBindingKeys: ["manual:old"],
+        journalBindingsComplete: true, updatedAtMs: 1 });
+      await store.persist();
+      await store.load();
+      const expected = store.list()[0]!;
+      const binding = store.listWorkspaceBindings()[0]!;
+      atCommit = () => {
+        assert.deepEqual(store.list(), [expected]);
+        assert.deepEqual(store.listWorkspaceBindings(), [binding]);
+        if (race === "generation") current = false;
+        if (race === "replacement") store.upsert({ ...expected, instanceId: "new", updatedAtMs: 2 });
+        if (race === "ownership") owns = false;
+        if (race === "publication") throw new Error("snapshot publication failed");
+      };
+      if (race === "publication" || race === "ack") {
+        await assert.rejects(store.detachTargetOwner(expected, () => current), /snapshot publication/);
+      } else {
+        assert.equal(await store.detachTargetOwner(expected, () => current), race === "none");
+      }
+      const committed = race === "none" || race === "ack";
+      assert.deepEqual(store.listWorkspaceBindings(), [{ ...binding,
+        ...(committed ? { inactiveSinceMs: 1000 } : {}) }]);
+      assert.deepEqual(store.listSyncObservations(), [], "detachment is not Thread absence");
+      const disk = JSON.parse(await readFile(path, "utf8"));
+      assert.equal(disk.threads.length, committed ? 0 : 1);
+      assert.equal(disk.workspaceBindings[0].inactiveSinceMs, committed ? 1000 : undefined);
+      atCommit = undefined;
+      if (committed) {
+        nowMs = 2000;
+        assert.equal(await store.detachTargetOwner(expected, () => true), false);
+        assert.equal(store.listWorkspaceBindings()[0]?.inactiveSinceMs, 1000);
+      }
+      if (race === "replacement") {
+        assert.equal(await store.detachTargetOwner(expected, () => true), false);
+        assert.equal(store.list()[0]?.instanceId, "new");
+        assert.equal(store.listWorkspaceBindings()[0]?.inactiveSinceMs, undefined);
+      }
+      if (race === "publication") {
+        assert.equal(await store.detachTargetOwner(expected, () => true), true);
+        assert.equal(store.listWorkspaceBindings()[0]?.inactiveSinceMs, 1000);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Owner detachment never frees a slot without an unambiguous retained Workspace binding", async () => {
+  for (const bindingState of ["missing", "slot-conflict", "duplicate", "duplicate-owner"] as const) {
+    const root = await mkdtemp(join(tmpdir(), "telegram-detachment-binding-"));
+    const path = join(root, "state.json");
+    const target = { chatId: 7, threadId: 42 };
+    const store = createTelegramTopicTargetStore({ path });
+    try {
+      store.upsert({ profileKey: "manual:old", instanceId: "old", target,
+        status: "active", slot: "A", createdAtMs: 1, updatedAtMs: 1 });
+      if (bindingState !== "missing") store.upsertWorkspaceBinding({
+        ...createTelegramWorkspaceBindingIdentity("/one")!, target,
+        slot: bindingState === "slot-conflict" ? "B" : "A", updatedAtMs: 1,
+      });
+      await store.persist();
+      if (bindingState === "duplicate" || bindingState === "duplicate-owner") {
+        const file = JSON.parse(await readFile(path, "utf8"));
+        if (bindingState === "duplicate") {
+          file.workspaceBindings.push({ ...createTelegramWorkspaceBindingIdentity("/two")!,
+            target, slot: "A", updatedAtMs: 1 });
+        } else {
+          file.threads.push({ ...file.threads[0], instanceId: "another-runtime",
+            owner: { kind: "manual-follower", instanceId: "another-owner" } });
+        }
+        await writeFile(path, JSON.stringify(file));
+        await store.refresh!();
+        assert.equal(bindingState === "duplicate" ? store.listWorkspaceBindings().length : store.list().length, 2);
+      }
+      const before = await readFile(path, "utf8");
+      assert.equal(await store.detachTargetOwner(store.list()[0]!, () => true), false, bindingState);
+      assert.equal(store.list()[0]?.instanceId, "old");
+      assert.ok(store.listWorkspaceBindings().every((binding) => binding.inactiveSinceMs === undefined));
+      assert.equal(await readFile(path, "utf8"), before);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Owner detachment reconciles memory even when the desired snapshot is already on disk", async () => {
+  const root = await mkdtemp(join(tmpdir(), "telegram-detachment-equality-"));
+  const path = join(root, "state.json");
+  const target = { chatId: 7, threadId: 42 };
+  const store = createTelegramTopicTargetStore({ path, getNowMs: () => 1000 });
+  try {
+    store.upsert({ profileKey: "manual:old", instanceId: "old", target,
+      status: "active", slot: "A", createdAtMs: 1, updatedAtMs: 1 });
+    store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo")!,
+      target, slot: "A", updatedAtMs: 1 });
+    await store.persist();
+    await store.load();
+    const expected = store.list()[0]!;
+    const publisher = createTelegramTopicTargetStore({ path, getNowMs: () => 1000 });
+    await publisher.load();
+    assert.equal(await publisher.detachTargetOwner(expected, () => true), true);
+    store.upsert(expected);
+    assert.equal(await store.detachTargetOwner(expected, () => true), true);
+    assert.deepEqual(store.list(), []);
+    assert.equal(store.getWorkspaceBinding("/repo")?.inactiveSinceMs, 1000);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -514,6 +651,36 @@ test("Workspace inactivity persists its first proof, survives stale upserts, and
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("Only exact confirmed absence starts Workspace inactivity, including binding-only recovery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-workspace-absence-"));
+  const path = join(dir, "state.json");
+  let nowMs = 1000;
+  try {
+    const store = createTelegramTopicTargetStore({ path, getNowMs: () => nowMs });
+    const target = { chatId: 7, threadId: 41 };
+    store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo")!,
+      target, slot: "A", updatedAtMs: 1 });
+    store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/other")!,
+      target: { chatId: 8, threadId: 41 }, slot: "B", updatedAtMs: 1 });
+    store.upsert({ profileKey: "cwd:/repo", instanceId: "leader", target,
+      status: "active", createdAtMs: 1, updatedAtMs: 1 });
+    assert.equal(store.markStaleByTarget(target, "unknown"), true);
+    assert.equal(store.markStaleByTarget(target, "closed"), false);
+    assert.equal(store.getWorkspaceBinding("/repo")?.inactiveSinceMs, undefined);
+    assert.equal(store.markStaleByTarget(target, "deleted"), true);
+    assert.equal(store.getWorkspaceBinding("/repo")?.inactiveSinceMs, 1000);
+    assert.equal(store.getWorkspaceBinding("/other")?.inactiveSinceMs, undefined);
+    nowMs = 2000;
+    assert.equal(store.markStaleByTarget(target, "deleted"), false);
+    await store.persist();
+    const restored = createTelegramTopicTargetStore({ path });
+    await restored.load();
+    assert.equal(restored.getWorkspaceBinding("/repo")?.inactiveSinceMs, 1000);
+    assert.equal(restored.getWorkspaceBinding("/other")?.inactiveSinceMs, undefined);
+    assert.equal(restored.listWorkspaceBindings().length, 2);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("Inactive Workspace cleanup commit removes only one exact unprotected binding", async () => {

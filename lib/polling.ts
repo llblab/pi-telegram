@@ -28,8 +28,8 @@ const TELEGRAM_GET_UPDATES_CONFLICT_SLOW_RETRY_MS = 3_000;
 const TELEGRAM_POLLING_RETRY_MS = 3_000;
 export const TELEGRAM_GET_UPDATES_GRACE_MS = 10_000;
 
-// Standard Telegram DM polling does not expose ordinary message-deletion events,
-// so queue removal stays reaction-driven while delete-like business updates remain defensive-only.
+// Standard Telegram DM polling does not expose ordinary message-deletion events.
+// Business deletions belong to a separate namespace and default routing ignores them.
 export const TELEGRAM_ALLOWED_UPDATES = [
   "message",
   "edited_message",

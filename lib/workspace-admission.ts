@@ -142,6 +142,12 @@ export type TelegramWorkspaceRetirementFence =
       deletionIssuedAtMs: number;
     })
   | (TelegramWorkspaceRetirementFenceBase & {
+      destructiveKind?: "pressure-retirement";
+      phase: "deletion-rejected";
+      deletionIssuedAtMs: number;
+      rejectionConfirmedAtMs: number;
+    })
+  | (TelegramWorkspaceRetirementFenceBase & {
       phase: "commit-ready";
       absenceConfirmedAtMs: number;
       deletionIssuedAtMs?: number;
@@ -318,6 +324,14 @@ export interface TelegramWorkspaceAdmissionLedger {
     expected: TelegramWorkspaceRetirementFence,
   ) => TelegramWorkspaceRetirementFence;
   confirmThreadCleanupAbsence: TelegramWorkspaceAdmissionLedger["confirmRetirementAbsence"];
+  /** Caller must have exact transport proof of rejection, never merely target presence. */
+  confirmRetirementRejection: (
+    expected: TelegramWorkspaceRetirementFence,
+  ) => TelegramWorkspaceRetirementFence;
+  /** Caller must first durably withdraw the exact rejected intent, retaining its binding. */
+  completeRejectedRetirementFence: (
+    expected: TelegramWorkspaceRetirementFence,
+  ) => boolean;
   releaseUnissuedRetirementFence: (
     expected: TelegramWorkspaceRetirementFence,
   ) => boolean;
@@ -490,6 +504,12 @@ function normalizeFence(
       phase: "deletion-issued",
       deletionIssuedAtMs: value.deletionIssuedAtMs,
     };
+  }
+  if (value.phase === "deletion-rejected" &&
+      (value.destructiveKind === undefined || value.destructiveKind === "pressure-retirement") &&
+      isSafeTimestamp(value.deletionIssuedAtMs) && isSafeTimestamp(value.rejectionConfirmedAtMs)) {
+    return { ...base, destructiveKind: value.destructiveKind, phase: "deletion-rejected",
+      deletionIssuedAtMs: value.deletionIssuedAtMs, rejectionConfirmedAtMs: value.rejectionConfirmedAtMs };
   }
   if (
     value.phase === "commit-ready" &&
@@ -767,6 +787,10 @@ function areFencesEqual(
     right.phase === "deletion-issued"
   ) {
     return left.deletionIssuedAtMs === right.deletionIssuedAtMs;
+  }
+  if (left.phase === "deletion-rejected" && right.phase === "deletion-rejected") {
+    return left.deletionIssuedAtMs === right.deletionIssuedAtMs &&
+      left.rejectionConfirmedAtMs === right.rejectionConfirmedAtMs;
   }
   return (
     left.phase === "commit-ready" &&
@@ -1519,6 +1543,9 @@ export function createTelegramWorkspaceAdmissionLedger(
     if (!areOwnersEqual(expected.owner, options.owner)) {
       authorityChanged("Telegram Workspace absence confirmation requires fence owner authority.");
     }
+    if (expected.phase === "deletion-rejected") {
+      authorityChanged("Rejected Telegram Workspace deletion cannot confirm absence.");
+    }
     return transact((state) => {
       if (!state.fence || !isTelegramWorkspaceRetirementFence(state.fence)) {
         authorityChanged("Telegram Workspace retirement fence is absent or has another kind.");
@@ -1571,9 +1598,10 @@ export function createTelegramWorkspaceAdmissionLedger(
     });
   }
 
-  function completeRetirementFence(
+  function completeDestructiveFence(
     expected: TelegramWorkspaceRetirementFence,
-    expectedKind: TelegramWorkspaceDeletionFenceKind = "pressure-retirement",
+    expectedKind: TelegramWorkspaceDeletionFenceKind,
+    requiredPhase: "commit-ready" | "deletion-rejected",
   ): boolean {
     validateExpectedFence(expected, options.profileKey);
     if (resolveTelegramWorkspaceDestructiveFenceKind(expected) !== expectedKind)
@@ -1588,12 +1616,45 @@ export function createTelegramWorkspaceAdmissionLedger(
       if (!areFencesEqual(state.fence, expected)) {
         authorityChanged("Telegram Workspace retirement fence authority changed.");
       }
-      if (state.fence.phase !== "commit-ready") {
-        authorityChanged("Telegram Workspace retirement commit is not ready.");
+      if (state.fence.phase !== requiredPhase) {
+        authorityChanged(requiredPhase === "commit-ready"
+          ? "Telegram Workspace retirement commit is not ready."
+          : "Telegram Workspace retirement rejection is not confirmed.");
       }
       delete state.fence;
       return { result: true, changed: true };
     });
+  }
+
+  function confirmRetirementRejection(expected: TelegramWorkspaceRetirementFence): TelegramWorkspaceRetirementFence {
+    validateExpectedFence(expected, options.profileKey);
+    if (resolveTelegramWorkspaceDestructiveFenceKind(expected) !== "pressure-retirement" ||
+        !areOwnersEqual(expected.owner, options.owner) ||
+        (expected.phase !== "deletion-issued" && expected.phase !== "deletion-rejected")) {
+      authorityChanged("Telegram Workspace rejection requires exact issued retirement authority.");
+    }
+    return transact((state) => {
+      const current = state.fence;
+      if (!current || !isTelegramWorkspaceRetirementFence(current) || !areFenceBasesEqual(current, expected) ||
+          (current.phase !== "deletion-issued" && current.phase !== "deletion-rejected") ||
+          current.deletionIssuedAtMs !== expected.deletionIssuedAtMs ||
+          (expected.phase === "deletion-rejected" && !areFencesEqual(current, expected))) {
+        authorityChanged("Telegram Workspace retirement fence authority changed.");
+      }
+      if (current.phase === "deletion-rejected") return { result: cloneFence(current), changed: false };
+      const rejected: TelegramWorkspaceRetirementFence = { ...current,
+        destructiveKind: "pressure-retirement", phase: "deletion-rejected", rejectionConfirmedAtMs: getNowMs() };
+      state.fence = rejected;
+      return { result: cloneFence(rejected), changed: true };
+    });
+  }
+
+  function completeRetirementFence(expected: TelegramWorkspaceRetirementFence,
+    expectedKind: TelegramWorkspaceDeletionFenceKind = "pressure-retirement") {
+    return completeDestructiveFence(expected, expectedKind, "commit-ready");
+  }
+  function completeRejectedRetirementFence(expected: TelegramWorkspaceRetirementFence) {
+    return completeDestructiveFence(expected, "pressure-retirement", "deletion-rejected");
   }
 
   function adoptThreadCleanupFence(expected: TelegramWorkspaceRetirementFence,
@@ -1635,6 +1696,8 @@ export function createTelegramWorkspaceAdmissionLedger(
     issueThreadCleanupDeletionPermit,
     confirmRetirementAbsence,
     confirmThreadCleanupAbsence,
+    confirmRetirementRejection,
+    completeRejectedRetirementFence,
     releaseUnissuedRetirementFence,
     releaseUnissuedThreadCleanupFence,
     completeRetirementFence,

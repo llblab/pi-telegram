@@ -7,6 +7,7 @@
 import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError } from "./telegram-api.ts";
 import { getTelegramTargetKey, type TelegramTarget } from "./target.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
+import { TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.ts";
 import {
   createTelegramWorkspaceAdmissionOperationId,
   runWithTelegramWorkspaceAdmissionsAsync,
@@ -195,6 +196,47 @@ export function markTelegramConfigSyncChange<
     action,
   }) as TSyncState;
   return nextState;
+}
+
+export function createTelegramPreservedLeaderQuitHandler(deps: {
+  instanceId: string;
+  topicTargetStore: Pick<TelegramTopicTargetStore,
+    "load" | "list" | "listPendingCleanups" | "detachTargetOwner">;
+  getCurrentLeaderEpoch: () => number | string | undefined;
+  getProfileName: () => string | undefined;
+  isPollingSuspended: () => boolean;
+  resolveAutomaticThreadCleanupEnabled: () => boolean | Promise<boolean>;
+  runWorkspaceOperation: TelegramSyncWorkspaceOperationRunner;
+}): (isSessionCurrent: () => boolean) => (() => Promise<void>) | undefined {
+  return (isSessionCurrent) => {
+    const epoch = deps.getCurrentLeaderEpoch();
+    const profile = deps.getProfileName();
+    if (epoch === undefined || !isSessionCurrent()) return undefined;
+    const isCurrent = () => isSessionCurrent() && deps.getCurrentLeaderEpoch() === epoch &&
+      deps.getProfileName() === profile && deps.isPollingSuspended();
+    return async () => {
+      if (!isCurrent() || await deps.resolveAutomaticThreadCleanupEnabled() !== false) return;
+      if (!isCurrent()) return;
+      await deps.runWorkspaceOperation({
+        operationId: createTelegramWorkspaceAdmissionOperationId(),
+        operationKind: "workspace.preserve-leader-quit",
+        scopes: [{ kind: "profile" }],
+      }, async () => {
+        if (!isCurrent()) return;
+        await deps.topicTargetStore.load();
+        if (!isCurrent()) return;
+        const records = deps.topicTargetStore.list().filter((record) =>
+          record.instanceId === deps.instanceId && (record.status === "active" || record.status === "starting"));
+        if (records.length !== 1) return;
+        const record = records[0]!;
+        if (deps.topicTargetStore.listPendingCleanups().some((intent) =>
+          intent.target.chatId === record.target.chatId && intent.target.threadId === record.target.threadId)) return;
+        if (!await deps.topicTargetStore.detachTargetOwner(record, isCurrent) && isCurrent()) {
+          throw new Error("Telegram preserved leader detachment was not committed.");
+        }
+      });
+    };
+  };
 }
 
 export interface TelegramSessionRestartThreadCleanupDeps<
@@ -650,15 +692,17 @@ export async function ensureTelegramLeaderThreadBinding(
   const leaderProfileKey = getTelegramThreadOwnerKey(leaderOwner);
   const legacyLeaderRecord =
     deps.topicTargetStore.getByProfileKey(leaderProfileKey);
+  let capacityUnavailable = false;
   const workspaceIdentity = normalizedLeaderCwd
     ? deps.topicTargetStore.claimWorkspaceIdentity(
         normalizedLeaderCwd,
         deps.instanceId,
         legacyLeaderRecord?.instanceId,
-        { sessionId: deps.sessionId },
+        { sessionId: deps.sessionId, onCapacityUnavailable() { capacityUnavailable = true; } },
       )
     : undefined;
   if (deps.cwd && !workspaceIdentity) {
+    if (capacityUnavailable) throw new TelegramWorkspaceSlotUnavailableError();
     throw new Error("Telegram Workspace identity is already claimed.");
   }
   const commitWorkspaceBinding = async (

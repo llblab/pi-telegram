@@ -146,6 +146,8 @@ The registry object on `globalThis.__piTelegramUpdateHandlerRegistry__` is versi
 
 `pi-telegram` invokes registered handlers first, then routes the update through its own handlers: commands, app menu, queue menu, model menu, default prompt routing, and callback namespace fallback. If any handler returns `"consume"`, `pi-telegram` skips the rest of routing for that update.
 
+Default routing ignores `deleted_business_messages`. Telegram's [BusinessMessagesDeleted](https://core.telegram.org/bots/api#businessmessagesdeleted) belongs to a connected business account; [Message.business_connection_id](https://core.telegram.org/bots/api#message) explicitly distinguishes that account's chats from bot chats with the same IDs. Such an update cannot delete private Pi queue entries or pending media groups. Raw handlers still receive the carrier and may own their own namespace-aware behavior. The polling filter is not an authority check: Telegram may return updates created before a changed `allowed_updates` setting.
+
 This means:
 
 - Extensions can claim callback namespaces that `pi-telegram` would otherwise forward as `[callback] <data>` text.

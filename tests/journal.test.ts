@@ -858,7 +858,7 @@ test("Legacy custody operator runtime resolves exact live binding without cachin
     "enter:journal:g2", "apply:journal:g2:legacy:7", "exit:journal:g2"]);
 });
 
-test("V3 worker journal port exposes custody and refuses every legacy raw mutation", async context => {
+test("V3 worker journal port exposes custody but cannot complete non-excluded input without receipts", async context => {
   await withInputCustodyFixture(context, async ({ options, path }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 1 }], 1);
@@ -869,7 +869,12 @@ test("V3 worker journal port exposes custody and refuses every legacy raw mutati
     assert.equal("listLegacyCustodyCandidates" in port.inputCustody, false);
     assert.equal(port.read().version, 3);
     const before = await readFile(path, "utf8");
-    assert.throws(() => port.removeCompleted([1]), /forbids legacy raw worker settlement/);
+    const assertRawRemovalRefused = () => {
+      const snapshot = store.read();
+      assert.throws(() => port.removeCompleted([1]), error => isJournalError(error, "conflict"));
+      assert.deepEqual(store.read(), snapshot);
+    };
+    assertRawRemovalRefused();
     assert.throws(() => port.markQueued({ queueKind: "prompt", receiptId: "legacy",
       sourceUpdateIds: [1], owner: { ...options.queueRuntimeIdentity, sessionGeneration: 1 } }),
     /forbids legacy raw worker settlement/);
@@ -896,15 +901,19 @@ test("V3 worker journal port exposes custody and refuses every legacy raw mutati
     assert.equal(binding?.journal.read().version, 3);
     assert.deepEqual([sourceReads, recipientReads], [1, 1]);
     const raw = store.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
+    assertRawRemovalRefused();
     assert.equal(store.startInput(raw.receipt).started, true);
+    assertRawRemovalRefused();
     const queued = store.queueInputs({ queueKind: "prompt", receiptId: "v3-handoff",
       receipts: [raw.receipt] }).queueReceipt;
+    assertRawRemovalRefused();
     const recipientOwner = { instanceId: "recipient", processId: process.pid + 1,
       processBirthId: `${process.pid + 1}:recipient`, sessionGeneration: 1 };
     const handoff = { queueKind: queued.queueKind, receiptId: queued.receiptId,
       sourceUpdateIds: queued.sourceUpdateIds, expectedOwner: queued.queueOwner, recipientOwner,
       handoffToken: createTelegramUpdateQueueHandoffToken() };
     assert.deepEqual(binding?.journal.offerQueuedHandoff?.(handoff).offeredUpdateIds, [1]);
+    assertRawRemovalRefused();
     assert.deepEqual(binding?.journal.cancelQueuedHandoff?.(handoff).cancelledUpdateIds, [1]);
   });
 });
@@ -1042,6 +1051,138 @@ test("Assembled custodied worker publishes one late grouped queue receipt", asyn
       assert.equal(worker.getState().queuedClaimCount, 2);
       assert.equal(worker.getState().blockedReason, undefined);
     } finally { await worker.stop(); }
+  });
+});
+
+for (const mode of ["leader-restart", "follower-mutable-active"] as const) test(`V3 lifecycle refreshes expired source dependencies behind unchanged binding keys (${mode})`, async context => {
+  await withInputCustodyFixture(context, async ({ options, setOwner }) => {
+    const follower = mode === "follower-mutable-active";
+    let lifetime = 1;
+    const createSource = () => {
+      const capturedLifetime = lifetime;
+      return createTelegramInputJournalStore({ ...options, getInputContext() {
+        const current = options.getInputContext();
+        return capturedLifetime === lifetime ? current : undefined;
+      } });
+    };
+    let source = createSource();
+    const resolve = createTelegramInputCustodyLifecycleBindingResolver({
+      isEnabled: () => true,
+      resolveInputJournal: () => ({ runtimeKey: "same-source-runtime",
+        recoveryKey: createTelegramUpdateJournalBindingKey(options), journal: source }),
+      getRecipientBindingKey: () => "workspace:owner",
+    });
+    let descriptor: ReturnType<typeof resolve>;
+    const resolveBinding = () => {
+      const fresh = resolve()!;
+      if (!follower || !descriptor) descriptor = fresh;
+      else Object.assign(descriptor.journal, fresh.journal);
+      return descriptor;
+    };
+    const originalKeys = { runtime: resolveBinding().runtimeKey, recovery: resolveBinding().recoveryKey };
+    const handled: number[] = [];
+    const assembly = createTelegramUpdateAdmissionLifecycleAssembly({
+      runtimeBinding: createTelegramUpdateAdmissionRuntimeBinding({ isFollowerRegistered: () => follower }),
+      worker: {
+        getQueueOwnerIdentity: () => ({ ...options.queueRuntimeIdentity, sessionGeneration: lifetime }),
+        async defaultHandle(update) { handled.push(update.update_id); },
+      },
+      leader: { resolveBinding, hasAuthority: () => !follower },
+      follower: { resolveBinding, isRegistered: () => follower,
+        getGeneration: () => "stable-registration", prepareUpdateForExecution: update => update },
+    });
+    const lifecycle = follower ? assembly.follower : assembly.leader;
+    try {
+      source.appendBatch([{ update_id: 1 }], 1);
+      await lifecycle.onSessionStart({});
+      await new Promise<void>(done => setImmediate(done));
+      assert.deepEqual(handled, [1]);
+      await lifecycle.onSessionShutdown();
+      // Stable source handles may still reuse the worker and its compatible dependencies.
+      await lifecycle.onSessionStart({});
+      await new Promise<void>(done => setImmediate(done));
+      assert.equal(lifecycle.getState()?.generation, 2);
+      if (!follower) await lifecycle.onSessionShutdown();
+      lifetime += 1;
+      setOwner({ ...options.queueRuntimeIdentity, sessionGeneration: lifetime });
+      source = createSource();
+      source.appendBatch([{ update_id: 2 }], 2);
+      assert.deepEqual({ runtime: resolveBinding().runtimeKey, recovery: resolveBinding().recoveryKey }, originalKeys);
+      await lifecycle.onSessionStart({});
+      await new Promise<void>(done => setImmediate(done));
+      assert.deepEqual(handled, [1, 2], "Fresh maintenance reads must not restart expired execution ports");
+      assert.equal(lifecycle.getState()?.blockedReason, undefined);
+      assert.deepEqual(source.read().entries, []);
+    } finally { await lifecycle.onSessionShutdown(); }
+  });
+});
+
+test("V3 source refresh cannot replay an unsettled handler while independent input progresses", async context => {
+  await withInputCustodyFixture(context, async ({ options, setOwner }) => {
+    let lifetime = 1;
+    const createSource = () => {
+      const capturedLifetime = lifetime;
+      return createTelegramInputJournalStore({ ...options, getInputContext() {
+        const current = options.getInputContext();
+        return capturedLifetime === lifetime ? current : undefined;
+      } });
+    };
+    let source = createSource();
+    const resolveBinding = createTelegramInputCustodyLifecycleBindingResolver({
+      isEnabled: () => true,
+      resolveInputJournal: () => ({ runtimeKey: "held-source-runtime",
+        recoveryKey: createTelegramUpdateJournalBindingKey(options), journal: source }),
+      getRecipientBindingKey: () => "workspace:owner",
+    });
+    const release = Promise.withResolvers<void>();
+    const attempted: number[] = [];
+    const effects: number[] = [];
+    let oldFinished = false;
+    const assembly = createTelegramUpdateAdmissionLifecycleAssembly({
+      runtimeBinding: createTelegramUpdateAdmissionRuntimeBinding({ isFollowerRegistered: () => false }),
+      worker: {
+        getQueueOwnerIdentity: () => ({ ...options.queueRuntimeIdentity, sessionGeneration: lifetime }),
+        async defaultHandle(update, _ctx, execution) {
+          attempted.push(update.update_id);
+          if (update.update_id === 1) {
+            try { await release.promise; execution!.assertCurrent(); }
+            finally { oldFinished = true; }
+          }
+          effects.push(update.update_id);
+        },
+      },
+      leader: { resolveBinding, hasAuthority: () => true },
+      follower: { resolveBinding, isRegistered: () => false,
+        getGeneration: () => undefined, prepareUpdateForExecution: update => update },
+    });
+    try {
+      source.appendBatch([{ update_id: 1 }], 1);
+      await assembly.leader.onSessionStart({});
+      await new Promise<void>(done => setImmediate(done));
+      assert.deepEqual(attempted, [1]);
+      const running = source.read().entries[0]!.inputClaim;
+      assert.equal(running?.phase, "running");
+      lifetime += 1;
+      setOwner({ ...options.queueRuntimeIdentity, sessionGeneration: lifetime });
+      source = createSource();
+      source.appendBatch([{ update_id: 2 }], 2);
+      await assembly.leader.onSessionStart({});
+      await new Promise<void>(done => setImmediate(done));
+      assert.equal(oldFinished, false, "Stop is not settlement of the held handler");
+      assert.deepEqual(attempted, [1, 2]);
+      assert.deepEqual(effects, [2]);
+      assert.deepEqual(source.read().entries.map(entry => entry.updateId), [1]);
+      assert.deepEqual(source.read().entries[0]?.inputClaim, running);
+      release.resolve();
+      await new Promise<void>(done => setImmediate(done));
+      assert.equal(oldFinished, true);
+      assert.deepEqual(effects, [2], "The aborted origin cannot issue a late effect");
+      assert.deepEqual(source.read().entries[0]?.inputClaim, running);
+    } finally {
+      release.resolve();
+      await assembly.leader.onSessionShutdown();
+      await new Promise<void>(done => setImmediate(done));
+    }
   });
 });
 
@@ -3992,6 +4133,36 @@ test("Exclusion journal rejects malformed, changed, resurrected, and legacy evid
       assert.equal(existsSync(join(dir, "recovery")), false, scenario);
     });
   }
+});
+
+test("Workspace protection reads journal evidence without recovery, repair, or publication", async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-protection-read-")));
+  const path = join(directory, "inbox.json");
+  let recoveries = 0;
+  const resolveBinding = createTelegramUpdateJournalRuntimeBindingResolver({
+    getProfileName: () => undefined, getBotToken: () => "token-a", getBotId: () => 7,
+    getJournalPath: () => path, onRecovery() { recoveries++; },
+  });
+  try {
+    const binding = resolveBinding()!;
+    const read = binding.readForProtection!;
+    if (!fs.constants.O_NOFOLLOW || !fs.constants.O_NONBLOCK) {
+      assert.throws(read);
+      assert.equal(existsSync(path), false);
+      return;
+    }
+    assert.deepEqual(read(), { entries: [] });
+    assert.equal(existsSync(path), false);
+    binding.journal.appendBatch([{ update_id: 1, message: { chat: { id: 7 }, message_thread_id: 42 } }]);
+    const before = await readFile(path, "utf8");
+    assert.equal(read().entries.length, 1);
+    assert.equal(await readFile(path, "utf8"), before);
+    await writeFile(path, "{");
+    assert.throws(read);
+    assert.equal(await readFile(path, "utf8"), "{");
+    assert.equal(recoveries, 0);
+    assert.equal(existsSync(join(directory, "recovery")), false);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test("Update journal runtime binding separates worker and process recovery identity", async () => {

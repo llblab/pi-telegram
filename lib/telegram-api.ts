@@ -882,15 +882,18 @@ export function isTelegramApiCommitUnknownError(
 class TelegramApiHttpError extends Error {
   readonly status: number | undefined;
   readonly retryAfterSeconds: number | undefined;
+  readonly rejectedRequestMethod: string | undefined;
   requestTarget?: { chatId: number; threadId: number };
   constructor(
     message: string,
     status: number | undefined,
     retryAfterSeconds: number | undefined,
+    rejectedRequestMethod?: string,
   ) {
     super(message);
     this.status = status;
     this.retryAfterSeconds = retryAfterSeconds;
+    this.rejectedRequestMethod = rejectedRequestMethod;
   }
 }
 
@@ -932,6 +935,12 @@ export function getTelegramApiErrorRequestTarget(
 export function isTelegramStaleTargetHttpError(error: unknown): boolean {
   if (!(error instanceof TelegramApiHttpError) || error.status !== 400) return false;
   return /^Telegram API \w+ failed: HTTP 400: Bad Request: (message thread not found|thread not found|topic not found|topic deleted|topic closed|thread closed|forum topic closed|message thread closed|topic_id_invalid|topic_closed)$/i.test(error.message);
+}
+
+/** Only a parsed Telegram rejection of this method proves a request had no effect. */
+export function isTelegramApiRequestRejected(error: unknown, method: string): boolean {
+  return error instanceof TelegramApiHttpError && error.rejectedRequestMethod !== undefined &&
+    error.rejectedRequestMethod === method;
 }
 
 export function isTelegramMessageNotModifiedError(error: unknown): boolean {
@@ -1106,6 +1115,8 @@ async function parseTelegramApiResponse<TResponse>(
       `Telegram API ${method} failed: ${status}${description}`,
       response.status,
       Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
+      data?.ok === false && data.error_code === response.status &&
+        [400, 401, 403, 404, 429].includes(response.status) ? method : undefined,
     );
   }
   if (!data) {
@@ -1785,6 +1796,10 @@ export function buildTelegramAnswerGuestQueryBody(
   return body;
 }
 
+export type TelegramWorkspaceThreadDeletionTransport = (
+  authorize: () => { chatId: number; threadId: number },
+) => Promise<void>;
+
 export function createDefaultTelegramBridgeApiRuntime(deps: {
   getBotToken: () => string | undefined;
   recordRuntimeEvent: TelegramBridgeApiRuntimeDeps["recordRuntimeEvent"];
@@ -1793,7 +1808,9 @@ export function createDefaultTelegramBridgeApiRuntime(deps: {
   workspaceAdmission?:
     | TelegramApiWorkspaceAdmissionPort
     | (() => TelegramApiWorkspaceAdmissionPort | undefined);
-}): TelegramBridgeApiRuntime {
+}): TelegramBridgeApiRuntime & {
+  deleteWorkspaceThread: TelegramWorkspaceThreadDeletionTransport;
+} {
   const client = createTelegramApiClient(deps.getBotToken, {
     recordRuntimeEvent: deps.recordRuntimeEvent,
   });
@@ -1807,7 +1824,7 @@ export function createDefaultTelegramBridgeApiRuntime(deps: {
         },
       })
     : client;
-  return createTelegramBridgeApiRuntime({
+  const runtime = createTelegramBridgeApiRuntime({
     client: deps.targetActivity
       ? createTelegramApiTargetTrackingClient(admittedClient, deps.targetActivity)
       : admittedClient,
@@ -1817,6 +1834,17 @@ export function createDefaultTelegramBridgeApiRuntime(deps: {
     recordRuntimeEvent: deps.recordRuntimeEvent,
     captureRequestErrorHandler: deps.captureRequestErrorHandler,
   });
+  return {
+    ...runtime,
+    async deleteWorkspaceThread(authorize) {
+      // The exclusive deletion permit replaces ordinary target admission.
+      const target = authorize();
+      const deleted = await client.call<boolean>("deleteForumTopic", {
+        chat_id: target.chatId, message_thread_id: target.threadId,
+      }, { maxAttempts: 1, retrySafety: "non-idempotent" });
+      if (deleted !== true) throw new Error("Telegram Workspace Thread deletion was not confirmed.");
+    },
+  };
 }
 
 export function createTelegramBridgeApiRuntime(

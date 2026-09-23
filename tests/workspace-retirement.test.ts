@@ -22,16 +22,30 @@ import {
   adoptTelegramWorkspaceRetirementIntent,
   captureTelegramWorkspaceExternalProtection,
   captureTelegramWorkspaceJournalProtectionSources,
+  createTelegramWorkspaceDeadOwnerQueueReclaimer,
   createTelegramWorkspaceExternalProtectionCapture,
   createTelegramWorkspaceOperationGate,
+  createTelegramWorkspaceOperationRuntime,
+  createTelegramWorkspaceSlotRotation,
   executeTelegramWorkspaceRetirement,
   prepareTelegramWorkspaceRetirement,
   pruneTelegramWorkspaceJournalEvidence,
   resolveTelegramWorkspaceAcceptedWorkProtection,
   runTelegramWorkspaceRetirementLifecycle,
 } from "../lib/workspace-retirement.ts";
-import { TelegramApiStaleTargetError } from "../lib/telegram-api.ts";
+import {
+  createDefaultTelegramBridgeApiRuntime,
+  setTelegramApiHttpsFetchForTesting,
+  TelegramApiStaleTargetError,
+} from "../lib/telegram-api.ts";
+import { TelegramWorkspaceSlotUnavailableError } from "../lib/workspace-slots.ts";
 import { createTelegramWorkspaceAdmissionLedger } from "../lib/workspace-admission.ts";
+import {
+  createTelegramUpdateJournalBotIdentity,
+  createTelegramUpdateJournalStore,
+  inspectTelegramUpdateJournalFamily,
+  type TelegramUpdateJournalEntry,
+} from "../lib/journal.ts";
 
 const clearExternalProtection = () => ({
   liveOwner: "clear" as const,
@@ -496,6 +510,485 @@ test("Explicit lifecycle prepares and executes one pressure retirement", async (
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("Pressure rotation reclaims exact queued custody only after native dead-owner proof", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-dead-owner-reclamation-"));
+  try {
+    const admission = createRetirementAdmission(join(dir, "admission.json"));
+    const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"),
+      getExternalReservedSlots: admission.listReservedSlots });
+    for (let index = 0; index < 26; index++) addBinding(store, index, index + 1);
+    const initial = store.getWorkspaceBinding("/repo/0")!;
+    const journalBindingKey = "manual-follower:dead-fixture";
+    assert.ok(store.commitWorkspaceJournalEvidence(initial, [journalBindingKey], true));
+    await store.persist();
+
+    const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "7:fixture" });
+    const recoveryOwner = { instanceId: "leader", processId: process.pid,
+      processBirthId: `${process.pid}:leader`, sessionGeneration: 2 };
+    const deadOwner = { instanceId: "dead-follower",
+      processId: process.pid + 1_000_000, processBirthId: `${process.pid + 1_000_000}:dead`,
+      sessionGeneration: 1 };
+    const createJournal = (name: string, queueRuntimeIdentity = recoveryOwner) => {
+      const path = join(dir, name);
+      const journal = createTelegramUpdateJournalStore({ path, profileName: "default", botIdentity,
+        queueRuntimeIdentity, workspaceAdmission: admission,
+        getQueueProcessLiveness: owner => owner.processId === deadOwner.processId ? "dead" : "alive" });
+      return { recoveryKey: path, journal, readForProtection: () => {
+        const evidence = inspectTelegramUpdateJournalFamily({ directory: dir, path,
+          profile: "default", botIdentity,
+          limits: { maxFiles: 128, maxBytes: 1_000_000, maxEntries: 128, maxWork: 10_000 } });
+        if (evidence.kind !== "present") throw new Error("fixture journal disappeared");
+        return { entries: evidence.file.entries };
+      } };
+    };
+    const leader = createJournal("inbox.json");
+    leader.journal.appendBatch([{ update_id: 99, message: { message_id: 99,
+      chat: { id: 999, type: "private" }, from: { id: 7, is_bot: false }, text: "seed" } }], 99);
+    const seeded = leader.journal.markQueued({ queueKind: "prompt", receiptId: "seed-receipt",
+      sourceUpdateIds: [99], owner: recoveryOwner });
+    assert.ok(seeded.queueOwner);
+    leader.journal.completeQueued([{ queueKind: "prompt", receiptId: "seed-receipt",
+      sourceUpdateIds: [99], queueOwner: seeded.queueOwner! }]);
+    const deadWriter = createJournal("follower-inbox-dead000000000000.json", deadOwner);
+    deadWriter.journal.appendBatch([{ update_id: 1, message: { message_id: 10,
+      message_thread_id: initial.target.threadId, chat: { id: initial.target.chatId, type: "private" },
+      from: { id: 7, is_bot: false }, text: "retained dead-owner work" } }], 1);
+    deadWriter.journal.markQueued({ queueKind: "prompt", receiptId: "dead-receipt",
+      sourceUpdateIds: [1], owner: deadOwner });
+    const follower = createJournal("follower-inbox-dead000000000000.json");
+
+    const capture = createTelegramWorkspaceExternalProtectionCapture({
+      listFollowers: () => [], getActiveTurnTarget: () => undefined, getQueuedItems: () => [],
+      resolveLeaderJournal: () => leader,
+      createFollowerJournalResolver: key => () => key === journalBindingKey ? follower : undefined,
+      getJournalWriterProtection: () => "clear", getDeliveryAuthorityProtection: () => "clear",
+    });
+    const getProtection = (binding: TelegramWorkspaceThreadBinding): TelegramWorkspaceExternalProtectionEvidence =>
+      binding.bindingKey === initial.bindingKey ? capture(binding) : {
+        liveOwner: "protected", acceptedWork: "clear", deliveryAuthority: "clear",
+      };
+    const reclaim = createTelegramWorkspaceDeadOwnerQueueReclaimer({
+      getExternalProtection: getProtection, getActiveTurnTarget: () => undefined,
+      getQueuedItems: () => [], resolveLeaderJournal: () => leader,
+      createFollowerJournalResolver: key => () => key === journalBindingKey ? follower : undefined,
+      getRecoveryOwner: () => recoveryOwner,
+      getQueueOwnerLiveness: candidate => candidate.processId === deadOwner.processId ? "dead" : "alive",
+      isBindingCurrent: binding => store.listWorkspaceBindings().some(candidate =>
+        candidate.bindingKey === binding.bindingKey && candidate.updatedAtMs === binding.updatedAtMs),
+    });
+    assert.deepEqual(getProtection(store.getWorkspaceBinding("/repo/0")!), {
+      liveOwner: "clear", acceptedWork: "protected", deliveryAuthority: "clear",
+    });
+    let deletions = 0;
+    let effects = 0;
+    const reclamations: unknown[] = [];
+    const operations = createTelegramWorkspaceOperationRuntime({ getWorkspaceAdmission: () => admission });
+    const rotation = createTelegramWorkspaceSlotRotation({
+      store, getAdmission: () => admission, getLeaderEpoch: () => 1,
+      runExclusive: operations.runExclusive,
+      getExternalProtection: getProtection, recordEvent() {},
+      reclaimDeadOwnerQueuedWork(binding, isCurrent) {
+        return operations.run({ operationId: "dead-owner-reclamation-fixture",
+          operationKind: "workspace.reclaim-dead-owner-queue",
+          scopes: [{ kind: "target", target: binding.target }] }, async () => {
+          const result = await reclaim(binding, isCurrent);
+          reclamations.push(result);
+          return result;
+        });
+      },
+      async deleteThread(authorize) { authorize(); deletions++; },
+    });
+    const slot = await rotation(async () => {
+      const claimed = store.claimWorkspaceIdentity("/fresh", "fresh");
+      if (!claimed) throw new TelegramWorkspaceSlotUnavailableError();
+      effects++;
+      return claimed.slot;
+    });
+    assert.equal(slot, "A", JSON.stringify(reclamations));
+    assert.equal(deletions, 1);
+    assert.equal(effects, 1, "The failed allocation must not execute its effect before reclamation");
+    assert.deepEqual(reclamations, [{ kind: "recovered", receipts: 1, updateIds: [1] }]);
+    assert.deepEqual(follower.journal.read().entries, []);
+    assert.equal(store.listWorkspaceBindings().length, 25);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Dead-owner reclamation refuses replacement and partial custody, then resumes interrupted exact groups", async (t) => {
+  const binding: TelegramWorkspaceThreadBinding = {
+    ...createTelegramWorkspaceBindingIdentity("/repo/dead-owner")!,
+    target: { chatId: 7, threadId: 42 }, slot: "A", inactiveSinceMs: 1, updatedAtMs: 2,
+    journalBindingsComplete: true,
+  };
+  const owner = { instanceId: "dead", processId: 444, processBirthId: "444:start:dead",
+    sessionGeneration: 1, acquisitionId: "acquire-dead", acquiredAtMs: 1 };
+  const recoveryOwner = { instanceId: "leader", processId: 555, processBirthId: "555:start:leader",
+    sessionGeneration: 2 };
+  const entry = (updateId: number, threadId: number, receiptId: string): TelegramUpdateJournalEntry => ({
+    updateId, admittedAtMs: 1, state: "queued", queueKind: "prompt", queueReceiptId: receiptId,
+    queueOwner: owner, update: { update_id: updateId, message: { message_id: updateId,
+      message_thread_id: threadId, chat: { id: 7, type: "private" },
+      from: { id: 7, is_bot: false }, text: `update-${updateId}` } },
+  });
+  const createHarness = (input: {
+    initialEntries: TelegramUpdateJournalEntry[];
+    getLiveOwner?: (call: number) => "clear" | "protected" | "unknown";
+    liveness?: "alive" | "dead" | "unverifiable";
+    recover?: (call: number) => "recovered" | "owner-alive" | "owner-unverifiable" | "throw";
+  }) => {
+    let entries = [...input.initialEntries];
+    let protectionCalls = 0;
+    let recoveryCalls = 0;
+    const source = {
+      recoveryKey: "fixture-source",
+      readForProtection: () => ({ entries }),
+      journal: { recoverDeadQueueOwner(recovery: Parameters<ReturnType<
+        typeof createTelegramUpdateJournalStore>["recoverDeadQueueOwner"]>[0]) {
+        recoveryCalls++;
+        const outcome = input.recover?.(recoveryCalls) ?? "recovered";
+        if (outcome === "throw") throw new Error("interrupted publication");
+        if (outcome !== "recovered") return { status: outcome, previousOwner: owner,
+          recoveredUpdateIds: [] as [], entryCount: entries.length, serializedBytes: 1 };
+        entries = entries.filter((candidate) =>
+          !recovery.sourceUpdateIds.includes(candidate.updateId));
+        return { status: "recovered" as const, previousOwner: owner,
+          recoveredUpdateIds: [...recovery.sourceUpdateIds], entryCount: entries.length, serializedBytes: 1 };
+      } },
+    };
+    const getExternalProtection = (): TelegramWorkspaceExternalProtectionEvidence => {
+      protectionCalls++;
+      const acceptedWork = entries.some((candidate) =>
+        (candidate.update as { message?: { message_thread_id?: number } }).message
+          ?.message_thread_id === binding.target.threadId)
+        ? "protected" as const : "clear" as const;
+      return { liveOwner: input.getLiveOwner?.(protectionCalls) ?? "clear",
+        acceptedWork, deliveryAuthority: "clear" };
+    };
+    const reclaim = createTelegramWorkspaceDeadOwnerQueueReclaimer({
+      getExternalProtection, getActiveTurnTarget: () => undefined, getQueuedItems: () => [],
+      resolveLeaderJournal: () => source, createFollowerJournalResolver: () => () => undefined,
+      getRecoveryOwner: () => recoveryOwner,
+      getQueueOwnerLiveness: () => input.liveness ?? "dead",
+      isBindingCurrent: () => true,
+    });
+    return { reclaim, get entries() { return entries; }, get recoveryCalls() { return recoveryCalls; } };
+  };
+
+  await t.test("replacement owner", async () => {
+    const harness = createHarness({ initialEntries: [entry(1, 42, "receipt")],
+      getLiveOwner: call => call >= 2 ? "protected" : "clear" });
+    assert.deepEqual(await harness.reclaim(binding, () => true),
+      { kind: "blocked", reason: "live-owner" });
+    assert.equal(harness.recoveryCalls, 0);
+    assert.deepEqual(harness.entries.map(candidate => candidate.updateId), [1]);
+  });
+  await t.test("partial grouped receipt", async () => {
+    const harness = createHarness({ initialEntries: [
+      entry(1, 42, "shared-receipt"), entry(2, 43, "shared-receipt"),
+    ] });
+    assert.deepEqual(await harness.reclaim(binding, () => true),
+      { kind: "blocked", reason: "unsupported-custody" });
+    assert.equal(harness.recoveryCalls, 0);
+    assert.deepEqual(harness.entries.map(candidate => candidate.updateId), [1, 2]);
+  });
+  for (const status of ["owner-alive", "owner-unverifiable"] as const) {
+    await t.test(status, async () => {
+      const harness = createHarness({ initialEntries: [entry(1, 42, "receipt")],
+        liveness: status === "owner-alive" ? "alive" : "unverifiable" });
+      assert.deepEqual(await harness.reclaim(binding, () => true),
+        { kind: "blocked", reason: status });
+      assert.deepEqual(harness.entries.map(candidate => candidate.updateId), [1]);
+    });
+  }
+  await t.test("interrupted mutation and exact retry", async () => {
+    const harness = createHarness({ initialEntries: [
+      entry(1, 42, "dead-receipt"), entry(2, 43, "unrelated-receipt"),
+    ], recover: call => call === 1 ? "throw" : "recovered" });
+    assert.deepEqual(await harness.reclaim(binding, () => true),
+      { kind: "blocked", reason: "mutation-refused" });
+    assert.deepEqual(harness.entries.map(candidate => candidate.updateId), [1, 2]);
+    assert.deepEqual(await harness.reclaim(binding, () => true),
+      { kind: "recovered", receipts: 1, updateIds: [1] });
+    assert.deepEqual(harness.entries.map(candidate => candidate.updateId), [2]);
+  });
+});
+
+test("Dead-owner pressure reclamation retries an interrupted native journal publication without replay", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-dead-owner-publication-"));
+  try {
+    const path = join(dir, "inbox.json");
+    const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "7:publication" });
+    const deadOwner = { instanceId: "dead", processId: 444,
+      processBirthId: "444:start:dead", sessionGeneration: 1 };
+    const recoveryOwner = { instanceId: "leader", processId: 555,
+      processBirthId: "555:start:leader", sessionGeneration: 2 };
+    const writer = createTelegramUpdateJournalStore({ path, profileName: "default", botIdentity,
+      queueRuntimeIdentity: deadOwner, getQueueProcessLiveness: () => "dead" });
+    writer.appendBatch([{ update_id: 1, message: { message_id: 1, message_thread_id: 42,
+      chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "once" } }], 1);
+    writer.markQueued({ queueKind: "prompt", receiptId: "receipt", sourceUpdateIds: [1], owner: deadOwner });
+    let interrupt = true;
+    let effects = 0;
+    const journal = createTelegramUpdateJournalStore({ path, profileName: "default", botIdentity,
+      queueRuntimeIdentity: recoveryOwner, getQueueProcessLiveness: () => "dead",
+      onPublicationBoundary(boundary) {
+        if (interrupt && boundary === "after-write-before-rename") {
+          interrupt = false;
+          throw new Error("interrupted publication");
+        }
+      } });
+    const inspect = () => {
+      const evidence = inspectTelegramUpdateJournalFamily({ directory: dir, path,
+        profile: "default", botIdentity,
+        limits: { maxFiles: 128, maxBytes: 1_000_000, maxEntries: 128, maxWork: 10_000 } });
+      if (evidence.kind !== "present") throw new Error("fixture journal disappeared");
+      return { entries: evidence.file.entries };
+    };
+    const source = { recoveryKey: path, journal, readForProtection: inspect };
+    const binding: TelegramWorkspaceThreadBinding = {
+      ...createTelegramWorkspaceBindingIdentity("/repo/publication")!,
+      target: { chatId: 7, threadId: 42 }, slot: "A", inactiveSinceMs: 1, updatedAtMs: 2,
+      journalBindingsComplete: true,
+    };
+    const getExternalProtection = (): TelegramWorkspaceExternalProtectionEvidence => ({
+      liveOwner: "clear",
+      acceptedWork: inspect().entries.length ? "protected" : "clear",
+      deliveryAuthority: "clear",
+    });
+    const reclaim = createTelegramWorkspaceDeadOwnerQueueReclaimer({
+      getExternalProtection, getActiveTurnTarget: () => undefined, getQueuedItems: () => [],
+      resolveLeaderJournal: () => source, createFollowerJournalResolver: () => () => undefined,
+      getRecoveryOwner: () => recoveryOwner, getQueueOwnerLiveness: () => "dead",
+      isBindingCurrent: () => true,
+    });
+    const invoke = async () => {
+      const result = await reclaim(binding, () => true);
+      if (result.kind === "recovered") effects += result.updateIds.length;
+      return result;
+    };
+    assert.deepEqual(await invoke(), { kind: "blocked", reason: "mutation-refused" });
+    assert.deepEqual(inspect().entries.map(entry => entry.updateId), [1]);
+    assert.deepEqual(await invoke(), { kind: "recovered", receipts: 1, updateIds: [1] });
+    assert.equal(effects, 1);
+    assert.deepEqual(inspect().entries, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Slot rotation cancels proven Telegram rejection but retains ambiguous deletion without replay", async (t) => {
+  for (const outcome of ["rejected", "malformed", "forged", "server", "network", "false"] as const) {
+    await t.test(outcome, async (t) => {
+      const dir = await mkdtemp(join(tmpdir(), "pi-telegram-rotation-rejection-"));
+      const attempts: string[] = [];
+      t.mock.method(Date, "now", () => 1000);
+      let requests = 0;
+      let success = false;
+      const fetch = async () => {
+        requests++;
+        if (success) return new Response(JSON.stringify({ ok: true, result: true }));
+        if (outcome === "network") throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+        if (outcome === "forged") throw Object.assign(new Error("Too Many Requests"), { status: 429 });
+        if (outcome === "false") return new Response(JSON.stringify({ ok: true, result: false }));
+        const status = outcome === "server" ? 500 : 429;
+        return new Response(outcome === "malformed" ? "invalid JSON" : JSON.stringify({
+          ok: false, error_code: status, description: "fixture rejection",
+        }), { status });
+      };
+      t.mock.method(globalThis, "fetch", fetch);
+      const restoreFetch = setTelegramApiHttpsFetchForTesting(fetch);
+      try {
+        const admission = createTelegramWorkspaceAdmissionLedger({ path: join(dir, "admission.json"),
+          profileKey: "default", owner: { processId: process.pid, processBirthId: `${process.pid}:rejection` },
+          getNowMs: () => 1000, getProcessLiveness: () => "alive" });
+        const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000,
+          getExternalReservedSlots: admission.listReservedSlots });
+        for (let index = 0; index < 26; index++) addBinding(store, index, index + 1);
+        await store.persist();
+        const api = createDefaultTelegramBridgeApiRuntime({
+          getBotToken: () => "123:fixture", recordRuntimeEvent() {}, workspaceAdmission: admission,
+        });
+        const rotation = createTelegramWorkspaceSlotRotation({
+          store, getAdmission: () => admission, getLeaderEpoch: () => 1,
+          runExclusive: createTelegramWorkspaceOperationGate().runExclusive,
+          getExternalProtection: clearExternalProtection, recordEvent() {},
+          deleteThread(authorize) {
+            attempts.push(admission.read().fence!.operationId);
+            return api.deleteWorkspaceThread(authorize);
+          },
+        });
+        await assert.rejects(rotation(async () => { throw new TelegramWorkspaceSlotUnavailableError(); }),
+          outcome === "rejected" ? /delete-rejected/ : /delete-unconfirmed/);
+        assert.equal(requests, 1);
+        assert.equal(store.listWorkspaceBindings().length, 26);
+        if (outcome === "rejected") {
+          assert.equal(admission.read().fence, undefined);
+          assert.deepEqual(store.listWorkspaceRetirementIntents(), []);
+          const lease = admission.acquireAdmission({ operationId: "after-rejection",
+            operationKind: "workspace.register-follower", scope: { kind: "profile" } });
+          assert.equal(lease.kind, "acquired");
+          if (lease.kind === "acquired") admission.releaseAdmission(lease.lease);
+          assert.equal(await rotation(async () => "existing binding"), "existing binding");
+          assert.equal(requests, 1);
+          success = true;
+          assert.equal(await rotation(async () => {
+            const claim = store.claimWorkspaceIdentity("/fresh", "fresh");
+            if (!claim) throw new TelegramWorkspaceSlotUnavailableError();
+            return claim.slot;
+          }), "A");
+          assert.equal(requests, 2);
+          assert.equal(new Set(attempts).size, 2, "Fresh attempts need distinct authority even with the same clock tick");
+        } else {
+          assert.equal(admission.read().fence?.phase, "deletion-issued");
+          await assert.rejects(rotation(async () => "existing binding"), /delete-unconfirmed/);
+          assert.equal(requests, 1);
+        }
+      } finally {
+        restoreFetch();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Rejected rotation recovery finishes each durable cancellation prefix without another delete", async (t) => {
+  for (const fault of ["rejection", "withdrawal", "withdrawal-same-store", "withdrawal-ack", "authority", "release", "release-ack"] as const) {
+    await t.test(fault, async (t) => {
+      const dir = await mkdtemp(join(tmpdir(), "pi-telegram-rejection-recovery-"));
+      const path = join(dir, "state.json");
+      const admissionPath = join(dir, "admission.json");
+      let requests = 0;
+      let fail = true;
+      let epoch = 1;
+      const fetch = async () => {
+        requests++;
+        return new Response(JSON.stringify({ ok: false, error_code: 429, description: "Too Many Requests" }), { status: 429 });
+      };
+      t.mock.method(globalThis, "fetch", fetch);
+      const restoreFetch = setTelegramApiHttpsFetchForTesting(fetch);
+      try {
+        const ledger = createRetirementAdmission(admissionPath);
+        const admission = { ...ledger,
+          confirmRetirementRejection(expected: Parameters<typeof ledger.confirmRetirementRejection>[0]) {
+            const result = ledger.confirmRetirementRejection(expected);
+            if (fail && fault === "rejection") throw new Error("interrupted rejection ACK");
+            return result;
+          },
+          completeRejectedRetirementFence(expected: Parameters<typeof ledger.completeRejectedRetirementFence>[0]) {
+            if (fail && fault === "release") throw new Error("interrupted release");
+            const result = ledger.completeRejectedRetirementFence(expected);
+            if (fail && fault === "release-ack") throw new Error("interrupted release ACK");
+            return result;
+          },
+        };
+        const backing = createTelegramTopicTargetStore({ path, getExternalReservedSlots: ledger.listReservedSlots });
+        const store = { ...backing, async persist() {
+          const cancelling = ledger.read().fence?.phase === "deletion-rejected";
+          if (fail && cancelling && (fault === "withdrawal" || fault === "withdrawal-same-store")) {
+            throw new Error("interrupted withdrawal");
+          }
+          await backing.persist();
+          if (fail && cancelling && fault === "withdrawal-ack") throw new Error("interrupted withdrawal ACK");
+          if (fail && cancelling && fault === "authority") epoch = 2;
+        } };
+        for (let index = 0; index < 26; index++) addBinding(store, index, index + 1);
+        await store.persist();
+        const bindings = store.listWorkspaceBindings();
+        const api = createDefaultTelegramBridgeApiRuntime({
+          getBotToken: () => "123:fixture", recordRuntimeEvent() {}, workspaceAdmission: admission,
+        });
+        const rotation = createTelegramWorkspaceSlotRotation({
+          store, getAdmission: () => admission, getLeaderEpoch: () => epoch,
+          runExclusive: createTelegramWorkspaceOperationGate().runExclusive,
+          getExternalProtection: clearExternalProtection, recordEvent() {}, deleteThread: api.deleteWorkspaceThread,
+        });
+        await assert.rejects(rotation(async () => { throw new TelegramWorkspaceSlotUnavailableError(); }),
+          /interrupted|fence-release-unconfirmed|delete-rejected|authority-changed/);
+        assert.equal(requests, 1);
+        assert.equal(ledger.read().fence?.phase, fault === "release-ack" ? undefined : "deletion-rejected");
+        fail = false;
+        const successorAdmission = createRetirementAdmission(admissionPath, "successor");
+        const successorStore = fault === "withdrawal-same-store" ? store : createTelegramTopicTargetStore({ path,
+          getExternalReservedSlots: successorAdmission.listReservedSlots });
+        const successor = createTelegramWorkspaceSlotRotation({
+          store: successorStore, getAdmission: () => successorAdmission, getLeaderEpoch: () => 2,
+          runExclusive: createTelegramWorkspaceOperationGate().runExclusive,
+          getExternalProtection() { throw new Error("Cancellation must not require deletion eligibility"); },
+          recordEvent() {}, async deleteThread() { throw new Error("Deletion must not replay during cancellation"); },
+        });
+        assert.equal(await successor(async () => "restored binding"), "restored binding");
+        assert.equal(successorAdmission.read().fence, undefined);
+        const restored = createTelegramTopicTargetStore({ path });
+        await restored.load();
+        assert.deepEqual(restored.listWorkspaceRetirementIntents(), []);
+        assert.deepEqual(restored.listWorkspaceBindings(), bindings);
+        assert.equal(requests, 1);
+      } finally {
+        restoreFetch();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Slot rotation recovers a committed binding removal before fence completion without deleting again", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-rotation-commit-ready-"));
+  try {
+    const path = join(dir, "state.json");
+    const admission = createRetirementAdmission(join(dir, "admission.json"));
+    const operations = createTelegramWorkspaceOperationRuntime({ getWorkspaceAdmission: () => admission });
+    const store = createTelegramTopicTargetStore({ path, getExternalReservedSlots: admission.listReservedSlots });
+    for (let index = 0; index < 26; index++) addBinding(store, index, index + 1);
+    await store.persist();
+    let deletions = 0;
+    const rotation = createTelegramWorkspaceSlotRotation({
+      store, getAdmission: () => ({ ...admission, completeRetirementFence() { throw new Error("interrupted completion"); } }),
+      runExclusive: operations.runExclusive, getLeaderEpoch: () => 1,
+      getExternalProtection: clearExternalProtection, recordEvent() {},
+      async deleteThread(authorize) { authorize(); deletions++; },
+    });
+    await assert.rejects(rotation(async () => { throw new TelegramWorkspaceSlotUnavailableError(); }), /fence-release-unconfirmed/);
+    assert.equal(deletions, 1);
+    assert.equal(store.listWorkspaceBindings().length, 25);
+    assert.deepEqual(store.listWorkspaceRetirementIntents(), []);
+    assert.equal(admission.read().fence?.phase, "commit-ready");
+    const reopened = createTelegramTopicTargetStore({ path, getExternalReservedSlots: admission.listReservedSlots });
+    const successor = createTelegramWorkspaceSlotRotation({
+      store: reopened, getAdmission: () => admission, runExclusive: operations.runExclusive,
+      getLeaderEpoch: () => 2, getExternalProtection: clearExternalProtection, recordEvent() {},
+      async deleteThread() { throw new Error("must not delete twice"); },
+    });
+    const restoredSlot = await successor(async () => reopened.claimWorkspaceIdentity("/fresh", "new")?.slot);
+    assert.equal(restoredSlot, "A");
+    assert.equal(admission.read().fence, undefined);
+    assert.equal(deletions, 1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Slot rotation validates leader authority again at deletion issuance", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-rotation-epoch-"));
+  try {
+    const admission = createRetirementAdmission(join(dir, "admission.json"));
+    const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+    for (let index = 0; index < 26; index++) addBinding(store, index, index + 1);
+    await store.persist();
+    let epoch = 1;
+    let issued = 0;
+    const rotate = createTelegramWorkspaceSlotRotation({
+      store, getAdmission: () => admission, runExclusive: createTelegramWorkspaceOperationGate().runExclusive,
+      getLeaderEpoch: () => epoch, getExternalProtection: clearExternalProtection, recordEvent() {},
+      async deleteThread(authorize) { epoch = 2; authorize(); issued++; },
+    });
+    await assert.rejects(rotate(async () => { throw new Error("unrelated failure"); }), /unrelated failure/);
+    assert.equal(admission.read().fence, undefined);
+    await assert.rejects(rotate(async () => { throw new TelegramWorkspaceSlotUnavailableError(); }), /delete-unconfirmed/);
+    assert.equal(issued, 0);
+    assert.equal(store.listWorkspaceBindings().length, 26);
+    assert.equal(admission.read().fence?.phase, "deletion-issued");
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("Retirement waits for active admission and releases an unissued fence on late protection", async () => {

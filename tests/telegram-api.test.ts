@@ -38,6 +38,7 @@ import {
   getTelegramApiWorkspaceAdmissionScope,
   getTelegramInboundFileByteLimitFromEnv,
   isTelegramApiCommitUnknownError,
+  isTelegramApiRequestRejected,
   isTelegramMessageNotModifiedError,
   setTelegramApiHttpsFetchForTesting,
   prepareTelegramTempDir,
@@ -1734,6 +1735,72 @@ test("Default Telegram bridge API runtime binds lazy token client and defaults",
   } finally {
     restoreFetch();
   }
+});
+
+test("Workspace deletion requires executor authority and never retries transport or ambiguous success", async () => {
+  let requests = 0;
+  let outcome: "success" | "false" | "absent" | "network" = "success";
+  const previousFamily = process.env.PI_TELEGRAM_NETWORK_FAMILY;
+  process.env.PI_TELEGRAM_NETWORK_FAMILY = "ipv4-fallback";
+  const restoreFetch = setApiTestFetch(async (input) => {
+    requests++;
+    assert.match(getApiTestFetchUrl(input), /deleteForumTopic$/);
+    if (outcome === "network") throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+    if (outcome === "absent") return createApiErrorResponse(400, "Bad Request: message thread not found");
+    return createApiJsonResponse(outcome === "success");
+  });
+  const runtime = createDefaultTelegramBridgeApiRuntime({
+    getBotToken: () => "123:abc", recordRuntimeEvent() {},
+    workspaceAdmission: { acquireAdmission: () => ({ kind: "blocked", reason: "retirement-fenced" }),
+      releaseAdmission: () => { throw new Error("no ordinary lease"); } },
+  });
+  const authorize = () => ({ chatId: 7, threadId: 42 });
+  try {
+    await assert.rejects(runtime.call("deleteForumTopic", { chat_id: 7, message_thread_id: 42 }), /unavailable/);
+    await assert.rejects(runtime.deleteWorkspaceThread(() => { throw new Error("stale permit"); }), /stale permit/);
+    assert.equal(requests, 0);
+    await runtime.deleteWorkspaceThread(authorize);
+    assert.equal(requests, 1);
+    outcome = "false";
+    await assert.rejects(runtime.deleteWorkspaceThread(authorize), /not confirmed/);
+    assert.equal(requests, 2);
+    outcome = "absent";
+    await assert.rejects(runtime.deleteWorkspaceThread(authorize), (error) =>
+      error instanceof Error && "status" in error && error.status === 400);
+    assert.equal(requests, 3);
+    outcome = "network";
+    await assert.rejects(runtime.deleteWorkspaceThread(authorize));
+    assert.equal(requests, 4);
+  } finally {
+    restoreFetch();
+    if (previousFamily === undefined) delete process.env.PI_TELEGRAM_NETWORK_FAMILY;
+    else process.env.PI_TELEGRAM_NETWORK_FAMILY = previousFamily;
+  }
+});
+
+test("Request rejection requires matching method and parsed Telegram no-effect response evidence", async () => {
+  for (const [status, code, ok, rejected] of [
+    [400, 400, false, true], [401, 401, false, true], [403, 403, false, true],
+    [404, 404, false, true], [429, 429, false, true], [408, 408, false, false],
+    [500, 500, false, false], [429, 400, false, false], [429, "429", false, false],
+    [429, 429, true, false], [429, undefined, false, false],
+  ] as const) {
+    const restore = setApiTestFetch(async () => new Response(JSON.stringify({
+      ok, error_code: code, description: "fixture rejection",
+    }), { status }));
+    try {
+      const api = createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:fixture", recordRuntimeEvent() {} });
+      await assert.rejects(api.deleteWorkspaceThread(() => ({ chatId: 7, threadId: 42 })), error => {
+        assert.equal(isTelegramApiRequestRejected(error, "deleteForumTopic"), rejected);
+        assert.equal(isTelegramApiRequestRejected(error, "sendMessage"), false);
+        assert.equal(isTelegramApiRequestRejected(error, undefined as unknown as string), false);
+        return true;
+      });
+    } finally { restore(); }
+  }
+  assert.equal(isTelegramApiRequestRejected(Object.assign(new Error("rejected"), {
+    status: 429, rejectedRequestMethod: "deleteForumTopic",
+  }), "deleteForumTopic"), false);
 });
 
 test("Default Telegram bridge API runtime applies optional Workspace admission", async () => {

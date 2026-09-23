@@ -8,6 +8,13 @@
 
 export const TELEGRAM_WORKSPACE_SLOTS = "abcdefghijklmnopqrstuvwxyz";
 
+export class TelegramWorkspaceSlotUnavailableError extends Error {
+  constructor() {
+    super("Telegram Workspace slot reservation is unavailable.");
+    this.name = "TelegramWorkspaceSlotUnavailableError";
+  }
+}
+
 export interface TelegramWorkspaceSlotOccupancy {
   bindingKey: string;
   slot: string;

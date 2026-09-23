@@ -2824,6 +2824,38 @@ test("Bus follower target ownership never treats persisted bindings as live auth
   );
 });
 
+test("Unregistered follower observations are non-routing and invalidate on replacement even after removal", () => {
+  for (const change of ["instance", "profile", "target", "unrelated", "clear", "release"] as const) {
+    const registry = createTelegramBusFollowerRegistry();
+    const old = { instanceId: "old", profileKey: "owner", target: { chatId: 7, threadId: 11 },
+      connectedAtMs: 0, pid: 42, registrationGeneration: "old:1" };
+    registry.register(old);
+    const liveObservation = registry.observeUnregistered(registry.get("old")!);
+    assert.equal(liveObservation.isCurrent(), false);
+    const [removed] = registry.pruneStale(1000, 100);
+    const observation = registry.observeUnregistered(removed!);
+    assert.equal(observation.isCurrent(), true);
+    assert.deepEqual(registry.list(), []);
+    assert.equal(registry.getByTarget(old.target), undefined);
+    assert.equal(registry.heartbeat(old.instanceId, 1001), undefined);
+    if (change === "clear") registry.clear();
+    else if (change === "release") observation.release();
+    else {
+      const replacement = { ...old, instanceId: change === "instance" ? "old" : "new",
+        profileKey: change === "profile" ? "owner" : "other",
+        target: change === "target" ? old.target : { chatId: 7, threadId: 12 },
+        registrationGeneration: "new:1", pid: 43 };
+      registry.register(replacement);
+      registry.remove(replacement.instanceId);
+    }
+    assert.equal(observation.isCurrent(), change === "unrelated", change);
+    assert.equal(liveObservation.isCurrent(), false, "a former live observation never gains authority");
+    observation.release();
+    observation.release();
+    assert.equal(observation.isCurrent(), false);
+  }
+});
+
 test("Bus follower registry returns defensive copies", () => {
   const registry = createTelegramBusFollowerRegistry();
   const registered = registry.register({

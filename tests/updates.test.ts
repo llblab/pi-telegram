@@ -52,6 +52,7 @@ import {
   TELEGRAM_PRIORITY_REACTIONS,
   TELEGRAM_REMOVAL_REACTION_EMOJIS,
   TELEGRAM_REMOVAL_REACTIONS,
+  type TelegramQueueAdmissionItemLike,
   type TelegramUpdateAdmissionOutcome,
   type TelegramUpdateFlow,
   type TelegramUpdateHandler,
@@ -662,7 +663,7 @@ test("Update routing extracts guest messages without private chat filter", () =>
   assert.equal(guestMessage.guest_query_id, "gq-1");
 });
 
-test("Update flow prioritizes deleted business-message handling over other update kinds", () => {
+test("Default update flow refuses business deletion authority even in a mixed carrier", () => {
   const action = buildTelegramUpdateFlowAction(
     {
       deleted_business_messages: { message_ids: [1, 2] },
@@ -676,7 +677,7 @@ test("Update flow prioritizes deleted business-message handling over other updat
     },
     1,
   );
-  assert.deepEqual(action, { kind: "deleted", messageIds: [1, 2] });
+  assert.deepEqual(action, { kind: "ignore" });
 });
 
 test("Update flow detects topic lifecycle before prompt routing", () => {
@@ -4279,12 +4280,17 @@ test("Admission lifecycle scopes failed reaction dependencies to their queued ta
     disposition: "failed",
     terminalReason: "terminal:reaction-failed",
   });
+  let exclusion: boolean | undefined;
   const lifecycle = createTelegramUpdateAdmissionLifecycleRuntime<string>({
     resolveBinding: () => ({
       runtimeKey: "reaction-target",
       recoveryKey: "reaction-target",
       journal: {
         ...storage.journal,
+        read() {
+          const snapshot = storage.journal.read();
+          return { ...snapshot, entries: snapshot.entries.map(entry => ({ ...entry, preApprovalExcluded: exclusion })) };
+        },
         appendBatch: () => ({ nonExcludedUpdateIds: [] }),
       },
     }),
@@ -4302,7 +4308,11 @@ test("Admission lifecycle scopes failed reaction dependencies to their queued ta
     replyToMessageId: 100,
     sourceMessageIds: [100],
   };
-  assert.equal(lifecycle.hasPendingQueueMutationForItem(governed), true);
+  for (const value of [undefined, false, true, undefined]) {
+    exclusion = value;
+    assert.equal(lifecycle.hasPendingQueueMutationForItem(governed), value !== true,
+      "Only explicit immutable exclusion removes a dependency; unknown legacy evidence remains protective");
+  }
   assert.equal(
     lifecycle.hasPendingQueueMutationForItem({
       chatId: 7,
@@ -5193,46 +5203,60 @@ test("Update worker fences an offered local receipt until handoff resolves", asy
   assert.deepEqual(storage.getEntries()[0]?.queueOwner, donorOwner);
 });
 
-test("Queue settlement mux resolves mixed receipts across owning journals", () => {
-  const calls: string[] = [];
-  const createRuntime = (name: string, receiptId: string) => ({
-    isItemReady: (item: { admissionReceipts?: readonly { receiptId: string }[] }) =>
-      (item.admissionReceipts ?? []).every(
-        (receipt) => receipt.receiptId === receiptId,
-      ),
-    getQueueReceiptOwner: () => undefined,
-    onPromptHandedOff: () => {
-      calls.push(`${name}:prompt`);
-    },
-    onControlSettled: () => {},
-    onItemsDiscarded: () => {},
+for (const operation of ["prompt", "control", "discard"] as const) {
+  test(`Queue settlement mux requires exact acknowledgements across owning journals (${operation})`, () => {
+    type Item = TelegramQueueAdmissionItemLike;
+    const calls: string[] = [];
+    let acknowledged = true;
+    const createRuntime = (receiptId: string) => {
+      const complete = (item: Item) => {
+        assert.deepEqual(item.admissionReceipts?.map(receipt => receipt.receiptId), [receiptId]);
+        calls.push(receiptId);
+        return receiptId === "leader" || acknowledged;
+      };
+      return {
+        isItemReady: (item: Item) => (item.admissionReceipts ?? []).every(receipt => receipt.receiptId === receiptId),
+        getQueueReceiptOwner: (): TelegramUpdateJournalQueueOwner | undefined => undefined,
+        onPromptHandedOff: complete, onControlSettled: complete,
+        onItemsDiscarded: (items: readonly Item[]) =>
+          complete({ admissionReceipts: items.flatMap(item => item.admissionReceipts ?? []) }),
+      };
+    };
+    const leader = createRuntime("leader");
+    const follower = createRuntime("follower");
+    const settlement = createTelegramQueueAdmissionSettlementMuxRuntime([leader, follower]);
+    const complete = (item: Item) => operation === "discard" ? settlement.onItemsDiscarded([item], "ctx")
+      : operation === "prompt" ? settlement.onPromptHandedOff(item, "ctx") : settlement.onControlSettled(item, "ctx");
+    const item: Item = { admissionReceipts: ["leader", "follower"].map((receiptId, index) => ({
+      queueKind: operation === "control" ? "control" : "prompt", receiptId, sourceUpdateIds: [index + 1],
+    })) };
+    assert.equal(settlement.isItemReady(item), true);
+    assert.equal(complete(item), true);
+    assert.deepEqual(calls, ["leader", "follower"]);
+    calls.length = 0;
+    acknowledged = false;
+    assert.equal(complete(item), false, "A completed prefix does not acknowledge the whole request");
+    assert.deepEqual(calls, ["leader", "follower"]);
+    calls.length = 0;
+    assert.equal(complete({ admissionReceipts: [...item.admissionReceipts!, {
+      queueKind: "prompt", receiptId: "unknown", sourceUpdateIds: [3],
+    }] }), false);
+    assert.deepEqual(calls, [], "Refuse an unowned request before any partial completion");
+    follower.isItemReady = () => true;
+    assert.equal(complete(item), false, "Ambiguous projections need exact matching owner evidence");
+    assert.deepEqual(calls, []);
+    const owner: TelegramUpdateJournalQueueOwner = { instanceId: "same", processId: process.pid,
+      processBirthId: "fixture-birth", sessionGeneration: 1, acquisitionId: "acquisition", acquiredAtMs: 1 };
+    leader.getQueueReceiptOwner = follower.getQueueReceiptOwner = () => ({ ...owner });
+    const duplicate = { admissionReceipts: [item.admissionReceipts![0]!] };
+    assert.equal(complete(duplicate), true, "Identical projections settle once through one exact owner");
+    assert.deepEqual(calls, ["leader"]);
+    calls.length = 0;
+    follower.getQueueReceiptOwner = () => ({ ...owner, acquisitionId: "competing" });
+    assert.equal(complete(duplicate), false);
+    assert.deepEqual(calls, []);
   });
-  const settlement = createTelegramQueueAdmissionSettlementMuxRuntime([
-    createRuntime("leader", "leader-receipt"),
-    createRuntime("follower", "follower-receipt"),
-  ]);
-  const item = {
-    admissionReceipts: [
-      {
-        queueKind: "prompt" as const,
-        receiptId: "leader-receipt",
-        sourceUpdateIds: [1],
-      },
-      {
-        queueKind: "prompt" as const,
-        receiptId: "follower-receipt",
-        sourceUpdateIds: [2],
-      },
-    ],
-  };
-  assert.equal(settlement.isItemReady(item), true);
-  assert.equal(
-    settlement.getQueueReceiptOwner(item.admissionReceipts[0]!),
-    undefined,
-  );
-  settlement.onPromptHandedOff(item, "ctx");
-  assert.deepEqual(calls, ["leader:prompt", "follower:prompt"]);
-});
+}
 
 test("Queue settlement ignores receipts owned by another journal", async () => {
   const storage = createTestUpdateWorkerJournal([1]);
@@ -6085,6 +6109,26 @@ test("Update worker preserves retry wait across runtime restart", async () => {
   await replacement.stop();
 });
 
+test("Update worker retains a fresh signal across an older blocked drain result", async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  let authority = false;
+  const handled: number[] = [];
+  const worker = createTelegramUpdateWorkerRuntime({
+    journal: storage.journal, hasAuthority: () => authority,
+    executeUpdate(update) { handled.push(update.update_id); return { kind: "complete" }; },
+  });
+  try {
+    worker.start(TEST_CONTEXT);
+    assert.equal(worker.getState().blockedReason, "authority-lost");
+    authority = true;
+    worker.signal();
+    await new Promise<void>(done => setImmediate(done));
+    await worker.waitForDrain();
+    assert.deepEqual(handled, [1]);
+    assert.deepEqual(storage.getUpdateIds(), []);
+  } finally { await worker.stop(); }
+});
+
 test("Update worker exposes completion-write failure without hot retry", async () => {
   const storage = createTestUpdateWorkerJournal([1]);
   let executionCalls = 0;
@@ -6098,11 +6142,15 @@ test("Update worker exposes completion-write failure without hot retry", async (
     hasAuthority: () => true,
     executeUpdate() {
       executionCalls += 1;
+      // This wake precedes the write failure and cannot clear its later failure latch.
+      worker.signal();
       return { kind: "complete" };
     },
   });
 
   worker.start(TEST_CONTEXT);
+  await worker.waitForDrain();
+  await new Promise<void>(done => setImmediate(done));
   await worker.waitForDrain();
   assert.equal(executionCalls, 1);
   assert.equal(worker.getState().phase, "blocked");
