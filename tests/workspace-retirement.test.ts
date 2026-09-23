@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -512,8 +512,12 @@ test("Explicit lifecycle prepares and executes one pressure retirement", async (
   }
 });
 
-test("Pressure rotation reclaims exact queued custody only after native dead-owner proof", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-dead-owner-reclamation-"));
+test("Pressure rotation reclaims exact queued custody only after native dead-owner proof", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Strict no-follow journal-family inspection is unavailable on Windows.");
+    return;
+  }
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-dead-owner-reclamation-")));
   try {
     const admission = createRetirementAdmission(join(dir, "admission.json"));
     const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"),
@@ -716,8 +720,12 @@ test("Dead-owner reclamation refuses replacement and partial custody, then resum
   });
 });
 
-test("Dead-owner pressure reclamation retries an interrupted native journal publication without replay", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-dead-owner-publication-"));
+test("Dead-owner pressure reclamation retries an interrupted native journal publication without replay", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Strict no-follow journal-family inspection is unavailable on Windows.");
+    return;
+  }
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-dead-owner-publication-")));
   try {
     const path = join(dir, "inbox.json");
     const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "7:publication" });
