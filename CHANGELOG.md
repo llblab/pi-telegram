@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.51.4: Resolver-owned Skills and drift-safe Git installs
+
+- `Resolver-owned Skills`: Auto-discovered user/project checkouts now contribute source Skills even when Pi selects their compiled entrypoint, while manifest-loaded npm, Git, and Pi Kit packages retain `pi.skills` filters and package provenance. Resolver regressions cover checkout and filtered-package behavior; unsupported source manifest aliases are removed.
+- `Drift-safe distributive`: The compiled runtime and Skill tree are now committed for self-contained Git installs. Builds compile into a temporary candidate and use a rollback-safe swap; validation rejects stale committed output without silently repairing it.
+
 ## 0.51.3: Follower recovery and filterable Skills
 
 - `Follower slot reconciliation`: Re-registration now treats the exact Workspace claim as canonical when a retained follower record carries a different slot. It repairs the record before binding commit, preserves the unrelated binding that owns the stale letter, and makes repeated registration idempotent instead of returning `Telegram Workspace binding claim changed.` forever.

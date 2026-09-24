@@ -1,0 +1,167 @@
+/**
+ * Telegram prompt injection helpers
+ * Zones: pi agent prompts, telegram guidance
+ * Owns Telegram-specific system prompt suffixes injected into pi agent turns
+ */
+import { TELEGRAM_PREFIX } from "./turns.js";
+export const TELEGRAM_CONNECTED_CONTEXT_MESSAGE = "Telegram session connected. Use Telegram features for Telegram-originated turns or explicit Telegram requests; connectivity alone is not user intent.";
+export const TELEGRAM_DISCONNECTED_CONTEXT_MESSAGE = "Telegram session disconnected. Do not use Telegram delivery, actions, or Telegram-specific reply features unless the user reconnects it.";
+const LOCAL_SYSTEM_PROMPT_SUFFIX = `
+
+${TELEGRAM_CONNECTED_CONTEXT_MESSAGE} For Telegram work, consult bundled Skills in routing order: \`telegram-bridge\` for the transport and turn protocol, \`show-me\` when a user needs a truthful visual explanation of work or behavior, \`generated-control-surface\` when contextual controls materially shorten feedback, then \`generative-apps\` when the interaction warrants a reusable deterministic app. Load a Skill only if its instructions are not already present in the current context. Do not use Telegram-specific features from unrelated local/TUI prompts.`;
+const TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX = `
+
+Telegram turn note: Follow the applicable bundled Telegram Skills in routing order; load only missing instructions.`;
+export const TELEGRAM_ATTACH_PROMPT_SNIPPET = "Queue files for the active Telegram reply; outside Telegram turns, send files directly to Telegram.";
+export const TELEGRAM_ATTACH_PROMPT_GUIDELINES = [
+    "When handling a [telegram] message and the user asked for a file or generated artifact, call telegram_attach with the local path instead of only mentioning the path in text.",
+    "When a local/TUI user explicitly asks to send a generated file to Telegram, telegram_attach can deliver it to the paired/default Telegram chat even without an active Telegram turn.",
+    "For an explicit thread target, provide chat_id plus thread_id; registered multi-instance followers default to their assigned thread target.",
+];
+export const TELEGRAM_MESSAGE_PROMPT_SNIPPET = "Send direct Telegram Markdown text when the user explicitly asks for Telegram delivery to a concrete chat, channel, or live Pi Thread outside the normal reply flow.";
+export const TELEGRAM_MESSAGE_PROMPT_GUIDELINES = [
+    "Use telegram_message only when the user explicitly asks to send a message to Telegram from the local/TUI side, or names a concrete Telegram delivery target.",
+    "For an explicitly requested channel post, pass its exact numeric id or public @username as chat_id; no local channel registry is required, and Telegram remains the authority on the bot's posting permission.",
+    "For an explicitly requested channel media post, pass one local .jpg/.jpeg/.png/.webp photo or .mp4 video as media; the text becomes its caption (max 1024 characters), and albums or other media types are rejected.",
+    "For a live Pi thread target, provide thread as its case-insensitive name or numeric id; the bridge sends visibly and admits one attributed turn to that live instance. Unknown, ambiguous, same, or offline targets fail before sending.",
+    "Add buttons by embedding the same top-level telegram_button HTML comments used in normal Telegram replies; Telegram does not support standalone buttons.",
+    "During an active Telegram turn, omit telegram_message for the current target and answer normally; use thread only when the user requests delivery to a different live Pi thread.",
+];
+const TELEGRAM_TOOL_METADATA_LINES = Object.fromEntries([
+    `- telegram_attach: ${TELEGRAM_ATTACH_PROMPT_SNIPPET}`,
+    `- telegram_message: ${TELEGRAM_MESSAGE_PROMPT_SNIPPET}`,
+    ...TELEGRAM_ATTACH_PROMPT_GUIDELINES.map((line) => `- ${line}`),
+    ...TELEGRAM_MESSAGE_PROMPT_GUIDELINES.map((line) => `- ${line}`),
+].map((line) => [line, true]));
+const TELEGRAM_MODEL_CONTEXT_TOOL_NAMES = new Set([
+    "telegram_attach",
+    "telegram_bind",
+    "telegram_channel_post",
+    "telegram_channel_posts",
+    "telegram_message",
+]);
+const TELEGRAM_MODEL_CONTEXT_MEMORY_KEY = Symbol.for("@llblab/pi-telegram:model-context-suspended-tools");
+function getTelegramModelContextAvailabilityMemory() {
+    const globals = globalThis;
+    const existing = globals[TELEGRAM_MODEL_CONTEXT_MEMORY_KEY];
+    if (existing &&
+        typeof existing === "object" &&
+        "toolNames" in existing &&
+        existing.toolNames instanceof Set) {
+        return existing;
+    }
+    const memory = {
+        suspended: false,
+        toolNames: new Set(),
+    };
+    globals[TELEGRAM_MODEL_CONTEXT_MEMORY_KEY] = memory;
+    return memory;
+}
+export function createTelegramModelContextAvailabilityBinding() {
+    let runtime;
+    return {
+        bind(next) {
+            runtime = next;
+        },
+        reconcile() {
+            runtime?.reconcile();
+        },
+    };
+}
+export function createTelegramModelContextAvailabilityRuntime(deps) {
+    const memory = deps.memory ?? getTelegramModelContextAvailabilityMemory();
+    return {
+        reconcile() {
+            if (deps.canReconcile && !deps.canReconcile())
+                return;
+            const activeTools = deps.getActiveTools();
+            if (!deps.isAvailable()) {
+                if (!memory.suspended) {
+                    memory.toolNames.clear();
+                    for (const name of activeTools) {
+                        if (TELEGRAM_MODEL_CONTEXT_TOOL_NAMES.has(name)) {
+                            memory.toolNames.add(name);
+                        }
+                    }
+                    memory.suspended = true;
+                }
+                const nextTools = activeTools.filter((name) => !TELEGRAM_MODEL_CONTEXT_TOOL_NAMES.has(name));
+                if (nextTools.length !== activeTools.length) {
+                    deps.setActiveTools(nextTools);
+                }
+                return;
+            }
+            if (!memory.suspended)
+                return;
+            const nextTools = [...activeTools];
+            for (const name of TELEGRAM_MODEL_CONTEXT_TOOL_NAMES) {
+                if (memory.toolNames.has(name) && !nextTools.includes(name)) {
+                    nextTools.push(name);
+                }
+            }
+            memory.toolNames.clear();
+            memory.suspended = false;
+            if (nextTools.length !== activeTools.length) {
+                deps.setActiveTools(nextTools);
+            }
+        },
+    };
+}
+export function buildTelegramBridgeSystemPrompt(options) {
+    const basePrompt = options.systemPrompt ?? "";
+    const telegramPrefix = options.telegramPrefix ?? TELEGRAM_PREFIX;
+    const telegramHead = telegramPrefix.endsWith("]")
+        ? telegramPrefix.slice(0, -1)
+        : telegramPrefix;
+    const trimmedPrompt = options.prompt.trimStart();
+    const telegramTurn = trimmedPrompt.startsWith(`${telegramHead}]`) ||
+        trimmedPrompt.startsWith(`${telegramHead}|`);
+    const telegramSuffix = telegramTurn
+        ? `${options.telegramTurnSystemPromptSuffix}\n- The current user message came from Telegram.`
+        : "";
+    return {
+        systemPrompt: Array.isArray(basePrompt)
+            ? [
+                ...basePrompt,
+                options.localSystemPromptSuffix + telegramSuffix,
+            ]
+            : basePrompt +
+                options.localSystemPromptSuffix +
+                telegramSuffix,
+    };
+}
+export function createTelegramBeforeAgentStartHook(options = {}) {
+    return (event) => buildTelegramBridgeSystemPrompt({
+        prompt: event.prompt,
+        systemPrompt: event.systemPrompt,
+        telegramPrefix: options.telegramPrefix,
+        localSystemPromptSuffix: options.localSystemPromptSuffix ?? LOCAL_SYSTEM_PROMPT_SUFFIX,
+        telegramTurnSystemPromptSuffix: options.telegramTurnSystemPromptSuffix ??
+            TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX,
+    });
+}
+function stripTelegramToolMetadataFromString(systemPrompt) {
+    return systemPrompt
+        .split("\n")
+        .filter((line) => TELEGRAM_TOOL_METADATA_LINES[line] !== true)
+        .join("\n");
+}
+function stripTelegramToolMetadataFromSystemPrompt(systemPrompt) {
+    if (!systemPrompt)
+        return "";
+    return Array.isArray(systemPrompt)
+        ? systemPrompt.map(stripTelegramToolMetadataFromString)
+        : stripTelegramToolMetadataFromString(systemPrompt);
+}
+export function createTelegramProactiveBeforeAgentStartHook(deps) {
+    const baseHook = deps.baseHook ?? createTelegramBeforeAgentStartHook();
+    return async (event, ctx) => {
+        deps.reconcileAvailability?.();
+        if (!deps.isAvailable(ctx)) {
+            return {
+                systemPrompt: stripTelegramToolMetadataFromSystemPrompt(event.systemPrompt),
+            };
+        }
+        return baseHook(event);
+    };
+}

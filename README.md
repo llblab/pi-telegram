@@ -26,7 +26,7 @@ From git:
 pi install git:github.com/llblab/pi-telegram
 ```
 
-Installed npm/git packages expose bundled Skills through their `pi.skills` manifest, so Pi package filters can select individual Skills. A raw TypeScript checkout placed directly under Pi's `extensions` directory instead contributes its adjacent source Skills at runtime; the two discovery paths are mutually exclusive.
+Installed npm/git packages expose bundled Skills through their `pi.skills` manifest, so Pi package filters and package provenance remain authoritative. A checkout auto-discovered directly under Pi's user or project `extensions` directory contributes its adjacent source Skills even when Pi selects the checkout's compiled entrypoint; the two discovery paths are mutually exclusive.
 
 The extension requires Pi `0.84.4` or newer, matching the package's peer dependencies. Its Activity API uses the public `agent_settled` lifecycle event to keep retries/continuations under one activity identity and release that identity only after the run fully settles.
 
@@ -319,7 +319,7 @@ The docs index lives at [docs/README.md](./docs/README.md).
 
 ## Development
 
-Pi loads the compiled `dist/pi-telegram/index.js` entrypoint. After every project change, run `npm run build` before `/reload`, restart, or live verification; reloading source without rebuilding can leave the running extension on stale compiled code.
+Pi loads the compiled `dist/pi-telegram/index.js` entrypoint. The committed distributive also makes Git installs self-contained. After every project change, run `npm run build` before `/reload`, restart, or live verification; `npm run build:check` verifies source/artifact synchronization without rewriting it.
 
 ```bash
 npm run build

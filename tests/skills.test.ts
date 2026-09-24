@@ -4,11 +4,14 @@
  */
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
+  getTelegramExtensionPackageRoot,
+  isRawTelegramExtensionCheckout,
   registerTelegramSkillDiscovery,
   TELEGRAM_SKILLS_PATH,
 } from "../lib/skills.ts";
@@ -44,16 +47,7 @@ test("Local Bot API reference documents generation-stop controls on both draft m
   assert.match(section("MessageGenerationStopped"), /draft\\_id/u);
 });
 
-test("Source extension contributes focused bundled skills", async () => {
-  let resourceHook: (() => { skillPaths: string[] }) | undefined;
-  assert.equal(registerTelegramSkillDiscovery({
-    on(name: string, hook: unknown) {
-      assert.equal(name, "resources_discover");
-      resourceHook = hook as () => { skillPaths: string[] };
-    },
-  } as never), true);
-
-  assert.deepEqual(resourceHook?.(), { skillPaths: [TELEGRAM_SKILLS_PATH] });
+test("Bundled source Skills remain focused and self-contained", async () => {
   const skillNames = [
     "telegram-bridge",
     "show-me",
@@ -230,23 +224,128 @@ test("Bridge diagnosis distinguishes Pi commands from the agent file fallback", 
   assert.match(diagnosis, /state\.json.*logs\.jsonl/u);
 });
 
-test("Compiled package leaves filtered skill discovery to its manifest", () => {
+test("Manifest-loaded package leaves filtered Skill discovery to Pi", () => {
+  const packageRoot = dirname(TELEGRAM_SKILLS_PATH);
+  const compiledModule = join(packageRoot, "dist", "lib", "skills.js");
   let registered = false;
   assert.equal(registerTelegramSkillDiscovery({
     on() {
       registered = true;
     },
-  } as never, "/package/dist/lib/skills.js"), false);
+  } as never, compiledModule, {
+    agentDir: join(packageRoot, "managed-agent"),
+    cwd: join(packageRoot, "managed-cwd"),
+  }), false);
   assert.equal(registered, false);
 });
 
-test("Package metadata publishes the bundled skill root", async () => {
+test("Pi resolver preserves checkout Skills and package filters with package provenance", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-resolver-"));
+  try {
+    const packageManagerModule = await import(
+      "../node_modules/@earendil-works/pi-coding-agent/dist/core/package-manager.js"
+    );
+    const settingsModule = await import(
+      "../node_modules/@earendil-works/pi-coding-agent/dist/core/settings-manager.js"
+    );
+    const cwd = join(root, "cwd");
+    const agentDir = join(root, "agent");
+    const checkoutRoot = join(agentDir, "extensions", "pi-telegram");
+    const checkoutEntry = join(checkoutRoot, "dist", "pi-telegram", "index.js");
+    const checkoutSkill = join(checkoutRoot, "skills", "telegram-bridge", "SKILL.md");
+    await mkdir(dirname(checkoutEntry), { recursive: true });
+    await mkdir(dirname(checkoutSkill), { recursive: true });
+    await mkdir(join(checkoutRoot, "dist", "skills", "telegram-bridge"), { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await writeFile(join(checkoutRoot, "package.json"), JSON.stringify({
+      name: "@llblab/pi-telegram-checkout-fixture",
+      pi: {
+        extensions: ["./dist/pi-telegram/index.js"],
+        skills: ["./dist/skills"],
+      },
+    }));
+    await writeFile(checkoutEntry, "export default function () {}\n");
+    await writeFile(checkoutSkill, "---\nname: telegram-bridge\ndescription: source fixture\n---\n");
+    await writeFile(
+      join(checkoutRoot, "dist", "skills", "telegram-bridge", "SKILL.md"),
+      "---\nname: telegram-bridge\ndescription: dist fixture\n---\n",
+    );
+    const checkoutResolved = await new packageManagerModule.DefaultPackageManager({
+      cwd,
+      agentDir,
+      settingsManager: settingsModule.SettingsManager.inMemory(),
+    }).resolve();
+    assert.equal(checkoutResolved.extensions.some(
+      (entry: { path: string }) => entry.path === checkoutEntry,
+    ), true);
+    assert.equal(checkoutResolved.skills.some(
+      (entry: { path: string }) => entry.path.startsWith(checkoutRoot),
+    ), false);
+    const checkoutSkillsModule = join(checkoutRoot, "dist", "lib", "skills.js");
+    let resourceHook: (() => { skillPaths: string[] }) | undefined;
+    assert.equal(isRawTelegramExtensionCheckout(checkoutSkillsModule, { agentDir, cwd }), true);
+    assert.equal(
+      getTelegramExtensionPackageRoot(checkoutSkillsModule),
+      checkoutRoot,
+    );
+    assert.equal(registerTelegramSkillDiscovery({
+      on(name: string, hook: unknown) {
+        assert.equal(name, "resources_discover");
+        resourceHook = hook as () => { skillPaths: string[] };
+      },
+    } as never, checkoutSkillsModule, { agentDir, cwd }), true);
+    assert.deepEqual(resourceHook?.(), { skillPaths: [join(checkoutRoot, "skills")] });
+
+    const managedRoot = join(root, "managed", "pi-telegram");
+    const managedEntry = join(managedRoot, "dist", "pi-telegram", "index.js");
+    const managedSkill = join(managedRoot, "dist", "skills", "telegram-bridge", "SKILL.md");
+    await mkdir(dirname(managedEntry), { recursive: true });
+    await mkdir(dirname(managedSkill), { recursive: true });
+    await writeFile(join(managedRoot, "package.json"), JSON.stringify({
+      name: "@llblab/pi-telegram-managed-fixture",
+      pi: {
+        extensions: ["./dist/pi-telegram/index.js"],
+        skills: ["./dist/skills"],
+      },
+    }));
+    await writeFile(managedEntry, "export default function () {}\n");
+    await writeFile(managedSkill, "---\nname: telegram-bridge\ndescription: managed fixture\n---\n");
+    const managedAgentDir = join(root, "managed-agent");
+    const managedResolved = await new packageManagerModule.DefaultPackageManager({
+      cwd,
+      agentDir: managedAgentDir,
+      settingsManager: settingsModule.SettingsManager.inMemory({
+        packages: [{ source: managedRoot, skills: [] }],
+      }),
+    }).resolve();
+    const filteredSkill = managedResolved.skills.find(
+      (entry: { path: string }) => entry.path === managedSkill,
+    );
+    assert.ok(filteredSkill);
+    assert.equal(filteredSkill.enabled, false);
+    assert.equal(filteredSkill.metadata.origin, "package");
+    assert.equal(isRawTelegramExtensionCheckout(
+      join(managedRoot, "dist", "lib", "skills.js"),
+      { agentDir: managedAgentDir, cwd },
+    ), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Package metadata publishes only Pi-supported compiled resources", async () => {
   const packageRoot = dirname(TELEGRAM_SKILLS_PATH);
   const manifest = JSON.parse(
     await readFile(join(packageRoot, "package.json"), "utf8"),
-  ) as { files?: string[]; pi?: { skills?: string[] } };
+  ) as {
+    files?: string[];
+    pi?: { extensions?: string[]; skills?: string[]; sourceExtensions?: string[]; sourceSkills?: string[] };
+  };
 
   assert.ok(manifest.files?.includes("skills/"));
   assert.ok(manifest.files?.includes("dist/"));
+  assert.deepEqual(manifest.pi?.extensions, ["./dist/pi-telegram/index.js"]);
   assert.deepEqual(manifest.pi?.skills, ["./dist/skills"]);
+  assert.equal("sourceExtensions" in (manifest.pi ?? {}), false);
+  assert.equal("sourceSkills" in (manifest.pi ?? {}), false);
 });

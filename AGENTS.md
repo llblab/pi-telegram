@@ -152,7 +152,7 @@ Before non-trivial work:
 While working:
 
 - Keep changes inside this repository; updating an installed Pi checkout is a separate operator action.
-- Rebuild the package with `npm run build` after edits. Pi loads `dist/pi-telegram/index.js`, so source-only changes are not live and `/reload` or process restart alone will reload stale compiled output.
+- Rebuild the package with `npm run build` after edits. Pi loads `dist/pi-telegram/index.js`, so source-only changes are not live and `/reload` or process restart alone will reload stale compiled output. Keep the committed `dist/` synchronized for Git installs; builds use a temporary candidate and rollback-safe swap, while `npm run build:check` rejects drift without rewriting the tree.
 - Read large artifacts search-first and range-bounded. For `CHANGELOG.md`, inspect only the current release section unless older history is relevant.
 - Keep successful validation output compact; inspect focused failure tails. Prefer focused tests/typecheck during iteration and broad validation at a stable gate.
 - Preserve unrelated work and do not commit, publish, tag, deploy, or perform external actions without explicit authorization.
