@@ -5,6 +5,7 @@
     "declaration": true,
     "emitDeclarationOnly": false,
     "noEmit": false,
+    "newLine": "lf",
     "outDir": "dist",
     "rewriteRelativeImportExtensions": true,
     "rootDir": "."

@@ -47,26 +47,7 @@ test("Local Bot API reference documents generation-stop controls on both draft m
   assert.match(section("MessageGenerationStopped"), /draft\\_id/u);
 });
 
-test("Auto-discovered checkout contributes focused source Skills", async () => {
-  const packageRoot = dirname(TELEGRAM_SKILLS_PATH);
-  const sourceModule = join(packageRoot, "lib", "skills.ts");
-  const compiledModule = join(packageRoot, "dist", "lib", "skills.js");
-  const checkoutOptions = {
-    agentDir: dirname(dirname(packageRoot)),
-    cwd: join(packageRoot, "unrelated-cwd"),
-  };
-  let resourceHook: (() => { skillPaths: string[] }) | undefined;
-  assert.equal(isRawTelegramExtensionCheckout(sourceModule, checkoutOptions), true);
-  assert.equal(isRawTelegramExtensionCheckout(compiledModule, checkoutOptions), true);
-  assert.equal(getTelegramExtensionPackageRoot(compiledModule), packageRoot);
-  assert.equal(registerTelegramSkillDiscovery({
-    on(name: string, hook: unknown) {
-      assert.equal(name, "resources_discover");
-      resourceHook = hook as () => { skillPaths: string[] };
-    },
-  } as never, compiledModule, checkoutOptions), true);
-
-  assert.deepEqual(resourceHook?.(), { skillPaths: [TELEGRAM_SKILLS_PATH] });
+test("Bundled source Skills remain focused and self-contained", async () => {
   const skillNames = [
     "telegram-bridge",
     "show-me",
@@ -300,10 +281,20 @@ test("Pi resolver preserves checkout Skills and package filters with package pro
     assert.equal(checkoutResolved.skills.some(
       (entry: { path: string }) => entry.path.startsWith(checkoutRoot),
     ), false);
-    assert.equal(isRawTelegramExtensionCheckout(
-      join(checkoutRoot, "dist", "lib", "skills.js"),
-      { agentDir, cwd },
-    ), true);
+    const checkoutSkillsModule = join(checkoutRoot, "dist", "lib", "skills.js");
+    let resourceHook: (() => { skillPaths: string[] }) | undefined;
+    assert.equal(isRawTelegramExtensionCheckout(checkoutSkillsModule, { agentDir, cwd }), true);
+    assert.equal(
+      getTelegramExtensionPackageRoot(checkoutSkillsModule),
+      checkoutRoot,
+    );
+    assert.equal(registerTelegramSkillDiscovery({
+      on(name: string, hook: unknown) {
+        assert.equal(name, "resources_discover");
+        resourceHook = hook as () => { skillPaths: string[] };
+      },
+    } as never, checkoutSkillsModule, { agentDir, cwd }), true);
+    assert.deepEqual(resourceHook?.(), { skillPaths: [join(checkoutRoot, "skills")] });
 
     const managedRoot = join(root, "managed", "pi-telegram");
     const managedEntry = join(managedRoot, "dist", "pi-telegram", "index.js");
