@@ -1210,13 +1210,36 @@ export function createTelegramBusFollowerTargetProvisioner(
         : recoverableTarget && !pendingTargetRecovery
           ? await recoverRequestedTarget()
           : await provisionTarget();
+      const alignResultWithWorkspaceSlot = (): void => {
+        if (
+          !workspaceIdentity ||
+          result.record.slot === workspaceIdentity.slot
+        ) return;
+        deps.recordRuntimeEvent(
+          "bus",
+          "Telegram follower record slot reconciled to its Workspace claim",
+          {
+            phase: "follower-register-slot-reconcile",
+            instanceId: registration.instanceId,
+            chatId: result.target.chatId,
+            threadId: result.target.threadId,
+            previousSlot: result.record.slot,
+            slot: workspaceIdentity.slot,
+          },
+        );
+        result = {
+          ...result,
+          record: { ...result.record, slot: workspaceIdentity.slot },
+        };
+      };
+      alignResultWithWorkspaceSlot();
       const crossSessionReuse =
         !!reconnectRecord &&
         reconnectRecord.instanceId !== registration.instanceId;
       if (reconnectRecord && !crossSessionReuse) {
         const nowMs = getNowMs();
         const refreshedRecord = deps.topicTargetStore.upsert({
-          ...reconnectRecord,
+          ...result.record,
           instanceId: registration.instanceId,
           updatedAtMs: nowMs,
           lastSyncObservedAtMs: nowMs,
@@ -1300,7 +1323,7 @@ export function createTelegramBusFollowerTargetProvisioner(
           } else if (crossSessionReuse && reconnectRecord) {
             const nowMs = getNowMs();
             const transferredRecord = deps.topicTargetStore.upsert({
-              ...reconnectRecord,
+              ...result.record,
               profileKey: followerProfileKey,
               owner:
                 followerOwner.kind === "manual-follower"
@@ -1361,6 +1384,7 @@ export function createTelegramBusFollowerTargetProvisioner(
         }
       }
       if (workspaceIdentity) {
+        alignResultWithWorkspaceSlot();
         const workspaceCommit =
           Threads.commitTelegramWorkspaceProvisionBinding({
             store: deps.topicTargetStore,
@@ -1373,7 +1397,7 @@ export function createTelegramBusFollowerTargetProvisioner(
               ...(result.record.threadName
                 ? { threadName: result.record.threadName }
                 : {}),
-              ...(result.record.slot ? { slot: result.record.slot } : {}),
+              slot: workspaceIdentity.slot,
               journalBindingKeys: [followerProfileKey],
               journalBindingsComplete: true,
               updatedAtMs: getNowMs(),

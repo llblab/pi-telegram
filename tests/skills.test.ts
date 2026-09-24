@@ -44,14 +44,14 @@ test("Local Bot API reference documents generation-stop controls on both draft m
   assert.match(section("MessageGenerationStopped"), /draft\\_id/u);
 });
 
-test("Telegram extension contributes focused bundled skills", async () => {
+test("Source extension contributes focused bundled skills", async () => {
   let resourceHook: (() => { skillPaths: string[] }) | undefined;
-  registerTelegramSkillDiscovery({
+  assert.equal(registerTelegramSkillDiscovery({
     on(name: string, hook: unknown) {
       assert.equal(name, "resources_discover");
       resourceHook = hook as () => { skillPaths: string[] };
     },
-  } as never);
+  } as never), true);
 
   assert.deepEqual(resourceHook?.(), { skillPaths: [TELEGRAM_SKILLS_PATH] });
   const skillNames = [
@@ -228,6 +228,16 @@ test("Bridge diagnosis distinguishes Pi commands from the agent file fallback", 
   assert.match(diagnosis, /not shell executables or agent tools/u);
   assert.match(diagnosis, /read the diagnostic files directly/u);
   assert.match(diagnosis, /state\.json.*logs\.jsonl/u);
+});
+
+test("Compiled package leaves filtered skill discovery to its manifest", () => {
+  let registered = false;
+  assert.equal(registerTelegramSkillDiscovery({
+    on() {
+      registered = true;
+    },
+  } as never, "/package/dist/lib/skills.js"), false);
+  assert.equal(registered, false);
 });
 
 test("Package metadata publishes the bundled skill root", async () => {

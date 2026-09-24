@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.51.3: Follower recovery and filterable Skills
+
+- `Follower slot reconciliation`: Re-registration now treats the exact Workspace claim as canonical when a retained follower record carries a different slot. It repairs the record before binding commit, preserves the unrelated binding that owns the stale letter, and makes repeated registration idempotent instead of returning `Telegram Workspace binding claim changed.` forever.
+- `Filterable packaged Skills`: Compiled npm/git installations now leave bundled Skill discovery to the `pi.skills` manifest, so Pi package filters can select or disable individual Skills. A raw TypeScript checkout under Pi's `extensions` directory still contributes its source Skill root through `resources_discover`, preserving local-repository development without double-owning installed resources.
+
 ## 0.51.2: Model switching and typing continuity
 
 - `In-flight model switching`: Telegram model selection can again stop, switch, and continue any interruptible agent run in the current Pi session, including local/TUI work without an active Telegram prompt. The exact model-menu chat/Thread/message supplies fallback continuation ownership, active tools defer abort until settlement, and cancellation/session boundaries clear both selection and target state instead of returning a false busy response.
