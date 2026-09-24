@@ -37,6 +37,17 @@ function listFiles(root, current = root) {
   }).sort();
 }
 
+function normalizeTextFiles(root) {
+  const textSuffixes = [".js", ".ts", ".mjs", ".json", ".md"];
+  for (const path of listFiles(root)) {
+    if (!textSuffixes.some((suffix) => path.endsWith(suffix))) continue;
+    const absolutePath = join(root, path);
+    const source = readFileSync(absolutePath, "utf8");
+    const normalized = source.replace(/\r\n?/g, "\n");
+    if (normalized !== source) writeFileSync(absolutePath, normalized, "utf8");
+  }
+}
+
 function assertTreesEqual(expectedRoot, actualRoot) {
   if (!existsSync(expectedRoot)) {
     throw new Error(`${expectedRoot} is missing; run npm run build.`);
@@ -90,6 +101,7 @@ try {
     join("lib", "generative-app-worker.mjs"),
     join(candidate, "lib", "generative-app-worker.mjs"),
   );
+  normalizeTextFiles(candidate);
   run(process.execPath, ["--check", join(candidate, "pi-telegram", "index.js")]);
 
   if (checkOnly) {
