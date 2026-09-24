@@ -26,6 +26,8 @@ From git:
 pi install git:github.com/llblab/pi-telegram
 ```
 
+Installed npm/git packages expose bundled Skills through their `pi.skills` manifest, so Pi package filters can select individual Skills. A raw TypeScript checkout placed directly under Pi's `extensions` directory instead contributes its adjacent source Skills at runtime; the two discovery paths are mutually exclusive.
+
 The extension requires Pi `0.84.4` or newer, matching the package's peer dependencies. Its Activity API uses the public `agent_settled` lifecycle event to keep retries/continuations under one activity identity and release that identity only after the run fully settles.
 
 Pi is the primary and only officially supported host. Narrow host-neutral adapters preserve ordered prompt blocks and normalize synchronous or asynchronous legacy/generic settings services for Pi-compatible hosts, but this is best-effort compatibility rather than an OMP support guarantee. Alternate-host shims must still reproduce required Pi lifecycle semantics—especially `agent_settled`—and their maintainers own ongoing validation.

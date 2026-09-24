@@ -1291,6 +1291,85 @@ test("Bus leader follower target provisioner creates thread and announces connec
   }
 });
 
+test("Bus leader reconciles a stale follower record slot to its Workspace claim", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-slot-reconcile-"));
+  const store = createTelegramTopicTargetStore({
+    path: join(dir, "state.json"),
+    getNowMs: () => 1000,
+  });
+  store.upsertWorkspaceBinding({
+    ...createTelegramWorkspaceBindingIdentity("/old", 0, "session-old")!,
+    target: { chatId: 7, threadId: 11 },
+    slot: "P",
+    updatedAtMs: 100,
+  });
+  store.upsertWorkspaceBinding({
+    ...createTelegramWorkspaceBindingIdentity("/repo", 0, "session-a")!,
+    target: { chatId: 7, threadId: 12 },
+    slot: "Q",
+    updatedAtMs: 200,
+  });
+  store.upsert({
+    profileKey: "manual:follower-a",
+    owner: { kind: "manual-follower", instanceId: "follower-a" },
+    target: { chatId: 7, threadId: 12 },
+    status: "active",
+    createdAtMs: 100,
+    updatedAtMs: 200,
+    instanceId: "follower-a",
+    slot: "P",
+    threadName: "Quartz",
+  });
+  const calls: string[] = [];
+  const phases: string[] = [];
+  const provision = createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7,
+    topicTargetStore: store,
+    async callApi<TResponse>(method: string) {
+      calls.push(method);
+      return { ok: true } as TResponse;
+    },
+    getSyncState: () => ({}),
+    setSyncState: () => undefined,
+    recordRuntimeEvent(_category, _error, details) {
+      if (typeof details?.phase === "string") phases.push(details.phase);
+    },
+    getNowMs: () => 1000,
+  });
+  const registration = {
+    instanceId: "follower-a",
+    profileKey: "manual:follower-a",
+    cwd: "/repo",
+    sessionId: "session-a",
+    target: { chatId: 7, threadId: 12 },
+    connectedAtMs: 1000,
+  };
+  try {
+    assert.deepEqual(await provision(registration), {
+      chatId: 7,
+      threadId: 12,
+      slot: "Q",
+      threadName: "Quartz",
+    });
+    assert.equal(store.getByProfileKey("manual:follower-a")?.slot, "Q");
+    assert.equal(
+      store.getWorkspaceBinding("/repo", "a", "session-a")?.slot,
+      "Q",
+    );
+    assert.equal(
+      store.getWorkspaceBinding("/old", "a", "session-old")?.slot,
+      "P",
+    );
+    assert.deepEqual(calls, []);
+    assert.deepEqual(phases, ["follower-register-slot-reconcile"]);
+
+    assert.equal((await provision(registration))?.slot, "Q");
+    assert.deepEqual(phases, ["follower-register-slot-reconcile"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Bus leader replaces only the stale session-qualified follower target", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-session-target-replace-"));
   const store = createTelegramTopicTargetStore({
