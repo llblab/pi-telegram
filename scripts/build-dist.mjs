@@ -1,44 +1,103 @@
 #!/usr/bin/env node
 
 /**
- * Builds the distributive JavaScript, declarations, Pi entrypoint, and Skills.
- * Usage: node scripts/build-dist.mjs
- *
- * The build replaces `dist`, compiles with `tsconfig.build.json`, then copies
- * package-owned runtime assets. It does not publish, pack, or modify sources.
+ * Builds or verifies the distributive JavaScript, declarations, Pi entrypoint,
+ * Skills, and runtime assets without exposing a partial tree.
  */
 
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { join, relative } from "node:path";
+
+const DIST_DIR = "dist";
+const checkOnly = process.argv.includes("--check");
 
 function run(command, args) {
   const result = spawnSync(command, args, { stdio: "inherit" });
   if (result.error) throw result.error;
-  if (result.status !== 0) process.exit(result.status ?? 1);
+  if (result.status !== 0) {
+    throw new Error(`${command} exited with status ${result.status ?? "unknown"}.`);
+  }
 }
 
-rmSync("dist", { recursive: true, force: true });
-mkdirSync("dist", { recursive: true });
+function listFiles(root, current = root) {
+  return readdirSync(current, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(current, entry.name);
+    return entry.isDirectory() ? listFiles(root, path) : [relative(root, path)];
+  }).sort();
+}
 
-run(process.execPath, [
-  join("node_modules", "typescript", "bin", "tsc"),
-  "-p",
-  "tsconfig.build.json",
-]);
+function assertTreesEqual(expectedRoot, actualRoot) {
+  if (!existsSync(expectedRoot)) {
+    throw new Error(`${expectedRoot} is missing; run npm run build.`);
+  }
+  const expectedFiles = listFiles(expectedRoot);
+  const actualFiles = listFiles(actualRoot);
+  if (JSON.stringify(expectedFiles) !== JSON.stringify(actualFiles)) {
+    throw new Error("dist file inventory is stale; run npm run build.");
+  }
+  for (const path of expectedFiles) {
+    if (!readFileSync(join(expectedRoot, path)).equals(readFileSync(join(actualRoot, path)))) {
+      throw new Error(`dist/${path} is stale; run npm run build.`);
+    }
+  }
+}
 
-mkdirSync(join("dist", "pi-telegram"), { recursive: true });
-writeFileSync(
-  join("dist", "pi-telegram", "index.js"),
-  'export { default } from "../index.js";\n',
-  "utf8",
-);
+function replaceDist(candidate) {
+  const backup = `.dist-backup-${process.pid}-${Date.now()}`;
+  const hadDist = existsSync(DIST_DIR);
+  if (hadDist) renameSync(DIST_DIR, backup);
+  try {
+    renameSync(candidate, DIST_DIR);
+    if (hadDist) rmSync(backup, { recursive: true, force: true });
+  } catch (error) {
+    if (hadDist && existsSync(backup) && !existsSync(DIST_DIR)) {
+      renameSync(backup, DIST_DIR);
+    }
+    throw error;
+  }
+}
 
-cpSync("skills", join("dist", "skills"), { recursive: true });
-cpSync("package.json", join("dist", "package.json"));
-cpSync(
-  join("lib", "generative-app-worker.mjs"),
-  join("dist", "lib", "generative-app-worker.mjs"),
-);
+const candidate = mkdtempSync(join(process.cwd(), ".dist-build-"));
+try {
+  run(process.execPath, [
+    join("node_modules", "typescript", "bin", "tsc"),
+    "-p",
+    "tsconfig.build.json",
+    "--outDir",
+    candidate,
+  ]);
 
-run(process.execPath, ["--check", join("dist", "pi-telegram", "index.js")]);
+  mkdirSync(join(candidate, "pi-telegram"), { recursive: true });
+  writeFileSync(
+    join(candidate, "pi-telegram", "index.js"),
+    'export { default } from "../index.js";\n',
+    "utf8",
+  );
+  cpSync("skills", join(candidate, "skills"), { recursive: true });
+  cpSync("package.json", join(candidate, "package.json"));
+  cpSync(
+    join("lib", "generative-app-worker.mjs"),
+    join(candidate, "lib", "generative-app-worker.mjs"),
+  );
+  run(process.execPath, ["--check", join(candidate, "pi-telegram", "index.js")]);
+
+  if (checkOnly) {
+    assertTreesEqual(DIST_DIR, candidate);
+    console.log("pi-telegram: dist is current");
+  } else {
+    replaceDist(candidate);
+  }
+} finally {
+  rmSync(candidate, { recursive: true, force: true });
+}

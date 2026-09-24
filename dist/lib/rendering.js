@@ -1,0 +1,983 @@
+/**
+ * Telegram UI/compat rendering helpers
+ * Zones: telegram rendering, shared text utils
+ * Converts bridge-owned UI/status/menu/interactive text into Telegram-safe plain text and HTML chunks with chunk-boundary handling
+ */
+export const MAX_MESSAGE_LENGTH = 4096;
+const TELEGRAM_TABLE_GRAPHEME_SEGMENTER = typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : undefined;
+const TELEGRAM_TABLE_EMOJI_GRAPHEME_PATTERN = /\p{Extended_Pictographic}|\p{Emoji_Presentation}|\p{Regional_Indicator}/u;
+const TELEGRAM_VOID_HTML_TAGS = new Set(["br", "hr"]);
+export function escapeHtml(text) {
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+}
+export function escapeHtmlAttribute(text) {
+    return escapeHtml(text).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function getHtmlTagName(tag) {
+    return tag.match(/^<\/?\s*([a-zA-Z][\w-]*)/)?.[1]?.toLowerCase();
+}
+function isHtmlClosingTag(tag) {
+    return /^<\//.test(tag);
+}
+function isHtmlSelfClosingTag(tag) {
+    return /\/\s*>$/.test(tag);
+}
+function getHtmlClosingTags(openTags) {
+    return [...openTags]
+        .reverse()
+        .map((tag) => `</${tag.name}>`)
+        .join("");
+}
+function getHtmlOpeningTags(openTags) {
+    return openTags.map((tag) => tag.openTag).join("");
+}
+function updateOpenHtmlTags(tag, openTags) {
+    const name = getHtmlTagName(tag);
+    if (!name || TELEGRAM_VOID_HTML_TAGS.has(name))
+        return;
+    if (isHtmlClosingTag(tag)) {
+        const index = openTags.map((openTag) => openTag.name).lastIndexOf(name);
+        if (index !== -1)
+            openTags.splice(index, 1);
+        return;
+    }
+    if (isHtmlSelfClosingTag(tag))
+        return;
+    openTags.push({ name, openTag: tag });
+}
+export function chunkHtmlPreservingTags(html, maxLength) {
+    if (html.length <= maxLength)
+        return [html];
+    const chunks = [];
+    const openTags = [];
+    const tagPattern = /<\/?[a-zA-Z][^>]*>/g;
+    let current = "";
+    let index = 0;
+    const flushCurrent = () => {
+        if (current.length === 0)
+            return;
+        chunks.push(`${current}${getHtmlClosingTags(openTags)}`);
+        current = getHtmlOpeningTags(openTags);
+    };
+    const appendText = (text) => {
+        let remaining = text;
+        while (remaining.length > 0) {
+            const closingTags = getHtmlClosingTags(openTags);
+            const available = maxLength - current.length - closingTags.length;
+            if (available <= 0) {
+                flushCurrent();
+                continue;
+            }
+            const slice = remaining.slice(0, available);
+            current += slice;
+            remaining = remaining.slice(slice.length);
+            if (remaining.length > 0)
+                flushCurrent();
+        }
+    };
+    const appendTag = (tag) => {
+        const closingTags = isHtmlClosingTag(tag)
+            ? ""
+            : getHtmlClosingTags(openTags);
+        if (current.length + tag.length + closingTags.length > maxLength) {
+            flushCurrent();
+        }
+        current += tag;
+        updateOpenHtmlTags(tag, openTags);
+    };
+    for (const match of html.matchAll(tagPattern)) {
+        appendText(html.slice(index, match.index));
+        appendTag(match[0]);
+        index = match.index + match[0].length;
+    }
+    appendText(html.slice(index));
+    if (current.length > 0)
+        chunks.push(current);
+    return chunks;
+}
+// --- Plain Preview Rendering ---
+function splitPlainMarkdownLine(line, maxLength = 1500) {
+    if (line.length <= maxLength)
+        return [line];
+    const words = line.split(/\s+/).filter(Boolean);
+    if (words.length === 0)
+        return [line];
+    const parts = [];
+    let current = "";
+    for (const word of words) {
+        const candidate = current.length === 0 ? word : `${current} ${word}`;
+        if (candidate.length <= maxLength) {
+            current = candidate;
+            continue;
+        }
+        if (current.length > 0) {
+            parts.push(current);
+            current = "";
+        }
+        if (word.length <= maxLength) {
+            current = word;
+            continue;
+        }
+        for (let i = 0; i < word.length; i += maxLength) {
+            parts.push(word.slice(i, i + maxLength));
+        }
+    }
+    if (current.length > 0) {
+        parts.push(current);
+    }
+    return parts.length > 0 ? parts : [line];
+}
+function isEscapedMarkdownCharacter(text, index) {
+    let backslashCount = 0;
+    for (let i = index - 1; i >= 0 && text[i] === "\\"; i--) {
+        backslashCount += 1;
+    }
+    return backslashCount % 2 === 1;
+}
+function findMarkdownClosingBracket(text, startIndex) {
+    let depth = 0;
+    for (let index = startIndex; index < text.length; index += 1) {
+        if (isEscapedMarkdownCharacter(text, index))
+            continue;
+        const char = text[index] ?? "";
+        if (char === "[") {
+            depth += 1;
+            continue;
+        }
+        if (char !== "]")
+            continue;
+        depth -= 1;
+        if (depth === 0)
+            return index;
+    }
+    return undefined;
+}
+function parseMarkdownLinkTarget(text, openParenIndex) {
+    let index = openParenIndex + 1;
+    while (index < text.length && /\s/.test(text[index] ?? "")) {
+        index += 1;
+    }
+    if (index >= text.length)
+        return undefined;
+    let destination = "";
+    if (text[index] === "<") {
+        const destinationStart = index + 1;
+        index += 1;
+        while (index < text.length) {
+            if (!isEscapedMarkdownCharacter(text, index) && text[index] === ">") {
+                break;
+            }
+            index += 1;
+        }
+        if (index >= text.length)
+            return undefined;
+        destination = text.slice(destinationStart, index).trim();
+        index += 1;
+    }
+    else {
+        const destinationStart = index;
+        let parenDepth = 0;
+        while (index < text.length) {
+            if (isEscapedMarkdownCharacter(text, index)) {
+                index += 1;
+                continue;
+            }
+            const char = text[index] ?? "";
+            if (/\s/.test(char) && parenDepth === 0)
+                break;
+            if (char === "(") {
+                parenDepth += 1;
+                index += 1;
+                continue;
+            }
+            if (char === ")") {
+                if (parenDepth === 0)
+                    break;
+                parenDepth -= 1;
+                index += 1;
+                continue;
+            }
+            index += 1;
+        }
+        destination = text.slice(destinationStart, index).trim();
+    }
+    if (!destination)
+        return undefined;
+    while (index < text.length && /\s/.test(text[index] ?? "")) {
+        index += 1;
+    }
+    if (index < text.length &&
+        (text[index] === '"' || text[index] === "'" || text[index] === "(")) {
+        const titleDelimiter = text[index] ?? '"';
+        const closingTitleDelimiter = titleDelimiter === "(" ? ")" : titleDelimiter;
+        index += 1;
+        while (index < text.length) {
+            if (!isEscapedMarkdownCharacter(text, index) &&
+                text[index] === closingTitleDelimiter) {
+                break;
+            }
+            index += 1;
+        }
+        if (index >= text.length)
+            return undefined;
+        index += 1;
+        while (index < text.length && /\s/.test(text[index] ?? "")) {
+            index += 1;
+        }
+    }
+    if (text[index] !== ")")
+        return undefined;
+    return { destination, endIndex: index };
+}
+function isSupportedMarkdownLinkDestination(destination) {
+    return /^(?:https?:\/\/|mailto:)/i.test(destination.trim());
+}
+function parseMarkdownInlineLinkAt(text, index) {
+    const isImage = text[index] === "!" && text[index + 1] === "[";
+    const labelStartIndex = isImage ? index + 1 : index;
+    if (text[labelStartIndex] !== "[")
+        return undefined;
+    if (isEscapedMarkdownCharacter(text, labelStartIndex) ||
+        (isImage && isEscapedMarkdownCharacter(text, index))) {
+        return undefined;
+    }
+    const labelEndIndex = findMarkdownClosingBracket(text, labelStartIndex);
+    if (labelEndIndex === undefined || text[labelEndIndex + 1] !== "(") {
+        return undefined;
+    }
+    const target = parseMarkdownLinkTarget(text, labelEndIndex + 1);
+    if (!target)
+        return undefined;
+    return {
+        startIndex: index,
+        endIndex: target.endIndex,
+        label: text.slice(labelStartIndex + 1, labelEndIndex),
+        destination: target.destination,
+        isImage,
+    };
+}
+function parseMarkdownAutolinkAt(text, index) {
+    if (text[index] !== "<" || isEscapedMarkdownCharacter(text, index)) {
+        return undefined;
+    }
+    let endIndex = index + 1;
+    while (endIndex < text.length) {
+        if (!isEscapedMarkdownCharacter(text, endIndex) && text[endIndex] === ">") {
+            break;
+        }
+        endIndex += 1;
+    }
+    if (endIndex >= text.length)
+        return undefined;
+    const destination = text.slice(index + 1, endIndex).trim();
+    if (!isSupportedMarkdownLinkDestination(destination)) {
+        return undefined;
+    }
+    return { startIndex: index, endIndex, destination };
+}
+function replaceMarkdownLink(text, options) {
+    let result = "";
+    for (let index = 0; index < text.length;) {
+        const inlineLink = parseMarkdownInlineLinkAt(text, index);
+        if (inlineLink) {
+            result += options.renderInlineLink(inlineLink, isSupportedMarkdownLinkDestination(inlineLink.destination));
+            index = inlineLink.endIndex + 1;
+            continue;
+        }
+        const autolink = parseMarkdownAutolinkAt(text, index);
+        if (autolink) {
+            result += options.renderAutolink(autolink);
+            index = autolink.endIndex + 1;
+            continue;
+        }
+        result += text[index] ?? "";
+        index += 1;
+    }
+    return result;
+}
+function stripInlineMarkdownToPlainText(text) {
+    let result = replaceMarkdownLink(text, {
+        renderInlineLink: (link, supported) => {
+            const plainLabel = stripInlineMarkdownToPlainText(link.label).trim();
+            if (plainLabel.length > 0)
+                return plainLabel;
+            return supported ? link.destination : "";
+        },
+        renderAutolink: (link) => link.destination,
+    });
+    result = result.replace(/`([^`\n]+)`/g, "$1");
+    result = result.replace(/(\*\*\*|___)(.+?)\1/g, "$2");
+    result = result.replace(/(\*\*|__)(.+?)\1/g, "$2");
+    result = result.replace(/(\*|_)(.+?)\1/g, "$2");
+    result = result.replace(/~~(.+?)~~/g, "$1");
+    result = result.replace(/\\([\\`*_{}\[\]()#+\-.!>~|])/g, "$1");
+    return result;
+}
+function isMarkdownTableSeparator(line) {
+    return /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/.test(line);
+}
+function parseMarkdownFence(line) {
+    const match = line.match(/^\s*([`~]{3,})(.*)$/);
+    if (!match)
+        return undefined;
+    const fence = match[1] ?? "";
+    const marker = fence[0];
+    if ((marker !== "`" && marker !== "~") || /[^`~]/.test(fence)) {
+        return undefined;
+    }
+    if (!fence.split("").every((char) => char === marker))
+        return undefined;
+    return {
+        marker,
+        length: fence.length,
+        info: (match[2] ?? "").trim() || undefined,
+    };
+}
+function isFencedCodeStart(line) {
+    return parseMarkdownFence(line) !== undefined;
+}
+function isMatchingMarkdownFence(line, fence) {
+    const match = line.match(/^\s*([`~]{3,})\s*$/);
+    if (!match)
+        return false;
+    const candidate = match[1] ?? "";
+    return (candidate.length >= fence.length &&
+        candidate[0] === fence.marker &&
+        candidate.split("").every((char) => char === fence.marker));
+}
+function isIndentedCodeLine(line) {
+    return /^(?:\t| {4,})/.test(line);
+}
+function isIndentedMarkdownStructureLine(line) {
+    const trimmed = line.trimStart();
+    return (/^(?:[-*+]|\d+\.)\s+\[([ xX])\]\s+/.test(trimmed) ||
+        /^(?:[-*+]|\d+\.)\s+/.test(trimmed) ||
+        /^>\s?/.test(trimmed) ||
+        /^#{1,6}\s+/.test(trimmed) ||
+        parseMarkdownFence(trimmed) !== undefined);
+}
+function canStartIndentedCodeBlock(lines, index) {
+    const line = lines[index] ?? "";
+    if (!isIndentedCodeLine(line))
+        return false;
+    if (isIndentedMarkdownStructureLine(line))
+        return false;
+    if (index === 0)
+        return true;
+    return (lines[index - 1] ?? "").trim().length === 0;
+}
+function stripIndentedCodePrefix(line) {
+    if (line.startsWith("\t"))
+        return line.slice(1);
+    if (line.startsWith("    "))
+        return line.slice(4);
+    return line;
+}
+function normalizeMarkdownDocument(markdown) {
+    const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+    let start = 0;
+    while (start < lines.length && (lines[start] ?? "").trim().length === 0) {
+        start += 1;
+    }
+    let end = lines.length;
+    while (end > start && (lines[end - 1] ?? "").trim().length === 0) {
+        end -= 1;
+    }
+    return lines.slice(start, end).join("\n");
+}
+function isMarkdownNumberedListMarker(marker) {
+    return /^\d+\.$/.test(marker);
+}
+function matchMarkdownHeadingLine(line) {
+    return line.match(/^(\s*)#{1,6}\s+(.+)$/);
+}
+// --- UI Markdown-to-Telegram-HTML Rendering ---
+function renderDelimitedInlineStyle(text, delimiter, render) {
+    const escapedDelimiter = delimiter.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`(^|[^\\p{L}\\p{N}\\\\])(${escapedDelimiter})(?=\\S)([\\s\\S]+?)(?<=\\S)\\2(?=[^\\p{L}\\p{N}]|$)`, "gu");
+    return text.replace(pattern, (_match, prefix, _wrapped, content) => {
+        return `${prefix}${render(content)}`;
+    });
+}
+function makeInlineMarkdownToken(state, html) {
+    const token = `\uE000${state.tokens.length}\uE001`;
+    state.tokens.push(html);
+    return token;
+}
+function stashInlineMarkdownLinks(text, state, allowLinks) {
+    return replaceMarkdownLink(text, {
+        renderInlineLink: (link, supported) => {
+            const plainLabel = stripInlineMarkdownToPlainText(link.label).trim();
+            if (!allowLinks || !supported)
+                return plainLabel.length > 0 ? plainLabel : link.destination;
+            const renderedLabel = plainLabel.length > 0 ? plainLabel : link.destination;
+            return makeInlineMarkdownToken(state, `<a href="${escapeHtmlAttribute(link.destination)}">${escapeHtml(renderedLabel)}</a>`);
+        },
+        renderAutolink: (link) => {
+            if (!allowLinks)
+                return link.destination;
+            return makeInlineMarkdownToken(state, `<a href="${escapeHtmlAttribute(link.destination)}">${escapeHtml(link.destination)}</a>`);
+        },
+    });
+}
+function stashInlineMarkdownCodeSpans(text, state) {
+    return text.replace(/`([^`\n]+)`/g, (_match, code) => {
+        return makeInlineMarkdownToken(state, `<code>${escapeHtml(code)}</code>`);
+    });
+}
+function applyInlineMarkdownStyles(text) {
+    let result = renderDelimitedInlineStyle(text, "***", (content) => {
+        return `<b><i>${content}</i></b>`;
+    });
+    result = renderDelimitedInlineStyle(result, "___", (content) => {
+        return `<b><i>${content}</i></b>`;
+    });
+    result = renderDelimitedInlineStyle(result, "~~", (content) => {
+        return `<s>${content}</s>`;
+    });
+    result = renderDelimitedInlineStyle(result, "**", (content) => {
+        return `<b>${content}</b>`;
+    });
+    result = renderDelimitedInlineStyle(result, "__", (content) => {
+        return `<b>${content}</b>`;
+    });
+    result = renderDelimitedInlineStyle(result, "*", (content) => {
+        return `<i>${content}</i>`;
+    });
+    result = renderDelimitedInlineStyle(result, "_", (content) => {
+        return `<i>${content}</i>`;
+    });
+    return renderDelimitedInlineStyle(result, "||", (content) => {
+        return `<tg-spoiler>${content}</tg-spoiler>`;
+    });
+}
+function restoreInlineMarkdownTokens(text, state) {
+    return text.replace(/\uE000(\d+)\uE001/g, (_match, index) => state.tokens[Number(index)] ?? "");
+}
+function renderInlineMarkdown(text, options = {}) {
+    const tokenState = { tokens: [] };
+    let result = stashInlineMarkdownLinks(text, tokenState, options.allowLinks !== false);
+    result = stashInlineMarkdownCodeSpans(result, tokenState);
+    result = escapeHtml(result);
+    result = applyInlineMarkdownStyles(result);
+    result = result.replace(/\\([\\`*_{}\[\]()#+\-.!>~|])/g, "$1");
+    return restoreInlineMarkdownTokens(result, tokenState);
+}
+export function renderTelegramInlineMarkdownHtml(text, options = {}) {
+    return renderInlineMarkdown(text, options);
+}
+function buildListIndent(level) {
+    return "\u00A0".repeat(Math.max(0, level) * 2);
+}
+function parseMarkdownTableRow(line) {
+    const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+    return trimmed
+        .split("|")
+        .map((cell) => stripInlineMarkdownToPlainText(cell.trim()));
+}
+function parseMarkdownQuoteLine(line) {
+    const match = line.match(/^\s*((?:>\s*)+)(.*)$/);
+    if (!match)
+        return undefined;
+    const markers = match[1] ?? "";
+    const depth = (markers.match(/>/g) ?? []).length;
+    return {
+        depth,
+        content: match[2] ?? "",
+    };
+}
+function renderMarkdownTextPiece(piece) {
+    const heading = matchMarkdownHeadingLine(piece);
+    if (heading) {
+        const indent = buildListIndent(Math.floor((heading[1] ?? "").length / 2));
+        return `${indent}<b>${renderInlineMarkdown(heading[2] ?? "")}</b>`;
+    }
+    const task = piece.match(/^(\s*)([-*+]|\d+\.)\s+\[([ xX])\]\s+(.+)$/);
+    if (task) {
+        const indent = buildListIndent(Math.floor((task[1] ?? "").length / 2));
+        const listMarker = task[2] ?? "-";
+        const checkboxMarker = (task[3] ?? " ").toLowerCase() === "x" ? "[x]" : "[ ]";
+        const taskPrefix = isMarkdownNumberedListMarker(listMarker)
+            ? `<code>${listMarker}</code> <code>${checkboxMarker}</code>`
+            : `<code>${checkboxMarker}</code>`;
+        return `${indent}${taskPrefix} ${renderInlineMarkdown(task[4] ?? "")}`;
+    }
+    const bullet = piece.match(/^(\s*)[-*+]\s+(.+)$/);
+    if (bullet) {
+        const indent = buildListIndent(Math.floor((bullet[1] ?? "").length / 2));
+        return `${indent}<code>-</code> ${renderInlineMarkdown(bullet[2] ?? "")}`;
+    }
+    const numbered = piece.match(/^(\s*)(\d+)\.\s+(.+)$/);
+    if (numbered) {
+        const indent = buildListIndent(Math.floor((numbered[1] ?? "").length / 2));
+        return `${indent}<code>${numbered[2]}.</code> ${renderInlineMarkdown(numbered[3] ?? "")}`;
+    }
+    const quote = piece.match(/^>\s?(.+)$/);
+    if (quote) {
+        return `<blockquote>${renderInlineMarkdown(quote[1] ?? "")}</blockquote>`;
+    }
+    if (/^([-*_]\s*){3,}$/.test(piece.trim()))
+        return "────────────";
+    return renderInlineMarkdown(piece);
+}
+function isPlainInlineMarkdownLine(line) {
+    if (line.trim().length === 0)
+        return false;
+    return (matchMarkdownHeadingLine(line) === null &&
+        !/^(\s*)([-*+]|\d+\.)\s+\[([ xX])\]\s+(.+)$/.test(line) &&
+        !/^(\s*)[-*+]\s+(.+)$/.test(line) &&
+        !/^(\s*)(\d+)\.\s+(.+)$/.test(line) &&
+        !/^>\s?(.+)$/.test(line) &&
+        !/^([-*_]\s*){3,}$/.test(line.trim()));
+}
+function renderMarkdownTextLines(block) {
+    const rendered = [];
+    const lines = block.split("\n");
+    const nonBlankLines = lines.filter((line) => line.trim().length > 0);
+    if (nonBlankLines.length > 1 &&
+        nonBlankLines.every(isPlainInlineMarkdownLine)) {
+        return renderInlineMarkdown(nonBlankLines.join("\n")).split("\n");
+    }
+    for (const line of lines) {
+        if (line.trim().length === 0)
+            continue;
+        for (const piece of splitPlainMarkdownLine(line)) {
+            rendered.push(renderMarkdownTextPiece(piece));
+        }
+    }
+    return rendered;
+}
+function sanitizeTelegramCodeLanguage(language) {
+    return language.split(/\s+/)[0]?.replace(/[^A-Za-z0-9_+.-]/g, "") ?? "";
+}
+function renderMarkdownCodeBlock(code, language) {
+    const safeLanguage = language ? sanitizeTelegramCodeLanguage(language) : "";
+    const open = safeLanguage
+        ? `<pre><code class="language-${escapeHtmlAttribute(safeLanguage)}">`
+        : "<pre><code>";
+    const close = "</code></pre>";
+    const maxContentLength = MAX_MESSAGE_LENGTH - open.length - close.length;
+    const chunks = [];
+    let current = "";
+    const pushCurrent = () => {
+        if (current.length === 0)
+            return;
+        chunks.push(`${open}${current}${close}`);
+        current = "";
+    };
+    const appendEscapedLine = (escapedLine) => {
+        if (escapedLine.length <= maxContentLength) {
+            const candidate = current.length === 0 ? escapedLine : `${current}\n${escapedLine}`;
+            if (candidate.length <= maxContentLength) {
+                current = candidate;
+                return;
+            }
+            pushCurrent();
+            current = escapedLine;
+            return;
+        }
+        pushCurrent();
+        for (let i = 0; i < escapedLine.length; i += maxContentLength) {
+            chunks.push(`${open}${escapedLine.slice(i, i + maxContentLength)}${close}`);
+        }
+    };
+    for (const line of code.split("\n")) {
+        appendEscapedLine(escapeHtml(line));
+    }
+    pushCurrent();
+    return chunks.length > 0 ? chunks : [`${open}${close}`];
+}
+function isTelegramTableEmojiGrapheme(grapheme) {
+    return (TELEGRAM_TABLE_EMOJI_GRAPHEME_PATTERN.test(grapheme) ||
+        grapheme.includes("\u20e3"));
+}
+function getTelegramTableCodePointWidth(char) {
+    const codePoint = char.codePointAt(0) ?? 0;
+    if (codePoint === 0 || codePoint < 32)
+        return 0;
+    if (/\p{Mark}/u.test(char))
+        return 0;
+    if ((codePoint >= 0xfe00 && codePoint <= 0xfe0f) || codePoint === 0x200d)
+        return 0;
+    if ((codePoint >= 0x1100 && codePoint <= 0x115f) ||
+        codePoint === 0x2329 ||
+        codePoint === 0x232a ||
+        (codePoint >= 0x2e80 && codePoint <= 0xa4cf) ||
+        (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+        (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+        (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
+        (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
+        (codePoint >= 0xff00 && codePoint <= 0xff60) ||
+        (codePoint >= 0xffe0 && codePoint <= 0xffe6)) {
+        return 2;
+    }
+    return 1;
+}
+function getTelegramTableGraphemes(text) {
+    if (TELEGRAM_TABLE_GRAPHEME_SEGMENTER) {
+        return Array.from(TELEGRAM_TABLE_GRAPHEME_SEGMENTER.segment(text), (segment) => segment.segment);
+    }
+    return Array.from(text);
+}
+function getTelegramTableCellWidth(text) {
+    return getTelegramTableGraphemes(text).reduce((width, grapheme) => {
+        if (isTelegramTableEmojiGrapheme(grapheme))
+            return width + 2;
+        return (width +
+            Array.from(grapheme).reduce((sum, char) => sum + getTelegramTableCodePointWidth(char), 0));
+    }, 0);
+}
+function padTelegramTableCellEnd(cell, width) {
+    const padding = width - getTelegramTableCellWidth(cell);
+    return padding > 0 ? `${cell}${" ".repeat(padding)}` : cell;
+}
+function renderMarkdownTableBlock(lines) {
+    const rows = lines.map(parseMarkdownTableRow);
+    const columnCount = Math.max(...rows.map((row) => row.length), 0);
+    const normalizedRows = rows.map((row) => {
+        const next = [...row];
+        while (next.length < columnCount) {
+            next.push("");
+        }
+        return next;
+    });
+    const widths = Array.from({ length: columnCount }, (_, columnIndex) => {
+        return Math.max(3, ...normalizedRows.map((row) => getTelegramTableCellWidth(row[columnIndex] ?? "")));
+    });
+    const formatRow = (row) => {
+        return row
+            .map((cell, columnIndex) => padTelegramTableCellEnd(cell ?? "", widths[columnIndex] ?? 3))
+            .join(" | ");
+    };
+    const separator = widths.map((width) => "-".repeat(width)).join(" | ");
+    const [header, ...body] = normalizedRows;
+    const tableLines = [
+        formatRow(header ?? []),
+        separator,
+        ...body.map(formatRow),
+    ];
+    return renderMarkdownCodeBlock(tableLines.join("\n"), "markdown");
+}
+function chunkRenderedHtmlLines(lines, wrapper) {
+    if (lines.length === 0)
+        return [];
+    const open = wrapper?.open ?? "";
+    const close = wrapper?.close ?? "";
+    const maxContentLength = MAX_MESSAGE_LENGTH - open.length - close.length;
+    const chunks = [];
+    let current = "";
+    const pushCurrent = () => {
+        if (current.length === 0)
+            return;
+        chunks.push(`${open}${current}${close}`);
+        current = "";
+    };
+    for (const line of lines) {
+        const candidate = current.length === 0 ? line : `${current}\n${line}`;
+        if (candidate.length <= maxContentLength) {
+            current = candidate;
+            continue;
+        }
+        pushCurrent();
+        if (line.length <= maxContentLength) {
+            current = line;
+            continue;
+        }
+        for (let i = 0; i < line.length; i += maxContentLength) {
+            chunks.push(`${open}${line.slice(i, i + maxContentLength)}${close}`);
+        }
+    }
+    pushCurrent();
+    return chunks;
+}
+function renderMarkdownTextBlock(block) {
+    return chunkRenderedHtmlLines(renderMarkdownTextLines(block));
+}
+function renderMarkdownQuoteBlock(lines) {
+    const inner = lines
+        .map((line) => {
+        const parsed = parseMarkdownQuoteLine(line);
+        if (!parsed)
+            return line;
+        const nestedIndent = "\u00A0".repeat(Math.max(0, parsed.depth - 1) * 2);
+        return `${nestedIndent}${parsed.content}`;
+    })
+        .join("\n");
+    return chunkRenderedHtmlLines(renderMarkdownTextLines(inner), {
+        open: "<blockquote>",
+        close: "</blockquote>",
+    });
+}
+function collectFencedMarkdownCodeLines(lines, index, fence) {
+    const codeLines = [];
+    let nextIndex = index + 1;
+    while (nextIndex < lines.length &&
+        !isMatchingMarkdownFence(lines[nextIndex] ?? "", fence)) {
+        codeLines.push(lines[nextIndex] ?? "");
+        nextIndex += 1;
+    }
+    const closed = nextIndex < lines.length;
+    if (closed)
+        nextIndex += 1;
+    return { codeLines, nextIndex, closed };
+}
+function collectMarkdownTableBlockLines(lines, index) {
+    const tableLines = [lines[index] ?? ""];
+    let nextIndex = index + 2;
+    while (nextIndex < lines.length) {
+        const tableLine = lines[nextIndex] ?? "";
+        if (tableLine.trim().length === 0 || !tableLine.includes("|"))
+            break;
+        tableLines.push(tableLine);
+        nextIndex += 1;
+    }
+    return { tableLines, nextIndex };
+}
+function collectIndentedMarkdownCodeLines(lines, index) {
+    const codeLines = [];
+    let nextIndex = index;
+    while (nextIndex < lines.length) {
+        const rawLine = lines[nextIndex] ?? "";
+        if (rawLine.trim().length === 0) {
+            codeLines.push("");
+            nextIndex += 1;
+            continue;
+        }
+        if (!isIndentedCodeLine(rawLine))
+            break;
+        codeLines.push(stripIndentedCodePrefix(rawLine));
+        nextIndex += 1;
+    }
+    return { codeLines, nextIndex };
+}
+function collectMarkdownQuoteBlockLines(lines, index) {
+    const quoteLines = [];
+    let nextIndex = index;
+    while (nextIndex < lines.length && /^\s*>/.test(lines[nextIndex] ?? "")) {
+        quoteLines.push(lines[nextIndex] ?? "");
+        nextIndex += 1;
+    }
+    return { quoteLines, nextIndex };
+}
+function isMarkdownTextBlockBoundary(lines, index) {
+    const current = lines[index] ?? "";
+    const following = lines[index + 1] ?? "";
+    if (current.trim().length === 0)
+        return true;
+    if (isFencedCodeStart(current))
+        return true;
+    if (canStartIndentedCodeBlock(lines, index))
+        return true;
+    if (/^\s*>/.test(current))
+        return true;
+    return current.includes("|") && isMarkdownTableSeparator(following);
+}
+function collectMarkdownTextBlockLines(lines, index) {
+    const textLines = [];
+    let nextIndex = index;
+    while (nextIndex < lines.length) {
+        if (isMarkdownTextBlockBoundary(lines, nextIndex))
+            break;
+        textLines.push(lines[nextIndex] ?? "");
+        nextIndex += 1;
+    }
+    return { textLines, nextIndex };
+}
+function renderMarkdownDocumentBlocks(normalizedMarkdown) {
+    const renderedBlocks = [];
+    let minimumBlankLinesBeforeNextBlock = 0;
+    const pushRenderedBlocks = (blocks, blankLinesBefore) => {
+        const effectiveBlankLinesBefore = renderedBlocks.length === 0
+            ? blankLinesBefore
+            : Math.max(blankLinesBefore, minimumBlankLinesBeforeNextBlock);
+        for (const [blockIndex, block] of blocks.entries()) {
+            renderedBlocks.push({
+                text: block,
+                blankLinesBefore: blockIndex === 0 ? effectiveBlankLinesBefore : 0,
+            });
+        }
+        minimumBlankLinesBeforeNextBlock = 0;
+    };
+    const lines = normalizedMarkdown.split("\n");
+    let index = 0;
+    let pendingBlankLines = 0;
+    while (index < lines.length) {
+        const line = lines[index] ?? "";
+        const nextLine = lines[index + 1] ?? "";
+        if (line.trim().length === 0) {
+            pendingBlankLines += 1;
+            index += 1;
+            continue;
+        }
+        const heading = matchMarkdownHeadingLine(line);
+        if (heading) {
+            pushRenderedBlocks(renderMarkdownTextBlock(line), renderedBlocks.length === 0
+                ? pendingBlankLines
+                : Math.max(pendingBlankLines, 1));
+            pendingBlankLines = 0;
+            minimumBlankLinesBeforeNextBlock = 1;
+            index += 1;
+            continue;
+        }
+        const fence = parseMarkdownFence(line);
+        if (fence) {
+            const block = collectFencedMarkdownCodeLines(lines, index, fence);
+            index = block.nextIndex;
+            pushRenderedBlocks(renderMarkdownCodeBlock(block.codeLines.join("\n"), fence.info), pendingBlankLines);
+            pendingBlankLines = 0;
+            continue;
+        }
+        if (line.includes("|") && isMarkdownTableSeparator(nextLine)) {
+            const block = collectMarkdownTableBlockLines(lines, index);
+            index = block.nextIndex;
+            pushRenderedBlocks(renderMarkdownTableBlock(block.tableLines), pendingBlankLines);
+            pendingBlankLines = 0;
+            continue;
+        }
+        if (canStartIndentedCodeBlock(lines, index)) {
+            const block = collectIndentedMarkdownCodeLines(lines, index);
+            index = block.nextIndex;
+            pushRenderedBlocks(renderMarkdownCodeBlock(block.codeLines.join("\n")), pendingBlankLines);
+            pendingBlankLines = 0;
+            continue;
+        }
+        if (/^\s*>/.test(line)) {
+            const block = collectMarkdownQuoteBlockLines(lines, index);
+            index = block.nextIndex;
+            pushRenderedBlocks(renderMarkdownQuoteBlock(block.quoteLines), pendingBlankLines);
+            pendingBlankLines = 0;
+            continue;
+        }
+        const block = collectMarkdownTextBlockLines(lines, index);
+        index = block.nextIndex;
+        pushRenderedBlocks(renderMarkdownTextBlock(block.textLines.join("\n")), pendingBlankLines);
+        pendingBlankLines = 0;
+    }
+    return renderedBlocks;
+}
+function flushTelegramMarkdownChunkAccumulator(accumulator) {
+    if (accumulator.current.length === 0)
+        return;
+    accumulator.chunks.push(accumulator.current);
+    accumulator.current = "";
+}
+function splitOversizedTelegramMarkdownBlock(text) {
+    const chunks = [];
+    for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
+        chunks.push(text.slice(i, i + MAX_MESSAGE_LENGTH));
+    }
+    return chunks;
+}
+function appendTelegramRenderedMarkdownBlock(accumulator, block) {
+    const separator = "\n".repeat(block.blankLinesBefore + 1);
+    const candidate = accumulator.current.length === 0
+        ? block.text
+        : `${accumulator.current}${separator}${block.text}`;
+    if (candidate.length <= MAX_MESSAGE_LENGTH) {
+        accumulator.current = candidate;
+        return;
+    }
+    flushTelegramMarkdownChunkAccumulator(accumulator);
+    if (block.text.length <= MAX_MESSAGE_LENGTH) {
+        accumulator.current = block.text;
+        return;
+    }
+    accumulator.chunks.push(...splitOversizedTelegramMarkdownBlock(block.text));
+}
+function chunkTelegramRenderedMarkdownBlocks(renderedBlocks) {
+    const accumulator = {
+        chunks: [],
+        current: "",
+    };
+    for (const block of renderedBlocks) {
+        appendTelegramRenderedMarkdownBlock(accumulator, block);
+    }
+    flushTelegramMarkdownChunkAccumulator(accumulator);
+    return accumulator.chunks;
+}
+function renderMarkdownToTelegramHtmlChunks(markdown) {
+    const normalized = normalizeMarkdownDocument(markdown);
+    if (normalized.length === 0)
+        return [];
+    return chunkTelegramRenderedMarkdownBlocks(renderMarkdownDocumentBlocks(normalized));
+}
+function chunkParagraphs(text) {
+    if (text.length <= MAX_MESSAGE_LENGTH)
+        return [text];
+    const normalized = text.replace(/\r\n/g, "\n");
+    const paragraphs = normalized.split(/\n\n+/);
+    const chunks = [];
+    let current = "";
+    const flushCurrent = () => {
+        if (current.trim().length > 0)
+            chunks.push(current);
+        current = "";
+    };
+    const splitLongBlock = (block) => {
+        if (block.length <= MAX_MESSAGE_LENGTH)
+            return [block];
+        const lines = block.split("\n");
+        const lineChunks = [];
+        let lineCurrent = "";
+        for (const line of lines) {
+            const candidate = lineCurrent.length === 0 ? line : `${lineCurrent}\n${line}`;
+            if (candidate.length <= MAX_MESSAGE_LENGTH) {
+                lineCurrent = candidate;
+                continue;
+            }
+            if (lineCurrent.length > 0) {
+                lineChunks.push(lineCurrent);
+                lineCurrent = "";
+            }
+            if (line.length <= MAX_MESSAGE_LENGTH) {
+                lineCurrent = line;
+                continue;
+            }
+            for (let i = 0; i < line.length; i += MAX_MESSAGE_LENGTH) {
+                lineChunks.push(line.slice(i, i + MAX_MESSAGE_LENGTH));
+            }
+        }
+        if (lineCurrent.length > 0) {
+            lineChunks.push(lineCurrent);
+        }
+        return lineChunks;
+    };
+    for (const paragraph of paragraphs) {
+        if (paragraph.length === 0)
+            continue;
+        const parts = splitLongBlock(paragraph);
+        for (const part of parts) {
+            const candidate = current.length === 0 ? part : `${current}\n\n${part}`;
+            if (candidate.length <= MAX_MESSAGE_LENGTH) {
+                current = candidate;
+            }
+            else {
+                flushCurrent();
+                current = part;
+            }
+        }
+    }
+    flushCurrent();
+    return chunks;
+}
+export function renderTelegramMessage(text, options) {
+    const mode = options?.mode ?? "plain";
+    if (mode === "plain") {
+        return chunkParagraphs(text).map((chunk) => ({ text: chunk }));
+    }
+    if (mode === "html") {
+        return chunkHtmlPreservingTags(text, MAX_MESSAGE_LENGTH).map((chunk) => ({
+            text: chunk,
+            parseMode: "HTML",
+        }));
+    }
+    return renderMarkdownToTelegramHtmlChunks(text).map((chunk) => ({
+        text: chunk,
+        parseMode: "HTML",
+    }));
+}
