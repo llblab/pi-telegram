@@ -383,7 +383,7 @@ test("Compaction observer settles immediately on the native failure event", () =
   ]);
 });
 
-test("Compaction observer sends native typing to the resolved thread and All", async () => {
+test("Compaction observer sends native typing only to the resolved thread", async () => {
   const runtime = createTelegramBridgeRuntime();
   const actions: Array<string> = [];
   const startTyping = createTelegramTypingLoopStarter({
@@ -391,9 +391,6 @@ test("Compaction observer sends native typing to the resolved thread and All", a
     getDefaultChatId: () => 77,
     sendTypingAction: async (chatId, options) => {
       actions.push(`thread:${chatId}:${options?.message_thread_id ?? "all"}`);
-    },
-    sendAggregateTypingAction: async (chatId) => {
-      actions.push(`aggregate:${chatId}`);
     },
     updateStatus: () => {},
     intervalMs: 60_000,
@@ -413,7 +410,35 @@ test("Compaction observer sends native typing to the resolved thread and All", a
   observer.onSessionCompact({} as never, createLifecycleContext());
   await runtime.typing.waitForIdle();
 
-  assert.deepEqual(actions, ["thread:77:12", "aggregate:77"]);
+  assert.deepEqual(actions, ["thread:77:12"]);
+  assert.equal(runtime.lifecycle.isCompactionInProgress(), false);
+});
+
+test("Compaction observer preserves an existing agent typing loop", async () => {
+  const runtime = createTelegramBridgeRuntime();
+  const startTyping = createTelegramTypingLoopStarter({
+    typing: runtime.typing,
+    getDefaultChatId: () => 77,
+    sendTypingAction: async () => {},
+    updateStatus: () => {},
+    intervalMs: 60_000,
+  });
+  const target = { chatId: 77, threadId: 12 };
+  assert.equal(startTyping(createLifecycleContext(), 77, { target }), true);
+  const observer = createTelegramCompactionObserverRuntime({
+    setCompactionInProgress: runtime.lifecycle.setCompactionInProgress,
+    updateStatus: () => {},
+    startTypingLoop: (ctx) => startTyping(ctx, 77, { target }),
+    stopTypingLoop: runtime.typing.stop,
+    requestDeferredDispatchNextQueuedTelegramTurn: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+  });
+
+  observer.onSessionBeforeCompact({} as never, createLifecycleContext());
+  observer.onSessionCompact({} as never, createLifecycleContext());
+
+  assert.equal(runtime.typing.stop(), true);
+  await runtime.typing.waitForIdle();
   assert.equal(runtime.lifecycle.isCompactionInProgress(), false);
 });
 

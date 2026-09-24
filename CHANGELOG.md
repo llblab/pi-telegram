@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+## 0.51.2: Model switching and typing continuity
+
+- `In-flight model switching`: Telegram model selection can again stop, switch, and continue any interruptible agent run in the current Pi session, including local/TUI work without an active Telegram prompt. The exact model-menu chat/Thread/message supplies fallback continuation ownership, active tools defer abort until settlement, and cancellation/session boundaries clear both selection and target state instead of returning a false busy response.
+- `Typing continuity`: Native presence now refreshes only the assigned Thread every three seconds instead of duplicating each action into aggregate `All`. The leader admits at most one concurrent action per chat and shares Telegram 429 cooldown across that chat's Thread keys. Compaction preserves a pre-existing agent typing loop instead of claiming and stopping it, addressing both multi-instance flicker and lifecycle gaps.
+- `Typing status truthfulness`: Failed `sendChatAction(typing)` calls remain bounded structured diagnostics but no longer replace a healthy connected/leader/follower status with `error`. Optional presence failures therefore cannot misreport transport health after the actual turn and delivery continue successfully.
+
 ## 0.51.1: Queue transitions and follower heartbeat stability
 
 - `/next lifecycle notices`: Target command composition now forwards request, exact-turn marker, and cancellation ports. Busy `/next` orders abort then selected-prompt dispatch notices; failures cannot block dispatch, and `/abort`/`/stop` cancel stale notices. A successful dispatch notice keeps first-reply ownership through agent start, so later answer messages do not repeat the queued-prompt reply. Rapid ordinary messages remain distinct turns.

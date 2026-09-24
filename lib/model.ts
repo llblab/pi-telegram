@@ -374,7 +374,6 @@ export interface PendingModelSwitchStore<TSelection> {
 
 export interface TelegramInFlightModelSwitchState {
   isIdle: boolean;
-  hasActiveTelegramTurn: boolean;
   hasAbortHandler: boolean;
 }
 
@@ -394,21 +393,21 @@ export function createPendingModelSwitchStore<
   };
 }
 
-export function canRestartTelegramTurnForModelSwitch(
+export function canRestartAgentRunForTelegramModelSwitch(
   state: TelegramInFlightModelSwitchState,
 ): boolean {
-  return !state.isIdle && state.hasActiveTelegramTurn && state.hasAbortHandler;
+  return !state.isIdle && state.hasAbortHandler;
 }
 
 export function shouldTriggerPendingTelegramModelSwitchAbort(state: {
   hasPendingModelSwitch: boolean;
-  hasActiveTelegramTurn: boolean;
+  hasContinuationTurn: boolean;
   hasAbortHandler: boolean;
   activeToolExecutions: number;
 }): boolean {
   return (
     state.hasPendingModelSwitch &&
-    state.hasActiveTelegramTurn &&
+    state.hasContinuationTurn &&
     state.hasAbortHandler &&
     state.activeToolExecutions === 0
   );
@@ -458,13 +457,18 @@ export function buildTelegramModelSwitchContinuationText<
   const thinkingSuffix = thinkingLevel
     ? ` Keep the selected thinking level (${thinkingLevel}) if it still applies.`
     : "";
-  return `${telegramPrefix} Continue the interrupted previous Telegram request using the newly selected model (${modelLabel}). Resume from the last unfinished step instead of restarting from scratch unless necessary.${thinkingSuffix}`;
+  return `${telegramPrefix} Continue the interrupted previous request using the newly selected model (${modelLabel}). Resume from the last unfinished step instead of restarting from scratch unless necessary.${thinkingSuffix}`;
 }
+
+export type TelegramModelSwitchContinuationSource = Pick<
+  PendingTelegramTurn,
+  "chatId" | "replyToMessageId" | "target"
+>;
 
 export function buildTelegramModelSwitchContinuationTurn<
   TModel extends MenuModel,
 >(options: {
-  turn: Pick<PendingTelegramTurn, "chatId" | "replyToMessageId" | "target">;
+  turn: TelegramModelSwitchContinuationSource;
   selection: ScopedTelegramModel<TModel>;
   telegramPrefix?: string;
   queueOrder: number;
@@ -494,7 +498,7 @@ export function buildTelegramModelSwitchContinuationTurn<
         ),
       },
     ],
-    historyText: `Continue interrupted Telegram request on ${modelLabel}`,
+    historyText: `Continue interrupted request on ${modelLabel}`,
     statusSummary: `↻ ${statusLabel || "continue"}`,
   };
 }
@@ -506,7 +510,7 @@ export function createTelegramModelSwitchContinuationTurnBuilder<
   allocateItemOrder: () => number;
   allocateControlOrder: () => number;
 }): (options: {
-  turn: Pick<PendingTelegramTurn, "chatId" | "replyToMessageId" | "target">;
+  turn: TelegramModelSwitchContinuationSource;
   selection: ScopedTelegramModel<TModel>;
 }) => PendingTelegramTurn {
   return (options) =>
@@ -523,11 +527,15 @@ export function createTelegramModelSwitchContinuationQueue<
   TSelection extends ScopedTelegramModel,
 >(deps: {
   createContinuationTurn: (options: {
-    turn: Pick<PendingTelegramTurn, "chatId" | "replyToMessageId" | "target">;
+    turn: TelegramModelSwitchContinuationSource;
     selection: TSelection;
   }) => PendingTelegramTurn;
   appendQueuedItem: (item: PendingTelegramTurn, ctx: TContext) => void;
-}): (turn: PendingTelegramTurn, selection: TSelection, ctx: TContext) => void {
+}): (
+  turn: TelegramModelSwitchContinuationSource,
+  selection: TSelection,
+  ctx: TContext,
+) => void {
   return (turn, selection, ctx) => {
     deps.appendQueuedItem(
       deps.createContinuationTurn({ turn, selection }),
@@ -544,7 +552,11 @@ export function createTelegramModelSwitchContinuationQueueRuntime<
   allocateItemOrder: () => number;
   allocateControlOrder: () => number;
   appendQueuedItem: (item: PendingTelegramTurn, ctx: TContext) => void;
-}): (turn: PendingTelegramTurn, selection: TSelection, ctx: TContext) => void {
+}): (
+  turn: TelegramModelSwitchContinuationSource,
+  selection: TSelection,
+  ctx: TContext,
+) => void {
   return createTelegramModelSwitchContinuationQueue<TContext, TSelection>({
     createContinuationTurn: createTelegramModelSwitchContinuationTurnBuilder({
       telegramPrefix: deps.telegramPrefix,
@@ -564,7 +576,7 @@ export interface TelegramModelSwitchControllerDeps<TContext, TSelection> {
   hasAbortHandler: () => boolean;
   getActiveToolExecutions: () => number;
   queueContinuation: (
-    turn: PendingTelegramTurn,
+    turn: TelegramModelSwitchContinuationSource,
     selection: TSelection,
     ctx: TContext,
   ) => void;
@@ -573,15 +585,23 @@ export interface TelegramModelSwitchControllerDeps<TContext, TSelection> {
 
 export interface TelegramModelSwitchController<TContext, TSelection> {
   canOfferInFlightSwitch: (ctx: TContext) => boolean;
-  stagePendingSwitch: (selection: TSelection, ctx: TContext) => void;
+  stagePendingSwitch: (
+    selection: TSelection,
+    ctx: TContext,
+    continuationTurn?: TelegramModelSwitchContinuationSource,
+  ) => void;
   clearPendingSwitch: () => void;
   queueContinuation: (
-    turn: PendingTelegramTurn,
+    turn: TelegramModelSwitchContinuationSource,
     selection: TSelection,
     ctx: TContext,
   ) => void;
   triggerPendingAbort: (ctx: TContext) => boolean;
-  restartInterruptedTurn: (selection: TSelection, ctx: TContext) => boolean;
+  restartInterruptedTurn: (
+    selection: TSelection,
+    ctx: TContext,
+    continuationTurn?: TelegramModelSwitchContinuationSource,
+  ) => boolean;
 }
 
 export interface TelegramModelSwitchControllerRuntimeDeps<
@@ -624,49 +644,62 @@ export function createTelegramModelSwitchControllerRuntime<
 export function createTelegramModelSwitchController<TContext, TSelection>(
   deps: TelegramModelSwitchControllerDeps<TContext, TSelection>,
 ): TelegramModelSwitchController<TContext, TSelection> {
+  let pendingContinuationTurn:
+    | TelegramModelSwitchContinuationSource
+    | undefined;
+  const triggerPendingAbort = (ctx: TContext): boolean => {
+    const turn = pendingContinuationTurn ?? deps.getActiveTurn();
+    if (
+      !shouldTriggerPendingTelegramModelSwitchAbort({
+        hasPendingModelSwitch: !!deps.getPendingModelSwitch(),
+        hasContinuationTurn: !!turn,
+        hasAbortHandler: deps.hasAbortHandler(),
+        activeToolExecutions: deps.getActiveToolExecutions(),
+      })
+    ) {
+      return false;
+    }
+    const selection = deps.getPendingModelSwitch();
+    const abort = deps.getAbortHandler();
+    if (!selection || !turn || !abort) return false;
+    pendingContinuationTurn = undefined;
+    deps.setPendingModelSwitch(undefined);
+    deps.queueContinuation(turn, selection, ctx);
+    abort();
+    return true;
+  };
   return {
     canOfferInFlightSwitch: (ctx) =>
-      canRestartTelegramTurnForModelSwitch({
+      canRestartAgentRunForTelegramModelSwitch({
         isIdle: deps.isIdle(ctx),
-        hasActiveTelegramTurn: !!deps.getActiveTurn(),
         hasAbortHandler: deps.hasAbortHandler(),
       }),
-    stagePendingSwitch: (selection, ctx) => {
+    stagePendingSwitch: (selection, ctx, continuationTurn) => {
+      pendingContinuationTurn = deps.getActiveTurn() ?? continuationTurn;
       deps.setPendingModelSwitch(selection);
-      deps.updateStatus(ctx);
+      try {
+        deps.updateStatus(ctx);
+      } finally {
+        triggerPendingAbort(ctx);
+      }
     },
     clearPendingSwitch: () => {
+      pendingContinuationTurn = undefined;
       deps.setPendingModelSwitch(undefined);
     },
     queueContinuation: deps.queueContinuation,
-    triggerPendingAbort: (ctx) => {
-      if (
-        !shouldTriggerPendingTelegramModelSwitchAbort({
-          hasPendingModelSwitch: !!deps.getPendingModelSwitch(),
-          hasActiveTelegramTurn: !!deps.getActiveTurn(),
-          hasAbortHandler: deps.hasAbortHandler(),
-          activeToolExecutions: deps.getActiveToolExecutions(),
-        })
-      ) {
-        return false;
-      }
-      const selection = deps.getPendingModelSwitch();
-      const turn = deps.getActiveTurn();
-      const abort = deps.getAbortHandler();
-      if (!selection || !turn || !abort) return false;
-      deps.setPendingModelSwitch(undefined);
-      deps.queueContinuation(turn, selection, ctx);
-      abort();
-      return true;
-    },
-    restartInterruptedTurn: (selection, ctx) =>
-      restartTelegramModelSwitchContinuation({
-        activeTurn: deps.getActiveTurn(),
+    triggerPendingAbort,
+    restartInterruptedTurn: (selection, ctx, continuationTurn) => {
+      const restarted = restartTelegramModelSwitchContinuation({
+        activeTurn: deps.getActiveTurn() ?? continuationTurn,
         abort: deps.getAbortHandler(),
         selection,
         queueContinuation: (turn, nextSelection) => {
           deps.queueContinuation(turn, nextSelection, ctx);
         },
-      }),
+      });
+      if (restarted) pendingContinuationTurn = undefined;
+      return restarted;
+    },
   };
 }

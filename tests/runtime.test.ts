@@ -150,7 +150,6 @@ test("Typing loop retargets chat-level activity into the active thread", async (
   const typingActions: Array<{
     chatId: number;
     threadId?: number;
-    aggregate?: boolean;
   }> = [];
   const recordTypingAction = (
     chatId: number,
@@ -170,9 +169,6 @@ test("Typing loop retargets chat-level activity into the active thread", async (
       sendTypingAction: async (chatId, options) => {
         recordTypingAction(chatId, options);
       },
-      sendAggregateTypingAction: async (chatId) => {
-        typingActions.push({ chatId, aggregate: true });
-      },
     }),
     true,
   );
@@ -186,9 +182,6 @@ test("Typing loop retargets chat-level activity into the active thread", async (
       sendTypingAction: async (chatId, options) => {
         recordTypingAction(chatId, options);
       },
-      sendAggregateTypingAction: async (chatId) => {
-        typingActions.push({ chatId, aggregate: true });
-      },
     }),
     true,
   );
@@ -196,7 +189,6 @@ test("Typing loop retargets chat-level activity into the active thread", async (
   assert.deepEqual(typingActions, [
     { chatId: 42 },
     { chatId: 42, threadId: 99 },
-    { chatId: 42, aggregate: true },
   ]);
   assert.equal(Runtime.stopTelegramTypingLoop(state), true);
 });
@@ -212,16 +204,13 @@ test("Typing keepalive retargets queued work without leaking ticks across thread
     sendTypingAction: async (_chatId, options) => {
       actions.push(`thread:${options?.message_thread_id ?? "all"}`);
     },
-    sendAggregateTypingAction: async () => {
-      actions.push("aggregate");
-    },
   });
 
   assert.equal(Runtime.startTelegramTypingLoop(state, createDeps(7)), true);
   await flushMicrotasks();
   ctx.mock.timers.tick(1000);
   await flushMicrotasks();
-  assert.deepEqual(actions, ["thread:7", "aggregate", "thread:7", "aggregate"]);
+  assert.deepEqual(actions, ["thread:7", "thread:7"]);
 
   assert.equal(Runtime.startTelegramTypingLoop(state, createDeps(9)), true);
   await flushMicrotasks();
@@ -229,24 +218,19 @@ test("Typing keepalive retargets queued work without leaking ticks across thread
   await flushMicrotasks();
   assert.deepEqual(actions, [
     "thread:7",
-    "aggregate",
     "thread:7",
-    "aggregate",
     "thread:9",
-    "aggregate",
     "thread:9",
-    "aggregate",
   ]);
   assert.equal(Runtime.stopTelegramTypingLoop(state), true);
   ctx.mock.timers.reset();
 });
 
-test("Typing loop sends chat actions into thread target and aggregate surface", async () => {
+test("Typing loop sends chat actions only into the exact thread target", async () => {
   const state = Runtime.createTelegramBridgeRuntimeState();
   const typingActions: Array<{
     chatId: number;
     threadId?: number;
-    aggregate?: boolean;
   }> = [];
   assert.equal(
     Runtime.startTelegramTypingLoop(state, {
@@ -259,17 +243,11 @@ test("Typing loop sends chat actions into thread target and aggregate surface", 
           threadId: options?.message_thread_id,
         });
       },
-      sendAggregateTypingAction: async (chatId) => {
-        typingActions.push({ chatId, aggregate: true });
-      },
     }),
     true,
   );
   await flushMicrotasks();
-  assert.deepEqual(typingActions, [
-    { chatId: 42, threadId: 99 },
-    { chatId: 42, aggregate: true },
-  ]);
+  assert.deepEqual(typingActions, [{ chatId: 42, threadId: 99 }]);
   assert.equal(Runtime.stopTelegramTypingLoop(state), true);
 });
 
@@ -428,10 +406,10 @@ test("Typing loop starter uses a conservative native keepalive interval", () => 
 
   startTypingLoop({ id: "ctx" });
 
-  assert.equal(capturedIntervalMs, 2500);
+  assert.equal(capturedIntervalMs, 3000);
 });
 
-test("Typing loop starter sends one thread action and one aggregate action", async () => {
+test("Typing loop starter sends one exact thread action", async () => {
   const state = Runtime.createTelegramBridgeRuntimeState();
   const runtime = Runtime.createTelegramBridgeRuntime(state);
   const actions: string[] = [];
@@ -443,9 +421,6 @@ test("Typing loop starter sends one thread action and one aggregate action", asy
     sendTypingAction: async (chatId, options) => {
       actions.push(`thread:${chatId}:${options?.message_thread_id ?? "all"}`);
     },
-    sendAggregateTypingAction: async (chatId) => {
-      actions.push(`aggregate:${chatId}`);
-    },
     updateStatus: () => {},
     intervalMs: 1000,
   });
@@ -455,7 +430,7 @@ test("Typing loop starter sends one thread action and one aggregate action", asy
   });
   await flushMicrotasks();
 
-  assert.deepEqual(actions, ["thread:8:44", "aggregate:8"]);
+  assert.deepEqual(actions, ["thread:8:44"]);
   assert.equal(runtime.typing.stop(), true);
 });
 
@@ -495,7 +470,7 @@ test("Typing loop skips interval ticks while the previous action is in flight", 
   ctx.mock.timers.reset();
 });
 
-test("Typing loop starter binds default chat and reports failures", async () => {
+test("Typing loop records failures without changing bridge status", async () => {
   const state = Runtime.createTelegramBridgeRuntimeState();
   const runtime = Runtime.createTelegramBridgeRuntime(state);
   const sentChatIds: number[] = [];
@@ -543,7 +518,7 @@ test("Typing loop starter binds default chat and reports failures", async () => 
   });
   startFailingTypingLoop({ id: "ctx" }, 8);
   await flushMicrotasks();
-  assert.deepEqual(failingStatusErrors, ["boom"]);
+  assert.deepEqual(failingStatusErrors, []);
   assert.deepEqual(runtimeEvents, ["typing:boom:8"]);
   assert.equal(runtime.typing.stop(), true);
 });
@@ -715,32 +690,6 @@ test("Typing loop replacement fences late failures from the old loop", async (ct
   ctx.mock.timers.reset();
 });
 
-test("Typing loop skips aggregate activity when authority is lost after thread activity", async () => {
-  const runtime = Runtime.createTelegramBridgeRuntime();
-  let available = true;
-  const actions: string[] = [];
-  const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
-    typing: runtime.typing,
-    getDefaultChatId: () => undefined,
-    sendTypingAction: async () => {
-      actions.push("thread");
-      available = false;
-    },
-    sendAggregateTypingAction: async () => {
-      actions.push("aggregate");
-    },
-    updateStatus: () => {},
-    isTransportAvailable: () => available,
-  });
-
-  startTypingLoop({ id: "ctx" }, 8, {
-    target: createTelegramThreadTarget(8, 44),
-  });
-  await flushMicrotasks();
-  assert.deepEqual(actions, ["thread"]);
-  assert.equal(runtime.typing.stop(), false);
-});
-
 test("Typing loop stops quietly when Telegram transport authority is lost", async () => {
   const runtime = Runtime.createTelegramBridgeRuntime();
   let available = true;
@@ -848,7 +797,7 @@ test("Typing loop ignores late failures from a replaced session context", async 
   assert.deepEqual(runtimeEvents, []);
 });
 
-test("Typing loop starter records stale status failures", async () => {
+test("Typing loop failure diagnostics do not invoke status updates", async () => {
   const state = Runtime.createTelegramBridgeRuntimeState();
   const runtime = Runtime.createTelegramBridgeRuntime(state);
   const runtimeEvents: string[] = [];
@@ -875,9 +824,6 @@ test("Typing loop starter records stale status failures", async () => {
   startTypingLoop({ id: "ctx" }, 8);
   await flushMicrotasks();
 
-  assert.deepEqual(runtimeEvents, [
-    "typing:stale ctx:status-update",
-    "typing:typing failed:8",
-  ]);
+  assert.deepEqual(runtimeEvents, ["typing:typing failed:8"]);
   assert.equal(runtime.typing.stop(), true);
 });

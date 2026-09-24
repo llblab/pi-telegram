@@ -4,7 +4,7 @@
  * Owns small session-local runtime primitives that are shared by orchestration but are not specific to queueing, rendering, polling, or Telegram transport
  */
 
-const TELEGRAM_TYPING_ACTION_INTERVAL_MS = 2500;
+const TELEGRAM_TYPING_ACTION_INTERVAL_MS = 3_000;
 const TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS = 250;
 
 export interface TelegramRuntimeQueueCounters {
@@ -319,7 +319,6 @@ export interface TelegramTypingLoopDeps {
     chatId: number,
     options?: { message_thread_id?: number },
   ) => Promise<unknown>;
-  sendAggregateTypingAction?: (chatId: number) => Promise<unknown>;
   shouldContinue?: () => boolean;
   onStopped?: () => void;
 }
@@ -364,7 +363,6 @@ export interface TelegramTypingLoopStarterDeps<
     chatId: number,
     options?: { message_thread_id?: number },
   ) => Promise<unknown>;
-  sendAggregateTypingAction?: (chatId: number) => Promise<unknown>;
   updateStatus: (ctx: TContext, error?: string) => void;
   isContextActive?: (ctx: TContext) => boolean;
   isTransportAvailable?: () => boolean;
@@ -378,7 +376,7 @@ export function createTelegramTypingLoopStarter<TContext>(
   ctx: TContext,
   chatId?: number,
   options?: { target?: TelegramTypingLoopTarget },
-) => void {
+) => boolean {
   return (ctx, chatId, options) => {
     const transportAuthority = deps.getTransportAuthority?.();
     const hasTransport = (): boolean =>
@@ -386,9 +384,9 @@ export function createTelegramTypingLoopStarter<TContext>(
         ? transportAuthority !== undefined &&
           Object.is(deps.getTransportAuthority(), transportAuthority)
         : deps.isTransportAvailable?.() !== false;
-    if (!hasTransport()) return;
+    if (!hasTransport()) return false;
     let active = true;
-    deps.typing.start({
+    return deps.typing.start({
       chatId: chatId ?? deps.getDefaultChatId(),
       target: options?.target,
       intervalMs: deps.intervalMs ?? TELEGRAM_TYPING_ACTION_INTERVAL_MS,
@@ -407,14 +405,6 @@ export function createTelegramTypingLoopStarter<TContext>(
             deps.typing.stop();
             return;
           }
-          const message =
-            error instanceof Error ? error.message : String(error);
-          updateTelegramRuntimeStatusSafely(deps.updateStatus, ctx, {
-            error: message,
-            category: "typing",
-            phase: "status-update",
-            recordRuntimeEvent: deps.recordRuntimeEvent,
-          });
           try {
             deps.recordRuntimeEvent?.("typing", error, {
               chatId: targetChatId,
@@ -424,41 +414,6 @@ export function createTelegramTypingLoopStarter<TContext>(
           }
         }
       },
-      sendAggregateTypingAction: deps.sendAggregateTypingAction
-        ? async (targetChatId) => {
-            if (!active) return;
-            if (!hasTransport()) {
-              deps.typing.stop();
-              return;
-            }
-            try {
-              await deps.sendAggregateTypingAction?.(targetChatId);
-            } catch (error) {
-              if (deps.isContextActive?.(ctx) === false) return;
-              if (!active) return;
-              if (!hasTransport()) {
-                deps.typing.stop();
-                return;
-              }
-              const message =
-                error instanceof Error ? error.message : String(error);
-              updateTelegramRuntimeStatusSafely(deps.updateStatus, ctx, {
-                error: message,
-                category: "typing",
-                phase: "status-update",
-                recordRuntimeEvent: deps.recordRuntimeEvent,
-              });
-              try {
-                deps.recordRuntimeEvent?.("typing", error, {
-                  chatId: targetChatId,
-                  aggregate: true,
-                });
-              } catch {
-                // Typing diagnostics cannot escape the in-flight action owner.
-              }
-            }
-          }
-        : undefined,
       shouldContinue: hasTransport,
       onStopped: () => {
         active = false;
@@ -502,12 +457,7 @@ export function startTelegramTypingLoop(
     const targetChatId = activeDeps.chatId;
     const threadParams = getTelegramTypingLoopThreadParams(activeDeps.target);
     const typing = Promise.resolve()
-      .then(async () => {
-        await activeDeps.sendTypingAction(targetChatId, threadParams);
-        if (threadParams?.message_thread_id !== undefined) {
-          await activeDeps.sendAggregateTypingAction?.(targetChatId);
-        }
-      })
+      .then(() => activeDeps.sendTypingAction(targetChatId, threadParams))
       .then(() => undefined)
       .catch(() => undefined);
     state.typingInFlight = typing;
@@ -602,7 +552,7 @@ export interface TelegramPromptDispatchLifecycleDeps<
     ctx: TContext,
     chatId?: number,
     options?: { target?: TelegramTypingLoopTarget },
-  ) => void;
+  ) => boolean | void;
   updateStatus: (ctx: TContext, error?: string) => void;
 }
 
@@ -616,7 +566,6 @@ export interface TelegramPromptDispatchRuntimeDeps<
     chatId: number,
     options?: { message_thread_id?: number },
   ) => Promise<unknown>;
-  sendAggregateTypingAction?: (chatId: number) => Promise<unknown>;
   updateStatus: (ctx: TContext, error?: string) => void;
   isContextActive?: (ctx: TContext) => boolean;
   isTransportAvailable?: () => boolean;
@@ -629,7 +578,7 @@ export interface TelegramPromptDispatchRuntime<TContext> {
     ctx: TContext,
     chatId?: number,
     options?: { target?: TelegramTypingLoopTarget },
-  ) => void;
+  ) => boolean | void;
   onPromptDispatchStart: (ctx: TContext, chatId?: number) => void;
   onPromptDispatchFailure: (ctx: TContext, message: string) => void;
 }

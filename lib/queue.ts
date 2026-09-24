@@ -1253,7 +1253,6 @@ export interface TelegramAgentStartHookRuntimeDeps<
 export type TelegramAgentStartHookEvent = unknown;
 
 export interface TelegramToolExecutionRuntimeDeps {
-  hasActiveTurn: () => boolean;
   getActiveToolExecutions: () => number;
   setActiveToolExecutions: (count: number) => void;
 }
@@ -1361,11 +1360,9 @@ export function createTelegramAgentStartHook<
 }
 
 export function getNextTelegramToolExecutionCount(options: {
-  hasActiveTurn: boolean;
   currentCount: number;
   event: "start" | "end";
 }): number {
-  if (!options.hasActiveTurn) return options.currentCount;
   if (options.event === "start") {
     return options.currentCount + 1;
   }
@@ -1377,7 +1374,6 @@ export function handleTelegramToolExecutionStartRuntime(
 ): void {
   deps.setActiveToolExecutions(
     getNextTelegramToolExecutionCount({
-      hasActiveTurn: deps.hasActiveTurn(),
       currentCount: deps.getActiveToolExecutions(),
       event: "start",
     }),
@@ -1387,15 +1383,13 @@ export function handleTelegramToolExecutionStartRuntime(
 export function handleTelegramToolExecutionEndRuntime(
   deps: TelegramToolExecutionEndRuntimeDeps,
 ): void {
-  const hasActiveTurn = deps.hasActiveTurn();
   deps.setActiveToolExecutions(
     getNextTelegramToolExecutionCount({
-      hasActiveTurn,
       currentCount: deps.getActiveToolExecutions(),
       event: "end",
     }),
   );
-  if (hasActiveTurn) deps.triggerPendingModelSwitchAbort();
+  deps.triggerPendingModelSwitchAbort();
 }
 
 export type TelegramAgentLifecycleHooksRuntimeDeps<
@@ -1485,7 +1479,6 @@ export function createTelegramToolExecutionHooks<TContext>(
       ctx: TContext,
     ): void => {
       handleTelegramToolExecutionEndRuntime({
-        hasActiveTurn: deps.hasActiveTurn,
         getActiveToolExecutions: deps.getActiveToolExecutions,
         setActiveToolExecutions: deps.setActiveToolExecutions,
         triggerPendingModelSwitchAbort: () => {

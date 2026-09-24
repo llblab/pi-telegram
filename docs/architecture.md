@@ -526,7 +526,7 @@ Queued controls:
 
 - `/continue` creates a priority Telegram-owned `continue` prompt.
 - Prompt-template commands expand Telegram-safe Pi template aliases before entering the prompt queue.
-- Model-switch continuation uses the control lane when an in-flight Telegram-owned run must be stopped and resumed.
+- Model-switch continuation uses the control lane when any interruptible in-flight agent run in the current Pi session must be stopped and resumed. A Telegram-owned run retains its prompt target; otherwise the exact model-menu chat/Thread/message supplies continuation and reply ownership.
 
 Queue and menu mutations are reachable through Telegram updates handled by the current polling owner. After ownership moves, the old instance keeps processing its accepted local queue, but it no longer receives new menu callbacks or control updates for remote mutation. UI label, navigation, tab, toggle, card, and dialog rules are defined in [UI Style](./ui-style.md). Callback prefix ownership is defined in [Callback Namespaces](./callback-namespaces.md).
 
@@ -539,10 +539,10 @@ Native typing during compaction follows connected-instance activity rather than 
 - Confirmed manual `/compact` starts a native `typing` keepalive in the command target and stops it on completion/failure.
 - Automatic/session compaction with an active Telegram turn reuses that turn's target.
 - Automatic/session compaction without an active Telegram turn uses the connected instance's assigned target; an unconnected instance sends nothing.
-- Thread-targeted typing is sent to the concrete thread and mirrored to `All` as the aggregate activity surface; completion, native failure, timeout, and shutdown stop the keyed loop.
+- Thread-targeted typing is sent only to the concrete thread. Aggregate `All` mirroring is intentionally omitted because duplicating every keepalive multiplies shared-chat flood pressure. Compaction completion, failure, or timeout stops only a loop actually started by the compaction observer; a pre-existing agent-owned loop remains active. Authority loss and shutdown still stop the keyed loop.
 - Pi `ui_prompt_start` pauses typing while an extension-owned local prompt waits for the operator; `ui_prompt_end` emits the matching Activity boundary and resumes typing whenever agent or compaction work remains unsettled.
 
-At every connected instance `agent_start`, the lifecycle binding starts Telegram's native `…typing` indicator in that instance's assigned target, whether the run came from Telegram, the local TUI, or an autonomous continuation such as Grow Loop. Terminal `Active` remains Telegram-turn-specific; the native indicator answers the separate question of whether the instance is doing agent work. Each loop keeps one action in flight, while the leader API runtime coalesces identical chat/thread/action calls across local and follower traffic for two seconds; expired gates prune opportunistically and at most 256 currently active keys are retained. A Telegram 429 response opens the exact action's shared `retry_after` suppression window without scheduling delayed retries or projecting expected activity throttling as a terminal status error. Assistant message start/update hooks still re-arm it during Telegram-owned turns so transient provider/model errors do not leave a continuing run without activity feedback, and agent/session completion stops it.
+At every connected instance `agent_start`, the lifecycle binding starts Telegram's native `…typing` indicator in that instance's assigned target, whether the run came from Telegram, the local TUI, or an autonomous continuation such as Grow Loop. Terminal `Active` remains Telegram-turn-specific; the native indicator answers the separate question of whether the instance is doing agent work. Each loop refreshes its exact target every three seconds and keeps one action in flight. The leader API runtime coalesces identical chat/thread/action calls for two seconds, permits at most one concurrent chat action per chat, and shares a Telegram 429 `retry_after` fence across every Thread key in that chat; expired gates prune opportunistically and each gate family retains at most 256 active keys. Suppression never schedules a delayed retry. A failed typing action remains a structured diagnostic but cannot project `error` onto an otherwise healthy connected/leader/follower status. Assistant message start/update hooks still re-arm typing during Telegram-owned turns so transient provider/model errors do not leave a continuing run without activity feedback, and agent/session completion stops it.
 
 ### Rendering And Delivery
 
@@ -625,14 +625,14 @@ Telegram prompt guidance is context- and authority-aware. The package and source
 
 ## In-Flight Model Switching
 
-When `/model` is used during an active Telegram-owned run, the bridge can emulate Pi's interactive stop/switch/continue workflow:
+When `/model` is used during an interruptible active agent run in the current Pi session, the bridge emulates Pi's interactive stop/switch/continue workflow:
 
 1. Apply the selected model immediately.
-2. Queue or stage a synthetic Telegram continuation turn.
-3. Abort the active Telegram turn immediately, or wait for the current tool to finish before aborting.
-4. Dispatch the continuation after abort completion.
+2. Queue or stage a synthetic Telegram continuation turn before aborting.
+3. Abort immediately, or wait for every active tool execution to finish before aborting.
+4. Dispatch the continuation in the same session context under the selected model.
 
-This is limited to Telegram-owned runs. If Pi is busy with non-Telegram work, the bridge refuses the switch instead of hijacking unrelated activity.
+A Telegram-originated run retains its active prompt target and reply anchor. For local/TUI or autonomous work without an active Telegram turn, the exact authorized model-menu chat, Thread, and message become the continuation target and reply anchor. Merely busy non-agent lifecycle work remains ineligible because no active agent abort handler exists. Pending selection and fallback-target state clear together on cancellation, new agent start, settlement, or session replacement.
 
 ## Shutdown And Timer Lifecycle
 

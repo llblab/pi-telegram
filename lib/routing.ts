@@ -1010,7 +1010,6 @@ export function createTelegramInboundRouteRuntime<
     updateSettingsMenuMessage: deps.updateSettingsMenuMessage,
     answerCallbackQuery: deps.answerCallbackQuery,
     isIdle: deps.isIdle,
-    hasActiveTelegramTurn: deps.activeTurnRuntime.has,
     hasAbortHandler: deps.bridgeRuntime.abort.hasHandler,
     getActiveToolExecutions:
       deps.bridgeRuntime.lifecycle.getActiveToolExecutions,

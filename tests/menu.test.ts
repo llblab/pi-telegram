@@ -1052,7 +1052,6 @@ test("Menu runtime routes stored callback queries through callback action ports"
         events.push(`answer:${text ?? ""}`);
       },
       isIdle: (ctx) => ctx.idle,
-      hasActiveTelegramTurn: () => true,
       hasAbortHandler: () => true,
       hasActiveToolExecutions: () => false,
       setModel: async (nextModel) => {
@@ -1098,7 +1097,6 @@ test("Menu runtime routes stored callback queries through callback action ports"
         events.push(`answer:${text ?? ""}`);
       },
       isIdle: (ctx) => ctx.idle,
-      hasActiveTelegramTurn: () => true,
       hasAbortHandler: () => true,
       hasActiveToolExecutions: () => false,
       setModel: async () => true,
@@ -1134,7 +1132,6 @@ test("Menu runtime routes stored callback queries through callback action ports"
         events.push(`answer:${text ?? ""}`);
       },
       isIdle: (ctx) => ctx.idle,
-      hasActiveTelegramTurn: () => true,
       hasAbortHandler: () => true,
       hasActiveToolExecutions: () => false,
       setModel: async (nextModel) => {
@@ -1165,8 +1162,8 @@ test("Menu runtime routes stored callback queries through callback action ports"
     "current:gpt-5",
     "thinking:high",
     "status",
-    "model-menu",
     "restart:gpt-5",
+    "model-menu",
     "answer:Switching to gpt-5 and continuing…",
   ]);
 });
@@ -1200,7 +1197,6 @@ test("Menu callback handler captures runtime ports", async () => {
       events.push(`answer:${text ?? ""}`);
     },
     isIdle: (ctx) => ctx.idle,
-    hasActiveTelegramTurn: () => false,
     hasAbortHandler: () => false,
     hasActiveToolExecutions: () => false,
     setModel: async () => true,
@@ -1221,6 +1217,7 @@ test("Menu callback adapter converts active tool count into runtime booleans", a
   const getActiveToolExecutions = () => activeToolExecutions;
   const state: TelegramModelMenuState = {
     ...createMenuState(2),
+    threadId: 42,
     allModels: [
       { model: createMenuModel("openai", "gpt-5", true) },
       { model: createMenuModel("anthropic", "claude-3", false) },
@@ -1244,18 +1241,25 @@ test("Menu callback adapter converts active tool count into runtime booleans", a
       events.push(`answer:${text ?? ""}`);
     },
     isIdle: () => false,
-    hasActiveTelegramTurn: () => true,
     hasAbortHandler: () => true,
     getActiveToolExecutions,
     setModel: async () => true,
     setCurrentModel: (nextModel) => {
       events.push(`current:${nextModel.id}`);
     },
-    stagePendingModelSwitch: (selection) => {
-      events.push(`pending:${selection.model.id}`);
+    stagePendingModelSwitch: (selection, _ctx, continuationTurn) => {
+      events.push(
+        `pending:${selection.model.id}:${continuationTurn.chatId}:${continuationTurn.target?.threadId}:${continuationTurn.replyToMessageId}`,
+      );
     },
-    restartInterruptedTelegramTurn: () => {
-      events.push("restart");
+    restartInterruptedTelegramTurn: (
+      _selection,
+      _ctx,
+      continuationTurn,
+    ) => {
+      events.push(
+        `restart:${continuationTurn.chatId}:${continuationTurn.target?.threadId}:${continuationTurn.replyToMessageId}`,
+      );
       return true;
     },
   });
@@ -1270,12 +1274,12 @@ test("Menu callback adapter converts active tool count into runtime booleans", a
   );
   assert.deepEqual(events, [
     "current:claude-3",
+    "pending:claude-3:1:42:2",
     "model-menu",
-    "pending:claude-3",
     "answer:Switched to claude-3. Restarting after the current tool finishes…",
     "current:claude-3",
+    "restart:1:42:2",
     "model-menu",
-    "restart",
     "answer:Switching to claude-3 and continuing…",
   ]);
 });
@@ -1411,15 +1415,15 @@ test("Menu helpers execute model callback actions across update, switch, and res
   assert.equal(events[0], "update-menu");
   assert.equal(events[1], "answer:");
   assert.equal(events[2], "current:claude-3");
-  assert.equal(events[3], "update-menu");
-  assert.equal(events[4], "pending:claude-3");
+  assert.equal(events[3], "pending:claude-3");
+  assert.equal(events[4], "update-menu");
   assert.equal(
     events[5],
     "answer:Switched to claude-3. Restarting after the current tool finishes…",
   );
   assert.equal(events[6], "current:claude-3");
-  assert.equal(events[7], "update-menu");
-  assert.equal(events[8], "restart:claude-3");
+  assert.equal(events[7], "restart:claude-3");
+  assert.equal(events[8], "update-menu");
   assert.equal(events[9], "answer:Switching to claude-3 and continuing…");
 });
 
@@ -2391,7 +2395,6 @@ test("Section callback actions preserve callback thread target", async () => {
       updateStatusMessage: async () => {},
       answerCallbackQuery: async () => {},
       isIdle: () => true,
-      hasActiveTelegramTurn: () => false,
       hasAbortHandler: () => false,
       hasActiveToolExecutions: () => false,
       setModel: async () => true,

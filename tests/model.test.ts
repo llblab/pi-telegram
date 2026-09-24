@@ -9,7 +9,7 @@ import test from "node:test";
 import {
   buildTelegramModelSwitchContinuationText,
   buildTelegramModelSwitchContinuationTurn,
-  canRestartTelegramTurnForModelSwitch,
+  canRestartAgentRunForTelegramModelSwitch,
   createCurrentModelRuntime,
   createCurrentModelStore,
   createCurrentModelUpdateRuntime,
@@ -218,35 +218,24 @@ test("Pending model-switch store owns selection state helpers", () => {
   assert.equal(store.has(), false);
 });
 
-test("In-flight model switch is allowed only for active Telegram turns with abort support", () => {
+test("In-flight model switch is allowed for any interruptible active agent run", () => {
   assert.equal(
-    canRestartTelegramTurnForModelSwitch({
+    canRestartAgentRunForTelegramModelSwitch({
       isIdle: false,
-      hasActiveTelegramTurn: true,
       hasAbortHandler: true,
     }),
     true,
   );
   assert.equal(
-    canRestartTelegramTurnForModelSwitch({
+    canRestartAgentRunForTelegramModelSwitch({
       isIdle: true,
-      hasActiveTelegramTurn: true,
       hasAbortHandler: true,
     }),
     false,
   );
   assert.equal(
-    canRestartTelegramTurnForModelSwitch({
+    canRestartAgentRunForTelegramModelSwitch({
       isIdle: false,
-      hasActiveTelegramTurn: false,
-      hasAbortHandler: true,
-    }),
-    false,
-  );
-  assert.equal(
-    canRestartTelegramTurnForModelSwitch({
-      isIdle: false,
-      hasActiveTelegramTurn: true,
       hasAbortHandler: false,
     }),
     false,
@@ -257,7 +246,7 @@ test("Pending model switch abort waits until no tool executions remain", () => {
   assert.equal(
     shouldTriggerPendingTelegramModelSwitchAbort({
       hasPendingModelSwitch: true,
-      hasActiveTelegramTurn: true,
+      hasContinuationTurn: true,
       hasAbortHandler: true,
       activeToolExecutions: 0,
     }),
@@ -266,7 +255,7 @@ test("Pending model switch abort waits until no tool executions remain", () => {
   assert.equal(
     shouldTriggerPendingTelegramModelSwitchAbort({
       hasPendingModelSwitch: true,
-      hasActiveTelegramTurn: true,
+      hasContinuationTurn: true,
       hasAbortHandler: true,
       activeToolExecutions: 1,
     }),
@@ -275,7 +264,7 @@ test("Pending model switch abort waits until no tool executions remain", () => {
   assert.equal(
     shouldTriggerPendingTelegramModelSwitchAbort({
       hasPendingModelSwitch: false,
-      hasActiveTelegramTurn: true,
+      hasContinuationTurn: true,
       hasAbortHandler: true,
       activeToolExecutions: 0,
     }),
@@ -315,7 +304,8 @@ test("Model-switch continuation restart queues before abort when state is presen
 test("Model-switch controller centralizes pending abort and continuation queueing", () => {
   const events: string[] = [];
   let pendingSelection: { model: { provider: string; id: string } } | undefined;
-  const activeTurn = createModelTestTurn({
+  let activeToolExecutions = 1;
+  let activeTurn = createModelTestTurn({
     chatId: 1,
     replyToMessageId: 2,
     sourceMessageIds: [2],
@@ -337,7 +327,7 @@ test("Model-switch controller centralizes pending abort and continuation queuein
       };
     },
     hasAbortHandler: () => true,
-    getActiveToolExecutions: () => 0,
+    getActiveToolExecutions: () => activeToolExecutions,
     queueContinuation: (turn, selection) => {
       events.push(`queue:${turn.replyToMessageId}:${selection.model.id}`);
     },
@@ -347,9 +337,94 @@ test("Model-switch controller centralizes pending abort and continuation queuein
   });
   assert.equal(controller.canOfferInFlightSwitch({}), true);
   controller.stagePendingSwitch(createModelTestSelection(), {});
+  activeTurn = createModelTestTurn({ replyToMessageId: 99 });
   assert.deepEqual(events, ["status"]);
+  activeToolExecutions = 0;
   assert.equal(controller.triggerPendingAbort({}), true);
   assert.deepEqual(events, ["status", "queue:2:gpt-5", "abort"]);
+  assert.equal(pendingSelection, undefined);
+});
+
+test("Model-switch controller resumes a local run in the exact Telegram menu target", () => {
+  const events: string[] = [];
+  let pendingSelection: { model: { provider: string; id: string } } | undefined;
+  let activeToolExecutions = 0;
+  const continuationTurn = {
+    chatId: 7,
+    replyToMessageId: 9,
+    target: { chatId: 7, threadId: 11 },
+  };
+  const controller = createTelegramModelSwitchController({
+    isIdle: () => false,
+    getPendingModelSwitch: () => pendingSelection,
+    setPendingModelSwitch: (selection) => {
+      pendingSelection = selection;
+    },
+    getActiveTurn: () => undefined,
+    getAbortHandler: () => () => {
+      events.push("abort");
+    },
+    hasAbortHandler: () => true,
+    getActiveToolExecutions: () => activeToolExecutions,
+    queueContinuation: (turn, selection) => {
+      events.push(
+        `queue:${turn.chatId}:${turn.target?.threadId}:${turn.replyToMessageId}:${selection.model.id}`,
+      );
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+  });
+
+  assert.equal(controller.canOfferInFlightSwitch({}), true);
+  assert.equal(
+    controller.restartInterruptedTurn(
+      createModelTestSelection(),
+      {},
+      continuationTurn,
+    ),
+    true,
+  );
+  assert.deepEqual(events, ["queue:7:11:9:gpt-5", "abort"]);
+
+  activeToolExecutions = 1;
+  controller.stagePendingSwitch(
+    createModelTestSelection(),
+    {},
+    continuationTurn,
+  );
+  assert.equal(controller.triggerPendingAbort({}), false);
+  activeToolExecutions = 0;
+  assert.equal(controller.triggerPendingAbort({}), true);
+  assert.deepEqual(events, [
+    "queue:7:11:9:gpt-5",
+    "abort",
+    "status",
+    "queue:7:11:9:gpt-5",
+    "abort",
+  ]);
+  assert.equal(pendingSelection, undefined);
+
+  controller.stagePendingSwitch(
+    createModelTestSelection(),
+    {},
+    continuationTurn,
+  );
+  assert.deepEqual(events.slice(-3), [
+    "status",
+    "queue:7:11:9:gpt-5",
+    "abort",
+  ]);
+  assert.equal(pendingSelection, undefined);
+
+  activeToolExecutions = 1;
+  controller.stagePendingSwitch(
+    createModelTestSelection(),
+    {},
+    continuationTurn,
+  );
+  controller.clearPendingSwitch();
+  assert.equal(controller.triggerPendingAbort({}), false);
   assert.equal(pendingSelection, undefined);
 });
 
@@ -419,13 +494,13 @@ test("Model-switch continuation turn stays control-lane and resume-oriented", ()
   assert.deepEqual(turn.sourceMessageIds, []);
   assert.equal(
     turn.historyText,
-    "Continue interrupted Telegram request on openai/gpt-5",
+    "Continue interrupted request on openai/gpt-5",
   );
   assert.equal(turn.statusSummary, "↻ continue on gpt-5");
   assert.match(String(turn.content[0]?.type), /text/);
   assert.match(
     String((turn.content[0] as { text?: string } | undefined)?.text ?? ""),
-    /Continue the interrupted previous Telegram request/,
+    /Continue the interrupted previous request/,
   );
 });
 
@@ -487,7 +562,7 @@ test("Continuation prompt stays Telegram-scoped and resume-oriented", () => {
     "high",
   );
   assert.match(text, /^\[telegram\]/);
-  assert.match(text, /Continue the interrupted previous Telegram request/);
+  assert.match(text, /Continue the interrupted previous request/);
   assert.match(text, /openai\/gpt-5/);
   assert.match(text, /thinking level \(high\)/);
 });

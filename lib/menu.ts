@@ -30,6 +30,7 @@ import {
 import {
   type MenuModel,
   type ScopedTelegramModel,
+  type TelegramModelSwitchContinuationSource,
   type ThinkingLevel,
 } from "./model.ts";
 import type { TelegramInputRichMessage } from "./telegram-api.ts";
@@ -194,7 +195,6 @@ export interface TelegramMenuCallbackRuntimeDeps<
     text?: string,
   ) => Promise<void>;
   isIdle: (ctx: TContext) => boolean;
-  hasActiveTelegramTurn: () => boolean;
   hasAbortHandler: () => boolean;
   hasActiveToolExecutions: () => boolean;
   persistScopedModelPatterns?: (
@@ -206,10 +206,12 @@ export interface TelegramMenuCallbackRuntimeDeps<
   stagePendingModelSwitch: (
     selection: ScopedTelegramModel<TModel>,
     ctx: TContext,
+    continuationTurn: TelegramModelSwitchContinuationSource,
   ) => void;
   restartInterruptedTelegramTurn: (
     selection: ScopedTelegramModel<TModel>,
     ctx: TContext,
+    continuationTurn: TelegramModelSwitchContinuationSource,
   ) => Promise<boolean> | boolean;
   sectionRegistry?: TelegramSectionRegistry;
   editInteractiveMessage?: (
@@ -452,7 +454,6 @@ export interface TelegramMenuCallbackRuntimeAdapterDeps<
     text?: string,
   ) => Promise<void>;
   isIdle: (ctx: TContext) => boolean;
-  hasActiveTelegramTurn: () => boolean;
   hasAbortHandler: () => boolean;
   getActiveToolExecutions: () => number;
   persistScopedModelPatterns?: (
@@ -464,10 +465,12 @@ export interface TelegramMenuCallbackRuntimeAdapterDeps<
   stagePendingModelSwitch: (
     selection: ScopedTelegramModel<TModel>,
     ctx: TContext,
+    continuationTurn: TelegramModelSwitchContinuationSource,
   ) => void;
   restartInterruptedTelegramTurn: (
     selection: ScopedTelegramModel<TModel>,
     ctx: TContext,
+    continuationTurn: TelegramModelSwitchContinuationSource,
   ) => Promise<boolean> | boolean;
   sectionRegistry?: TelegramSectionRegistry;
   editInteractiveMessage?: (
@@ -527,7 +530,6 @@ export function createTelegramMenuCallbackHandlerForContext<
     updateSettingsMenuMessage: deps.updateSettingsMenuMessage,
     answerCallbackQuery: deps.answerCallbackQuery,
     isIdle: deps.isIdle,
-    hasActiveTelegramTurn: deps.hasActiveTelegramTurn,
     hasAbortHandler: deps.hasAbortHandler,
     hasActiveToolExecutions: () => deps.getActiveToolExecutions() > 0,
     persistScopedModelPatterns: deps.persistScopedModelPatterns,
@@ -715,8 +717,7 @@ export async function handleTelegramMenuCallbackRuntime<
             activeModel: deps.getActiveModel(ctx),
             currentThinkingLevel: deps.getThinkingLevel(),
             isIdle: deps.isIdle(ctx),
-            canRestartBusyRun:
-              deps.hasActiveTelegramTurn() && deps.hasAbortHandler(),
+            canRestartBusyRun: deps.hasAbortHandler(),
             hasActiveToolExecutions: deps.hasActiveToolExecutions(),
           },
           {
@@ -733,11 +734,15 @@ export async function handleTelegramMenuCallbackRuntime<
               deps.setThinkingLevel(level);
               deps.updateStatus(ctx);
             },
-            stagePendingModelSwitch: (selection) => {
-              deps.stagePendingModelSwitch(selection, ctx);
+            stagePendingModelSwitch: (selection, continuationTurn) => {
+              deps.stagePendingModelSwitch(selection, ctx, continuationTurn);
             },
-            restartInterruptedTelegramTurn: (selection) =>
-              deps.restartInterruptedTelegramTurn(selection, ctx),
+            restartInterruptedTelegramTurn: (selection, continuationTurn) =>
+              deps.restartInterruptedTelegramTurn(
+                selection,
+                ctx,
+                continuationTurn,
+              ),
           },
         );
       } catch (error) {
