@@ -667,8 +667,6 @@ export default function (pi: Pi.ExtensionAPI) {
     typing,
     getDefaultChatId: proactivePushChatIdGetter,
     sendTypingAction,
-    sendAggregateTypingAction:
-      BusApi.createTelegramAggregateTypingActionSender(telegramApiRuntime),
     updateStatus,
     isContextActive: telegramSessionContextStore.isCurrent,
     getTransportAuthority() {
@@ -1628,7 +1626,7 @@ export default function (pi: Pi.ExtensionAPI) {
         loadConfig: configStore.load,
         setQueuedItems: telegramQueueStore.setQueuedItems,
         setCurrentModel: currentModelRuntime.set,
-        setPendingModelSwitch: pendingModelSwitchStore.set,
+        setPendingModelSwitch: modelSwitchController.clearPendingSwitch,
         syncCounters: queue.syncCounters,
         syncFlags: lifecycle.syncFlags,
         bindDeferredDispatchContext: deferredQueueDispatchRuntime.bind,

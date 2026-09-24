@@ -771,7 +771,7 @@ test("Telegram bridge API runtime owns reply-markup edits", async () => {
   ]);
 });
 
-test("Telegram bridge API runtime coalesces and spaces identical chat actions", async () => {
+test("Telegram bridge API runtime coalesces identical actions and suppresses concurrent chat peers", async () => {
   let nowMs = 1000;
   let releaseFirst: (value: boolean) => void = () => {};
   const firstResult = new Promise<boolean>((resolve) => {
@@ -802,7 +802,11 @@ test("Telegram bridge API runtime coalesces and spaces identical chat actions", 
 
   const first = runtime.call<boolean>("sendChatAction", body);
   const joined = runtime.call<boolean>("sendChatAction", body);
-  await Promise.resolve();
+  const suppressed = runtime.call<boolean>("sendChatAction", {
+    ...body,
+    message_thread_id: 9,
+  });
+  assert.equal(await suppressed, true);
   assert.equal(calls, 1);
   releaseFirst(true);
   assert.deepEqual(await Promise.all([first, joined]), [true, true]);
@@ -853,7 +857,7 @@ test("Telegram bridge API runtime bounds active chat-action gates", async () => 
   assert.deepEqual(calls, ["1", "2", "3"]);
 });
 
-test("Telegram bridge API runtime shares retry-after suppression for chat actions", async () => {
+test("Telegram bridge API runtime shares retry-after suppression across one chat", async () => {
   let nowMs = 1000;
   let calls = 0;
   const events: Array<Record<string, unknown>> = [];
@@ -879,7 +883,12 @@ test("Telegram bridge API runtime shares retry-after suppression for chat action
       now: () => nowMs,
       chatActionMinIntervalMs: 2000,
     });
-    const body = { chat_id: 7, action: "typing" };
+    const body = {
+      chat_id: 7,
+      message_thread_id: 11,
+      action: "typing",
+    };
+    const peerThreadBody = { ...body, message_thread_id: 12 };
 
     assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
     assert.equal(calls, 1);
@@ -891,12 +900,33 @@ test("Telegram bridge API runtime shares retry-after suppression for chat action
       },
     ]);
 
-    nowMs = 3999;
-    assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
+    nowMs = 2000;
+    assert.equal(
+      await runtime.call<boolean>("sendChatAction", peerThreadBody),
+      true,
+    );
     assert.equal(calls, 1);
-    nowMs = 4000;
-    assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
+    assert.equal(
+      await runtime.call<boolean>("sendChatAction", {
+        ...peerThreadBody,
+        chat_id: 8,
+      }),
+      true,
+    );
     assert.equal(calls, 2);
+
+    nowMs = 3999;
+    assert.equal(
+      await runtime.call<boolean>("sendChatAction", peerThreadBody),
+      true,
+    );
+    assert.equal(calls, 2);
+    nowMs = 4000;
+    assert.equal(
+      await runtime.call<boolean>("sendChatAction", peerThreadBody),
+      true,
+    );
+    assert.equal(calls, 3);
   } finally {
     restoreFetch();
   }

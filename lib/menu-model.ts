@@ -13,6 +13,7 @@ import {
   resolveScopedModelPatterns,
   type ScopedTelegramModel,
   sortScopedModels,
+  type TelegramModelSwitchContinuationSource,
   type ThinkingLevel,
 } from "./model.ts";
 
@@ -157,9 +158,13 @@ export type TelegramModelMenuCallbackDeps<
   setModel: (model: TModel) => Promise<boolean>;
   setCurrentModel: (model: TModel) => void;
   setThinkingLevel: (level: ThinkingLevel) => void;
-  stagePendingModelSwitch: (selection: ScopedTelegramModel<TModel>) => void;
+  stagePendingModelSwitch: (
+    selection: ScopedTelegramModel<TModel>,
+    continuationTurn: TelegramModelSwitchContinuationSource,
+  ) => void;
   restartInterruptedTelegramTurn: (
     selection: ScopedTelegramModel<TModel>,
+    continuationTurn: TelegramModelSwitchContinuationSource,
   ) => Promise<boolean> | boolean;
 };
 
@@ -961,14 +966,28 @@ export async function handleTelegramModelMenuCallbackAction<
   if (plan.selection.thinkingLevel) {
     deps.setThinkingLevel(plan.selection.thinkingLevel);
   }
-  await deps.updateModelMenuMessage();
+  const continuationTurn: TelegramModelSwitchContinuationSource = {
+    chatId: params.state.chatId,
+    replyToMessageId: params.state.messageId,
+    target: {
+      chatId: params.state.chatId,
+      ...(params.state.threadId === undefined
+        ? {}
+        : { threadId: params.state.threadId }),
+    },
+  };
   if (plan.mode === "restart-after-tool") {
-    deps.stagePendingModelSwitch(plan.selection);
+    deps.stagePendingModelSwitch(plan.selection, continuationTurn);
+    await deps.updateModelMenuMessage();
     await deps.answerCallbackQuery(callbackQueryId, plan.callbackText);
     return true;
   }
   if (plan.mode === "restart-now") {
-    const restarted = await deps.restartInterruptedTelegramTurn(plan.selection);
+    const restarted = await deps.restartInterruptedTelegramTurn(
+      plan.selection,
+      continuationTurn,
+    );
+    await deps.updateModelMenuMessage();
     if (!restarted) {
       await deps.answerCallbackQuery(
         callbackQueryId,
@@ -976,6 +995,8 @@ export async function handleTelegramModelMenuCallbackAction<
       );
       return true;
     }
+  } else {
+    await deps.updateModelMenuMessage();
   }
   await deps.answerCallbackQuery(callbackQueryId, plan.callbackText);
   return true;

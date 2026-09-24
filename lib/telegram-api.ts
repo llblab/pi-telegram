@@ -1866,14 +1866,16 @@ export function createTelegramBridgeApiRuntime(
     deps.chatActionMinIntervalMs ?? 2_000,
   );
   const chatActionMaxGates = Math.max(1, deps.chatActionMaxGates ?? 256);
-  const chatActionGates = new Map<
-    string,
-    { inFlight?: Promise<unknown>; notBeforeMs: number }
-  >();
-  const getChatActionKey = (
+  type ChatActionGate = {
+    inFlight?: Promise<unknown>;
+    notBeforeMs: number;
+  };
+  const chatActionGates = new Map<string, ChatActionGate>();
+  const chatActionChatGates = new Map<string, ChatActionGate>();
+  const getChatActionKeys = (
     method: string,
     body: Record<string, unknown>,
-  ): string | undefined => {
+  ): { action: string; chat: string } | undefined => {
     if (method !== "sendChatAction") return undefined;
     const chatId = body.chat_id;
     const action = body.action;
@@ -1883,12 +1885,16 @@ export function createTelegramBridgeApiRuntime(
     ) {
       return undefined;
     }
+    const chat = String(chatId);
     const threadId = body.message_thread_id;
-    return `${String(chatId)}:${
-      typeof threadId === "number" || typeof threadId === "string"
-        ? String(threadId)
-        : "all"
-    }:${action}`;
+    return {
+      action: `${chat}:${
+        typeof threadId === "number" || typeof threadId === "string"
+          ? String(threadId)
+          : "all"
+      }:${action}`,
+      chat,
+    };
   };
   const callRecorded = async <TResponse>(
     method: string,
@@ -1896,22 +1902,38 @@ export function createTelegramBridgeApiRuntime(
     options?: TelegramApiCallOptions,
   ): Promise<TResponse> => {
     const recoverError = deps.captureRequestErrorHandler?.(body);
-    const chatActionKey = getChatActionKey(method, body);
-    if (chatActionKey) {
+    const chatActionKeys = getChatActionKeys(method, body);
+    if (chatActionKeys) {
       const nowMs = now();
       for (const [key, candidate] of chatActionGates) {
         if (!candidate.inFlight && nowMs >= candidate.notBeforeMs) {
           chatActionGates.delete(key);
         }
       }
-      let gate = chatActionGates.get(chatActionKey);
+      for (const [key, candidate] of chatActionChatGates) {
+        if (!candidate.inFlight && nowMs >= candidate.notBeforeMs) {
+          chatActionChatGates.delete(key);
+        }
+      }
+      let gate = chatActionGates.get(chatActionKeys.action);
       if (!gate) {
         if (chatActionGates.size >= chatActionMaxGates) return true as TResponse;
         gate = { notBeforeMs: 0 };
-        chatActionGates.set(chatActionKey, gate);
+        chatActionGates.set(chatActionKeys.action, gate);
+      }
+      let chatGate = chatActionChatGates.get(chatActionKeys.chat);
+      if (!chatGate) {
+        if (chatActionChatGates.size >= chatActionMaxGates) {
+          return true as TResponse;
+        }
+        chatGate = { notBeforeMs: 0 };
+        chatActionChatGates.set(chatActionKeys.chat, chatGate);
       }
       if (gate.inFlight) return (await gate.inFlight) as TResponse;
-      if (now() < gate.notBeforeMs) return true as TResponse;
+      if (chatGate.inFlight) return true as TResponse;
+      if (nowMs < gate.notBeforeMs || nowMs < chatGate.notBeforeMs) {
+        return true as TResponse;
+      }
       let request: Promise<TResponse>;
       request = Promise.resolve()
         .then(() =>
@@ -1931,7 +1953,9 @@ export function createTelegramBridgeApiRuntime(
               chatActionMinIntervalMs,
               (error.retryAfterSeconds ?? 0) * 1_000,
             );
-            gate.notBeforeMs = now() + retryAfterMs;
+            const notBeforeMs = now() + retryAfterMs;
+            gate.notBeforeMs = notBeforeMs;
+            chatGate.notBeforeMs = Math.max(chatGate.notBeforeMs, notBeforeMs);
             deps.recordRuntimeEvent(
               "api",
               error,
@@ -1952,8 +1976,10 @@ export function createTelegramBridgeApiRuntime(
         })
         .finally(() => {
           if (gate.inFlight === request) gate.inFlight = undefined;
+          if (chatGate.inFlight === request) chatGate.inFlight = undefined;
         });
       gate.inFlight = request;
+      chatGate.inFlight = request;
       return request;
     }
     try {

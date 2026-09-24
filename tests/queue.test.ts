@@ -4484,7 +4484,6 @@ test("Tool execution runtimes update counts and trigger delayed aborts", () => {
   const events: string[] = [];
   let count = 0;
   handleTelegramToolExecutionStartRuntime({
-    hasActiveTurn: () => true,
     getActiveToolExecutions: () => count,
     setActiveToolExecutions: (nextCount) => {
       count = nextCount;
@@ -4492,7 +4491,6 @@ test("Tool execution runtimes update counts and trigger delayed aborts", () => {
     },
   });
   handleTelegramToolExecutionEndRuntime({
-    hasActiveTurn: () => true,
     getActiveToolExecutions: () => count,
     setActiveToolExecutions: (nextCount) => {
       count = nextCount;
@@ -4510,7 +4508,6 @@ test("Tool execution hooks bind counter and pending model-switch abort ports", (
   let count = 0;
   const events: string[] = [];
   const hooks = createTelegramToolExecutionHooks<{ id: string }>({
-    hasActiveTurn: () => true,
     getActiveToolExecutions: () => count,
     setActiveToolExecutions: (nextCount) => {
       count = nextCount;
@@ -4526,10 +4523,9 @@ test("Tool execution hooks bind counter and pending model-switch abort ports", (
   assert.deepEqual(events, ["count:1", "count:0", "abort:ctx"]);
 });
 
-test("Tool execution count helper respects active-turn presence", () => {
+test("Tool execution count helper tracks every active agent run", () => {
   assert.equal(
     getNextTelegramToolExecutionCount({
-      hasActiveTurn: true,
       currentCount: 0,
       event: "start",
     }),
@@ -4537,7 +4533,6 @@ test("Tool execution count helper respects active-turn presence", () => {
   );
   assert.equal(
     getNextTelegramToolExecutionCount({
-      hasActiveTurn: true,
       currentCount: 1,
       event: "end",
     }),
@@ -4545,11 +4540,10 @@ test("Tool execution count helper respects active-turn presence", () => {
   );
   assert.equal(
     getNextTelegramToolExecutionCount({
-      hasActiveTurn: false,
-      currentCount: 3,
+      currentCount: 0,
       event: "end",
     }),
-    3,
+    0,
   );
 });
 

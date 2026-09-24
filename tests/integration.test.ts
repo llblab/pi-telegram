@@ -7495,7 +7495,7 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
   }
 });
 
-test("Extension runtime switches model in flight and dispatches a continuation turn after abort", async () => {
+test("Extension runtime switches a local run in flight and continues in the model-menu target", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const runtimeEvents: string[] = [];
   const modelA = createRuntimeModel("openai", "gpt-a", true);
@@ -7504,7 +7504,6 @@ test("Extension runtime switches model in flight and dispatches a continuation t
   let aborted = false;
   const setModels: Array<string> = [];
   const secondUpdates = createRuntimeDeferredResponse();
-  const thirdUpdates = createRuntimeDeferredResponse();
   const { handlers, commands, pi } = createRuntimePiHarness({
     sendUserMessage: (content) => {
       recordRuntimeDispatchEvent(runtimeEvents, content);
@@ -7541,7 +7540,6 @@ test("Extension runtime switches model in flight and dispatches a continuation t
         ]);
       }
       if (getUpdatesCalls === 2) return secondUpdates.promise;
-      if (getUpdatesCalls === 3) return thirdUpdates.promise;
       throw new DOMException("stop", "AbortError");
     }
     if (method === "sendMessage" || method === "sendRichMessage") {
@@ -7581,32 +7579,13 @@ test("Extension runtime switches model in flight and dispatches a continuation t
     await waitForCondition(() =>
       runtimeEvents.some((event) => event === "send:<b>🤖 Choose a model:</b>"),
     );
+    idle = false;
+    await handlers.get("agent_start")?.({}, ctx);
     secondUpdates.resolve(
       createRuntimeTelegramApiResponse([
         {
           _: "other",
           update_id: 2,
-          message: {
-            message_id: 41,
-            chat: { id: 99, type: "private" },
-            from: { id: 77, is_bot: false, first_name: "Test" },
-            text: "first request",
-          },
-        },
-      ]),
-    );
-    await waitForCondition(() =>
-      runtimeEvents.some(
-        (event) => event === "dispatch:[telegram] first request",
-      ),
-    );
-    idle = false;
-    await handlers.get("agent_start")?.({}, ctx);
-    thirdUpdates.resolve(
-      createRuntimeTelegramApiResponse([
-        {
-          _: "other",
-          update_id: 3,
           callback_query: {
             id: "cb-1",
             from: { id: 77, is_bot: false, first_name: "Test" },
@@ -7641,18 +7620,14 @@ test("Extension runtime switches model in flight and dispatches a continuation t
     await waitForCondition(() =>
       runtimeEvents.some((event) =>
         event.includes(
-          "Continue the interrupted previous Telegram request using the newly selected model (anthropic/claude-b)",
+          "Continue the interrupted previous request using the newly selected model (anthropic/claude-b)",
         ),
       ),
     );
     assert.equal(
-      runtimeEvents.includes("dispatch:[telegram] first request"),
-      true,
-    );
-    assert.equal(
       runtimeEvents.some((event) =>
         event.includes(
-          "dispatch:[telegram] Continue the interrupted previous Telegram request using the newly selected model (anthropic/claude-b)",
+          "dispatch:[telegram] Continue the interrupted previous request using the newly selected model (anthropic/claude-b)",
         ),
       ),
       true,
@@ -8035,7 +8010,7 @@ test("Extension runtime delays model-switch abort until the active tool finishes
     await waitForCondition(() =>
       runtimeEvents.some((event) =>
         event.includes(
-          "dispatch:[telegram] Continue the interrupted previous Telegram request using the newly selected model (anthropic/claude-b)",
+          "dispatch:[telegram] Continue the interrupted previous request using the newly selected model (anthropic/claude-b)",
         ),
       ),
     );

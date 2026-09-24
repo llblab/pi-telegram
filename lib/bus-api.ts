@@ -82,13 +82,6 @@ function rejectTelegramDirectOwnership(method: string): Promise<never> {
   );
 }
 
-export function createTelegramAggregateTypingActionSender(
-  runtime: Pick<TelegramBridgeApiRuntime, "call">,
-): (chatId: number) => Promise<unknown> {
-  return (chatId) =>
-    runtime.call("sendChatAction", { chat_id: chatId, action: "typing" });
-}
-
 export function createTelegramBusAwareApiRuntime(
   deps: TelegramBusAwareApiRuntimeDeps,
 ): TelegramBridgeApiRuntime {

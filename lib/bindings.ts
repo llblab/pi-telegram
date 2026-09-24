@@ -1203,10 +1203,13 @@ export function registerTelegramLifecycleRuntimeHooks({
     if (uiPromptActive || !canSendAgentActivity(ctx)) return false;
     const turn = activeTurnRuntime.get();
     const target = turn?.target ?? proactivePushTargetGetter();
-    promptDispatchRuntime.startTypingLoop(ctx, turn?.chatId ?? target?.chatId, {
-      target,
-    });
-    return true;
+    return (
+      promptDispatchRuntime.startTypingLoop(
+        ctx,
+        turn?.chatId ?? target?.chatId,
+        { target },
+      ) !== false
+    );
   };
   const startActiveTurnTypingLoop = (ctx: Pi.ExtensionContext): void => {
     if (uiPromptActive) return;
