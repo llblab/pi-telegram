@@ -95,13 +95,13 @@ try {
     'export { default } from "../index.js";\n',
     "utf8",
   );
+  normalizeTextFiles(candidate);
   cpSync("skills", join(candidate, "skills"), { recursive: true });
   cpSync("package.json", join(candidate, "package.json"));
   cpSync(
     join("lib", "generative-app-worker.mjs"),
     join(candidate, "lib", "generative-app-worker.mjs"),
   );
-  normalizeTextFiles(candidate);
   run(process.execPath, ["--check", join(candidate, "pi-telegram", "index.js")]);
 
   if (checkOnly) {
