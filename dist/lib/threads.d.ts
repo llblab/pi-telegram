@@ -187,6 +187,12 @@ export interface TelegramSessionReplacementIntent {
     threadName?: string;
     createdAtMs: number;
     expiresAtMs: number;
+    /**
+     * Present only when the leader published the intent for a registered
+     * follower. Successor re-key and settlement must come from this exact
+     * follower runtime or its authenticated same-process session handoff.
+     */
+    sourceInstanceId?: string;
 }
 export interface TelegramTopicTargetFile {
     version: 1;
@@ -385,6 +391,7 @@ export declare function isTelegramLeaderSessionHandoffFresh(handoff: TelegramLea
 }): handoff is TelegramLeaderSessionHandoff;
 export declare function getTelegramThreadOwnerKey(owner: TelegramThreadOwner): string;
 export declare function getTelegramThreadOwnerFromProfileKey(profileKey: string): TelegramThreadOwner;
+export declare function normalizeTelegramSessionReplacementIntent(value: unknown): TelegramSessionReplacementIntent | undefined;
 export declare function isSameTelegramProcessInstance(left: string | undefined, right: string | undefined): boolean;
 export declare function createTelegramTopicTargetStore(options: TelegramTopicTargetStoreOptions): TelegramTopicTargetStore;
 export declare function normalizeTelegramTopicTargetThreadName(threadName: string): string;

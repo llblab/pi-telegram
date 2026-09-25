@@ -9,7 +9,7 @@ import { createTelegramThreadDisplayReconciler, resolveTelegramInitialWorkspaceD
 import * as ThreadReconciler from "./thread-reconciler.js";
 import { getTelegramApiErrorRequestTarget, isTelegramApiCommitUnknownError, } from "./telegram-api.js";
 import * as Threads from "./threads.js";
-import { createTelegramBusLocalServer, createUnauthorizedBusAck, getTelegramBusEnvelopeTrafficClass, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, getTelegramBusFollowerSocketPath, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, } from "./bus.js";
+import { createTelegramBusLocalServer, createUnauthorizedBusAck, getTelegramBusEnvelopeTrafficClass, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, getTelegramBusFollowerSocketPath, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, } from "./bus.js";
 import { getTelegramBusTransportRetryPolicy } from "./bus-transport.js";
 import { createTelegramWorkspaceOperationRuntime, createTelegramWorkspaceSlotRotation, } from "./workspace-retirement.js";
 import { createTelegramWorkspaceAdmissionOperationId, runWithTelegramWorkspaceAdmissionsAsync, } from "./workspace-admission.js";
@@ -26,6 +26,75 @@ function formatTelegramBusInstanceLabel(input) {
     if (threadName)
         return escapeHtml(threadName);
     return input.slot && /^[A-Z]$/.test(input.slot) ? input.slot : "?";
+}
+/**
+ * Leader-owned durable session-replacement authority for registered followers.
+ * Followers cannot persist `state.json`; the leader validates the request
+ * against its live registry entry and authoritative Workspace binding before
+ * one CAS publication or claim. Follower memory is never accepted as binding
+ * evidence.
+ */
+export function createTelegramBusFollowerSessionReplacementAuthority(deps) {
+    const getNowMs = deps.getNowMs ?? Date.now;
+    const ttlMs = deps.ttlMs ?? Threads.TELEGRAM_LEADER_SESSION_HANDOFF_TTL_MS;
+    const assertCommon = (follower, intent) => {
+        const cwd = follower.cwd
+            ? Threads.normalizeTelegramWorkspacePath(follower.cwd)
+            : undefined;
+        const sessionId = follower.sessionId
+            ? Threads.normalizeTelegramSessionId(follower.sessionId)
+            : undefined;
+        const nowMs = getNowMs();
+        if (intent.continuity !== "workspace-thread" ||
+            typeof intent.target.threadId !== "number" ||
+            follower.target?.chatId !== intent.target.chatId ||
+            follower.target.threadId !== intent.target.threadId ||
+            !cwd || cwd !== intent.cwd || !sessionId ||
+            intent.profileName !== (deps.getTelegramProfile?.() ?? "default")) {
+            throw new Error("Telegram session replacement does not match the current follower registration.");
+        }
+        if (intent.expiresAtMs <= nowMs || intent.expiresAtMs > nowMs + ttlMs) {
+            throw new Error("Telegram session replacement intent is expired or unbounded.");
+        }
+        return { cwd, sessionId };
+    };
+    return {
+        async publish(follower, intent, isCurrent) {
+            const { sessionId } = assertCommon(follower, intent);
+            if (intent.sourceInstanceId !== follower.instanceId ||
+                intent.sourceSessionId !== sessionId) {
+                throw new Error("Telegram session replacement source does not match the current follower registration.");
+            }
+            await deps.store.load();
+            if (!isCurrent())
+                return false;
+            const binding = deps.store.getWorkspaceBindingByTarget(intent.target);
+            if (!binding || binding.cwd !== intent.cwd ||
+                binding.sessionId !== intent.sourceSessionId ||
+                binding.slot !== intent.slot ||
+                (binding.manualThreadName ?? binding.threadName) !== intent.threadName) {
+                throw new Error("Telegram session replacement binding is unavailable.");
+            }
+            return deps.store.commitSessionReplacementIntent(intent, isCurrent);
+        },
+        async settle(follower, intent, isCurrent) {
+            const { sessionId } = assertCommon(follower, intent);
+            if (!intent.sourceInstanceId ||
+                (intent.sourceInstanceId !== follower.instanceId &&
+                    intent.sourceInstanceId !== follower.previousInstanceId) ||
+                intent.sourceSessionId === sessionId) {
+                throw new Error("Telegram session replacement successor does not match the current follower registration.");
+            }
+            await deps.store.load();
+            if (!isCurrent())
+                return false;
+            if (deps.store.getWorkspaceBindingByTarget(intent.target, sessionId)?.cwd !==
+                intent.cwd) {
+                throw new Error("Telegram session replacement successor binding is unavailable.");
+            }
+            return deps.store.removeSessionReplacementIntent(intent, isCurrent);
+        },
+    };
 }
 export function createTelegramBusLeaderRuntimeAssembly(deps) {
     const runWorkspaceAdmission = deps.getWorkspaceAdmission
@@ -327,6 +396,11 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
             }
         });
     });
+    const followerSessionReplacement = createTelegramBusFollowerSessionReplacementAuthority({
+        store: deps.topicTargetStore,
+        getTelegramProfile: deps.getTelegramProfile,
+        getNowMs: deps.runtime.getNowMs,
+    });
     const runtime = createTelegramBusLeaderRuntime({
         ...deps.runtime,
         applyThreadDisplayMode,
@@ -427,6 +501,16 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
                 }
             });
         }),
+        publishFollowerSessionReplacement: (follower, intent, isCurrent) => runWorkspaceOperation({
+            operationId: createTelegramWorkspaceAdmissionOperationId(),
+            operationKind: "workspace.publish-follower-session-replacement",
+            scopes: [{ kind: "profile" }],
+        }, () => followerSessionReplacement.publish(follower, intent, isCurrent)),
+        settleFollowerSessionReplacement: (follower, intent, isCurrent) => runWorkspaceOperation({
+            operationId: createTelegramWorkspaceAdmissionOperationId(),
+            operationKind: "workspace.settle-follower-session-replacement",
+            scopes: [{ kind: "profile" }],
+        }, () => followerSessionReplacement.settle(follower, intent, isCurrent)),
         onFollowerConfirmedDead: async (follower) => {
             await runWorkspaceOperation({
                 operationId: createTelegramWorkspaceAdmissionOperationId(),
@@ -1796,6 +1880,63 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
                     }
                 });
             }
+            case "follower.publishSessionReplacement":
+            case "follower.settleSessionReplacement": {
+                const registeredFollower = deps.followerRegistry.get(envelope.instanceId);
+                return runFollowerMutation(registeredFollower ?? { instanceId: envelope.instanceId }, async () => {
+                    const publish = envelope.kind === "follower.publishSessionReplacement";
+                    const operation = publish
+                        ? deps.publishFollowerSessionReplacement
+                        : deps.settleFollowerSessionReplacement;
+                    const epoch = deps.getCurrentLeaderEpoch?.();
+                    const follower = deps.followerRegistry.get(envelope.instanceId);
+                    const isCurrent = () => epoch !== undefined &&
+                        deps.getCurrentLeaderEpoch?.() === epoch &&
+                        deps.followerRegistry.get(envelope.instanceId)?.registrationGeneration ===
+                            envelope.registrationGeneration;
+                    if (!follower?.registrationGeneration ||
+                        follower.registrationGeneration !== envelope.registrationGeneration ||
+                        !isCurrent() || !operation ||
+                        !hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT) ||
+                        !hasTelegramBusCapability(follower.protocol, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT)) {
+                        return {
+                            kind: "bus.ack",
+                            requestId: envelope.requestId,
+                            ok: false,
+                            message: "Telegram session replacement requires current follower registration and compatible leader authority.",
+                        };
+                    }
+                    try {
+                        const committed = await operation(follower, envelope.intent, isCurrent);
+                        if (!committed || !isCurrent()) {
+                            return {
+                                kind: "bus.ack",
+                                requestId: envelope.requestId,
+                                ok: false,
+                                message: publish
+                                    ? "Telegram session replacement intent was not persisted."
+                                    : "Telegram session replacement intent was not claimed.",
+                            };
+                        }
+                        return {
+                            kind: "bus.ack",
+                            requestId: envelope.requestId,
+                            ok: true,
+                            result: { committed: true },
+                        };
+                    }
+                    catch (error) {
+                        return {
+                            kind: "bus.ack",
+                            requestId: envelope.requestId,
+                            ok: false,
+                            message: error instanceof Error
+                                ? error.message
+                                : "Telegram session replacement request failed.",
+                        };
+                    }
+                });
+            }
             case "follower.disconnect": {
                 const registeredFollower = deps.followerRegistry.get(envelope.instanceId);
                 return runFollowerMutation(registeredFollower ?? { instanceId: envelope.instanceId }, async () => {
@@ -2303,6 +2444,8 @@ export function createTelegramBusLeaderRuntime(deps) {
         onFollowerDisconnected: deps.onFollowerDisconnected,
         renameFollowerThread: deps.renameFollowerThread,
         resetFollowerThreadName: deps.resetFollowerThreadName,
+        publishFollowerSessionReplacement: deps.publishFollowerSessionReplacement,
+        settleFollowerSessionReplacement: deps.settleFollowerSessionReplacement,
         getFollowerDisplayTitle: deps.getFollowerDisplayTitle,
         onFollowerRegistered: deps.onFollowerRegistered,
         applyThreadDisplayMode: deps.applyThreadDisplayMode,

@@ -54,6 +54,8 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
         threadId: number;
     }) => Promise<string>;
     setThreadDisplayMode?: (mode: TelegramThreadDisplayMode) => Promise<void>;
+    /** Leader-mediated durable publication or successor claim; true only after exact commit. */
+    requestSessionReplacement?: (operation: "publish" | "settle", intent: Threads.TelegramSessionReplacementIntent) => Promise<boolean>;
     stop: () => void;
 }
 export interface TelegramBusFollowerSessionReplacementSuspenderDeps {

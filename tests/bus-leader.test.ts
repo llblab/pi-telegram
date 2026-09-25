@@ -21,10 +21,12 @@ import {
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
+  TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
 } from "../lib/bus.ts";
 import {
   createTelegramBusFollowerConfirmedDeadHandler,
   createTelegramBusFollowerDisconnectHandler,
+  createTelegramBusFollowerSessionReplacementAuthority,
   createTelegramBusFollowerTargetProvisioner,
   createTelegramBusInstanceLifecycleAnnouncement,
   createTelegramBusLeaderActivationScheduler,
@@ -6096,6 +6098,119 @@ test("Bus leader runtime stops the local server if polling startup fails", async
     );
   } finally {
     await runtime.stopPolling();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Leader publishes and claims follower session replacement only for exact live authority", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-session-replacement-"));
+  const path = join(dir, "state.json");
+  const target = { chatId: 7, threadId: 42 };
+  const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "test",
+    capabilities: [TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT] });
+  const legacyProtocol = createTelegramBusProtocolIdentity({ runtimeBuild: "test" });
+  try {
+    const store = createTelegramTopicTargetStore({ path, getNowMs: () => 1000 });
+    store.upsertWorkspaceBinding({
+      ...createTelegramWorkspaceBindingIdentity("/follower", 0, "session-old")!,
+      target, slot: "B", threadName: "Beacon", updatedAtMs: 1,
+    });
+    await store.persist();
+    const registry = createTelegramBusFollowerRegistry();
+    const source = { instanceId: "follower", cwd: "/follower", sessionId: "session-old",
+      target, slot: "B", threadName: "Beacon", registrationGeneration: "follower:1",
+      protocol, connectedAtMs: 1 };
+    registry.register(source);
+    let epoch: number | undefined = 1;
+    const authority = createTelegramBusFollowerSessionReplacementAuthority({
+      store, getNowMs: () => 1000,
+    });
+    const handler = createTelegramBusLeaderEnvelopeHandler({
+      followerRegistry: registry,
+      protocolIdentity: protocol,
+      getNowMs: () => 1000,
+      getCurrentLeaderEpoch: () => epoch,
+      publishFollowerSessionReplacement: authority.publish,
+      settleFollowerSessionReplacement: authority.settle,
+    });
+    const intent = { continuity: "workspace-thread" as const, cwd: "/follower",
+      profileName: "default", sourceSessionId: "session-old", sourceUpdateId: 41,
+      target, messageId: 99, slot: "B", threadName: "Beacon", createdAtMs: 1000,
+      expiresAtMs: 31_000, sourceInstanceId: "follower" };
+    let sequence = 0;
+    const send = async (
+      kind: "follower.publishSessionReplacement" | "follower.settleSessionReplacement",
+      request: typeof intent | Omit<typeof intent, "sourceInstanceId">,
+      registrationGeneration = "follower:1",
+      instanceId = "follower",
+    ) => {
+      const response = await handler({ kind, requestId: `request:${sequence++}`,
+        instanceId, registrationGeneration, intent: request, sentAtMs: 1000 });
+      assert.equal(response.kind, "bus.ack");
+      return response as Extract<typeof response, { kind: "bus.ack" }>;
+    };
+    const persisted = async () => {
+      const reopened = createTelegramTopicTargetStore({ path });
+      await reopened.load();
+      return reopened.getSessionReplacementIntent();
+    };
+    const { sourceInstanceId: _omitted, ...unfenced } = intent;
+    for (const [request, generation, instanceId] of [
+      [intent, "follower:0", "follower"],
+      [intent, "ghost:1", "ghost"],
+      [unfenced, "follower:1", "follower"],
+      [{ ...intent, sourceInstanceId: "other" }, "follower:1", "follower"],
+      [{ ...intent, sourceSessionId: "session-other" }, "follower:1", "follower"],
+      [{ ...intent, target: { chatId: 7, threadId: 43 } }, "follower:1", "follower"],
+      [{ ...intent, cwd: "/other" }, "follower:1", "follower"],
+      [{ ...intent, profileName: "work" }, "follower:1", "follower"],
+      [{ ...intent, threadName: "Other" }, "follower:1", "follower"],
+      [{ ...intent, createdAtMs: 0, expiresAtMs: 1000 }, "follower:1", "follower"],
+      [{ ...intent, expiresAtMs: 31_001 }, "follower:1", "follower"],
+    ] as const) {
+      const response = await send("follower.publishSessionReplacement",
+        request, generation, instanceId);
+      assert.equal(response.ok, false, JSON.stringify(request));
+    }
+    epoch = undefined;
+    assert.equal((await send("follower.publishSessionReplacement", intent)).ok, false);
+    epoch = 1;
+    registry.register({ ...source, protocol: legacyProtocol });
+    assert.match((await send("follower.publishSessionReplacement", intent)).message ?? "",
+      /compatible leader authority/);
+    registry.register(source);
+    assert.equal(await persisted(), undefined);
+
+    const published = await send("follower.publishSessionReplacement", intent);
+    assert.equal(published.ok, true, published.message);
+    assert.deepEqual(published.result, { committed: true });
+    assert.deepEqual(await persisted(), intent);
+    assert.equal((await send("follower.publishSessionReplacement",
+      { ...intent, messageId: 100 })).ok, false);
+    assert.equal((await send("follower.settleSessionReplacement", intent)).ok, false);
+
+    registry.register({ ...source, instanceId: "follower-next",
+      previousInstanceId: "follower", sessionId: "session-new",
+      registrationGeneration: "follower-next:1", connectedAtMs: 2 });
+    assert.match((await send("follower.settleSessionReplacement", intent,
+      "follower-next:1", "follower-next")).message ?? "", /successor binding is unavailable/);
+    await assert.rejects(authority.settle({ ...source, instanceId: "intruder",
+      previousInstanceId: "someone", sessionId: "session-new",
+      registrationGeneration: "intruder:1", lastHeartbeatMs: 2 }, intent, () => true),
+    /successor does not match/);
+    assert.equal(store.claimWorkspaceIdentity("/follower", "follower-next", "follower",
+      { sessionId: "session-new", existingBindingOnly: true })?.slot, "B");
+    await store.persist();
+    assert.equal((await send("follower.settleSessionReplacement", intent,
+      "follower-next:0", "follower-next")).ok, false);
+    assert.deepEqual(await persisted(), intent);
+    const settled = await send("follower.settleSessionReplacement", intent,
+      "follower-next:1", "follower-next");
+    assert.equal(settled.ok, true, settled.message);
+    assert.equal(await persisted(), undefined);
+    assert.equal((await send("follower.settleSessionReplacement", intent,
+      "follower-next:1", "follower-next")).ok, false);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

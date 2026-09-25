@@ -1180,8 +1180,16 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
     ctx: TContext,
     owner: TOwner,
   ): Promise<boolean | undefined> => {
-    if (!(await refreshFollowerState())) return undefined;
-    if (!deps.hasRememberedWorkspaceBinding?.(ctx)) return undefined;
+    if (!(await refreshFollowerState())) {
+      deps.recordEvent("bus", "Telegram follower auto-connect skipped: Threaded Mode is not enabled.",
+        { phase: "follower-auto-connect-skip", reason: "thread-mode-unavailable" });
+      return undefined;
+    }
+    if (!deps.hasRememberedWorkspaceBinding?.(ctx)) {
+      deps.recordEvent("bus", "Telegram follower auto-connect skipped: no binding for this session.",
+        { phase: "follower-auto-connect-skip", reason: "session-binding-unavailable" });
+      return undefined;
+    }
     return deps.restoreFollowerWithLeader?.(ctx, owner);
   };
   return {

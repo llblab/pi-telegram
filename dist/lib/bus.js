@@ -15,6 +15,7 @@ import { classifyTelegramBusTransportError, createTelegramBusTransportTimeoutErr
 import { TELEGRAM_QUEUE_HANDOFF_MAX_RECEIPTS, TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BYTES, } from "./queue.js";
 import { isProcessAlive } from "./locks.js";
 import { resolveAgentDir } from "./paths.js";
+import { normalizeTelegramSessionReplacementIntent, } from "./threads.js";
 function readDarwinProcessStart(pid) {
     return execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], {
         encoding: "utf8",
@@ -124,6 +125,7 @@ export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME = "workspace-thread
 export const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE = "thread-display-mode-v1";
 export const TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT = "directory-display-format-v1";
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT = "workspace-follower-auto-connect-v1";
+export const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT = "session-replacement-intent-v1";
 export function createTelegramBusProtocolIdentity(input) {
     const runtimeBuild = input.runtimeBuild.trim();
     if (!runtimeBuild || runtimeBuild.length > 128) {
@@ -500,6 +502,23 @@ export function parseTelegramBusEnvelope(line) {
                     instanceId: value.instanceId,
                     registrationGeneration: value.registrationGeneration,
                     target: { chatId: target.chatId, threadId: target.threadId },
+                    sentAtMs: value.sentAtMs,
+                };
+            }
+            break;
+        }
+        case "follower.publishSessionReplacement":
+        case "follower.settleSessionReplacement": {
+            const intent = normalizeTelegramSessionReplacementIntent(value.intent);
+            if (typeof value.instanceId === "string" &&
+                typeof value.registrationGeneration === "string" &&
+                typeof value.sentAtMs === "number" && intent) {
+                envelope = {
+                    kind,
+                    requestId,
+                    instanceId: value.instanceId,
+                    registrationGeneration: value.registrationGeneration,
+                    intent,
                     sentAtMs: value.sentAtMs,
                 };
             }

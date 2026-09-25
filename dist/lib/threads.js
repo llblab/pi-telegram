@@ -648,7 +648,7 @@ function cloneWorkspaceBinding(binding) {
 function cloneSessionReplacementIntent(intent) {
     return { ...intent, target: { ...intent.target } };
 }
-function normalizeSessionReplacementIntent(value) {
+export function normalizeTelegramSessionReplacementIntent(value) {
     if (!value || typeof value !== "object" || Array.isArray(value))
         return undefined;
     const record = value;
@@ -663,7 +663,10 @@ function normalizeSessionReplacementIntent(value) {
         typeof record.messageId !== "number" || !Number.isSafeInteger(record.messageId) ||
         typeof record.createdAtMs !== "number" || !Number.isSafeInteger(record.createdAtMs) ||
         typeof record.expiresAtMs !== "number" || !Number.isSafeInteger(record.expiresAtMs) ||
-        record.expiresAtMs <= record.createdAtMs)
+        record.expiresAtMs <= record.createdAtMs ||
+        (record.sourceInstanceId !== undefined &&
+            (typeof record.sourceInstanceId !== "string" || !record.sourceInstanceId ||
+                record.sourceInstanceId.length > 256)))
         return undefined;
     const continuity = record.continuity === "workspace-thread" ||
         record.continuity === "classic-chat"
@@ -687,6 +690,8 @@ function normalizeSessionReplacementIntent(value) {
         ...(typeof record.threadName === "string" ? { threadName: record.threadName } : {}),
         createdAtMs: record.createdAtMs,
         expiresAtMs: record.expiresAtMs,
+        ...(typeof record.sourceInstanceId === "string"
+            ? { sourceInstanceId: record.sourceInstanceId } : {}),
     };
 }
 function normalizeWorkspaceRetirementIntent(value) {
@@ -949,7 +954,7 @@ function parseTopicTargetFile(value) {
                 return normalized ? [normalized] : [];
             })
             : [],
-        sessionReplacement: normalizeSessionReplacementIntent(file.sessionReplacement),
+        sessionReplacement: normalizeTelegramSessionReplacementIntent(file.sessionReplacement),
         reservations: Array.isArray(file.reservations)
             ? file.reservations.flatMap((reservation) => {
                 const normalized = normalizeReservation(reservation);
@@ -1667,7 +1672,7 @@ export function createTelegramTopicTargetStore(options) {
                 : undefined;
         },
         async commitSessionReplacementIntent(intent, isCurrent) {
-            const next = normalizeSessionReplacementIntent(intent);
+            const next = normalizeTelegramSessionReplacementIntent(intent);
             if (!next || !isCurrent())
                 return false;
             await loadFromDisk();
@@ -2081,7 +2086,10 @@ export function createTelegramTopicTargetStore(options) {
                 replacement.expiresAtMs > getNowMs() &&
                 replacement.profileName === (getTelegramProfile() ?? "default") &&
                 replacement.cwd === normalizedCwd &&
-                replacement.sourceSessionId !== normalizedSessionId) {
+                replacement.sourceSessionId !== normalizedSessionId &&
+                (replacement.sourceInstanceId === undefined ||
+                    replacement.sourceInstanceId === instanceId ||
+                    replacement.sourceInstanceId === previousInstanceId)) {
                 const sourceEntry = Array.from(workspaceBindings.entries()).find(([, binding]) => binding.cwd === normalizedCwd &&
                     binding.sessionId === replacement.sourceSessionId &&
                     targetMatches(binding.target, replacement.target));

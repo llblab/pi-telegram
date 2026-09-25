@@ -1515,7 +1515,12 @@ export function createTelegramLockedPollingRuntime<
             ctx,
             state.lock,
           );
-          if (!isCurrent() || !restored) return;
+          if (!isCurrent()) return;
+          if (!restored) {
+            deps.recordRuntimeEvent?.("lock", "Telegram follower auto-connect did not restore this session.",
+              { phase: "follower-auto-connect-unavailable" });
+            return;
+          }
           deps.onTransportAvailabilityChanged?.();
           deps.updateStatus(ctx);
           deps.recordRuntimeEvent?.(

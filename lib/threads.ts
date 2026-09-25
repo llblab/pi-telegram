@@ -371,6 +371,12 @@ export interface TelegramSessionReplacementIntent {
   threadName?: string;
   createdAtMs: number;
   expiresAtMs: number;
+  /**
+   * Present only when the leader published the intent for a registered
+   * follower. Successor re-key and settlement must come from this exact
+   * follower runtime or its authenticated same-process session handoff.
+   */
+  sourceInstanceId?: string;
 }
 
 export interface TelegramTopicTargetFile {
@@ -1329,7 +1335,7 @@ function cloneSessionReplacementIntent(
   return { ...intent, target: { ...intent.target } };
 }
 
-function normalizeSessionReplacementIntent(
+export function normalizeTelegramSessionReplacementIntent(
   value: unknown,
 ): TelegramSessionReplacementIntent | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -1346,7 +1352,10 @@ function normalizeSessionReplacementIntent(
     typeof record.messageId !== "number" || !Number.isSafeInteger(record.messageId) ||
     typeof record.createdAtMs !== "number" || !Number.isSafeInteger(record.createdAtMs) ||
     typeof record.expiresAtMs !== "number" || !Number.isSafeInteger(record.expiresAtMs) ||
-    record.expiresAtMs <= record.createdAtMs
+    record.expiresAtMs <= record.createdAtMs ||
+    (record.sourceInstanceId !== undefined &&
+      (typeof record.sourceInstanceId !== "string" || !record.sourceInstanceId ||
+        record.sourceInstanceId.length > 256))
   ) return undefined;
   const continuity = record.continuity === "workspace-thread" ||
       record.continuity === "classic-chat"
@@ -1370,6 +1379,8 @@ function normalizeSessionReplacementIntent(
     ...(typeof record.threadName === "string" ? { threadName: record.threadName } : {}),
     createdAtMs: record.createdAtMs,
     expiresAtMs: record.expiresAtMs,
+    ...(typeof record.sourceInstanceId === "string"
+      ? { sourceInstanceId: record.sourceInstanceId } : {}),
   };
 }
 
@@ -1680,7 +1691,7 @@ function parseTopicTargetFile(value: unknown): TelegramTopicTargetFile {
           return normalized ? [normalized] : [];
         })
       : [],
-    sessionReplacement: normalizeSessionReplacementIntent(file.sessionReplacement),
+    sessionReplacement: normalizeTelegramSessionReplacementIntent(file.sessionReplacement),
     reservations: Array.isArray(file.reservations)
       ? file.reservations.flatMap((reservation) => {
           const normalized = normalizeReservation(reservation);
@@ -2510,7 +2521,7 @@ export function createTelegramTopicTargetStore(
         : undefined;
     },
     async commitSessionReplacementIntent(intent, isCurrent) {
-      const next = normalizeSessionReplacementIntent(intent);
+      const next = normalizeTelegramSessionReplacementIntent(intent);
       if (!next || !isCurrent()) return false;
       await loadFromDisk();
       if (!isCurrent()) return false;
@@ -2925,7 +2936,10 @@ export function createTelegramTopicTargetStore(
         replacement.expiresAtMs > getNowMs() &&
         replacement.profileName === (getTelegramProfile() ?? "default") &&
         replacement.cwd === normalizedCwd &&
-        replacement.sourceSessionId !== normalizedSessionId
+        replacement.sourceSessionId !== normalizedSessionId &&
+        (replacement.sourceInstanceId === undefined ||
+          replacement.sourceInstanceId === instanceId ||
+          replacement.sourceInstanceId === previousInstanceId)
       ) {
         const sourceEntry = Array.from(workspaceBindings.entries()).find(([, binding]) =>
           binding.cwd === normalizedCwd &&

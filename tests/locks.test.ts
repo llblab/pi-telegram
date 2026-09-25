@@ -2151,6 +2151,36 @@ test("Locked polling runtime auto-connects a remembered follower under a live le
   }
 });
 
+test("Locked polling runtime reports a refused follower restore without claiming transport", async () => {
+  const temp = createTempLockPath();
+  try {
+    writeFileSync(temp.path, JSON.stringify({ [TELEGRAM_LOCK_KEY]: {
+      pid: 20, cwd: "/leader", instanceId: "leader", heartbeatMs: Date.now(),
+      leaderEpoch: "leader-epoch",
+    } }));
+    const events: string[] = [];
+    const runtime = createTelegramLockedPollingRuntime({
+      lock: createTelegramLockRuntime({ locksPath: temp.path, pid: 10,
+        instanceId: "follower", isProcessAlive: (pid) => pid === 20 }),
+      hasBotToken: () => true,
+      startPolling: async () => { throw new Error("must not poll"); },
+      stopPolling: async () => undefined,
+      restoreFollowerWithOwner: async () => false,
+      onTransportAvailabilityChanged: () => { events.push("availability"); },
+      updateStatus: () => { events.push("status"); },
+      recordRuntimeEvent(_category, _message, details) {
+        if (details?.phase === "follower-auto-connect-unavailable") events.push("refused");
+      },
+    });
+    await runtime.onSessionStart({}, { cwd: "/repo" });
+    await waitForCondition(() => events.includes("refused"));
+    assert.deepEqual(events, ["refused"]);
+    await runtime.suspend();
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
 test("Locked polling runtime session auto-start does not block session initialization", async () => {
   const temp = createTempLockPath();
   try {
