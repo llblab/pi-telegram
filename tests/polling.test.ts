@@ -795,12 +795,14 @@ test("Thread-aware polling refreshes owner-published enabled mode over stale loc
 test("Thread-aware polling auto-restores followers only for remembered Workspaces", async () => {
   let remembered = false;
   let restores = 0;
+  let threadMode: "enabled" | "disabled" = "enabled";
+  const reasons: string[] = [];
   const store = {
     async load() {},
     async refresh() {},
     async persist() {},
     getBotState() {
-      return { threadMode: "enabled" as const };
+      return { threadMode };
     },
     setBotState() {},
     list() {
@@ -830,19 +832,25 @@ test("Thread-aware polling auto-restores followers only for remembered Workspace
       return true;
     },
     stopFollowerRegistration() {},
-    recordEvent() {},
+    recordEvent(_category, _message, details) {
+      if (typeof details?.reason === "string") reasons.push(details.reason);
+    },
   });
 
   assert.equal(
     await ports.restoreFollowerWithOwner(TEST_CONTEXT, { pid: 1 }),
     undefined,
   );
+  threadMode = "disabled";
+  assert.equal(await ports.restoreFollowerWithOwner(TEST_CONTEXT, { pid: 1 }), undefined);
+  threadMode = "enabled";
   remembered = true;
   assert.equal(
     await ports.restoreFollowerWithOwner(TEST_CONTEXT, { pid: 1 }),
     true,
   );
   assert.equal(restores, 1);
+  assert.deepEqual(reasons, ["session-binding-unavailable", "thread-mode-unavailable"]);
 });
 
 test("Thread capability downgrade retries classic restore after failure", async () => {

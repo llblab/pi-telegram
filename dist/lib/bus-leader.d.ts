@@ -135,6 +135,23 @@ export interface TelegramBusLeaderRuntimeAssemblyDeps<TContext> {
     runWorkspaceOperation?: TelegramBusWorkspaceAdmissionRunner;
     workspaceRotation?: TelegramWorkspaceSlotRotationPorts;
 }
+export type TelegramBusFollowerSessionReplacementOperation = (follower: TelegramBusFollowerView, intent: Threads.TelegramSessionReplacementIntent, isCurrent: () => boolean) => Promise<boolean>;
+/**
+ * Leader-owned durable session-replacement authority for registered followers.
+ * Followers cannot persist `state.json`; the leader validates the request
+ * against its live registry entry and authoritative Workspace binding before
+ * one CAS publication or claim. Follower memory is never accepted as binding
+ * evidence.
+ */
+export declare function createTelegramBusFollowerSessionReplacementAuthority(deps: {
+    store: Pick<Threads.TelegramTopicTargetStore, "load" | "getWorkspaceBindingByTarget" | "getSessionReplacementIntent" | "commitSessionReplacementIntent" | "removeSessionReplacementIntent">;
+    getTelegramProfile?: () => string | undefined;
+    getNowMs?: () => number;
+    ttlMs?: number;
+}): {
+    publish: TelegramBusFollowerSessionReplacementOperation;
+    settle: TelegramBusFollowerSessionReplacementOperation;
+};
 export declare function createTelegramBusLeaderRuntimeAssembly<TContext>(deps: TelegramBusLeaderRuntimeAssemblyDeps<TContext>): TelegramBusLeaderRuntime<TContext> & {
     renameLeaderThreadAdmitted: (threadName: string, expectedTarget?: Threads.TelegramTopicTargetRecord["target"]) => Promise<Threads.TelegramTopicTargetRecord>;
     resetLeaderThreadName: (expectedTarget: Threads.TelegramTopicTargetRecord["target"]) => Promise<{
@@ -188,6 +205,8 @@ export interface TelegramBusLeaderRuntimeDeps<TContext> {
     }> | {
         threadName: string;
     };
+    publishFollowerSessionReplacement?: TelegramBusFollowerSessionReplacementOperation;
+    settleFollowerSessionReplacement?: TelegramBusFollowerSessionReplacementOperation;
     getFollowerDisplayTitle?: (follower: TelegramBusFollowerView) => string | undefined;
     onFollowerRegistered?: () => void;
     applyThreadDisplayMode?: (mode: TelegramThreadDisplayMode, isCurrent: () => boolean) => Promise<void>;
@@ -273,6 +292,8 @@ export declare function createTelegramBusLeaderEnvelopeHandler(deps: {
     }> | {
         threadName: string;
     };
+    publishFollowerSessionReplacement?: TelegramBusFollowerSessionReplacementOperation;
+    settleFollowerSessionReplacement?: TelegramBusFollowerSessionReplacementOperation;
     getFollowerDisplayTitle?: (follower: TelegramBusFollowerView) => string | undefined;
     onFollowerRegistered?: () => void;
     applyThreadDisplayMode?: (mode: TelegramThreadDisplayMode, isCurrent: () => boolean) => Promise<void>;

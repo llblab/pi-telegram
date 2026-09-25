@@ -65,6 +65,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
+  TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
 } from "../lib/bus.ts";
 import {
   getTelegramThreadOwnerFromProfileKey,
@@ -692,6 +693,43 @@ test("Bus contract encodes and parses Workspace Thread rename envelopes", () => 
     reset,
   );
   assert.equal(getTelegramBusEnvelopeTrafficClass(reset), "generation-fenced");
+});
+
+test("Bus contract parses exact follower session replacement envelopes and rejects malformed intents", () => {
+  const intent = {
+    continuity: "workspace-thread" as const, cwd: "/repo", profileName: "default",
+    sourceSessionId: "session-old", sourceUpdateId: 41,
+    target: { chatId: 7, threadId: 42 }, messageId: 99, slot: "B",
+    threadName: "Beacon", createdAtMs: 1000, expiresAtMs: 31_000,
+    sourceInstanceId: "inst-a",
+  };
+  for (const kind of [
+    "follower.publishSessionReplacement",
+    "follower.settleSessionReplacement",
+  ] as const) {
+    const envelope = { kind, requestId: "inst-a:5", instanceId: "inst-a",
+      registrationGeneration: "inst-a:1", intent, sentAtMs: 2000 };
+    assert.deepEqual(
+      parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()),
+      envelope,
+    );
+    assert.equal(getTelegramBusEnvelopeTrafficClass(envelope), "generation-fenced");
+    for (const malformed of [
+      { ...intent, sourceInstanceId: "" },
+      { ...intent, continuity: "classic-chat" },
+      { ...intent, expiresAtMs: intent.createdAtMs },
+      { ...intent, target: { chatId: "7", threadId: 42 } },
+    ]) {
+      assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope,
+        intent: malformed })), undefined);
+    }
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope,
+      registrationGeneration: undefined })), undefined);
+  }
+  assert.equal(
+    TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
+    "session-replacement-intent-v1",
+  );
 });
 
 test("Bus contract encodes and parses follower target replacement envelopes", () => {

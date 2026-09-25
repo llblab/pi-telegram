@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.51.5: Follower Thread new-session hotfix
+
+- `Follower Thread /new`: Telegram `/new` now starts a new session in a follower's Pi process and preserves its Thread binding. The leader publishes and later claims the durable replacement intent through capability-gated, generation-fenced bus requests, validating its own live registration and Workspace binding before accepting the follower's request. Incompatible or stale leaders fail closed rather than silently switching sessions.
+- `Follower restore diagnostics`: Session startup now records when automatic follower restore lacks a session binding, Threaded Mode, or leader-side Workspace authority, or finishes without connecting. Restore-only refusal still cannot create a new Thread; `/telegram-connect` remains the explicit recovery path.
+
 ## 0.51.4: Resolver-owned Skills and drift-safe Git installs
 
 - `Resolver-owned Skills`: Auto-discovered user/project checkouts now contribute source Skills even when Pi selects their compiled entrypoint, while manifest-loaded npm, Git, and Pi Kit packages retain `pi.skills` filters and package provenance. Resolver regressions cover checkout and filtered-package behavior; unsupported source manifest aliases are removed.

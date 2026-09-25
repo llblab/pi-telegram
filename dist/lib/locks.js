@@ -1171,8 +1171,12 @@ export function createTelegramLockedPollingRuntime(deps) {
                     return;
                 if (canRestoreRememberedFollower && state?.kind === "active-elsewhere") {
                     const restored = await deps.restoreFollowerWithOwner?.(ctx, state.lock);
-                    if (!isCurrent() || !restored)
+                    if (!isCurrent())
                         return;
+                    if (!restored) {
+                        deps.recordRuntimeEvent?.("lock", "Telegram follower auto-connect did not restore this session.", { phase: "follower-auto-connect-unavailable" });
+                        return;
+                    }
                     deps.onTransportAvailabilityChanged?.();
                     deps.updateStatus(ctx);
                     deps.recordRuntimeEvent?.("bus", "Telegram follower auto-connect completed", { phase: "follower-auto-connect" });

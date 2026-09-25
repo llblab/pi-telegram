@@ -2243,6 +2243,7 @@ test("Bus follower restore-only registration exits quietly without a remembered 
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-auto-connect-"));
   const socketPath = join(dir, "bus.sock");
   let restoreOnly = false;
+  const reasons: string[] = [];
   const registry = createTelegramBusFollowerRegistry();
   const server = createTelegramBusLocalServer({
     socketPath,
@@ -2259,6 +2260,9 @@ test("Bus follower restore-only registration exits quietly without a remembered 
     instanceId: "inst-a",
     createRequestId: () => "inst-a:restore:1",
     registrationState: state,
+    recordRuntimeEvent(_category, _message, details) {
+      if (typeof details?.reason === "string") reasons.push(details.reason);
+    },
   });
   try {
     await server.start();
@@ -2271,6 +2275,7 @@ test("Bus follower restore-only registration exits quietly without a remembered 
       false,
     );
     assert.equal(restoreOnly, true);
+    assert.deepEqual(reasons, ["leader-binding-unavailable"]);
     assert.equal(state.isRegistered(), false);
     assert.equal(registry.get("inst-a"), undefined);
   } finally {

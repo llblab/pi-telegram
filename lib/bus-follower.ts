@@ -48,6 +48,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
   TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT,
+  TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
 } from "./bus.ts";
 import type { TelegramConfigStore, TelegramThreadDisplayMode } from "./config.ts";
 import {
@@ -142,6 +143,11 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
     target: TelegramTarget & { threadId: number },
   ) => Promise<string>;
   setThreadDisplayMode?: (mode: TelegramThreadDisplayMode) => Promise<void>;
+  /** Leader-mediated durable publication or successor claim; true only after exact commit. */
+  requestSessionReplacement?: (
+    operation: "publish" | "settle",
+    intent: Threads.TelegramSessionReplacementIntent,
+  ) => Promise<boolean>;
   stop: () => void;
 }
 
@@ -1919,7 +1925,13 @@ export function createTelegramBusFollowerRegistrationRuntime<
         if (
           registrationOptions?.restoreWorkspace &&
           response.error?.code === "workspace-binding-unavailable"
-        ) return false;
+        ) {
+          deps.recordRuntimeEvent?.("bus", "Telegram follower auto-connect refused by leader: Workspace binding unavailable.", {
+            phase: "follower-auto-connect-skip",
+            reason: "leader-binding-unavailable",
+          });
+          return false;
+        }
         throw new Error(
           response.message ??
             "Telegram bus follower registration was rejected.",
@@ -2143,6 +2155,72 @@ export function createTelegramBusFollowerRegistrationRuntime<
         });
       }
       return resetName;
+    },
+    async requestSessionReplacement(operation, intent) {
+      if (!activeLeaderSocketPath || !activeRegistrationGeneration) {
+        throw new Error("Telegram follower is not registered with the leader.");
+      }
+      if (
+        !hasTelegramBusCapability(
+          deps.protocolIdentity,
+          TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
+        ) ||
+        !hasTelegramBusCapability(
+          deps.registrationState?.getLeaderProtocol(),
+          TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
+        )
+      ) {
+        throw new Error(
+          "The active Telegram leader does not support follower session replacement. Update or restart that Pi instance.",
+        );
+      }
+      const expectedLeaderSocketPath = activeLeaderSocketPath;
+      const expectedRegistrationGeneration = activeRegistrationGeneration;
+      const expectedAuthSecret = activeAuthSecret;
+      const requestId = deps.createRequestId();
+      const response = await sendTelegramBusLocalEnvelope({
+        socketPath: expectedLeaderSocketPath,
+        timeoutMs: registrationTimeoutMs,
+        retry: getTelegramBusTransportRetryPolicy({
+          endpoint: expectedLeaderSocketPath,
+          operation: "operation",
+        }),
+        envelope: {
+          kind: operation === "publish"
+            ? "follower.publishSessionReplacement"
+            : "follower.settleSessionReplacement",
+          requestId,
+          auth: expectedAuthSecret,
+          instanceId: deps.instanceId,
+          registrationGeneration: expectedRegistrationGeneration,
+          intent,
+          sentAtMs: getNowMs(),
+        },
+      });
+      if (
+        response?.kind !== "bus.ack" || !response.ok ||
+        response.requestId !== requestId ||
+        !isRecord(response.result) || response.result.committed !== true
+      ) {
+        throw new Error(
+          response?.kind === "bus.ack"
+            ? (response.message ?? "Telegram session replacement was rejected.")
+            : "Telegram session replacement was not acknowledged.",
+        );
+      }
+      if (
+        activeLeaderSocketPath !== expectedLeaderSocketPath ||
+        activeRegistrationGeneration !== expectedRegistrationGeneration ||
+        activeAuthSecret !== expectedAuthSecret ||
+        (deps.registrationState &&
+          deps.registrationState.getGeneration() !==
+            expectedRegistrationGeneration)
+      ) {
+        throw new Error(
+          "Telegram session replacement completed for a stale follower registration.",
+        );
+      }
+      return true;
     },
     async disconnectFromLeader() {
       if (!activeLeaderSocketPath || !activeRegistrationGeneration) {

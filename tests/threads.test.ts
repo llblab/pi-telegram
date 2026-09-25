@@ -1128,6 +1128,39 @@ test("Session replacement intent re-keys the exact Workspace binding for a succe
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("Follower-published replacement intent re-keys only for its exact source instance lineage", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-follower-session-rekey-"));
+  const path = join(dir, "state.json");
+  try {
+    const seed = createTelegramTopicTargetStore({ path, getNowMs: () => 1000 });
+    const oldIdentity = createTelegramWorkspaceBindingIdentity("/repo", 0, "session-old")!;
+    const target = { chatId: 7, threadId: 42 };
+    seed.upsertWorkspaceBinding({ ...oldIdentity, target, slot: "C", threadName: "Cedar", updatedAtMs: 1 });
+    await seed.persist();
+    const intent = { continuity: "workspace-thread" as const, cwd: "/repo",
+      profileName: "default", sourceSessionId: "session-old", sourceUpdateId: 41,
+      target, messageId: 99, slot: "C", threadName: "Cedar", createdAtMs: 1000,
+      expiresAtMs: 31_000, sourceInstanceId: "follower-old" };
+    assert.equal(await seed.commitSessionReplacementIntent(
+      { ...intent, sourceInstanceId: "" }, () => true), false);
+    assert.equal(await seed.commitSessionReplacementIntent(intent, () => true), true);
+
+    const successor = createTelegramTopicTargetStore({ path, getNowMs: () => 2000 });
+    await successor.load();
+    assert.deepEqual(successor.getSessionReplacementIntent(), intent);
+    assert.equal(successor.claimWorkspaceIdentity("/repo", "intruder", undefined,
+      { sessionId: "session-intruder", existingBindingOnly: true }), undefined);
+    assert.equal(successor.claimWorkspaceIdentity("/repo", "intruder", "other-old",
+      { sessionId: "session-intruder", existingBindingOnly: true }), undefined);
+    assert.deepEqual(successor.getWorkspaceBinding("/repo", "a", "session-old")?.target, target);
+    const claimed = successor.claimWorkspaceIdentity("/repo", "follower-new", "follower-old",
+      { sessionId: "session-new", existingBindingOnly: true });
+    assert.equal(claimed?.slot, "C");
+    assert.equal(successor.getWorkspaceBinding("/repo", "a", "session-old"), undefined);
+    assert.deepEqual(successor.getWorkspaceBinding("/repo", "a", "session-new")?.target, target);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("Workspace binding moves an existing Thread and slot to a replacement session", () => {
   const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
   const previous = store.claimWorkspaceIdentity("/repo", "instance-old", undefined, {

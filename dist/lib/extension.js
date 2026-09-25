@@ -60,6 +60,7 @@ const telegramBusProtocolIdentity = Bus.createTelegramCurrentBusProtocolIdentity
     Bus.TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
     Bus.TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
     Bus.TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT,
+    Bus.TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
 ]);
 // --- Extension Runtime ---
 export default function (pi) {
@@ -191,6 +192,21 @@ export default function (pi) {
         store: threadStore,
         getProfileName: configStore.getActiveProfileName,
         ownsPersistence: lockRuntime.owns,
+        follower: {
+            instanceId: telegramInstanceId,
+            isRegisteredFor(target) {
+                const registered = telegramBusFollowerRegistrationState.getTarget();
+                return telegramBusFollowerRegistrationState.isRegistered() &&
+                    registered?.chatId === target.chatId &&
+                    registered.threadId === target.threadId;
+            },
+            async requestSessionReplacement(operation, intent) {
+                const request = telegramBusFollowerRegistration.requestSessionReplacement;
+                if (!request)
+                    return false;
+                return await request(operation, intent);
+            },
+        },
         async sendResult(target, html) {
             const delivery = await Delivery.sendTelegramView({ text: html, parseMode: "html", replyMarkup: { inline_keyboard: [] } }, { scope: { kind: "target", target } });
             return delivery.ok ? { ok: true } : { ok: false,

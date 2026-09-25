@@ -52,6 +52,10 @@ import type { TelegramTarget } from "./target.ts";
 import type { TelegramThreadDisplayMode } from "./config.ts";
 import { isProcessAlive } from "./locks.ts";
 import { resolveAgentDir } from "./paths.ts";
+import {
+  normalizeTelegramSessionReplacementIntent,
+  type TelegramSessionReplacementIntent,
+} from "./threads.ts";
 
 export interface TelegramBusProcessRuntime {
   instanceId: string;
@@ -234,6 +238,8 @@ export const TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT =
   "directory-display-format-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT =
   "workspace-follower-auto-connect-v1" as const;
+export const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT =
+  "session-replacement-intent-v1" as const;
 
 export interface TelegramBusProtocolIdentity {
   protocolVersion: number;
@@ -817,6 +823,16 @@ export type TelegramBusEnvelope = (
       sentAtMs: number;
     }
   | {
+      kind:
+        | "follower.publishSessionReplacement"
+        | "follower.settleSessionReplacement";
+      requestId: string;
+      instanceId: string;
+      registrationGeneration: string;
+      intent: TelegramSessionReplacementIntent;
+      sentAtMs: number;
+    }
+  | {
       kind: "leader.forwardCallback";
       requestId: string;
       recipientInstanceId: string;
@@ -1050,6 +1066,23 @@ export function parseTelegramBusEnvelope(
           instanceId: value.instanceId,
           registrationGeneration: value.registrationGeneration,
           target: { chatId: target.chatId, threadId: target.threadId },
+          sentAtMs: value.sentAtMs,
+        };
+      }
+      break;
+    }
+    case "follower.publishSessionReplacement":
+    case "follower.settleSessionReplacement": {
+      const intent = normalizeTelegramSessionReplacementIntent(value.intent);
+      if (typeof value.instanceId === "string" &&
+          typeof value.registrationGeneration === "string" &&
+          typeof value.sentAtMs === "number" && intent) {
+        envelope = {
+          kind,
+          requestId,
+          instanceId: value.instanceId,
+          registrationGeneration: value.registrationGeneration,
+          intent,
           sentAtMs: value.sentAtMs,
         };
       }

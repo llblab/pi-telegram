@@ -645,6 +645,19 @@ export interface TelegramSessionActionAssemblyDeps {
     };
     getProfileName: () => string | undefined;
     ownsPersistence: () => boolean;
+    /**
+     * Registered-follower port. A follower cannot persist leader-owned state, so
+     * its Workspace Thread intent is published and claimed by the leader over
+     * authenticated generation-fenced bus RPC.
+     */
+    follower?: {
+        instanceId: string;
+        isRegisteredFor: (target: {
+            chatId: number;
+            threadId?: number;
+        }) => boolean;
+        requestSessionReplacement: (operation: "publish" | "settle", intent: TelegramSessionReplacementIntent) => Promise<boolean>;
+    };
     sendResult: (target: {
         chatId: number;
         threadId?: number;

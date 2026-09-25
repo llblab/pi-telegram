@@ -11,7 +11,7 @@ import * as Threads from "./threads.js";
 import { parseTelegramUpdateJournalQueueOwner } from "./journal.js";
 import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS, } from "./locks.js";
 import { isTelegramApiMethodRetrySafe, TelegramApiCommitUnknownError, TelegramApiStaleTargetError, } from "./telegram-api.js";
-import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusFollowerTargetController, createTelegramBusForeignOwnedUpdateForwarder, createTelegramBusLocalServer, createTelegramBusRequestIdFactory, createUnauthorizedBusAck, getTelegramBusProtocolCompatibility, getTelegramBusSocketPath, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, } from "./bus.js";
+import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusFollowerTargetController, createTelegramBusForeignOwnedUpdateForwarder, createTelegramBusLocalServer, createTelegramBusRequestIdFactory, createUnauthorizedBusAck, getTelegramBusProtocolCompatibility, getTelegramBusSocketPath, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, } from "./bus.js";
 import { getTelegramBusTransportRetryPolicy, TELEGRAM_BUS_REGISTRATION_RETRY, } from "./bus-transport.js";
 import { createTelegramWorkspaceAdmissionOperationId, runWithTelegramWorkspaceAdmissionsAsync, } from "./workspace-admission.js";
 export const TELEGRAM_BUS_FOLLOWER_PROMOTION_GRACE_MS = 2_500;
@@ -1214,8 +1214,13 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
                 deps.setActiveAuthSecret?.(undefined);
                 await deps.stopReceiving?.();
                 if (registrationOptions?.restoreWorkspace &&
-                    response.error?.code === "workspace-binding-unavailable")
+                    response.error?.code === "workspace-binding-unavailable") {
+                    deps.recordRuntimeEvent?.("bus", "Telegram follower auto-connect refused by leader: Workspace binding unavailable.", {
+                        phase: "follower-auto-connect-skip",
+                        reason: "leader-binding-unavailable",
+                    });
                     return false;
+                }
                 throw new Error(response.message ??
                     "Telegram bus follower registration was rejected.");
             }
@@ -1425,6 +1430,54 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
                 });
             }
             return resetName;
+        },
+        async requestSessionReplacement(operation, intent) {
+            if (!activeLeaderSocketPath || !activeRegistrationGeneration) {
+                throw new Error("Telegram follower is not registered with the leader.");
+            }
+            if (!hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT) ||
+                !hasTelegramBusCapability(deps.registrationState?.getLeaderProtocol(), TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT)) {
+                throw new Error("The active Telegram leader does not support follower session replacement. Update or restart that Pi instance.");
+            }
+            const expectedLeaderSocketPath = activeLeaderSocketPath;
+            const expectedRegistrationGeneration = activeRegistrationGeneration;
+            const expectedAuthSecret = activeAuthSecret;
+            const requestId = deps.createRequestId();
+            const response = await sendTelegramBusLocalEnvelope({
+                socketPath: expectedLeaderSocketPath,
+                timeoutMs: registrationTimeoutMs,
+                retry: getTelegramBusTransportRetryPolicy({
+                    endpoint: expectedLeaderSocketPath,
+                    operation: "operation",
+                }),
+                envelope: {
+                    kind: operation === "publish"
+                        ? "follower.publishSessionReplacement"
+                        : "follower.settleSessionReplacement",
+                    requestId,
+                    auth: expectedAuthSecret,
+                    instanceId: deps.instanceId,
+                    registrationGeneration: expectedRegistrationGeneration,
+                    intent,
+                    sentAtMs: getNowMs(),
+                },
+            });
+            if (response?.kind !== "bus.ack" || !response.ok ||
+                response.requestId !== requestId ||
+                !isRecord(response.result) || response.result.committed !== true) {
+                throw new Error(response?.kind === "bus.ack"
+                    ? (response.message ?? "Telegram session replacement was rejected.")
+                    : "Telegram session replacement was not acknowledged.");
+            }
+            if (activeLeaderSocketPath !== expectedLeaderSocketPath ||
+                activeRegistrationGeneration !== expectedRegistrationGeneration ||
+                activeAuthSecret !== expectedAuthSecret ||
+                (deps.registrationState &&
+                    deps.registrationState.getGeneration() !==
+                        expectedRegistrationGeneration)) {
+                throw new Error("Telegram session replacement completed for a stale follower registration.");
+            }
+            return true;
         },
         async disconnectFromLeader() {
             if (!activeLeaderSocketPath || !activeRegistrationGeneration) {

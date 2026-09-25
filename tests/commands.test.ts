@@ -65,9 +65,16 @@ import {
   TELEGRAM_RESERVED_COMMAND_NAMES,
 } from "../lib/commands.ts";
 import { runTelegramPollLoop } from "../lib/polling.ts";
-import { createTelegramTopicTargetStore } from "../lib/threads.ts";
+import {
+  createTelegramTopicTargetStore,
+  type TelegramSessionReplacementIntent,
+} from "../lib/threads.ts";
 import { createTelegramPollingStartRecoveryHandler } from "../lib/recovery.ts";
-import type { ExtensionAPI, ExtensionCommandContext } from "../lib/pi.ts";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+} from "../lib/pi.ts";
 
 type RegisteredBridgeCommand = {
   description: string;
@@ -2643,6 +2650,131 @@ test("Classic session action publishes chat continuity without a Workspace bindi
     sourceSessionId: "session-old", sourceUpdateId: 41,
     target: { chatId: 7 }, messageId: 9, createdAtMs: 1000, expiresAtMs: 31_000,
   }]);
+});
+
+test("Follower Thread session action publishes and settles through leader-mediated authority", async () => {
+  const threadTarget = { chatId: 7, threadId: 8 };
+  const createHarness = (options: {
+    registered?: boolean;
+    publish?: (intent: TelegramSessionReplacementIntent) => Promise<boolean>;
+  } = {}) => {
+    const commands = new Map<string, RegisteredCommand>();
+    const dispatched: string[] = [];
+    const requests: Array<{ operation: string; intent: TelegramSessionReplacementIntent }> = [];
+    const localCommits: TelegramSessionReplacementIntent[] = [];
+    const localRemovals: TelegramSessionReplacementIntent[] = [];
+    const results: string[] = [];
+    const state = { registered: options.registered ?? true, refreshes: 0, rekeyed: false,
+      intent: undefined as TelegramSessionReplacementIntent | undefined };
+    const assembly = createTelegramSessionActionAssembly({
+      registerCommand: (name, definition) => { commands.set(name, definition as RegisteredCommand); },
+      sendUserMessage: async (content) => { dispatched.push(content as string); },
+      store: {
+        load: async () => {},
+        refresh: async () => { state.refreshes += 1; },
+        getWorkspaceBindingByTarget: (_target, sessionId) =>
+          sessionId === undefined || sessionId === (state.rekeyed ? "session-new" : "session-old")
+            ? { cwd: "/repo", sessionId: state.rekeyed ? "session-new" : "session-old",
+                slot: "B", threadName: "Beacon", target: threadTarget }
+            : undefined,
+        getSessionReplacementIntent: () => state.intent,
+        commitSessionReplacementIntent: async (intent, isCurrent) => {
+          localCommits.push(intent);
+          return isCurrent();
+        },
+        removeSessionReplacementIntent: async (intent) => { localRemovals.push(intent); return true; },
+      },
+      getProfileName: () => undefined,
+      ownsPersistence: () => false,
+      follower: {
+        instanceId: "follower-a",
+        isRegisteredFor: (target) => state.registered &&
+          target.chatId === threadTarget.chatId && target.threadId === threadTarget.threadId,
+        async requestSessionReplacement(operation, intent) {
+          requests.push({ operation, intent });
+          if (operation === "publish") {
+            return options.publish ? options.publish(intent) : true;
+          }
+          return true;
+        },
+      },
+      sendResult: async (_target, html) => { results.push(html); return { ok: true }; },
+      handoffTtlMs: 30_000,
+      now: () => 1000,
+    });
+    assembly.action.register();
+    const run = async () => {
+      assert.equal(assembly.action.scheduleAfterUpdate(41, { ...threadTarget, messageId: 9 }), true);
+      assembly.action.onUpdateCompleted(41);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      let newSessions = 0;
+      await commands.get(TELEGRAM_INTERNAL_COMMAND_NAME)!.handler(
+        getInternalCommandToken(dispatched.at(-1)!), {
+        cwd: "/repo",
+        sessionManager: { getSessionId: () => "session-old" },
+        newSession: async () => { newSessions += 1; return { cancelled: false }; },
+      } as unknown as ExtensionCommandContext);
+      return newSessions;
+    };
+    return { assembly, requests, localCommits, localRemovals, results, state, run };
+  };
+
+  const success = createHarness();
+  assert.equal(await success.run(), 1);
+  assert.equal(success.state.refreshes, 1);
+  assert.deepEqual(success.localCommits, []);
+  assert.deepEqual(success.requests, [{ operation: "publish", intent: {
+    continuity: "workspace-thread", cwd: "/repo", profileName: "default",
+    sourceSessionId: "session-old", sourceUpdateId: 41, target: threadTarget,
+    messageId: 9, slot: "B", threadName: "Beacon", createdAtMs: 1000,
+    expiresAtMs: 31_000, sourceInstanceId: "follower-a",
+  } }]);
+  assert.deepEqual(success.results, []);
+
+  // The successor claims only after the leader re-keyed its binding and its
+  // own follower registration is live again.
+  // Successor settlement uses the real clock; publish a live copy of the intent.
+  const liveAtMs = Date.now();
+  const intent = { ...success.requests[0]!.intent,
+    createdAtMs: liveAtMs, expiresAtMs: liveAtMs + 30_000 };
+  success.state.intent = intent;
+  success.state.registered = false;
+  success.state.rekeyed = true;
+  let delivered!: () => void;
+  const delivery = new Promise<void>((resolve) => { delivered = resolve; });
+  const sendResultCount = () => success.results.length;
+  success.assembly.settlement.onSessionStart({ cwd: "/repo",
+    sessionManager: { getSessionId: () => "session-new" } } as unknown as ExtensionContext);
+  await new Promise<void>((resolve) => setTimeout(resolve, 150));
+  assert.equal(success.requests.length, 1);
+  success.state.registered = true;
+  const poll = setInterval(() => { if (sendResultCount() > 0) delivered(); }, 10);
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([delivery, new Promise<never>((_, reject) => {
+      guard = setTimeout(() => reject(new Error("Successor settlement did not deliver.")), 2_000);
+    })]);
+  } finally { clearInterval(poll); if (guard) clearTimeout(guard); }
+  assert.deepEqual(success.requests.slice(1), [{ operation: "settle", intent }]);
+  assert.deepEqual(success.localRemovals, []);
+  assert.deepEqual(success.results, ["<b>🆕 New session started.</b>"]);
+
+  for (const publish of [
+    async () => false,
+    async () => { throw new Error("Stale Telegram bus follower registration generation."); },
+  ]) {
+    const rejected = createHarness({ publish });
+    assert.equal(await rejected.run(), 0);
+    assert.deepEqual(rejected.localCommits, []);
+    assert.deepEqual(rejected.results, ["<b>⚠️ New session failed.</b>"]);
+  }
+
+  const unregistered = createHarness({ registered: false });
+  assert.equal(await unregistered.run(), 0);
+  assert.deepEqual(unregistered.requests, []);
+  assert.equal(unregistered.localCommits.length, 1);
+  assert.equal(unregistered.localCommits[0]!.sourceInstanceId, undefined);
+  assert.deepEqual(unregistered.results, ["<b>⚠️ New session failed.</b>"]);
 });
 
 test("Classic successor settles once across same-process and process-replacement startup", async () => {

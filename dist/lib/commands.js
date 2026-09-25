@@ -1294,7 +1294,15 @@ export function createTelegramSessionActionAssembly(deps) {
         sendUserMessage: deps.sendUserMessage,
         notifyResult(target, result) { return sendTerminalResult(target, result); },
         async prepareReplacement(ctx, updateId, target) {
-            await deps.store.load();
+            const follower = !deps.ownsPersistence() && typeof target.threadId === "number" &&
+                deps.follower?.isRegisteredFor(target)
+                ? deps.follower
+                : undefined;
+            // Follower memory is not authority; reread the leader-published snapshot.
+            if (follower && deps.store.refresh)
+                await deps.store.refresh();
+            else
+                await deps.store.load();
             const sessionId = ctx.sessionManager.getSessionId();
             const binding = typeof target.threadId === "number"
                 ? deps.store.getWorkspaceBindingByTarget(target)
@@ -1304,7 +1312,7 @@ export function createTelegramSessionActionAssembly(deps) {
                 throw new Error("Telegram session replacement binding is unavailable.");
             }
             const createdAtMs = now();
-            if (!await deps.store.commitSessionReplacementIntent({
+            const intent = {
                 continuity: binding ? "workspace-thread" : "classic-chat",
                 cwd: binding?.cwd ?? ctx.cwd,
                 profileName: deps.getProfileName() ?? "default",
@@ -1317,7 +1325,11 @@ export function createTelegramSessionActionAssembly(deps) {
                     ? { threadName: binding.manualThreadName ?? binding.threadName } : {}),
                 createdAtMs,
                 expiresAtMs: createdAtMs + deps.handoffTtlMs,
-            }, deps.ownsPersistence)) {
+                ...(follower ? { sourceInstanceId: follower.instanceId } : {}),
+            };
+            if (!await (follower
+                ? follower.requestSessionReplacement("publish", intent)
+                : deps.store.commitSessionReplacementIntent(intent, deps.ownsPersistence))) {
                 throw new Error("Telegram session replacement intent was not persisted.");
             }
         },
@@ -1331,11 +1343,22 @@ export function createTelegramSessionActionAssembly(deps) {
             return {
                 async getIntent() { await deps.store.refresh?.(); return deps.store.getSessionReplacementIntent(); },
                 hasSuccessorContinuity(intent) {
-                    return intent.continuity === "classic-chat" ||
-                        deps.store.getWorkspaceBindingByTarget(intent.target, sessionId)?.cwd === intent.cwd;
+                    if (intent.continuity === "classic-chat")
+                        return true;
+                    if (deps.store.getWorkspaceBindingByTarget(intent.target, sessionId)?.cwd !==
+                        intent.cwd)
+                        return false;
+                    // A follower successor claims only after its own re-registration is live.
+                    return intent.sourceInstanceId === undefined || deps.ownsPersistence() ||
+                        deps.follower?.isRegisteredFor(intent.target) === true;
                 },
                 editSuccess(intent) { return deps.sendResult(intent.target, "<b>🆕 New session started.</b>"); },
-                clearIntent(intent) { return deps.store.removeSessionReplacementIntent(intent, deps.ownsPersistence); },
+                async clearIntent(intent) {
+                    if (intent.sourceInstanceId === undefined || deps.ownsPersistence()) {
+                        return deps.store.removeSessionReplacementIntent(intent, deps.ownsPersistence);
+                    }
+                    return await deps.follower?.requestSessionReplacement("settle", intent) ?? false;
+                },
                 profileName: deps.getProfileName() ?? "default",
                 cwd: ctx.cwd,
                 sessionId,
