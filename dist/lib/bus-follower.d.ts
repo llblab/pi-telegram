@@ -11,7 +11,7 @@ import { type TelegramUpdateJournalStoreOptions } from "./journal.ts";
 import { type TelegramLockEntry, type TelegramLockState } from "./locks.ts";
 import type { TelegramQueueHandoffPayload, TelegramQueueHandoffStageResult } from "./queue.ts";
 import type { TelegramTarget } from "./target.ts";
-import { type TelegramBusAgentMessage, type TelegramBusAgentTargetSelector, type TelegramBusEnvelope, type TelegramBusForwardOwnership, type TelegramBusProtocolIdentity, type TelegramBusSocketPathSource } from "./bus.ts";
+import { type TelegramBusAgentMessage, type TelegramBusAgentTargetSelector, type TelegramBusEnvelope, type TelegramBusForwardOwnership, type TelegramBusFollowerDisconnectResult, type TelegramBusProtocolIdentity, type TelegramBusSocketPathSource } from "./bus.ts";
 import type { TelegramConfigStore, TelegramThreadDisplayMode } from "./config.ts";
 import { type TelegramWorkspaceAdmissionLedger } from "./workspace-admission.ts";
 export declare const TELEGRAM_BUS_FOLLOWER_PROMOTION_GRACE_MS = 2500;
@@ -36,6 +36,23 @@ export declare function isTelegramFollowerSessionHandoffFresh(handoff: TelegramF
     nowMs?: number;
     ttlMs?: number;
 }): handoff is TelegramFollowerSessionHandoff;
+export interface TelegramBusFollowerDisconnectOutcome {
+    requestId: string;
+    instanceId: string;
+    registrationGeneration: string;
+    target?: TelegramTarget & {
+        threadId: number;
+    };
+    deletion?: TelegramBusFollowerDisconnectResult;
+}
+export type TelegramBusFollowerQuitDisconnectAttempt = {
+    status: "disconnected";
+    outcome: TelegramBusFollowerDisconnectOutcome;
+} | {
+    status: "refused";
+    reason: "busy" | "unknown" | "changed" | "unsupported";
+    message: string;
+};
 export interface TelegramBusFollowerRegistrationRuntime<TContext> {
     registerWithLeader: (ctx: TContext, leader: {
         busSocketPath?: string;
@@ -47,6 +64,10 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
     }) => Promise<boolean>;
     setContext: (ctx: TContext) => void | Promise<void>;
     disconnectFromLeader?: () => Promise<boolean>;
+    /** Exact current-response evidence for delete-first quit; absent deletion is not failure of ordinary disconnect. */
+    disconnectFromLeaderWithResult?: () => Promise<TelegramBusFollowerDisconnectOutcome | undefined>;
+    /** Distinguishes certified pre-effect refusal from ambiguous transport/effect failure. */
+    disconnectFromLeaderForQuit?: () => Promise<TelegramBusFollowerQuitDisconnectAttempt | undefined>;
     renameThread?: (target: TelegramTarget & {
         threadId: number;
     }, threadName: string) => Promise<string>;

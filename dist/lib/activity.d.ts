@@ -194,6 +194,8 @@ export interface TelegramActivityPublicationReservation {
     cancel: () => void;
 }
 export interface TelegramActivityPublicationRuntime {
+    /** Includes reservations, queued publication and effects still running after reset. */
+    hasPendingWork: () => boolean;
     enqueue: (task: () => Promise<void>) => Promise<void>;
     reserve: () => TelegramActivityPublicationReservation;
     reset: () => void;

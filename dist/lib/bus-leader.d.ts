@@ -10,7 +10,7 @@ import * as ThreadReconciler from "./thread-reconciler.ts";
 import { type TelegramApiCallOptions } from "./telegram-api.ts";
 import type { TelegramTarget } from "./target.ts";
 import * as Threads from "./threads.ts";
-import { type TelegramBusEnvelope, type TelegramBusFollowerRegistry, type TelegramBusFollowerView, type TelegramBusInstanceRegistration, type TelegramBusProtocolIdentity, type TelegramBusSocketPathSource } from "./bus.ts";
+import { type TelegramBusEnvelope, type TelegramBusFollowerRegistry, type TelegramBusFollowerView, type TelegramBusFollowerDisconnectResult, type TelegramBusInstanceRegistration, type TelegramBusProtocolIdentity, type TelegramBusSocketPathSource } from "./bus.ts";
 import type { TelegramQueueHandoffPayload } from "./queue.ts";
 import { type TelegramWorkspaceCapacityRunner, type TelegramWorkspaceSlotRotationPorts, type TelegramWorkspaceOperationRunner } from "./workspace-retirement.ts";
 import { type TelegramWorkspaceAdmissionLedger } from "./workspace-admission.ts";
@@ -212,6 +212,9 @@ export interface TelegramBusLeaderRuntimeDeps<TContext> {
     applyThreadDisplayMode?: (mode: TelegramThreadDisplayMode, isCurrent: () => boolean) => Promise<void>;
     getThreadDisplayMode?: () => TelegramThreadDisplayMode;
     getCurrentLeaderEpoch?: () => number | string | undefined;
+    /** When paired, disconnect closes forwarding and checks current leader-source settlement first. */
+    followerClosingGate?: TelegramBusFollowerClosingGate;
+    observeFollowerSourceSettlement?: (follower: TelegramBusFollowerView, isCurrent: () => boolean) => Promise<TelegramBusFollowerSourceSettlement> | TelegramBusFollowerSourceSettlement;
     getTelegramProfile?: () => string | undefined;
     provisionLeaderTarget?: (ctx: TContext) => Promise<void> | void;
     runWorkspaceAdmission?: TelegramBusWorkspaceAdmissionRunner;
@@ -222,7 +225,7 @@ export interface TelegramBusLeaderRuntimeDeps<TContext> {
     followerStaleAfterMs?: number;
     isFollowerProcessAlive?: (pid: number) => boolean;
     shouldCleanupConfirmedDeadFollower?: () => Promise<boolean> | boolean;
-    onFollowerDisconnected?: (follower: TelegramBusFollowerView) => Promise<void> | void;
+    onFollowerDisconnected?: (follower: TelegramBusFollowerView) => Promise<TelegramBusFollowerDisconnectResult | void> | TelegramBusFollowerDisconnectResult | void;
     onFollowerConfirmedDead?: (follower: TelegramBusFollowerView) => Promise<void> | void;
     /** True settles this observation; false needs fresh proof before another attempt. */
     onFollowerConfirmedDeadPreserved?: (follower: TelegramBusFollowerView, isDetached: () => boolean, operationId: string) => Promise<boolean> | boolean;
@@ -242,7 +245,7 @@ export declare function createTelegramBusFollowerTargetProvisioner(deps: Telegra
     slot?: string;
     threadName?: string;
 }) | undefined>;
-export declare function createTelegramBusFollowerDisconnectHandler(deps: TelegramBusFollowerDisconnectHandlerDeps): (follower: TelegramBusFollowerView) => Promise<void>;
+export declare function createTelegramBusFollowerDisconnectHandler(deps: TelegramBusFollowerDisconnectHandlerDeps): (follower: TelegramBusFollowerView) => Promise<TelegramBusFollowerDisconnectResult | undefined>;
 export declare function createTelegramBusFollowerConfirmedDeadHandler(deps: TelegramBusFollowerDisconnectHandlerDeps): (follower: TelegramBusFollowerView) => Promise<void>;
 export declare function createTelegramBusLeaderTargetProvisioner<TContext>(deps: TelegramBusLeaderTargetProvisionerDeps<TContext>): (ctx: TContext) => Promise<void>;
 export declare function createTelegramBusLeaderApiProxy(deps: TelegramBusLeaderApiProxyDeps): (method: string, args: unknown[]) => Promise<unknown>;
@@ -250,6 +253,41 @@ type TelegramBusFollowerMutationRunner = <T>(follower: {
     instanceId: string;
     profileKey?: string;
 }, operation: () => Promise<T>) => Promise<T>;
+export type TelegramBusFollowerSourceSettlement = "clear" | "busy" | "unknown";
+interface TelegramBusFollowerClosingLease {
+    isCurrent(): boolean;
+    reopen(): void;
+    seal(): boolean;
+    retire(): void;
+}
+export interface TelegramBusFollowerClosingGate {
+    enter(follower: TelegramBusFollowerView): (() => void) | undefined;
+    tryClose(follower: TelegramBusFollowerView): TelegramBusFollowerClosingLease | undefined;
+    getPhase(follower: TelegramBusFollowerView): "open" | "closing" | "sealed";
+}
+/** Process-local forwarding exclusion. It owns no journal, registry, transport, or cleanup authority. */
+export declare function createTelegramBusFollowerClosingGate(): TelegramBusFollowerClosingGate;
+export type TelegramBusFollowerQuitClosingResult = {
+    status: "ready";
+    deletion: TelegramBusFollowerDisconnectResult;
+} | {
+    status: "refused";
+    reason: "forwarding" | "source-busy" | "source-unknown" | "registration-changed";
+} | {
+    status: "disconnected-unconfirmed";
+    deletion?: TelegramBusFollowerDisconnectResult;
+} | {
+    status: "outcome-unknown";
+};
+/** Close forwarding, prove source settlement, then invoke the existing exact disconnect owner once. */
+export declare function createTelegramBusFollowerQuitClosingCoordinator(deps: {
+    gate: TelegramBusFollowerClosingGate;
+    getCurrentFollower(instanceId: string): TelegramBusFollowerView | undefined;
+    observeSourceSettlement(follower: TelegramBusFollowerView, isCurrent: () => boolean): Promise<TelegramBusFollowerSourceSettlement> | TelegramBusFollowerSourceSettlement;
+    disconnect(follower: TelegramBusFollowerView, isCurrent: () => boolean): Promise<TelegramBusFollowerDisconnectResult | undefined>;
+}): {
+    close(follower: TelegramBusFollowerView): Promise<TelegramBusFollowerQuitClosingResult>;
+};
 export declare function createTelegramBusLeaderEnvelopeHandler(deps: {
     followerRegistry: TelegramBusFollowerRegistry;
     authSecret?: string;
@@ -281,7 +319,7 @@ export declare function createTelegramBusLeaderEnvelopeHandler(deps: {
         slot?: string;
         threadName?: string;
     }) | undefined;
-    onFollowerDisconnected?: (follower: TelegramBusFollowerView) => Promise<void> | void;
+    onFollowerDisconnected?: (follower: TelegramBusFollowerView) => Promise<TelegramBusFollowerDisconnectResult | void> | TelegramBusFollowerDisconnectResult | void;
     renameFollowerThread?: (follower: TelegramBusFollowerView, threadName: string) => Promise<{
         threadName: string;
     }> | {
@@ -300,6 +338,9 @@ export declare function createTelegramBusLeaderEnvelopeHandler(deps: {
     getThreadDisplayMode?: () => TelegramThreadDisplayMode;
     getCurrentLeaderEpoch?: () => number | string | undefined;
     runFollowerMutation?: TelegramBusFollowerMutationRunner;
+    /** Optional disconnect/forwarding fence; requires the paired source observer to affect disconnect. */
+    followerClosingGate?: TelegramBusFollowerClosingGate;
+    observeFollowerSourceSettlement?: (follower: TelegramBusFollowerView, isCurrent: () => boolean) => Promise<TelegramBusFollowerSourceSettlement> | TelegramBusFollowerSourceSettlement;
     runWorkspaceAdmission?: TelegramBusWorkspaceAdmissionRunner;
     runWithWorkspaceCapacity?: TelegramWorkspaceCapacityRunner;
 }): (envelope: TelegramBusEnvelope) => Promise<TelegramBusEnvelope> | TelegramBusEnvelope;

@@ -751,6 +751,8 @@ export interface TelegramActivityPublicationReservation {
 }
 
 export interface TelegramActivityPublicationRuntime {
+  /** Includes reservations, queued publication and effects still running after reset. */
+  hasPendingWork: () => boolean;
   enqueue: (task: () => Promise<void>) => Promise<void>;
   reserve: () => TelegramActivityPublicationReservation;
   reset: () => void;
@@ -760,8 +762,12 @@ export function createTelegramActivityPublicationRuntime(): TelegramActivityPubl
   let generation = 0;
   let tail = Promise.resolve();
   const pending = new Set<() => void>();
+  const waiting = new Set<object>();
+  let running = 0;
   const reserve = (): TelegramActivityPublicationReservation => {
     const admittedGeneration = generation;
+    const claim = {};
+    waiting.add(claim);
     let state: "pending" | "published" | "cancelled" = "pending";
     let resolve!: (task: (() => Promise<void>) | undefined) => void;
     const ready = new Promise<(() => Promise<void>) | undefined>((accept) => { resolve = accept; });
@@ -769,12 +775,17 @@ export function createTelegramActivityPublicationRuntime(): TelegramActivityPubl
       if (state !== "pending") return;
       state = "cancelled";
       pending.delete(cancel);
+      waiting.delete(claim);
       resolve(undefined);
     };
     pending.add(cancel);
     const result = tail.then(async () => {
       const task = await ready;
-      if (admittedGeneration === generation && task) await task();
+      waiting.delete(claim);
+      if (admittedGeneration === generation && task) {
+        running++;
+        try { await task(); } finally { running--; }
+      }
     });
     tail = result.catch(() => {});
     return {
@@ -790,11 +801,14 @@ export function createTelegramActivityPublicationRuntime(): TelegramActivityPubl
     };
   };
   return {
+    hasPendingWork: () => waiting.size > 0 || running > 0,
     reserve,
     enqueue: (task) => reserve().publish(task),
     reset() {
       generation += 1;
       for (const cancel of pending) cancel();
+      // Unstarted old-generation work is fenced; already-running effects remain counted.
+      waiting.clear();
       tail = Promise.resolve();
     },
   };

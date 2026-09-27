@@ -60,7 +60,7 @@ export declare const TELEGRAM_REMOVAL_REACTIONS: readonly [{
     readonly emoji: "🗑";
 }];
 export declare const TELEGRAM_PRIORITY_REACTION_EMOJIS: ("👍" | "⚡" | "❤" | "🕊" | "🔥")[];
-export declare const TELEGRAM_REMOVAL_REACTION_EMOJIS: ("👎" | "👻" | "💔" | "💩" | "🗑")[];
+export declare const TELEGRAM_REMOVAL_REACTION_EMOJIS: ("🗑" | "👎" | "👻" | "💔" | "💩")[];
 export interface TelegramUpdateDeletion {
     deleted_business_messages?: {
         message_ids?: unknown;
@@ -121,7 +121,10 @@ export declare function getAuthorizedTelegramCallbackQuery(update: TelegramUpdat
 export declare function getAuthorizedTelegramMessage(update: TelegramUpdateRouting, allowedUserId?: number): TelegramUpdateMessage | undefined;
 export declare function getAuthorizedTelegramEditedMessage(update: TelegramUpdateRouting, allowedUserId?: number): TelegramUpdateMessage | undefined;
 export declare function getAuthorizedTelegramGuestMessage(update: TelegramUpdateRouting): TelegramGuestMessage | undefined;
-export type TelegramMessageOwnershipView = TelegramBusForwardOwnership;
+export type TelegramMessageOwnershipView = TelegramBusForwardOwnership & {
+    /** Original message target, not the replacement recipient's current target. */
+    target?: TelegramTarget;
+};
 export type TelegramMessageOwnershipLookup = (chatId: number, messageId: number) => TelegramMessageOwnershipView | undefined;
 export type TelegramTargetOwnershipView = TelegramBusForwardOwnership;
 export type TelegramTargetOwnershipLookup = (target: TelegramTarget) => TelegramTargetOwnershipView | undefined;
@@ -282,9 +285,12 @@ interface TelegramUnauthorizedReplyOptions {
         threadId?: number;
     };
 }
+/** Positive exact-target deletion evidence, supplied by the routing/store owner. */
+export type TelegramConfirmedDeletedTargetLookup<TContext> = (target: TelegramTarget, ctx: TContext) => boolean | Promise<boolean>;
 export interface TelegramUpdateRuntimeDeps<TContext = unknown, TReactionUpdate extends TelegramMessageReactionUpdated = TelegramMessageReactionUpdated, TCallbackQuery extends TelegramCallbackQuery = TelegramCallbackQuery, TMessage extends TelegramUpdateMessage = TelegramUpdateMessage> {
     ctx: TContext;
     execution?: TelegramUpdateExecutionFence;
+    isTargetConfirmedDeleted?: TelegramConfirmedDeletedTargetLookup<TContext>;
     getCurrentInstanceId?: () => string | undefined;
     getMessageOwnership?: TelegramMessageOwnershipLookup;
     getTargetOwnership?: TelegramTargetOwnershipLookup;
@@ -311,6 +317,7 @@ export interface TelegramUpdateRuntimeDeps<TContext = unknown, TReactionUpdate e
 }
 export interface TelegramUpdateRuntimeControllerDeps<TContext = unknown, TCallbackQuery extends TelegramCallbackQuery = TelegramCallbackQuery, TMessage extends TelegramUpdateMessage = TelegramUpdateMessage> {
     getAllowedUserId: () => number | undefined;
+    isTargetConfirmedDeleted?: TelegramConfirmedDeletedTargetLookup<TContext>;
     getCurrentInstanceId?: () => string | undefined;
     getMessageOwnership?: TelegramMessageOwnershipLookup;
     getTargetOwnership?: TelegramTargetOwnershipLookup;
@@ -354,6 +361,7 @@ export declare function createTelegramUpdateRuntime<TContext = unknown, TUpdate 
 export interface AuthorizedTelegramReactionUpdateDeps<TContext> {
     allowedUserId?: number;
     ctx: TContext;
+    isTargetConfirmedDeleted?: TelegramConfirmedDeletedTargetLookup<TContext>;
     getCurrentInstanceId?: () => string | undefined;
     getMessageOwnership?: TelegramMessageOwnershipLookup;
     foreignOwnedUpdateForwarder?: TelegramForeignOwnedUpdateForwarder<TContext>;
@@ -408,6 +416,16 @@ export interface TelegramUpdateWorkerStateSnapshot {
     lastFailureAtMs?: number;
     lastFailurePhase?: string;
 }
+export type TelegramFollowerSourceSettlementObservation = "clear" | "busy" | "unknown";
+/** Conservative read-only leader-journal observation for one exact follower binding/Thread. */
+export declare function observeTelegramFollowerSourceSettlement(input: {
+    snapshot: TelegramUpdateWorkerJournalSnapshot;
+    recipientBindingKey: string;
+    target: TelegramTarget & {
+        threadId: number;
+    };
+    getMessageOwnership?: TelegramMessageOwnershipLookup;
+}): TelegramFollowerSourceSettlementObservation;
 export interface TelegramUpdateWorkerJournalSnapshot {
     version: typeof TELEGRAM_UPDATE_JOURNAL_VERSION | typeof TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION | typeof TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION;
     acceptedThroughUpdateId?: number;

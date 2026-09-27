@@ -34,6 +34,37 @@ function getTestTimerId(timer: TestTimer): number {
   return timer as unknown as number;
 }
 
+test("Media pending-work observation retains removed in-flight work until settlement", async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const group = createTelegramMediaGroupController({ setTimer: () => createTestTimer(1), clearTimer() {} });
+  const message = { message_id: 1, chat: { id: 7 }, media_group_id: "album" };
+  assert.equal(group.hasPendingWork(), false);
+  group.queueMessage({ message, dispatchMessages: () => blocked });
+  group.suspend();
+  assert.equal(group.hasPendingWork(), true);
+  const flushing = group.flushMessage(1);
+  group.removeMessages([1]);
+  assert.equal(group.hasPendingWork(), true, "removing buffered state does not settle its active dispatch");
+  group.clear();
+  assert.equal(group.hasPendingWork(), true);
+  group.queueMessage({ message: { ...message, message_id: 2 }, dispatchMessages: async () => {} });
+  release(); await flushing;
+  assert.equal(group.hasPendingWork(), true, "old settlement cannot clear newer work");
+  await group.flushMessage(2);
+  assert.equal(group.hasPendingWork(), false);
+});
+
+test("Media pending-work observation keeps failed input and releases cleared work", async () => {
+  const group = createTelegramMediaGroupController({ setTimer: () => createTestTimer(1), clearTimer() {} });
+  group.queueMessage({ message: { message_id: 1, chat: { id: 7 }, media_group_id: "album" },
+    dispatchMessages: async () => { throw new Error("fixture dispatch failure"); } });
+  await assert.rejects(group.flushMessage(1), /fixture dispatch failure/);
+  assert.equal(group.hasPendingWork(), true);
+  group.clear();
+  assert.equal(group.hasPendingWork(), false);
+});
+
 test("Media helpers collect file infos across Telegram message variants", () => {
   const files = collectTelegramFileInfos([
     {

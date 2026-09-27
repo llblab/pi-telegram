@@ -55,6 +55,7 @@ import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS } from "../lib/locks.ts";
 import { createTelegramUpdateJournalBotIdentity, createTelegramUpdateJournalStore } from "../lib/journal.ts";
 import {
   createTelegramBusFollowerTargetProvisioner,
+  createTelegramBusFollowerClosingGate,
   createTelegramBusLeaderEnvelopeHandler as createRawTelegramBusLeaderEnvelopeHandler,
 } from "../lib/bus-leader.ts";
 import {
@@ -2658,7 +2659,9 @@ test("Bus follower registration runtime registers and explicitly disconnects", a
     capabilities: [TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME],
   });
   const registrationState = createTelegramBusFollowerRegistrationState();
-  let disconnects = 0;
+  const closingGate = createTelegramBusFollowerClosingGate();
+  let disconnects = 0, mutateTargetOnDisconnect = false;
+  let sourceSettlement: "clear" | "busy" = "clear";
   const renames: string[] = [];
   const server = createTelegramBusLocalServer({
     socketPath,
@@ -2666,11 +2669,21 @@ test("Bus follower registration runtime registers and explicitly disconnects", a
       followerRegistry: registry,
       protocolIdentity: leaderProtocol,
       getNowMs: () => 1000,
+      followerClosingGate: closingGate,
+      observeFollowerSourceSettlement: () => sourceSettlement,
       provisionFollowerTarget() {
         return { chatId: 7, threadId: 42, slot: "A" };
       },
-      onFollowerDisconnected() {
+      onFollowerDisconnected(follower) {
         disconnects += 1;
+        if (mutateTargetOnDisconnect && follower.registrationGeneration) registrationState.setRegistered(true,
+          { chatId: 7, threadId: 99 }, { generation: follower.registrationGeneration });
+        return follower.target?.threadId && follower.registrationGeneration ? {
+          kind: "follower-disconnect-result" as const, instanceId: follower.instanceId,
+          registrationGeneration: follower.registrationGeneration,
+          target: { chatId: follower.target.chatId, threadId: follower.target.threadId },
+          threadDeletion: "confirmed" as const,
+        } : undefined;
       },
       renameFollowerThread(_follower, threadName) {
         renames.push(threadName);
@@ -2730,9 +2743,26 @@ test("Bus follower registration runtime registers and explicitly disconnects", a
     ), "A");
     assert.equal(registry.get("inst-a")?.threadName, "A");
     assert.equal(registrationState.getThreadName(), "A");
-    assert.equal(await follower.disconnectFromLeader?.(), true);
-    assert.equal(disconnects, 1);
-    assert.equal(registry.get("inst-a"), undefined);
+    const disconnect = await follower.disconnectFromLeaderWithResult?.();
+    assert.match(disconnect?.requestId ?? "", /^inst-a:\d+$/);
+    assert.deepEqual(disconnect && { ...disconnect, requestId: "captured" }, { requestId: "captured", instanceId: "inst-a",
+      registrationGeneration: "inst-a:1", target: { chatId: 7, threadId: 42 },
+      deletion: { kind: "follower-disconnect-result", instanceId: "inst-a", registrationGeneration: "inst-a:1",
+        target: { chatId: 7, threadId: 42 }, threadDeletion: "confirmed" } });
+    assert.equal(disconnects, 1); assert.equal(registry.get("inst-a"), undefined);
+    assert.equal(registrationState.isRegistered(), false, "exact success closes local follower authority before post-delete exit evidence");
+    assert.equal(await follower.registerWithLeader({ cwd: "/repo" }, { busSocketPath: socketPath }), true);
+    assert.equal(await follower.disconnectFromLeader?.(), true, "ordinary callers retain their boolean contract");
+    assert.equal(disconnects, 2); assert.equal(registry.get("inst-a"), undefined);
+    assert.equal(await follower.registerWithLeader({ cwd: "/repo" }, { busSocketPath: socketPath }), true);
+    sourceSettlement = "busy";
+    assert.deepEqual(await follower.disconnectFromLeaderForQuit?.(), { status: "refused", reason: "busy",
+      message: "Telegram follower disconnect refused: source-busy." });
+    assert.equal(disconnects, 2); assert.ok(registry.get("inst-a"));
+    sourceSettlement = "clear";
+    mutateTargetOnDisconnect = true;
+    await assert.rejects(follower.disconnectFromLeaderWithResult!(), /stale registration/);
+    assert.equal(disconnects, 3); assert.equal(registry.get("inst-a"), undefined);
   } finally {
     follower.stop();
     await server.stop();

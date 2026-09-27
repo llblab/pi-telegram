@@ -63,6 +63,7 @@ export declare const TELEGRAM_COMMAND_EMOJI: {
     readonly stop: "🟥";
     readonly name: "🏷️";
     readonly new: "🆕";
+    readonly quit: "🗑";
 };
 export type TelegramCommandEmojiName = keyof typeof TELEGRAM_COMMAND_EMOJI;
 export declare function getTelegramCommandEmoji(command: TelegramCommandEmojiName): string;
@@ -144,7 +145,7 @@ export declare function createTelegramThreadDisplayNameRenameBinding(): {
     rename: TelegramThreadDisplayNameRenamePort;
 };
 export declare function registerTelegramBridgeCommands(pi: ExtensionAPI, deps: TelegramBridgeCommandRegistrationDeps): void;
-export declare const TELEGRAM_RESERVED_COMMAND_NAMES: readonly ["stop", "name", "new", "abort", "next", "continue", "status", "queue", "compact", "model", "thinking", "settings", "help", "start"];
+export declare const TELEGRAM_RESERVED_COMMAND_NAMES: readonly ["stop", "name", "new", "quit", "abort", "next", "continue", "status", "queue", "compact", "model", "thinking", "settings", "help", "start"];
 export type TelegramReservedCommandName = (typeof TELEGRAM_RESERVED_COMMAND_NAMES)[number];
 export declare function isTelegramReservedCommandName(commandName: string | undefined): commandName is TelegramReservedCommandName;
 export type TelegramCommandAction = {
@@ -158,6 +159,9 @@ export type TelegramCommandAction = {
     executionMode: "immediate";
 } | {
     kind: "new";
+    executionMode: "immediate";
+} | {
+    kind: "quit";
     executionMode: "immediate";
 } | {
     kind: "abort";
@@ -196,6 +200,7 @@ export interface TelegramCommandActionDeps<TMessage, TContext> {
     handleStop: (message: TMessage, ctx: TContext) => Promise<void>;
     handleName: (message: TMessage, ctx: TContext, name: string) => Promise<void>;
     handleNew: (message: TMessage, ctx: TContext) => Promise<void>;
+    handleQuit: (message: TMessage, ctx: TContext) => Promise<void>;
     handleAbort: (message: TMessage, ctx: TContext) => Promise<void>;
     handleNext: (message: TMessage, ctx: TContext) => Promise<void>;
     handleContinue: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -416,6 +421,8 @@ export interface TelegramCommandRuntimeDeps<TMessage extends TelegramCommandRunt
     openThinkingMenu: (message: TMessage, ctx: TContext) => Promise<void>;
     openQueueMenu: (message: TMessage, ctx: TContext) => Promise<void>;
     openSettingsMenu?: (message: TMessage, ctx: TContext) => Promise<void>;
+    /** Private activation port; `/quit` is not reserved or advertised without this binding. */
+    openQuitConfirmation?: (message: TMessage, ctx: TContext) => Promise<void>;
     validateThreadName?: (threadName: string) => string | undefined;
     renameCurrentThread?: TelegramThreadDisplayNameRenamePort;
     resetCurrentThreadName?: TelegramThreadDisplayNameResetPort;
@@ -451,6 +458,10 @@ export declare const TELEGRAM_COMMAND_ACTIONS: {
     };
     readonly new: {
         readonly kind: "new";
+        readonly executionMode: "immediate";
+    };
+    readonly quit: {
+        readonly kind: "quit";
         readonly executionMode: "immediate";
     };
     readonly abort: {

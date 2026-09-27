@@ -773,6 +773,32 @@ export function createTelegramBusFollowerSourceReferenceDeliveryIdentity(input: 
       handoffId: input.source.owner.handoffId } });
 }
 
+/** Optional outcome in the existing disconnect ACK. ACK success alone only proves disconnection. */
+export interface TelegramBusFollowerDisconnectResult {
+  kind: "follower-disconnect-result";
+  instanceId: string;
+  registrationGeneration: string;
+  target: TelegramTarget & { threadId: number };
+  threadDeletion: "confirmed" | "unconfirmed";
+}
+
+/** Content validation only: caller must still fence the authenticated transport/session. */
+export function isTelegramBusFollowerDisconnectDeletionConfirmed(
+  response: TelegramBusEnvelope | undefined,
+  expected: { requestId: string; instanceId: string; registrationGeneration: string;
+    target: TelegramTarget & { threadId: number } },
+): boolean {
+  if (![expected.requestId, expected.instanceId, expected.registrationGeneration].every((value) =>
+    typeof value === "string" && value.trim().length > 0) ||
+    !Number.isSafeInteger(expected.target.chatId) || expected.target.chatId === 0 ||
+    !Number.isSafeInteger(expected.target.threadId) || expected.target.threadId <= 0) return false;
+  if (response?.kind !== "bus.ack" || response.ok !== true || response.requestId !== expected.requestId) return false;
+  const result = response.result;
+  return isRecord(result) && result.kind === "follower-disconnect-result" && result.threadDeletion === "confirmed" &&
+    result.instanceId === expected.instanceId && result.registrationGeneration === expected.registrationGeneration &&
+    isRecord(result.target) && result.target.chatId === expected.target.chatId && result.target.threadId === expected.target.threadId;
+}
+
 export type TelegramBusEnvelope = (
   | {
       kind: "follower.register";

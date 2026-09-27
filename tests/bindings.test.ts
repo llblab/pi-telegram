@@ -642,6 +642,7 @@ for (const replaceRegistration of [false, true]) {
         });
       }
       await started;
+      assert.equal(binding.publicationRuntime.hasPendingWork(), true);
       startTurn();
       binding.activityRuntime.onToolEnd({ toolCallId: "read", toolName: "read", result: "contents", isError: false });
       finishTurn();
@@ -660,6 +661,7 @@ for (const replaceRegistration of [false, true]) {
       }
       release();
       await binding.publicationRuntime.enqueue(async () => {});
+      assert.equal(binding.publicationRuntime.hasPendingWork(), false);
       const expected = preparation === "text"
         ? ["Prepared final", "tool"]
         : preparation === "attachment"

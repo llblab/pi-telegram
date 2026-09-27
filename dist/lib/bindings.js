@@ -311,6 +311,7 @@ export function createTelegramActivityBindingRuntime(deps) {
         activityVerbosityRuntime,
         assistantOutputRuntime: assistantOutputBinding.runtime,
         publicationRuntime: {
+            hasPendingWork: publication.hasPendingWork,
             enqueue: publication.enqueue,
             reserve: publication.reserve,
             capture() {

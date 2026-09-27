@@ -47,6 +47,8 @@ export interface TelegramTextGroupState<TMessage, TContext = unknown> {
 export type TelegramForwardCommentBatchPosition = "comment" | "forward";
 
 export interface TelegramTextGroupController<TMessage, TContext = unknown> {
+  /** Buffered input or a dispatch still settling, even after clear or replacement. */
+  hasPendingWork: () => boolean;
   prepareUpdateBatch: (
     updates: readonly { message?: TMessage }[],
   ) => void;
@@ -188,6 +190,7 @@ export function queueTelegramTextGroupMessage<
     messages: TMessage[],
     ctx: TContext,
   ) => unknown | Promise<unknown>;
+  trackDispatch?: () => () => void;
   forceStart?: boolean;
   dispatchImmediately?: boolean;
   forwardPairCandidate?: TelegramForwardCommentBatchPosition;
@@ -232,10 +235,13 @@ export function queueTelegramTextGroupMessage<
       dispatchedMessages.map((message) => message.message_id),
     );
     queued.dispatching = true;
-    const operation = Promise.resolve(
-      options.dispatchMessages(dispatchedMessages, queued.context),
-    ).then(
+    const finishTracking = options.trackDispatch?.();
+    let dispatched: unknown;
+    try { dispatched = options.dispatchMessages(dispatchedMessages, queued.context); }
+    catch (error) { finishTracking?.(); throw error; }
+    const operation = Promise.resolve(dispatched).then(
       () => {
+        finishTracking?.();
         if (options.groups.get(key) !== queued) return;
         queued.messages = queued.messages.filter(
           (message) => !dispatchedIds.has(message.message_id),
@@ -246,6 +252,7 @@ export function queueTelegramTextGroupMessage<
         else if (!queued.flushTimer) scheduleDispatch();
       },
       (error) => {
+        finishTracking?.();
         if (options.groups.get(key) === queued) {
           queued.dispatching = false;
           queued.dispatchPromise = undefined;
@@ -281,6 +288,7 @@ export function createTelegramTextGroupController<
   options: TelegramTextGroupControllerOptions = {},
 ): TelegramTextGroupController<TMessage, TContext> {
   const groups = new Map<string, TelegramTextGroupState<TMessage, TContext>>();
+  let activeDispatches = 0;
   const plannedForwardCommentStarts = new Set<string>();
   const plannedForwardCommentEnds = new Set<string>();
   const debounceMs = options.debounceMs ?? TELEGRAM_TEXT_GROUP_DEBOUNCE_MS;
@@ -307,6 +315,7 @@ export function createTelegramTextGroupController<
           (timer as unknown as AbortController).abort();
         });
   return {
+    hasPendingWork: () => groups.size > 0 || activeDispatches > 0,
     prepareUpdateBatch(updates) {
       for (let index = 0; index + 1 < updates.length; index += 1) {
         const comment = updates[index]?.message;
@@ -394,6 +403,10 @@ export function createTelegramTextGroupController<
         setTimer,
         clearTimer,
         dispatchMessages,
+        trackDispatch() {
+          activeDispatches++;
+          return () => { activeDispatches--; };
+        },
         forceStart,
         dispatchImmediately,
         forwardPairCandidate:

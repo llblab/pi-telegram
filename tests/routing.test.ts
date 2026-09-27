@@ -418,6 +418,9 @@ interface RouteHarnessOptions {
     TestMessage, TestCallbackQuery, TestContext, TestModel
   >["editInteractiveMessage"];
   threadStore?: Threads.TelegramTopicTargetStore;
+  getMessageOwnership?: Updates.TelegramMessageOwnershipLookup;
+  getAdmissionScope?: () => string | undefined;
+  isContextActive?: (ctx: TestContext) => boolean;
   runWorkspaceOperation?: Routing.TelegramInboundRouteRuntimeDeps<
     TestMessage,
     TestCallbackQuery,
@@ -460,6 +463,12 @@ interface RouteHarnessOptions {
     TestContext,
     TestModel
   >["replaceFollowerThreadTarget"];
+  quitCallbackHandler?: Routing.TelegramInboundRouteRuntimeDeps<
+    TestMessage,
+    TestCallbackQuery,
+    TestContext,
+    TestModel
+  >["quitCallbackHandler"];
   foreignOwnedUpdateForwarder?: Routing.TelegramInboundRouteRuntimeDeps<
     TestMessage,
     TestCallbackQuery,
@@ -583,7 +592,9 @@ function createRouteHarness(options: RouteHarnessOptions = {}) {
     replaceFollowerThreadTarget: options.replaceFollowerThreadTarget,
     foreignOwnedUpdateForwarder: options.foreignOwnedUpdateForwarder,
     getCurrentInstanceId: () => options.instanceId ?? "leader-a",
-    getAdmissionScope: () => "profile-a:bot-a",
+    getAdmissionScope: options.getAdmissionScope ?? (() => "profile-a:bot-a"),
+    getMessageOwnership: options.getMessageOwnership,
+    isContextActive: options.isContextActive,
     getLiveThreadTargets: options.getLiveThreadTargets,
     getDisplayTitle: options.getDisplayTitle,
     getLocalThreadLabelForTarget: options.getLocalThreadLabelForTarget,
@@ -606,6 +617,7 @@ function createRouteHarness(options: RouteHarnessOptions = {}) {
     menuActions,
     openQueueMenu: async () => undefined,
     queueMenuCallbackHandler: async () => false,
+    quitCallbackHandler: options.quitCallbackHandler,
     inboundHandlerRuntime: {
       process:
         options.processInbound ??
@@ -1025,6 +1037,104 @@ function unboundTopicUpdate(text = "hello"): TestUpdate {
       text,
     },
   };
+}
+
+for (const kind of ["message", "edited-message", "callback", "reaction", "threadless-message", "threadless-edit", "threadless-callback"] as const) {
+  test(`Routing rejects confirmed-deleted ${kind} before cached foreign ownership`, async () => {
+    await withTopicStore(async (threadStore) => {
+      const target = { chatId: 100, threadId: 42 };
+      threadStore.upsert({ profileKey: "old", instanceId: "old-pi", target,
+        status: "active", createdAtMs: 1000, updatedAtMs: 1000 });
+      threadStore.markStaleByTarget(target, "deleted"); await threadStore.persist();
+      let forwards = 0;
+      const forward = () => { forwards++; return acceptedForeignUpdateSettlement(); };
+      const { routeRuntime, telegramQueueStore } = createRouteHarness({ threadStore,
+        getMessageOwnership: () => ({ instanceId: "successor", target }),
+        foreignOwnedUpdateForwarder: { forwardMessage: forward, forwardEditedMessage: forward,
+          forwardCallback: forward, forwardReaction: forward } });
+      const message: TestMessage = { message_id: 11, chat: { id: 100, type: "private" },
+        from: { id: 7, is_bot: false }, message_thread_id: kind.startsWith("threadless") ? undefined : 42, text: "replay" };
+      const update: TestUpdate = kind === "message" || kind === "threadless-message" ? { message }
+        : kind === "edited-message" || kind === "threadless-edit" ? { edited_message: message }
+        : kind === "callback" || kind === "threadless-callback" ? { callback_query: { id: "cb", from: message.from!, message, data: "menu:status" } }
+          : { message_reaction: { chat: message.chat, message_id: 11, user: message.from!, old_reaction: [],
+            new_reaction: [{ type: "emoji", emoji: "👍" }] } };
+      await routeRuntime.handleUpdate(update, { cwd: "/repo" });
+      assert.equal(forwards, 0);
+      assert.deepEqual(telegramQueueStore.getQueuedItems(), []);
+    });
+  });
+}
+
+test("Routing checks sender authority before reading deleted-target evidence", async () => {
+  await withTopicStore(async (threadStore) => {
+    let reads = 0, lookups = 0;
+    const { routeRuntime } = createRouteHarness({ threadStore: { ...threadStore, async load() { reads++; } },
+      getMessageOwnership: () => { lookups++; return undefined; } });
+    const message: TestMessage = { message_id: 11, chat: { id: 100, type: "private" },
+      message_thread_id: 42, from: { id: 99, is_bot: false }, text: "unauthorized" };
+    for (const update of [
+      { message }, { edited_message: message },
+      { callback_query: { id: "cb", from: message.from!, message, data: "menu:status" } },
+      { message_reaction: { chat: message.chat, message_id: 11, user: message.from!, old_reaction: [],
+        new_reaction: [{ type: "emoji", emoji: "👍" }] } },
+    ] satisfies TestUpdate[]) await routeRuntime.handleUpdate(update, { cwd: "/repo" });
+    assert.equal(reads, 0); assert.equal(lookups, 0);
+  });
+});
+
+test("Routing retains ordinary handoff for closed, unknown and different deleted targets", async () => {
+  for (const evidence of ["closed", "unknown", "other-thread", "other-chat"] as const) {
+    await withTopicStore(async (threadStore) => {
+      const observed = { chatId: evidence === "other-chat" ? 101 : 100, threadId: evidence === "other-thread" ? 43 : 42 };
+      threadStore.upsert({ profileKey: "old", instanceId: "old-pi", target: observed,
+        status: "active", createdAtMs: 1000, updatedAtMs: 1000 });
+      threadStore.markStaleByTarget(observed, evidence === "closed" ? "closed" : evidence === "unknown" ? undefined : "deleted");
+      await threadStore.persist();
+      let forwards = 0;
+      const { routeRuntime } = createRouteHarness({ threadStore,
+        getMessageOwnership: () => ({ instanceId: "successor", target: { chatId: 100, threadId: 42 } }),
+        foreignOwnedUpdateForwarder: { forwardMessage: () => { forwards++; return acceptedForeignUpdateSettlement(); } } });
+      await routeRuntime.handleUpdate(unboundTopicUpdate("retained accepted handoff"), { cwd: "/repo" });
+      assert.equal(forwards, 1, evidence);
+    });
+  }
+});
+
+for (const change of ["profile", "context", "execution", "reaction-execution", "read-failure"] as const) {
+  test(`Routing deleted-target lookup retains failure on ${change}`, async () => {
+    await withTopicStore(async (threadStore) => {
+      let release!: () => void, started!: () => void;
+      const blocked = new Promise<void>((resolve) => { release = resolve; });
+      const reading = new Promise<void>((resolve) => { started = resolve; });
+      let scope = "original", active = true, forwards = 0;
+      const { routeRuntime } = createRouteHarness({
+        threadStore: { ...threadStore, async load() { started(); await blocked;
+          if (change === "read-failure") throw new Error("fixture unreadable Thread store"); } },
+        getAdmissionScope: () => scope, isContextActive: () => active,
+        getMessageOwnership: () => ({ instanceId: "successor", target: { chatId: 100, threadId: 42 } }),
+        foreignOwnedUpdateForwarder: {
+          forwardMessage: () => { forwards++; return acceptedForeignUpdateSettlement(); },
+          forwardReaction: () => { forwards++; return acceptedForeignUpdateSettlement(); },
+        } });
+      const abort = new AbortController();
+      const execution: Updates.TelegramUpdateExecutionFence = { generation: 1, updateId: 1, signal: abort.signal,
+        isCurrent: () => !abort.signal.aborted,
+        assertCurrent: () => { if (abort.signal.aborted) throw new Error("fixture execution authority lost"); } };
+      const update: TestUpdate = change === "reaction-execution" ? { message_reaction: { chat: { id: 100, type: "private" },
+        message_id: 11, user: { id: 7, is_bot: false }, old_reaction: [], new_reaction: [{ type: "emoji", emoji: "👍" }] } }
+        : unboundTopicUpdate("must remain unresolved");
+      const processing = routeRuntime.handleUpdate(update, { cwd: "/repo" }, execution);
+      // A missing lookup must fail visibly rather than leave this test waiting forever.
+      await Promise.race([reading, processing.then(() => { throw new Error("lookup was bypassed"); })]);
+      if (change === "profile") scope = "replacement";
+      if (change === "context") active = false;
+      if (change === "execution" || change === "reaction-execution") abort.abort();
+      release();
+      await assert.rejects(processing, /authority|unreadable/);
+      assert.equal(forwards, 0);
+    });
+  });
 }
 
 test("Routing runtime silently completes journal replay from a confirmed deleted thread", async () => {
@@ -3269,6 +3379,26 @@ test("Routing runtime restores a temporary command thread and deletes only its c
       true,
     );
   });
+});
+
+test("Routing reserves private quit callbacks and passes only worker-bound execution identity to its optional handler", async () => {
+  const handled: Array<{ data: string | undefined; updateId: number | undefined }> = [];
+  const withHandler = createRouteHarness({
+    quitCallbackHandler: async (query, _ctx, updateId) => {
+      handled.push({ data: query.data, updateId }); return true;
+    },
+  });
+  const callback = { id: "quit", from: { id: 7, is_bot: false },
+    message: { message_id: 90, message_thread_id: 11, chat: { id: 100, type: "private" as const } },
+    data: "quit:confirm:token" };
+  await withHandler.routeRuntime.handleUpdate({ update_id: 77, callback_query: callback }, { cwd: "/repo" });
+  assert.deepEqual(handled, [{ data: "quit:confirm:token", updateId: undefined }],
+    "direct routing cannot substitute unbound wire update_id for durable worker authority");
+  assert.equal(withHandler.telegramQueueStore.getQueuedItems().length, 0);
+
+  const withoutHandler = createRouteHarness();
+  await withoutHandler.routeRuntime.handleUpdate({ update_id: 78, callback_query: callback }, { cwd: "/repo" });
+  assert.equal(withoutHandler.telegramQueueStore.getQueuedItems().length, 0);
 });
 
 test("Pending restore cleanup preserves rebound, live, reserved, and pending targets", async () => {

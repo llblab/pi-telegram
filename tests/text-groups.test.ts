@@ -25,6 +25,36 @@ function createMessage(
   };
 }
 
+test("Text pending-work observation retains cleared in-flight work until settlement", async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const group = TextGroups.createTelegramTextGroupController<TestMessage, string>({
+    minSplitLength: 8, setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>, clearTimer() {} });
+  assert.equal(group.hasPendingWork(), false);
+  group.queueMessage({ message: createMessage(1, "long-enough"), context: "old", dispatchMessages: () => blocked });
+  group.suspend();
+  assert.equal(group.hasPendingWork(), true);
+  const flushing = group.flushMessage(1);
+  group.clear();
+  assert.equal(group.hasPendingWork(), true, "clearing a buffer cannot cancel its awaited dispatch");
+  group.queueMessage({ message: createMessage(2, "new-long-message"), context: "new", dispatchMessages: async () => {} });
+  release(); await flushing;
+  assert.equal(group.hasPendingWork(), true);
+  await group.flushMessage(2);
+  assert.equal(group.hasPendingWork(), false);
+});
+
+test("Text pending-work observation keeps failed input and releases cleared work", async () => {
+  const group = TextGroups.createTelegramTextGroupController<TestMessage, string>({
+    minSplitLength: 8, setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>, clearTimer() {} });
+  group.queueMessage({ message: createMessage(1, "long-enough"), context: "ctx",
+    dispatchMessages: async () => { throw new Error("fixture dispatch failure"); } });
+  await assert.rejects(group.flushMessage(1), /fixture dispatch failure/);
+  assert.equal(group.hasPendingWork(), true);
+  group.clear();
+  assert.equal(group.hasPendingWork(), false);
+});
+
 test("Text group helper delays likely split messages and appends quick continuations", () => {
   const groups = new Map<
     string,

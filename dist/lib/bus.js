@@ -430,6 +430,19 @@ export function createTelegramBusFollowerSourceReferenceDeliveryIdentity(input) 
         sourceClaim: { acquisitionId: input.source.owner.acquisitionId,
             handoffId: input.source.owner.handoffId } });
 }
+/** Content validation only: caller must still fence the authenticated transport/session. */
+export function isTelegramBusFollowerDisconnectDeletionConfirmed(response, expected) {
+    if (![expected.requestId, expected.instanceId, expected.registrationGeneration].every((value) => typeof value === "string" && value.trim().length > 0) ||
+        !Number.isSafeInteger(expected.target.chatId) || expected.target.chatId === 0 ||
+        !Number.isSafeInteger(expected.target.threadId) || expected.target.threadId <= 0)
+        return false;
+    if (response?.kind !== "bus.ack" || response.ok !== true || response.requestId !== expected.requestId)
+        return false;
+    const result = response.result;
+    return isRecord(result) && result.kind === "follower-disconnect-result" && result.threadDeletion === "confirmed" &&
+        result.instanceId === expected.instanceId && result.registrationGeneration === expected.registrationGeneration &&
+        isRecord(result.target) && result.target.chatId === expected.target.chatId && result.target.threadId === expected.target.threadId;
+}
 export function getTelegramBusEnvelopeTrafficClass(envelope) {
     if (envelope.kind === "follower.register" ||
         envelope.kind === "follower.restoreWorkspace")

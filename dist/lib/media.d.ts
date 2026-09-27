@@ -105,6 +105,8 @@ export interface TelegramMediaGroupController<TMessage extends TelegramMediaGrou
         context?: TContext;
         dispatchMessages: (messages: TMessage[], ctx?: TContext) => unknown | Promise<unknown>;
     }) => boolean;
+    /** Buffered input or a dispatch still settling, including work removed from the buffer. */
+    hasPendingWork: () => boolean;
     removeMessages: (messageIds: number[]) => number;
     flushMessage: (messageId: number) => Promise<boolean>;
     suspend: () => void;
@@ -173,6 +175,7 @@ export declare function queueTelegramMediaGroupMessage<TMessage extends Telegram
     setTimer: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
     clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
     dispatchMessages: (messages: TMessage[], ctx?: TContext) => unknown | Promise<unknown>;
+    trackDispatch?: () => () => void;
 }): boolean;
 export declare function createTelegramMediaGroupController<TMessage extends TelegramMediaGroupMessage, TContext = unknown>(options?: TelegramMediaGroupControllerOptions): TelegramMediaGroupController<TMessage, TContext>;
 export declare function createTelegramMediaGroupDispatchRuntime<TMessage extends TelegramMediaGroupMessage, TContext>(deps: TelegramMediaGroupDispatchRuntimeDeps<TMessage, TContext>): TelegramMediaGroupDispatchRuntime<TMessage, TContext>;

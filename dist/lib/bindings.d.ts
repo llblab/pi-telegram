@@ -137,6 +137,7 @@ export declare function createTelegramAssistantOutputBindingRuntime<TTransportSt
 }): TelegramAssistantOutputBindingRuntime<TTransportStamp>;
 type TelegramAssistantOutputAuthority<TTransportStamp> = ReturnType<Routing.TelegramAssistantOutputAuthorityRuntime<TTransportStamp>["captureAuthority"]>;
 export interface TelegramBridgePublicationRuntime {
+    hasPendingWork: Activity.TelegramActivityPublicationRuntime["hasPendingWork"];
     enqueue: Activity.TelegramActivityPublicationRuntime["enqueue"];
     reserve: Activity.TelegramActivityPublicationRuntime["reserve"];
     capture: () => {

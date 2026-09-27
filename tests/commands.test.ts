@@ -151,6 +151,7 @@ test("Command helpers expose Telegram bot command definitions", () => {
     "compact",
     "next",
     "continue",
+    "quit",
     "abort",
     "stop",
   ]) {
@@ -158,7 +159,7 @@ test("Command helpers expose Telegram bot command definitions", () => {
   }
   assert.doesNotMatch(
     TELEGRAM_APP_MENU_INTRO_HTML,
-    /<code>\/(?:start|name|compact|next|continue|abort|stop|name)<\/code>/,
+    /<code>\/(?:start|name|compact|next|continue|quit|abort|stop|name)<\/code>/,
   );
   const expectedBuiltins = [
     {
@@ -174,6 +175,10 @@ test("Command helpers expose Telegram bot command definitions", () => {
     {
       command: "next",
       description: "⏩ Force next turn",
+    },
+    {
+      command: "quit",
+      description: "🗑 Delete Thread & Quit Pi",
     },
     {
       command: "abort",
@@ -1505,6 +1510,9 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
     openModelMenu: async () => {},
     openThinkingMenu: async () => {},
     openQueueMenu: async () => {},
+    openQuitConfirmation: async (nextMessage) => {
+      events.push(`quit:${nextMessage.chat.id}:${nextMessage.message_id}`);
+    },
     getAllowedUserId: () => 1,
     persistAllowedUserId: async () => true,
     registerBotCommands: async () => {},
@@ -1528,6 +1536,9 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
     '[[{"text":"🗜 Yes, compact","callback_data":"compact:confirm"},{"text":"❌ No","callback_data":"compact:cancel"}]]',
     '{"target":{"chatId":42,"threadId":123}}',
   ]);
+  events.length = 0;
+  assert.equal(await handleCommand("quit", message, {}), true);
+  assert.deepEqual(events, ["quit:42:99"]);
   events.length = 0;
   const cancelled = await handleTelegramCompactConfirmationCallback(
     {
@@ -2416,6 +2427,9 @@ test("Command helpers execute command actions through provided handlers", async 
     handleNew: async () => {
       events.push("new");
     },
+    handleQuit: async () => {
+      events.push("quit");
+    },
   };
   assert.equal(
     await executeTelegramCommandAction(
@@ -2456,6 +2470,15 @@ test("Command helpers execute command actions through provided handlers", async 
   );
   assert.equal(
     await executeTelegramCommandAction(
+      { kind: "quit", executionMode: "immediate" },
+      {},
+      {},
+      deps,
+    ),
+    true,
+  );
+  assert.equal(
+    await executeTelegramCommandAction(
       { kind: "help", commandName: "start", executionMode: "immediate" },
       {},
       {},
@@ -2463,7 +2486,7 @@ test("Command helpers execute command actions through provided handlers", async 
     ),
     true,
   );
-  assert.deepEqual(events, ["stop", "name:Navigator", "new", "help:start"]);
+  assert.deepEqual(events, ["stop", "name:Navigator", "new", "quit", "help:start"]);
 });
 
 function createNewSessionCommandDeps(

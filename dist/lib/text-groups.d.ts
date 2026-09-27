@@ -36,6 +36,8 @@ export interface TelegramTextGroupState<TMessage, TContext = unknown> {
 }
 export type TelegramForwardCommentBatchPosition = "comment" | "forward";
 export interface TelegramTextGroupController<TMessage, TContext = unknown> {
+    /** Buffered input or a dispatch still settling, even after clear or replacement. */
+    hasPendingWork: () => boolean;
     prepareUpdateBatch: (updates: readonly {
         message?: TMessage;
     }[]) => void;
@@ -74,6 +76,7 @@ export declare function queueTelegramTextGroupMessage<TMessage extends TelegramT
     setTimer: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
     clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
     dispatchMessages: (messages: TMessage[], ctx: TContext) => unknown | Promise<unknown>;
+    trackDispatch?: () => () => void;
     forceStart?: boolean;
     dispatchImmediately?: boolean;
     forwardPairCandidate?: TelegramForwardCommentBatchPosition;

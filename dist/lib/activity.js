@@ -471,8 +471,12 @@ export function createTelegramActivityPublicationRuntime() {
     let generation = 0;
     let tail = Promise.resolve();
     const pending = new Set();
+    const waiting = new Set();
+    let running = 0;
     const reserve = () => {
         const admittedGeneration = generation;
+        const claim = {};
+        waiting.add(claim);
         let state = "pending";
         let resolve;
         const ready = new Promise((accept) => { resolve = accept; });
@@ -481,13 +485,22 @@ export function createTelegramActivityPublicationRuntime() {
                 return;
             state = "cancelled";
             pending.delete(cancel);
+            waiting.delete(claim);
             resolve(undefined);
         };
         pending.add(cancel);
         const result = tail.then(async () => {
             const task = await ready;
-            if (admittedGeneration === generation && task)
-                await task();
+            waiting.delete(claim);
+            if (admittedGeneration === generation && task) {
+                running++;
+                try {
+                    await task();
+                }
+                finally {
+                    running--;
+                }
+            }
         });
         tail = result.catch(() => { });
         return {
@@ -505,12 +518,15 @@ export function createTelegramActivityPublicationRuntime() {
         };
     };
     return {
+        hasPendingWork: () => waiting.size > 0 || running > 0,
         reserve,
         enqueue: (task) => reserve().publish(task),
         reset() {
             generation += 1;
             for (const cancel of pending)
                 cancel();
+            // Unstarted old-generation work is fenced; already-running effects remain counted.
+            waiting.clear();
             tail = Promise.resolve();
         },
     };

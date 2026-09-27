@@ -11,7 +11,7 @@ import * as Threads from "./threads.js";
 import { parseTelegramUpdateJournalQueueOwner } from "./journal.js";
 import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS, } from "./locks.js";
 import { isTelegramApiMethodRetrySafe, TelegramApiCommitUnknownError, TelegramApiStaleTargetError, } from "./telegram-api.js";
-import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusFollowerTargetController, createTelegramBusForeignOwnedUpdateForwarder, createTelegramBusLocalServer, createTelegramBusRequestIdFactory, createUnauthorizedBusAck, getTelegramBusProtocolCompatibility, getTelegramBusSocketPath, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, } from "./bus.js";
+import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusFollowerTargetController, createTelegramBusForeignOwnedUpdateForwarder, createTelegramBusLocalServer, createTelegramBusRequestIdFactory, createUnauthorizedBusAck, getTelegramBusProtocolCompatibility, getTelegramBusSocketPath, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, isTelegramBusFollowerDisconnectDeletionConfirmed, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, } from "./bus.js";
 import { getTelegramBusTransportRetryPolicy, TELEGRAM_BUS_REGISTRATION_RETRY, } from "./bus-transport.js";
 import { createTelegramWorkspaceAdmissionOperationId, runWithTelegramWorkspaceAdmissionsAsync, } from "./workspace-admission.js";
 export const TELEGRAM_BUS_FOLLOWER_PROMOTION_GRACE_MS = 2_500;
@@ -1075,6 +1075,67 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
         }, heartbeatMs);
         heartbeatInterval.unref?.();
     };
+    const disconnectFromLeaderForQuit = async () => {
+        const leaderSocketPath = activeLeaderSocketPath;
+        const registrationGeneration = activeRegistrationGeneration;
+        const authSecret = activeAuthSecret;
+        const target = deps.registrationState?.getTarget() ?? lastKnownTarget;
+        if (!leaderSocketPath || !registrationGeneration)
+            return undefined;
+        const requestId = deps.createRequestId();
+        const response = await sendTelegramBusLocalEnvelope({
+            socketPath: leaderSocketPath,
+            timeoutMs: registrationTimeoutMs,
+            retry: getTelegramBusTransportRetryPolicy({ endpoint: leaderSocketPath, operation: "operation" }),
+            envelope: { kind: "follower.disconnect", requestId, auth: authSecret, instanceId: deps.instanceId,
+                registrationGeneration, sentAtMs: getNowMs() },
+        });
+        const currentTarget = deps.registrationState?.getTarget() ?? lastKnownTarget;
+        if (activeLeaderSocketPath !== leaderSocketPath || activeRegistrationGeneration !== registrationGeneration ||
+            activeAuthSecret !== authSecret || (deps.registrationState && deps.registrationState.getGeneration() !== registrationGeneration) ||
+            currentTarget?.chatId !== target?.chatId || currentTarget?.threadId !== target?.threadId) {
+            throw new Error("Telegram follower disconnect completed for a stale registration.");
+        }
+        if (response?.kind !== "bus.ack" || response.requestId !== requestId) {
+            throw new Error("Telegram follower disconnect was not acknowledged.");
+        }
+        if (!response.ok) {
+            const message = response.message ?? "Telegram follower disconnect was rejected.";
+            const reason = message === "Telegram follower disconnect refused: source-busy." ||
+                message === "Telegram follower disconnect refused: forwarding." ? "busy"
+                : message === "Telegram follower disconnect refused: source-unknown." ? "unknown"
+                    : message === "Telegram follower disconnect refused: registration-changed." ||
+                        message === "Unknown Telegram bus follower instance." ||
+                        message === "Stale Telegram bus follower registration generation." ? "changed"
+                        : undefined;
+            if (reason)
+                return { status: "refused", reason, message };
+            throw new Error(message);
+        }
+        const exactTarget = target?.threadId ? { chatId: target.chatId, threadId: target.threadId } : undefined;
+        const deletion = exactTarget && isTelegramBusFollowerDisconnectDeletionConfirmed(response, {
+            requestId, instanceId: deps.instanceId, registrationGeneration, target: exactTarget,
+        }) ? response.result : undefined;
+        stopHeartbeat();
+        activeLeaderSocketPath = undefined;
+        activeAuthSecret = undefined;
+        activeRegistrationGeneration = undefined;
+        heartbeatPromise = undefined;
+        heartbeatPromiseGeneration = undefined;
+        deps.setActiveAuthSecret?.(undefined);
+        deps.registrationState?.setRegistered(false);
+        await deps.stopReceiving?.();
+        return { status: "disconnected", outcome: { requestId, instanceId: deps.instanceId, registrationGeneration,
+                ...(exactTarget ? { target: exactTarget } : {}), ...(deletion ? { deletion } : {}) } };
+    };
+    const disconnectFromLeaderWithResult = async () => {
+        const attempt = await disconnectFromLeaderForQuit();
+        if (!attempt)
+            return undefined;
+        if (attempt.status === "refused")
+            throw new Error(attempt.message);
+        return attempt.outcome;
+    };
     return {
         registerWithLeader: async (ctx, leader, options) => {
             if (deps.isContextActive?.(ctx) === false)
@@ -1479,31 +1540,10 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
             }
             return true;
         },
+        disconnectFromLeaderWithResult,
+        disconnectFromLeaderForQuit,
         async disconnectFromLeader() {
-            if (!activeLeaderSocketPath || !activeRegistrationGeneration) {
-                return false;
-            }
-            const response = await sendTelegramBusLocalEnvelope({
-                socketPath: activeLeaderSocketPath,
-                timeoutMs: registrationTimeoutMs,
-                retry: getTelegramBusTransportRetryPolicy({
-                    endpoint: activeLeaderSocketPath,
-                    operation: "operation",
-                }),
-                envelope: {
-                    kind: "follower.disconnect",
-                    requestId: deps.createRequestId(),
-                    auth: activeAuthSecret,
-                    instanceId: deps.instanceId,
-                    registrationGeneration: activeRegistrationGeneration,
-                    sentAtMs: getNowMs(),
-                },
-            });
-            if (response?.kind === "bus.ack" && response.ok)
-                return true;
-            throw new Error(response?.kind === "bus.ack"
-                ? (response.message ?? "Telegram follower disconnect was rejected.")
-                : "Telegram follower disconnect was not acknowledged.");
+            return (await disconnectFromLeaderWithResult()) !== undefined;
         },
         stop,
     };

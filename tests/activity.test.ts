@@ -31,6 +31,33 @@ import {
 } from "../lib/outbound.ts";
 import type { TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
 
+test("Publication pending-work observation covers reservations, queued and running effects across reset", async () => {
+  const publication = createTelegramActivityPublicationRuntime();
+  assert.equal(publication.hasPendingWork(), false);
+  const cancelled = publication.reserve();
+  assert.equal(publication.hasPendingWork(), true);
+  cancelled.cancel();
+  assert.equal(publication.hasPendingWork(), false);
+  let release!: () => void, started!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const running = new Promise<void>((resolve) => { started = resolve; });
+  const active = publication.enqueue(async () => { started(); await blocked; });
+  const stale = publication.enqueue(async () => assert.fail("reset work must not execute"));
+  await running;
+  publication.reset();
+  assert.equal(publication.hasPendingWork(), true, "reset cannot settle an effect already running");
+  const replacement = publication.reserve();
+  release(); await Promise.all([active, stale]);
+  assert.equal(publication.hasPendingWork(), true, "old completion cannot erase a replacement reservation");
+  await replacement.publish(async () => {});
+  assert.equal(publication.hasPendingWork(), false);
+  const failed = publication.enqueue(async () => { throw new Error("fixture failure"); });
+  await assert.rejects(failed, /fixture failure/);
+  assert.equal(publication.hasPendingWork(), false);
+  publication.reserve(); publication.reset();
+  assert.equal(publication.hasPendingWork(), false);
+});
+
 test("Activity publication isolates failed tasks and fences queued work across reset", async () => {
   const publication = createTelegramActivityPublicationRuntime();
   const events: string[] = [];

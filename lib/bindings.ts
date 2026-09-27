@@ -465,6 +465,7 @@ type TelegramAssistantOutputAuthority<TTransportStamp> = ReturnType<
 >;
 
 export interface TelegramBridgePublicationRuntime {
+  hasPendingWork: Activity.TelegramActivityPublicationRuntime["hasPendingWork"];
   enqueue: Activity.TelegramActivityPublicationRuntime["enqueue"];
   reserve: Activity.TelegramActivityPublicationRuntime["reserve"];
   capture: () => { target?: Queue.TelegramQueueTarget; isCurrent: () => boolean };
@@ -544,6 +545,7 @@ export function createTelegramActivityBindingRuntime<TTransportStamp>(deps: {
     activityVerbosityRuntime,
     assistantOutputRuntime: assistantOutputBinding.runtime,
     publicationRuntime: {
+      hasPendingWork: publication.hasPendingWork,
       enqueue: publication.enqueue,
       reserve: publication.reserve,
       capture() {

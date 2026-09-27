@@ -33,6 +33,7 @@ import {
   type TelegramBusEnvelope,
   type TelegramBusFollowerRegistry,
   type TelegramBusFollowerView,
+  type TelegramBusFollowerDisconnectResult,
   type TelegramBusInstanceRegistration,
   type TelegramBusProtocolIdentity,
   type TelegramBusSocketPathSource,
@@ -764,7 +765,7 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
       return binding?.displayTitle ?? binding?.threadName;
     },
     onFollowerDisconnected: async (follower) => {
-      await runWorkspaceOperation(
+      const result = await runWorkspaceOperation(
         {
           operationId: createTelegramWorkspaceAdmissionOperationId(),
           operationKind: "workspace.disconnect-follower",
@@ -773,6 +774,7 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
         () => disconnectFollower(follower),
       );
       scheduleDisplay();
+      return result;
     },
     async renameFollowerThread(follower, threadName) {
       return runWorkspaceOperation({
@@ -1029,6 +1031,12 @@ export interface TelegramBusLeaderRuntimeDeps<TContext> {
   applyThreadDisplayMode?: (mode: TelegramThreadDisplayMode, isCurrent: () => boolean) => Promise<void>;
   getThreadDisplayMode?: () => TelegramThreadDisplayMode;
   getCurrentLeaderEpoch?: () => number | string | undefined;
+  /** When paired, disconnect closes forwarding and checks current leader-source settlement first. */
+  followerClosingGate?: TelegramBusFollowerClosingGate;
+  observeFollowerSourceSettlement?: (
+    follower: TelegramBusFollowerView,
+    isCurrent: () => boolean,
+  ) => Promise<TelegramBusFollowerSourceSettlement> | TelegramBusFollowerSourceSettlement;
   getTelegramProfile?: () => string | undefined;
   provisionLeaderTarget?: (ctx: TContext) => Promise<void> | void;
   runWorkspaceAdmission?: TelegramBusWorkspaceAdmissionRunner;
@@ -1041,7 +1049,7 @@ export interface TelegramBusLeaderRuntimeDeps<TContext> {
   shouldCleanupConfirmedDeadFollower?: () => Promise<boolean> | boolean;
   onFollowerDisconnected?: (
     follower: TelegramBusFollowerView,
-  ) => Promise<void> | void;
+  ) => Promise<TelegramBusFollowerDisconnectResult | void> | TelegramBusFollowerDisconnectResult | void;
   onFollowerConfirmedDead?: (
     follower: TelegramBusFollowerView,
   ) => Promise<void> | void;
@@ -1661,10 +1669,10 @@ export function createTelegramBusFollowerTargetProvisioner(
 function createTelegramBusFollowerCleanupHandler(
   deps: TelegramBusFollowerDisconnectHandlerDeps,
   trigger: "graceful-disconnect" | "confirmed-dead",
-): (follower: TelegramBusFollowerView) => Promise<void> {
+): (follower: TelegramBusFollowerView) => Promise<TelegramBusFollowerDisconnectResult | undefined> {
   return async (follower) => {
-    const target = follower.target;
-    if (!target?.threadId) return;
+    if (!follower.target?.threadId) return;
+    const target = { chatId: follower.target.chatId, threadId: follower.target.threadId };
     const leaderEpoch = deps.getCurrentLeaderEpoch?.();
     if (deps.getCurrentLeaderEpoch && leaderEpoch === undefined) {
       throw new Error("Follower disconnect cleanup requires leader ownership.");
@@ -1674,6 +1682,11 @@ function createTelegramBusFollowerCleanupHandler(
         "Follower disconnect cleanup requires an exact registration generation.",
       );
     }
+    const result: TelegramBusFollowerDisconnectResult = {
+      kind: "follower-disconnect-result", instanceId: follower.instanceId,
+      registrationGeneration: follower.registrationGeneration, target, threadDeletion: "unconfirmed",
+    };
+    let deletionObserved = false;
     const intent: ThreadReconciler.TelegramThreadCleanupIntent = {
       id: `cleanup:${follower.instanceId}:${follower.registrationGeneration}:${target.chatId}:${target.threadId}`,
       owner: "manual-follower",
@@ -1699,8 +1712,11 @@ function createTelegramBusFollowerCleanupHandler(
       {
         isCleanupTargetProtected,
         callApi: deps.callApi,
-        markStaleByTarget(target, syncStatus, lastSyncError) {
-          return deps.topicTargetStore.markStaleByTarget(target, syncStatus, lastSyncError);
+        markStaleByTarget(observedTarget, syncStatus, lastSyncError) {
+          if (syncStatus === "deleted" && observedTarget.chatId === target.chatId && observedTarget.threadId === target.threadId) {
+            deletionObserved = true;
+          }
+          return deps.topicTargetStore.markStaleByTarget(observedTarget, syncStatus, lastSyncError);
         },
         removeCleanupIntentById: deps.topicTargetStore.removePendingCleanup,
         persist: deps.topicTargetStore.persist,
@@ -1708,7 +1724,7 @@ function createTelegramBusFollowerCleanupHandler(
         recordRuntimeEvent: deps.recordRuntimeEvent,
       },
     );
-    if (cleanupPlan.actions.some((action) => isCleanupTargetProtected(action.target, action))) return;
+    if (cleanupPlan.actions.some((action) => isCleanupTargetProtected(action.target, action))) return result;
     if (cleanup.incompleteActions?.length) {
       throw new Error(
         "Telegram follower thread deletion was not confirmed; reconnect the leader to retry cleanup.",
@@ -1720,6 +1736,9 @@ function createTelegramBusFollowerCleanupHandler(
     ) {
       throw new Error("Follower disconnect cleanup lost leader ownership.");
     }
+    // A skipped/protected plan is not deletion proof. Persistence must also have completed above.
+    if (!deletionObserved) return result;
+    result.threadDeletion = "confirmed";
     deps.setSyncState(
       Sync.markTelegramSyncSliceFresh(deps.getSyncState(), "target-bindings", {
         nowMs: (deps.getNowMs ?? Date.now)(),
@@ -1744,19 +1763,21 @@ function createTelegramBusFollowerCleanupHandler(
         threadId: target.threadId,
       },
     );
+    return result;
   };
 }
 
 export function createTelegramBusFollowerDisconnectHandler(
   deps: TelegramBusFollowerDisconnectHandlerDeps,
-): (follower: TelegramBusFollowerView) => Promise<void> {
+): (follower: TelegramBusFollowerView) => Promise<TelegramBusFollowerDisconnectResult | undefined> {
   return createTelegramBusFollowerCleanupHandler(deps, "graceful-disconnect");
 }
 
 export function createTelegramBusFollowerConfirmedDeadHandler(
   deps: TelegramBusFollowerDisconnectHandlerDeps,
 ): (follower: TelegramBusFollowerView) => Promise<void> {
-  return createTelegramBusFollowerCleanupHandler(deps, "confirmed-dead");
+  const cleanup = createTelegramBusFollowerCleanupHandler(deps, "confirmed-dead");
+  return async (follower) => { await cleanup(follower); };
 }
 
 export function createTelegramBusLeaderTargetProvisioner<TContext>(
@@ -1972,6 +1993,139 @@ type TelegramBusFollowerMutationRunner = <T>(
   operation: () => Promise<T>,
 ) => Promise<T>;
 
+export type TelegramBusFollowerSourceSettlement = "clear" | "busy" | "unknown";
+
+interface TelegramBusFollowerClosingLease {
+  isCurrent(): boolean;
+  reopen(): void;
+  seal(): boolean;
+  retire(): void;
+}
+
+export interface TelegramBusFollowerClosingGate {
+  enter(follower: TelegramBusFollowerView): (() => void) | undefined;
+  tryClose(follower: TelegramBusFollowerView): TelegramBusFollowerClosingLease | undefined;
+  getPhase(follower: TelegramBusFollowerView): "open" | "closing" | "sealed";
+}
+
+function getFollowerClosingKey(follower: TelegramBusFollowerView): string | undefined {
+  const target = follower.target;
+  return typeof follower.instanceId === "string" && follower.instanceId.trim() &&
+    typeof follower.registrationGeneration === "string" && follower.registrationGeneration.trim() &&
+    Number.isSafeInteger(target?.chatId) && Number.isSafeInteger(target?.threadId) && target!.threadId! > 0
+    ? `${follower.instanceId}\0${follower.registrationGeneration}\0${target!.chatId}\0${target!.threadId}`
+    : undefined;
+}
+
+/** Process-local forwarding exclusion. It owns no journal, registry, transport, or cleanup authority. */
+export function createTelegramBusFollowerClosingGate(): TelegramBusFollowerClosingGate {
+  const states = new Map<string, { phase: "open" | "closing" | "sealed"; admitted: number; owner?: object }>();
+  const stateFor = (follower: TelegramBusFollowerView) => {
+    const key = getFollowerClosingKey(follower);
+    if (!key) return undefined;
+    let state = states.get(key);
+    if (!state) { state = { phase: "open", admitted: 0 }; states.set(key, state); }
+    return { key, state };
+  };
+  return {
+    enter(follower) {
+      const current = stateFor(follower);
+      if (!current || current.state.phase !== "open") return undefined;
+      current.state.admitted++;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        current.state.admitted--;
+        if (current.state.phase === "open" && current.state.admitted === 0 && !current.state.owner) states.delete(current.key);
+      };
+    },
+    tryClose(follower) {
+      const current = stateFor(follower);
+      if (!current || current.state.phase !== "open" || current.state.admitted !== 0) return undefined;
+      const claim = current.state.owner = {};
+      current.state.phase = "closing";
+      const isCurrent = () => current.state.owner === claim &&
+        (current.state.phase === "closing" || current.state.phase === "sealed");
+      return {
+        isCurrent,
+        reopen() {
+          if (current.state.owner !== claim || current.state.phase !== "closing") return;
+          current.state.phase = "open"; current.state.owner = undefined;
+          if (current.state.admitted === 0) states.delete(current.key);
+        },
+        seal() {
+          if (current.state.owner !== claim || current.state.phase !== "closing") return false;
+          current.state.phase = "sealed";
+          return true;
+        },
+        retire() {
+          if (current.state.owner === claim && current.state.phase === "sealed") states.delete(current.key);
+        },
+      };
+    },
+    getPhase(follower) {
+      const key = getFollowerClosingKey(follower);
+      return (key ? states.get(key)?.phase : undefined) ?? "open";
+    },
+  };
+}
+
+export type TelegramBusFollowerQuitClosingResult =
+  | { status: "ready"; deletion: TelegramBusFollowerDisconnectResult }
+  | { status: "refused"; reason: "forwarding" | "source-busy" | "source-unknown" | "registration-changed" }
+  | { status: "disconnected-unconfirmed"; deletion?: TelegramBusFollowerDisconnectResult }
+  | { status: "outcome-unknown" };
+
+/** Close forwarding, prove source settlement, then invoke the existing exact disconnect owner once. */
+export function createTelegramBusFollowerQuitClosingCoordinator(deps: {
+  gate: TelegramBusFollowerClosingGate;
+  getCurrentFollower(instanceId: string): TelegramBusFollowerView | undefined;
+  observeSourceSettlement(follower: TelegramBusFollowerView, isCurrent: () => boolean):
+    Promise<TelegramBusFollowerSourceSettlement> | TelegramBusFollowerSourceSettlement;
+  disconnect(follower: TelegramBusFollowerView, isCurrent: () => boolean):
+    Promise<TelegramBusFollowerDisconnectResult | undefined>;
+}) {
+  const sameRegistration = (left: TelegramBusFollowerView | undefined, right: TelegramBusFollowerView) =>
+    !!left && getFollowerClosingKey(left) === getFollowerClosingKey(right);
+  return {
+    async close(follower: TelegramBusFollowerView): Promise<TelegramBusFollowerQuitClosingResult> {
+      if (!sameRegistration(deps.getCurrentFollower(follower.instanceId), follower)) {
+        return { status: "refused", reason: "registration-changed" };
+      }
+      const lease = deps.gate.tryClose(follower);
+      if (!lease) return { status: "refused", reason: "forwarding" };
+      let terminal = false;
+      try {
+        let settlement: TelegramBusFollowerSourceSettlement;
+        try { settlement = await deps.observeSourceSettlement(follower, lease.isCurrent); }
+        catch { settlement = "unknown"; }
+        if (!lease.isCurrent()) return { status: "refused", reason: "registration-changed" };
+        if (settlement !== "clear") return { status: "refused", reason: settlement === "busy" ? "source-busy" : "source-unknown" };
+        if (!sameRegistration(deps.getCurrentFollower(follower.instanceId), follower)) {
+          return { status: "refused", reason: "registration-changed" };
+        }
+        let deletion: TelegramBusFollowerDisconnectResult | undefined;
+        try { deletion = await deps.disconnect(follower, lease.isCurrent); }
+        catch { return { status: "outcome-unknown" }; }
+        const current = deps.getCurrentFollower(follower.instanceId);
+        if (sameRegistration(current, follower)) return { status: "outcome-unknown" };
+        if (!lease.isCurrent() || !lease.seal()) return { status: "outcome-unknown" };
+        terminal = true;
+        lease.retire();
+        if (deletion?.kind === "follower-disconnect-result" && deletion.threadDeletion === "confirmed" && deletion.instanceId === follower.instanceId &&
+            deletion.registrationGeneration === follower.registrationGeneration &&
+            deletion.target.chatId === follower.target?.chatId && deletion.target.threadId === follower.target?.threadId) {
+          return { status: "ready", deletion };
+        }
+        return { status: "disconnected-unconfirmed", ...(deletion ? { deletion } : {}) };
+      } finally {
+        if (!terminal) lease.reopen();
+      }
+    },
+  };
+}
+
 function createTelegramBusFollowerMutationRunner(): TelegramBusFollowerMutationRunner {
   const tails = new Map<string, Promise<void>>();
   return async (follower, operation) => {
@@ -2040,7 +2194,7 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
     | undefined;
   onFollowerDisconnected?: (
     follower: TelegramBusFollowerView,
-  ) => Promise<void> | void;
+  ) => Promise<TelegramBusFollowerDisconnectResult | void> | TelegramBusFollowerDisconnectResult | void;
   renameFollowerThread?: (
     follower: TelegramBusFollowerView,
     threadName: string,
@@ -2056,6 +2210,12 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
   getThreadDisplayMode?: () => TelegramThreadDisplayMode;
   getCurrentLeaderEpoch?: () => number | string | undefined;
   runFollowerMutation?: TelegramBusFollowerMutationRunner;
+  /** Optional disconnect/forwarding fence; requires the paired source observer to affect disconnect. */
+  followerClosingGate?: TelegramBusFollowerClosingGate;
+  observeFollowerSourceSettlement?: (
+    follower: TelegramBusFollowerView,
+    isCurrent: () => boolean,
+  ) => Promise<TelegramBusFollowerSourceSettlement> | TelegramBusFollowerSourceSettlement;
   runWorkspaceAdmission?: TelegramBusWorkspaceAdmissionRunner;
   runWithWorkspaceCapacity?: TelegramWorkspaceCapacityRunner;
 }): (
@@ -2193,61 +2353,76 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
         message: "Telegram queue handoff recipient must be another runtime.",
       };
     }
-    if (deps.routeQueueHandoff) {
-      const result = await deps.routeQueueHandoff(donor, envelope);
+    const releaseClosingAdmission = deps.followerClosingGate?.enter(recipient);
+    if (deps.followerClosingGate && !releaseClosingAdmission) {
+      return { kind: "bus.ack", requestId: envelope.requestId, ok: false,
+        message: "Telegram queue handoff recipient is closing input admission." };
+    }
+    const recipientIsCurrent = () => deps.followerRegistry.get(recipient.instanceId)?.registrationGeneration ===
+      recipient.registrationGeneration;
+    try {
+      if (deps.routeQueueHandoff) {
+        const result = await deps.routeQueueHandoff(donor, envelope);
+        if (!recipientIsCurrent()) return { kind: "bus.ack", requestId: envelope.requestId, ok: false,
+          message: "Stale Telegram queue handoff recipient registration generation." };
+        return {
+          kind: "bus.ack",
+          requestId: envelope.requestId,
+          ok: true,
+          ...(result !== undefined ? { result } : {}),
+        };
+      }
+      const recipientSocketPath =
+        recipient.busSocketPath ??
+        getTelegramBusFollowerSocketPath(recipient.instanceId);
+      const response = await sendTelegramBusLocalEnvelope({
+        socketPath: recipientSocketPath,
+        timeoutMs: deps.timeoutMs,
+        retry: getTelegramBusTransportRetryPolicy({
+          endpoint: recipientSocketPath,
+          operation: "operation",
+        }),
+        envelope: {
+          kind: "leader.offerQueueHandoff",
+          requestId: envelope.requestId,
+          auth: envelope.auth,
+          recipientInstanceId: recipient.instanceId,
+          recipientRegistrationGeneration: recipient.registrationGeneration,
+          donorInstanceId: donor.instanceId,
+          donorProcessId: envelope.donorProcessId,
+          donorProcessBirthId: envelope.donorProcessBirthId,
+          donorSessionGeneration: envelope.donorSessionGeneration,
+          donorAcquisitionId: envelope.donorAcquisitionId,
+          donorAcquiredAtMs: envelope.donorAcquiredAtMs,
+          handoffToken: envelope.handoffToken,
+          payload: envelope.payload,
+          sentAtMs: envelope.sentAtMs,
+        },
+      });
+      if (response?.kind === "bus.ack" && response.ok) {
+        if (!recipientIsCurrent()) return { kind: "bus.ack", requestId: envelope.requestId, ok: false,
+          message: "Stale Telegram queue handoff recipient registration generation." };
+        deps.followerRegistry.heartbeat(donor.instanceId, getNowMs());
+        deps.followerRegistry.heartbeat(recipient.instanceId, getNowMs());
+        return {
+          kind: "bus.ack",
+          requestId: envelope.requestId,
+          ok: true,
+          ...(response.result !== undefined ? { result: response.result } : {}),
+        };
+      }
       return {
         kind: "bus.ack",
         requestId: envelope.requestId,
-        ok: true,
-        ...(result !== undefined ? { result } : {}),
+        ok: false,
+        message:
+          response?.kind === "bus.ack"
+            ? response.message
+            : "Telegram queue handoff recipient did not acknowledge staging.",
       };
+    } finally {
+      releaseClosingAdmission?.();
     }
-    const recipientSocketPath =
-      recipient.busSocketPath ??
-      getTelegramBusFollowerSocketPath(recipient.instanceId);
-    const response = await sendTelegramBusLocalEnvelope({
-      socketPath: recipientSocketPath,
-      timeoutMs: deps.timeoutMs,
-      retry: getTelegramBusTransportRetryPolicy({
-        endpoint: recipientSocketPath,
-        operation: "operation",
-      }),
-      envelope: {
-        kind: "leader.offerQueueHandoff",
-        requestId: envelope.requestId,
-        auth: envelope.auth,
-        recipientInstanceId: recipient.instanceId,
-        recipientRegistrationGeneration: recipient.registrationGeneration,
-        donorInstanceId: donor.instanceId,
-        donorProcessId: envelope.donorProcessId,
-        donorProcessBirthId: envelope.donorProcessBirthId,
-        donorSessionGeneration: envelope.donorSessionGeneration,
-        donorAcquisitionId: envelope.donorAcquisitionId,
-        donorAcquiredAtMs: envelope.donorAcquiredAtMs,
-        handoffToken: envelope.handoffToken,
-        payload: envelope.payload,
-        sentAtMs: envelope.sentAtMs,
-      },
-    });
-    if (response?.kind === "bus.ack" && response.ok) {
-      deps.followerRegistry.heartbeat(donor.instanceId, getNowMs());
-      deps.followerRegistry.heartbeat(recipient.instanceId, getNowMs());
-      return {
-        kind: "bus.ack",
-        requestId: envelope.requestId,
-        ok: true,
-        ...(response.result !== undefined ? { result: response.result } : {}),
-      };
-    }
-    return {
-      kind: "bus.ack",
-      requestId: envelope.requestId,
-      ok: false,
-      message:
-        response?.kind === "bus.ack"
-          ? response.message
-          : "Telegram queue handoff recipient did not acknowledge staging.",
-    };
   };
   const forwardToFollower = async (
     envelope: Extract<
@@ -2280,6 +2455,13 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
         requestId: envelope.requestId,
         ok: false,
         message: "Stale Telegram bus follower registration generation.",
+      };
+    }
+    const releaseClosingAdmission = deps.followerClosingGate?.enter(follower);
+    if (deps.followerClosingGate && !releaseClosingAdmission) {
+      return {
+        kind: "bus.ack", requestId: envelope.requestId, ok: false,
+        message: "Telegram bus follower is closing input admission.",
       };
     }
     const followerSocketPath =
@@ -2323,6 +2505,8 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
             ? error.message
             : "Telegram bus follower forwarding failed.",
       };
+    } finally {
+      releaseClosingAdmission?.();
     }
   };
   return async (envelope) => {
@@ -2768,23 +2952,45 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
               message: "Stale Telegram bus follower registration generation.",
             };
           }
-          await deps.onFollowerDisconnected?.(follower);
+          const disconnect = async (_expected: TelegramBusFollowerView, isCurrent: () => boolean) => {
+            if (!isCurrent()) throw new Error("Telegram follower disconnect authority changed.");
+            const result = await deps.onFollowerDisconnected?.(follower);
+            const current = deps.followerRegistry.get(follower.instanceId);
+            if (!isCurrent() || current?.registrationGeneration !== follower.registrationGeneration) {
+              throw new Error("Stale Telegram bus follower registration generation.");
+            }
+            deps.followerRegistry.remove(follower.instanceId);
+            if (!result) return undefined;
+            return result;
+          };
+          if (deps.followerClosingGate && deps.observeFollowerSourceSettlement) {
+            const closing = await createTelegramBusFollowerQuitClosingCoordinator({
+              gate: deps.followerClosingGate,
+              getCurrentFollower: deps.followerRegistry.get,
+              observeSourceSettlement: deps.observeFollowerSourceSettlement,
+              disconnect,
+            }).close(follower);
+            if (closing.status === "ready" || closing.status === "disconnected-unconfirmed") {
+              return { kind: "bus.ack" as const, requestId: envelope.requestId, ok: true,
+                ...(closing.deletion !== undefined ? { result: closing.deletion } : {}) };
+            }
+            return { kind: "bus.ack" as const, requestId: envelope.requestId, ok: false,
+              message: closing.status === "refused"
+                ? `Telegram follower disconnect refused: ${closing.reason}.`
+                : "Telegram follower disconnect outcome is unknown." };
+          }
+          const result = await deps.onFollowerDisconnected?.(follower);
           const current = deps.followerRegistry.get(follower.instanceId);
-          if (
-            current?.registrationGeneration !== follower.registrationGeneration
-          ) {
-            return {
-              kind: "bus.ack" as const,
-              requestId: envelope.requestId,
-              ok: false,
-              message: "Stale Telegram bus follower registration generation.",
-            };
+          if (current?.registrationGeneration !== follower.registrationGeneration) {
+            return { kind: "bus.ack" as const, requestId: envelope.requestId, ok: false,
+              message: "Stale Telegram bus follower registration generation." };
           }
           deps.followerRegistry.remove(follower.instanceId);
           return {
             kind: "bus.ack" as const,
             requestId: envelope.requestId,
             ok: true,
+            ...(result !== undefined ? { result } : {}),
           };
           },
         );
@@ -3320,6 +3526,8 @@ export function createTelegramBusLeaderRuntime<TContext>(
     applyThreadDisplayMode: deps.applyThreadDisplayMode,
     getThreadDisplayMode: deps.getThreadDisplayMode,
     getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
+    followerClosingGate: deps.followerClosingGate,
+    observeFollowerSourceSettlement: deps.observeFollowerSourceSettlement,
     runFollowerMutation,
     runWorkspaceAdmission: deps.runWorkspaceAdmission,
     runWithWorkspaceCapacity: deps.runWithWorkspaceCapacity,
@@ -3357,11 +3565,19 @@ export function createTelegramBusLeaderRuntime<TContext>(
         message: "Stale Telegram queue handoff recipient registration generation.",
       };
     }
+    const releaseClosingAdmission = deps.followerClosingGate?.enter(recipient);
+    if (deps.followerClosingGate && !releaseClosingAdmission) {
+      return { kind: "bus.ack", requestId: input.requestId, ok: false,
+        message: "Telegram queue handoff recipient is closing input admission." };
+    }
+    const recipientIsCurrent = () => deps.followerRegistry.get(recipient.instanceId)?.registrationGeneration ===
+      recipient.registrationGeneration;
     const recipientSocketPath =
       recipient.busSocketPath ??
       getTelegramBusFollowerSocketPath(recipient.instanceId);
-    const response = await sendTelegramBusLocalEnvelope({
-      socketPath: recipientSocketPath,
+    try {
+      const response = await sendTelegramBusLocalEnvelope({
+        socketPath: recipientSocketPath,
       timeoutMs: deps.timeoutMs,
       retry: getTelegramBusTransportRetryPolicy({
         endpoint: recipientSocketPath,
@@ -3382,26 +3598,31 @@ export function createTelegramBusLeaderRuntime<TContext>(
         handoffToken: input.handoffToken,
         payload: input.payload,
         sentAtMs: input.sentAtMs,
-      },
-    });
-    if (response?.kind === "bus.ack" && response.ok) {
-      deps.followerRegistry.heartbeat(recipient.instanceId, getNowMs());
+        },
+      });
+      if (response?.kind === "bus.ack" && response.ok) {
+        if (!recipientIsCurrent()) return { kind: "bus.ack", requestId: input.requestId, ok: false,
+          message: "Stale Telegram queue handoff recipient registration generation." };
+        deps.followerRegistry.heartbeat(recipient.instanceId, getNowMs());
+        return {
+          kind: "bus.ack",
+          requestId: input.requestId,
+          ok: true,
+          ...(response.result !== undefined ? { result: response.result } : {}),
+        };
+      }
       return {
         kind: "bus.ack",
         requestId: input.requestId,
-        ok: true,
-        ...(response.result !== undefined ? { result: response.result } : {}),
+        ok: false,
+        message:
+          response?.kind === "bus.ack"
+            ? response.message
+            : "Telegram queue handoff recipient did not acknowledge staging.",
       };
+    } finally {
+      releaseClosingAdmission?.();
     }
-    return {
-      kind: "bus.ack",
-      requestId: input.requestId,
-      ok: false,
-      message:
-        response?.kind === "bus.ack"
-          ? response.message
-          : "Telegram queue handoff recipient did not acknowledge staging.",
-    };
   };
   const localServer = createTelegramBusLocalServer({
     socketPath: deps.socketPath,

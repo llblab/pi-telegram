@@ -31,6 +31,7 @@ import {
   createTelegramBusForwardOwnershipValidator,
   createTelegramBusFollowerSourceReferenceDeliveryIdentity,
   createTelegramBusFollowerRegistry,
+  isTelegramBusFollowerDisconnectDeletionConfirmed,
   type TelegramBusEnvelope,
   createTelegramBusFollowerThreadRestoreHandler,
   createTelegramBusProtocolIdentity,
@@ -632,6 +633,31 @@ test("Bus contract encodes and parses Workspace follower restore envelopes", () 
     TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
     "workspace-follower-auto-connect-v1",
   );
+});
+
+test("Bus disconnect deletion proof survives ACK serialization and requires every exact correlation", () => {
+  const expected = { requestId: "delete-op", instanceId: "worker", registrationGeneration: "worker:1",
+    target: { chatId: 7, threadId: 42 } };
+  const result = { kind: "follower-disconnect-result", instanceId: expected.instanceId,
+    registrationGeneration: expected.registrationGeneration, target: expected.target, threadDeletion: "confirmed" };
+  const ack: TelegramBusEnvelope = { kind: "bus.ack", requestId: expected.requestId, ok: true, result };
+  assert.equal(isTelegramBusFollowerDisconnectDeletionConfirmed(parseTelegramBusEnvelope(encodeTelegramBusEnvelope(ack).trimEnd()), expected), true);
+  for (const [name, response] of Object.entries({
+    absent: undefined,
+    legacy: { ...ack, result: undefined },
+    failed: { ...ack, ok: false },
+    wrongRequest: { ...ack, requestId: "other-op" },
+    malformed: { ...ack, result: "confirmed" },
+    wrongKind: { ...ack, result: { ...result, kind: "other" } },
+    unconfirmed: { ...ack, result: { ...result, threadDeletion: "unconfirmed" } },
+    wrongInstance: { ...ack, result: { ...result, instanceId: "other" } },
+    wrongGeneration: { ...ack, result: { ...result, registrationGeneration: "worker:2" } },
+    wrongChat: { ...ack, result: { ...result, target: { chatId: 8, threadId: 42 } } },
+    wrongThread: { ...ack, result: { ...result, target: { chatId: 7, threadId: 43 } } },
+    noTarget: { ...ack, result: { ...result, target: null } },
+  })) assert.equal(isTelegramBusFollowerDisconnectDeletionConfirmed(response, expected), false, name);
+  assert.equal(isTelegramBusFollowerDisconnectDeletionConfirmed(ack, { ...expected, requestId: "" }), false);
+  assert.equal(isTelegramBusFollowerDisconnectDeletionConfirmed(ack, { ...expected, target: { chatId: 7, threadId: 0 } }), false);
 });
 
 test("Bus contract encodes and parses explicit follower disconnect envelopes", () => {

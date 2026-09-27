@@ -105,7 +105,10 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     updateSettingsMenuMessage?: (state: Menu.TelegramModelMenuState<TModel>, ctx: TContext) => Promise<void>;
     openQueueMenu: (chatId: number, replyToMessageId: number, ctx: TContext) => Promise<void>;
     openSettingsMenu?: (chatId: number, replyToMessageId: number, ctx: TContext) => Promise<void>;
+    openQuitConfirmation?: (message: TMessage, ctx: TContext) => Promise<void>;
     settingsMenuCallbackHandler?: (query: TCallbackQuery, ctx: TContext) => Promise<boolean>;
+    /** Private activation port for exact quit confirmation callbacks. */
+    quitCallbackHandler?: (query: TCallbackQuery, ctx: TContext, updateId: number | undefined) => Promise<boolean>;
     queueMenuCallbackHandler: (query: TCallbackQuery, ctx: TContext) => Promise<boolean>;
     buttonActionStore?: OutboundHandlers.TelegramButtonActionStore;
     invokeBoundButtonAction?: (action: OutboundHandlers.TelegramOutboundButtonAction, query: TCallbackQuery, ctx: TContext) => Promise<false | "new" | "edit">;
@@ -179,6 +182,13 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
         };
     }) => Promise<number | undefined>;
 }
+/** Read existing deletion evidence before any cached-owner forwarding or local action. */
+export declare function createTelegramDeletedTargetLookup<TContext>(deps: {
+    threadStore: Pick<Threads.TelegramTopicTargetStore, "load" | "list" | "listSyncObservations">;
+    getAdmissionScope?: () => string | undefined;
+    isContextActive?: (ctx: TContext) => boolean;
+    recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
+}): Updates.TelegramConfirmedDeletedTargetLookup<TContext>;
 export declare function createTelegramInboundRouteRuntime<TUpdate extends Updates.TelegramUpdateFlow & {
     message?: TMessage;
     edited_message?: TMessage;

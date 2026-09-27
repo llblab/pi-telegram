@@ -599,9 +599,16 @@ export interface TelegramInboundRouteRuntimeDeps<
     replyToMessageId: number,
     ctx: TContext,
   ) => Promise<void>;
+  openQuitConfirmation?: (message: TMessage, ctx: TContext) => Promise<void>;
   settingsMenuCallbackHandler?: (
     query: TCallbackQuery,
     ctx: TContext,
+  ) => Promise<boolean>;
+  /** Private activation port for exact quit confirmation callbacks. */
+  quitCallbackHandler?: (
+    query: TCallbackQuery,
+    ctx: TContext,
+    updateId: number | undefined,
   ) => Promise<boolean>;
   queueMenuCallbackHandler: (
     query: TCallbackQuery,
@@ -725,6 +732,7 @@ const TELEGRAM_OWNED_CALLBACK_PREFIXES = [
   "model:",
   "new:",
   "queue:",
+  "quit:",
   "section:",
   "settings:",
   "status:",
@@ -736,6 +744,38 @@ function isTelegramOwnedCallbackData(data: string): boolean {
   return TELEGRAM_OWNED_CALLBACK_PREFIXES.some((prefix) =>
     data.startsWith(prefix),
   );
+}
+
+/** Read existing deletion evidence before any cached-owner forwarding or local action. */
+export function createTelegramDeletedTargetLookup<TContext>(deps: {
+  threadStore: Pick<Threads.TelegramTopicTargetStore, "load" | "list" | "listSyncObservations">;
+  getAdmissionScope?: () => string | undefined;
+  isContextActive?: (ctx: TContext) => boolean;
+  recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
+}): Updates.TelegramConfirmedDeletedTargetLookup<TContext> {
+  return async (target, ctx) => {
+    if (!Number.isSafeInteger(target.chatId) || !Number.isSafeInteger(target.threadId) || target.threadId! <= 0) return false;
+    const scope = deps.getAdmissionScope?.();
+    const assertCurrent = () => {
+      if ((deps.isContextActive && !deps.isContextActive(ctx)) ||
+          (deps.getAdmissionScope && (!scope || deps.getAdmissionScope() !== scope))) {
+        throw new Error("Telegram deleted-target observation authority is unavailable.");
+      }
+    };
+    assertCurrent();
+    await deps.threadStore.load();
+    assertCurrent();
+    const matches = (other: Queue.TelegramQueueTarget) => other.chatId === target.chatId && other.threadId === target.threadId;
+    // Preserve the existing precedence of current active/starting records over old observations.
+    if (deps.threadStore.list().some((record) => matches(record.target) &&
+        (record.status === "active" || record.status === "starting"))) return false;
+    const deleted = deps.threadStore.listSyncObservations().some((observation) =>
+      matches(observation.target) && observation.syncStatus === "deleted");
+    if (deleted) deps.recordRuntimeEvent?.("inbound-worker", "Discarded update from a confirmed deleted Telegram thread", {
+      phase: "discard-deleted-thread", chatId: target.chatId, threadId: target.threadId,
+    });
+    return deleted;
+  };
 }
 
 export function createTelegramInboundRouteRuntime<
@@ -2007,6 +2047,10 @@ export function createTelegramInboundRouteRuntime<
       }
       return;
     }
+    const quitUpdateId = Updates.getTelegramUpdateExecutionFence(query)?.updateId;
+    const handledByQuit = await deps.quitCallbackHandler?.(query, ctx, quitUpdateId);
+    assertExecutionCurrent();
+    if (handledByQuit) return;
     const handledByNew =
       await Commands.handleTelegramNewConfirmationCallback(query, {
         ctx,
@@ -2251,6 +2295,7 @@ export function createTelegramInboundRouteRuntime<
       return deps.openQueueMenu(chatId, message.message_id, ctx);
     },
     openSettingsMenu: deps.openSettingsMenu,
+    openQuitConfirmation: deps.openQuitConfirmation,
     getAllowedUserId: deps.configStore.getAllowedUserId,
     persistAllowedUserId: deps.configStore.persistAllowedUserId,
     setMyCommands: deps.setMyCommands,
@@ -2943,6 +2988,10 @@ export function createTelegramInboundRouteRuntime<
   };
   return Updates.createTelegramPairedUpdateRuntime<TContext, TUpdate>({
     getAllowedUserId: deps.configStore.getAllowedUserId,
+    isTargetConfirmedDeleted: deps.threadStore ? createTelegramDeletedTargetLookup({
+      threadStore: deps.threadStore, getAdmissionScope: deps.getAdmissionScope,
+      isContextActive: deps.isContextActive, recordRuntimeEvent: deps.recordRuntimeEvent,
+    }) : undefined,
     getCurrentInstanceId: deps.getCurrentInstanceId,
     getMessageOwnership: deps.getMessageOwnership,
     getTargetOwnership: deps.getTargetOwnership,

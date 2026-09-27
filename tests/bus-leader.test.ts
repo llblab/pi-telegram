@@ -22,10 +22,13 @@ import {
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
   TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
+  type TelegramBusEnvelope,
 } from "../lib/bus.ts";
 import {
   createTelegramBusFollowerConfirmedDeadHandler,
   createTelegramBusFollowerDisconnectHandler,
+  createTelegramBusFollowerClosingGate,
+  createTelegramBusFollowerQuitClosingCoordinator,
   createTelegramBusFollowerSessionReplacementAuthority,
   createTelegramBusFollowerTargetProvisioner,
   createTelegramBusInstanceLifecycleAnnouncement,
@@ -2468,7 +2471,11 @@ test("Bus leader activation scheduler hot-switches an owning classic poller", as
 
 test("Bus leader routes authenticated queue handoff between exact follower generations", async () => {
   const registry = createTelegramBusFollowerRegistry();
+  const closingGate = createTelegramBusFollowerClosingGate();
   const routed: unknown[] = [];
+  let replaceRecipient = false, markRouteStarted!: () => void, releaseRoute!: () => void;
+  const routeStarted = new Promise<void>((resolve) => { markRouteStarted = resolve; });
+  const routeBlocked = new Promise<void>((resolve) => { releaseRoute = resolve; });
   registry.register({
     instanceId: "donor",
     registrationGeneration: "donor-generation",
@@ -2480,12 +2487,17 @@ test("Bus leader routes authenticated queue handoff between exact follower gener
     registrationGeneration: "recipient-generation",
     protocol: TEST_BUS_PROTOCOL_IDENTITY,
     connectedAtMs: 1,
+    target: { chatId: 7, threadId: 42 },
   });
   const handleEnvelope = createTelegramBusLeaderEnvelopeHandler({
     followerRegistry: registry,
     authSecret: "secret",
-    routeQueueHandoff(follower, envelope) {
+    followerClosingGate: closingGate,
+    async routeQueueHandoff(follower, envelope) {
       routed.push({ follower, envelope });
+      if (envelope.requestId === "handoff:active") { markRouteStarted(); await routeBlocked; }
+      if (replaceRecipient) registry.register({ ...registry.get("recipient")!,
+        registrationGeneration: "recipient-replacement" });
       return { status: "staged", receiptId: "receipt-1", sourceUpdateIds: [1] };
     },
   });
@@ -2534,6 +2546,18 @@ test("Bus leader routes authenticated queue handoff between exact follower gener
   });
   assert.equal(routed.length, 1);
   assert.equal((routed[0] as { follower: { instanceId: string } }).follower.instanceId, "donor");
+  const recipient = registry.get("recipient")!;
+  const closing = closingGate.tryClose(recipient)!;
+  assert.deepEqual(await handleEnvelope({ ...envelope, requestId: "handoff:closing" }), {
+    kind: "bus.ack", requestId: "handoff:closing", ok: false,
+    message: "Telegram queue handoff recipient is closing input admission.",
+  });
+  assert.equal(routed.length, 1); closing.reopen();
+  const activeHandoff = handleEnvelope({ ...envelope, requestId: "handoff:active" });
+  await routeStarted;
+  assert.equal(closingGate.tryClose(recipient), undefined, "accepted handoff staging counts as active input");
+  releaseRoute();
+  assert.equal((await activeHandoff).kind, "bus.ack");
   assert.deepEqual(
     await handleEnvelope({
       ...envelope,
@@ -2560,7 +2584,13 @@ test("Bus leader routes authenticated queue handoff between exact follower gener
       message: "Stale Telegram queue handoff recipient registration generation.",
     },
   );
-  assert.equal(routed.length, 1);
+  assert.equal(routed.length, 2);
+  replaceRecipient = true;
+  assert.deepEqual(await handleEnvelope({ ...envelope, requestId: "handoff:replacement" }), {
+    kind: "bus.ack", requestId: "handoff:replacement", ok: false,
+    message: "Stale Telegram queue handoff recipient registration generation.",
+  });
+  assert.equal(routed.length, 3);
 });
 
 test("Bus leader envelope handler registers and heartbeats followers", async () => {
@@ -2936,6 +2966,61 @@ test("Bus leader rejects generationless registration and disconnect envelopes", 
   );
   assert.equal(disconnects, 0);
   assert.equal(registry.get("inst-a")?.registrationGeneration, "inst-a:1");
+});
+
+test("Bus leader never publishes a disconnect deletion result after registration replacement", async () => {
+  const registry = createTelegramBusFollowerRegistry();
+  const target = { chatId: 7, threadId: 42 };
+  registry.register({ instanceId: "worker", registrationGeneration: "worker:1", connectedAtMs: 1, target });
+  const handle = createTelegramBusLeaderEnvelopeHandler({ followerRegistry: registry,
+    onFollowerDisconnected(follower) {
+      registry.register({ ...follower, registrationGeneration: "worker:2" });
+      return { kind: "follower-disconnect-result", instanceId: follower.instanceId,
+        registrationGeneration: "worker:1", target, threadDeletion: "confirmed" };
+    } });
+  const response = await handle({ kind: "follower.disconnect", requestId: "delete-op", instanceId: "worker",
+    registrationGeneration: "worker:1", sentAtMs: 2 });
+  assert.ok(response.kind === "bus.ack");
+  assert.equal(response.ok, false); assert.equal(response.result, undefined);
+  assert.equal(registry.get("worker")?.registrationGeneration, "worker:2");
+});
+
+test("Bus leader assembly preserves deletion proof through Workspace admission and IPC", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-disconnect-result-"));
+  const socketPath = join(dir, "bus.sock"), target = { chatId: 7, threadId: 42 };
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+  const registry = createTelegramBusFollowerRegistry();
+  registry.register({ instanceId: "worker", registrationGeneration: "worker:1", connectedAtMs: Date.now(),
+    target, profileKey: "manual:worker", protocol: TEST_BUS_PROTOCOL_IDENTITY });
+  store.upsert({ profileKey: "manual:worker", instanceId: "worker", target, status: "active",
+    createdAtMs: 1, updatedAtMs: 1 });
+  const events: string[] = [];
+  const runtime = createTelegramBusLeaderRuntimeAssembly({
+    runtime: { socketPath, followerRegistry: registry, protocolIdentity: TEST_BUS_PROTOCOL_IDENTITY,
+      startPolling() {}, stopPolling() {} },
+    instanceId: "leader", getAllowedUserId: () => undefined, getCurrentLeaderEpoch: () => 2,
+    topicTargetStore: store,
+    async runWorkspaceOperation(request, run) {
+      const result = await run();
+      if (request.operationKind === "workspace.disconnect-follower") events.push("admission-finished");
+      return result;
+    },
+    async callApi<TResponse>(method: string) { events.push(method); return true as TResponse; },
+    callMultipart: async () => true, downloadFile: async () => undefined,
+    getSyncState: () => ({}), setSyncState() {}, setLeaderTarget() {}, recordRuntimeEvent() {},
+  });
+  try {
+    await store.persist(); await runtime.startPolling("ctx");
+    const response = await sendTelegramBusLocalEnvelope({ socketPath, envelope: {
+      kind: "follower.disconnect", requestId: "delete-op", instanceId: "worker", registrationGeneration: "worker:1", sentAtMs: Date.now(),
+    } });
+    assert.ok(response?.kind === "bus.ack"); assert.equal(response.ok, true);
+    assert.deepEqual(response.result, { kind: "follower-disconnect-result", instanceId: "worker",
+      registrationGeneration: "worker:1", target, threadDeletion: "confirmed" });
+    assert.ok(events.indexOf("deleteForumTopic") >= 0);
+    assert.ok(events.indexOf("deleteForumTopic") < events.indexOf("admission-finished"));
+    assert.equal(registry.get("worker"), undefined);
+  } finally { await runtime.stopPolling(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("Bus leader serializes disconnect cleanup before cross-session registration", async () => {
@@ -3701,6 +3786,146 @@ test("Bus leader encodes commit-unknown API failures structurally", async () => 
       error: { code: "commit-unknown", method: "sendMessage" },
     },
   );
+});
+
+test("Follower closing gate counts exact active forwarding and isolates registrations", () => {
+  const gate = createTelegramBusFollowerClosingGate();
+  const follower = { instanceId: "inst-a", registrationGeneration: "inst-a:1", connectedAtMs: 1, lastHeartbeatMs: 1,
+    target: { chatId: 7, threadId: 42 } };
+  const other = { ...follower, instanceId: "inst-b", registrationGeneration: "inst-b:1", target: { chatId: 7, threadId: 43 } };
+  const first = gate.enter(follower)!, second = gate.enter(follower)!;
+  assert.equal(gate.tryClose(follower), undefined);
+  const otherLease = gate.tryClose(other)!;
+  assert.equal(gate.enter(other), undefined);
+  first(); first();
+  assert.equal(gate.tryClose(follower), undefined, "the second active admission remains counted");
+  second();
+  const lease = gate.tryClose(follower)!;
+  assert.equal(gate.enter(follower), undefined);
+  assert.ok(gate.enter({ ...follower, registrationGeneration: "inst-a:2" }));
+  lease.reopen(); otherLease.reopen();
+  const replacementLease = gate.tryClose({ ...follower, registrationGeneration: "inst-a:2" });
+  assert.equal(replacementLease, undefined, "replacement activity is independently counted");
+});
+
+test("Leader closing gate rejects every forwarded Telegram update kind without contacting follower", async () => {
+  const registry = createTelegramBusFollowerRegistry();
+  const follower = { instanceId: "inst-a", registrationGeneration: "inst-a:1", connectedAtMs: 1, lastHeartbeatMs: 1,
+    target: { chatId: 7, threadId: 42 }, busSocketPath: "/must-not-connect" };
+  registry.register(follower);
+  const gate = createTelegramBusFollowerClosingGate();
+  assert.ok(gate.tryClose(follower));
+  const handle = createTelegramBusLeaderEnvelopeHandler({ followerRegistry: registry, followerClosingGate: gate });
+  for (const [index, kind] of (["leader.forwardMessage", "leader.forwardEditedMessage", "leader.forwardCallback", "leader.forwardReaction"] as const).entries()) {
+    const delivery = createTelegramBusFollowerDeliveryIdentity({ kind, recipientBindingKey: "manual:inst-a", sourceUpdateId: 80 + index });
+    const common = { kind, requestId: `closing:${index}`, recipientInstanceId: "inst-a",
+      recipientRegistrationGeneration: "inst-a:1", delivery, sentAtMs: 2 };
+    const envelope = (kind === "leader.forwardCallback" ? { ...common, query: {} }
+      : kind === "leader.forwardReaction" ? { ...common, reactionUpdate: {} } : { ...common, message: {} }) as TelegramBusEnvelope;
+    assert.deepEqual(await handle(envelope), { kind: "bus.ack", requestId: `closing:${index}`, ok: false,
+      message: "Telegram bus follower is closing input admission." });
+  }
+});
+
+test("Follower quit closing coordinator refuses active, retained and unknown source work and reopens forwarding", async () => {
+  for (const condition of ["forwarding", "busy", "unknown", "throw", "changed"] as const) {
+    const gate = createTelegramBusFollowerClosingGate();
+    const follower = { instanceId: "inst-a", registrationGeneration: "inst-a:1", connectedAtMs: 1, lastHeartbeatMs: 1,
+      target: { chatId: 7, threadId: 42 } };
+    let current = follower, disconnects = 0;
+    const release = condition === "forwarding" ? gate.enter(follower)! : undefined;
+    const coordinator = createTelegramBusFollowerQuitClosingCoordinator({ gate,
+      getCurrentFollower: () => current,
+      observeSourceSettlement: async () => {
+        if (condition === "throw") throw new Error("fixture source unavailable");
+        if (condition === "changed") current = { ...follower, registrationGeneration: "inst-a:2" };
+        return condition === "busy" ? "busy" : condition === "unknown" ? "unknown" : "clear";
+      },
+      async disconnect() { disconnects++; throw new Error("must not disconnect"); },
+    });
+    const result = await coordinator.close(follower);
+    assert.deepEqual(result, { status: "refused", reason: condition === "forwarding" ? "forwarding"
+      : condition === "busy" ? "source-busy" : condition === "changed" ? "registration-changed" : "source-unknown" });
+    assert.equal(disconnects, 0, condition);
+    release?.();
+    if (condition !== "changed") {
+      const admitted = gate.enter(follower); assert.ok(admitted, `${condition} must reopen`); admitted?.();
+    }
+  }
+});
+
+test("Follower quit closing coordinator blocks late forwarding through deletion and isolates other followers", async () => {
+  const gate = createTelegramBusFollowerClosingGate();
+  const follower = { instanceId: "inst-a", registrationGeneration: "inst-a:1", connectedAtMs: 1, lastHeartbeatMs: 1,
+    target: { chatId: 7, threadId: 42 } };
+  const other = { ...follower, instanceId: "inst-b", registrationGeneration: "inst-b:1", target: { chatId: 7, threadId: 43 } };
+  let current: typeof follower | undefined = follower, observedClosing = false;
+  const coordinator = createTelegramBusFollowerQuitClosingCoordinator({ gate,
+    getCurrentFollower: () => current,
+    observeSourceSettlement() {
+      observedClosing = gate.enter(follower) === undefined;
+      const unrelated = gate.enter(other); assert.ok(unrelated); unrelated?.();
+      return "clear";
+    },
+    async disconnect(_follower, isCurrent) {
+      assert.equal(isCurrent(), true); assert.equal(gate.enter(follower), undefined);
+      current = undefined;
+      return { kind: "follower-disconnect-result", instanceId: "inst-a", registrationGeneration: "inst-a:1",
+        target: { chatId: 7, threadId: 42 }, threadDeletion: "confirmed" };
+    },
+  });
+  assert.deepEqual(await coordinator.close(follower), { status: "ready", deletion: {
+    kind: "follower-disconnect-result", instanceId: "inst-a", registrationGeneration: "inst-a:1",
+    target: { chatId: 7, threadId: 42 }, threadDeletion: "confirmed" } });
+  assert.equal(observedClosing, true); assert.equal(gate.getPhase(follower), "open", "removed registration retires its gate state");
+  assert.ok(gate.enter(other));
+});
+
+test("Configured disconnect handler retains registration until source settlement is clear", async () => {
+  const registry = createTelegramBusFollowerRegistry();
+  const follower = { instanceId: "inst-a", profileKey: "manual:inst-a", registrationGeneration: "inst-a:1",
+    connectedAtMs: 1, lastHeartbeatMs: 1, target: { chatId: 7, threadId: 42 } };
+  registry.register(follower);
+  const gate = createTelegramBusFollowerClosingGate();
+  let settlement: "busy" | "clear" = "busy", cleanups = 0;
+  const handle = createTelegramBusLeaderEnvelopeHandler({ followerRegistry: registry, followerClosingGate: gate,
+    observeFollowerSourceSettlement: () => settlement,
+    onFollowerDisconnected() { cleanups++; return { kind: "follower-disconnect-result", instanceId: "inst-a",
+      registrationGeneration: "inst-a:1", target: { chatId: 7, threadId: 42 }, threadDeletion: "confirmed" }; } });
+  const envelope = { kind: "follower.disconnect" as const, requestId: "delete-op", instanceId: "inst-a",
+    registrationGeneration: "inst-a:1", sentAtMs: 2 };
+  assert.deepEqual(await handle(envelope), { kind: "bus.ack", requestId: "delete-op", ok: false,
+    message: "Telegram follower disconnect refused: source-busy." });
+  assert.equal(cleanups, 0); assert.ok(registry.get("inst-a")); assert.equal(gate.getPhase(follower), "open");
+  settlement = "clear";
+  assert.deepEqual(await handle(envelope), { kind: "bus.ack", requestId: "delete-op", ok: true, result: {
+    kind: "follower-disconnect-result", instanceId: "inst-a", registrationGeneration: "inst-a:1",
+    target: { chatId: 7, threadId: 42 }, threadDeletion: "confirmed" } });
+  assert.equal(cleanups, 1); assert.equal(registry.get("inst-a"), undefined);
+  assert.equal(gate.getPhase(follower), "open", "removed registration leaves no gate tombstone");
+});
+
+test("Follower quit closing coordinator never upgrades ambiguous disconnect outcomes", async () => {
+  for (const outcome of ["unconfirmed", "missing", "throw", "still-registered"] as const) {
+    const gate = createTelegramBusFollowerClosingGate();
+    const follower = { instanceId: "inst-a", registrationGeneration: "inst-a:1", connectedAtMs: 1, lastHeartbeatMs: 1,
+      target: { chatId: 7, threadId: 42 } };
+    let current: typeof follower | undefined = follower;
+    const coordinator = createTelegramBusFollowerQuitClosingCoordinator({ gate, getCurrentFollower: () => current,
+      observeSourceSettlement: () => "clear",
+      async disconnect() {
+        if (outcome === "throw") { current = undefined; throw new Error("fixture outcome unknown"); }
+        if (outcome !== "still-registered") current = undefined;
+        return outcome === "missing" ? undefined : { kind: "follower-disconnect-result", instanceId: "inst-a",
+          registrationGeneration: "inst-a:1", target: { chatId: 7, threadId: 42 }, threadDeletion: "unconfirmed" };
+      } });
+    const result = await coordinator.close(follower);
+    assert.deepEqual(result, outcome === "unconfirmed" ? { status: "disconnected-unconfirmed", deletion: {
+      kind: "follower-disconnect-result", instanceId: "inst-a", registrationGeneration: "inst-a:1",
+      target: { chatId: 7, threadId: 42 }, threadDeletion: "unconfirmed" } }
+      : outcome === "missing" ? { status: "disconnected-unconfirmed" } : { status: "outcome-unknown" });
+    assert.notEqual(result.status, "ready");
+  }
 });
 
 test("Bus leader proxies only exact-generation traffic and preserves durable receipts", async () => {
@@ -4966,6 +5191,7 @@ test("Bus leader runtime exposes direct leader-to-follower queue handoff", async
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-leader-handoff-route-"));
   const socketPath = join(dir, "bus.sock");
   const registry = createTelegramBusFollowerRegistry();
+  const closingGate = createTelegramBusFollowerClosingGate();
   const recipientSocketPath = join(dir, "recipient.sock");
   registry.register({
     instanceId: "recipient",
@@ -4980,20 +5206,25 @@ test("Bus leader runtime exposes direct leader-to-follower queue handoff", async
     socketPath,
     followerRegistry: registry,
     protocolIdentity: TEST_BUS_PROTOCOL_IDENTITY,
+    followerClosingGate: closingGate,
     startPolling: () => undefined,
     stopPolling: () => undefined,
   });
+  let markStarted!: () => void, releaseStaging!: () => void;
+  const stagingStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+  const stagingBlocked = new Promise<void>((resolve) => { releaseStaging = resolve; });
   const recipientServer = createTelegramBusLocalServer({
     socketPath: recipientSocketPath,
-    handleEnvelope: (envelope) => ({
-      kind: "bus.ack",
-      requestId: envelope.requestId,
-      ok: true,
-      result: { status: "staged", receiptId: "receipt-1", sourceUpdateIds: [1] },
-    }),
+    async handleEnvelope(envelope) {
+      if (envelope.requestId === "handoff:runtime-active") { markStarted(); await stagingBlocked; }
+      if (envelope.requestId === "handoff:runtime-replacement") registry.register({ ...registry.get("recipient")!,
+        registrationGeneration: "recipient-replacement" });
+      return { kind: "bus.ack", requestId: envelope.requestId, ok: true,
+        result: { status: "staged", receiptId: "receipt-1", sourceUpdateIds: [1] } };
+    },
   });
   await recipientServer.start();
-  const response = await runtime.routeQueueHandoff({
+  const input = {
     requestId: "handoff:runtime",
     auth: undefined,
     recipientInstanceId: "recipient",
@@ -5006,29 +5237,43 @@ test("Bus leader runtime exposes direct leader-to-follower queue handoff", async
     donorAcquiredAtMs: 1,
     handoffToken: "x".repeat(32),
     payload: {
-      kind: "prompt",
+      kind: "prompt" as const,
       chatId: 7,
       replyToMessageId: 10,
       queueOrder: 1,
-      queueLane: "default",
+      queueLane: "default" as const,
       laneOrder: 1,
       statusSummary: "handoff",
       admissionReceipts: [
-        { queueKind: "prompt", receiptId: "receipt-1", sourceUpdateIds: [1] },
+        { queueKind: "prompt" as const, receiptId: "receipt-1", sourceUpdateIds: [1] },
       ],
       sourceMessageIds: [10],
       queuedAttachments: [],
-      content: [{ type: "text", text: "handoff prompt" }],
+      content: [{ type: "text" as const, text: "handoff prompt" }],
       historyText: "handoff",
     },
     sentAtMs: 1,
-  });
+  };
+  const response = await runtime.routeQueueHandoff(input);
   assert.deepEqual(response, {
     kind: "bus.ack",
     requestId: "handoff:runtime",
     ok: true,
     result: { status: "staged", receiptId: "receipt-1", sourceUpdateIds: [1] },
   });
+  const recipient = registry.get("recipient")!;
+  const closing = closingGate.tryClose(recipient)!;
+  assert.deepEqual(await runtime.routeQueueHandoff({ ...input, requestId: "handoff:runtime-closing" }), {
+    kind: "bus.ack", requestId: "handoff:runtime-closing", ok: false,
+    message: "Telegram queue handoff recipient is closing input admission." });
+  closing.reopen();
+  const active = runtime.routeQueueHandoff({ ...input, requestId: "handoff:runtime-active" });
+  await stagingStarted;
+  assert.equal(closingGate.tryClose(recipient), undefined, "direct staging counts as active input");
+  releaseStaging(); assert.equal((await active).kind, "bus.ack");
+  assert.deepEqual(await runtime.routeQueueHandoff({ ...input, requestId: "handoff:runtime-replacement" }), {
+    kind: "bus.ack", requestId: "handoff:runtime-replacement", ok: false,
+    message: "Stale Telegram queue handoff recipient registration generation." });
   await recipientServer.stop();
   await runtime.stopPolling();
   rmSync(dir, { recursive: true, force: true });

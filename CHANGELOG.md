@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+## 0.52.0: Confirmed follower Telegram quit
+
+- `Confirmed follower quit`: Registered `/quit` for the invoking Pi's active follower Thread. Exact actor/Thread/message/token confirmation waits for durable command and callback completion, then closes source forwarding, deletes through the authenticated leader, and invokes public Pi shutdown only after exact deletion plus fresh idle/disconnected evidence. Busy-after-delete stays running without retry; shared-owner quit remains unsupported.
+- `Quit failure safety`: Certified pre-effect refusal reopens confirmation, while unconfirmed, malformed, lost or uncertain cleanup seals without shutdown or generic cleanup replay. Exact socket/auth/registration/target correlation and one-use exit decisions prevent stale confirmation, replacement, persistence, leadership and ACK races from authorizing exit. Live probes proved safe refusal with a legacy leader and exact deletion, disconnection, receiver stop, and normal process exit with candidate peers.
+- `Deleted-Thread replay`: Check exact original-Thread deletion evidence before cached-owner forwarding or local handling of messages, edits, callbacks and reactions. Existing durable deletion facts prevent successor delegation even after interrupted source completion and store reopening. Sender, profile/context and execution fences apply before settlement; ordinary non-deleted handoffs remain unchanged. No protocol or journal schema changes.
+
 ## 0.51.5: Follower Thread new-session hotfix
 
 - `Follower Thread /new`: Telegram `/new` now starts a new session in a follower's Pi process and preserves its Thread binding. The leader publishes and later claims the durable replacement intent through capability-gated, generation-fenced bus requests, validating its own live registration and Workspace binding before accepting the follower's request. Incompatible or stale leaders fail closed rather than silently switching sessions.

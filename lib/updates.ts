@@ -346,7 +346,10 @@ export function getAuthorizedTelegramGuestMessage(
 
 // --- Flow ---
 
-export type TelegramMessageOwnershipView = TelegramBusForwardOwnership;
+export type TelegramMessageOwnershipView = TelegramBusForwardOwnership & {
+  /** Original message target, not the replacement recipient's current target. */
+  target?: TelegramTarget;
+};
 
 export type TelegramMessageOwnershipLookup = (
   chatId: number,
@@ -905,6 +908,11 @@ function formatTelegramUnauthorizedDenial(format: "plain" | "html"): string {
     : `🚫 ${TELEGRAM_UNAUTHORIZED_DENIAL_COPY}`;
 }
 
+/** Positive exact-target deletion evidence, supplied by the routing/store owner. */
+export type TelegramConfirmedDeletedTargetLookup<TContext> = (
+  target: TelegramTarget, ctx: TContext,
+) => boolean | Promise<boolean>;
+
 export interface TelegramUpdateRuntimeDeps<
   TContext = unknown,
   TReactionUpdate extends TelegramMessageReactionUpdated =
@@ -914,6 +922,7 @@ export interface TelegramUpdateRuntimeDeps<
 > {
   ctx: TContext;
   execution?: TelegramUpdateExecutionFence;
+  isTargetConfirmedDeleted?: TelegramConfirmedDeletedTargetLookup<TContext>;
   getCurrentInstanceId?: () => string | undefined;
   getMessageOwnership?: TelegramMessageOwnershipLookup;
   getTargetOwnership?: TelegramTargetOwnershipLookup;
@@ -986,6 +995,7 @@ export interface TelegramUpdateRuntimeControllerDeps<
   TMessage extends TelegramUpdateMessage = TelegramUpdateMessage,
 > {
   getAllowedUserId: () => number | undefined;
+  isTargetConfirmedDeleted?: TelegramConfirmedDeletedTargetLookup<TContext>;
   getCurrentInstanceId?: () => string | undefined;
   getMessageOwnership?: TelegramMessageOwnershipLookup;
   getTargetOwnership?: TelegramTargetOwnershipLookup;
@@ -1094,6 +1104,29 @@ function getTelegramMessageReplyTarget(
       ? { threadId: message.message_thread_id }
       : {}),
   };
+}
+
+function getTelegramDeletionEvidenceTarget(
+  message: TelegramUpdateMessage,
+  deps: { getMessageOwnership?: TelegramMessageOwnershipLookup },
+): TelegramTarget | undefined {
+  const explicit = getTelegramMessageTarget(message);
+  if (explicit?.threadId !== undefined) return explicit;
+  const reference = getTelegramMessageReplyTarget(message);
+  const original = reference ? deps.getMessageOwnership?.(reference.chatId, reference.messageId)?.target : undefined;
+  return original?.chatId === explicit?.chatId ? original : undefined;
+}
+
+async function isConfirmedDeletedUpdateTarget<TContext>(
+  target: TelegramTarget | undefined,
+  deps: { ctx: TContext; isTargetConfirmedDeleted?: TelegramConfirmedDeletedTargetLookup<TContext> },
+  assertCurrent?: () => void,
+): Promise<boolean> {
+  if (target?.threadId === undefined || !deps.isTargetConfirmedDeleted) return false;
+  assertCurrent?.();
+  const deleted = await deps.isTargetConfirmedDeleted(target, deps.ctx);
+  assertCurrent?.();
+  return deleted === true;
 }
 
 function getForeignTelegramMessageOwnership(
@@ -1218,6 +1251,7 @@ export function createTelegramPairedUpdateRuntime<
 ): TelegramUpdateRuntimeController<TContext, TUpdate> {
   return createTelegramUpdateRuntime({
     getAllowedUserId: deps.getAllowedUserId,
+    isTargetConfirmedDeleted: deps.isTargetConfirmedDeleted,
     getCurrentInstanceId: deps.getCurrentInstanceId,
     getMessageOwnership: deps.getMessageOwnership,
     getTargetOwnership: deps.getTargetOwnership,
@@ -1264,18 +1298,19 @@ export function createTelegramUpdateRuntime<
   const handleAuthorizedReactionUpdate = async (
     reactionUpdate: NonNullable<TUpdate["message_reaction"]>,
     ctx: TContext,
+    execution?: TelegramUpdateExecutionFence,
   ): Promise<void> => {
     await handleAuthorizedTelegramReactionUpdate(reactionUpdate, {
       allowedUserId: deps.getAllowedUserId(),
       ctx,
+      isTargetConfirmedDeleted: deps.isTargetConfirmedDeleted,
       flushPendingMediaGroupMessage: deps.flushPendingMediaGroupMessage,
       flushPendingTextGroupMessage: deps.flushPendingTextGroupMessage,
       getCurrentInstanceId: deps.getCurrentInstanceId,
       getMessageOwnership: deps.getMessageOwnership,
       foreignOwnedUpdateForwarder: deps.foreignOwnedUpdateForwarder,
-      assertExecutionCurrent: createTelegramUpdateExecutionFenceGuard(
-        reactionUpdate,
-      ),
+      assertExecutionCurrent: execution ? () => execution.assertCurrent()
+        : createTelegramUpdateExecutionFenceGuard(reactionUpdate),
       applyQueuedTelegramTurnReactionByMessageId:
         deps.applyQueuedTelegramTurnReactionByMessageId,
     });
@@ -1286,6 +1321,7 @@ export function createTelegramUpdateRuntime<
       executeTelegramUpdate(update, deps.getAllowedUserId(), {
         ctx,
         execution,
+        isTargetConfirmedDeleted: deps.isTargetConfirmedDeleted,
         getCurrentInstanceId: deps.getCurrentInstanceId,
         getMessageOwnership: deps.getMessageOwnership,
         getTargetOwnership: deps.getTargetOwnership,
@@ -1294,7 +1330,8 @@ export function createTelegramUpdateRuntime<
         removePendingMediaGroupMessages: deps.removePendingMediaGroupMessages,
         removeQueuedTelegramTurnsByMessageIds:
           deps.removeQueuedTelegramTurnsByMessageIds,
-        handleAuthorizedTelegramReactionUpdate: handleAuthorizedReactionUpdate,
+        handleAuthorizedTelegramReactionUpdate: (reactionUpdate, current) =>
+          handleAuthorizedReactionUpdate(reactionUpdate, current, execution),
         handleTelegramTopicLifecycleUpdate:
           deps.handleTelegramTopicLifecycleUpdate,
         pairTelegramUserIfNeeded: deps.pairTelegramUserIfNeeded,
@@ -1317,6 +1354,7 @@ export function createTelegramUpdateRuntime<
 export interface AuthorizedTelegramReactionUpdateDeps<TContext> {
   allowedUserId?: number;
   ctx: TContext;
+  isTargetConfirmedDeleted?: TelegramConfirmedDeletedTargetLookup<TContext>;
   getCurrentInstanceId?: () => string | undefined;
   getMessageOwnership?: TelegramMessageOwnershipLookup;
   foreignOwnedUpdateForwarder?: TelegramForeignOwnedUpdateForwarder<TContext>;
@@ -1342,6 +1380,12 @@ export async function handleAuthorizedTelegramReactionUpdate<TContext>(
     !reactionUser || reactionUser.is_bot || reactionUser.id !== allowedUserId ||
     reactionUpdate.actor_chat !== undefined
   ) return;
+  if (deps.isTargetConfirmedDeleted) {
+    const message = getTelegramReactionMessageTarget(reactionUpdate);
+    const original = message ? deps.getMessageOwnership?.(message.chatId, message.messageId)?.target : undefined;
+    const target = original?.chatId === message?.chatId ? original : undefined;
+    if (await isConfirmedDeletedUpdateTarget(target, deps, deps.assertExecutionCurrent)) return;
+  }
   const foreignOwnership = getForeignTelegramMessageOwnership(
     getTelegramReactionMessageTarget(reactionUpdate),
     deps,
@@ -1454,6 +1498,10 @@ export async function executeTelegramUpdatePlan<
         }
         return;
       }
+      if (deps.isTargetConfirmedDeleted && await isConfirmedDeletedUpdateTarget(
+        plan.query.message ? getTelegramDeletionEvidenceTarget(plan.query.message, deps) : undefined,
+        deps, assertExecutionCurrent,
+      )) return;
       const foreignOwnership = getForeignTelegramCallbackOwnership(
         plan.query,
         deps,
@@ -1548,6 +1596,10 @@ export async function executeTelegramUpdatePlan<
       );
       assertExecutionCurrent();
     }
+    const messageTarget = getTelegramMessageTarget(plan.message);
+    if (deps.isTargetConfirmedDeleted && await isConfirmedDeletedUpdateTarget(
+      getTelegramDeletionEvidenceTarget(plan.message, deps), deps, assertExecutionCurrent,
+    )) return;
     const foreignMessageOwnership = getForeignTelegramMessageOwnership(
       replyTarget,
       deps,
@@ -1576,7 +1628,6 @@ export async function executeTelegramUpdatePlan<
       assertExecutionCurrent();
       return;
     }
-    const messageTarget = getTelegramMessageTarget(plan.message);
     const foreignTargetOwnership = getForeignTelegramTargetOwnership(
       messageTarget,
       deps,
@@ -1700,6 +1751,53 @@ export interface TelegramUpdateWorkerStateSnapshot {
   lastCompletedAtMs?: number;
   lastFailureAtMs?: number;
   lastFailurePhase?: string;
+}
+
+export type TelegramFollowerSourceSettlementObservation = "clear" | "busy" | "unknown";
+
+/** Conservative read-only leader-journal observation for one exact follower binding/Thread. */
+export function observeTelegramFollowerSourceSettlement(input: {
+  snapshot: TelegramUpdateWorkerJournalSnapshot;
+  recipientBindingKey: string;
+  target: TelegramTarget & { threadId: number };
+  getMessageOwnership?: TelegramMessageOwnershipLookup;
+}): TelegramFollowerSourceSettlementObservation {
+  if (!input.recipientBindingKey.trim() || !Number.isSafeInteger(input.target.chatId) ||
+      !Number.isSafeInteger(input.target.threadId) || input.target.threadId <= 0 ||
+      !Array.isArray(input.snapshot?.entries)) return "unknown";
+  const exactTarget = (target: TelegramTarget | undefined) => target?.chatId === input.target.chatId &&
+    target.threadId === input.target.threadId;
+  const observeMessage = (message: TelegramUpdateMessage | undefined): TelegramFollowerSourceSettlementObservation => {
+    if (!message || typeof message.chat?.id !== "number") return "clear";
+    const target = getTelegramMessageTarget(message);
+    if (target?.threadId !== undefined) return exactTarget(target) ? "busy" : "clear";
+    if (target?.chatId !== input.target.chatId) return "clear";
+    if (typeof message.message_id !== "number" || !input.getMessageOwnership) return "unknown";
+    const ownership = input.getMessageOwnership(message.chat.id, message.message_id);
+    if (!ownership) return "unknown";
+    if (ownership.recipientBindingKey === input.recipientBindingKey) return "busy";
+    return ownership.recipientBindingKey ? "clear" : "unknown";
+  };
+  for (const entry of input.snapshot.entries) {
+    const claimBinding = entry.inputClaim?.recipientBindingKey;
+    if (claimBinding === input.recipientBindingKey) return "busy";
+    const update = entry.update as TelegramUpdateFlow;
+    const message = update.message ?? update.edited_message ?? update.callback_query?.message ?? update.guest_message;
+    const messageObservation = observeMessage(message);
+    if (messageObservation !== "clear") {
+      if (claimBinding && claimBinding !== input.recipientBindingKey) return "unknown";
+      return messageObservation;
+    }
+    const reaction = update.message_reaction;
+    if (!reaction || typeof reaction.chat?.id !== "number") continue;
+    if (reaction.chat.id !== input.target.chatId) continue;
+    if (!input.getMessageOwnership) return "unknown";
+    const ownership = input.getMessageOwnership(reaction.chat.id, reaction.message_id);
+    if (!ownership) return "unknown";
+    if (ownership.recipientBindingKey === input.recipientBindingKey) return "busy";
+    if (!ownership.recipientBindingKey) return "unknown";
+  }
+  return "clear";
 }
 
 export interface TelegramUpdateWorkerJournalSnapshot {

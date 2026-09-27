@@ -91,6 +91,7 @@ export const TELEGRAM_COMMAND_EMOJI = {
     stop: "🟥",
     name: "🏷️",
     new: "🆕",
+    quit: "🗑",
 };
 export function getTelegramCommandEmoji(command) {
     return TELEGRAM_COMMAND_EMOJI[command];
@@ -150,6 +151,10 @@ export const TELEGRAM_BUILTIN_BOT_COMMANDS = [
     {
         command: "next",
         description: formatTelegramBotCommandDescription("next", "Force next turn"),
+    },
+    {
+        command: "quit",
+        description: formatTelegramBotCommandDescription("quit", "Delete Thread & Quit Pi"),
     },
     {
         command: "abort",
@@ -393,6 +398,7 @@ export const TELEGRAM_RESERVED_COMMAND_NAMES = [
     "stop",
     "name",
     "new",
+    "quit",
     "abort",
     "next",
     "continue",
@@ -512,6 +518,7 @@ export const TELEGRAM_APP_MENU_INTRO_HTML = [
     `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
     `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
     `${formatTelegramCommandEmojiPrefix("new")}/new — Start a new session`,
+    `${formatTelegramCommandEmojiPrefix("quit")}/quit — Delete Thread & Quit Pi`,
     `${formatTelegramCommandEmojiPrefix("continue")}/continue — Queue continue prompt`,
     `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
     `${formatTelegramCommandEmojiPrefix("abort")}/abort — Abort Pi`,
@@ -550,6 +557,7 @@ function buildTelegramAppMenuIntroHtml() {
         `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
         `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
         `${formatTelegramCommandEmojiPrefix("new")}/new — Start a new session`,
+        `${formatTelegramCommandEmojiPrefix("quit")}/quit — Delete Thread & Quit Pi`,
         `${formatTelegramCommandEmojiPrefix("continue")}/continue — Queue continue prompt`,
         `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
         ...extensionLines,
@@ -605,6 +613,7 @@ export const TELEGRAM_COMMAND_ACTIONS = {
     stop: { kind: "stop", executionMode: "immediate" },
     name: { kind: "name", executionMode: "immediate" },
     new: { kind: "new", executionMode: "immediate" },
+    quit: { kind: "quit", executionMode: "immediate" },
     abort: { kind: "abort", executionMode: "immediate" },
     next: { kind: "next", executionMode: "immediate" },
     continue: { kind: "continue", executionMode: "immediate" },
@@ -871,6 +880,9 @@ export async function executeTelegramCommandAction(action, message, ctx, deps, c
         case "new":
             await deps.handleNew(message, ctx);
             return true;
+        case "quit":
+            await deps.handleQuit(message, ctx);
+            return true;
         case "abort":
             await deps.handleAbort(message, ctx);
             return true;
@@ -952,6 +964,7 @@ export function createTelegramCommandHandlerTargetRuntime(deps) {
         openThinkingMenu: deps.openThinkingMenu,
         openQueueMenu: deps.openQueueMenu,
         openSettingsMenu: commandTargetRuntime.openSettingsMenu,
+        openQuitConfirmation: deps.openQuitConfirmation,
         handleForumBootstrap: deps.handleForumBootstrap,
         getAllowedUserId: deps.getAllowedUserId,
         persistAllowedUserId: deps.persistAllowedUserId,
@@ -1086,6 +1099,13 @@ async function handleTelegramCommandRuntime(commandName, message, ctx, deps, com
             await sendReplyFor(nextMessage)(result.ok && !result.message
                 ? formatTelegramThreadDisplayNameSavedHeading(result.threadName ?? threadName)
                 : formatTelegramInformationHeading(result.ok ? "✅" : "⚠️", result.message ?? "Thread display name update failed."), { parseMode: "HTML" });
+        },
+        handleQuit: async (nextMessage, commandCtx) => {
+            if (deps.openQuitConfirmation) {
+                await deps.openQuitConfirmation(nextMessage, commandCtx);
+                return;
+            }
+            await sendReplyFor(nextMessage)(formatTelegramInformationHeading("🚫", "Quit is unavailable."), { parseMode: "HTML" });
         },
         handleAbort: async (nextMessage, commandCtx) => {
             await handleTelegramAbortCommand({

@@ -206,6 +206,25 @@ export declare function createTelegramBusFollowerSourceReferenceDeliveryIdentity
         };
     };
 }): TelegramBusFollowerDeliveryIdentity;
+/** Optional outcome in the existing disconnect ACK. ACK success alone only proves disconnection. */
+export interface TelegramBusFollowerDisconnectResult {
+    kind: "follower-disconnect-result";
+    instanceId: string;
+    registrationGeneration: string;
+    target: TelegramTarget & {
+        threadId: number;
+    };
+    threadDeletion: "confirmed" | "unconfirmed";
+}
+/** Content validation only: caller must still fence the authenticated transport/session. */
+export declare function isTelegramBusFollowerDisconnectDeletionConfirmed(response: TelegramBusEnvelope | undefined, expected: {
+    requestId: string;
+    instanceId: string;
+    registrationGeneration: string;
+    target: TelegramTarget & {
+        threadId: number;
+    };
+}): boolean;
 export type TelegramBusEnvelope = ({
     kind: "follower.register";
     requestId: string;

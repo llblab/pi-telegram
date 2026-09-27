@@ -94,7 +94,17 @@ export function queueTelegramTextGroupMessage(options) {
         const dispatchedMessages = queued.messages.slice(0, dispatchCount);
         const dispatchedIds = new Set(dispatchedMessages.map((message) => message.message_id));
         queued.dispatching = true;
-        const operation = Promise.resolve(options.dispatchMessages(dispatchedMessages, queued.context)).then(() => {
+        const finishTracking = options.trackDispatch?.();
+        let dispatched;
+        try {
+            dispatched = options.dispatchMessages(dispatchedMessages, queued.context);
+        }
+        catch (error) {
+            finishTracking?.();
+            throw error;
+        }
+        const operation = Promise.resolve(dispatched).then(() => {
+            finishTracking?.();
             if (options.groups.get(key) !== queued)
                 return;
             queued.messages = queued.messages.filter((message) => !dispatchedIds.has(message.message_id));
@@ -105,6 +115,7 @@ export function queueTelegramTextGroupMessage(options) {
             else if (!queued.flushTimer)
                 scheduleDispatch();
         }, (error) => {
+            finishTracking?.();
             if (options.groups.get(key) === queued) {
                 queued.dispatching = false;
                 queued.dispatchPromise = undefined;
@@ -134,6 +145,7 @@ export function queueTelegramTextGroupMessage(options) {
 }
 export function createTelegramTextGroupController(options = {}) {
     const groups = new Map();
+    let activeDispatches = 0;
     const plannedForwardCommentStarts = new Set();
     const plannedForwardCommentEnds = new Set();
     const debounceMs = options.debounceMs ?? TELEGRAM_TEXT_GROUP_DEBOUNCE_MS;
@@ -156,6 +168,7 @@ export function createTelegramTextGroupController(options = {}) {
                 timer.abort();
             });
     return {
+        hasPendingWork: () => groups.size > 0 || activeDispatches > 0,
         prepareUpdateBatch(updates) {
             for (let index = 0; index + 1 < updates.length; index += 1) {
                 const comment = updates[index]?.message;
@@ -237,6 +250,10 @@ export function createTelegramTextGroupController(options = {}) {
                 setTimer,
                 clearTimer,
                 dispatchMessages,
+                trackDispatch() {
+                    activeDispatches++;
+                    return () => { activeDispatches--; };
+                },
                 forceStart,
                 dispatchImmediately,
                 forwardPairCandidate: forceStart && !canStartTelegramTextGroup(message, minSplitLength)

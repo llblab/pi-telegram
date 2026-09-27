@@ -177,6 +177,7 @@ export const TELEGRAM_COMMAND_EMOJI = {
   stop: "🟥",
   name: "🏷️",
   new: "🆕",
+  quit: "🗑",
 } as const;
 
 export type TelegramCommandEmojiName = keyof typeof TELEGRAM_COMMAND_EMOJI;
@@ -290,6 +291,10 @@ export const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinitio
         "next",
         "Force next turn",
       ),
+    },
+    {
+      command: "quit",
+      description: formatTelegramBotCommandDescription("quit", "Delete Thread & Quit Pi"),
     },
     {
       command: "abort",
@@ -637,6 +642,7 @@ export const TELEGRAM_RESERVED_COMMAND_NAMES = [
   "stop",
   "name",
   "new",
+  "quit",
   "abort",
   "next",
   "continue",
@@ -671,6 +677,7 @@ export type TelegramCommandAction =
   | { kind: "stop"; executionMode: "immediate" }
   | { kind: "name"; executionMode: "immediate" }
   | { kind: "new"; executionMode: "immediate" }
+  | { kind: "quit"; executionMode: "immediate" }
   | { kind: "abort"; executionMode: "immediate" }
   | { kind: "next"; executionMode: "immediate" }
   | { kind: "continue"; executionMode: "immediate" }
@@ -692,6 +699,7 @@ export interface TelegramCommandActionDeps<TMessage, TContext> {
   handleStop: (message: TMessage, ctx: TContext) => Promise<void>;
   handleName: (message: TMessage, ctx: TContext, name: string) => Promise<void>;
   handleNew: (message: TMessage, ctx: TContext) => Promise<void>;
+  handleQuit: (message: TMessage, ctx: TContext) => Promise<void>;
   handleAbort: (message: TMessage, ctx: TContext) => Promise<void>;
   handleNext: (message: TMessage, ctx: TContext) => Promise<void>;
   handleContinue: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -1180,6 +1188,8 @@ export interface TelegramCommandRuntimeDeps<
   openThinkingMenu: (message: TMessage, ctx: TContext) => Promise<void>;
   openQueueMenu: (message: TMessage, ctx: TContext) => Promise<void>;
   openSettingsMenu?: (message: TMessage, ctx: TContext) => Promise<void>;
+  /** Private activation port; `/quit` is not reserved or advertised without this binding. */
+  openQuitConfirmation?: (message: TMessage, ctx: TContext) => Promise<void>;
   validateThreadName?: (threadName: string) => string | undefined;
   renameCurrentThread?: TelegramThreadDisplayNameRenamePort;
   resetCurrentThreadName?: TelegramThreadDisplayNameResetPort;
@@ -1209,6 +1219,7 @@ export const TELEGRAM_APP_MENU_INTRO_HTML = [
   `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
   `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
   `${formatTelegramCommandEmojiPrefix("new")}/new — Start a new session`,
+  `${formatTelegramCommandEmojiPrefix("quit")}/quit — Delete Thread & Quit Pi`,
   `${formatTelegramCommandEmojiPrefix("continue")}/continue — Queue continue prompt`,
   `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
   `${formatTelegramCommandEmojiPrefix("abort")}/abort — Abort Pi`,
@@ -1250,6 +1261,7 @@ function buildTelegramAppMenuIntroHtml(): string {
     `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
     `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
     `${formatTelegramCommandEmojiPrefix("new")}/new — Start a new session`,
+    `${formatTelegramCommandEmojiPrefix("quit")}/quit — Delete Thread & Quit Pi`,
     `${formatTelegramCommandEmojiPrefix("continue")}/continue — Queue continue prompt`,
     `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
     ...extensionLines,
@@ -1319,6 +1331,7 @@ export const TELEGRAM_COMMAND_ACTIONS = {
   stop: { kind: "stop", executionMode: "immediate" },
   name: { kind: "name", executionMode: "immediate" },
   new: { kind: "new", executionMode: "immediate" },
+  quit: { kind: "quit", executionMode: "immediate" },
   abort: { kind: "abort", executionMode: "immediate" },
   next: { kind: "next", executionMode: "immediate" },
   continue: { kind: "continue", executionMode: "immediate" },
@@ -1789,6 +1802,9 @@ export async function executeTelegramCommandAction<TMessage, TContext>(
     case "new":
       await deps.handleNew(message, ctx);
       return true;
+    case "quit":
+      await deps.handleQuit(message, ctx);
+      return true;
     case "abort":
       await deps.handleAbort(message, ctx);
       return true;
@@ -1905,6 +1921,7 @@ export function createTelegramCommandHandlerTargetRuntime<
     openThinkingMenu: deps.openThinkingMenu,
     openQueueMenu: deps.openQueueMenu,
     openSettingsMenu: commandTargetRuntime.openSettingsMenu,
+    openQuitConfirmation: deps.openQuitConfirmation,
     handleForumBootstrap: deps.handleForumBootstrap,
     getAllowedUserId: deps.getAllowedUserId,
     persistAllowedUserId: deps.persistAllowedUserId,
@@ -2120,6 +2137,16 @@ async function handleTelegramCommandRuntime<
               result.ok ? "✅" : "⚠️",
               result.message ?? "Thread display name update failed.",
             ),
+          { parseMode: "HTML" },
+        );
+      },
+      handleQuit: async (nextMessage, commandCtx) => {
+        if (deps.openQuitConfirmation) {
+          await deps.openQuitConfirmation(nextMessage, commandCtx);
+          return;
+        }
+        await sendReplyFor(nextMessage)(
+          formatTelegramInformationHeading("🚫", "Quit is unavailable."),
           { parseMode: "HTML" },
         );
       },

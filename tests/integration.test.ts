@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
 import { runNodeEval } from "./fixtures/node-eval.ts";
+import { registerQuitFeasibilityTests } from "./fixtures/quit-feasibility.ts";
 import { createTelegramActivityVerbosityRuntime } from "../lib/activity-verbosity.ts";
 import * as AgentMessages from "../lib/agent-messages.ts";
 import * as Bindings from "../lib/bindings.ts";
@@ -66,6 +67,8 @@ function test(
 function strictFileTest(name: string, fn: RuntimeTestHandler): void {
   void testRoot(name, { concurrency: false, skip: process.platform === "win32", timeout: 5_000 }, fn);
 }
+
+registerQuitFeasibilityTests(test);
 
 let runtimeTelegramExtension: RuntimeTelegramExtension | undefined;
 let runtimeAgentDir: string | undefined;

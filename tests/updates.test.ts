@@ -43,6 +43,7 @@ import {
   getTelegramUpdateHandlerRegistry,
   handleAuthorizedTelegramReactionUpdate,
   normalizeTelegramReactionEmoji,
+  observeTelegramFollowerSourceSettlement,
   registerTelegramUpdateHandler,
   reportTelegramQueueAdmission,
   reportTelegramUpdateCompleted,
@@ -87,6 +88,57 @@ function acceptedForeignUpdateSettlement(sourceUpdateId = 1) {
 function clearGlobalRegistry(): void {
   delete (globalThis as Record<string, unknown>)[REGISTRY_KEY];
 }
+
+function sourceSettlementSnapshot(update: TelegramJournaledUpdate, inputClaim?: TelegramUpdateWorkerJournalSnapshot["entries"][number]["inputClaim"]): TelegramUpdateWorkerJournalSnapshot {
+  return { version: 3, serializedBytes: 0,
+    entries: [{ updateId: update.update_id, update, admittedAtMs: 1, state: "pending", ...(inputClaim ? { inputClaim } : {}) }] };
+}
+
+test("Follower source observation covers direct, cached and claimed leader journal authority", () => {
+  const target = { chatId: 7, threadId: 42 }, recipientBindingKey = "manual:worker";
+  const ownership = (chatId: number, messageId: number) => chatId === 7 && messageId === 9
+    ? { instanceId: "worker", ownerGeneration: "worker:1", recipientBindingKey, target } : undefined;
+  const updates: TelegramJournaledUpdate[] = [
+    { update_id: 1, message: { message_id: 9, chat: { id: 7, type: "private" }, message_thread_id: 42 } },
+    { update_id: 2, edited_message: { message_id: 9, chat: { id: 7, type: "private" }, message_thread_id: 42 } },
+    { update_id: 3, callback_query: { id: "cb", from: { id: 7, is_bot: false },
+      message: { message_id: 9, chat: { id: 7, type: "private" }, message_thread_id: 42 } } },
+    { update_id: 4, message: { message_id: 9, chat: { id: 7, type: "private" } } },
+    { update_id: 5, message_reaction: { chat: { id: 7, type: "private" }, message_id: 9,
+      user: { id: 7, is_bot: false }, old_reaction: [], new_reaction: [] } },
+  ];
+  for (const update of updates) assert.equal(observeTelegramFollowerSourceSettlement({
+    snapshot: sourceSettlementSnapshot(update), recipientBindingKey, target, getMessageOwnership: ownership,
+  }), "busy", `update ${update.update_id}`);
+  assert.equal(observeTelegramFollowerSourceSettlement({ snapshot: sourceSettlementSnapshot({ update_id: 6 }, {
+    phase: "ready", owner: { instanceId: "leader", processId: 1, processBirthId: "birth", sessionGeneration: 1,
+      acquisitionId: "acquisition", acquiredAtMs: 1 }, recipientBindingKey }), recipientBindingKey, target }), "busy");
+});
+
+test("Follower source observation clears proven unrelated entries and fails closed on ambiguous identity", () => {
+  const target = { chatId: 7, threadId: 42 }, recipientBindingKey = "manual:worker";
+  for (const update of [
+    { update_id: 1, message: { message_id: 9, chat: { id: 7, type: "private" }, message_thread_id: 43 } },
+    { update_id: 2, message: { message_id: 9, chat: { id: 8, type: "private" } } },
+    { update_id: 3, callback_query: { id: "inline", from: { id: 7, is_bot: false } } },
+  ] satisfies TelegramJournaledUpdate[]) assert.equal(observeTelegramFollowerSourceSettlement({
+    snapshot: sourceSettlementSnapshot(update), recipientBindingKey, target,
+    getMessageOwnership: () => ({ instanceId: "other", recipientBindingKey: "manual:other" }),
+  }), "clear", `update ${update.update_id}`);
+  for (const update of [
+    { update_id: 4, message: { message_id: 10, chat: { id: 7, type: "private" } } },
+    { update_id: 5, message_reaction: { chat: { id: 7, type: "private" }, message_id: 10,
+      user: { id: 7, is_bot: false }, old_reaction: [], new_reaction: [] } },
+  ] satisfies TelegramJournaledUpdate[]) assert.equal(observeTelegramFollowerSourceSettlement({
+    snapshot: sourceSettlementSnapshot(update), recipientBindingKey, target, getMessageOwnership: () => undefined,
+  }), "unknown", `update ${update.update_id}`);
+  assert.equal(observeTelegramFollowerSourceSettlement({ snapshot: sourceSettlementSnapshot({ update_id: 6,
+    message: { message_id: 9, chat: { id: 7, type: "private" }, message_thread_id: 42 } }, {
+      phase: "ready", owner: { instanceId: "leader", processId: 1, processBirthId: "birth", sessionGeneration: 1,
+        acquisitionId: "acquisition", acquiredAtMs: 1 }, recipientBindingKey: "manual:other" }), recipientBindingKey, target }), "unknown");
+  assert.equal(observeTelegramFollowerSourceSettlement({ snapshot: { version: 3, serializedBytes: 0, entries: [] },
+    recipientBindingKey: "", target }), "unknown");
+});
 
 function createTestUpdateWorkerJournal(
   inputs: readonly (number | TelegramJournaledUpdate)[],

@@ -119,6 +119,8 @@ export interface TelegramMediaGroupController<
       ctx?: TContext,
     ) => unknown | Promise<unknown>;
   }) => boolean;
+  /** Buffered input or a dispatch still settling, including work removed from the buffer. */
+  hasPendingWork: () => boolean;
   removeMessages: (messageIds: number[]) => number;
   flushMessage: (messageId: number) => Promise<boolean>;
   suspend: () => void;
@@ -514,6 +516,7 @@ export function queueTelegramMediaGroupMessage<
     messages: TMessage[],
     ctx?: TContext,
   ) => unknown | Promise<unknown>;
+  trackDispatch?: () => () => void;
 }): boolean {
   const key = getTelegramMediaGroupKey(options.message);
   if (!key) return false;
@@ -537,10 +540,13 @@ export function queueTelegramMediaGroupMessage<
       dispatchedMessages.map((message) => message.message_id),
     );
     state.dispatching = true;
-    const operation = Promise.resolve(
-      options.dispatchMessages(dispatchedMessages, state.context),
-    ).then(
+    const finishTracking = options.trackDispatch?.();
+    let dispatched: unknown;
+    try { dispatched = options.dispatchMessages(dispatchedMessages, state.context); }
+    catch (error) { finishTracking?.(); throw error; }
+    const operation = Promise.resolve(dispatched).then(
       () => {
+        finishTracking?.();
         if (options.groups.get(key) !== state) return;
         state.messages = state.messages.filter(
           (message) => !dispatchedIds.has(message.message_id),
@@ -551,6 +557,7 @@ export function queueTelegramMediaGroupMessage<
         else if (!state.flushTimer) scheduleDispatch();
       },
       (error) => {
+        finishTracking?.();
         if (options.groups.get(key) === state) {
           state.dispatching = false;
           state.dispatchPromise = undefined;
@@ -584,6 +591,7 @@ export function createTelegramMediaGroupController<
   options: TelegramMediaGroupControllerOptions = {},
 ): TelegramMediaGroupController<TMessage, TContext> {
   const groups = new Map<string, TelegramMediaGroupState<TMessage, TContext>>();
+  let activeDispatches = 0;
   const debounceMs = options.debounceMs ?? TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS;
   const setTimer =
     options.setTimer ??
@@ -600,7 +608,12 @@ export function createTelegramMediaGroupController<
         setTimer,
         clearTimer,
         dispatchMessages,
+        trackDispatch() {
+          activeDispatches++;
+          return () => { activeDispatches--; };
+        },
       }),
+    hasPendingWork: () => groups.size > 0 || activeDispatches > 0,
     removeMessages: (messageIds) =>
       removePendingTelegramMediaGroupMessages(groups, messageIds, clearTimer),
     async flushMessage(messageId) {
