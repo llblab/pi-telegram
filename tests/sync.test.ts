@@ -1755,18 +1755,78 @@ test("Thread disconnect and restart cleanup stop before mutation behind every re
           },
         });
 
-        await assert.rejects(
-          () => assembly[testCase.entrypoint](),
-          (error) => error instanceof TelegramWorkspaceAdmissionError &&
-            error.code === "admission-blocked",
-        );
+        if (testCase.entrypoint === "disconnect") {
+          // A blocked Workspace admission must never leave the local transport running.
+          const message = await assembly.disconnect();
+          assert.match(message, /^stopped\. Thread cleanup was skipped: /u);
+          assert.deepEqual(mutations, ["stop-polling"]);
+        } else {
+          await assert.rejects(
+            () => assembly[testCase.entrypoint](),
+            (error) => error instanceof TelegramWorkspaceAdmissionError &&
+              error.code === "admission-blocked",
+          );
+          assert.deepEqual(mutations, []);
+        }
         assert.deepEqual(operationKinds, [testCase.operationKind]);
-        assert.deepEqual(mutations, []);
       } finally {
         await rm(dir, { recursive: true, force: true });
       }
     }
   }
+});
+
+test("Manual disconnect stops the transport when Workspace admission reports corruption", async () => {
+  const events: string[] = [];
+  const assembly = createTelegramThreadDisconnectAssembly({
+    instanceId: "leader-runtime:1",
+    getCurrentThreadRecord: () => ({
+      owner: { kind: "leader" },
+      instanceId: "leader-runtime:1",
+      target: { chatId: 7, threadId: 42 },
+    }),
+    topicTargetStore: {
+      list: () => [],
+      markStaleByTarget: () => false,
+      persist: async () => {},
+      upsertPendingCleanup: () => {},
+      removePendingCleanup: () => false,
+    },
+    callApi: async <TResponse>() => ({ ok: true }) as TResponse,
+    getCurrentLeaderEpoch: () => 1,
+    getLeaderTarget: () => undefined,
+    clearLeaderTarget: () => {
+      events.push("clear-leader-target");
+    },
+    getSyncState: createUnknownTelegramSyncState,
+    setSyncState: () => {
+      events.push("set-sync-state");
+    },
+    stopPolling: async () => {
+      events.push("stop-polling");
+      return "Telegram bridge disconnected.";
+    },
+    suspendPolling: async () => {
+      events.push("suspend-polling");
+    },
+    recordRuntimeEvent: (category, error, details) => {
+      const message = error instanceof Error ? error.message : String(error);
+      events.push(`event:${category}:${message}:${details?.phase}`);
+    },
+    runWorkspaceOperation() {
+      // Mirrors a malformed or unreadable Workspace admission state file.
+      throw new Error("Telegram Workspace admission state is malformed.");
+    },
+  });
+
+  assert.equal(
+    await assembly.disconnect(),
+    "Telegram bridge disconnected. Thread cleanup was skipped: Telegram Workspace admission state is malformed.",
+  );
+  assert.deepEqual(events, [
+    "event:connection:Telegram Workspace admission state is malformed.:disconnect-cleanup",
+    "stop-polling",
+  ]);
 });
 
 test("Manual follower disconnect delegates thread deletion to its live leader", async () => {

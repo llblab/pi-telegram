@@ -1116,6 +1116,9 @@ export default function (pi) {
         onPersistentConflict(ctx, count) {
             return lockedPollingRuntime.onPersistentConflict(ctx, count);
         },
+        onRetryExhausted(ctx, count) {
+            return lockedPollingRuntime.onRetryExhausted(ctx, count);
+        },
         getConfig: configStore.get,
         hasBotToken: configStore.hasBotToken,
         deleteWebhook,

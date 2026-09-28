@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- `Polling stand-down`: Consecutive non-conflict polling failures now use exponential backoff and stop after a bounded attempt count instead of retrying forever. The terminal stop releases local ownership, stops the typing loop and transport, and reports `retry-exhausted` in the status bar, so one unreachable endpoint or permanent transport failure cannot leave Telegram traffic running with no operator remedy.
+- `Disconnect durability`: Unreadable, malformed, or fenced Workspace admission state can no longer block `/telegram-disconnect`. A failed Thread cleanup is reported as skipped after local polling stops and ownership releases, so the bridge never stays connected just because durable cleanup authority is unavailable.
+
 ## 0.51.6: Connection resume and Workspace recovery hotfix
 
 - `Workspace slot recovery`: Confirmed pressure-retirement deletion invalidates the exact stale active-target record before binding removal. Same-process and successor retries finish a retained `commit-ready` fence without repeating Telegram deletion, preventing exhausted A–Z slots from deadlocking on `protection-changed`. Includes [#305](https://github.com/llblab/pi-telegram/pull/305).

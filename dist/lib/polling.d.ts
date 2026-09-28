@@ -11,6 +11,7 @@ export interface TelegramUpdate {
     update_id: number;
 }
 export declare const TELEGRAM_GET_UPDATES_CONFLICT_STOP_LIMIT = 10;
+export declare const TELEGRAM_POLLING_RETRY_STOP_LIMIT = 8;
 export declare const TELEGRAM_GET_UPDATES_GRACE_MS = 10000;
 export declare const TELEGRAM_ALLOWED_UPDATES: readonly ["message", "edited_message", "callback_query", "message_reaction", "guest_message"];
 export declare function buildTelegramInitialSyncRequest(): {
@@ -29,6 +30,12 @@ export declare class TelegramPersistentGetUpdatesConflictError extends Error {
     readonly count: number;
     constructor(count: number);
 }
+export declare class TelegramPollingRetryExhaustedError extends Error {
+    readonly count: number;
+    constructor(count: number);
+}
+/** Exponential backoff for transport failures that are not getUpdates conflicts. */
+export declare function getTelegramPollingRetryDelayMs(consecutiveFailures: number): number;
 export declare class TelegramGetUpdatesTimeoutError extends Error {
     readonly timeoutMs: number;
     constructor(timeoutMs: number);
@@ -41,7 +48,7 @@ export interface TelegramPollingStartState {
 }
 export type TelegramPollingWorkPhase = "long-poll" | "persisting-journal" | "persisting-offset" | "retrying";
 export type TelegramPollingPhase = "stopped" | "starting" | TelegramPollingWorkPhase;
-export type TelegramPollingStopReason = "not-started" | "requested" | "completed" | "failed" | "persistent-conflict";
+export type TelegramPollingStopReason = "not-started" | "requested" | "completed" | "failed" | "persistent-conflict" | "retry-exhausted";
 export interface TelegramPollingStateSnapshot {
     phase: TelegramPollingPhase;
     phaseStartedAtMs?: number;
@@ -74,6 +81,7 @@ export interface TelegramPollingRuntimeDeps<TContext> extends TelegramRuntimeEve
     getNowMs?: () => number;
     onPollingStateChange?: () => void;
     onPersistentConflict?: (ctx: TContext, count: number) => MaybePromise<void>;
+    onRetryExhausted?: (ctx: TContext, count: number) => MaybePromise<void>;
     onPollingStarted?: () => void;
     onPollingStopped?: (reason: TelegramPollingStopReason) => void;
 }
@@ -128,6 +136,7 @@ export type TelegramPollingControllerRuntimeDeps<TUpdate extends TelegramUpdate,
     getNowMs?: () => number;
     onPollingStateChange?: () => void;
     onPersistentConflict?: (ctx: TContext, count: number) => MaybePromise<void>;
+    onRetryExhausted?: (ctx: TContext, count: number) => MaybePromise<void>;
 };
 export declare function createTelegramPollingControllerRuntime<TUpdate extends TelegramUpdate, TContext = unknown>(deps: TelegramPollingControllerRuntimeDeps<TUpdate, TContext>): TelegramPollingController<TContext>;
 export declare function createTelegramPollingController<TContext>(deps: TelegramPollingControllerDeps<TContext>): TelegramPollingController<TContext>;

@@ -29,6 +29,7 @@ import {
   cutOverTelegramPollingCursor,
   getLatestTelegramUpdateId,
   getTelegramGetUpdatesRequestBudgetMs,
+  getTelegramPollingRetryDelayMs,
   isTelegramGetUpdatesConflictError,
   isTelegramPollingControllerActive,
   runTelegramPollLoop,
@@ -39,10 +40,12 @@ import {
   stopTelegramPollingRuntime,
   TELEGRAM_ALLOWED_UPDATES,
   TELEGRAM_GET_UPDATES_CONFLICT_STOP_LIMIT,
+  TELEGRAM_POLLING_RETRY_STOP_LIMIT,
   TelegramPersistentGetUpdatesConflictError,
   TelegramGetUpdatesTimeoutError,
   TelegramPollingBatchValidationError,
   TelegramPollingCursorBootstrapError,
+  TelegramPollingRetryExhaustedError,
 } from "../lib/polling.ts";
 
 const TEST_CONTEXT = "ctx";
@@ -1579,7 +1582,7 @@ test("Poll loop cancels stalled getUpdates at its owner-derived budget", async (
       statusMessages.push("unexpected reset");
     },
     sleep: async (ms, signal) => {
-      assert.equal(ms, 3_000);
+      assert.equal(ms, 1_000);
       assert.equal(signal, controller.signal);
       controller.abort();
     },
@@ -1690,7 +1693,7 @@ test("Poll loop runner ignores stale-context status failures while retrying", as
     },
   });
   await runPollLoop("ctx", new AbortController().signal);
-  assert.deepEqual(events, ["status:network down", "sleep:3000", "status:ok"]);
+  assert.deepEqual(events, ["status:network down", "sleep:1000", "status:ok"]);
   assert.deepEqual(runtimeEvents, [
     "polling:network down:loop",
     "polling:stale ctx:status-update",
@@ -2050,8 +2053,143 @@ test("Poll loop reports retryable errors and sleeps before retrying", async () =
   });
   assert.deepEqual(statusMessages, [
     "error:network down",
-    "sleep:3000",
+    "sleep:1000",
     "reset",
   ]);
   assert.deepEqual(runtimeEvents, ["polling:network down:loop"]);
+});
+
+test("Poll loop bounds consecutive transport failures with exponential backoff", async () => {
+  const config = { botToken: "123:abc", lastUpdateId: 1 };
+  const sleeps: number[] = [];
+  const runtimeEvents: string[] = [];
+  let calls = 0;
+  await assert.rejects(
+    () => runTelegramPollLoop({
+      ctx: TEST_CONTEXT,
+      signal: new AbortController().signal,
+      config,
+      ...NOOP_JOURNAL_ADMISSION,
+      deleteWebhook: async () => {},
+      getUpdates: async () => {
+        calls += 1;
+        throw new Error("network down");
+      },
+      persistConfig: async () => {},
+      onErrorStatus: () => {},
+      onStatusReset: () => {},
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      recordRuntimeEvent: (category, error, details) => {
+        const message = error instanceof Error ? error.message : String(error);
+        runtimeEvents.push(`${category}:${message}:${details?.phase}`);
+      },
+    }),
+    (error: unknown) =>
+      error instanceof TelegramPollingRetryExhaustedError &&
+      error.count === TELEGRAM_POLLING_RETRY_STOP_LIMIT,
+  );
+  assert.equal(calls, TELEGRAM_POLLING_RETRY_STOP_LIMIT);
+  assert.deepEqual(sleeps, [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
+  assert.equal(runtimeEvents.length, TELEGRAM_POLLING_RETRY_STOP_LIMIT);
+  assert.ok(
+    runtimeEvents.every((event) => event === "polling:network down:loop"),
+  );
+});
+
+test("Poll loop resets the transport failure ceiling after a successful response", async () => {
+  const config = { botToken: "123:abc", lastUpdateId: 1 };
+  const sleeps: number[] = [];
+  let calls = 0;
+  await runTelegramPollLoop({
+    ctx: TEST_CONTEXT,
+    signal: new AbortController().signal,
+    config,
+    ...NOOP_JOURNAL_ADMISSION,
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      calls += 1;
+      if (calls === 1 || calls === 3) throw new Error("network down");
+      if (calls === 2) return [];
+      throw new DOMException("stop", "AbortError");
+    },
+    persistConfig: async () => {},
+    onErrorStatus: () => {},
+    onStatusReset: () => {},
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+  assert.deepEqual(sleeps, [1_000, 1_000]);
+});
+
+test("Polling retry delay saturates and never becomes non-finite", () => {
+  assert.equal(getTelegramPollingRetryDelayMs(1), 1_000);
+  assert.equal(getTelegramPollingRetryDelayMs(5), 16_000);
+  assert.equal(getTelegramPollingRetryDelayMs(6), 30_000);
+  assert.equal(getTelegramPollingRetryDelayMs(1_000), 30_000);
+});
+
+test("Retry exhaustion stands down the transport instead of restarting polling", async () => {
+  const state = createTelegramPollingControllerState();
+  const events: string[] = [];
+  let controller: ReturnType<typeof createTelegramPollingController<string>>;
+  controller = createTelegramPollingController({
+    state,
+    hasBotToken: () => true,
+    updateStatus: () => {},
+    stopTypingLoop: () => {
+      events.push("typing-stop");
+    },
+    runPollLoop: async () => {
+      throw new TelegramPollingRetryExhaustedError(TELEGRAM_POLLING_RETRY_STOP_LIMIT);
+    },
+    async onRetryExhausted(ctx, count): Promise<void> {
+      assert.equal(ctx, TEST_CONTEXT);
+      assert.equal(count, TELEGRAM_POLLING_RETRY_STOP_LIMIT);
+      assert.equal(state.pollingPromise, undefined);
+      await controller.stop();
+      events.push(`stand-down:${count}`);
+    },
+    recordRuntimeEvent: (category, error, details) => {
+      const message = error instanceof Error ? error.message : String(error);
+      events.push(`event:${category}:${message}:${details?.phase}`);
+    },
+  });
+  controller.start(TEST_CONTEXT);
+  await state.pollingPromise;
+  await waitForPollingCondition(
+    () => state.stopReason !== undefined,
+    "polling did not report a terminal stop reason",
+  );
+  assert.equal(state.stopReason, "retry-exhausted");
+  assert.deepEqual(events, ["typing-stop", `stand-down:${TELEGRAM_POLLING_RETRY_STOP_LIMIT}`]);
+});
+
+test("Retry exhaustion without a stand-down owner still stops typing and reports", async () => {
+  const state = createTelegramPollingControllerState();
+  const events: string[] = [];
+  const controller = createTelegramPollingController({
+    state,
+    hasBotToken: () => true,
+    updateStatus: () => {},
+    stopTypingLoop: () => {
+      events.push("typing-stop");
+    },
+    runPollLoop: async () => {
+      throw new TelegramPollingRetryExhaustedError(3);
+    },
+    recordRuntimeEvent: (category, error, details) => {
+      const message = error instanceof Error ? error.message : String(error);
+      events.push(`event:${category}:${message}:${details?.phase}`);
+    },
+  });
+  controller.start(TEST_CONTEXT);
+  await state.pollingPromise;
+  assert.equal(state.stopReason, "retry-exhausted");
+  assert.deepEqual(events, [
+    "typing-stop",
+    `event:polling:${new TelegramPollingRetryExhaustedError(3).message}:retry-exhausted`,
+  ]);
 });

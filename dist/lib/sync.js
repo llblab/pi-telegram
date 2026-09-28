@@ -72,12 +72,41 @@ export function createTelegramSessionRestartThreadCleanupHandler(deps) {
     });
 }
 export function createTelegramThreadDisconnectAssembly(deps) {
+    const disconnect = createTelegramManualThreadDisconnectHandler({
+        ...deps,
+        workspaceOperationKind: "workspace.disconnect-thread",
+        stopPolling: deps.stopPolling,
+    });
     return {
-        disconnect: createTelegramManualThreadDisconnectHandler({
-            ...deps,
-            workspaceOperationKind: "workspace.disconnect-thread",
-            stopPolling: deps.stopPolling,
-        }),
+        async disconnect() {
+            try {
+                return await disconnect();
+            }
+            catch (error) {
+                // Thread cleanup can need durable Workspace authority that is unreadable,
+                // malformed, or fenced. Local transport ownership never does, so a failed
+                // cleanup must still stop polling instead of leaving it running forever.
+                deps.recordRuntimeEvent("connection", error, {
+                    phase: "disconnect-cleanup",
+                });
+                let stopped;
+                try {
+                    stopped = await deps.stopPolling();
+                }
+                catch (stopError) {
+                    deps.recordRuntimeEvent("connection", stopError, {
+                        phase: "disconnect-stop",
+                    });
+                }
+                const reason = error instanceof Error ? error.message : String(error);
+                if (!stopped)
+                    return `Telegram bridge disconnect was incomplete: ${reason}`;
+                // The stop message is owned by the lock runtime; keep the two sentences
+                // separated even when it omits terminal punctuation.
+                const separator = /[.!?]$/u.test(stopped) ? " " : ". ";
+                return `${stopped}${separator}Thread cleanup was skipped: ${reason}`;
+            }
+        },
         cleanupForSessionRestart: createTelegramSessionRestartThreadCleanupHandler({
             ...deps,
             suspendPolling: deps.suspendPolling,

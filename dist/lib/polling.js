@@ -14,7 +14,9 @@ export const TELEGRAM_GET_UPDATES_CONFLICT_STOP_LIMIT = 10;
 const TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT = 3;
 const TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_MS = 1_000;
 const TELEGRAM_GET_UPDATES_CONFLICT_SLOW_RETRY_MS = 3_000;
-const TELEGRAM_POLLING_RETRY_MS = 3_000;
+export const TELEGRAM_POLLING_RETRY_STOP_LIMIT = 8;
+const TELEGRAM_POLLING_RETRY_BASE_MS = 1_000;
+const TELEGRAM_POLLING_RETRY_MAX_MS = 30_000;
 export const TELEGRAM_GET_UPDATES_GRACE_MS = 10_000;
 // Standard Telegram DM polling does not expose ordinary message-deletion events.
 // Business deletions belong to a separate namespace and default routing ignores them.
@@ -50,6 +52,19 @@ export class TelegramPersistentGetUpdatesConflictError extends Error {
         this.name = "TelegramPersistentGetUpdatesConflictError";
         this.count = count;
     }
+}
+export class TelegramPollingRetryExhaustedError extends Error {
+    count;
+    constructor(count) {
+        super(`Telegram polling stopped after ${count} consecutive failed attempts.`);
+        this.name = "TelegramPollingRetryExhaustedError";
+        this.count = count;
+    }
+}
+/** Exponential backoff for transport failures that are not getUpdates conflicts. */
+export function getTelegramPollingRetryDelayMs(consecutiveFailures) {
+    const exponent = Math.max(0, Math.min(consecutiveFailures - 1, 16));
+    return Math.min(TELEGRAM_POLLING_RETRY_BASE_MS * 2 ** exponent, TELEGRAM_POLLING_RETRY_MAX_MS);
 }
 export class TelegramGetUpdatesTimeoutError extends Error {
     timeoutMs;
@@ -233,6 +248,7 @@ export function createTelegramPollingControllerRuntime(deps) {
         getNowMs,
         onPollingStateChange: deps.onPollingStateChange,
         onPersistentConflict: deps.onPersistentConflict,
+        onRetryExhausted: deps.onRetryExhausted,
         recordRuntimeEvent: deps.recordRuntimeEvent,
     });
 }
@@ -326,6 +342,7 @@ export function startTelegramPollingRuntime(ctx, deps) {
     deps.onPollingStarted?.();
     let failed = false;
     let persistentConflict;
+    let retryExhausted;
     let runPromise;
     try {
         runPromise = deps.runPollLoop(ctx, controller.signal);
@@ -342,6 +359,10 @@ export function startTelegramPollingRuntime(ctx, deps) {
             persistentConflict = error;
             return;
         }
+        if (error instanceof TelegramPollingRetryExhaustedError) {
+            retryExhausted = error;
+            return;
+        }
         failed = true;
         deps.recordRuntimeEvent?.("polling", error, {
             phase: "controller",
@@ -356,23 +377,32 @@ export function startTelegramPollingRuntime(ctx, deps) {
             deps.setPollingController(undefined);
         if (!ownsPromise && !ownsController)
             return;
-        deps.onPollingStopped?.(controller.signal.aborted ? "requested" : persistentConflict
-            ? "persistent-conflict" : failed ? "failed" : "completed");
+        const terminalError = persistentConflict ?? retryExhausted;
+        const terminalReason = persistentConflict
+            ? "persistent-conflict"
+            : retryExhausted ? "retry-exhausted" : undefined;
+        deps.onPollingStopped?.(controller.signal.aborted ? "requested" : terminalReason
+            ?? (failed ? "failed" : "completed"));
         // Detach the inner promise before outer teardown calls polling.stop().
-        if (persistentConflict && !controller.signal.aborted) {
+        if (terminalError && terminalReason && !controller.signal.aborted) {
             try {
-                if (deps.onPersistentConflict) {
-                    await deps.onPersistentConflict(ctx, persistentConflict.count);
+                const standDown = persistentConflict
+                    ? deps.onPersistentConflict
+                    : deps.onRetryExhausted;
+                if (standDown) {
+                    await standDown(ctx, terminalError.count);
                 }
                 else {
                     deps.stopTypingLoop();
-                    deps.recordRuntimeEvent?.("polling", persistentConflict, {
-                        phase: "persistent-conflict", count: persistentConflict.count,
+                    deps.recordRuntimeEvent?.("polling", terminalError, {
+                        phase: terminalReason, count: terminalError.count,
                     });
                 }
             }
             catch (error) {
-                deps.recordRuntimeEvent?.("polling", error, { phase: "conflict-stand-down" });
+                deps.recordRuntimeEvent?.("polling", error, {
+                    phase: "terminal-stand-down",
+                });
             }
             if (deps.getPollingController() || deps.getPollingPromise())
                 return;
@@ -1103,6 +1133,7 @@ export async function runTelegramPollLoop(deps) {
     if (!deps.config.botToken)
         return;
     let consecutiveGetUpdatesConflicts = 0;
+    let consecutiveFailures = 0;
     const retryConflict = async () => {
         consecutiveGetUpdatesConflicts += 1;
         if (consecutiveGetUpdatesConflicts >= TELEGRAM_GET_UPDATES_CONFLICT_STOP_LIMIT) {
@@ -1160,6 +1191,7 @@ export async function runTelegramPollLoop(deps) {
             const updates = await requestTelegramUpdatesWithinBudget(deps, request);
             reportTelegramPollingResponse(deps, updates.length);
             consecutiveGetUpdatesConflicts = 0;
+            consecutiveFailures = 0;
             currentUpdateId = updates[0]?.update_id;
             await admitTelegramPollingUpdateBatch({
                 updates,
@@ -1190,8 +1222,14 @@ export async function runTelegramPollLoop(deps) {
                     : {}),
             });
             consecutiveGetUpdatesConflicts = 0;
+            consecutiveFailures += 1;
             deps.onErrorStatus(getTelegramPollingErrorMessage(error));
-            await deps.sleep(TELEGRAM_POLLING_RETRY_MS, deps.signal);
+            // A permanent transport failure must not retry forever: the operator keeps
+            // polling alive with no way to stop it except restarting Pi.
+            if (consecutiveFailures >= TELEGRAM_POLLING_RETRY_STOP_LIMIT) {
+                throw new TelegramPollingRetryExhaustedError(consecutiveFailures);
+            }
+            await deps.sleep(getTelegramPollingRetryDelayMs(consecutiveFailures), deps.signal);
             if (deps.signal.aborted)
                 return;
             deps.onStatusReset();

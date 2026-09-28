@@ -135,6 +135,7 @@ export interface TelegramLockedPollingRuntime<TContext extends TelegramLockConte
     suspend: () => Promise<void>;
     isSuspended: () => boolean;
     onPersistentConflict: (ctx: TContext, count: number) => Promise<void>;
+    onRetryExhausted: (ctx: TContext, count: number) => Promise<void>;
     onSessionStart: (_event: unknown, ctx: TContext) => Promise<void>;
     registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;
     restoreFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;

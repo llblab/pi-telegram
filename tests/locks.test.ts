@@ -2467,6 +2467,51 @@ test("Persistent conflicts stop watchers and monitoring, revoke sends, and relea
   }
 });
 
+test("Retry exhaustion stops transport, monitoring, and exact ownership", async () => {
+  const temp = createTempLockPath();
+  const ctx = { cwd: "/repo" };
+  const lock = createTelegramLockRuntime({
+    locksPath: temp.path, pid: 10, instanceId: "local", isProcessAlive: () => true,
+  });
+  let stops = 0;
+  let monitoring = false;
+  const diagnostics: Array<{ message: string; details: Record<string, unknown> | undefined }> = [];
+  const runtime = createTelegramLockedPollingRuntime({
+    lock, hasBotToken: () => true,
+    startPolling: async () => {}, stopPolling: async () => { stops++; },
+    transportMonitor: { start: () => { monitoring = true; }, stop: () => { monitoring = false; } },
+    updateStatus: () => {},
+    recordRuntimeEvent: (_category, error, details) => {
+      const message = error instanceof Error ? error.message : String(error);
+      diagnostics.push({ message, details });
+    },
+  });
+  try {
+    assert.equal((await runtime.start(ctx)).ok, true);
+    assert.equal(monitoring, true);
+    await runtime.onRetryExhausted(ctx, 8);
+    assert.equal(stops, 1);
+    assert.equal(monitoring, false);
+    assert.equal(lock.owns(ctx), false);
+    assert.equal(lock.refresh(ctx), false);
+    assert.equal(diagnostics.length, 1);
+    assert.equal(diagnostics[0]?.details?.phase, "retry-exhausted");
+    assert.equal(diagnostics[0]?.details?.count, 8);
+    assert.equal(diagnostics[0]?.details?.ownership, "owned");
+    assert.equal(
+      diagnostics[0]?.message,
+      "Telegram transport stopped: polling failed repeatedly; run /telegram-connect to retry.",
+    );
+    // A later stand-down attempt must not stop the transport twice.
+    await runtime.onRetryExhausted(ctx, 8);
+    assert.equal(stops, 1);
+    assert.equal(diagnostics.length, 1);
+  } finally {
+    await runtime.suspend();
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
 test("A failed durable release stays locally revoked until explicit acquisition mints a new epoch", () => {
   const temp = createTempLockPath();
   const ctx = { cwd: "/repo" };

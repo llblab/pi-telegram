@@ -440,7 +440,9 @@ export function buildTelegramStatusBarText(theme, state) {
         : "";
     if (!state.hasBotToken)
         return `${label} ${theme.fg("muted", "not configured")}${queued}`;
-    if (state.pollingStopReason === "persistent-conflict" && state.busRole !== "follower")
+    if ((state.pollingStopReason === "persistent-conflict" ||
+        state.pollingStopReason === "retry-exhausted") &&
+        state.busRole !== "follower")
         return `${label} ${theme.fg("error", "error")}`;
     if (!state.paired)
         return `${label} ${theme.fg("warning", "awaiting pairing")}${queued}`;
