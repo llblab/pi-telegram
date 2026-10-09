@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.54.3: One routing tab on mobile
+
+- `Mobile routing tab`: Sending a command or prompt from `All` in mobile Telegram no longer leaves an extra tab named after the input. The mobile client creates that native tab itself before delivering the input to `All`; the bridge now adopts it as the routing tab and renames it, instead of creating a second tab beside it. Desktop behavior is unchanged.
+
 ## 0.54.2: Diagnosable ownership checks and safe app cancellation
 
 - `Ownership checks`: An ownership check that cannot be verified no longer silently stops a live transport. Each such miss is recorded (`ownership-check-failed`) and polling stands down only after two consecutive tolerated misses; a confirmed loss is recorded as `ownership-lost` and stands down at once (#319).
