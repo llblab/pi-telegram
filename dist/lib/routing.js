@@ -910,6 +910,8 @@ export const TELEGRAM_ALL_TAB_COMMAND_MAX_AGE_MS = 60 * 60_000;
 export const TELEGRAM_ROUTING_CHOICE_EXPIRED = "Routing choice expired";
 /** Every temporary routing tab carries this name, whether the bot created it or adopted Telegram's native tab. */
 const TELEGRAM_TEMPORARY_THREAD_NAME = "🚦 Routing";
+/** A mobile client's native tab creation precedes the All input it is named after by about a second. */
+const TELEGRAM_IMPLICIT_ALL_INPUT_WINDOW_SEC = 10;
 export function isTelegramAllTabCommandExpired(message, nowMs = Date.now()) {
     return (message.message_thread_id === undefined &&
         typeof message.date === "number" &&
@@ -6854,6 +6856,30 @@ export function createTelegramInboundRouteRuntime(deps) {
         }
         return undefined;
     };
+    /** A fresh implicit native tab whose name the All input starts with, observed just before it in the same exact scope. */
+    const findImplicitCreationForAllInput = (message, updateId, cap, ctx) => {
+        const text = (message.text ?? message.caption ?? "").trim();
+        let match;
+        for (const [key, implicit] of implicitThreadCreations) {
+            if (implicit.name &&
+                text.startsWith(implicit.name) &&
+                implicit.updateId < updateId &&
+                implicit.createdAtSec > 0 &&
+                message.date !== undefined &&
+                message.date >= implicit.createdAtSec &&
+                message.date - implicit.createdAtSec <=
+                    TELEGRAM_IMPLICIT_ALL_INPUT_WINDOW_SEC &&
+                implicit.ctx === ctx &&
+                implicit.operatorUserId === cap.operatorUserId &&
+                implicit.journalBindingKey === cap.journalBindingKey &&
+                isDeepStrictEqual(implicit.executor, cap.authority.executor) &&
+                implicit.generation === deps.getSessionGeneration?.() &&
+                implicit.scope === deps.getAdmissionScope?.() &&
+                (!match || implicit.updateId > match.implicit.updateId))
+                match = { key, implicit };
+        }
+        return match;
+    };
     /**
      * An All input gets one source-bound tab. The original stays deferred in All until explicit routing,
      * and an existing entry is reused on replay, so restart never creates a second tab or retries an unknown one.
@@ -6892,6 +6918,34 @@ export function createTelegramInboundRouteRuntime(deps) {
             if (found) {
                 entry = found;
                 return;
+            }
+            // Mobile clients sending from All first create a native tab named after the input, then deliver
+            // the input itself to All: adopt that tab rather than leaving it behind next to a second one.
+            const native = findImplicitCreationForAllInput(message, updateId, cap, ctx);
+            if (native) {
+                const adopted = store.registerImplicitTemporaryThread({ journalBindingKey, updateIds: [updateId] }, native.implicit.target, randomBytes(16).toString("hex"), {
+                    ...authority,
+                    isCurrent: () => current() &&
+                        implicitThreadCreations.get(native.key) === native.implicit,
+                });
+                if (adopted && current()) {
+                    implicitThreadCreations.delete(native.key);
+                    entry = adopted;
+                    // Adopted native tabs share the routing name; a failed rename never blocks routing.
+                    try {
+                        await deps.callApi("editForumTopic", {
+                            chat_id: native.implicit.target.chatId,
+                            message_thread_id: native.implicit.target.threadId,
+                            name: TELEGRAM_TEMPORARY_THREAD_NAME,
+                        });
+                    }
+                    catch (error) {
+                        deps.recordRuntimeEvent?.("routing", error, {
+                            phase: "temporary-thread-name",
+                        });
+                    }
+                    return;
+                }
             }
             const reservation = store.reserveTemporaryThread(source, randomBytes(16).toString("hex"), authority);
             entry = reservation?.entry;
@@ -7253,6 +7307,12 @@ export function createTelegramInboundRouteRuntime(deps) {
                 executor: structuredClone(cap.authority.executor),
                 generation: deps.getSessionGeneration?.(),
                 scope: deps.getAdmissionScope?.(),
+                target: {
+                    chatId: lifecycle.target.chatId,
+                    threadId: lifecycle.target.threadId,
+                },
+                name: "name" in created && typeof created.name === "string" ? created.name : "",
+                createdAtSec: message.date ?? 0,
             });
         }
         else

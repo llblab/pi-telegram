@@ -8876,6 +8876,45 @@ for (const proof of ["implicit", "manual", "string-flag", "foreign-creator", "hi
   });
 }
 
+for (const client of ["mobile", "desktop", "unrelated-native"] as const) {
+  test(`All command adopts the native tab a mobile client creates for it (${client})`, async () => {
+    await fixture(async frame => {
+      const f = await createAllCommandFixture("cancel", frame);
+      f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+      const now = Math.floor(Date.now() / 1000);
+      try {
+        // Mobile Telegram first creates an implicitly named tab, then delivers the menu command itself to All.
+        if (client !== "desktop") {
+          f.journal.appendBatch([{ update_id: 120, message: { message_id: 9, message_thread_id: 77, date: now,
+            chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+            forum_topic_created: { name: client === "mobile" ? "/start" : "New Chat", icon_color: 7322096, is_name_implicit: true } } }]);
+          f.worker.signal(); await f.worker.waitForDrain();
+        }
+        f.journal.appendBatch([{ update_id: 121, message: { message_id: 10, date: now + 1,
+          chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "/start",
+          entities: [{ type: "bot_command", offset: 0, length: 6 }] } }]);
+        f.worker.signal(); await f.worker.waitForDrain();
+        assert.equal(f.choosers.length, 1);
+        const adopted = client === "mobile";
+        assert.equal(f.creations.length, adopted ? 0 : 1, "One routing tab per All input");
+        const [entry] = f.store.listTemporaryThreads();
+        assert.equal(entry?.source.updateId, 121);
+        assert.equal(entry?.target?.threadId === 77, adopted);
+        assert.equal((f.choosers[0]!.target as { threadId?: number }).threadId === 77, adopted);
+        assert.deepEqual(f.apiCalls.filter(call => call.method === "editForumTopic").map(call => call.body.message_thread_id),
+          adopted ? [77] : [], "The adopted native tab is renamed once to the routing name");
+        // Cancel is pressed inside the tab that actually holds the chooser.
+        const tab = (f.choosers[0]!.target as { threadId: number }).threadId;
+        f.journal.appendBatch([{ update_id: 300, callback_query: { id: "native-cancel", from: { id: 7, is_bot: false }, data: f.cancelOf(0),
+          message: { message_id: 501, message_thread_id: tab, chat: { id: 7, type: "private" } } } }]);
+        f.worker.signal(); await f.worker.waitForDrain(); await f.harness.routeRuntime.waitForRestoreSettlement();
+        assert.equal(f.deletions().some(call => call.body.message_thread_id === 77), adopted,
+          "The adopted native tab leaves with the routing lifecycle; an unrelated one is never claimed");
+      } finally { await f.stop(); }
+    });
+  });
+}
+
 for (const text of ["/status", "native prompt Forward"]) {
   test(`Implicit native tab retains normal one-shot Forward settlement (${text})`, async () => {
     await fixture(async frame => {
