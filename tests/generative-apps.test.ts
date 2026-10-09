@@ -683,6 +683,50 @@ export async function inspect({ run, argument }) {
   }
 });
 
+test("Generative App worker never starts a process after cancellation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
+  const agentDir = join(root, "agent");
+  try {
+    const marker = join(root, "after-abort.txt");
+    const script = await writeApp(
+      root,
+      "after-abort",
+      `
+export function init() { return { state: {}, output: "ready" }; }
+export async function mutate({ run, signal }) {
+  await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+  await run({
+    command: process.execPath,
+    args: ["-e", ${JSON.stringify(`require("node:fs").writeFileSync(${JSON.stringify(marker)}, "orphan")`)}],
+    cwd: ${JSON.stringify(root)},
+    timeoutMs: 1000,
+  });
+  return { state: {}, output: "unreachable" };
+}
+`,
+    );
+    await installGenerativeApp({ agentDir, app: "after-abort", script });
+    const execution = new AbortController();
+    const pending = invokeGenerativeApp({
+      agentDir,
+      execution: {
+        assertCurrent: () => {
+          if (execution.signal.aborted) throw new Error("stale execution");
+        },
+        signal: execution.signal,
+      },
+      method: "mutate",
+      app: "after-abort",
+    });
+    setTimeout(() => execution.abort(), 200);
+    await assert.rejects(pending, /cancelled|stale execution/);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await assert.rejects(readFile(marker), /ENOENT/, "A cancelled method cannot leave an orphan process behind");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Generative App worker bounds synchronous methods and cancels in-flight processes", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-telegram-generative-app-"));
   const agentDir = join(root, "agent");
