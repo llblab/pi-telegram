@@ -9229,6 +9229,10 @@ export interface TelegramCurrentThreadAssemblyDeps {
   instanceId: string;
   listRecords: TelegramCurrentInstanceThreadRuntimeDeps["listRecords"];
   listWorkspaceBindings?: () => readonly TelegramWorkspaceThreadBinding[];
+  /** Display-mode title for a binding whose tab has no acknowledged title yet (fresh, moved or reclaimed). */
+  resolveAutomaticDisplayTitle?: (
+    binding: TelegramWorkspaceThreadBinding,
+  ) => string | undefined;
   getFollowerDisplayTitle?: () => string | undefined;
   getActiveTurnTarget(): TelegramTarget | undefined;
   getFollowerTarget(): TelegramTarget | undefined;
@@ -9290,9 +9294,13 @@ export function createTelegramCurrentThreadAssembly(
     ) {
       return deps.getFollowerDisplayTitle?.();
     }
-    return deps
+    const binding = deps
       .listWorkspaceBindings?.()
-      .find((binding) => targetMatches(binding.target, target))?.displayTitle;
+      .find((value) => targetMatches(value.target, target));
+    return (
+      binding?.displayTitle ??
+      (binding ? deps.resolveAutomaticDisplayTitle?.(binding) : undefined)
+    );
   };
   const displayIdentity = (
     identity: TelegramInstanceThreadIdentityCandidate,

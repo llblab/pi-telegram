@@ -302,7 +302,8 @@ function formatTelegramUnboundRerouteChooserText(command) {
     return `<b>🔀 Reroute ${formatTelegramRouteSubject(command)} to:</b>`;
 }
 function formatTelegramUnboundRerouteRestoreChooserText(command) {
-    return `<b>🔁 Restore into this tab & send ${formatTelegramRouteSubject(command)}:</b>`;
+    const subject = command ? ` for ${formatTelegramRouteSubject(command)}` : "";
+    return `<b>🔁 Restore a Pi into this tab${subject}:</b>`;
 }
 function formatTelegramUnboundTopicGuidance() {
     return [
@@ -370,7 +371,10 @@ function classifyLiveRebindCleanupFailure(error) {
         ? "rejected"
         : "unknown";
 }
-/** Default live-rebind cleanup pacing: quick early attempts, then minutely, within a 15-minute window. */
+/**
+ * Default live-rebind cleanup pacing: quick early attempts, then minutely, within a 15-minute window. The first
+ * delay is not cosmetic: a leader's detached command reply still needs the released, cleanup-free row.
+ */
 export const TELEGRAM_LIVE_REBIND_CLEANUP_SCHEDULE = Object.freeze({
     delaysMs: Object.freeze([1_000, 2_000, 5_000, 10_000, 30_000]),
     intervalMs: 60_000,
@@ -465,7 +469,7 @@ export function createTelegramLiveRebindCoordinator(input) {
         return confirmed && current();
     };
     let preparation;
-    let saved = false, commitIssued = false, applyIssued = false, peerReleaseIssued = false, donorSettlementAttempted = false, continuationIssued = false, released = false, advancing = false;
+    let saved = false, commitIssued = false, applyIssued = false, retitleIssued = false, peerReleaseIssued = false, donorSettlementAttempted = false, continuationIssued = false, released = false, advancing = false;
     let preparedSource;
     const runFollower = async (mode) => {
         if (!input.follower || !recipient || !current())
@@ -687,6 +691,19 @@ export function createTelegramLiveRebindCoordinator(input) {
                 }
                 if (!sourceSaved() || (preparation && !preparation.confirmSaved()))
                     return "protected";
+                if (input.retitle && !retitleIssued) {
+                    retitleIssued = true;
+                    try {
+                        await input.retitle(current);
+                    }
+                    catch (error) {
+                        input.recordRuntimeEvent?.("telegram", error, {
+                            phase: "live-rebind-title",
+                        });
+                    }
+                    if (!current() || !canonical(intent))
+                        return "unknown";
+                }
                 if (intent.phase === "rebound") {
                     const expected = intent;
                     input.restoreStore.advanceLiveRebind(expected, "release", recipient.kind === "leader"
@@ -1561,6 +1578,47 @@ export function createTelegramInboundRouteRuntime(deps) {
     };
     /** One-shot per chooser: the copies are taken before deletion, so a later consuming path finds none. */
     const deleteAllTabCopies = (pending) => deleteAllTabMessages(pending.sourceTarget.chatId, pending.allTabCopies?.splice(0) ?? []);
+    /**
+     * Restore keeps the tab as the Thread, so the input must stay visible there: the All original goes only when the tab
+     * holds its forwarded copy. Without one it stays where the operator can still read it.
+     */
+    const releaseAllTabCopiesIntoSurvivingTab = (pending) => {
+        if (pending.allTabCopiesForwarded)
+            return deleteAllTabCopies(pending);
+        pending.allTabCopies?.splice(0);
+        return Promise.resolve();
+    };
+    /**
+     * The Bot API files a threadless All input in All even when a mobile client first draws it in its new tab. One silent
+     * best-effort forward moves it into the routing tab it opened, and only a confirmed copy lets the original leave All;
+     * any failure keeps the original where the operator can still read it.
+     */
+    const moveAllTabSourceIntoTab = async (pending, target, isCurrent) => {
+        const [messageId] = pending.allTabCopies ?? [];
+        if (messageId === undefined || !deps.callApi || !isCurrent())
+            return;
+        try {
+            const copy = await deps.callApi("forwardMessage", {
+                chat_id: target.chatId,
+                message_thread_id: target.threadId,
+                from_chat_id: pending.sourceTarget.chatId,
+                message_id: messageId,
+                disable_notification: true,
+            });
+            const copyId = copy?.message_id;
+            if (typeof copyId !== "number" || !Number.isSafeInteger(copyId))
+                return;
+            pending.allTabCopiesForwarded = true;
+            await deleteAllTabCopies(pending);
+            return copyId;
+        }
+        catch (error) {
+            deps.recordRuntimeEvent?.("routing", error, {
+                phase: "temporary-thread-source-forward",
+            });
+            return;
+        }
+    };
     const dismissRerouteChooserMessage = async (query, assertExecutionCurrent) => {
         const chatId = query.message?.chat?.id;
         const messageId = query.message?.message_id;
@@ -1585,6 +1643,26 @@ export function createTelegramInboundRouteRuntime(deps) {
             });
             return false;
         }
+    };
+    /** Choosers are one-shot: a final outcome deletes the menu; only a failed delete leaves an inert, button-free notice. */
+    const retireRerouteChooserMessage = async (chatId, messageId, fallbackText, assertCurrent) => {
+        if (deps.deleteMessage) {
+            try {
+                await deps.deleteMessage(chatId, messageId);
+                return;
+            }
+            catch (error) {
+                deps.recordRuntimeEvent?.("telegram", error, {
+                    phase: "reroute-chooser-delete",
+                    chatId,
+                    messageId,
+                });
+            }
+            assertCurrent?.();
+        }
+        await deps.editInteractiveMessage?.(chatId, messageId, fallbackText, "html", {
+            inline_keyboard: [],
+        });
     };
     const closeReroutedUnboundTopic = async (target, messageId, assertExecutionCurrent, ownTemporary) => {
         if (!target || !deps.threadStore)
@@ -1708,8 +1786,9 @@ export function createTelegramInboundRouteRuntime(deps) {
                     continue;
                 if (!recordCancelledTemporaryThreadInput(pending, ctx, current))
                     continue;
+                // A sibling cancelled by Restore stays visible in the restored tab, like a desktop input typed there.
                 if (await retireCancellationChooser(id, pending, current))
-                    await deleteAllTabCopies(pending);
+                    await releaseAllTabCopiesIntoSurvivingTab(pending);
             }
             catch (error) {
                 deps.recordRuntimeEvent?.("routing", error, {
@@ -2239,12 +2318,28 @@ export function createTelegramInboundRouteRuntime(deps) {
                     if (!intent)
                         continue;
                 }
+                // The chooser follows the success proof, never old-thread cleanup, which may stay protected indefinitely.
+                const retireRestoreChoosers = async () => {
+                    for (const [id, pending] of pendingUnboundReroutes) {
+                        if (pending.workspaceRestore?.operationId !== operationId)
+                            continue;
+                        pending.phase = { kind: "finalizing", message: "Restored" };
+                        if (pending.chooserMessageId === undefined)
+                            continue;
+                        assertSettlementCurrent();
+                        await retireRerouteChooserMessage(pending.sourceTarget.chatId, pending.chooserMessageId, "<b>✅ Message routed.</b>", assertSettlementCurrent);
+                        assertSettlementCurrent();
+                        if (pendingUnboundReroutes.get(id) === pending)
+                            removePendingReroute(id);
+                    }
+                };
                 if (intent.routing?.cleanup === undefined) {
                     if (!intent.request.source.updateIds.every((id) => intent.routing.settlements.some((value) => value.kind !== "queued" && value.updateIds.includes(id))))
                         continue;
-                    // Positive settlement of every selected source is the success proof; old-thread cleanup may stay protected indefinitely.
+                    // Positive settlement of every selected source is the success proof.
                     await disposeTemporaryThreadSiblingsAfterRestore(intent, ctx, settlementAuthority.isCurrent);
                     assertSettlementCurrent();
+                    await retireRestoreChoosers();
                     if (isRerouteTargetProtected(intent.request.binding.target, intent))
                         continue;
                     const grant = store.issueCleanup(intent, settlementAuthority);
@@ -2265,19 +2360,7 @@ export function createTelegramInboundRouteRuntime(deps) {
                 if (!store.retire(intent, settlementAuthority))
                     continue;
                 retired = true;
-                for (const [id, pending] of pendingUnboundReroutes) {
-                    if (pending.workspaceRestore?.operationId !== operationId)
-                        continue;
-                    pending.phase = { kind: "finalizing", message: "Restored" };
-                    if (!deps.editInteractiveMessage ||
-                        pending.chooserMessageId === undefined)
-                        continue;
-                    assertSettlementCurrent();
-                    await deps.editInteractiveMessage(pending.sourceTarget.chatId, pending.chooserMessageId, "<b>✅ Message routed.</b>", "html", { inline_keyboard: [] });
-                    assertSettlementCurrent();
-                    if (pendingUnboundReroutes.get(id) === pending)
-                        removePendingReroute(id);
-                }
+                await retireRestoreChoosers();
             }
         }))
             .catch((error) => {
@@ -3211,6 +3294,20 @@ export function createTelegramInboundRouteRuntime(deps) {
             messages: selection.messages,
             restoreStore: store,
             threadStore: threads,
+            // Same title as Workspace Restore: the display-mode title of the restored binding on its new tab.
+            retitle: deps.callApi
+                ? async (isCurrent) => {
+                    if (!isCurrent())
+                        return;
+                    const slot = binding.slot ?? "";
+                    await deps.callApi("editForumTopic", {
+                        chat_id: target.chatId,
+                        message_thread_id: target.threadId,
+                        name: deps.getDisplayTitle?.(target) ??
+                            ThreadNaming.getTelegramTopicTitleForThreadName(getRestoredThreadName(request.owner, slot), slot),
+                    });
+                }
+                : undefined,
             authority: {
                 executor: { instanceId, leaderEpoch: String(epoch) },
                 operatorUserId,
@@ -3729,6 +3826,8 @@ export function createTelegramInboundRouteRuntime(deps) {
     const issueLiveRebindFollowerCleanup = (intent, ctx) => inspectLiveRebindRecipient(intent, ctx, "follower-issue");
     // One pacing chain per operation: a waiting timer or a running attempt; repeated choices never start another.
     const liveRebindCleanupChains = new Map();
+    // A leader retry waiting out its delay; a settled session wakes it at once, since its own busy run is the usual wait.
+    const liveRebindCleanupWakers = new Map();
     /** End an unissued attempt honestly under fresh admission and current operator authority; no executor grant is borrowed. */
     const terminalizeUnissuedLiveRebindCleanup = async (operationId, ctx) => {
         const run = deps.runWorkspaceOperation, store = deps.getWorkspaceRestoreStore?.();
@@ -3779,7 +3878,8 @@ export function createTelegramInboundRouteRuntime(deps) {
                 liveRebindCleanupChains.delete(operationId);
             return;
         }
-        const timer = setTimeout(() => {
+        const attemptNow = () => {
+            liveRebindCleanupWakers.delete(operationId);
             if (liveRebindCleanupChains.get(operationId) !== timer)
                 return;
             liveRebindCleanupChains.set(operationId, "running");
@@ -3814,9 +3914,25 @@ export function createTelegramInboundRouteRuntime(deps) {
             });
             restoreSettlementTasks.add(task);
             void task.finally(() => restoreSettlementTasks.delete(task));
-        }, pacing.delaysMs[attempt] ?? pacing.intervalMs);
+        };
+        const timer = setTimeout(attemptNow, pacing.delaysMs[attempt] ?? pacing.intervalMs);
         timer.unref?.();
         liveRebindCleanupChains.set(operationId, timer);
+        // The first delay stays whole: a detached command reply still needs the released, cleanup-free row.
+        if (role === "leader" && attempt > 0)
+            liveRebindCleanupWakers.set(operationId, () => {
+                if (liveRebindCleanupChains.get(operationId) !== timer)
+                    return;
+                clearTimeout(timer);
+                attemptNow();
+            });
+    };
+    /** The agent settled: every gate is re-sampled now, so an old tab goes right after the answer, not at the next tick. */
+    const onSessionSettled = (ctx) => {
+        if (deps.isContextActive?.(ctx) !== true)
+            return;
+        for (const wake of [...liveRebindCleanupWakers.values()])
+            wake();
     };
     const restoreWorkspace = deps.workspaceRestoreRecipient
         ? async (input) => {
@@ -4203,17 +4319,25 @@ export function createTelegramInboundRouteRuntime(deps) {
         }
         await promptEnqueue(messages, ctx);
     };
-    const finalizePendingReroute = async (rerouteId, pending, query, successMessage, assertExecutionCurrent = Updates.createTelegramUpdateExecutionFenceGuard(query)) => {
+    const finalizePendingReroute = async (rerouteId, pending, query, successMessage, assertExecutionCurrent = Updates.createTelegramUpdateExecutionFenceGuard(query), retainRecord = false) => {
         assertExecutionCurrent();
         const dismissed = await dismissRerouteChooserMessage(query, assertExecutionCurrent);
         assertExecutionCurrent();
         if (dismissed) {
-            removePendingReroute(rerouteId);
+            // A retained record no longer matches any chooser, so a late duplicate tap reads as expired.
+            if (retainRecord)
+                pending.chooserMessageId = undefined;
+            else
+                removePendingReroute(rerouteId);
             await deps.answerCallbackQuery(query.id, successMessage);
             await deleteAllTabCopies(pending);
             return;
         }
-        pending.phase = { kind: "finalizing", message: successMessage };
+        pending.phase = {
+            kind: "finalizing",
+            message: successMessage,
+            ...(retainRecord ? { retainRecord: true } : {}),
+        };
         await deps.answerCallbackQuery(query.id, `${successMessage}; tap again to clear the menu`);
     };
     const isTemporaryReroute = (pending) => !!pending.temporaryThread ||
@@ -4613,10 +4737,10 @@ export function createTelegramInboundRouteRuntime(deps) {
     const retireCancellationChooser = async (id, pending, isCurrent) => {
         if (!isPendingRerouteCancelled(pending) ||
             !isCurrent() ||
-            !deps.editInteractiveMessage ||
+            (!deps.deleteMessage && !deps.editInteractiveMessage) ||
             pending.chooserMessageId === undefined)
             return false;
-        await deps.editInteractiveMessage(pending.sourceTarget.chatId, pending.chooserMessageId, "<b>⛔️ Routing cancelled.</b>", "html", { inline_keyboard: [] });
+        await retireRerouteChooserMessage(pending.sourceTarget.chatId, pending.chooserMessageId, "<b>⛔️ Routing cancelled.</b>");
         if (!isCurrent() || pendingUnboundReroutes.get(id) !== pending)
             return false;
         removePendingReroute(id);
@@ -4973,9 +5097,11 @@ export function createTelegramInboundRouteRuntime(deps) {
             if (!result)
                 return;
             // Expiry revokes the donor carrier; old controls and late ACKs cannot issue another delivery. No body is archived.
+            let movedIntoTab = false;
             for (const [id, pending] of pendingUnboundReroutes) {
                 if (!Updates.collectTelegramAdmissionSourceUpdateIds(pending.messages).includes(source.original.updateId))
                     continue;
+                movedIntoTab ||= pending.allTabCopiesForwarded === true;
                 removePendingReroute(id);
                 if (signal.aborted ||
                     deps.isContextActive?.(ctx) !== true ||
@@ -4999,7 +5125,9 @@ export function createTelegramInboundRouteRuntime(deps) {
             // never closes over this source or asks the worker to retain a terminal prompt while metadata publication fails.
             if (temporary?.target && runtimeCurrent()) {
                 scheduleTemporaryThreadCleanup(temporary.target, ctx, true);
-                await deleteAllTabMessages(temporary.target.chatId, getTelegramAllTabSourceMessageIds([message], temporary.target.chatId));
+                // A moved original already left All with its forward; only an unmoved one is deleted here.
+                if (!movedIntoTab)
+                    await deleteAllTabMessages(temporary.target.chatId, getTelegramAllTabSourceMessageIds([message], temporary.target.chatId));
             }
         });
     };
@@ -5448,7 +5576,7 @@ export function createTelegramInboundRouteRuntime(deps) {
             return true;
         }
         if (pending.phase.kind === "finalizing") {
-            await finalizePendingReroute(parsed.rerouteId, pending, query, pending.phase.message, assertExecutionCurrent);
+            await finalizePendingReroute(parsed.rerouteId, pending, query, pending.phase.message, assertExecutionCurrent, pending.phase.retainRecord === true);
             return true;
         }
         if (pending.liveRebind &&
@@ -5723,7 +5851,7 @@ export function createTelegramInboundRouteRuntime(deps) {
                 if (row?.phase === "released" && row.cleanup === undefined)
                     scheduleLiveRebindCleanup(operationId, selection.record.owner?.kind === "leader" ? "leader" : "follower", ctx);
                 if (outcome === "released")
-                    await deleteAllTabCopies(pending);
+                    await releaseAllTabCopiesIntoSurvivingTab(pending);
             }
             catch (error) {
                 deps.recordRuntimeEvent?.("routing", error, {
@@ -5734,29 +5862,32 @@ export function createTelegramInboundRouteRuntime(deps) {
                 selection.isCurrent = undefined;
             }
             assertExecutionCurrent();
-            await deps.answerCallbackQuery(query.id, outcome === "released"
-                ? selection.extensionKind === "generated-prompt"
-                    ? "Input queued in the rebound Thread; old-Thread cleanup is scheduled, not confirmed"
-                    : selection.extensionCommand
-                        ? "Command source disposal confirmed; reply delivery and old-Thread cleanup are not confirmed"
-                        : selection.nameCommand
-                            ? selection.nameCommand.args.trim()
-                                ? "Command source disposal confirmed; title/reply delivery and old-Thread cleanup are not confirmed"
-                                : "Command source disposal confirmed; name-dialog publication was handled, not title change or old-Thread cleanup"
-                            : selection.confirmationCommand
-                                ? `Command source disposal confirmed; confirmation delivery and actual ${selection.confirmationCommand.name === "new" ? "session replacement" : "compaction"} or old-Thread cleanup are not confirmed`
-                                : selection.helpCommand
-                                    ? "Command source disposal confirmed; menu/sync delivery and old-Thread cleanup are not confirmed"
-                                    : selection.stopCommand
-                                        ? "Command source disposal confirmed; abort settlement, reply delivery and old-Thread cleanup are not confirmed"
-                                        : selection.nextCommand
-                                            ? "Command source disposal confirmed; queue dispatch, transition notices and old-Thread cleanup are not confirmed"
-                                            : selection.menuCommand || selection.abortCommand
-                                                ? `Command source disposal confirmed; ${selection.menuCommand ? "menu" : "reply"} delivery and old-Thread cleanup are not confirmed`
-                                                : selection.coordinator?.selectedCommandReference()
-                                                    ? "Command source disposal confirmed; recipient command effects and old-Thread cleanup are not confirmed"
-                                                    : "Input queued in the rebound Thread; old-Thread cleanup is scheduled, not confirmed"
-                : "Live rebind is unconfirmed; this choice never replays issued input");
+            if (outcome !== "released") {
+                await deps.answerCallbackQuery(query.id, "Live rebind is unconfirmed; this choice never replays issued input");
+                return true;
+            }
+            // The tab now belongs to the rebound thread; only the one-shot chooser message goes.
+            await finalizePendingReroute(parsed.rerouteId, pending, query, selection.extensionKind === "generated-prompt"
+                ? "Input queued in the rebound Thread; old-Thread cleanup is scheduled, not confirmed"
+                : selection.extensionCommand
+                    ? "Command source disposal confirmed; reply delivery and old-Thread cleanup are not confirmed"
+                    : selection.nameCommand
+                        ? selection.nameCommand.args.trim()
+                            ? "Command source disposal confirmed; title/reply delivery and old-Thread cleanup are not confirmed"
+                            : "Command source disposal confirmed; name-dialog publication was handled, not title change or old-Thread cleanup"
+                        : selection.confirmationCommand
+                            ? `Command source disposal confirmed; confirmation delivery and actual ${selection.confirmationCommand.name === "new" ? "session replacement" : "compaction"} or old-Thread cleanup are not confirmed`
+                            : selection.helpCommand
+                                ? "Command source disposal confirmed; menu/sync delivery and old-Thread cleanup are not confirmed"
+                                : selection.stopCommand
+                                    ? "Command source disposal confirmed; abort settlement, reply delivery and old-Thread cleanup are not confirmed"
+                                    : selection.nextCommand
+                                        ? "Command source disposal confirmed; queue dispatch, transition notices and old-Thread cleanup are not confirmed"
+                                        : selection.menuCommand || selection.abortCommand
+                                            ? `Command source disposal confirmed; ${selection.menuCommand ? "menu" : "reply"} delivery and old-Thread cleanup are not confirmed`
+                                            : selection.coordinator?.selectedCommandReference()
+                                                ? "Command source disposal confirmed; recipient command effects and old-Thread cleanup are not confirmed"
+                                                : "Input queued in the rebound Thread; old-Thread cleanup is scheduled, not confirmed", assertExecutionCurrent, true);
             return true;
         }
         if (!(await selectPendingDestination()))
@@ -5768,6 +5899,8 @@ export function createTelegramInboundRouteRuntime(deps) {
                 messages: [...pending.messages],
             });
             let active = true;
+            // Delivery proof for the toast only; chooser retirement still waits for the positive settlement that follows.
+            let delivered = false;
             const ownerUserId = deps.configStore.getAllowedUserId();
             const leaderEpoch = deps.getCurrentLeaderEpoch?.();
             const admissionScope = deps.getAdmissionScope?.();
@@ -5818,12 +5951,15 @@ export function createTelegramInboundRouteRuntime(deps) {
                                 : routed;
                             await dispatchPendingRerouteMessages(pending, messages, ctx);
                             assertRecipientCurrent();
-                            await deleteAllTabCopies(pending);
+                            delivered = true;
+                            await releaseAllTabCopiesIntoSurvivingTab(pending);
                             return true;
                         }
                         const forwarded = await forwardPendingRerouteMessages(pending, recipient.instanceId, sourceTarget.threadId, ctx, assertRecipientCurrent, recordForwardAcceptance);
-                        if (forwarded)
-                            await deleteAllTabCopies(pending);
+                        if (forwarded) {
+                            delivered = true;
+                            await releaseAllTabCopiesIntoSurvivingTab(pending);
+                        }
                         return forwarded;
                     },
                 });
@@ -5834,7 +5970,7 @@ export function createTelegramInboundRouteRuntime(deps) {
             assertExecutionCurrent();
             if (!selectionCurrent())
                 return true;
-            await deps.answerCallbackQuery(query.id, "Restore unconfirmed; not resending");
+            await deps.answerCallbackQuery(query.id, delivered ? "Restored" : "Restore unconfirmed; not resending");
             return true;
         }
         if (record.instanceId &&
@@ -6856,13 +6992,16 @@ export function createTelegramInboundRouteRuntime(deps) {
         }
         return undefined;
     };
-    /** A fresh implicit native tab whose name the All input starts with, observed just before it in the same exact scope. */
+    /**
+     * A fresh implicit native tab observed just before the All input in the same exact scope: mobile names it after
+     * the input, while other clients may use a generic name, so the immediately preceding creation also qualifies.
+     */
     const findImplicitCreationForAllInput = (message, updateId, cap, ctx) => {
         const text = (message.text ?? message.caption ?? "").trim();
         let match;
         for (const [key, implicit] of implicitThreadCreations) {
-            if (implicit.name &&
-                text.startsWith(implicit.name) &&
+            if (((implicit.name && text.startsWith(implicit.name)) ||
+                implicit.updateId === updateId - 1) &&
                 implicit.updateId < updateId &&
                 implicit.createdAtSec > 0 &&
                 message.date !== undefined &&
@@ -6906,6 +7045,9 @@ export function createTelegramInboundRouteRuntime(deps) {
             .find((entry) => entry.source.journalBindingKey === journalBindingKey &&
             entry.source.updateId === updateId);
         let entry;
+        // A tab opened by this call, by the bot or adopted from the client, gets the input's one forwarded copy; re-entry
+        // after a restart finds its tab already prepared and never forwards again.
+        let openedNow = false;
         await deps.runWorkspaceOperation({
             operationId: `temporary-thread-${randomBytes(16).toString("hex")}`,
             operationKind: "workspace.temporary-thread",
@@ -6931,6 +7073,7 @@ export function createTelegramInboundRouteRuntime(deps) {
                 if (adopted && current()) {
                     implicitThreadCreations.delete(native.key);
                     entry = adopted;
+                    openedNow = true;
                     // Adopted native tabs share the routing name; a failed rename never blocks routing.
                     try {
                         await deps.callApi("editForumTopic", {
@@ -6971,8 +7114,9 @@ export function createTelegramInboundRouteRuntime(deps) {
                 !Number.isSafeInteger(threadId) ||
                 threadId <= 0)
                 return;
-            entry =
-                store.acknowledgeTemporaryThread(reservation.entry, { chatId: operatorUserId, threadId }, authority) ?? entry;
+            const acknowledged = store.acknowledgeTemporaryThread(reservation.entry, { chatId: operatorUserId, threadId }, authority);
+            openedNow = !!acknowledged;
+            entry = acknowledged ?? entry;
         });
         if (!current() || !entry)
             throw new Error("Temporary Thread authority changed; the input remains retryable.");
@@ -7003,6 +7147,9 @@ export function createTelegramInboundRouteRuntime(deps) {
             };
         }
         pending.rootChooserText = formatTelegramTemporaryThreadChooserText(command?.name);
+        const tabCopyId = openedNow
+            ? await moveAllTabSourceIntoTab(pending, target, current)
+            : undefined;
         try {
             if (!deps.sendInteractiveMessage)
                 throw new Error("Temporary Thread chooser publication is unavailable.");
@@ -7010,7 +7157,9 @@ export function createTelegramInboundRouteRuntime(deps) {
                 canRestore: true,
                 canCancel: !!pending.abandonment,
                 getDisplayTitle: deps.getDisplayTitle,
-            }), { target });
+            }), tabCopyId === undefined
+                ? { target }
+                : { target, replyToMessageId: tabCopyId });
             rememberRerouteChooser(rerouteId, chooserId);
         }
         catch (error) {
@@ -7311,7 +7460,9 @@ export function createTelegramInboundRouteRuntime(deps) {
                     chatId: lifecycle.target.chatId,
                     threadId: lifecycle.target.threadId,
                 },
-                name: "name" in created && typeof created.name === "string" ? created.name : "",
+                name: "name" in created && typeof created.name === "string"
+                    ? created.name
+                    : "",
                 createdAtSec: message.date ?? 0,
             });
         }
@@ -7623,7 +7774,35 @@ export function createTelegramInboundRouteRuntime(deps) {
                     threadId: target.threadId,
                 };
                 /** Rebinds the leader record to this unbound tab, publishes its identity and handles the message there. */
-                const reclaimUnboundTargetForLeader = async (base, profileKey, slot, threadName, event, details) => {
+                // The leader's own Workspace binding follows a reclaimed tab, keeping its slot and name; without it, the tab
+                // would gain a second slot while Restore, labels and titles still pointed at the deleted target.
+                const leaderWorkspaceCwd = typeof ctx.cwd === "string"
+                    ? ctx.cwd
+                    : undefined;
+                const claimLeaderWorkspaceBinding = () => {
+                    const sessionId = deps.workspaceRestoreRecipient?.getSessionId(ctx);
+                    if (!leaderWorkspaceCwd || !sessionId || !instanceId)
+                        return undefined;
+                    const identity = deps.threadStore.claimWorkspaceIdentity(leaderWorkspaceCwd, instanceId, undefined, { existingBindingOnly: true, sessionId });
+                    const binding = identity
+                        ? deps.threadStore.getWorkspaceBinding(identity.cwd, identity.instanceSlot, identity.sessionId)
+                        : undefined;
+                    if (!binding)
+                        deps.threadStore.releaseWorkspaceClaim(instanceId);
+                    return binding;
+                };
+                const reclaimUnboundTargetForLeader = async (base, profileKey, slot, threadName, event, details, leaderBinding) => {
+                    if (leaderBinding) {
+                        const { inactiveSinceMs: _inactiveSinceMs, displayTitle: _displayTitle, ...moved } = leaderBinding;
+                        const committed = deps.threadStore.upsertWorkspaceBinding({
+                            ...moved,
+                            target: { ...unboundTarget },
+                            updatedAtMs: Date.now(),
+                        }, instanceId);
+                        deps.threadStore.releaseWorkspaceClaim(instanceId);
+                        if (committed)
+                            threadName = committed.threadName ?? threadName;
+                    }
                     deps.threadStore.upsert({
                         ...base,
                         profileKey,
@@ -7654,6 +7833,33 @@ export function createTelegramInboundRouteRuntime(deps) {
                         slot,
                         profileKey,
                     });
+                    if (leaderBinding && deps.callApi) {
+                        const title = deps.getDisplayTitle?.(unboundTarget);
+                        if (title)
+                            try {
+                                await deps.callApi("editForumTopic", {
+                                    chat_id: unboundTarget.chatId,
+                                    message_thread_id: unboundTarget.threadId,
+                                    name: title,
+                                });
+                                const current = deps
+                                    .threadStore.listWorkspaceBindings()
+                                    .find((value) => value.bindingKey === leaderBinding.bindingKey &&
+                                    isDeepStrictEqual(value.target, unboundTarget));
+                                if (current) {
+                                    deps.threadStore.upsertWorkspaceBinding({
+                                        ...current,
+                                        displayTitle: title,
+                                    });
+                                    await deps.threadStore.persist();
+                                }
+                            }
+                            catch (error) {
+                                deps.recordRuntimeEvent?.("bus", error, {
+                                    phase: "leader-topic-reclaim-title",
+                                });
+                            }
+                    }
                     await textDispatch.handleMessage(message, ctx);
                 };
                 const records = deps.threadStore.list();
@@ -7754,7 +7960,10 @@ export function createTelegramInboundRouteRuntime(deps) {
                                 throw error;
                         }
                         if (currentLeaderIsStale) {
-                            const slot = deps.threadStore.allocateSlot(leaderProfileKey);
+                            const leaderBinding = claimLeaderWorkspaceBinding();
+                            const slot = deps.threadStore.allocateSlot(leaderProfileKey, leaderBinding?.slot, leaderBinding?.bindingKey);
+                            if (leaderBinding && leaderBinding.slot !== slot)
+                                deps.threadStore.releaseWorkspaceClaim(instanceId);
                             if (!slot) {
                                 deps.threadStore.markStaleByTarget(currentLeaderRecord.target, "deleted", "Current leader thread is stale during unbound prompt routing.");
                                 await deps.threadStore.persist();
@@ -7767,7 +7976,7 @@ export function createTelegramInboundRouteRuntime(deps) {
                             await reclaimUnboundTargetForLeader(currentLeaderRecord, leaderProfileKey, slot, threadName, "Bus leader reclaimed stale-current unbound thread", {
                                 phase: "leader-topic-unbound-stale-reclaim",
                                 staleThreadId: currentLeaderRecord.target.threadId,
-                            });
+                            }, leaderBinding?.slot === slot ? leaderBinding : undefined);
                             return;
                         }
                     }
@@ -7777,7 +7986,12 @@ export function createTelegramInboundRouteRuntime(deps) {
                     !hasAnyRoutableThread) {
                     const priorLeaderRecord = deps.threadStore.getByProfileKey(leaderProfileKey);
                     const priorLeaderIdentity = deps.threadStore.getIdentityByProfileKey(leaderProfileKey);
-                    const slot = deps.threadStore.allocateSlot(leaderProfileKey, priorLeaderRecord?.slot ?? priorLeaderIdentity?.slot);
+                    const leaderBinding = claimLeaderWorkspaceBinding();
+                    const slot = deps.threadStore.allocateSlot(leaderProfileKey, leaderBinding?.slot ??
+                        priorLeaderRecord?.slot ??
+                        priorLeaderIdentity?.slot, leaderBinding?.bindingKey);
+                    if (leaderBinding && leaderBinding.slot !== slot)
+                        deps.threadStore.releaseWorkspaceClaim(instanceId);
                     if (!slot) {
                         await deps.sendTextReply(target.chatId, message.message_id, TELEGRAM_SLOT_CAPACITY_MESSAGE, { target });
                         return;
@@ -7790,7 +8004,7 @@ export function createTelegramInboundRouteRuntime(deps) {
                         identityThreadName ??
                         ThreadNaming.chooseTelegramThreadName({ slot }) ??
                         "Pi";
-                    await reclaimUnboundTargetForLeader({ createdAtMs: priorLeaderRecord?.createdAtMs ?? Date.now() }, leaderProfileKey, slot, threadName, "Bus leader reclaimed unbound thread", { phase: "leader-topic-reclaim" });
+                    await reclaimUnboundTargetForLeader({ createdAtMs: priorLeaderRecord?.createdAtMs ?? Date.now() }, leaderProfileKey, slot, threadName, "Bus leader reclaimed unbound thread", { phase: "leader-topic-reclaim" }, leaderBinding?.slot === slot ? leaderBinding : undefined);
                     return;
                 }
                 await sendUnboundRerouteChooser(message, ctx);
@@ -7817,6 +8031,7 @@ export function createTelegramInboundRouteRuntime(deps) {
         onUpdateCompleted,
         prepareHeldCommand: commandHandler.prepareHeldCommand,
         canPrepareHeldCommand: commandHandler.canPrepareHeldCommand,
+        onSessionSettled,
         observeLiveRebindLeaderWork,
         prepareLiveRebindLeaderCleanup,
         prepareLiveRebindFollowerCleanup,

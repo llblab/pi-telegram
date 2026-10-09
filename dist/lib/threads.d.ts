@@ -855,6 +855,8 @@ export interface TelegramCurrentThreadAssemblyDeps {
     instanceId: string;
     listRecords: TelegramCurrentInstanceThreadRuntimeDeps["listRecords"];
     listWorkspaceBindings?: () => readonly TelegramWorkspaceThreadBinding[];
+    /** Display-mode title for a binding whose tab has no acknowledged title yet (fresh, moved or reclaimed). */
+    resolveAutomaticDisplayTitle?: (binding: TelegramWorkspaceThreadBinding) => string | undefined;
     getFollowerDisplayTitle?: () => string | undefined;
     getActiveTurnTarget(): TelegramTarget | undefined;
     getFollowerTarget(): TelegramTarget | undefined;

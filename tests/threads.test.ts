@@ -6434,7 +6434,10 @@ test("Current-thread assembly owns preferred-target order and status identity", 
         threadName: "Cedar", slot: "C", displayTitle: "stale-disk-title", updatedAtMs: 1 },
       { ...createTelegramWorkspaceBindingIdentity("/other")!, target: { chatId: 7, threadId: 55 },
         threadName: "Oak", slot: "O", displayTitle: "other", updatedAtMs: 1 },
+      { ...createTelegramWorkspaceBindingIdentity("/moved")!, target: { chatId: 7, threadId: 66 },
+        threadName: "Pine", slot: "P", updatedAtMs: 1 },
     ],
+    resolveAutomaticDisplayTitle: (binding) => `auto:${binding.threadName}`,
     getLeaderIdentity: () => ({
       target: { chatId: 7, threadId: 10 },
       slot: "L",
@@ -6463,7 +6466,9 @@ test("Current-thread assembly owns preferred-target order and status identity", 
   assert.equal(assembly.status.getBusRole(), "follower");
   assert.equal(assembly.status.getInstanceThreadName(), "Cedar");
   assert.equal(assembly.getDisplayTitle({ chatId: 7, threadId: 11 }), undefined);
-  assert.equal(assembly.getDisplayTitle({ chatId: 7, threadId: 55 }), "other");
+  assert.equal(assembly.getDisplayTitle({ chatId: 7, threadId: 55 }), "other", "An acknowledged title wins");
+  assert.equal(assembly.getDisplayTitle({ chatId: 7, threadId: 66 }), "auto:Pine",
+    "A binding whose tab has no acknowledged title shows its display-mode title, not its generated name");
   assert.equal(assembly.getDisplayTitle({ chatId: 8, threadId: 55 }), undefined);
   followerDisplayTitle = "repo_c";
   assert.equal(assembly.getDisplayTitle({ chatId: 7, threadId: 11 }), "repo_c");

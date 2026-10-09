@@ -632,6 +632,13 @@ export default function (pi: Pi.ExtensionAPI) {
     instanceId: telegramInstanceId,
     listRecords: threadStore.list,
     listWorkspaceBindings: threadStore.listWorkspaceBindings,
+    resolveAutomaticDisplayTitle(binding) {
+      return ThreadDisplay.resolveTelegramInitialWorkspaceDisplayName({
+        bindings: threadStore.listWorkspaceBindings(),
+        binding,
+        mode: Config.resolveTelegramThreadDisplayMode(configStore.get()),
+      });
+    },
     getFollowerDisplayTitle:
       telegramBusFollowerRegistrationState.getDisplayTitle,
     getActiveTurnTarget: activeTurnRuntime.getTarget,
@@ -3027,5 +3034,6 @@ export default function (pi: Pi.ExtensionAPI) {
     },
     updateStatus,
     recordRuntimeEvent,
+    onSessionSettled: inboundRouteRuntime.onSessionSettled,
   });
 }

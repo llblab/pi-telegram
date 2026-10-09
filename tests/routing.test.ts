@@ -282,7 +282,9 @@ for (const fault of ["current", "release-only", "unknown-ack", "complete-no-ack"
             assert.deepEqual(caller.read().entries, rowsBefore); assert.deepEqual(f.store.listLiveRebindings(), []); return; }
           await click(); await click();
           const success = integrated ? !["chooser-integrated-report-lost", "chooser-integrated-work-report-lost", "chooser-integrated-ack-lost"].includes(fault) : ["chooser-current", "chooser-busy", "chooser-preflight-copy"].includes(fault), preRefused = !integrated && fault !== "chooser-port-lost" && !success;
-          assert.equal(donorRemovals, success ? 1 : 0); assert.equal(menus, success || integrated ? 1 : 0); assert.equal(prepares, preRefused ? 0 : 1); assert.equal(appends, preRefused ? 0 : 1);
+          assert.equal(donorRemovals, success ? 1 : 0); assert.equal(menus, success || integrated ? 1 : 0);
+          assert.equal(harness!.events.filter(event => event === "delete-message:7:500").length, success ? 1 : 0,
+            "A released live rebind deletes its one-shot chooser once; later taps read as expired"); assert.equal(prepares, preRefused ? 0 : 1); assert.equal(appends, preRefused ? 0 : 1);
           assert.equal(applications, success || integrated ? 1 : 0); assert.equal(defaults, 0);
           if (preRefused) { assert.deepEqual(caller.read().entries, rowsBefore, "Refusal cannot select clock or freeze originals"); assert.deepEqual(f.store.listLiveRebindings(), []); assert.deepEqual(calls, []); }
           if (success) assert.deepEqual(caller.read().entries, []);
@@ -1143,6 +1145,8 @@ for (const fault of ["normal", "busy", "clock", "clock-busy", "apply-before", "a
         if (succeeded) {
           assert.deepEqual(local.getTarget(), f.request.target);
           assert.equal(f.store.listLiveRebindings()[0]?.phase, "released");
+          assert.equal(effects.filter(method => method === "editForumTopic").length, 1,
+            "Restore renames the tab to its new owner's display title");
           const turn = harness.telegramQueueStore.getQueuedItems().find(item =>
             item.kind === "prompt" && item.admissionReceipts?.some(receipt => receipt.sourceUpdateIds.includes(100))) as Queue.PendingTelegramTurn;
           assert.deepEqual(turn.target, f.request.target); assert.deepEqual(turn.admissionReceipts?.[0]?.sourceUpdateIds, selectedIds);
@@ -2294,7 +2298,7 @@ for (const fault of ["clear", "local-model", "tools", "messages", "control", "di
   "publication", "logical-delivery", "api-chat", "api-other-thread", "command-render", "command-api", "command-unknown", "unstarted", "missing-collector", "context-before", "profile-before", "wrong-old-target", "follower",
   "admission-work", "admission-context", "after-context", "after-generation", "after-session", "after-epoch", "after-operator", "after-profile", "after-local", "after-canonical", "after-port", "malformed", "target-mutated", "getter-loss", "caller-mutated", "source-stopped", "chooser-expired",
   ...(mode !== "work" ? ["after-work", "after-delivery", "after-claim", "admission-claim", "after-veto-port", "missing-veto", "veto-unknown", "after-provision"] as const : []),
-  ...(mode === "issue" ? ["delete-absent", "delete-rejected", "delete-lost", "schedule-clear", "schedule-busy"] as const : [])] as const) {
+  ...(mode === "issue" ? ["delete-absent", "delete-rejected", "delete-lost", "schedule-clear", "schedule-busy", "schedule-settled"] as const : [])] as const) {
   test(`Released leader ${mode === "work" ? "work observation" : mode === "cleanup" ? "cleanup preparation" : "cleanup issuance"} fences fresh existing owners independently of source (${fault})`, async () => {
     await withLiveChooserProfileFixture(async f => {
       const ctx = { cwd: "/repo" }, path = join(dirname(f.path), "work-original.json"), commandCase = fault.startsWith("command-");
@@ -2337,7 +2341,9 @@ for (const fault of ["clear", "local-model", "tools", "messages", "control", "di
         return new Response(JSON.stringify({ ok: true, result: true }));
       };
       const harness = createRouteHarness({ instanceId: "old", threadStore: f.threads, getWorkspaceRestoreStore: () => f.store,
-        ...(fault.startsWith("schedule-") ? { liveRebindCleanupSchedule: { delaysMs: [400], intervalMs: 50, windowMs: fault === "schedule-busy" ? 800 : 60_000 } } : {}),
+        ...(fault.startsWith("schedule-") ? { liveRebindCleanupSchedule: fault === "schedule-settled"
+          ? { delaysMs: [400], intervalMs: 60_000, windowMs: 600_000 }
+          : { delaysMs: [400], intervalMs: 50, windowMs: fault === "schedule-busy" ? 800 : 60_000 } } : {}),
         beginCommandEffectWork: commandCase ? publication.beginWork : undefined,
         async sendStatusMessage(...args) { if (args[3] === 10 && commandCase) await oldMenus.sendStatusMessage(...args); },
         recordRuntimeEvent(_category, _error, detail) { if (commandCase && detail?.phase === "menu-render") commandDone.resolve(); },
@@ -2403,12 +2409,22 @@ for (const fault of ["clear", "local-model", "tools", "messages", "control", "di
         const intent = structuredClone(f.store.listLiveRebindings()[0]!); assert.equal(intent.phase, "released");
         if (fault.startsWith("schedule-")) {
           // The confirmed chooser release schedules bounded attempts; only a running attempt joins settlement.
-          if (fault === "schedule-busy") harness.bridgeRuntime.lifecycle.setActiveToolExecutions(1);
+          if (fault === "schedule-busy" || fault === "schedule-settled") harness.bridgeRuntime.lifecycle.setActiveToolExecutions(1);
+          if (fault === "schedule-settled") {
+            // The busy first attempt leaves a minute-long wait; the settled session wakes it instead.
+            await new Promise(resolve => setTimeout(resolve, 700)); await harness.routeRuntime.waitForRestoreSettlement();
+            assert.equal(f.store.listLiveRebindings()[0]?.cleanup, undefined, "A busy session keeps the old tab");
+            harness.bridgeRuntime.lifecycle.setActiveToolExecutions(0);
+            harness.routeRuntime.onSessionSettled({ cwd: "/elsewhere" });
+            await new Promise(resolve => setTimeout(resolve, 100)); await harness.routeRuntime.waitForRestoreSettlement();
+            assert.equal(f.store.listLiveRebindings()[0]?.cleanup, undefined, "A stale context wakes nothing, even when idle");
+            harness.routeRuntime.onSessionSettled(ctx);
+          }
           for (let i = 0; i < 200 && f.store.listLiveRebindings()[0]?.phase !== "finished"; i++) await new Promise(resolve => setTimeout(resolve, 10));
           await harness.routeRuntime.waitForRestoreSettlement();
           const row = f.store.listLiveRebindings()[0]!;
           assert.equal(row.phase, "finished");
-          if (fault === "schedule-clear") {
+          if (fault === "schedule-clear" || fault === "schedule-settled") {
             assert.equal(row.cleanup, "confirmed"); assert.deepEqual(deletions, [{ chat_id: 7, message_thread_id: 10 }]);
           } else {
             assert.equal(row.cleanup, "not-issued", "A bounded window ends honestly instead of blocking the binding forever");
@@ -2416,7 +2432,7 @@ for (const fault of ["clear", "local-model", "tools", "messages", "control", "di
           }
           assert.deepEqual(local.getTarget(), f.request.target); assert.deepEqual(ledger.read().leases, []); f.assertOtherProfile();
           await new Promise(resolve => setTimeout(resolve, 150));
-          assert.equal(deletions.length, fault === "schedule-clear" ? 1 : 0, "No attempt follows a terminal outcome");
+          assert.equal(deletions.length, fault === "schedule-busy" ? 0 : 1, "No attempt follows a terminal outcome");
           return;
         }
         const beforeWorkspace = f.threads.listWorkspaceBindings(), beforeJournal = readFileSync(path, "utf8"), beforeEffects = [...harness.events];
@@ -6696,6 +6712,7 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
       } });
       const surfaces: Array<{ text: string; mode: unknown; keyboard: unknown }> = [];
       const editedIds: number[] = [];
+      const deletedIds: number[] = [];
       const apiCalls: string[] = [];
       const { routeRuntime, telegramQueueStore, events } = createRouteHarness({ threadStore,
         configStore: { get: () => ({} as never), getAllowedUserId: () => owner,
@@ -6713,7 +6730,8 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
           surfaces.push({ text, mode, keyboard });
         },
         async callApi(method) { apiCalls.push(method); return true as never; },
-        async deleteMessage() { apiCalls.push("deleteMessage"); },
+        // The edit-failure fault fails the chooser delete and its fallback notice once, so retirement itself fails.
+        async deleteMessage(_chat, messageId) { apiCalls.push("deleteMessage"); if (failEdit) throw new Error("fixture chooser delete failure"); deletedIds.push(messageId); },
       });
       const update = { update_id: 123, message: { message_id: 12, message_thread_id: 99,
         chat: { id: 100, type: "private" as const }, from: { id: 7, is_bot: false },
@@ -6795,14 +6813,14 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
           assert.equal(journal.read().operatorDispositions?.length, 1);
           assert.equal(abandonCalls, storageFault ? 2 : 1);
           if (scenario === "storage-recovery" || scenario === "voice-recovery") {
-            assert.deepEqual(editedIds, [500, 99, 500], "Recovery retires the original chooser only after the durable acknowledgement");
+            assert.deepEqual(editedIds, [500, 500], "Recovery re-renders only its review");
             assert.match(surfaces.at(-1)!.text, /⛔️ Routing cancelled\./);
-          } else assert.deepEqual(surfaces.at(-1), { text: "<b>⛔️ Routing cancelled.</b>",
-            mode: "html", keyboard: { inline_keyboard: [] } });
+          } else assert.equal(surfaces.some(surface => surface.text.includes("Routing cancelled")), false, "Cancel deletes the chooser, not a notice");
+          assert.deepEqual(deletedIds, [99], "The one-shot chooser is deleted only after the durable acknowledgement");
           const retained = journal.inspectPendingRetention(sourceEntry);
           assert.ok(retained);
           assert.deepEqual(JSON.parse(await readFile(retained.retainedPath, "utf8")).entry.update, update);
-          assert.equal(apiCalls.includes("deleteMessage") || apiCalls.includes("deleteForumTopic"), false);
+          assert.equal(apiCalls.includes("deleteForumTopic"), false, "An unbound tab and its private original stay");
           await click("reroute:1:42");
           await click("reroutecancel:1");
           assert.equal(telegramQueueStore.getQueuedItems().length, 0);
@@ -7694,8 +7712,10 @@ function createAllCommandFixture(scenario: AllCommandScenario,
   const queueAdmission = createTelegramWorkspaceAdmissionLedger({ path: `${path}.queue-admission`, profileKey: "profile-a:bot-a",
     owner: { processId: process.pid, processBirthId: `${process.pid}:temp-queue` }, getProcessLiveness: () => "alive" });
   const queueOperations = createTelegramWorkspaceOperationRuntime({ getWorkspaceAdmission: () => queueAdmission });
-  const choosers: Array<{ target: unknown; text: string; markup: string }> = [];
+  const choosers: Array<{ target: unknown; text: string; markup: string; replyTo?: number }> = [];
   let failPublication = scenario === "publication-failure";
+  // A forward without a confirmed copy must leave the All original for the operator.
+  let forwardFails = false;
   let proofLost = false;
   const liveTargets: Queue.TelegramQueueTarget[] = [{ chatId: 7, threadId: 10 }];
   const createHarness = (overrides: RouteHarnessOptions = {}) => createRouteHarness({ threadStore: threads, instanceId: asFollower ? "leader-a" : "old", getSessionGeneration: () => 1,
@@ -7739,6 +7759,7 @@ function createAllCommandFixture(scenario: AllCommandScenario,
       }
       apiCalls.push({ method, body: body as Record<string, unknown> });
       if (method === "deleteForumTopic" && (scenario === "cancel-delete-fails" || scenario === "cleanup-delete-fails")) throw new Error("fixture deletion failed");
+      if (method === "forwardMessage") return (forwardFails ? true : { message_id: 900 }) as never;
       if (method !== "createForumTopic") return true as never;
       creations.push(body);
       if (scenario === "create-error") throw new Error("fixture creation reply lost");
@@ -7747,7 +7768,8 @@ function createAllCommandFixture(scenario: AllCommandScenario,
     async editInteractiveMessage(_chat, _id, text) { edits.push(text); },
     async sendInteractiveMessage(_chat, text, _mode, markup, sendOptions) {
       if (failPublication) { failPublication = false; throw new Error("fixture chooser publication failed"); }
-      choosers.push({ target: sendOptions?.target, text, markup: JSON.stringify(markup) });
+      choosers.push({ target: sendOptions?.target, text, markup: JSON.stringify(markup),
+        ...(sendOptions?.replyToMessageId === undefined ? {} : { replyTo: sendOptions.replyToMessageId }) });
       chooserOwnership.recordLocal({ chatId: _chat, messageId: 500 + choosers.length, target: sendOptions?.target });
       return 500 + choosers.length;
     }, ...overrides });
@@ -7841,6 +7863,7 @@ function createAllCommandFixture(scenario: AllCommandScenario,
     followerRegistration, followerRegistry, forwardedIds, fullSlots, handOffQueuedInput, journal, liveTargets, loseDeliveryReply, open,
     options, path, queueAdmission, queuedCommand, recipientJournal, resolve, restoreModes, restoreReplyBoundary,
     routeOf, sleep, store, threads, typeInTab,
+    set forwardFails(value: boolean) { forwardFails = value; },
     /** Diagnostic snapshot for cross-process assertions. */
     diagnose: () => JSON.stringify({ leaderEvents: harness.events, followerEvents: followerHarness?.events,
       journal: journal.read().entries.map(entry => [entry.updateId, entry.state]),
@@ -8756,7 +8779,7 @@ async function assertCancelScenario(scenario: AllCommandScenario, f: AllCommandF
   assert.equal(deletes[0]!.body.message_thread_id, 55, "only the source's own tab is removed");
   if (scenario === "cancel-delete-fails") {
     assert.equal(f.store.listTemporaryThreads().length, 1, "an unconfirmed removal keeps the tab protected");
-    assert.match(f.edits.at(-1)!, /Routing cancelled\./);
+    assert.ok(f.harness.events.includes("delete-message:7:501"), "the chooser is gone even when the tab stays");
   } else {
     assert.deepEqual(f.store.listTemporaryThreads(), [], "confirmed removal retires the entry");
     assert.ok(f.harness.events.includes("answer:Routing cancelled"), f.harness.events.join("\n"));
@@ -8876,40 +8899,96 @@ for (const proof of ["implicit", "manual", "string-flag", "foreign-creator", "hi
   });
 }
 
-for (const client of ["mobile", "desktop", "unrelated-native"] as const) {
-  test(`All command adopts the native tab a mobile client creates for it (${client})`, async () => {
+// Telegram clients differ when the operator sends from All: Android names a native tab after the input, desktop typed
+// text opens a generic "New Chat" tab, desktop menu commands and bots without user topics create none.
+for (const variant of [
+  { name: "mobile menu command", native: { id: 120, name: "/start" }, text: "/start", adopted: true },
+  { name: "mobile typed text", native: { id: 120, name: "deploy the release" }, text: "deploy the release", adopted: true },
+  { name: "desktop New Chat before All input", native: { id: 120, name: "New Chat" }, text: "deploy the release", adopted: true },
+  { name: "no native tab", native: undefined, text: "/start", adopted: false },
+  { name: "stale unrelated native tab", native: { id: 118, name: "New Chat" }, text: "/start", adopted: false },
+] as const) {
+  test(`All input uses the native tab its client created, or exactly one new routing tab (${variant.name})`, async () => {
     await fixture(async frame => {
       const f = await createAllCommandFixture("cancel", frame);
       f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
       const now = Math.floor(Date.now() / 1000);
       try {
-        // Mobile Telegram first creates an implicitly named tab, then delivers the menu command itself to All.
-        if (client !== "desktop") {
-          f.journal.appendBatch([{ update_id: 120, message: { message_id: 9, message_thread_id: 77, date: now,
+        if (variant.native) {
+          f.journal.appendBatch([{ update_id: variant.native.id, message: { message_id: 9, message_thread_id: 77, date: now,
             chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
-            forum_topic_created: { name: client === "mobile" ? "/start" : "New Chat", icon_color: 7322096, is_name_implicit: true } } }]);
+            forum_topic_created: { name: variant.native.name, icon_color: 7322096, is_name_implicit: true } } }]);
           f.worker.signal(); await f.worker.waitForDrain();
         }
+        const command = variant.text.startsWith("/");
         f.journal.appendBatch([{ update_id: 121, message: { message_id: 10, date: now + 1,
-          chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "/start",
-          entities: [{ type: "bot_command", offset: 0, length: 6 }] } }]);
+          chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: variant.text,
+          ...(command ? { entities: [{ type: "bot_command", offset: 0, length: variant.text.length }] } : {}) } }]);
         f.worker.signal(); await f.worker.waitForDrain();
         assert.equal(f.choosers.length, 1);
-        const adopted = client === "mobile";
-        assert.equal(f.creations.length, adopted ? 0 : 1, "One routing tab per All input");
+        assert.equal(f.creations.length, variant.adopted ? 0 : 1, "One routing tab per All input");
         const [entry] = f.store.listTemporaryThreads();
         assert.equal(entry?.source.updateId, 121);
-        assert.equal(entry?.target?.threadId === 77, adopted);
-        assert.equal((f.choosers[0]!.target as { threadId?: number }).threadId === 77, adopted);
+        assert.equal(entry?.target?.threadId === 77, variant.adopted);
+        assert.equal((f.choosers[0]!.target as { threadId?: number }).threadId === 77, variant.adopted);
         assert.deepEqual(f.apiCalls.filter(call => call.method === "editForumTopic").map(call => call.body.message_thread_id),
-          adopted ? [77] : [], "The adopted native tab is renamed once to the routing name");
+          variant.adopted ? [77] : [], "The adopted native tab is renamed once to the routing name");
         // Cancel is pressed inside the tab that actually holds the chooser.
         const tab = (f.choosers[0]!.target as { threadId: number }).threadId;
         f.journal.appendBatch([{ update_id: 300, callback_query: { id: "native-cancel", from: { id: 7, is_bot: false }, data: f.cancelOf(0),
           message: { message_id: 501, message_thread_id: tab, chat: { id: 7, type: "private" } } } }]);
         f.worker.signal(); await f.worker.waitForDrain(); await f.harness.routeRuntime.waitForRestoreSettlement();
-        assert.equal(f.deletions().some(call => call.body.message_thread_id === 77), adopted,
+        assert.equal(f.deletions().some(call => call.body.message_thread_id === 77), variant.adopted,
           "The adopted native tab leaves with the routing lifecycle; an unrelated one is never claimed");
+        assert.ok(f.harness.events.includes("delete-message:7:10"), "Cancel discards the input together with its routing tab");
+      } finally { await f.stop(); }
+    });
+  });
+}
+
+// The Bot API files a threadless All input in All even when mobile first draws it in its new tab. The routing tab gets a
+// forwarded copy, so a restored Thread keeps the input it answers; the original never goes without that copy.
+for (const variant of [
+  { name: "a native tab", native: true, forwardFails: false },
+  { name: "a bot-created tab", native: false, forwardFails: false },
+  { name: "a native tab whose forward failed", native: true, forwardFails: true },
+] as const) {
+  test(`Restore keeps the All input visible in ${variant.name}`, async () => {
+    const { native } = variant;
+    await fixture(async frame => {
+      // A live-arriving Restore fixture: its acceptance witness expects the selected source to be update 123.
+      const f = createAllCommandFixture("restore-sibling-restart", frame);
+      f.forwardFails = variant.forwardFails;
+      f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+      const now = Math.floor(Date.now() / 1000);
+      try {
+        if (native) {
+          f.journal.appendBatch([{ update_id: 120, message: { message_id: 9, message_thread_id: 77, date: now,
+            chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+            forum_topic_created: { name: "/start", icon_color: 7322096, is_name_implicit: true } } }]);
+          f.worker.signal(); await f.worker.waitForDrain();
+        }
+        f.journal.appendBatch([{ update_id: 123, message: { message_id: 12, date: now + 1, chat: { id: 7, type: "private" },
+          from: { id: 7, is_bot: false }, text: "/start", entities: [{ type: "bot_command", offset: 0, length: 6 }] } }]);
+        f.worker.signal(); await f.worker.waitForDrain();
+        assert.equal(f.choosers.length, 1);
+        const tab = (f.choosers[0]!.target as { threadId: number }).threadId;
+        assert.equal(tab === 77, native, "a native tab is adopted, otherwise the bot creates one");
+        assert.deepEqual(f.apiCalls.filter(call => call.method === "forwardMessage").map(call => call.body),
+          [{ chat_id: 7, message_thread_id: tab, from_chat_id: 7, message_id: 12, disable_notification: true }],
+          "the tab gets one silent copy of the input before its chooser");
+        assert.equal(f.choosers[0]!.replyTo, variant.forwardFails ? undefined : 900, "the chooser answers the copy in its tab");
+        assert.equal(f.harness.events.includes("delete-message:7:12"), !variant.forwardFails,
+          "a confirmed copy moves the original out of All at once; a failed forward leaves it");
+        const id = f.choosers[0]!.markup.match(/reroutemenu:([a-z0-9]+)/)![1];
+        f.journal.appendBatch([{ update_id: 300, callback_query: { id: "native-restore", from: { id: 7, is_bot: false }, data: `reroutenew:${id}:10`,
+          message: { message_id: 501, message_thread_id: tab, chat: { id: 7, type: "private" } } } }]);
+        f.worker.signal(); await f.worker.waitForDrain(); await f.harness.routeRuntime.waitForRestoreSettlement();
+        assert.equal(f.harness.events.filter(event => event === "status-menu").length, 1, JSON.stringify(f.harness.events));
+        assert.deepEqual(f.threads.listWorkspaceBindings()[0]?.target, { chatId: 7, threadId: tab }, "the tab becomes the thread");
+        assert.ok(f.harness.events.includes("delete-message:7:501"), "the one-shot chooser is deleted");
+        assert.equal(f.harness.events.includes("delete-message:7:12"), !variant.forwardFails,
+          "the All original goes only once the restored tab holds its forwarded copy");
       } finally { await f.stop(); }
     });
   });
@@ -8990,15 +9069,19 @@ test("Implicit native tab opened by a voice note offers Cancel and removes itsel
   });
 });
 
-// Every input from the All tab ends in the same temporary-tab lifecycle: chooser, Cancel, notice first, then one deletion after the quiet period.
+// Every input from the All tab ends in the same temporary-tab lifecycle: chooser, Cancel deletes it, then one tab deletion after the quiet period.
 for (const input of ["text", "voice", "sticker", "album", "typed-command", "menu-command"] as const) {
-  test(`All-tab ${input} cancels into a notice, then removes its temporary tab after the quiet period`, async () => {
+  test(`All-tab ${input} cancel deletes its chooser, then removes its temporary tab after the quiet period`, async () => {
     await fixture(async frame => {
       const f = await createAllCommandFixture("cancel", frame);
       const quietMs = 300;
       const removedFromAll: Array<[number, number]> = [];
+      const timeline: Array<{ event: "chooser" | "delete"; at: number }> = [];
       f.harness = f.createHarness({ temporaryThreadCleanupDelayMs: quietMs,
-        async deleteMessage(chatId: number, messageId: number) { removedFromAll.push([chatId, messageId]); } });
+        async deleteMessage(chatId: number, messageId: number) {
+          if (messageId === 501) timeline.push({ event: "chooser", at: Date.now() });
+          removedFromAll.push([chatId, messageId]);
+        } });
       const sources = input === "album" ? [123, 124] : [123];
       try {
         if (input === "menu-command") await f.start();
@@ -9019,20 +9102,16 @@ for (const input of ["text", "voice", "sticker", "album", "typed-command", "menu
         assert.equal(f.choosers.length, 1, JSON.stringify(f.harness.events));
         assert.deepEqual(f.choosers[0]!.target, { chatId: 7, threadId: 55 }, "the chooser lives in the temporary tab");
         assert.match(f.choosers[0]!.markup, /"text":"⛔️ Cancel routing"/);
-        const timeline: Array<{ event: "notice" | "delete"; at: number }> = [];
-        const pushEdit = f.edits.push.bind(f.edits), pushCall = f.apiCalls.push.bind(f.apiCalls);
-        f.edits.push = (...texts) => {
-          if (texts.includes("<b>⛔️ Routing cancelled.</b>")) timeline.push({ event: "notice", at: Date.now() });
-          return pushEdit(...texts);
-        };
+        const pushCall = f.apiCalls.push.bind(f.apiCalls);
         f.apiCalls.push = (...calls) => {
           if (calls.some(call => call.method === "deleteForumTopic")) timeline.push({ event: "delete", at: Date.now() });
           return pushCall(...calls);
         };
         await f.click(f.cancelOf(0), 501);
         await f.sleep(quietMs + 200);
-        assert.deepEqual(timeline.map(entry => entry.event), ["notice", "delete"], "the notice shows first, then the tab is deleted exactly once");
-        assert.ok(timeline[1]!.at - timeline[0]!.at >= quietMs - 20, "deletion waits for the quiet period after the notice");
+        assert.deepEqual(timeline.map(entry => entry.event), ["chooser", "delete"], "the chooser goes first, then the tab is deleted exactly once");
+        assert.ok(timeline[1]!.at - timeline[0]!.at >= quietMs - 20, "deletion waits for the quiet period after the chooser");
+        assert.equal(f.edits.some(text => text.includes("Routing cancelled")), false, "no notice replaces the deleted chooser");
         assert.equal(f.deletions().length, 1);
         assert.equal(f.deletions()[0]!.body.message_thread_id, 55);
         assert.deepEqual(f.store.listTemporaryThreads(), []);
@@ -9041,41 +9120,43 @@ for (const input of ["text", "voice", "sticker", "album", "typed-command", "menu
           assert.ok(f.journal.inspectAbandonedPending(id), `source ${id} is retained privately, never sent to Pi`);
         }
         assert.equal(f.harness.events.includes("status-menu"), false);
-        // Only a menu-picked command stays behind in All; typed inputs live in the tab and leave with it.
-        assert.deepEqual(removedFromAll, input === "menu-command" ? [[7, 12]] : [],
-          "a consumed All copy is deleted, nothing else is");
+        // Only a menu-picked command arrives in All; it moved into the tab when the tab opened. Typed inputs live in the tab.
+        assert.deepEqual(removedFromAll, input === "menu-command" ? [[7, 12], [7, 501]] : [[7, 501]],
+          "the moved All original and the chooser are deleted, nothing else is");
       } finally { await f.stop(); }
     });
   });
 }
 
-test("By default Cancel deletes its temporary tab and All copy right after the notice, with no grace delay", async () => {
+test("By default Cancel deletes its temporary tab right after the chooser, with no grace delay", async () => {
   await fixture(async frame => {
     const f = createAllCommandFixture("cancel", frame);
     const order: string[] = [];
+    const at: Record<string, number> = {};
     f.harness = f.createHarness({ temporaryThreadCleanupDelayMs: undefined,
-      async deleteMessage(_chatId: number, messageId: number) { order.push(`all:${messageId}`); await f.sleep(200); order.push("all-done"); } });
+      async deleteMessage(_chatId: number, messageId: number) {
+        if (messageId === 501) { order.push("chooser"); at.chooser = Date.now(); return; }
+        order.push(`all:${messageId}`);
+      } });
     try {
       await f.start();
-      const pushEdit = f.edits.push.bind(f.edits), pushCall = f.apiCalls.push.bind(f.apiCalls);
-      const at: Record<string, number> = {};
-      f.edits.push = (...texts) => { if (texts.includes("<b>⛔️ Routing cancelled.</b>")) { order.push("notice"); at.notice = Date.now(); } return pushEdit(...texts); };
+      assert.deepEqual(order, ["all:12"], "the All original left as soon as the tab held its copy");
+      order.length = 0;
+      const pushCall = f.apiCalls.push.bind(f.apiCalls);
       f.apiCalls.push = (...calls) => { if (calls.some(call => call.method === "deleteForumTopic")) { order.push("delete"); at.delete = Date.now(); } return pushCall(...calls); };
       await f.click(f.cancelOf(0), 501);
       await f.harness.routeRuntime.waitForRestoreSettlement();
-      assert.equal(order[0], "notice", "the notice still comes first");
-      assert.deepEqual(order.slice(1).sort(), ["all-done", "all:12", "delete"]);
-      assert.ok(order.indexOf("delete") < order.indexOf("all-done"), "a slow All deletion never holds the tab back");
-      // The old default was a 1 s timer between the notice and the deletion; only scheduling latency may remain.
-      assert.ok(at.delete! - at.notice! < 900, `no grace timer separates the notice from the deletion (${at.delete! - at.notice!} ms)`);
+      assert.deepEqual(order, ["chooser", "delete"], "the chooser goes first, and nothing is left in All to delete");
+      // The old default was a 1 s timer between the chooser and the deletion; only scheduling latency may remain.
+      assert.ok(at.delete! - at.chooser! < 900, `no grace timer separates the chooser from the deletion (${at.delete! - at.chooser!} ms)`);
       assert.deepEqual(f.store.listTemporaryThreads(), []);
     } finally { await f.stop(); }
   });
 });
 
-// A menu-picked command arrives threadless, so its copy stays in All while the routing tab carries the chooser.
+// A menu-picked command arrives threadless in All; it moves into its routing tab at once, whatever happens next.
 for (const consumed of ["forward", "restore", "expiry"] as const) {
-  test(`A menu-picked All command leaves All once ${consumed === "expiry" ? "its choice expires" : consumed === "restore" ? "it is restored" : "it is sent"}`,
+  test(`A menu-picked All command moves into its tab, then ${consumed === "expiry" ? "its choice expires" : consumed === "restore" ? "it is restored" : "it is sent"}`,
     async () => {
     await fixture(async frame => {
       let now = Date.now();
@@ -9086,7 +9167,7 @@ for (const consumed of ["forward", "restore", "expiry"] as const) {
         async deleteMessage(chatId: number, messageId: number) { removedFromAll.push([chatId, messageId]); } });
       try {
         await f.start();
-        assert.deepEqual(removedFromAll, [], "a waiting command keeps its All copy");
+        assert.deepEqual(removedFromAll, [[7, 12]], "a waiting command already moved into its tab");
         if (consumed === "forward") await f.click(f.routeOf(0), 501);
         else if (consumed === "restore") {
           await f.click(`reroutenew:${f.choosers[0]!.markup.match(/reroutemenu:([a-z0-9]+)/)![1]}:10`);
@@ -9097,8 +9178,9 @@ for (const consumed of ["forward", "restore", "expiry"] as const) {
           await f.harness.routeRuntime.waitForRestoreSettlement();
         }
         assert.equal(f.journal.read().entries.some(entry => entry.updateId === 123), false, JSON.stringify(f.harness.events));
-        // Forward already dismisses its chooser (501); the All copy (12) follows it, exactly once.
-        assert.deepEqual(removedFromAll, consumed === "forward" ? [[7, 501], [7, 12]] : [[7, 12]], JSON.stringify(f.harness.events));
+        // The original left All when the tab opened; Forward and Restore then delete only their chooser. Each goes once.
+        assert.deepEqual(removedFromAll, consumed === "expiry" ? [[7, 12]] : [[7, 12], [7, 501]], JSON.stringify(f.harness.events));
+        if (consumed === "restore") assert.ok(f.harness.events.includes("answer:Restored"), "a delivered Restore is not reported as unconfirmed");
       } finally { await f.stop(); }
     });
   });
@@ -9167,7 +9249,7 @@ for (const restart of ["revive", "expired"] as const) {
           { chatId: 7, threadId: 55, messageId: 501 }, "the original deadline and chooser are kept");
         await f.click(chooser.markup.match(/reroutecancel:[a-z0-9]+/)![0], 501);
         await f.sleep(quietMs + 200);
-        assert.ok(f.edits.includes("<b>⛔️ Routing cancelled.</b>"));
+        assert.ok(f.harness.events.includes("delete-message:7:501"), "Cancel deletes the revived chooser");
         assert.ok(f.journal.inspectAbandonedPending(123), "the revived source is retained privately");
         assert.equal(f.deletions().length, 1, "and its temporary tab is removed after the quiet period");
       } finally { await f.stop(); }
@@ -9202,7 +9284,7 @@ test("Temporary routing offers separate Reroute and Restore submenus without exe
       assert.match(menus[2]!.markup, /reroutenew:[a-z0-9]+:10/);
       assert.doesNotMatch(menus[2]!.markup, /"callback_data":"reroute:|reroutecancel:/);
       const restoreMenu = JSON.parse(menus[2]!.markup).inline_keyboard;
-      assert.equal(menus[2]!.text, "<b>🔁 Restore into this tab & send <code>/start</code>:</b>");
+      assert.equal(menus[2]!.text, "<b>🔁 Restore a Pi into this tab for <code>/start</code>:</b>");
       assert.equal(restoreMenu[0][0].text, "⬆️ Back");
       assert.ok(restoreMenu.slice(1).every((row: Array<{ text: string }>) => row[0]!.text.startsWith("🧵 ")), "thread targets carry the thread marker");
       await f.click(restoreMenu[0][0].callback_data);
@@ -9620,7 +9702,7 @@ async function assertRestoreScenario(scenario: AllCommandScenario, f: AllCommand
       await f.settleUntil(() => !f.journal.read().entries.some(entry => entry.updateId === 150));
       assert.equal(f.journal.read().entries.find(entry => entry.updateId === 150)?.state, undefined, `the sibling is privately abandoned ${f.diagnose()}`);
       assert.ok(f.journal.inspectAbandonedPending(150));
-      assert.ok(f.edits.includes("<b>⛔️ Routing cancelled.</b>"));
+      assert.ok(f.harness.events.includes("delete-message:7:502"), "the sibling chooser is deleted");
       assert.equal(f.apiCalls.some(call => call.method === "deleteForumTopic" && call.body.message_thread_id === 55), false, "Restore keeps the tab");
       assert.deepEqual(f.store.listTemporaryThreads(), [], "the single completed group releases the entry");
       assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0, "a sibling is never delivered by Restore");
@@ -9674,7 +9756,7 @@ async function assertRestoreScenario(scenario: AllCommandScenario, f: AllCommand
     }
     assert.equal(states(150), undefined, "the sibling's journal source is retired by private abandonment");
     assert.ok(f.journal.inspectAbandonedPending(150), "the sibling original is retained privately");
-    assert.ok(f.edits.includes("<b>⛔️ Routing cancelled.</b>"), "the sibling control is invalidated");
+    assert.ok(f.harness.events.includes("delete-message:7:502"), "the sibling control is deleted");
     assert.deepEqual(f.store.listTemporaryThreads(), [], "the single uncancelled completed group releases the entry");
     await f.click(f.routeOf(1), 502);
     assert.equal(f.harness.events.filter(event => event === "status-menu").length, 1, "a stale sibling control cannot route it");
@@ -12915,6 +12997,49 @@ test("Routing runtime reclaims unbound prompt without visible rename when curren
     assert.equal(events.some((event) => event.includes("deleteForumTopic")), false);
   });
 });
+
+for (const leaderState of ["stale-current", "no-current"] as const) {
+  test(`Reclaimed leader tab carries the leader's Workspace binding and display title (${leaderState})`, async () => {
+    await withTopicStore(async (threadStore) => {
+      const apiCalls: Array<{ method: string; body: Record<string, unknown> }> = [];
+      const identity = Threads.createTelegramWorkspaceBindingIdentity("/repo", 0, "session-a")!;
+      threadStore.upsertWorkspaceBinding({ ...identity, slot: "A", threadName: "Axial", target: { chatId: 100, threadId: 7 },
+        displayTitle: "Old title", updatedAtMs: 1, inactiveSinceMs: 5 });
+      if (leaderState === "stale-current") threadStore.upsert({
+        profileKey: "cwd:/repo", owner: { kind: "leader", cwd: "/repo", instanceId: "leader-a" },
+        target: { chatId: 100, threadId: 7 }, status: "active", createdAtMs: 1000, updatedAtMs: 1000,
+        instanceId: "leader-a", slot: "A", threadName: "Axial" });
+      await threadStore.persist();
+      const { routeRuntime } = createRouteHarness({
+        threadStore,
+        workspaceRestoreRecipient: { getSessionId: () => "session-a", getCwd: () => "/repo", getLeaderIdentity: () => undefined } as never,
+        // Display-mode title of the moved binding; the deleted tab's acknowledged title must not leak onto the new tab.
+        getDisplayTitle: target => threadStore.listWorkspaceBindings().find(binding => binding.target.threadId === target.threadId)
+          ?.displayTitle ?? (target.threadId === 42 ? "Repo" : undefined),
+        callApi: async (method, body) => {
+          apiCalls.push({ method, body: body as Record<string, unknown> });
+          if (method === "sendChatAction")
+            throw new Error("Telegram API sendChatAction failed: HTTP 400: Bad Request: message thread not found");
+          return {} as never;
+        },
+      });
+
+      await routeRuntime.handleUpdate(unboundTopicUpdate(), { cwd: "/repo" });
+
+      const [binding] = threadStore.listWorkspaceBindings();
+      assert.deepEqual(binding?.target, { chatId: 100, threadId: 42 }, "The binding follows the reclaimed tab");
+      assert.equal(binding?.slot, "A", "No second slot is allocated for the same leader");
+      assert.equal(binding?.threadName, "Axial");
+      assert.equal(binding?.inactiveSinceMs, undefined);
+      assert.equal(binding?.displayTitle, "Repo", "The acknowledged title is the new tab's title");
+      const record = threadStore.getByProfileKey("cwd:/repo");
+      assert.deepEqual(record?.target, { chatId: 100, threadId: 42 });
+      assert.equal(record?.slot, "A");
+      assert.deepEqual(apiCalls.filter(call => call.method === "editForumTopic").map(call => call.body),
+        [{ chat_id: 100, message_thread_id: 42, name: "Repo" }], "The reclaimed tab shows the display-mode title");
+    });
+  });
+}
 
 test("Routing runtime assigns internal baked name when reclaiming unnamed stale current leader target", async () => {
   await withTopicStore(async (threadStore) => {

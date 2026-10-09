@@ -6093,9 +6093,11 @@ export function createTelegramCurrentThreadAssembly(deps) {
             deps.isFollowerRegistered()) {
             return deps.getFollowerDisplayTitle?.();
         }
-        return deps
+        const binding = deps
             .listWorkspaceBindings?.()
-            .find((binding) => targetMatches(binding.target, target))?.displayTitle;
+            .find((value) => targetMatches(value.target, target));
+        return (binding?.displayTitle ??
+            (binding ? deps.resolveAutomaticDisplayTitle?.(binding) : undefined));
     };
     const displayIdentity = (identity) => {
         const title = identity.target
