@@ -22,6 +22,11 @@ parentPort.on("message", (message) => {
 });
 
 function runBoundedProcess(input) {
+  // After an abort the parent may terminate this worker before execFile's own abort kill runs, which
+  // would orphan a freshly spawned child; never start a process once cancelled.
+  if (controller.signal.aborted) {
+    return Promise.reject(new Error("Generative App method was cancelled."));
+  }
   if (!input || typeof input !== "object") {
     throw new Error("Generative App run input must be an object.");
   }
