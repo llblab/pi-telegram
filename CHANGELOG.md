@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+## 0.54.2: Diagnosable ownership checks and safe app cancellation
+
 - `Ownership checks`: An ownership check that cannot be verified no longer silently stops a live transport. Each such miss is recorded (`ownership-check-failed`) and polling stands down only after two consecutive tolerated misses; a confirmed loss is recorded as `ownership-lost` and stands down at once (#319).
 - `Generative Apps`: A cancelled app method can no longer start a process: an abort that arrives before the method calls `run` previously let the worker spawn a child that its own termination could orphan.
 
