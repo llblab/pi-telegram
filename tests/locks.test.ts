@@ -40,6 +40,7 @@ import {
   TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
   TELEGRAM_LOCK_KEY,
   TELEGRAM_OWNERSHIP_CHECK_MS,
+  TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE,
   TELEGRAM_OWNERSHIP_REFRESH_MS,
   withTelegramFileTransaction,
   publishTelegramPrivateFile,
@@ -3309,13 +3310,82 @@ test("Locked polling runtime stops after ownership loss without live context", a
     await waitForCondition(() => events.includes("stop"));
     assert.deepEqual(events, ["start", "status", "stop"]);
     assert.equal(availabilityChanges, 2);
-    assert.deepEqual(runtimeEvents, []);
+    assert.deepEqual(
+      runtimeEvents.map((event) => event.phase),
+      ["ownership-lost"],
+      "A serialized not-owner answer is definitive: record it and stand down without tolerance",
+    );
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
 });
 
-test("Locked polling runtime records refresh write failures instead of throwing from watcher", async () => {
+test("Locked polling runtime tolerates a transient unverified ownership check", async () => {
+  const events: string[] = [];
+  const failureDetails: Record<string, unknown>[] = [];
+  let unverifiedNextCheck = false;
+  const lock = {
+    acquire: () => ({
+      ok: true,
+      lock: { pid: 10, cwd: "/repo" },
+      replacedStale: false as const,
+    }),
+    release: () => ({ kind: "inactive" as const }),
+    getState: () => ({
+      kind: "active-here" as const,
+      lock: { pid: 10, cwd: "/repo" },
+    }),
+    getStatusLabel: () => "active here",
+    getOwnedLeaderEpoch: () => undefined,
+    getJournalPath: () => undefined,
+    owns: () => !unverifiedNextCheck,
+    commitIfOwned: (commit: () => void) => {
+      commit();
+      return true;
+    },
+    // The serialized confirmation is also unavailable for exactly one tick.
+    refresh: () => {
+      if (!unverifiedNextCheck) return true;
+      unverifiedNextCheck = false;
+      throw new Error("Telegram runtime state identity changed before reading.");
+    },
+  };
+  const runtime = createTelegramLockedPollingRuntime({
+    lock,
+    hasBotToken: () => true,
+    ownershipCheckMs: 1,
+    ownershipRefreshMs: 1,
+    startPolling: async () => {
+      events.push("start");
+    },
+    stopPolling: async () => {
+      events.push("stop");
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      if (details?.phase === "ownership-check-failed") {
+        failureDetails.push(details);
+      }
+    },
+  });
+  assert.equal((await runtime.start({ cwd: "/repo" })).ok, true);
+  unverifiedNextCheck = true;
+  await waitForCondition(() => failureDetails.length > 0);
+  assert.equal(failureDetails[0]?.consecutiveFailures, 1);
+  assert.equal(
+    failureDetails[0]?.tolerance,
+    TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE,
+  );
+  // The next verified check resets the streak: polling must stay up.
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.deepEqual(events, ["start", "status"]);
+  await runtime.stop();
+  assert.deepEqual(events, ["start", "status", "stop"]);
+});
+
+for (const ownsReadable of [true, false]) test(`Locked polling runtime records refresh write failures instead of throwing from watcher (${ownsReadable ? "ownership verified" : "unverifiable"})`, async () => {
   const events: string[] = [];
   const runtimeEvents: {
     category: string;
@@ -3337,7 +3407,7 @@ test("Locked polling runtime records refresh write failures instead of throwing 
     getStatusLabel: () => "active here",
     getOwnedLeaderEpoch: () => undefined,
     getJournalPath: () => undefined,
-    owns: () => true,
+    owns: () => ownsReadable || refreshCalls < 2,
     commitIfOwned: (commit: () => void) => {
       commit();
       return true;
@@ -3371,10 +3441,19 @@ test("Locked polling runtime records refresh write failures instead of throwing 
     },
   });
   assert.equal((await runtime.start({ cwd: "/repo" })).ok, true);
-  await waitForCondition(() => events.includes("stop"));
-  assert.deepEqual(events, ["start", "status", "stop"]);
+  if (ownsReadable) {
+    // A failing write is not evidence of lost ownership while every check still verifies it.
+    await waitForCondition(() => runtimeEvents.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(events, ["start", "status"]);
+    await runtime.stop();
+  } else {
+    await waitForCondition(() => events.includes("stop"));
+    assert.deepEqual(events, ["start", "status", "stop"]);
+    assert.equal(runtimeEvents.length, TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE + 1);
+  }
   assert.equal(runtimeEvents[0]?.category, "lock");
-  assert.equal(runtimeEvents[0]?.phase, "refresh");
+  assert.equal(runtimeEvents[0]?.phase, "ownership-check-failed");
   assert.match(runtimeEvents[0]?.message ?? "", /EPERM/);
 });
 

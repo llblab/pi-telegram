@@ -8,6 +8,8 @@ export declare const TELEGRAM_LOCK_KEY = "default";
 export declare const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 8000;
 export declare const TELEGRAM_OWNERSHIP_CHECK_MS = 1000;
 export declare const TELEGRAM_OWNERSHIP_REFRESH_MS = 2000;
+/** Consecutive unverified ownership checks tolerated before standing down; a concurrent shared-state replacement must not stop an owned transport. */
+export declare const TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE = 2;
 /**
  * Resolve the extension-local owner slot for the active Telegram profile.
  * Default profile → default

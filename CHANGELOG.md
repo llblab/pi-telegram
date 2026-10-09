@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Ownership checks`: An ownership check that cannot be verified no longer silently stops a live transport. Each such miss is recorded (`ownership-check-failed`) and polling stands down only after two consecutive tolerated misses; a confirmed loss is recorded as `ownership-lost` and stands down at once (#319).
+
 ## 0.54.1: Followers go offline when Threaded Mode is turned off
 
 - `Threaded Mode downgrade`: Turning Threaded Mode off in BotFather now takes followers offline instead of looping between `electing` and `disconnected` (and filling the log) against a leader that switched to classic polling; reconnect with `/telegram-connect` after turning it back on. `/telegram-disconnect` on a follower without a live leader now disconnects locally and reports the Thread as kept, and a pending recovery retry no longer re-registers a disconnected follower.

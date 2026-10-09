@@ -38,6 +38,8 @@ export const TELEGRAM_LOCK_KEY = "default";
 export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 8_000;
 export const TELEGRAM_OWNERSHIP_CHECK_MS = 1_000;
 export const TELEGRAM_OWNERSHIP_REFRESH_MS = 2_000;
+/** Consecutive unverified ownership checks tolerated before standing down; a concurrent shared-state replacement must not stop an owned transport. */
+export const TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE = 2;
 const TELEGRAM_LOCK_WRITE_RETRY_ATTEMPTS = 5;
 const TELEGRAM_LOCK_WRITE_RETRY_DELAY_MS = 25;
 const TELEGRAM_LOCK_TRANSACTION_ATTEMPTS = 80;
@@ -2039,6 +2041,7 @@ export function createTelegramLockedPollingRuntime<
   let ownershipRefreshInterval: ReturnType<typeof setInterval> | undefined;
   let ownershipStop: Promise<void> | undefined;
   let activeContext: TContext | undefined;
+  let ownershipCheckFailures = 0;
   let takeoverCandidate: TelegramLockEntry | undefined;
   let sessionAutoStartRun: Promise<void> | undefined;
   let pollingGeneration = 0;
@@ -2102,22 +2105,45 @@ export function createTelegramLockedPollingRuntime<
   const startOwnershipWatcher = (ctx: TContext) => {
     const owner = snapshotLockContext(ctx);
     stopOwnershipWatcher();
-    ownershipCheckInterval = setInterval(() => {
+    ownershipCheckFailures = 0;
+    // A serialized "not the owner" answer is definitive and stands down at once; only an observation that
+    // cannot be verified at all (both reads failed) counts toward the bounded tolerance.
+    const verifyOwnership = (observe: () => boolean): void => {
+      let owned: boolean | undefined;
+      let failure: unknown;
       try {
-        // A lock-free miss can be a strict read racing an atomic replace; refresh confirms through the serialized path.
-        if (deps.lock.owns(owner) || deps.lock.refresh(owner)) return;
+        owned = observe();
       } catch (error) {
-        deps.recordRuntimeEvent?.("lock", error, { phase: "check" });
+        failure = error;
       }
-      stopAfterOwnershipLoss();
+      if (owned === true) {
+        ownershipCheckFailures = 0;
+        return;
+      }
+      if (owned === false) {
+        deps.recordRuntimeEvent?.(
+          "lock",
+          new Error("Telegram bridge ownership moved away from this instance."),
+          { phase: "ownership-lost" },
+        );
+        stopAfterOwnershipLoss();
+        return;
+      }
+      ownershipCheckFailures += 1;
+      deps.recordRuntimeEvent?.("lock", failure, {
+        phase: "ownership-check-failed",
+        consecutiveFailures: ownershipCheckFailures,
+        tolerance: TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE,
+      });
+      if (ownershipCheckFailures > TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE)
+        stopAfterOwnershipLoss();
+    };
+    ownershipCheckInterval = setInterval(() => {
+      // A lock-free miss can be a strict read racing an atomic replace; refresh confirms through the serialized path.
+      verifyOwnership(() => deps.lock.owns(owner) || deps.lock.refresh(owner));
     }, ownershipCheckMs);
     ownershipRefreshInterval = setInterval(() => {
-      try {
-        if (deps.lock.refresh(owner)) return;
-      } catch (error) {
-        deps.recordRuntimeEvent?.("lock", error, { phase: "refresh" });
-      }
-      stopAfterOwnershipLoss();
+      verifyOwnership(() => deps.lock.refresh(owner));
     }, ownershipRefreshMs);
     ownershipCheckInterval.unref?.();
     ownershipRefreshInterval.unref?.();
