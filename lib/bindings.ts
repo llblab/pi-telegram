@@ -1199,6 +1199,8 @@ interface TelegramLifecycleBindingDeps {
   isTurnTransportActive?: (turn: Queue.PendingTelegramTurn) => boolean;
   updateStatus: TelegramBridgeStatusUpdater;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
+  /** Settled-session hint for owners that wait on agent idleness, such as old-tab cleanup after a live rebind. */
+  onSessionSettled?: (ctx: Pi.ExtensionContext) => void;
 }
 
 export function registerTelegramLifecycleRuntimeHooks({
@@ -1247,6 +1249,7 @@ export function registerTelegramLifecycleRuntimeHooks({
   isTurnTransportActive,
   updateStatus,
   recordRuntimeEvent,
+  onSessionSettled,
 }: TelegramLifecycleBindingDeps): void {
   const agentEndResetter = Runtime.createTelegramAgentEndResetter({
     abort,
@@ -1753,6 +1756,7 @@ export function registerTelegramLifecycleRuntimeHooks({
       agentWorkActive = false;
       activityRuntime.onAgentSettled();
       modelContextAvailabilityRuntime.reconcile();
+      onSessionSettled?.(ctx);
     },
     onBeforeAgentStart: Prompts.createTelegramProactiveBeforeAgentStartHook({
       reconcileAvailability: modelContextAvailabilityRuntime.reconcile,

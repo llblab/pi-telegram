@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+## 0.54.4: Restored tabs take their Pi's name
+
+- `Restore title`: Restoring a Pi into a routing tab ("move Pi into this tab") now renames the tab to that Pi's Thread display title, as Workspace Restore already did; previously a live-rebind Restore left the tab named `🚦 Routing`. A failed rename is recorded and never blocks the Restore.
+- `Native routing tabs`: An `All` input now also adopts a generically named native tab (desktop `New Chat`) that its client created immediately before it, not only a tab named after the input (mobile). Desktop and Android clients, with user topic creation allowed or not, each end with exactly one routing tab; a client's own brief native name before the rename cannot be prevented.
+- `Reclaimed leader tab`: When the leader's own tab is gone (for example after deleting every tab) and a new tab from `All` is reclaimed for it, the leader's Workspace binding now moves to that tab with its slot and name instead of gaining a second slot, and the tab is renamed to its display title instead of staying `New Chat`. Restore and labels no longer point at the deleted tab.
+- `Display titles`: A Thread whose tab has no acknowledged title yet (fresh, moved or reclaimed) now shows its display-mode title, such as the directory title, in the Restore menu and after Restore, instead of falling back to its generated slot name.
+- `One-shot routing menus`: Every final routing choice now deletes its menu. A live-rebind Restore left the chooser in the tab, a Workspace Restore kept it until old-Thread cleanup, which may never come, and Cancel replaced it with a notice. A restored tab stays as the Pi's Thread; a routing tab with nothing left to route is still removed. A delivered Workspace Restore answers `Restored`, not `Restore unconfirmed`, and the Restore submenu now reads `🔁 Restore a Pi into this tab:`.
+- `Restore history`: An input sent from `All` now moves into the routing tab opened for it, on desktop and mobile alike: the tab starts with a silent forward of the input, its menu replies to it, and the original leaves `All` once the copy is confirmed. A Thread restored into that tab keeps the prompt it answers instead of losing it, since the Bot API files such inputs in `All` even when mobile first draws them in the tab.
+- `Old tab cleanup`: After a live-rebind Restore, the old tab is deleted right after Pi finishes answering the moved input, instead of at the next paced retry, which could add up to about 30 seconds and later a full minute. Cleanup still waits for an idle session; a settled agent only wakes the waiting retry early.
+
 ## 0.54.3: One routing tab on mobile
 
 - `Mobile routing tab`: Sending a command or prompt from `All` in mobile Telegram no longer leaves an extra tab named after the input. The mobile client creates that native tab itself before delivering the input to `All`; the bridge now adopts it as the routing tab and renames it, instead of creating a second tab beside it. Desktop behavior is unchanged.

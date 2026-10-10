@@ -57,7 +57,10 @@ export type TelegramLiveRebindCleanupIssue = {
     cleanup: ThreadReconciler.TelegramLiveRebindCleanupOutcome;
     recorded: boolean;
 };
-/** Default live-rebind cleanup pacing: quick early attempts, then minutely, within a 15-minute window. */
+/**
+ * Default live-rebind cleanup pacing: quick early attempts, then minutely, within a 15-minute window. The first
+ * delay is not cosmetic: a leader's detached command reply still needs the released, cleanup-free row.
+ */
 export declare const TELEGRAM_LIVE_REBIND_CLEANUP_SCHEDULE: Readonly<{
     delaysMs: readonly number[];
     intervalMs: 60000;
@@ -100,6 +103,8 @@ export declare function createTelegramLiveRebindCoordinator(input: {
         /** Explicit staged singleton command branch; absence preserves ordinary live input behavior. */
         selectedCommand?: Bus.TelegramBusSelectedCommandInput;
     };
+    /** Restore moves the tab to its new owner: once applied, show that owner's title (best-effort, never blocking). */
+    retitle?: (isCurrent: () => boolean) => Promise<void>;
     recordRuntimeEvent?: (category: string, error: unknown, details: Record<string, unknown>) => void;
 }): {
     /** Correlation only; a later cleanup attempt rereads and revalidates the canonical row itself. */
@@ -346,6 +351,8 @@ export declare function createTelegramInboundRouteRuntime<TUpdate extends Update
     /** Commands-owned registry port for dormant scoped recipient assembly, not ordinary update replay. */
     prepareHeldCommand: ReturnType<typeof Commands.createTelegramCommandHandlerTargetRuntime<TMessage, TContext>>["prepareHeldCommand"];
     canPrepareHeldCommand: ReturnType<typeof Commands.createTelegramCommandHandlerTargetRuntime<TMessage, TContext>>["canPrepareHeldCommand"];
+    /** Agent-settled hint: wakes waiting leader cleanup retries early; every readiness gate is still sampled fresh. */
+    onSessionSettled(ctx: TContext): void;
     /** Fresh body-free recipient observation only; never reconstructs an attempt or grants cleanup. */
     observeLiveRebindLeaderWork(intent: Threads.TelegramWorkspaceLiveRebindIntent, ctx: TContext): Promise<Bus.TelegramBusLiveRebindWorkObservation | undefined>;
     /** Fresh non-destructive candidate only; no retained idle, cleanup action or deletion grant. */
