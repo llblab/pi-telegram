@@ -312,7 +312,7 @@ The registration and delivery examples above remain the public building blocks f
 
 Native typing is best-effort and its visibility depends on the Telegram client. An optional companion can send one fixed notice at `agent-start` and remove its own message at `agent-settled`. Core does not enable this notice automatically; `quiet` continues to hide reasoning and tool evidence.
 
-Save this example as a Pi extension and load it alongside `pi-telegram` to opt in. The message stays through tool execution, retries and in-run compaction. Standalone compaction does not create a notice, and event payloads are never rendered. The public APIs retain default context scopes and handle authorization.
+Save the example as `extensions/work-start-notice.ts` in a [Pi package](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md#create-a-package), with `@llblab/pi-telegram` declared in `dependencies`. [Install the companion package](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md#install-and-manage-packages) alongside `pi-telegram`; local packages need their dependencies installed first. The message stays through tool execution, retries and in-run compaction. Standalone compaction does not create a notice, and event payloads are never rendered. The public APIs retain default context scopes and handle authorization.
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
