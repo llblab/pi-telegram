@@ -308,4 +308,54 @@ The registration and delivery examples above remain the public building blocks f
 - Interactive toggles belong in a registered Section and Settings row; activity messages can remain non-interactive.
 - `session_shutdown` should dispose stable registrations and drop retained delivery handles, so reload/session replacement cannot reuse old contexts or handles.
 
+### Optional Work-Start Notices
+
+Native typing is best-effort and its visibility depends on the Telegram client. An optional companion can send one fixed notice at `agent-start` and remove its own message at `agent-settled`. Core does not enable this notice automatically; `quiet` continues to hide reasoning and tool evidence.
+
+Save this example as a Pi extension and load it alongside `pi-telegram` to opt in. The message stays through tool execution, retries and in-run compaction. Standalone compaction does not create a notice, and event payloads are never rendered. The public APIs retain default context scopes and handle authorization.
+
+```ts
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerTelegramActivityHandler } from "@llblab/pi-telegram/activity";
+import type { TelegramDeliveryHandle } from "@llblab/pi-telegram/delivery";
+
+export default function workStartNotice(pi: ExtensionAPI) {
+  let dispose: (() => void) | undefined;
+  pi.on("session_start", () => {
+    dispose?.();
+    dispose = undefined;
+    let active = true;
+    const activities = new Map<string, { handle?: TelegramDeliveryHandle }>();
+    const unregister = registerTelegramActivityHandler({
+      id: "example/work-start-notice",
+      async handle(event, ctx) {
+        if (!active) return;
+        if (event.type === "agent-start") {
+          if (activities.has(event.activityId)) return;
+          const owner: { handle?: TelegramDeliveryHandle } = {};
+          activities.set(event.activityId, owner);
+          const result = await ctx.send({
+            text: "<b>⏳ Work started.</b>",
+            parseMode: "html",
+          });
+          if (active && activities.get(event.activityId) === owner) {
+            owner.handle = result.ok ? result.value : result.partial;
+          }
+        } else if (event.type === "agent-settled") {
+          const owner = activities.get(event.activityId);
+          activities.delete(event.activityId);
+          if (owner?.handle) await ctx.delete(owner.handle);
+        }
+      },
+    });
+    dispose = () => { active = false; activities.clear(); unregister(); };
+  });
+  pi.on("session_shutdown", () => { dispose?.(); dispose = undefined; });
+}
+```
+
+The notice acknowledges that work started; it is not a liveness probe or proof of final-reply delivery. Transport failures, shutdown during a send, or a process crash can leave a notice behind. Discard old handles on shutdown instead of bypassing generation fencing to clean them up. Failed or ambiguous sends are not replayed; a returned partial handle is retained for normal settlement cleanup. Send and delete failures use the existing delivery diagnostics.
+
+An ordinary notice can generate an extra notification because the current public view API has no silent-send option. This recipe does not change the client's native typing renderer.
+
 The separate [`pi-telegram-extension-demo`](https://github.com/llblab/pi-telegram-extension-demo) project remains the maintained companion-extension and managed-UI reference. This document owns the Activity-specific usage pattern; pi-telegram does not ship a redundant `examples/` package directory.
