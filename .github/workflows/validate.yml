@@ -54,10 +54,20 @@ jobs:
       - name: Run tests
         if: matrix.os != 'macos-26-intel'
         run: npm test
-      # Wall-clock latency tests share a small Intel runner; fewer parallel test files keep every assertion and deadline unchanged.
-      - name: Run tests with reduced concurrency
+      # Real child-process tests spawn the full extension and `pi`; on the small Intel runner they missed their exit deadlines
+      # while sharing it with other test files, so they run alone first. Every assertion and deadline stays unchanged.
+      - name: Run real-process tests alone
         if: matrix.os == 'macos-26-intel'
-        run: npm run test:low-concurrency
+        run: >-
+          node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts
+          --test --test-concurrency=1 --test-reporter=spec tests/process-shutdown.test.ts
+      # Wall-clock latency tests share a small Intel runner; fewer parallel test files keep every assertion and deadline unchanged.
+      - name: Run remaining tests with reduced concurrency
+        if: matrix.os == 'macos-26-intel'
+        run: >-
+          node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts
+          --test --test-concurrency=2 --test-reporter=dot
+          $(ls tests/*.test.ts | grep -v '^tests/process-shutdown\.test\.ts$')
       - name: Check package contents
         run: npm run pack:check
       - name: Audit dependencies
