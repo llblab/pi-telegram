@@ -21,3 +21,10 @@ Evidence (2026-10-23 07:11–07:16): a `/start` sent in a former leader tab move
 - [ ] Find why the temporary tab's selected `/start` stayed unresolved until expiry, and why that Restore moved custody without applying the rebind.
 - [ ] Route an input that arrives in a tab bound to nothing through a fresh temporary routing tab (the All flow) instead of publishing the chooser in the orphan, deleting the orphan with it once nothing unspent remains. Needs its own durable-metadata design.
 - [ ] Live acceptance on disposable tabs only: Cancel on an orphan tab deletes it; a second unspent input keeps it until the last Cancel; a plain `std::map` option button is delivered as an ordinary prompt.
+
+## macOS process-exit test flake
+
+The tag-triggered validate job on `macos-26-intel` failed three times for `v0.57.7` (and once on the `0.57.6` main push) in the real-process tests of `tests/process-shutdown.test.ts` (`Child process sharing the agent dir does not poll while parent owns Telegram lock`, `pi -p with Telegram extension and no active lock exits`), each with `did not exit` at its 10–20 s deadline; a fourth unchanged-head rerun passed and the identical tree passed on its PR. The failures are not reproducible on Linux and are unrelated to routing changes, but they gate every release.
+
+- [ ] Establish whether the child is slow to start or a handle really keeps it alive on macOS Intel (capture child timing and active handles in CI), then fix the cause or isolate these real-process tests; do not widen deadlines blindly.
+
