@@ -62,12 +62,12 @@ jobs:
         run: >-
           PATH="$PWD/node_modules/.bin:$PATH" node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts
           --test --test-concurrency=1 --test-reporter=spec tests/process-shutdown.test.ts
-      # Wall-clock latency tests share a small Intel runner; fewer parallel test files keep every assertion and deadline unchanged.
-      - name: Run remaining tests with reduced concurrency
+      # Wall-clock latency and child-process tests are noisy on the small Intel runner; one test file at a time keeps every assertion and deadline unchanged.
+      - name: Run remaining tests one file at a time
         if: matrix.os == 'macos-26-intel'
         run: >-
           PATH="$PWD/node_modules/.bin:$PATH" node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts
-          --test --test-concurrency=2 --test-reporter=dot
+          --test --test-concurrency=1 --test-reporter=dot
           $(ls tests/*.test.ts | grep -v '^tests/process-shutdown\.test\.ts$')
       - name: Check package contents
         run: npm run pack:check
