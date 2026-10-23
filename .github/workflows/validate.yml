@@ -58,14 +58,15 @@ jobs:
       # while sharing it with other test files, so they run alone first. Every assertion and deadline stays unchanged.
       - name: Run real-process tests alone
         if: matrix.os == 'macos-26-intel'
+        # npm scripts put the locally installed `pi` on PATH; direct node steps must too, or its tests silently skip.
         run: >-
-          node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts
+          PATH="$PWD/node_modules/.bin:$PATH" node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts
           --test --test-concurrency=1 --test-reporter=spec tests/process-shutdown.test.ts
       # Wall-clock latency tests share a small Intel runner; fewer parallel test files keep every assertion and deadline unchanged.
       - name: Run remaining tests with reduced concurrency
         if: matrix.os == 'macos-26-intel'
         run: >-
-          node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts
+          PATH="$PWD/node_modules/.bin:$PATH" node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts
           --test --test-concurrency=2 --test-reporter=dot
           $(ls tests/*.test.ts | grep -v '^tests/process-shutdown\.test\.ts$')
       - name: Check package contents
