@@ -34,7 +34,7 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `🧩` | Extension-provided surface | Extension command examples, extension section examples | Companion extensions may choose their own emoji, but `🧩` means generic extension/plugin. |
 | `👄` | Voice reply policy | Voice reply settings row and detail card | Not a generic audio attachment marker. |
 | `🕒` | Time injection / wall-clock context | Time injection settings row and detail card | Clock-face marker with hands; not a generic duration/progress marker. |
-| `🔬` | Activity / technical detail | Activity settings row and detail card | Chooses quiet, thinking, tools, or verbose bridge activity; not a generic diagnostics marker. |
+| `🔬` | Activity / technical detail | Activity settings row and detail card | Chooses quiet, thinking, tools, verbose, or stream bridge activity; not a generic diagnostics marker. |
 | `🧠` | Model thinking controls | Thinking menus and status rows | Thinking activity quotes omit this icon and their header entirely to minimize chat height. |
 | `📎` | Attachment | Attachment summaries, queue rows for attachment-only turns | Not for thread binding. |
 | `👁` | Read-only inspection | State/detail viewers and inspection entrypoints | Opens evidence without mutating the inspected object; do not use for edit or refresh actions. |

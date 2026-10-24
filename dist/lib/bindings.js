@@ -380,6 +380,10 @@ export function createTelegramAssistantOutputBindingRuntime(deps) {
         enqueue: deps.enqueue,
         prepareSend: (event) => event.source === "telegram" ? deps.prepareTelegramPreview?.() : undefined,
         async send(event, authority, isAuthorityActive) {
+            // Stream mode already carries the live text in the single stream
+            // message; admitted-intermediate bookkeeping stays recorded for dedup.
+            if (deps.isStreamMode?.())
+                return;
             await deps.waitForActivityIdle?.();
             if (!isAuthorityActive())
                 return;
@@ -674,6 +678,15 @@ export function registerTelegramCommandsAndTools({ pi, handleInternalAction, age
         },
     });
 }
+/** Composes the preview clear seam with stream-message retirement into one callable. */
+export function createTelegramPreviewStreamClearRuntime(deps) {
+    return {
+        clear: async function clearPreviewAndStream(chatId, options) {
+            await deps.clearPreview(chatId, options);
+            await deps.clearStreamMessage();
+        },
+    };
+}
 export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, activityRuntime, activityVerbosityRuntime, diagnostics, assistantOutputRuntime, sessionLifecycleRuntime, configStore, abort, typing, lifecycle, activeTurnRuntime, telegramQueueStore, modelSwitchController, previewRuntime, promptDispatchRuntime, deferredQueueDispatchRuntime, modelContextAvailabilityRuntime, disconnectOnQuit, onSessionStarted, shutdownGenerativeAppLiveSurfaces, resolveAutomaticThreadCleanupEnabled, buttonActionStore, callMultipart, sendChatAction, sendRecordVoiceAction, sendMarkdownReply, sendTextReply, dispatchNextQueuedTelegramTurn, onSteerTurnEnd, onPromptHandedOff, answerGuestQuery, editGuestInlineMessage, deleteMessage, sendGuestReply, editGuestReply, stopGuestPlaceholder, preparePreviewDelivery, finalizeMarkdownPreview, proactivePushTargetGetter, getAssistantRenderingMode, recordMessageOwnership, canSendAgentActivity, isSessionContextActive = () => true, getSessionGeneration, isTurnTransportActive, updateStatus, recordRuntimeEvent, onSessionSettled, }) {
     const agentEndResetter = Runtime.createTelegramAgentEndResetter({
         abort,
@@ -840,8 +853,10 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
             };
         },
         preparePreviewDelivery,
-        preparePreviewClear: previewRuntime.prepareClear,
-        clearPreview: previewRuntime.clear,
+        clearPreview: async (chatId, options) => {
+            await previewRuntime.clear(chatId, options);
+            await activityVerbosityRuntime?.clearStreamMessage();
+        },
         setPreviewPendingText: previewRuntime.setPendingText,
         finalizeMarkdownPreview,
         sendMarkdownReply,

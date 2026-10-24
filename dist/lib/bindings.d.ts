@@ -157,6 +157,8 @@ export declare function createTelegramAssistantOutputBindingRuntime<TTransportSt
     waitForActivityIdle?: () => Promise<void>;
     prepareTelegramPreview?: () => Activity.TelegramAssistantOutputPreparation | undefined;
     enqueue?: Activity.TelegramActivityPublicationRuntime["enqueue"];
+    /** Stream mode renders live assistant text in its own single message; intermediate segment sends stay silent. */
+    isStreamMode?: () => boolean;
     recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }): TelegramAssistantOutputBindingRuntime<TTransportStamp>;
 type TelegramAssistantOutputAuthority<TTransportStamp> = ReturnType<Routing.TelegramAssistantOutputAuthorityRuntime<TTransportStamp>["captureAuthority"]>;
@@ -302,5 +304,13 @@ interface TelegramLifecycleBindingDeps {
     /** Settled-session hint for owners that wait on agent idleness, such as old-tab cleanup after a live rebind. */
     onSessionSettled?: (ctx: Pi.ExtensionContext) => void;
 }
+export interface TelegramPreviewStreamClearDeps {
+    clearPreview: (chatId: number, options?: Preview.TelegramPreviewTargetOptions) => Promise<void>;
+    clearStreamMessage: () => Promise<void>;
+}
+/** Composes the preview clear seam with stream-message retirement into one callable. */
+export declare function createTelegramPreviewStreamClearRuntime(deps: TelegramPreviewStreamClearDeps): {
+    clear: TelegramPreviewStreamClearDeps["clearPreview"];
+};
 export declare function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, activityRuntime, activityVerbosityRuntime, diagnostics, assistantOutputRuntime, sessionLifecycleRuntime, configStore, abort, typing, lifecycle, activeTurnRuntime, telegramQueueStore, modelSwitchController, previewRuntime, promptDispatchRuntime, deferredQueueDispatchRuntime, modelContextAvailabilityRuntime, disconnectOnQuit, onSessionStarted, shutdownGenerativeAppLiveSurfaces, resolveAutomaticThreadCleanupEnabled, buttonActionStore, callMultipart, sendChatAction, sendRecordVoiceAction, sendMarkdownReply, sendTextReply, dispatchNextQueuedTelegramTurn, onSteerTurnEnd, onPromptHandedOff, answerGuestQuery, editGuestInlineMessage, deleteMessage, sendGuestReply, editGuestReply, stopGuestPlaceholder, preparePreviewDelivery, finalizeMarkdownPreview, proactivePushTargetGetter, getAssistantRenderingMode, recordMessageOwnership, canSendAgentActivity, isSessionContextActive, getSessionGeneration, isTurnTransportActive, updateStatus, recordRuntimeEvent, onSessionSettled, }: TelegramLifecycleBindingDeps): void;
 export {};

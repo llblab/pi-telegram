@@ -287,7 +287,7 @@ test("Settings detail markups show active values", () => {
   );
 });
 
-test("Activity settings expose quiet, thinking, tools, and verbose", () => {
+test("Activity settings expose quiet, thinking, tools, verbose, and stream", () => {
   const text = buildActivityVerbositySettingsText("thinking");
   assert.match(text, /<code>thinking<\/code>/);
   assert.match(text, /persistent collapsed thinking/);
@@ -299,12 +299,14 @@ test("Activity settings expose quiet, thinking, tools, and verbose", () => {
     "thinking",
     "🟢 tools",
     "verbose",
+    "stream",
   ]);
   assert.deepEqual(rows.map((row) => row.map((button) => button.text)), [
     ["⬆️ Back"],
     ["quiet"],
     ["thinking", "🟢 tools"],
     ["verbose"],
+    ["stream"],
   ]);
 });
 
@@ -326,7 +328,7 @@ test("Settings callback action mutates live settings and retires stale proactive
       calls.push(`rendering:${mode}`);
     },
     setActivityVerbosity: async (
-      verbosity: "quiet" | "thinking" | "tools" | "verbose",
+      verbosity: "quiet" | "thinking" | "tools" | "verbose" | "stream",
     ) => {
       calls.push(`activity:${verbosity}`);
     },
