@@ -39,7 +39,7 @@ export type TelegramThreadDisplayMode = "letters" | "names" | "directories" | "d
 export declare function resolveTelegramThreadDisplayMode(config: Pick<TelegramConfig, "threads">): TelegramThreadDisplayMode;
 export declare function setTelegramThreadDisplayMode(store: TelegramConfigStore, mode: TelegramThreadDisplayMode, isCurrent: () => boolean): Promise<void>;
 export type TelegramAssistantRenderingMode = "rich" | "html";
-export type TelegramActivityVerbosity = "quiet" | "thinking" | "tools" | "verbose";
+export type TelegramActivityVerbosity = "quiet" | "thinking" | "tools" | "verbose" | "stream";
 export interface TelegramConfig {
     /** @deprecated persisted identity belongs in profiles.default; retained for effective/legacy views */
     botToken?: string;
@@ -158,6 +158,7 @@ export declare function normalizeTelegramDefaultProfileConfig(config: TelegramCo
     changed: boolean;
 };
 export declare function createTelegramConfigStore(options?: TelegramConfigStoreOptions): TelegramConfigStore;
+export declare function resolveTelegramActivityVerbosity(config: Pick<TelegramConfig, "assistant">): TelegramActivityVerbosity;
 export declare function createTelegramVoiceReplyModeGetter(configStore: Pick<TelegramConfigStore, "get">): () => "manual" | "mirror" | "always";
 export declare function createTelegramVoiceReplyModeConfiguredChecker(configStore: Pick<TelegramConfigStore, "get">): () => boolean;
 export declare function createTelegramVoiceReplyModeSetter(configStore: TelegramMutableConfigStore): (replyMode: "manual" | "hidden" | "mirror" | "always" | undefined) => Promise<void>;
@@ -181,6 +182,7 @@ export declare function createTelegramConfigControls(configStore: TelegramMutabl
     getAssistantRenderingMode: () => TelegramAssistantRenderingMode;
     setAssistantRenderingMode: (mode: TelegramAssistantRenderingMode) => Promise<void>;
     getActivityVerbosity: () => TelegramActivityVerbosity;
+    isActivityStreamMode: () => boolean;
     refreshActivityVerbosity: () => Promise<void>;
     setActivityVerbosity: (verbosity: TelegramActivityVerbosity) => Promise<void>;
     getVoiceReplyMode: () => "manual" | "mirror" | "always";

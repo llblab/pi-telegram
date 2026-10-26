@@ -298,7 +298,7 @@ The implementation must cover:
 
 ## Core Verbosity And Consumer Policy
 
-The bridge owns a global `quiet`/`thinking`/`tools`/`verbose` policy. `verbose` is the absent-config default, `thinking` and `tools` select one technical class, and `quiet` disables both. Available thinking uses persistent ordinary HTML with an expandable blockquote; bounded tool evidence uses native Rich details without changing public assistant-segment projection or final replies.
+The bridge owns a global `quiet`/`thinking`/`tools`/`verbose`/`stream` policy. `verbose` is the absent-config default, `thinking` and `tools` select one technical class, `quiet` disables both, and `stream` projects thinking and tool calls as quoted lines inside one single streaming message per turn (see `docs/outbound.md`, Technical Activity). Available thinking uses persistent ordinary HTML with an expandable blockquote; bounded tool evidence uses native Rich details without changing public assistant-segment projection or final replies.
 
 The registration and delivery examples above remain the public building blocks for companion-specific policy:
 

@@ -3,6 +3,7 @@
 > Each release keeps at most 8 outcome records of at most 512 characters.
 
 ## Unreleased
+- `Stream mode`: New `assistant.activity: "stream"` (Settings → Activity → stream) collapses a turn into one Telegram message: thinking and tool calls stream as quoted lines above the live answer, edited in place on the draft cadence. The cleanly rendered final answer arrives as its own message and the streamed message is deleted at turn end. Native draft previews pause in this mode; `quiet/thinking/tools/verbose` are unchanged.
 
 ## 0.58.3: Typing Cancellation Diagnostics
 

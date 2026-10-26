@@ -589,6 +589,10 @@ export function createTelegramConfigStore(options = {}) {
 function createTelegramDraftPreviewsChecker(configStore) {
     return () => {
         const config = configStore.get();
+        // Stream mode owns the single streaming surface with its own edited
+        // message; the native draft must stay silent so only one message streams.
+        if (resolveTelegramActivityVerbosity(config) === "stream")
+            return false;
         return (config.assistant?.draftPreviews ??
             config.draftPreviews ??
             config.richDraftPreviews ??
@@ -626,22 +630,27 @@ function createTelegramAssistantRenderingModeSetter(configStore) {
         await configStore.persist(config);
     };
 }
+export function resolveTelegramActivityVerbosity(config) {
+    const assistant = config.assistant;
+    if (assistant?.activity !== undefined) {
+        if (assistant.activity === "thinking" ||
+            assistant.activity === "tools" ||
+            assistant.activity === "verbose" ||
+            assistant.activity === "stream") {
+            return assistant.activity;
+        }
+        return "quiet";
+    }
+    if (assistant?.activityVerbosity !== undefined) {
+        return assistant.activityVerbosity === "verbose" ? "verbose" : "quiet";
+    }
+    return "verbose";
+}
 function createTelegramActivityVerbosityGetter(configStore) {
-    return () => {
-        const assistant = configStore.get().assistant;
-        if (assistant?.activity !== undefined) {
-            if (assistant.activity === "thinking" ||
-                assistant.activity === "tools" ||
-                assistant.activity === "verbose") {
-                return assistant.activity;
-            }
-            return "quiet";
-        }
-        if (assistant?.activityVerbosity !== undefined) {
-            return assistant.activityVerbosity === "verbose" ? "verbose" : "quiet";
-        }
-        return "verbose";
-    };
+    return () => resolveTelegramActivityVerbosity(configStore.get());
+}
+function createTelegramActivityStreamModeChecker(configStore) {
+    return () => resolveTelegramActivityVerbosity(configStore.get()) === "stream";
 }
 function createTelegramActivityVerbosityRefresher(configStore) {
     return () => loadLatestTelegramConfig(configStore);
@@ -790,6 +799,7 @@ export function createTelegramConfigControls(configStore) {
         getAssistantRenderingMode: createTelegramAssistantRenderingModeGetter(configStore),
         setAssistantRenderingMode: createTelegramAssistantRenderingModeSetter(configStore),
         getActivityVerbosity: createTelegramActivityVerbosityGetter(configStore),
+        isActivityStreamMode: createTelegramActivityStreamModeChecker(configStore),
         refreshActivityVerbosity: createTelegramActivityVerbosityRefresher(configStore),
         setActivityVerbosity: createTelegramActivityVerbositySetter(configStore),
         getVoiceReplyMode: createTelegramVoiceReplyModeGetter(configStore),
