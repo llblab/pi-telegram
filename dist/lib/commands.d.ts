@@ -187,6 +187,7 @@ export interface TelegramBridgeCommandRegistrationDeps {
         cancel(): void;
     };
     getProfileNames?: () => string[];
+    getActiveProfileName?: () => string | undefined;
     activateDefaultProfileConfig?: (ctx: ExtensionCommandContext, isCurrent: () => boolean) => Promise<void>;
     activateProfileConfig?: (ctx: ExtensionCommandContext, profileName: string, isCurrent: () => boolean) => Promise<boolean>;
 }
@@ -216,6 +217,12 @@ export declare function createTelegramThreadDisplayNameRenameBinding(): {
     bind: (rename: TelegramThreadDisplayNameRenamePort) => void;
     rename: TelegramThreadDisplayNameRenamePort;
 };
+export interface TelegramProfileCompletionItem {
+    value: string;
+    label: string;
+    description?: string;
+}
+export declare function getTelegramProfileCompletions(deps: Pick<TelegramBridgeCommandRegistrationDeps, "getProfileNames" | "getActiveProfileName">, argumentPrefix: string): TelegramProfileCompletionItem[] | null;
 export declare function registerTelegramBridgeCommands(pi: ExtensionAPI, deps: TelegramBridgeCommandRegistrationDeps): void;
 export declare const TELEGRAM_RESERVED_COMMAND_NAMES: readonly ["stop", "name", "new", "abort", "next", "continue", "status", "queue", "compact", "model", "thinking", "settings", "help", "start"];
 export type TelegramReservedCommandName = (typeof TELEGRAM_RESERVED_COMMAND_NAMES)[number];

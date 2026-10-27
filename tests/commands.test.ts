@@ -22,6 +22,7 @@ import {
   formatTelegramInvalidInstanceName,
   formatTelegramPiCommandHtml,
   formatTelegramThreadDisplayNameSavedHeading,
+  getTelegramProfileCompletions,
   createTelegramAppMenuHtmlBuilder,
   createTelegramBotCommandRegistrar,
   createTelegramThreadDisplayNameRenameBinding,
@@ -69,6 +70,7 @@ import { runTelegramPollLoop } from "../lib/polling.ts";
 import * as Queue from "../lib/queue.ts";
 import * as Turns from "../lib/turns.ts";
 import { expandTelegramPromptTemplateCommand } from "../lib/prompt-templates.ts";
+import { TELEGRAM_DEFAULT_PROFILE_NAME } from "../lib/paths.ts";
 import { createTelegramQueueBindingRuntime, createTelegramFollowerSelectedCommandBinding } from "../lib/bindings.ts";
 import { createTelegramMenuActionRuntime, type TelegramModelMenuState } from "../lib/menu.ts";
 import { createTelegramQueueMenuRuntime } from "../lib/menu-queue.ts";
@@ -114,6 +116,7 @@ import type {
 type RegisteredBridgeCommand = {
   description: string;
   handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
+  getArgumentCompletions?: (argumentPrefix: string) => unknown;
 };
 
 for (const boundary of ["current", "entry", "response", "rebind", "adapter-failure", "unavailable"] as const) {
@@ -5822,4 +5825,260 @@ test("Session action contains failures and emits a terminal failure result", asy
   assert.equal(harness.failures.length, 1);
   assert.match(String(harness.failures[0]), /replacement failed/);
   assert.equal(harness.runtime.hasPending(), false);
+});
+
+test("Profile completions list every name and mark only the active profile", () => {
+  const deps = {
+    getProfileNames: () => ["work", "personal", "Build"],
+    getActiveProfileName: () => "work",
+  };
+  assert.deepEqual(getTelegramProfileCompletions(deps, ""), [
+    { value: "work", label: "work", description: "active profile" },
+    { value: "personal", label: "personal" },
+    { value: "Build", label: "Build" },
+  ]);
+  assert.deepEqual(getTelegramProfileCompletions(deps, "p"), [
+    { value: "personal", label: "personal" },
+  ]);
+  assert.deepEqual(getTelegramProfileCompletions(deps, "W"), [
+    { value: "work", label: "work", description: "active profile" },
+  ]);
+  assert.deepEqual(getTelegramProfileCompletions(deps, "b"), [
+    { value: "Build", label: "Build" },
+  ]);
+  // startsWith only: a substring elsewhere in the name is not a match.
+  assert.equal(getTelegramProfileCompletions(deps, "ork"), null);
+  const items = getTelegramProfileCompletions(deps, "")!;
+  assert.equal(
+    items.filter((item) => item.description !== undefined).length,
+    1,
+  );
+  assert.deepEqual(
+    getTelegramProfileCompletions(
+      { getProfileNames: () => ["a", "b"] },
+      "",
+    ),
+    [
+      { value: "a", label: "a" },
+      { value: "b", label: "b" },
+    ],
+  );
+});
+
+test("Profile completions refuse missing matches, missing profiles and finished words", () => {
+  const deps = {
+    getProfileNames: () => ["alpha", "beta"],
+    getActiveProfileName: () => "alpha",
+  };
+  assert.equal(getTelegramProfileCompletions(deps, "zzz"), null);
+  assert.equal(
+    getTelegramProfileCompletions({ getProfileNames: () => [] }, ""),
+    null,
+  );
+  assert.equal(getTelegramProfileCompletions({}, ""), null);
+  assert.equal(getTelegramProfileCompletions(deps, "alpha beta"), null);
+  assert.equal(getTelegramProfileCompletions(deps, "alpha "), null);
+});
+
+test("Setup and connect commands both complete the profile argument", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const deps = {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async () => {},
+    stopPolling: async () => {},
+    updateStatus: () => {},
+    getProfileNames: () => ["work", "personal"],
+    getActiveProfileName: () => "work",
+  };
+  registerTelegramBridgeCommands(harness.api, deps);
+  for (const name of ["telegram-setup", "telegram-connect"]) {
+    const command = getRequiredCommand(harness.commands, name);
+    assert.equal(typeof command.getArgumentCompletions, "function");
+    assert.deepEqual(command.getArgumentCompletions!(""), getTelegramProfileCompletions(deps, ""));
+    assert.deepEqual(command.getArgumentCompletions!("w"), getTelegramProfileCompletions(deps, "w"));
+    assert.equal(command.getArgumentCompletions!("zzz"), null);
+  }
+});
+
+function createNoDefaultProfileConnectHarness(options: {
+  profileNames: string[];
+  activeProfileName?: string;
+  selectedLabel?: string;
+  hasUI?: boolean;
+}) {
+  const harness = createCommandRegistrationApiHarness();
+  const events: string[] = [];
+  const notifications: string[] = [];
+  const activated: string[] = [];
+  const selectCalls: Array<{ title: string; items: string[] }> = [];
+  let tokenReady = false;
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {
+      events.push("setup");
+    },
+    getStatusLines: () => [],
+    reloadConfig: async () => {
+      events.push("reload");
+    },
+    hasBotToken: () => tokenReady,
+    startPolling: async () => {
+      events.push("start");
+    },
+    stopPolling: async () => {},
+    updateStatus: () => {
+      events.push("status");
+    },
+    getProfileNames: () => options.profileNames,
+    ...("activeProfileName" in options
+      ? { getActiveProfileName: () => options.activeProfileName }
+      : {}),
+    activateProfileConfig: async (_ctx, profileName) => {
+      activated.push(profileName);
+      tokenReady = true;
+      return true;
+    },
+  });
+  const ctx = createBridgeCommandContext(
+    (message) => {
+      notifications.push(message);
+    },
+    () => false,
+    async (title, items) => {
+      selectCalls.push({ title, items });
+      return options.selectedLabel;
+    },
+  );
+  (ctx as unknown as { hasUI: boolean }).hasUI = options.hasUI ?? true;
+  return { harness, events, notifications, activated, selectCalls, ctx };
+}
+
+test("Connect without a default profile offers a menu and connects the chosen profile", async () => {
+  const f = createNoDefaultProfileConnectHarness({
+    profileNames: ["alpha", "beta"],
+    activeProfileName: "beta",
+    selectedLabel: "beta (active)",
+  });
+  await getRequiredCommand(f.harness.commands, "telegram-connect").handler("", f.ctx);
+  assert.deepEqual(f.selectCalls, [
+    { title: "Select Telegram profile", items: ["alpha", "beta (active)"] },
+  ]);
+  assert.deepEqual(f.activated, ["beta"]);
+  assert.deepEqual(f.events, ["reload", "start", "status"]);
+  assert.ok(
+    f.notifications.some((message) => message.includes('Activated profile "beta".')),
+  );
+  assert.ok(
+    !f.notifications.some((message) => message.includes("No default Telegram profile")),
+  );
+});
+
+test("Connect profile menu cancellation ends without connecting", async () => {
+  const f = createNoDefaultProfileConnectHarness({
+    profileNames: ["alpha", "beta"],
+    activeProfileName: "beta",
+    selectedLabel: undefined,
+  });
+  await getRequiredCommand(f.harness.commands, "telegram-connect").handler("", f.ctx);
+  assert.equal(f.selectCalls.length, 1);
+  assert.deepEqual(f.activated, []);
+  assert.deepEqual(f.events, ["reload", "status"]);
+  assert.deepEqual(f.notifications, []);
+});
+
+test("Connect without a default profile connects the only profile without a menu when interactive", async () => {
+  const f = createNoDefaultProfileConnectHarness({
+    profileNames: ["solo"],
+    hasUI: true,
+  });
+  await getRequiredCommand(f.harness.commands, "telegram-connect").handler("", f.ctx);
+  assert.deepEqual(f.selectCalls, []);
+  assert.deepEqual(f.activated, ["solo"]);
+  assert.deepEqual(f.events, ["reload", "start", "status"]);
+  assert.ok(
+    f.notifications.some((message) => message.includes('Activated profile "solo".')),
+  );
+  assert.ok(
+    !f.notifications.some((message) => message.includes("No default Telegram profile")),
+  );
+});
+
+test("Connect without a default profile notifies without connecting when headless", async () => {
+  const f = createNoDefaultProfileConnectHarness({
+    profileNames: ["solo"],
+    hasUI: false,
+  });
+  await getRequiredCommand(f.harness.commands, "telegram-connect").handler("", f.ctx);
+  assert.deepEqual(f.selectCalls, []);
+  assert.deepEqual(f.activated, []);
+  assert.deepEqual(f.events, ["reload", "status"]);
+  assert.ok(
+    f.notifications.some((message) =>
+      message.includes(
+        "No default Telegram profile configured. Available profiles: solo.",
+      ),
+    ),
+  );
+  assert.ok(
+    !f.notifications.some((message) => message.includes('Activated profile "solo".')),
+  );
+});
+
+test("Profile completions mark the default profile active when the active dep returns undefined", () => {
+  const deps = {
+    getProfileNames: () => [TELEGRAM_DEFAULT_PROFILE_NAME, "work"],
+    getActiveProfileName: (): string | undefined => undefined,
+  };
+  assert.deepEqual(getTelegramProfileCompletions(deps, ""), [
+    {
+      value: TELEGRAM_DEFAULT_PROFILE_NAME,
+      label: TELEGRAM_DEFAULT_PROFILE_NAME,
+      description: "active profile",
+    },
+    { value: "work", label: "work" },
+  ]);
+  assert.deepEqual(getTelegramProfileCompletions(deps, "d"), [
+    {
+      value: TELEGRAM_DEFAULT_PROFILE_NAME,
+      label: TELEGRAM_DEFAULT_PROFILE_NAME,
+      description: "active profile",
+    },
+  ]);
+});
+
+test("Connect profile menu marks the default profile active when the active dep returns undefined", async () => {
+  const f = createNoDefaultProfileConnectHarness({
+    profileNames: [TELEGRAM_DEFAULT_PROFILE_NAME, "work"],
+    activeProfileName: undefined,
+    selectedLabel: `${TELEGRAM_DEFAULT_PROFILE_NAME} (active)`,
+  });
+  await getRequiredCommand(f.harness.commands, "telegram-connect").handler("", f.ctx);
+  assert.deepEqual(f.selectCalls, [
+    {
+      title: "Select Telegram profile",
+      items: [`${TELEGRAM_DEFAULT_PROFILE_NAME} (active)`, "work"],
+    },
+  ]);
+  assert.deepEqual(f.activated, [TELEGRAM_DEFAULT_PROFILE_NAME]);
+  assert.deepEqual(f.events, ["reload", "start", "status"]);
+  assert.ok(
+    f.notifications.some((message) =>
+      message.includes(`Activated profile "${TELEGRAM_DEFAULT_PROFILE_NAME}".`),
+    ),
+  );
+});
+
+test("Connect profile menu shows no active mark without the active-profile dep", async () => {
+  const f = createNoDefaultProfileConnectHarness({
+    profileNames: ["alpha", "beta"],
+    selectedLabel: "alpha",
+  });
+  await getRequiredCommand(f.harness.commands, "telegram-connect").handler("", f.ctx);
+  assert.deepEqual(f.selectCalls, [
+    { title: "Select Telegram profile", items: ["alpha", "beta"] },
+  ]);
+  assert.deepEqual(f.activated, ["alpha"]);
+  assert.deepEqual(f.events, ["reload", "start", "status"]);
 });

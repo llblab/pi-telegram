@@ -393,6 +393,24 @@ function parseTelegramProfileArg(args) {
         return undefined;
     return word === TELEGRAM_DEFAULT_PROFILE_NAME ? undefined : word;
 }
+export function getTelegramProfileCompletions(deps, argumentPrefix) {
+    // The profile argument is a single word: never complete after it is finished.
+    if (/\s/.test(argumentPrefix))
+        return null;
+    const names = deps.getProfileNames?.() ?? [];
+    if (names.length === 0)
+        return null;
+    const prefix = argumentPrefix.toLowerCase();
+    const activeProfileName = deps.getActiveProfileName
+        ? (deps.getActiveProfileName() ?? TELEGRAM_DEFAULT_PROFILE_NAME)
+        : undefined;
+    const items = names
+        .filter((name) => name.toLowerCase().startsWith(prefix))
+        .map((name) => name === activeProfileName
+        ? { value: name, label: name, description: "active profile" }
+        : { value: name, label: name });
+    return items.length > 0 ? items : null;
+}
 function formatTelegramTakeoverTitle(ctx) {
     return ctx.ui.theme.fg("accent", "pi-telegram");
 }
@@ -408,6 +426,7 @@ export function registerTelegramBridgeCommands(pi, deps) {
     const handleInternalAction = deps.handleInternalAction;
     pi.registerCommand("telegram-setup", {
         description: "<profile> — Configure Telegram bot token",
+        getArgumentCompletions: (argumentPrefix) => getTelegramProfileCompletions(deps, argumentPrefix),
         handler: async (args, ctx) => {
             await deps.promptForConfig(ctx, parseTelegramProfileArg(args));
         },
@@ -421,6 +440,7 @@ export function registerTelegramBridgeCommands(pi, deps) {
     });
     pi.registerCommand(TELEGRAM_CONNECT_COMMAND_NAME, {
         description: "<profile> — Start Telegram bridge",
+        getArgumentCompletions: (argumentPrefix) => getTelegramProfileCompletions(deps, argumentPrefix),
         handler: async (args, ctx) => {
             const words = args.trim().split(/\s+/);
             // Service dispatch never inherits profile activation or explicit-connect recovery authority.
@@ -475,12 +495,66 @@ export function registerTelegramBridgeCommands(pi, deps) {
                         ctx.ui.notify(botTokenDiagnostic, "error");
                     const profileNames = deps.getProfileNames?.() ?? [];
                     if (!profileName && profileNames.length > 0) {
-                        ctx.ui.notify(`No default Telegram profile configured. Available profiles: ${profileNames.join(", ")}. Use /telegram-connect <profileName> or /telegram-setup to create a default profile.`, "info");
-                        deps.updateStatus(ctx);
+                        const fallbackNotice = `No default Telegram profile configured. Available profiles: ${profileNames.join(", ")}. Use /telegram-connect <profileName> or /telegram-setup to create a default profile.`;
+                        let selectedProfileName;
+                        if (profileNames.length === 1 &&
+                            ctx.hasUI &&
+                            typeof ctx.ui.select === "function") {
+                            selectedProfileName = profileNames[0];
+                        }
+                        else if (ctx.hasUI && typeof ctx.ui.select === "function") {
+                            if (!isCurrent())
+                                return;
+                            const activeProfileName = deps.getActiveProfileName
+                                ? (deps.getActiveProfileName() ??
+                                    TELEGRAM_DEFAULT_PROFILE_NAME)
+                                : undefined;
+                            const options = profileNames.map((name) => ({
+                                name,
+                                label: name === activeProfileName ? `${name} (active)` : name,
+                            }));
+                            const selected = await ctx.ui.select("Select Telegram profile", options.map((option) => option.label));
+                            if (!isCurrent())
+                                return;
+                            if (selected === undefined) {
+                                deps.updateStatus(ctx);
+                                return;
+                            }
+                            selectedProfileName = options.find((option) => option.label === selected)?.name;
+                            if (!selectedProfileName) {
+                                deps.updateStatus(ctx);
+                                return;
+                            }
+                        }
+                        if (selectedProfileName && deps.activateProfileConfig) {
+                            // The intent was bound before the menu resolved: rebind it to the chosen profile.
+                            if (intentId)
+                                deps.connectionIntent?.finish(intentId);
+                            intentId = deps.connectionIntent?.begin(ctx.cwd, selectedProfileName);
+                            const ok = await deps.activateProfileConfig(ctx, selectedProfileName, isCurrent);
+                            if (!isCurrent())
+                                return;
+                            if (!ok) {
+                                ctx.ui.notify(`Profile "${selectedProfileName}" not found.`, "error");
+                                deps.updateStatus(ctx);
+                                return;
+                            }
+                            ctx.ui.notify(`Activated profile "${selectedProfileName}".`, "info");
+                            if (!deps.hasBotToken()) {
+                                await deps.promptForConfig(ctx, selectedProfileName);
+                                return;
+                            }
+                        }
+                        else {
+                            ctx.ui.notify(fallbackNotice, "info");
+                            deps.updateStatus(ctx);
+                            return;
+                        }
+                    }
+                    else {
+                        await deps.promptForConfig(ctx, profileName);
                         return;
                     }
-                    await deps.promptForConfig(ctx, profileName);
-                    return;
                 }
                 const startPolling = async (options) => {
                     try {

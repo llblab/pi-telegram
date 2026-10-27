@@ -1123,6 +1123,7 @@ export function registerTelegramCommandsAndTools({
     connectionIntent,
     getProfileNames: () =>
       Config.getTelegramProfileNames(configStore.getStoredConfig()),
+    getActiveProfileName: configStore.getActiveProfileName,
     activateDefaultProfileConfig: async (_ctx, isCurrent) => {
       const previousProfileName = configStore.getActiveProfileName();
       await configStore.load();
