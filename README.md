@@ -1,5 +1,7 @@
 # pi-telegram
 
+[![omp status](https://omppackages.com/badge/@llblab/pi-telegram.svg)](https://omppackages.com/packages/@llblab/pi-telegram)
+
 ![pi-telegram screenshot](screenshot.png)
 
 **A Telegram companion hub for live Pi sessions.**
