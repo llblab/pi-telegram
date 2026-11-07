@@ -3260,10 +3260,10 @@ test("Bus follower registration abandons an attempt when its session is replaced
 });
 
 for (const threaded of [false, true])
-for (const fault of ["known", "fresh-context", "same-generation", "stop", "session", "session-generation", "profile", "cwd", "birth", "pid", "endpoint", "leader-endpoint", "auth",
+for (const fault of ["known", "known-long-endpoint", "fresh-context", "same-generation", "stop", "session", "session-generation", "profile", "cwd", "birth", "pid", "endpoint", "leader-endpoint", "leader-endpoint-alias", "auth",
   "reader", "reader-during-registration", "state-reader", "protocol", "peer-protocol", "reentry", "read-error", "callout-owner-change", "availability-reentry", "no-birth", "no-endpoint", "no-incarnation", "wrong-ack", "no-local-cap", "no-peer-cap"] as const)
 test(`Attachment acknowledged registration retains native local lifetime (Thread=${threaded}, ${fault})`, async () => {
-  const dir = mkdtempSync(join(tmpdir(), "pt-attachment-reg-")), socketPath = join(dir, "bus.sock"), target = { chatId: 7, ...(threaded ? { threadId: 11 } : {}) };
+  const dir = mkdtempSync(join(tmpdir(), "pt-attachment-reg-")), socketPath = join(dir, ...(["known-long-endpoint", "leader-endpoint-alias"].includes(fault) ? ["long-context-".repeat(12)] : []), "bus.sock"), target = { chatId: 7, ...(threaded ? { threadId: 11 } : {}) };
   const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "0.58.3", capabilities: fault === "no-local-cap" ? [] : [TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION] });
   const peer = createTelegramBusProtocolIdentity({ runtimeBuild: "0.58.3", capabilities: fault === "no-peer-cap" ? [] : [TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION] });
   const registry = createTelegramBusFollowerRegistry(); let reentered = false;
@@ -3306,12 +3306,12 @@ test(`Attachment acknowledged registration retains native local lifetime (Thread
     assert.ok(captured); captured.assertCurrent();
     assert.equal(captured.registration.registrationGeneration, "g1"); assert.equal(captured.registration.sessionId, "s1");
     assert.equal(captured.registration.processBirthId, "birth"); assert.equal(captured.registration.busSocketPath, endpoint);
-    assert.equal(captured.registration.pid, 123); assert.equal(captured.leaderSocketPath, socketPath);
+    assert.equal(captured.registration.pid, 123); assert.equal(captured.leaderSocketPath, resolveTelegramBusSocketPath(socketPath));
     assert.equal(captured.registrationIncarnation, registry.get("consumer")?.registrationIncarnation);
     assert.ok(Object.isFrozen(captured) && Object.isFrozen(captured.registration) && Object.isFrozen(captured.registration.target) &&
       Object.isFrozen(captured.registration.protocol?.capabilities) && Object.isFrozen(captured.leaderProtocol.capabilities));
     assert.throws(() => { captured!.registration.target!.chatId = 99; }, TypeError);
-    if (fault === "known" || fault === "fresh-context") {
+    if (fault === "known" || fault === "known-long-endpoint" || fault === "fresh-context") {
       if (fault === "fresh-context") runtime.setContext({ cwd: "/repo" });
       captured.assertCurrent(); assert.equal(runtime.captureAttachmentPublicationRegistration?.(), captured); return;
     }
@@ -3327,6 +3327,11 @@ test(`Attachment acknowledged registration retains native local lifetime (Thread
     if (fault === "pid") { pid++; restore.push(() => { pid--; }); }
     if (fault === "endpoint") { endpoint += "other"; restore.push(() => { endpoint = join(dir, "receiver.sock"); }); }
     if (fault === "leader-endpoint") { leader.busSocketPath += "other"; restore.push(() => { leader.busSocketPath = socketPath; }); }
+    if (fault === "leader-endpoint-alias") {
+      leader.busSocketPath = resolveTelegramBusSocketPath(socketPath);
+      assert.notEqual(leader.busSocketPath, socketPath, "A different raw spelling is still a replaced captured provider value");
+      restore.push(() => { leader.busSocketPath = socketPath; });
+    }
     if (fault === "auth") { auth = undefined; restore.push(() => { auth = "secret"; }); }
     if (fault === "reader") { const original = deps.getPid; deps.getPid = () => pid; restore.push(() => { deps.getPid = original; }); }
     if (fault === "state-reader") { const original = state.getTarget; state.getTarget = () => target; restore.push(() => { state.getTarget = original; }); }
