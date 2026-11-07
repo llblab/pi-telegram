@@ -115,6 +115,11 @@ export interface TelegramSessionContextStore<TContext> {
 export declare function createTelegramSessionContextStore<TContext>(options?: {
     getIdentity?: (ctx: TContext) => unknown;
 }): TelegramSessionContextStore<TContext>;
+/** Artifact disclosure stays bound to the captured session generation and ID, even with reused managers. */
+export declare function createTelegramArtifactSessionCapture<TContext>(deps: {
+    context: Pick<TelegramSessionContextStore<TContext>, "get" | "getGeneration" | "isCurrent">;
+    getSessionId(ctx: TContext | undefined): string | undefined;
+}): () => (() => boolean) | undefined;
 /** Capture drain hints at work admission; late completion never borrows a replacement session or transport. */
 export declare function createTelegramSessionDrainObserver<TContext, TAuthority>(deps: {
     context: Pick<TelegramSessionContextStore<TContext>, "get" | "getGeneration" | "isCurrent">;

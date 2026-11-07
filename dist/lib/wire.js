@@ -1,8 +1,8 @@
 /**
  * Non-coercing decoded wire-value inspection
  * Zones: wire fields, record shape, integer bounds
- * Owns shared shallow predicates; excludes schemas, lossless decoding,
- * required fields, normalization, storage and execution authority.
+ * Owns shared shallow predicates and the artifact-document field bounds shared by declaration, IPC and API issuance;
+ * excludes schemas, lossless decoding, required fields, normalization, storage and execution authority.
  */
 /** Non-array object shape only; not a plain-object or JSON-serializability guarantee. */
 export function isWireRecord(value) {
@@ -18,4 +18,15 @@ export function isNonEmptyWireString(value) {
 }
 export function isNonNegativeWireInteger(value) {
     return Number.isSafeInteger(value) && value >= 0;
+}
+/** Bound for one producer-authorized artifact document, shared by declaration, IPC wire validation and Bot API issuance. */
+export const TELEGRAM_ARTIFACT_MAX_BYTES = 1_048_576;
+export const TELEGRAM_ARTIFACT_CAPTION_MAX_LENGTH = 1024;
+/** Explicit basename only: no separators or control characters, and not a relative-directory name. */
+export function isTelegramArtifactFileName(name) {
+    return typeof name === "string" && !!name.trim() && name.isWellFormed() && name !== "." && name !== ".." &&
+        Buffer.byteLength(name, "utf8") <= 255 && !/[\\/\x00-\x1f\x7f-\x9f]/u.test(name);
+}
+export function isTelegramArtifactCaption(caption) {
+    return typeof caption === "string" && caption.isWellFormed() && caption.length <= TELEGRAM_ARTIFACT_CAPTION_MAX_LENGTH;
 }

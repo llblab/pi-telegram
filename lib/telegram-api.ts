@@ -7,7 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { createWriteStream, openAsBlob } from "node:fs";
+import { createWriteStream, openAsBlob, } from "node:fs";
 import {
   mkdir,
   readdir,
@@ -21,8 +21,10 @@ import { join } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-import type { TelegramAttachmentSource } from "./media.ts";
+import { captureTelegramDrainObserver } from "./machine.ts";
+import { type TelegramAttachmentRequestCandidate, type TelegramAttachmentSource } from "./media.ts";
 import { resolveTelegramAttachmentsDir } from "./paths.ts";
+import { TELEGRAM_ARTIFACT_MAX_BYTES } from "./wire.ts";
 
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 
@@ -390,10 +392,24 @@ export interface TelegramApiRetryWait {
   retryAfterSeconds?: number;
 }
 
+/** Process-local resource ownership only; never an execution/transport grant. */
+export interface TelegramArtifactReservation { release: () => void }
+
+class TelegramArtifactObserverError extends AggregateError {
+  constructor(original: unknown, secondary: unknown[]) {
+    super([original, ...secondary], "Artifact observers failed.", { cause: original });
+  }
+}
+
 export interface TelegramApiCallOptions {
+  artifactReservation?: TelegramArtifactReservation;
   /** Local per-call effect authority; independent of source completion and transport ownership. */
   assertAuthority?: () => void;
   signal?: AbortSignal;
+  /** Origin-local observation at the actual HTTP boundary; never transported as authority. */
+  onRequestIssued?: () => void;
+  /** Private origin-local positive identity observation before late authority checks. */
+  onArtifactMessageId?: (messageId: number) => void;
   maxAttempts?: number;
   retryRateLimit?: boolean;
   retrySafety?: "safe" | "non-idempotent";
@@ -495,10 +511,14 @@ export interface TelegramAnswerCallbackQueryOptions extends Pick<
 }
 
 export interface TelegramApiClient {
+  reserveArtifact?: () => TelegramArtifactReservation | undefined;
   call: <TResponse>(
     method: string,
     body: Record<string, unknown>,
     options?: TelegramApiCallOptions,
+  ) => Promise<TResponse>;
+  callArtifactBytes?: <TResponse>(
+    fields: Record<string, string>, bytes: Uint8Array, fileName: string, options: TelegramApiCallOptions,
   ) => Promise<TResponse>;
   callMultipart: <TResponse>(
     method: string,
@@ -545,19 +565,6 @@ function parseTelegramApiTargetInteger(value: unknown): number | undefined {
     : undefined;
 }
 
-/** Optional drain hints are not transport outcomes or request authority. */
-function captureApiDrainObserver(capture?: () => (() => void) | undefined): () => void {
-  try {
-    const notify = capture?.();
-    return () => {
-      try {
-        const emitted: unknown = notify?.();
-        if (emitted) void Promise.resolve(emitted).catch(() => undefined);
-      } catch { /* Observer failure is inert. */ }
-    };
-  } catch { return () => {}; }
-}
-
 export function createTelegramApiTargetActivityRuntime(deps: {
   captureDrain?: () => (() => void) | undefined;
 } = {}): TelegramApiTargetActivityRuntime {
@@ -600,7 +607,7 @@ export function createTelegramApiTargetActivityRuntime(deps: {
       } else {
         pendingChats.set(chatId, (pendingChats.get(chatId) ?? 0) + 1);
       }
-      const notifyDrained = captureApiDrainObserver(deps.captureDrain);
+      const notifyDrained = captureTelegramDrainObserver(deps.captureDrain);
       let completed = false;
       return () => {
         if (completed) return;
@@ -651,6 +658,9 @@ export function createTelegramApiTargetTrackingClient(
   return {
     call: (method, body, options) =>
       track(method, body, () => client.call(method, body, options)),
+    ...(client.reserveArtifact ? { reserveArtifact: client.reserveArtifact } : {}),
+    ...(client.callArtifactBytes ? { callArtifactBytes: <T>(fields: Record<string, string>, bytes: Uint8Array, name: string, options: TelegramApiCallOptions) =>
+      track("sendDocument", fields, () => client.callArtifactBytes!<T>(fields, bytes, name, options)) } : {}),
     callMultipart: (method, fields, fileField, filePath, fileName, options) =>
       track(method, fields, () =>
         client.callMultipart(
@@ -799,6 +809,9 @@ export function createTelegramApiWorkspaceAdmissionClient(
   return {
     call: (method, body, callOptions) =>
       admit(method, body, () => client.call(method, body, callOptions)),
+    ...(client.reserveArtifact ? { reserveArtifact: client.reserveArtifact } : {}),
+    ...(client.callArtifactBytes ? { callArtifactBytes: <T>(fields: Record<string, string>, bytes: Uint8Array, name: string, options: TelegramApiCallOptions) =>
+      admit("sendDocument", fields, () => client.callArtifactBytes!<T>(fields, bytes, name, options)) } : {}),
     callMultipart: (
       method,
       fields,
@@ -845,6 +858,41 @@ export interface TelegramBridgeApiRuntimeDeps {
   chatActionMaxGates?: number;
 }
 
+/** UI caller-lifetime checks may fence IPC issuance/ACK; they are never remote execution grants. */
+export type TelegramApiUiAuthorityOptions = (
+  | { assertAuthority?: TelegramApiCallOptions["assertAuthority"]; assertLocalAuthority?: never }
+  | { assertAuthority?: never; assertLocalAuthority: NonNullable<TelegramApiCallOptions["assertAuthority"]> }
+) & {
+  /** @internal Data from this original native edit only, never a publication or execution grant. */
+  onNativeEditResult?: (result: unknown) => void;
+};
+
+/** @internal Capture callable identity before ownership observations or asynchronous work. */
+export function captureTelegramUiAuthorityOptions(options?: TelegramApiUiAuthorityOptions): TelegramApiUiAuthorityOptions | undefined {
+  const authority = options?.assertAuthority, local = options?.assertLocalAuthority;
+  if (authority && local) throw new TypeError("UI authority scope must be explicit.");
+  return authority ? { assertAuthority: authority } : local ? { assertLocalAuthority: local } : undefined;
+}
+
+/** The single caller-lifetime fence of a captured UI authority scope, whichever kind it carries. */
+export function getTelegramUiAuthorityAssertion(options?: TelegramApiUiAuthorityOptions): (() => void) | undefined {
+  return options?.assertAuthority ?? options?.assertLocalAuthority;
+}
+
+function captureNativeEditObserver(options?: TelegramApiUiAuthorityOptions): ((result: unknown) => void) | undefined {
+  const field = options && Object.getOwnPropertyDescriptor(options, "onNativeEditResult");
+  if (field && (!("value" in field) || field.value !== undefined && typeof field.value !== "function"))
+    throw new TypeError("Native edit observer must be a data function or omitted.");
+  return field?.value as ((result: unknown) => void) | undefined;
+}
+
+function telegramUiCallOptions(options?: TelegramApiUiAuthorityOptions): TelegramApiCallOptions | undefined {
+  const captured = captureTelegramUiAuthorityOptions(options);
+  return captured?.assertLocalAuthority
+    ? { assertAuthority: captured.assertLocalAuthority, maxAttempts: 1, retrySafety: "non-idempotent" }
+    : captured;
+}
+
 /** Typing issuance guard is local authority, never Bot API body or IPC data. */
 export interface TelegramTypingActionOptions extends Pick<TelegramApiCallOptions, "assertAuthority"> {
   message_thread_id?: number;
@@ -852,10 +900,27 @@ export interface TelegramTypingActionOptions extends Pick<TelegramApiCallOptions
   isCancelled?: () => boolean;
 }
 
+export interface TelegramArtifactTransport {
+  isCurrent: () => boolean;
+  send: (input: { bytes: Uint8Array; fileName: string; caption?: string; expiresAt: number; signal: AbortSignal; assertAuthority: () => void }) => Promise<{
+    effect: "sent" | "not-issued" | "rejected" | "unknown"; reason: string; messageId?: number;
+  }>;
+}
+
+export interface TelegramAttachmentPublicationTransport {
+  readonly assertCurrent: () => void;
+  readonly publish: (body: TelegramSendMessageBody, assertAuthority: () => void) => Promise<Readonly<{ messageId: number; botId: number }>>;
+}
+
 export interface TelegramBridgeApiRuntime extends Pick<
   TelegramApiClient,
-  "call" | "callMultipart"
+  "call" | "callMultipart" | "callArtifactBytes" | "reserveArtifact"
 > {
+  /** Original local direct publisher; unavailable follower provenance never enables common question coordination. */
+  captureQuestionAuthority?: () => (() => void) | undefined;
+  captureArtifactTransport?: (target: { chatId: number; threadId?: number }) => TelegramArtifactTransport | undefined;
+  /** Private follower question publication only; production composition leaves this unavailable. */
+  captureAttachmentPublication?: (target: { chatId: number; threadId?: number }) => TelegramAttachmentPublicationTransport | undefined;
   downloadFile: (
     fileId: string,
     suggestedName: string,
@@ -895,7 +960,7 @@ export interface TelegramBridgeApiRuntime extends Pick<
   ) => Promise<boolean>;
   sendMessage: (
     body: TelegramSendMessageBody,
-    options?: Pick<TelegramApiCallOptions, "assertAuthority">,
+    options?: TelegramApiUiAuthorityOptions,
   ) => Promise<TelegramSentMessage>;
   sendRichMessage: (
     body: TelegramSendRichMessageBody,
@@ -906,17 +971,18 @@ export interface TelegramBridgeApiRuntime extends Pick<
   ) => Promise<boolean>;
   editMessageText: (
     body: TelegramEditMessageTextBody,
-    options?: Pick<TelegramApiCallOptions, "assertAuthority">,
+    options?: TelegramApiUiAuthorityOptions,
   ) => Promise<"edited" | "unchanged">;
   editMessageReplyMarkup: (
     chatId: number,
     messageId: number,
     replyMarkup: unknown,
-  ) => Promise<void>;
+    options?: TelegramApiUiAuthorityOptions,
+  ) => Promise<void | "edited">;
   answerCallbackQuery: (
     callbackQueryId: string,
     text?: string,
-    options?: Pick<TelegramApiCallOptions, "assertAuthority">,
+    options?: TelegramApiUiAuthorityOptions,
   ) => Promise<void>;
   answerGuestQuery: (
     guestQueryId: string,
@@ -938,7 +1004,7 @@ export interface TelegramBridgeApiRuntime extends Pick<
     content: TelegramEditGuestInlineMessageContent,
     options?: Pick<TelegramApiCallOptions, "assertAuthority">,
   ) => Promise<void>;
-  deleteMessage: (chatId: number, messageId: number) => Promise<void>;
+  deleteMessage: (chatId: number, messageId: number, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
   prepareTempDir: () => Promise<number>;
 }
 
@@ -1094,6 +1160,7 @@ export function isTelegramApiRequestRejected(
   error: unknown,
   method: string,
 ): boolean {
+  if (error instanceof TelegramArtifactObserverError) error = error.cause;
   return (
     error instanceof TelegramApiHttpError &&
     error.rejectedRequestMethod !== undefined &&
@@ -1104,6 +1171,14 @@ export function isTelegramApiRequestRejected(
 export function isTelegramMessageNotModifiedError(error: unknown): boolean {
   return (
     error instanceof Error && error.message.includes("message is not modified")
+  );
+}
+
+/** Telegram refused the answer because the tap is too old or its ID is unknown; the toast can never be shown. */
+export function isTelegramCallbackQueryExpiredError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    /query is too old|query ID is invalid/u.test(error.message)
   );
 }
 
@@ -1393,7 +1468,7 @@ async function buildTelegramMultipartBody(
   }
   chunks.push(
     Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${fileName}"\r\nContent-Type: ${fileBlob.type || "application/octet-stream"}\r\n\r\n`,
+      `--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${fileName.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"\r\nContent-Type: ${fileBlob.type || "application/octet-stream"}\r\n\r\n`,
     ),
     Buffer.from(await fileBlob.arrayBuffer()),
     Buffer.from(`\r\n--${boundary}--\r\n`),
@@ -1603,6 +1678,7 @@ async function callTelegramWithRetry<TResponse>(
   const beforeRequest = () => {
     assertTelegramApiCallAuthority(assertAuthority, requestIssued);
     requestIssued = true;
+    options?.onRequestIssued?.();
   };
   const retrySafe =
     options?.retrySafety === "safe" ||
@@ -1647,6 +1723,9 @@ async function callTelegramWithRetry<TResponse>(
           method,
         ),
       );
+      const messageId = result && typeof result === "object" ? (result as { message_id?: unknown }).message_id : undefined;
+      if (method === "sendDocument" && typeof messageId === "number" && Number.isSafeInteger(messageId) && messageId > 0)
+        options?.onArtifactMessageId?.(messageId);
       assertTelegramApiCallAuthority(assertAuthority, requestIssued);
       return result;
     } catch (error) {
@@ -1793,6 +1872,13 @@ export async function callTelegramMultipart<TResponse>(
   options = options && { ...options };
   assertTelegramApiCallAuthority(options?.assertAuthority, false);
   const fileBlob = await openAsBlob(filePath);
+  return callTelegramBlobMultipart(configuredBotToken, method, fields, fileField, fileBlob, fileName, options);
+}
+
+async function callTelegramBlobMultipart<TResponse>(
+  configuredBotToken: string, method: string, fields: Record<string, string>, fileField: string,
+  fileBlob: Blob, fileName: string, options?: TelegramApiCallOptions,
+): Promise<TResponse> {
   try {
     return await callTelegramWithRetry(
       method,
@@ -1839,6 +1925,19 @@ export async function callTelegramMultipart<TResponse>(
   }
 }
 
+/** @internal */
+export interface TelegramAttachmentCapturedFile {
+  readonly metadata: Readonly<TelegramAttachmentRequestCandidate>;
+  readonly path: string;
+  readonly byteLength: number;
+}
+/** @internal Native lease accounting only; no producer/source execution or settlement grant. */
+export interface TelegramAttachmentConsumerLease {
+  readonly files: readonly (TelegramAttachmentCapturedFile & { readonly expiresAt: number })[];
+  readonly expiresAt: number;
+  /** Consumer lifetime ended, not evidence that source pins cleared or files were deleted. */
+  readonly ended: Promise<void>;
+}
 export async function downloadTelegramFile(
   botToken: string | undefined,
   fileId: string,
@@ -2234,6 +2333,24 @@ export function createTelegramBridgeApiRuntime(
   };
   return {
     call: callRecorded,
+    ...(deps.client.reserveArtifact ? { reserveArtifact: deps.client.reserveArtifact } : {}),
+    ...(deps.client.callArtifactBytes ? { callArtifactBytes: async <T>(fields: Record<string, string>, bytes: Uint8Array, name: string, options: TelegramApiCallOptions): Promise<T> => {
+      const recoverError = deps.captureRequestErrorHandler?.(fields);
+      try { return await deps.client.callArtifactBytes!<T>(fields, bytes, name, options); }
+      catch (error) {
+        // Observer failures retain exact causes locally, never replace native provenance.
+        const secondary: unknown[] = [];
+        try { await recoverError?.(error); }
+        catch (recoveryError) {
+          secondary.push(recoveryError);
+          try { deps.recordRuntimeEvent("api", recoveryError, { phase: "stale-target-recovery" }); }
+          catch (diagnosticError) { secondary.push(diagnosticError); }
+        }
+        try { deps.recordRuntimeEvent("multipart", error, withTelegramTransportDiagnostics(error, { method: "sendDocument" })); }
+        catch (diagnosticError) { secondary.push(diagnosticError); }
+        throw secondary.length ? new TelegramArtifactObserverError(error, secondary) : error;
+      }
+    } } : {}),
 
     /**
      * Sends a multipart/form-data request (used for sending voice messages,
@@ -2359,16 +2476,17 @@ export function createTelegramBridgeApiRuntime(
       return callRecorded<boolean>("sendMessageDraft", body);
     },
     sendMessage: (body, options) =>
-      callRecorded<TelegramSentMessage>("sendMessage", body, options),
+      callRecorded<TelegramSentMessage>("sendMessage", body, telegramUiCallOptions(options)),
     sendRichMessage: (body, options) =>
       callRecorded<TelegramSentMessage>("sendRichMessage", body, options),
     sendRichMessageDraft: (body) =>
       callRecorded<boolean>("sendRichMessageDraft", body),
     editMessageText: async (body, options) => {
+      const captured = captureTelegramUiAuthorityOptions(options), observe = captureNativeEditObserver(options);
       const recoverError = deps.captureRequestErrorHandler?.(body);
+      let result: unknown;
       try {
-        await deps.client.call("editMessageText", body, options);
-        return "edited";
+        result = await deps.client.call("editMessageText", body, telegramUiCallOptions(captured));
       } catch (error) {
         if (isTelegramMessageNotModifiedError(error)) return "unchanged";
         await recoverRequestError(recoverError, error);
@@ -2381,23 +2499,43 @@ export function createTelegramBridgeApiRuntime(
         );
         throw error;
       }
+      if (observe) {
+        assertTelegramApiCallAuthority(getTelegramUiAuthorityAssertion(captured), true);
+        observe(result);
+        assertTelegramApiCallAuthority(getTelegramUiAuthorityAssertion(captured), true);
+      }
+      return "edited";
     },
-    editMessageReplyMarkup: async (chatId, messageId, replyMarkup) => {
-      await callRecorded("editMessageReplyMarkup", {
-        chat_id: chatId,
-        message_id: messageId,
-        reply_markup: replyMarkup,
-      });
+    editMessageReplyMarkup: async (chatId, messageId, replyMarkup, options) => {
+      const captured = captureTelegramUiAuthorityOptions(options), observe = captureNativeEditObserver(options);
+      // Positional reassembly must retain its original route through recovery capture and JSON encoding.
+      // Only this internally owned top level is frozen, not caller-owned markup internals.
+      // The client's shallow snapshot must retain the sentinel; JSON omits its undefined value.
+      const body = Object.freeze(Object.defineProperty({ chat_id: chatId, message_id: messageId, reply_markup: replyMarkup }, "toJSON", { value: undefined, enumerable: true }));
+      const result = await callRecorded<unknown>("editMessageReplyMarkup", body, telegramUiCallOptions(captured));
+      const message = result as { message_id?: unknown; chat?: { id?: unknown } } | null;
+      if (!message || typeof message !== "object" || Array.isArray(message) || message.message_id !== messageId || message.chat?.id !== chatId) {
+        const error = new Error("Telegram reply-markup edit acknowledgement is unavailable.");
+        try { deps.recordRuntimeEvent("api", error, { method: "editMessageReplyMarkup" }); } catch { /* Diagnostics cannot certify an unknown issued result. */ }
+        throw error;
+      }
+      if (observe) {
+        assertTelegramApiCallAuthority(getTelegramUiAuthorityAssertion(captured), true);
+        observe(result);
+        assertTelegramApiCallAuthority(getTelegramUiAuthorityAssertion(captured), true);
+      }
+      return "edited";
     },
     answerCallbackQuery: async (callbackQueryId, text, options) => {
-      if (options?.assertAuthority) {
+      const callOptions = telegramUiCallOptions(options);
+      if (callOptions?.assertAuthority) {
         try {
           await callRecorded<boolean>(
             "answerCallbackQuery",
             text
               ? { callback_query_id: callbackQueryId, text }
               : { callback_query_id: callbackQueryId },
-            { assertAuthority: options.assertAuthority },
+            callOptions,
           );
         } catch (error) {
           if (error instanceof TelegramApiAuthorityError) throw error;
@@ -2466,11 +2604,11 @@ export function createTelegramBridgeApiRuntime(
     },
     prepareTempDir: () =>
       prepareTelegramTempDir(deps.tempDir, deps.tempFileMaxAgeMs),
-    deleteMessage: (chatId, messageId) =>
+    deleteMessage: (chatId, messageId, options) =>
       callRecorded<boolean>("deleteMessage", {
         chat_id: chatId,
         message_id: messageId,
-      }).then(() => {}),
+      }, options).then(() => {}),
   };
 }
 
@@ -2510,7 +2648,18 @@ export function createTelegramApiClient(
     return { ...callOptions, assertAuthority };
   };
   const draftRetryNotBeforeByTarget = new Map<string, number>();
+  let artifactSlot: { permit: TelegramArtifactReservation; running: boolean; consumed: boolean; released: boolean } | undefined;
+  const reserveArtifact = (): TelegramArtifactReservation | undefined => {
+    if (artifactSlot) return undefined;
+    const slot = { permit: { release() {
+      slot.released = true;
+      if (!slot.running && artifactSlot === slot) artifactSlot = undefined;
+    } }, running: false, consumed: false, released: false };
+    artifactSlot = slot;
+    return slot.permit;
+  };
   return {
+    reserveArtifact,
     call: async <TResponse>(
       method: string,
       body: Record<string, unknown>,
@@ -2578,6 +2727,25 @@ export function createTelegramApiClient(
           );
         }
         throw error;
+      }
+    },
+    callArtifactBytes: async <T>(fields: Record<string, string>, bytes: Uint8Array, fileName: string, options: TelegramApiCallOptions): Promise<T> => {
+      const permit = options.artifactReservation ?? reserveArtifact();
+      const slot = artifactSlot;
+      if (!permit || slot?.permit !== permit || slot.released || slot.consumed) throw new TelegramApiAuthorityError(false);
+      slot.consumed = true;
+      slot.running = true;
+      try {
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1 || bytes.byteLength > TELEGRAM_ARTIFACT_MAX_BYTES)
+          throw new TypeError("Artifact bytes must be bounded and nonempty.");
+        fields = { ...fields };
+        options = fenceOutput("sendDocument", fields, { ...options, maxAttempts: 1, retryRateLimit: false, retrySafety: "non-idempotent" })!;
+        assertTelegramApiCallAuthority(options.assertAuthority, false);
+        const blob = new Blob([new Uint8Array(bytes)]);
+        return await callTelegramBlobMultipart<T>(assertTelegramBotTokenConfigured(getBotToken()), "sendDocument", fields, "document", blob, fileName, options);
+      } finally {
+        slot.running = false;
+        if (!options.artifactReservation || slot.released) permit.release();
       }
     },
     callMultipart: async (

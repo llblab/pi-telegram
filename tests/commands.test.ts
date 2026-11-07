@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import * as Commands from "../lib/commands.ts";
 
 import {
   buildTelegramAppMenuHtml,
@@ -30,6 +31,8 @@ import {
   createTelegramCommandHandler,
   createTelegramCommandHandlerTargetRuntime,
   type TelegramCommandHandlerTargetRuntimeDeps,
+  buildTelegramSlashCatalogueHtml,
+  classifyTelegramSlashDiscovery,
   createTelegramCommandOrPromptDispatcher,
   createTelegramCommandTargetQueueRuntime,
   createTelegramCommandTargetRuntime,
@@ -66,6 +69,8 @@ import {
 } from "../lib/commands.ts";
 import type { PreparedSelectedCommand, SelectedCommandExecution, SelectedPreparationInput } from "../api/commands.ts";
 import { runTelegramPollLoop } from "../lib/polling.ts";
+import * as Delivery from "../lib/delivery.ts";
+
 import * as Queue from "../lib/queue.ts";
 import * as Turns from "../lib/turns.ts";
 import { expandTelegramPromptTemplateCommand } from "../lib/prompt-templates.ts";
@@ -76,11 +81,11 @@ import { createTelegramSettingsMenuRuntime } from "../lib/menu-settings.ts";
 import { createTelegramOutboundTextReplyRuntime } from "../lib/outbound.ts";
 import { createTelegramRenderedMessageDeliveryRuntime, resetTransportReplyDedup } from "../lib/replies.ts";
 import { createTelegramActivityPublicationRuntime } from "../lib/activity.ts";
-import { TelegramApiAuthorityError, createDefaultTelegramBridgeApiRuntime, createTelegramApiClient, createTelegramBridgeApiRuntime, type TelegramApiCallOptions } from "../lib/telegram-api.ts";
+import { TelegramApiAuthorityError, TelegramApiCommitUnknownError, assertTelegramApiCallAuthority, createDefaultTelegramBridgeApiRuntime, createTelegramApiClient, createTelegramBridgeApiRuntime, type TelegramApiCallOptions } from "../lib/telegram-api.ts";
 import { createTelegramBusAwareApiRuntime, createTelegramSelectedMenuTextApi } from "../lib/bus-api.ts";
 import { withWorkspaceRestoreFixture } from "./fixtures/workspace.ts";
 import { createTelegramBusFollowerSelectedMenuCaller, createTelegramBusFollowerRestoreContextGetter, createTelegramBusFollowerRegistrationState, createTelegramBusFollowerLiveRebindRuntime, createTelegramBusFollowerWorkspaceRestoreHandler, createTelegramBusForwardedUpdateReceiverRuntime } from "../lib/bus-follower.ts";
-import { createTelegramBusSelectedMenuDeliveryHandler, createTelegramBusLeaderEnvelopeHandler, createTelegramBusLeaderRuntime } from "../lib/bus-leader.ts";
+import { createTelegramBusSelectedMenuDeliveryHandler, createTelegramBusLeaderEnvelopeHandler, createTelegramBusLeaderRuntime, createTelegramBusLeaderApiProxy } from "../lib/bus-leader.ts";
 import { createTelegramBusMessageOwnershipRuntime } from "../lib/ownership.ts";
 import { createTelegramFollowerApiCallAuthorizer, createTelegramBusFollowerRegistry, createTelegramBusProtocolIdentity, createTelegramBusLocalServer, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, type TelegramBusPreparedCommandSource, createTelegramBusLiveRebindController, getTelegramBusFollowerSocketPath, type TelegramBusEnvelope } from "../lib/bus.ts";
 import { createTelegramWorkspaceAdmissionLedger } from "../lib/workspace-admission.ts";
@@ -596,6 +601,207 @@ test("Command helpers reject invalid and built-in extension command names", () =
     /conflicts with built-in command/,
   );
   clearTelegramExtensionCommands();
+});
+
+test("Native command exclusion captures genuine enrollment without handler or preparation", () => {
+  clearTelegramExtensionCommands(); let effects = 0;
+  const dispose = registerTelegramCommand({ name: "native_exclusion", handler() { effects++; }, selected: { prepare() { effects++; return undefined; } } });
+  try {
+    const capture = Commands.captureTelegramExtensionCommandExclusion;
+    assert.equal(typeof capture, "function"); const proof = capture!("native_exclusion"); assert.ok(proof);
+    assert.equal(proof.name, "native_exclusion"); assert.equal(Object.isFrozen(proof), true); assert.equal(proof.assertCurrent(), undefined);
+    assert.equal(effects, 0); dispose(); assert.throws(proof.assertCurrent, /Command exclusion/); assert.equal(effects, 0);
+  } finally { dispose(); clearTelegramExtensionCommands(); }
+});
+
+
+for (const kind of ["spread", "prototype", "proxy", "getters", "alias", "peer", "registry-copy", "map-copy"] as const)
+test(`Native command exclusion refuses intrinsic foreign entry without probes or owner revocation (${kind})`, () => {
+  clearTelegramExtensionCommands(); const globals = globalThis as unknown as Record<string, unknown>, key = "__piTelegramCommandRegistry__";
+  let probes = 0; const handler = () => { probes++; };
+  const dispose = registerTelegramCommand({ name: "native_origin", handler }), registry = globals[key] as { commands: Map<string, unknown> }, map = registry.commands, entry = map.get("native_origin");
+  const proof = Commands.captureTelegramExtensionCommandExclusion("native_origin"); assert.ok(proof);
+  let peerDispose: (() => void) | undefined, peerRegistry: typeof registry | undefined;
+  try {
+    let requested = "native_origin";
+    if (kind === "spread") registry.commands.set(requested, { ...(entry as object) });
+    if (kind === "prototype") registry.commands.set(requested, Object.create(entry as object));
+    if (kind === "proxy") registry.commands.set(requested, new Proxy(entry as object, { get() { probes++; throw Error("No proxy get"); }, getPrototypeOf() { probes++; throw Error("No proxy prototype"); }, has() { probes++; throw Error("No proxy has"); } }));
+    if (kind === "getters") registry.commands.set(requested, Object.defineProperties({}, { name: { get() { probes++; return requested; } }, handler: { get() { probes++; return handler; } }, constructor: { get() { probes++; throw Error("No constructor"); } } }));
+    if (kind === "alias") { requested = "native_alias"; registry.commands.set(requested, entry); }
+    if (kind === "registry-copy") globals[key] = { ...registry };
+    if (kind === "map-copy") registry.commands = new Map(registry.commands);
+    if (kind === "peer") {
+      peerRegistry = { commands: new Map() }; globals[key] = peerRegistry;
+      peerDispose = registerTelegramCommand({ name: requested, handler }); const peer = peerRegistry.commands.get(requested);
+      globals[key] = registry; registry.commands.set(requested, peer);
+    }
+    assert.equal(Commands.captureTelegramExtensionCommandExclusion(requested), undefined); assert.equal(probes, 0);
+    globals[key] = registry;
+  } finally {
+    globals[key] = registry;
+    registry.commands = map; map.set("native_origin", entry); map.delete("native_alias"); proof.assertCurrent();
+    if (peerRegistry) { globals[key] = peerRegistry; assert.ok(Commands.captureTelegramExtensionCommandExclusion("native_origin")); peerDispose!(); globals[key] = registry; }
+    dispose(); clearTelegramExtensionCommands();
+  }
+});
+
+for (const kind of ["handler", "name", "handler-getter", "name-getter", "global-getter", "global-proxy", "global-absent", "commands-getter", "commands-proxy", "map-getter", "map-method", "map-prototype", "registry-copy", "map-copy", "removed", "disposed", "cleared"] as const)
+test(`Native command exclusion matching observed loss is sticky before callbacks (${kind})`, () => {
+  clearTelegramExtensionCommands(); const globals = globalThis as unknown as Record<string, unknown>, key = "__piTelegramCommandRegistry__";
+  let probes = 0; const handler = () => { probes++; };
+  const dispose = registerTelegramCommand({ name: "native_loss", handler }), rootDescriptor = Object.getOwnPropertyDescriptor(globals, key)!, registry = globals[key] as { commands: Map<string, unknown> }, map = registry.commands;
+  const entry = map.get("native_loss") as object, proof = Commands.captureTelegramExtensionCommandExclusion("native_loss"); assert.ok(proof);
+  const nameDescriptor = Object.getOwnPropertyDescriptor(entry, "name")!, handlerDescriptor = Object.getOwnPropertyDescriptor(entry, "handler")!, mapDescriptor = Object.getOwnPropertyDescriptor(registry, "commands")!, prototypeGet = Object.getOwnPropertyDescriptor(Map.prototype, "get")!;
+  const trip = () => { probes++; throw Error("No business callback or getter"); };
+  let loss: unknown;
+  try {
+    if (kind === "handler") Object.defineProperty(entry, "handler", { value: trip });
+    if (kind === "name") Object.defineProperty(entry, "name", { value: "native_other" });
+    if (kind === "handler-getter") Object.defineProperty(entry, "handler", { get: trip });
+    if (kind === "name-getter") Object.defineProperty(entry, "name", { get: trip });
+    if (kind === "global-getter") Object.defineProperty(globals, key, { get: trip, configurable: true });
+    if (kind === "global-proxy") globals[key] = new Proxy(registry, { get: trip, getOwnPropertyDescriptor: trip, getPrototypeOf: trip, has: trip });
+    if (kind === "global-absent") delete globals[key];
+    if (kind === "commands-getter") Object.defineProperty(registry, "commands", { get: trip, configurable: true });
+    if (kind === "commands-proxy") registry.commands = new Proxy(map, { get: trip, getOwnPropertyDescriptor: trip, getPrototypeOf: trip, has: trip });
+    if (kind === "map-getter") Object.defineProperty(map, "get", { get: trip, configurable: true });
+    if (kind === "map-method") Object.defineProperty(map, "get", { value: trip, configurable: true });
+    if (kind === "map-prototype") Object.defineProperty(Map.prototype, "get", { value: trip, configurable: true });
+    if (kind === "registry-copy") globals[key] = { ...registry };
+    if (kind === "map-copy") registry.commands = new Map(map);
+    if (kind === "removed") map.delete("native_loss");
+    if (kind === "disposed") { dispose(); map.set("native_loss", entry); }
+    if (kind === "cleared") { clearTelegramExtensionCommands(); map.set("native_loss", entry); }
+    try { proof.assertCurrent(); } catch (error) { loss = error; }
+  } finally {
+    Object.defineProperty(Map.prototype, "get", prototypeGet); delete (map as unknown as Record<string, unknown>).get;
+    Object.defineProperty(globals, key, rootDescriptor); Object.defineProperty(registry, "commands", mapDescriptor);
+    Object.defineProperty(entry, "name", nameDescriptor); Object.defineProperty(entry, "handler", handlerDescriptor); map.set("native_loss", entry);
+  }
+  try {
+    assert.match(String(loss), /Command exclusion/); assert.equal(probes, 0);
+    assert.throws(proof.assertCurrent, /Command exclusion/); assert.throws(() => Commands.captureTelegramExtensionCommandExclusion("native_loss"), /Command exclusion/);
+    assert.equal(probes, 0);
+  } finally { dispose(); clearTelegramExtensionCommands(); }
+});
+
+for (const kind of ["constructor", "selected", "description", "emoji", "showInMenu", "order"] as const)
+test(`Native command exclusion ignores non-handler metadata without property probes (${kind})`, () => {
+  clearTelegramExtensionCommands(); let probes = 0;
+  const dispose = registerTelegramCommand({ name: "native_metadata", handler() { probes++; } });
+  const entry = findTelegramExtensionCommand("native_metadata")!;
+  try {
+    Object.defineProperty(entry, kind, { get() { probes++; throw Error("Not exclusion authority"); }, configurable: true });
+    const proof = Commands.captureTelegramExtensionCommandExclusion("native_metadata"); assert.ok(proof); proof.assertCurrent(); assert.equal(probes, 0);
+  } finally { dispose(); clearTelegramExtensionCommands(); }
+});
+
+for (const name of ["", "Native_origin", "/native_origin", " native_origin", "native_origin@bot", "template_unknown", "stop", null, {}, Symbol("not a name")])
+test(`Native command exclusion accepts canonical enrolled names only (${typeof name}/${String(name)})`, () => {
+  clearTelegramExtensionCommands(); const dispose = registerTelegramCommand({ name: "native_origin", handler() { assert.fail("No handler"); } });
+  try { assert.equal(Commands.captureTelegramExtensionCommandExclusion(name as never), undefined); }
+  finally { dispose(); clearTelegramExtensionCommands(); }
+});
+
+test("Native command exclusion pins handler at enrollment rather than first passive lookup", () => {
+  clearTelegramExtensionCommands(); const original = () => {}, replacement = () => {};
+  const dispose = registerTelegramCommand({ name: "native_birth", handler: original }), entry = findTelegramExtensionCommand("native_birth")!;
+  try {
+    entry.handler = replacement;
+    assert.throws(() => Commands.captureTelegramExtensionCommandExclusion("native_birth"), /Command exclusion/);
+    entry.handler = original;
+    assert.throws(() => Commands.captureTelegramExtensionCommandExclusion("native_birth"), /Command exclusion/);
+  } finally { dispose(); clearTelegramExtensionCommands(); }
+});
+
+test("Native command exclusion preserves plain records, data descriptors and original ordinary receiver", () => {
+  clearTelegramExtensionCommands(); let effects = 0, receiver: unknown;
+  const dispose = registerTelegramCommand({ name: "native_shape", handler() { effects++; receiver = this; } });
+  try {
+    const entry = findTelegramExtensionCommand("native_shape")!;
+    assert.equal(Object.getPrototypeOf(entry), Object.prototype); assert.deepEqual(Reflect.ownKeys(entry), ["name", "description", "order", "showInMenu", "emoji", "handler", "selected"]);
+    assert.deepEqual(Object.getOwnPropertyDescriptor(entry, "handler"), { value: entry.handler, configurable: true, writable: true, enumerable: true });
+    const proof = Commands.captureTelegramExtensionCommandExclusion("native_shape"); assert.ok(proof); proof.assertCurrent(); assert.equal(effects, 0);
+    entry.handler({ name: entry.name, args: "", async reply() {}, async enqueuePrompt() {} });
+    assert.equal(receiver, entry); assert.equal(effects, 1); proof.assertCurrent();
+  } finally { dispose(); clearTelegramExtensionCommands(); }
+});
+
+test("Native command exclusion does not upgrade structural legacy command records", async () => {
+  clearTelegramExtensionCommands(); const globals = globalThis as unknown as Record<string, unknown>, key = "__piTelegramCommandRegistry__", saved = globals[key]; let calls = 0;
+  const legacy = { name: "native_legacy", handler() { calls++; }, selected: { prepare() { calls++; return { kind: "generated-prompt" as const, prompt: "legacy prompt" }; } }, order: 0, showInMenu: false };
+  try {
+    globals[key] = { commands: new Map([[legacy.name, legacy]]) };
+    assert.equal(findTelegramExtensionCommand(legacy.name), legacy); assert.equal(Commands.captureTelegramExtensionCommandExclusion(legacy.name), undefined); assert.equal(calls, 0);
+    const prepared = await prepareTelegramSelectedExtensionCommand({ name: legacy.name, args: "" }, { assertSourceCurrent() {}, assertRecipientCurrent() {} });
+    assert.equal(prepared?.plan.kind, "generated-prompt"); prepared!.assertRegistrationCurrent(); assert.equal(calls, 1);
+  } finally { globals[key] = saved; clearTelegramExtensionCommands(); }
+});
+
+for (const mode of ["proxy-root", "accessor-map"] as const)
+test(`Native command exclusion preserves trusted structural registration getter/receiver behavior (${mode})`, () => {
+  clearTelegramExtensionCommands(); const globals = globalThis as unknown as Record<string, unknown>, key = "__piTelegramCommandRegistry__", saved = globals[key], map = new Map(); let gets = 0, descriptors = 0;
+  const root = mode === "proxy-root" ? new Proxy({ commands: map }, { get(target, prop, receiver) { if (prop === "commands") gets++; return Reflect.get(target, prop, receiver); }, getOwnPropertyDescriptor(target, prop) { descriptors++; return Reflect.getOwnPropertyDescriptor(target, prop); } }) : Object.defineProperty({}, "commands", { get() { gets++; return map; }, configurable: true });
+  let dispose: (() => void) | undefined;
+  try {
+    globals[key] = root; dispose = registerTelegramCommand({ name: "native_structural", handler() {} }); assert.equal(gets, 3); assert.equal(descriptors, 0);
+    const before = gets; assert.equal(Commands.captureTelegramExtensionCommandExclusion("native_structural"), undefined); assert.equal(gets, before); assert.equal(descriptors, 0);
+    dispose(); assert.equal(gets, before + 2); dispose = undefined;
+  } finally { dispose?.(); globals[key] = saved; clearTelegramExtensionCommands(); }
+});
+
+for (const end of ["dispose", "clear"] as const)
+test(`Native command exclusion explicit retirement cannot revive and stale disposer preserves replacement (${end})`, () => {
+  clearTelegramExtensionCommands(); const globals = globalThis as unknown as Record<string, unknown>, key = "__piTelegramCommandRegistry__", handler = () => {};
+  const oldDispose = registerTelegramCommand({ name: "native_retire", handler }), registry = globals[key] as { commands: Map<string, unknown> }, old = registry.commands.get("native_retire");
+  const proof = Commands.captureTelegramExtensionCommandExclusion("native_retire"); assert.ok(proof);
+  if (end === "dispose") oldDispose(); else clearTelegramExtensionCommands();
+  registry.commands.set("native_retire", old);
+  assert.throws(() => Commands.captureTelegramExtensionCommandExclusion("native_retire"), /Command exclusion/); assert.throws(proof.assertCurrent, /Command exclusion/);
+  registry.commands.delete("native_retire"); const replacementDispose = registerTelegramCommand({ name: "native_retire", handler });
+  try { oldDispose(); const fresh = Commands.captureTelegramExtensionCommandExclusion("native_retire"); assert.ok(fresh); fresh.assertCurrent(); assert.throws(proof.assertCurrent, /Command exclusion/); }
+  finally { replacementDispose(); clearTelegramExtensionCommands(); }
+});
+
+for (const kind of ["absent", "pseudo-map", "invalid-handler"] as const)
+test(`Native command exclusion never creates or repairs foreign registry state (${kind})`, () => {
+  clearTelegramExtensionCommands(); const globals = globalThis as unknown as Record<string, unknown>, key = "__piTelegramCommandRegistry__", saved = Object.getOwnPropertyDescriptor(globals, key)!;
+  let dispose: (() => void) | undefined;
+  try {
+    if (kind === "absent") delete globals[key];
+    if (kind === "pseudo-map") globals[key] = { commands: Object.create(Map.prototype) };
+    if (kind === "invalid-handler") {
+      dispose = registerTelegramCommand({ name: "native_invalid", handler: undefined as never });
+      assert.throws(() => Commands.captureTelegramExtensionCommandExclusion("native_invalid"), /Command exclusion/); return;
+    }
+    const before = globals[key]; assert.equal(Commands.captureTelegramExtensionCommandExclusion("native_unknown"), undefined); assert.equal(globals[key], before);
+  } finally { dispose?.(); Object.defineProperty(globals, key, saved); clearTelegramExtensionCommands(); }
+});
+
+for (const mode of ["live-entry", "dispose", "clear"] as const)
+test(`Native command exclusion obsolete capture collects without another registry (${mode})`, async () => {
+  clearTelegramExtensionCommands(); let dispose: (() => void) | undefined = registerTelegramCommand({ name: "native_collect", handler() {} }), entry: object | undefined = findTelegramExtensionCommand("native_collect"), proof = Commands.captureTelegramExtensionCommandExclusion("native_collect");
+  assert.ok(entry); assert.ok(proof); proof.assertCurrent(); const weakEntry = new WeakRef(entry), weakProof = new WeakRef(proof);
+  let currentDispose: (() => void) | undefined, current: ReturnType<typeof Commands.captureTelegramExtensionCommandExclusion>;
+  try {
+    if (mode !== "live-entry") {
+      if (mode === "dispose") dispose(); else clearTelegramExtensionCommands();
+      assert.throws(proof.assertCurrent, /Command exclusion/); dispose = undefined; entry = undefined;
+      currentDispose = registerTelegramCommand({ name: "native_collect", handler() {} });
+    }
+    current = Commands.captureTelegramExtensionCommandExclusion("native_collect"); assert.ok(current); current.assertCurrent(); proof = undefined;
+    const gc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+    if (gc) {
+      let collected = false;
+      for (let i = 0; i < 60; i++) {
+        await new Promise(resolve => setImmediate(resolve)); gc(); await new Promise(resolve => setImmediate(resolve));
+        if (weakProof.deref() === undefined && (mode === "live-entry" || weakEntry.deref() === undefined)) { collected = true; break; }
+      }
+      assert.ok(collected); current.assertCurrent();
+      console.log(JSON.stringify({ kind: "native-command-gc", mode, captureCollected: true, obsoleteEntryCollected: mode !== "live-entry", currentEnrollmentOwned: true }));
+    }
+  } finally { currentDispose?.(); dispose?.(); clearTelegramExtensionCommands(); }
 });
 
 test("Command helpers register disposable extension commands", () => {
@@ -1785,165 +1991,171 @@ test("Command helpers guard and complete compact command flow", async () => {
   ]);
 });
 
-test("Command helpers confirm new sessions before requesting replacement", async () => {
-  const events: string[] = [];
-  await openTelegramNewConfirmation(
-    { chatId: 42, threadId: 123, replyToMessageId: 99 },
-    {
-      sendInteractiveMessage: async (chatId, text, mode, markup, options) => {
-        events.push(`${chatId}:${mode}:${text}`);
-        events.push(JSON.stringify(markup.inline_keyboard));
-        events.push(JSON.stringify(options));
-        return 77;
-      },
+function commandConfirmationFixture(operatorId = 42, threadId = 123) {
+  const handles: Delivery.TelegramConfirmHandle[] = [];
+  const runtime = Delivery.createTelegramDeliveryRuntime({
+    generation: "command-confirmations",
+    getConfirmationAuthority: () => ({ profile: "default", operatorId }),
+    getActiveTurnTarget: () => undefined, getInstanceTarget: () => ({ chatId: operatorId, threadId }),
+    getAggregateTarget: () => undefined, isExplicitTargetAuthorized: target => target.chatId === operatorId,
+    renderView: view => [{ text: view.text, parseMode: view.parseMode ?? "plain" }],
+    async sendChunk() { assert.fail("A native question must retain its publisher"); },
+    async editChunk() { assert.fail("A native choice retains its own UI feedback"); },
+    async deleteMessage() {}, async sendChatAction() {},
+  });
+  const confirmations: Delivery.TelegramDeliveryConfirmationPort = {
+    async openConfirmation(request, owned) {
+      const opened = await runtime.openConfirmation!(request, owned);
+      if (opened.ok) handles.push(opened.handle);
+      return opened;
     },
-  );
-  assert.deepEqual(events, [
-    "42:html:<b>Start a new session?</b>",
-    '[[{"text":"🆕 Yes, start new","callback_data":"new:confirm"},{"text":"❌ No","callback_data":"new:cancel"}]]',
-    '{"target":{"chatId":42,"threadId":123}}',
-  ]);
+    acceptConfirmation: (query, guard) => runtime.acceptConfirmation!(query, guard),
+  };
+  return { runtime, confirmations, handles };
+}
+
+test("Command helpers confirm new sessions before requesting replacement", async t => {
+  const events: string[] = [], fixture = commandConfirmationFixture();
+  t.after(() => fixture.runtime.shutdown());
+  const target = { chatId: 42, threadId: 123, replyToMessageId: 99 };
+  const deps = { confirmations: fixture.confirmations,
+    sendInteractiveMessage: async (chatId: number, text: string, mode: string,
+      markup: Delivery.TelegramDeliveryView["replyMarkup"], options?: { target?: { chatId: number; threadId?: number } }) => {
+      events.push(`${chatId}:${mode}:${text}`, JSON.stringify(markup!.inline_keyboard), JSON.stringify(options));
+      return 77;
+    } };
+  await openTelegramNewConfirmation(target, deps);
+  const id = fixture.handles.at(-1)!.id;
+  assert.deepEqual(events, ["42:html:<b>Start a new session?</b>",
+    JSON.stringify([[{ text: "🆕 Yes, start new", callback_data: `tgconfirm:${id}:yes` },
+      { text: "❌ No", callback_data: `tgconfirm:${id}:no` }]]),
+    '{"target":{"chatId":42,"threadId":123}}']);
   events.length = 0;
-  assert.equal(await handleTelegramNewConfirmationCallback(
-    { id: "cancel", data: "new:cancel", message: { chat: { id: 42 }, message_id: 77 } },
-    {
-      ctx: {},
-      answerCallbackQuery: async (id) => { events.push(`answer:${id}`); },
-      editInteractiveMessage: async (_chatId, _messageId, text, _mode, markup) => {
-        events.push(text);
-        events.push(JSON.stringify(markup.inline_keyboard));
-      },
-      deleteMessage: async () => { events.push("unexpected:delete"); },
-      runNew: async () => { events.push("unexpected:run"); },
+  const cancelledQuery = { id: "cancel", data: `tgconfirm:${id}:no`, from: { id: 42 },
+    message: { chat: { id: 42 }, message_id: 77, message_thread_id: 123 } };
+  const cancelled = fixture.confirmations.acceptConfirmation(cancelledQuery);
+  assert.ok(cancelled.handled && cancelled.accepted);
+  assert.equal(await handleTelegramNewConfirmationCallback(cancelledQuery, {
+    ctx: {}, answerCallbackQuery: async id => { events.push(`answer:${id}`); },
+    editInteractiveMessage: async (_chat, _message, text, _mode, markup) => {
+      events.push(text, JSON.stringify(markup.inline_keyboard));
     },
-  ), true);
+    deleteMessage: async () => assert.fail("Cancelled dialogs never delete"),
+    runNew: async () => assert.fail("Cancelled dialogs never run"),
+  }, cancelled), true);
   assert.deepEqual(events, ["<b>🚫 New session cancelled.</b>", "[]", "answer:cancel"]);
+  await openTelegramNewConfirmation(target, deps);
   events.length = 0;
-  assert.equal(await handleTelegramNewConfirmationCallback(
-    { id: "confirm", data: "new:confirm", message: { chat: { id: 42 }, message_id: 77 } },
-    {
-      ctx: { id: "ctx" },
-      answerCallbackQuery: async (id) => { events.push(`answer:${id}`); },
-      editInteractiveMessage: async (_chatId, _messageId, text) => { events.push(text); },
-      deleteMessage: async (chatId, messageId) => { events.push(`delete:${chatId}:${messageId}`); },
-      runNew: async (ctx) => { events.push(`run:${(ctx as { id: string }).id}`); },
-    },
-  ), true);
-  assert.deepEqual(events, [
-    "answer:confirm",
-    "delete:42:77",
-    "run:ctx",
-  ]);
+  const confirmedQuery = { ...cancelledQuery, id: "confirm", data: `tgconfirm:${fixture.handles.at(-1)!.id}:yes` };
+  const confirmed = fixture.confirmations.acceptConfirmation(confirmedQuery);
+  assert.ok(confirmed.handled && confirmed.accepted);
+  assert.equal(await handleTelegramNewConfirmationCallback(confirmedQuery, {
+    ctx: { id: "ctx" }, answerCallbackQuery: async id => { events.push(`answer:${id}`); },
+    editInteractiveMessage: async (_chat, _message, text) => { events.push(text); },
+    deleteMessage: async (chat, message) => { events.push(`delete:${chat}:${message}`); },
+    runNew: async ctx => { events.push(`run:${ctx.id}`); },
+  }, confirmed), true);
+  assert.deepEqual(events, ["answer:confirm", "delete:42:77", "run:ctx"]);
+  assert.deepEqual(fixture.confirmations.acceptConfirmation(confirmedQuery), { handled: true, accepted: false });
 });
 
-test("Command helpers open compact confirmation and handle callbacks", async () => {
-  const events: string[] = [];
+test("Command helpers open compact confirmation and handle callbacks", async t => {
+  const events: string[] = [], fixture = commandConfirmationFixture();
+  t.after(() => fixture.runtime.shutdown());
   const message = { chat: { id: 42 }, message_id: 99, message_thread_id: 123 };
   const handleCommand = createTelegramCommandHandler({
-    hasAbortHandler: () => false,
-    clearPendingModelSwitch: () => {},
-    hasQueuedTelegramItems: () => false,
-    clearQueuedTelegramItems: () => 0,
-    setFoldQueuedPromptsIntoHistory: () => {},
-    abortCurrentTurn: () => {},
-    isIdle: () => true,
-    hasPendingMessages: () => false,
-    hasActiveTelegramTurn: () => false,
-    hasDispatchPending: () => false,
-    isCompactionInProgress: () => false,
-    setCompactionInProgress: () => {
-      events.push("unexpected:compact");
-    },
-    updateStatus: () => {},
-    dispatchNextQueuedTelegramTurn: () => {},
-    compact: () => {},
-    enqueueContinueTurn: async () => {},
-    enqueueControlItem: () => {},
-    showStatus: async () => {},
-    openModelMenu: async () => {},
-    openThinkingMenu: async () => {},
-    openQueueMenu: async () => {},
-    getAllowedUserId: () => 1,
-    persistAllowedUserId: async () => true,
-    registerBotCommands: async () => {},
-    sendTextReply: async () => {},
-    sendInteractiveMessage: async (
-      chatId,
-      text,
-      mode,
-      replyMarkup,
-      options,
-    ) => {
-      events.push(`${chatId}:${mode}:${text}`);
-      events.push(JSON.stringify(replyMarkup.inline_keyboard));
-      events.push(JSON.stringify(options));
+    hasAbortHandler: () => false, clearPendingModelSwitch() {}, hasQueuedTelegramItems: () => false,
+    clearQueuedTelegramItems: () => 0, setFoldQueuedPromptsIntoHistory() {}, abortCurrentTurn() {},
+    isIdle: () => true, hasPendingMessages: () => false, hasActiveTelegramTurn: () => false,
+    hasDispatchPending: () => false, isCompactionInProgress: () => false,
+    setCompactionInProgress() { assert.fail("Opening a question cannot start compaction"); },
+    updateStatus() {}, dispatchNextQueuedTelegramTurn() {}, compact() {}, enqueueContinueTurn: async () => {},
+    enqueueControlItem() {}, showStatus: async () => {}, openModelMenu: async () => {},
+    openThinkingMenu: async () => {}, openQueueMenu: async () => {}, getAllowedUserId: () => 42,
+    persistAllowedUserId: async () => true, registerBotCommands: async () => {}, sendTextReply: async () => {},
+    confirmations: fixture.confirmations,
+    sendInteractiveMessage: async (chatId, text, mode, markup, options) => {
+      events.push(`${chatId}:${mode}:${text}`, JSON.stringify(markup.inline_keyboard), JSON.stringify(options));
       return 77;
     },
   });
   assert.equal(await handleCommand("compact", message, {}), true);
-  assert.deepEqual(events, [
-    "42:html:<b>Compact session?</b>",
-    '[[{"text":"🗜 Yes, compact","callback_data":"compact:confirm"},{"text":"❌ No","callback_data":"compact:cancel"}]]',
-    '{"target":{"chatId":42,"threadId":123}}',
-  ]);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  const id = fixture.handles.at(-1)!.id;
+  assert.deepEqual(events, ["42:html:<b>Compact session?</b>",
+    JSON.stringify([[{ text: "🗜 Yes, compact", callback_data: `tgconfirm:${id}:yes` },
+      { text: "❌ No", callback_data: `tgconfirm:${id}:no` }]]),
+    '{"target":{"chatId":42,"threadId":123}}']);
   events.length = 0;
-  const cancelled = await handleTelegramCompactConfirmationCallback(
-    {
-      id: "cb-cancel",
-      data: "compact:cancel",
-      message: { chat: { id: 42 }, message_id: 77 },
+  const cancelledQuery = { id: "cb-cancel", data: `tgconfirm:${id}:no`, from: { id: 42 },
+    message: { chat: { id: 42 }, message_id: 77, message_thread_id: 123 } };
+  const cancelled = fixture.confirmations.acceptConfirmation(cancelledQuery);
+  assert.ok(cancelled.handled && cancelled.accepted);
+  assert.equal(await handleTelegramCompactConfirmationCallback(cancelledQuery, {
+    ctx: {}, answerCallbackQuery: async id => { events.push(`answer:${id}`); },
+    editInteractiveMessage: async (chat, message, text, mode, markup) => {
+      events.push(`${chat}:${message}:${mode}:${text}`, JSON.stringify(markup.inline_keyboard));
     },
-    {
-      ctx: {},
-      answerCallbackQuery: async (id) => {
-        events.push(`answer:${id}`);
-      },
-      editInteractiveMessage: async (chatId, messageId, text, mode, markup) => {
-        events.push(`${chatId}:${messageId}:${mode}:${text}`);
-        events.push(JSON.stringify(markup.inline_keyboard));
-      },
-      runCompact: async () => {
-        events.push("unexpected:run");
-      },
-    },
-  );
-  assert.equal(cancelled, true);
-  assert.deepEqual(events, [
-    "42:77:html:<b>🚫 Compaction cancelled.</b>",
-    "[]",
-    "answer:cb-cancel",
-  ]);
+    runCompact: async () => assert.fail("Cancelled dialogs never compact"),
+  }, cancelled), true);
+  assert.deepEqual(events, ["42:77:html:<b>🚫 Compaction cancelled.</b>", "[]", "answer:cb-cancel"]);
+  await handleCommand("compact", message, {});
+  await new Promise<void>(resolve => setImmediate(resolve));
   events.length = 0;
-  const confirmed = await handleTelegramCompactConfirmationCallback(
-    {
-      id: "cb-confirm",
-      data: "compact:confirm",
-      message: { chat: { id: 42 }, message_id: 77, message_thread_id: 123 },
+  const confirmedQuery = { ...cancelledQuery, id: "cb-confirm", data: `tgconfirm:${fixture.handles.at(-1)!.id}:yes` };
+  const confirmed = fixture.confirmations.acceptConfirmation(confirmedQuery);
+  assert.ok(confirmed.handled && confirmed.accepted);
+  assert.equal(await handleTelegramCompactConfirmationCallback(confirmedQuery, {
+    ctx: { id: "ctx" }, answerCallbackQuery: async id => { events.push(`answer:${id}`); },
+    editInteractiveMessage: async (chat, message, text, mode, markup) => {
+      events.push(`${chat}:${message}:${mode}:${text}`, JSON.stringify(markup.inline_keyboard));
     },
-    {
-      ctx: { id: "ctx" },
-      answerCallbackQuery: async (id) => {
-        events.push(`answer:${id}`);
-      },
-      editInteractiveMessage: async (chatId, messageId, text, mode, markup) => {
-        events.push(`${chatId}:${messageId}:${mode}:${text}`);
-        events.push(JSON.stringify(markup.inline_keyboard));
-      },
-      runCompact: async (ctx, chatId, messageId, target) => {
-        events.push(
-          `run:${(ctx as { id: string }).id}:${chatId}:${messageId}:${target?.chatId}:${target?.threadId}`,
-        );
-      },
-    },
-  );
-  assert.equal(confirmed, true);
-  assert.deepEqual(events, [
-    "42:77:html:<b>🗜 Compaction started.</b>",
-    "[]",
-    "answer:cb-confirm",
-    "run:ctx:42:77:42:123",
-  ]);
+    runCompact: async (ctx, chat, message, target) => { events.push(`run:${ctx.id}:${chat}:${message}:${target?.chatId}:${target?.threadId}`); },
+  }, confirmed), true);
+  assert.deepEqual(events, ["42:77:html:<b>🗜 Compaction started.</b>", "[]", "answer:cb-confirm", "run:ctx:42:77:42:123"]);
 });
+
+test("Legacy confirmation strings are consumed as expired without operation authority", async () => {
+  const events: string[] = [];
+  for (const command of ["new", "compact"] as const) {
+    const query = { id: "legacy", data: `${command}:confirm`, message: { chat: { id: 42 }, message_id: 77 } };
+    const shared = { ctx: {}, answerCallbackQuery: async (_id: string, text?: string) => { events.push(text!); },
+      editInteractiveMessage: async () => assert.fail("Stale dialogs cannot edit current UI") };
+    assert.equal(command === "new"
+      ? await handleTelegramNewConfirmationCallback(query, { ...shared, deleteMessage: async () => assert.fail("No delete grant"), runNew: async () => assert.fail("No replacement grant") })
+      : await handleTelegramCompactConfirmationCallback(query, { ...shared, runCompact: async () => assert.fail("No compaction grant") }), true);
+  }
+  assert.deepEqual(events, ["Interactive message expired", "Interactive message expired"]);
+});
+
+for (const command of ["new", "compact"] as const) {
+for (const boundary of command === "new" ? ["entry", "ack", "delete"] : ["entry", "edit", "ack"]) {
+test(`Native ${command} confirmation refuses source loss at ${boundary}`, async t => {
+  const f = commandConfirmationFixture();
+  t.after(() => f.runtime.shutdown());
+  const opened = await f.confirmations.openConfirmation({
+    owner: "@llblab/pi-telegram", scope: { kind: "instance" }, question: "Proceed?",
+    confirmLabel: "✅ Yes", cancelLabel: "❌ No", timeoutMs: 60_000, signal: new AbortController().signal,
+  }, { confirmedData: `${command}:confirm`, cancelledData: `${command}:cancel`, publish: async () => 77 });
+  assert.ok(opened.ok);
+  const query = { id: "source", data: `tgconfirm:${opened.handle.id}:yes`, from: { id: 42 },
+    message: { chat: { id: 42 }, message_thread_id: 123, message_id: 77 } };
+  const accepted = f.confirmations.acceptConfirmation(query);
+  assert.ok(accepted.handled && accepted.accepted);
+  let current = boundary !== "entry", effects = 0;
+  const shared = { ctx: {}, assertCurrent() { if (!current) throw new Error("Source expired"); },
+    async answerCallbackQuery() { if (boundary === "ack") { current = false; shared.assertCurrent = () => {}; } },
+    async editInteractiveMessage() { if (boundary === "edit") { current = false; shared.assertCurrent = () => {}; } } };
+  const result = command === "new"
+    ? handleTelegramNewConfirmationCallback(query, { ...shared,
+        async deleteMessage() { if (boundary === "delete") current = false; }, runNew: async () => { effects++; } }, accepted)
+    : handleTelegramCompactConfirmationCallback(query, { ...shared, runCompact: async () => { effects++; } }, accepted);
+  await assert.rejects(result, /Source expired/u);
+  assert.equal(effects, 0);
+  assert.deepEqual(f.confirmations.acceptConfirmation(query), { handled: true, accepted: false });
+});
+}
+}
 
 test("Command helpers defer compact-complete queue dispatch", async () => {
   const events: string[] = [];
@@ -2208,9 +2420,7 @@ test("Command handler target runtime binds command targets into command handling
       calls.push(`continue:${ctx}`);
     },
     compact: () => {},
-    requestNewSession: () => {
-      calls.push("new-session");
-    },
+    requestNewSession: () => assert.fail("A missing confirmation port cannot grant session replacement"),
     allocateItemOrder: () => 0,
     allocateControlOrder: () => 0,
     appendControlItem: (item, ctx) => {
@@ -2307,7 +2517,7 @@ test("Command handler target runtime binds command targets into command handling
     "reply:<b>✅ Automatic Thread display name restored as <i>A</i>.</b>",
     "name-dialog",
     "show:ctx",
-    "new-session",
+    "reply:<b>🚫 Confirmation delivery is unavailable.</b>",
     "request-next-notice",
     "mark-next-abort",
     "abort",
@@ -2520,10 +2730,12 @@ for (const mode of ["unregistered", "duplicate", "bad-path", "reserved", "extens
 }
 
 function createFencedCommandTargetFixture() {
+  const confirmation = commandConfirmationFixture(7, 41);
   const message = { chat: { id: 7, type: "private" }, message_id: 11, message_thread_id: 41, from: { id: 7, is_bot: false } };
   const ctx = { session: "same-live-session" }, effects: string[] = [], diagnostics: string[] = [];
   let current = true, contextCurrent = true;
   const deps: TelegramCommandHandlerTargetRuntimeDeps<typeof message, typeof ctx> = {
+    confirmations: confirmation.confirmations,
     assertExecutionCurrent(value) {
       assert.equal(value, message);
       if (!current) throw new Error("Command source authority revoked");
@@ -2567,7 +2779,7 @@ function createFencedCommandTargetFixture() {
       diagnostics.push(`${detail?.phase}:${(error as Error).message}`);
     },
   };
-  return { message, ctx, deps, effects, diagnostics,
+  return { message, ctx, deps, effects, diagnostics, confirmationRuntime: confirmation.runtime,
     revoke: () => { current = false; }, replaceContext: () => { contextCurrent = false; } };
 }
 
@@ -3794,16 +4006,54 @@ for (const mode of ["entry-mutation", "await-mutation"] as const) {
 }
 
 for (const commandName of ["compact", "new"] as const) {
+for (const boundary of ["captured", "source-loss", "unknown-publication"] as const) {
+test(`Ordinary ${commandName} opens a captured question without replay across ${boundary}`, async t => {
+  const f = createFencedCommandTargetFixture();
+  t.after(() => f.confirmationRuntime.shutdown());
+  let sends = 0;
+  const held = Promise.withResolvers<void>();
+  const outcomes: string[] = [];
+  f.deps.beginCommandEffectWork = () => ({ settle: outcome => { outcomes.push(outcome); } });
+  f.deps.sendInteractiveMessage = async (chatId, _text, _mode, _markup, options) => {
+    if (boundary === "source-loss") await held.promise;
+    assertTelegramApiCallAuthority(options?.assertLocalAuthority, false);
+    assert.deepEqual([chatId, options?.target], [7, { chatId: 7, threadId: 41 }]);
+    sends++;
+    if (boundary === "unknown-publication")
+      throw new TelegramApiCommitUnknownError("sendMessage", new TypeError("fixture response lost"));
+    return 99;
+  };
+  const handle = createTelegramCommandHandlerTargetRuntime(f.deps);
+  assert.equal(await handle(commandName, f.message, f.ctx), true);
+  if (boundary === "captured") {
+    f.message.chat.id = 99; f.message.message_thread_id = 99;
+    f.deps.sendInteractiveMessage = async () => assert.fail("Cannot borrow replacement delivery");
+  }
+  if (boundary === "source-loss") f.revoke();
+  held.resolve();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(sends, boundary === "source-loss" ? 0 : 1);
+  assert.deepEqual(f.effects, [], "Opening a question never acquires business execution");
+  assert.deepEqual(outcomes, [boundary === "unknown-publication" ? "unconfirmed" : "settled"]);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(sends, boundary === "source-loss" ? 0 : 1, "Unknown publication cannot reenter semantic execution");
+});
+}
+}
+
+for (const commandName of ["compact", "new"] as const) {
   const prepare = commandName === "compact" ? "prepareSelectedCompactCommand" : "prepareSelectedNewCommand";
   const confirmationHtml = commandName === "compact" ? "<b>Compact session?</b>" : "<b>Start a new session?</b>";
-  const confirmationMarkup = [[{ text: commandName === "compact" ? "🗜 Yes, compact" : "🆕 Yes, start new", callback_data: commandName + ":confirm" },
-    { text: "❌ No", callback_data: commandName + ":cancel" }]];
 test(`Selected ${commandName} requires its single confirmation leaf and interactive port before admission`, () => {
   const f = createFencedCommandTargetFixture();
   const admission = { assertSourceCurrent() { assert.fail("No source"); }, assertRecipientCurrent() { assert.fail("No recipient"); }, reportCompleted() { assert.fail("No report"); } };
   const command = { name: commandName, args: "" };
   assert.equal(createTelegramCommandHandlerTargetRuntime(f.deps)[prepare](command, [f.message], f.ctx, admission), undefined);
   f.deps.sendInteractiveMessage = async () => assert.fail("No confirmation");
+  const confirmations = f.deps.confirmations;
+  f.deps.confirmations = undefined;
+  assert.equal(createTelegramCommandHandlerTargetRuntime(f.deps)[prepare](command, [f.message], f.ctx, admission), undefined);
+  f.deps.confirmations = confirmations;
   const handler = createTelegramCommandHandlerTargetRuntime(f.deps);
   for (const name of [commandName === "compact" ? "new" : "compact", "name", "status", "extension"]) assert.equal(handler[prepare]({ ...command, name }, [f.message], f.ctx, admission), undefined);
   for (const messages of [[], [f.message, f.message]]) assert.equal(handler[prepare](command, messages, f.ctx, admission), undefined);
@@ -3812,8 +4062,9 @@ test(`Selected ${commandName} requires its single confirmation leaf and interact
 
 for (const mode of ["current", "classic", "busy", "captured", "source-entry", "execution-entry", "recipient-entry", "recipient-source-loss",
   "report-refused", "report-lost", "recipient-after-report", "context-replaced", "recipient-before-effect", "recipient-response", "response-lost", "missing-id"] as const) {
-  test(`Selected ${commandName} handles confirmation once without borrowing compaction or delivery (${mode})`, async () => {
+  test(`Selected ${commandName} handles confirmation once without borrowing compaction or delivery (${mode})`, async t => {
     const f = createFencedCommandTargetFixture(), held = Promise.withResolvers<void>();
+    t.after(() => f.confirmationRuntime.shutdown());
     if (mode === "classic") Reflect.deleteProperty(f.message, "message_thread_id");
     let source = mode !== "source-entry", recipient = mode !== "recipient-entry", reports = 0, sends = 0, delivered = 0;
     if (mode === "execution-entry") f.revoke();
@@ -3825,10 +4076,13 @@ for (const mode of ["current", "classic", "busy", "captured", "source-entry", "e
       assert.equal(reports, 1, "Handled semantics precedes detached delivery");
       assert.deepEqual([chatId, text, format, options?.target], [7, confirmationHtml, "html",
         mode === "classic" ? { chatId: 7 } : { chatId: 7, threadId: 41 }]);
-      assert.deepEqual(markup.inline_keyboard, confirmationMarkup);
-      assert.equal(options?.assertAuthority, assertRecipientCurrent); options?.assertAuthority?.(); sends++;
+      assert.deepEqual(markup.inline_keyboard[0]!.map(button => button.text),
+        [commandName === "compact" ? "🗜 Yes, compact" : "🆕 Yes, start new", "❌ No"]);
+      assert.ok(markup.inline_keyboard[0]!.every(button => /^tgconfirm:[a-f0-9]{32}:(yes|no)$/u.test(button.callback_data!)));
+      assert.equal(options?.assertAuthority, undefined);
+      assert.equal(typeof options?.assertLocalAuthority, "function"); options?.assertLocalAuthority?.(); sends++;
       await held.promise;
-      options?.assertAuthority?.();
+      options?.assertLocalAuthority?.();
       if (mode === "response-lost") throw new Error("Confirmation response lost");
       delivered++;
       return mode === "missing-id" ? undefined : 99;
@@ -3867,12 +4121,13 @@ for (const mode of ["current", "classic", "busy", "captured", "source-entry", "e
     assert.equal(delivered, sendExpected && !["recipient-response", "response-lost"].includes(mode) ? 1 : 0);
     assert.deepEqual(f.effects, [], "No compaction/new session, busy-work mutation, prompt/control admission, fold or menu");
     assert.deepEqual(f.diagnostics, ["recipient-before-effect", "recipient-response"].includes(mode) ? ["confirmation-render:Recipient revoked"]
-      : mode === "response-lost" ? ["confirmation-render:Confirmation response lost"] : []);
+      : mode === "response-lost" ? ["confirmation-render:Confirmation response lost"]
+      : mode === "missing-id" ? ["confirmation-render:Confirmation publication returned no message identity."] : []);
   });
 }
 
-for (const boundary of ["current", "render-loss", "response-loss"] as const) {
-  test(`Selected ${commandName} carries independent authority into actual rendered/direct owners (${boundary})`, async () => {
+for (const direct of [true, false]) for (const boundary of ["current", "render-loss", "response-loss"] as const) {
+  test(`Selected ${commandName} carries independent authority into actual rendered/API owners (direct=${direct}, ${boundary})`, async t => {
     const f = createFencedCommandTargetFixture(), originalFetch = globalThis.fetch, networkFamily = process.env.PI_TELEGRAM_NETWORK_FAMILY;
     delete process.env.PI_TELEGRAM_NETWORK_FAMILY; resetTransportReplyDedup();
     let source = true, recipient = true, reports = 0, requests = 0, owned = 0;
@@ -3886,13 +4141,20 @@ for (const boundary of ["current", "render-loss", "response-loss"] as const) {
       if (boundary === "response-loss") recipient = false;
       return new Response(JSON.stringify({ ok: true, result: { message_id: 99 } }));
     };
-    const api = createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:fixture", recordRuntimeEvent() {} });
+    const native = createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:fixture", recordRuntimeEvent() {} });
+    const proxy = createTelegramBusLeaderApiProxy({ call: native.call, callMultipart: native.callMultipart, downloadFile: native.downloadFile });
+    const api = createTelegramBusAwareApiRuntime({ directRuntime: native, ownsDirect: () => direct,
+      getDefaultTarget: () => ({ chatId: 7, threadId: 41 }),
+      async callFollowerApi(method, args, options) {
+        options?.assertAuthority?.(); const result = await proxy(method, structuredClone(args)); options?.assertAuthority?.(); return result;
+      } });
     const rendered = createTelegramRenderedMessageDeliveryRuntime<unknown>({
       renderTelegramMessage(text) { if (boundary === "render-loss") recipient = false; return [{ text }]; },
-      sendMessage(body, options) { assert.equal(options?.assertAuthority, assertRecipientCurrent); return api.sendMessage(body, options); },
+      sendMessage(body, options) { assert.equal(typeof options?.assertLocalAuthority, "function"); options?.assertLocalAuthority?.(); return api.sendMessage(body, options); },
       editMessage: api.editMessageText, sendRichMessage: api.sendRichMessage, recordOwnership() { owned++; },
     });
     f.deps.sendInteractiveMessage = rendered.sendInteractiveMessage;
+    t.after(() => f.confirmationRuntime.shutdown());
     try {
       const dispatch = createTelegramCommandHandlerTargetRuntime(f.deps)[prepare]({ name: commandName, args: "" }, [f.message], f.ctx, {
         assertSourceCurrent() { assert.ok(source); }, assertRecipientCurrent,
@@ -4859,7 +5121,6 @@ test("Command runtime routes commands through runtime ports", async () => {
     from: { id: 7 },
   };
   let allowedUserId: number | undefined;
-  let compactComplete: (() => void) | undefined;
   let contextActive = true;
   const deps = {
     hasAbortHandler: () => true,
@@ -4892,13 +5153,7 @@ test("Command runtime routes commands through runtime ports", async () => {
     dispatchNextQueuedTelegramTurn: () => {
       events.push("dispatch");
     },
-    compact: (
-      _ctx: { idle: boolean },
-      callbacks: { onComplete: () => void },
-    ) => {
-      events.push("compact:start");
-      compactComplete = callbacks.onComplete;
-    },
+    compact: () => assert.fail("Missing confirmation cannot start compaction"),
     startTypingLoop: (
       _ctx: { idle: boolean },
       chatId?: number,
@@ -4973,7 +5228,6 @@ test("Command runtime routes commands through runtime ports", async () => {
   assert.equal(await handleCommand("continue", message, { idle: true }), true);
   assert.equal(await handleCommand("continue", message, { idle: false }), true);
   assert.equal(await handleCommand("compact", message, { idle: true }), true);
-  compactComplete?.();
   assert.equal(await handleCommand("stop", message, { idle: true }), true);
   assert.equal(await handleCommand("unknown", message, { idle: true }), false);
   const eventCountBeforeStaleCommand = events.length;
@@ -4995,16 +5249,7 @@ test("Command runtime routes commands through runtime ports", async () => {
     "register",
     "continue:99",
     "continue:99",
-    "compact:true",
-    "status",
-    "typing:start:42:42:123",
-    "compact:start",
-    "reply:99:<b>🗜 Compaction started.</b>",
-    "typing:stop",
-    "compact:false",
-    "status",
-    "dispatch",
-    "reply:99:<b>✅ Compaction completed.</b>",
+    "reply:99:<b>🚫 Confirmation delivery is unavailable.</b>",
     "clear-switch",
     "clear-queue",
     "fold:false",
@@ -5720,6 +5965,98 @@ test("Classic successor settles once across same-process and process-replacement
   }
 });
 
+for (const boundary of ["before-removal", "before-dispatch", "before-command", "after-intent"] as const) {
+test(`A confirmed new-session intent cannot outlive its semantic owner at ${boundary}`, async () => {
+  let current = true, replacements = 0, preparations = 0;
+  const dispatched: string[] = [];
+  const action = createTelegramSessionActionRuntime({
+    sendUserMessage: text => { dispatched.push(String(text)); },
+    notifyResult: async () => assert.fail("Expired authority cannot publish into the successor session"),
+    prepareReplacement: async () => { preparations++; if (boundary === "after-intent") current = false; },
+  });
+  assert.equal(action.scheduleAfterUpdate(41, { chatId: 7, messageId: 9 }, { isCurrent: () => current }), true);
+  if (boundary === "before-removal") current = false;
+  action.onUpdateCompleted(41);
+  if (boundary === "before-dispatch") current = false;
+  await new Promise<void>(resolve => setImmediate(resolve));
+  if (boundary === "before-removal" || boundary === "before-dispatch") {
+    assert.deepEqual(dispatched, []);
+  } else {
+    assert.equal(dispatched.length, 1);
+    if (boundary === "before-command") current = false;
+    await action.handleInternalAction(`new ${getInternalCommandToken(dispatched[0]!)}`, {
+      newSession: async () => { replacements++; return { cancelled: false }; },
+      ui: { notify() { assert.fail("A stale armed action is not a manual command"); } },
+    } as unknown as ExtensionCommandContext);
+  }
+  assert.equal(replacements, 0);
+  assert.equal(preparations, boundary === "after-intent" ? 1 : 0);
+  assert.equal(action.hasPending(), false);
+});
+}
+
+test("Fresh new-session authority cannot be released by a stale journal's equal update ID", async () => {
+  let oldCurrent = true;
+  const dispatched: string[] = [];
+  const action = createTelegramSessionActionRuntime({ sendUserMessage: text => { dispatched.push(String(text)); }, notifyResult: async () => {} });
+  assert.equal(action.scheduleAfterUpdate(41, target, { journalBindingKey: "profile-a", isCurrent: () => oldCurrent }), true);
+  oldCurrent = false;
+  assert.equal(action.hasPending(), false);
+  const authority = { journalBindingKey: "profile-b", isCurrent: () => true };
+  assert.equal(action.scheduleAfterUpdate(41, target, authority), true);
+  authority.journalBindingKey = "profile-a"; authority.isCurrent = () => false;
+  action.onUpdateCompleted(41, "profile-a");
+  action.onUpdateCompleted(41);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(dispatched, []);
+  assert.equal(action.hasPending(), true);
+  action.onUpdateCompleted(41, "profile-b");
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(dispatched.length, 1);
+});
+
+test("Quit is reserved and immediate but absent from the bot menu and help", () => {
+  assert.equal(isTelegramReservedCommandName("quit"), true);
+  assert.deepEqual(buildTelegramCommandAction("quit"), { kind: "quit", executionMode: "immediate" });
+  assert.equal(TELEGRAM_BOT_COMMANDS.some(command => command.command === "quit"), false);
+  assert.equal(TELEGRAM_APP_MENU_INTRO_HTML.includes("/quit"), false);
+});
+
+for (const boundary of ["live", "before-removal", "before-dispatch", "after-abort", "abort-error", "shutdown-error", "unavailable"] as const) {
+test(`Quit uses a fresh SDK context and cannot outlive its semantic owner (${boundary})`, async () => {
+  let current = true, oldCalls = 0;
+  const events: string[] = [], errors: string[] = [];
+  let context: { abort(): void; shutdown(): void } | undefined = { abort() { oldCalls++; }, shutdown() { oldCalls++; } };
+  const action = createTelegramSessionActionRuntime({
+    getQuitContext: () => context, sendUserMessage: () => assert.fail("No host command or model prompt for quit"),
+    notifyResult: async () => assert.fail("No replacement notices"),
+    recordRuntimeEvent: category => { errors.push(category); },
+  });
+  assert.equal(action.scheduleAfterUpdate(41, target, { journalBindingKey: "original", isCurrent: () => current }, "quit"), true);
+  assert.equal(action.isQuitting(), true, "Fence covers completion-triggered dispatch before the quit microtask");
+  context = boundary === "unavailable" ? undefined : {
+    abort() { assert.equal(action.isQuitting(), true); events.push("abort"); if (boundary === "after-abort") current = false; if (boundary === "abort-error") throw new Error("injected abort failure"); },
+    shutdown() { events.push("shutdown"); if (boundary === "shutdown-error") throw new Error("injected shutdown failure"); },
+  };
+  action.onUpdateCompleted(41, "foreign");
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(events, []);
+  if (boundary === "before-removal") current = false;
+  action.onUpdateCompleted(41, "original");
+  if (boundary === "before-dispatch") current = false;
+  await new Promise<void>(resolve => setImmediate(resolve));
+  const expected = boundary === "before-removal" || boundary === "before-dispatch" || boundary === "unavailable" ? [] :
+    boundary === "after-abort" ? ["abort"] : ["abort", "shutdown"];
+  assert.deepEqual(events, expected);
+  assert.equal(oldCalls, 0);
+  assert.deepEqual(errors, ["abort-error", "shutdown-error", "unavailable"].includes(boundary) ? ["quit"] : []);
+  assert.equal(action.isQuitting(), boundary === "live" || boundary === "abort-error");
+  action.onUpdateCompleted(41, "original");
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(events, expected, "Unknown/failed shutdown is never automatically replayed");
+});
+}
+
 test("Session action dispatch waits for the exact durable update completion", async () => {
   const harness = createRuntimeHarness();
   assert.equal(harness.runtime.scheduleAfterUpdate(41, target), true);
@@ -5822,4 +6159,90 @@ test("Session action contains failures and emits a terminal failure result", asy
   assert.equal(harness.failures.length, 1);
   assert.match(String(harness.failures[0]), /replacement failed/);
   assert.equal(harness.runtime.hasPending(), false);
+});
+
+test("Slash discovery classifies only bare slash and unrecognized bot-command tokens", () => {
+  const known = new Set(["status", "review"]);
+  const classify = (text: string) => classifyTelegramSlashDiscovery(text, (name) => known.has(name));
+  assert.deepEqual(classify("/"), { kind: "bare" });
+  assert.deepEqual(classify("  /  \n"), { kind: "bare" });
+  assert.deepEqual(classify("/Nope"), { kind: "unknown", name: "nope" });
+  assert.deepEqual(classify("/nope@some_bot with args"), { kind: "unknown", name: "nope" });
+  assert.equal(classify("/status"), undefined, "Recognized names keep their path");
+  assert.equal(classify("/REVIEW now"), undefined, "Recognition is case-insensitive like command parsing");
+  for (const ordinary of ["hello /nope", "/ nope", "/etc/passwd is here", "/skill:review", "/my-cmd", "//", "/" + "a".repeat(65), ""])
+    assert.equal(classify(ordinary), undefined, `Ordinary text stays on the prompt path: ${ordinary}`);
+});
+
+test("Slash catalogue separates the actual bot menu, alphabetic unlisted commands and templates", async () => {
+  clearTelegramExtensionCommands();
+  const disposers = [
+    registerTelegramCommand({ name: "fresh", description: "Start <fresh>", handler: async () => {} }),
+    registerTelegramCommand({ name: "listed", description: "Menu one", showInMenu: true, emoji: "🆕", handler: async () => {} }),
+    registerTelegramCommand({ name: "menu_ignored", showInMenu: true, emoji: "🧩", handler: async () => {} }),
+  ];
+  try {
+    const html = buildTelegramSlashCatalogueHtml({ promptTemplates: [{ command: "triage" }, { command: "fix_tests" }] });
+    assert.match(html, /^<b>📚 Commands:<\/b>/u);
+    for (const name of TELEGRAM_RESERVED_COMMAND_NAMES.filter((name) => name !== "quit" && name !== "help"))
+      assert.match(html, new RegExp(`/${name} — `, "u"), `Public built-in ${name} is listed beyond the curated bot menu`);
+    assert.doesNotMatch(html, /\/quit/u, "Hidden quit stays out of the catalogue");
+    assert.match(html, /\/fresh — Start &lt;fresh&gt;/u, "Menu-hidden companion commands are still public and escaped");
+    assert.match(html, /🆕 \/listed — Menu one/u);
+    const blocks = html.split("\n\n");
+    assert.equal(blocks.length, 4, "Heading plus menu, unlisted and template blocks");
+    const names = (block: string) => block.split("\n").map(line => line.match(/\/([a-z0-9_]+)(?: —|$)/u)?.[1]);
+    let menuNames: string[] = [];
+    await registerTelegramBotCommands({ setMyCommands: async commands => { menuNames = commands.map(command => command.command); } });
+    assert.deepEqual(names(blocks[1]!), menuNames, "The first block exactly follows native menu membership and ordering");
+    assert.deepEqual(names(blocks[2]!), ["fresh", "menu_ignored", "model", "name", "queue", "settings", "status", "thinking"],
+      "showInMenu without a description does not qualify for the actual menu");
+    assert.deepEqual(names(blocks[3]!), ["fix_tests", "triage"]);
+    const unknown = buildTelegramSlashCatalogueHtml({ unknownName: "nope" });
+    assert.match(unknown, /^<b>❓ Unknown command \/nope\.<\/b>\n\n/u);
+    const crowded = buildTelegramSlashCatalogueHtml({
+      promptTemplates: Array.from({ length: 600 }, (_, index) => ({ command: `template_${index}` })),
+    });
+    assert.ok(crowded.length <= 4096, "The catalogue always fits one Telegram message");
+    assert.match(crowded, /<i>…and \d+ more\.<\/i>$/u);
+  } finally {
+    for (const dispose of disposers) dispose();
+    clearTelegramExtensionCommands();
+  }
+});
+
+test("Command or prompt dispatcher answers slash discovery instead of enqueueing", async () => {
+  const events: string[] = [], known = new Set(["status", "hostcmd"]);
+  const build = (overrides: Partial<Parameters<typeof createTelegramCommandOrPromptDispatcher<{ text: string }, { id: string }>>[0]> = {}) =>
+    createTelegramCommandOrPromptDispatcher<{ text: string }, { id: string }>({
+      extractRawText: (messages) => messages.map((message) => message.text).join(" "),
+      handleCommand: async (commandName) => commandName === "status",
+      isKnownCommandName: (name) => known.has(name),
+      discoverSlash: async (discovery, message) => {
+        events.push(`discover:${discovery.kind}:${discovery.kind === "unknown" ? discovery.name : ""}:${message.text}`);
+        return true;
+      },
+      replaceMessageText: (message, text) => ({ ...message, text }),
+      enqueueTurn: async (messages) => { events.push(`enqueue:${messages.length}:${messages[0]?.text}`); },
+      ...overrides,
+    });
+  const dispatch = build();
+  await dispatch([{ text: "/" }], { id: "ctx" });
+  await dispatch([{ text: "/nope args" }], { id: "ctx" });
+  await dispatch([{ text: "/status" }], { id: "ctx" });
+  await dispatch([{ text: "/hostcmd run" }], { id: "ctx" });
+  await dispatch([{ text: "/etc/hosts please" }], { id: "ctx" });
+  await dispatch([{ text: "/nope" }, { text: "album tail" }], { id: "ctx" });
+  assert.deepEqual(events, [
+    "discover:bare::/",
+    "discover:unknown:nope:/nope args",
+    "enqueue:1:/hostcmd run",
+    "enqueue:1:/etc/hosts please",
+    "enqueue:2:/nope",
+  ]);
+  events.length = 0;
+  await build({ discoverSlash: async () => false })([{ text: "/nope" }], { id: "ctx" });
+  await build({ discoverSlash: undefined })([{ text: "/" }], { id: "ctx" });
+  await build({ isKnownCommandName: undefined })([{ text: "/nope" }], { id: "ctx" });
+  assert.deepEqual(events, ["enqueue:1:/nope", "enqueue:1:/", "enqueue:1:/nope"], "Declined or unwired discovery keeps the ordinary prompt path");
 });

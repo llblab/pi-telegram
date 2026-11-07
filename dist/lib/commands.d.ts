@@ -5,12 +5,14 @@
  */
 import type { TelegramActivityPublicationWork } from "./activity.ts";
 import { type TelegramConfigStore } from "./config.ts";
+import type * as Delivery from "./delivery.ts";
+import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
 import type * as Pi from "./pi.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
 import type { TelegramPromptTemplateCommand } from "./prompt-templates.ts";
 import { createTelegramControlItemBuilder, type PendingTelegramControlItem, type TelegramControlQueueController, type TelegramControlQueueControllerDeps, type TelegramQueueAdmissionReceipt } from "./queue.ts";
 import { type TelegramBridgeStatusLineOptions } from "./status.ts";
-import { type TelegramApiCallOptions } from "./telegram-api.ts";
+import { type TelegramApiCallOptions, type TelegramApiUiAuthorityOptions } from "./telegram-api.ts";
 import type { TelegramTarget } from "./target.ts";
 import type { TelegramSessionReplacementIntent } from "./threads.ts";
 import { type TelegramDeferredSourceEvidence, type TelegramLiveSourceCompletionReadiness, type TelegramQueueAdmissionReceiptLike } from "./updates.ts";
@@ -113,6 +115,13 @@ interface RegisteredTelegramExtensionCommand {
     handler: TelegramExtensionCommandRegistration["handler"];
     selected?: Readonly<TelegramExtensionCommandRegistration["selected"]>;
 }
+/** Passive enrollment history only; never grants handler execution or physical-source disposition. */
+export interface TelegramExtensionCommandExclusion {
+    readonly name: string;
+    assertCurrent(): void;
+}
+/** Canonical parsed name only; foreign/absent entries are non-matches without getter/handler/prepare probes. */
+export declare function captureTelegramExtensionCommandExclusion(name: string): Readonly<TelegramExtensionCommandExclusion> | undefined;
 export declare function registerTelegramCommand(registration: TelegramExtensionCommandRegistration): () => void;
 export declare function findTelegramExtensionCommand(name: string | undefined): RegisteredTelegramExtensionCommand | undefined;
 /** Preparation only: no execution, admission, source freeze or binding effects. Routing owns those later. */
@@ -138,6 +147,7 @@ export declare const TELEGRAM_COMMAND_EMOJI: {
     readonly stop: "🟥";
     readonly name: "🏷️";
     readonly new: "🆕";
+    readonly quit: "🚪";
 };
 export type TelegramCommandEmojiName = keyof typeof TELEGRAM_COMMAND_EMOJI;
 export declare function formatTelegramCommandEmojiPrefix(command: TelegramCommandEmojiName): string;
@@ -217,7 +227,7 @@ export declare function createTelegramThreadDisplayNameRenameBinding(): {
     rename: TelegramThreadDisplayNameRenamePort;
 };
 export declare function registerTelegramBridgeCommands(pi: ExtensionAPI, deps: TelegramBridgeCommandRegistrationDeps): void;
-export declare const TELEGRAM_RESERVED_COMMAND_NAMES: readonly ["stop", "name", "new", "abort", "next", "continue", "status", "queue", "compact", "model", "thinking", "settings", "help", "start"];
+export declare const TELEGRAM_RESERVED_COMMAND_NAMES: readonly ["stop", "name", "new", "quit", "abort", "next", "continue", "status", "queue", "compact", "model", "thinking", "settings", "help", "start"];
 export type TelegramReservedCommandName = (typeof TELEGRAM_RESERVED_COMMAND_NAMES)[number];
 export declare function isTelegramReservedCommandName(commandName: string | undefined): commandName is TelegramReservedCommandName;
 export type TelegramCommandAction = {
@@ -231,6 +241,9 @@ export type TelegramCommandAction = {
     executionMode: "immediate";
 } | {
     kind: "new";
+    executionMode: "immediate";
+} | {
+    kind: "quit";
     executionMode: "immediate";
 } | {
     kind: "abort";
@@ -268,6 +281,7 @@ export interface TelegramCommandActionDeps<TMessage, TContext> {
     handleStop: (message: TMessage, ctx: TContext) => Promise<void>;
     handleName: (message: TMessage, ctx: TContext, name: string) => Promise<void>;
     handleNew: (message: TMessage, ctx: TContext) => Promise<void>;
+    handleQuit?: (message: TMessage, ctx: TContext) => Promise<void>;
     handleAbort: (message: TMessage, ctx: TContext) => Promise<void>;
     handleNext: (message: TMessage, ctx: TContext) => Promise<void>;
     handleContinue: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -294,12 +308,7 @@ export interface TelegramStopCommandDeps {
 export interface TelegramRuntimeEventRecorderPort {
     recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
 }
-export interface TelegramCompactConfirmationReplyMarkup {
-    inline_keyboard: {
-        text: string;
-        callback_data: string;
-    }[][];
-}
+export type TelegramCompactConfirmationReplyMarkup = TelegramInlineKeyboardMarkup;
 /** Pi or Telegram work that must drain before a session-level command may replace or compact the session. */
 export interface TelegramSessionBusyPorts {
     isIdle: () => boolean;
@@ -326,12 +335,12 @@ export interface TelegramCompactCommandDeps extends TelegramRuntimeEventRecorder
     suppressStartNotice?: boolean;
 }
 export interface TelegramCompactConfirmationDeps {
-    sendInteractiveMessage: (chatId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: TelegramCompactConfirmationReplyMarkup, options?: {
+    confirmations?: Delivery.TelegramDeliveryConfirmationPort;
+    sendInteractiveMessage: (chatId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: TelegramCompactConfirmationReplyMarkup, options?: TelegramApiUiAuthorityOptions & {
         target?: {
             chatId: number;
             threadId?: number;
         };
-        assertAuthority?: TelegramApiCallOptions["assertAuthority"];
     }) => Promise<number | undefined>;
 }
 export interface TelegramCompactConfirmationCallbackQuery {
@@ -347,6 +356,7 @@ export interface TelegramCompactConfirmationCallbackQuery {
 }
 export interface TelegramNewConfirmationCallbackDeps<TContext> {
     ctx: TContext;
+    assertCurrent?: () => void;
     answerCallbackQuery: (callbackQueryId: string, text?: string) => Promise<void>;
     editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: TelegramCompactConfirmationReplyMarkup) => Promise<void>;
     deleteMessage: (chatId: number, messageId: number) => Promise<void>;
@@ -354,6 +364,7 @@ export interface TelegramNewConfirmationCallbackDeps<TContext> {
 }
 export interface TelegramCompactConfirmationCallbackDeps<TContext> {
     ctx: TContext;
+    assertCurrent?: () => void;
     answerCallbackQuery: (callbackQueryId: string, text?: string) => Promise<void>;
     editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: TelegramCompactConfirmationReplyMarkup) => Promise<void>;
     runCompact: (ctx: TContext, chatId: number, replyToMessageId: number, target?: {
@@ -427,6 +438,10 @@ export interface TelegramCommandOrPromptDispatcherDeps<TMessage, TContext> {
     handleCommand: (commandName: string | undefined, message: TMessage, ctx: TContext, commandArgs?: string) => Promise<boolean>;
     executeExtensionCommand?: (command: ParsedTelegramCommand, message: TMessage, ctx: TContext) => Promise<boolean>;
     expandPromptTemplateCommand?: (commandName: string, args: string) => string | undefined;
+    /** Every executable name (built-ins, companion commands, templates, Pi commands); omitted disables slash discovery. */
+    isKnownCommandName?: (name: string) => boolean;
+    /** Answers a discovery request; false keeps the message on the ordinary prompt path. */
+    discoverSlash?: (discovery: TelegramSlashDiscovery, message: TMessage, ctx: TContext) => Promise<boolean>;
     replaceMessageText: (message: TMessage, text: string) => TMessage;
     enqueueTurn: (messages: TMessage[], ctx: TContext) => Promise<void>;
     assertExecutionCurrent?: (message: TMessage) => void;
@@ -503,6 +518,7 @@ export interface TelegramCommandRuntimeDeps<TMessage extends TelegramCommandRunt
         parseMode?: "HTML";
     }) => Promise<void>) | undefined;
     sendInteractiveMessage?: TelegramCompactConfirmationDeps["sendInteractiveMessage"];
+    confirmations?: Delivery.TelegramDeliveryConfirmationPort;
     assertExecutionCurrent?: (message: TMessage) => void;
 }
 export declare const TELEGRAM_APP_MENU_INTRO_HTML: string;
@@ -512,6 +528,23 @@ export declare function createTelegramAppMenuHtmlBuilder<TContext>(deps: {
     getPromptTemplateCommands?: () => readonly TelegramPromptTemplateMenuCommand[];
 }): (ctx: TContext) => string;
 export declare function parseTelegramCommand(text: string): ParsedTelegramCommand | undefined;
+/** A lone `/` asks for the command catalogue; a bot-command-shaped token nothing recognizes gets it with a refusal. */
+export type TelegramSlashDiscovery = {
+    kind: "bare";
+} | {
+    kind: "unknown";
+    name: string;
+};
+/**
+ * Classifies slash text for discovery only after every executable owner (built-ins, companion commands, prompt
+ * templates, Pi commands) declined it; `isKnownName` must cover all of them so recognized names keep their path.
+ */
+export declare function classifyTelegramSlashDiscovery(text: string, isKnownName: (name: string) => boolean): TelegramSlashDiscovery | undefined;
+/** Full public catalogue: built-ins, registered companion commands and prompt templates, bounded to one message. */
+export declare function buildTelegramSlashCatalogueHtml(input: {
+    unknownName?: string;
+    promptTemplates?: readonly TelegramPromptTemplateMenuCommand[];
+}): string;
 export declare const TELEGRAM_COMMAND_ACTIONS: {
     readonly stop: {
         readonly kind: "stop";
@@ -523,6 +556,10 @@ export declare const TELEGRAM_COMMAND_ACTIONS: {
     };
     readonly new: {
         readonly kind: "new";
+        readonly executionMode: "immediate";
+    };
+    readonly quit: {
+        readonly kind: "quit";
         readonly executionMode: "immediate";
     };
     readonly abort: {
@@ -605,8 +642,15 @@ export declare function handleTelegramNextCommand(deps: {
     }) => Promise<void>) | undefined;
 }): Promise<void>;
 export declare function openTelegramNewConfirmation(target: TelegramCommandMessageTarget, deps: TelegramCompactConfirmationDeps, assertAuthority?: TelegramApiCallOptions["assertAuthority"]): Promise<void>;
-export declare function handleTelegramNewConfirmationCallback<TContext>(query: TelegramCompactConfirmationCallbackQuery, deps: TelegramNewConfirmationCallbackDeps<TContext>): Promise<boolean>;
-export declare function handleTelegramCompactConfirmationCallback<TContext>(query: TelegramCompactConfirmationCallbackQuery, deps: TelegramCompactConfirmationCallbackDeps<TContext>): Promise<boolean>;
+type TelegramConfirmationAcceptance = Extract<Delivery.TelegramDeliveryConfirmationAcceptance, {
+    accepted: true;
+}>;
+export declare function handleTelegramNewConfirmationCallback<TContext>(query: TelegramCompactConfirmationCallbackQuery, deps: TelegramNewConfirmationCallbackDeps<TContext>, confirmation?: TelegramConfirmationAcceptance): Promise<boolean>;
+/** Native quit publishes intent feedback but never terminates inside the inbound handler. */
+export declare function handleTelegramQuitConfirmationCallback<TContext>(query: TelegramCompactConfirmationCallbackQuery, deps: Pick<TelegramNewConfirmationCallbackDeps<TContext>, "assertCurrent" | "answerCallbackQuery" | "editInteractiveMessage"> & {
+    requestQuit?: () => void;
+}, confirmation?: TelegramConfirmationAcceptance): Promise<boolean>;
+export declare function handleTelegramCompactConfirmationCallback<TContext>(query: TelegramCompactConfirmationCallbackQuery, deps: TelegramCompactConfirmationCallbackDeps<TContext>, confirmation?: TelegramConfirmationAcceptance): Promise<boolean>;
 export interface TelegramNewCommandDeps extends TelegramRuntimeEventRecorderPort, TelegramSessionBusyPorts {
     requestNewSession?: () => void;
     sendTextReply: (text: string, options?: {
@@ -666,6 +710,7 @@ export declare const TELEGRAM_CONNECT_COMMAND_NAME = "telegram-connect";
 export declare const TELEGRAM_INTERNAL_COMMAND_FLAG = "--internal";
 export declare const TELEGRAM_INTERNAL_MANUAL_USE_MESSAGE = "This internal Telegram action cannot be run manually.";
 export interface TelegramSessionActionRuntimeDeps {
+    getQuitContext?: () => Pick<Pi.ExtensionContext, "abort" | "shutdown"> | undefined;
     sendUserMessage: Pi.ExtensionAPI["sendUserMessage"];
     notifyResult: (target: {
         chatId: number;
@@ -676,7 +721,7 @@ export interface TelegramSessionActionRuntimeDeps {
         chatId: number;
         threadId?: number;
         messageId: number;
-    }) => Promise<void>;
+    }, isCurrent?: () => boolean) => Promise<void>;
     recordRuntimeEvent?: (category: string, error: unknown) => void;
 }
 export interface TelegramSessionReplacementSettlementDeps {
@@ -697,6 +742,7 @@ export interface TelegramSessionReplacementSettlementDeps {
 }
 export declare function settleTelegramSessionReplacement(deps: TelegramSessionReplacementSettlementDeps): Promise<"none" | "settled" | "expired" | "failed" | "stale">;
 export interface TelegramSessionActionAssemblyDeps {
+    getQuitContext?: TelegramSessionActionRuntimeDeps["getQuitContext"];
     sendUserMessage: Pi.ExtensionAPI["sendUserMessage"];
     store: {
         load: () => Promise<void>;
@@ -751,15 +797,30 @@ export declare function createTelegramSessionActionAssembly(deps: TelegramSessio
         onSessionStart: (ctx: Pi.ExtensionContext) => void;
     };
 };
+interface TelegramSessionActionAuthority {
+    isCurrent?: () => boolean;
+    journalBindingKey?: string;
+}
 export interface TelegramSessionActionRuntime {
     handleInternalAction: (args: string, ctx: Pi.ExtensionCommandContext) => Promise<void>;
     scheduleAfterUpdate: (updateId: number, target: {
         chatId: number;
         threadId?: number;
         messageId: number;
-    }) => boolean;
-    onUpdateCompleted: (updateId: number) => void;
+    }, authority?: TelegramSessionActionAuthority, operation?: "new" | "quit") => boolean;
+    onUpdateCompleted: (updateId: number, journalBindingKey?: string) => void;
     hasPending: () => boolean;
+    isQuitting: () => boolean;
 }
+/** Bind native lifecycle requests to their original source and semantic session, never a cached Pi context. */
+export declare function createTelegramSessionActionRequests(deps: {
+    getSessionGeneration: () => number;
+    getProfileName: () => string | undefined;
+    getOperatorId: () => number | undefined;
+    scheduleAfterUpdate: TelegramSessionActionRuntime["scheduleAfterUpdate"];
+}): {
+    requestNewSession(source: unknown): void;
+    requestQuit(source: unknown): void;
+};
 export declare function createTelegramSessionActionRuntime(deps: TelegramSessionActionRuntimeDeps): TelegramSessionActionRuntime;
 export {};

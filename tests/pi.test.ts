@@ -6,6 +6,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as Pi from "../lib/pi.ts";
 
 import {
   canStartPollingInExtensionContext,
@@ -40,6 +41,216 @@ function createHarnessModel(id: string): PiRuntimeModel {
 function getHarnessModelId(model: PiRuntimeModel): string {
   return String(Reflect.get(Object(model), "id"));
 }
+
+test("Original Pi command provider capture pins API callable without lookup effects", () => {
+  let calls = 0, receiver: unknown;
+  const api = { getCommands() { calls++; receiver = this; return []; } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0];
+  const ports = createExtensionApiRuntimePorts(api, true);
+  assert.equal(typeof ports.captureCommandProvider, "function");
+  const capture = ports.captureCommandProvider!(); assert.equal(Pi.readPiCommandProviderCapture(capture, ports), capture); assert.equal(calls, 0); assert.equal(capture.assertCallable(), undefined);
+  assert.deepEqual(capture.getCommands(), []); assert.equal(calls, 1); assert.equal(receiver, api); assert.ok(Object.isFrozen(capture));
+});
+
+
+for (const kind of ["api-method", "api-getter", "api-inherited", "port-method", "port-getter", "capture-method", "capture-getter"] as const)
+test(`Original Pi command provider observed own-data loss is sticky without getter probes (${kind})`, () => {
+  let calls = 0, gets = 0;
+  const api = { getCommands() { calls++; return []; } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0];
+  const ports = createExtensionApiRuntimePorts(api, true), originalCapture = ports.captureCommandProvider!, proof = originalCapture();
+  const apiDescriptor = Object.getOwnPropertyDescriptor(api, "getCommands")!, portDescriptor = Object.getOwnPropertyDescriptor(ports, "getCommands")!, captureDescriptor = Object.getOwnPropertyDescriptor(ports, "captureCommandProvider")!, prototype = Object.getPrototypeOf(api);
+  try {
+    if (kind === "api-method") api.getCommands = () => [];
+    if (kind === "api-getter") Object.defineProperty(api, "getCommands", { get() { gets++; return apiDescriptor.value; }, configurable: true });
+    if (kind === "api-inherited") { delete (api as unknown as Record<string, unknown>).getCommands; Object.setPrototypeOf(api, { getCommands: apiDescriptor.value }); }
+    if (kind === "port-method") ports.getCommands = () => [];
+    if (kind === "port-getter") Object.defineProperty(ports, "getCommands", { get() { gets++; return portDescriptor.value; }, configurable: true });
+    if (kind === "capture-method") ports.captureCommandProvider = () => proof;
+    if (kind === "capture-getter") Object.defineProperty(ports, "captureCommandProvider", { get() { gets++; return originalCapture; }, configurable: true });
+    assert.throws(proof.assertCallable, /command provider callable/); assert.throws(originalCapture, /command provider callable/); assert.throws(proof.getCommands, /command provider callable/);
+    assert.equal(calls, 0); assert.equal(gets, 0);
+  } finally { Object.setPrototypeOf(api, prototype); Object.defineProperty(api, "getCommands", apiDescriptor); Object.defineProperty(ports, "getCommands", portDescriptor); Object.defineProperty(ports, "captureCommandProvider", captureDescriptor); }
+  assert.throws(proof.assertCallable, /command provider callable/); assert.throws(originalCapture, /command provider callable/); assert.equal(calls, 0);
+  assert.deepEqual(ports.getCommands(), []); assert.equal(calls, 1, "Ordinary dynamic ports are not adopted into the private capture policy");
+});
+
+for (const kind of ["copy", "prototype", "proxy", "getters", "foreign-api", "foreign-ports", "proxy-ports"] as const)
+test(`Original Pi command provider native reader rejects intrinsic peers before probes without revoking genuine owner (${kind})`, () => {
+  let calls = 0, gets = 0;
+  const api = { getCommands() { calls++; return []; } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0], ports = createExtensionApiRuntimePorts(api, true), proof = ports.captureCommandProvider!();
+  let value: unknown = proof, receiver = ports;
+  if (kind === "copy") value = { ...proof };
+  if (kind === "prototype") value = Object.create(proof);
+  if (kind === "proxy") value = new Proxy(proof, { get() { gets++; throw Error("No provider proxy get"); }, has() { gets++; throw Error("No provider proxy has"); }, getPrototypeOf() { gets++; throw Error("No provider proxy prototype"); } });
+  if (kind === "getters") value = Object.defineProperties({}, { getCommands: { get() { gets++; throw Error("No getter"); } }, assertCallable: { get() { gets++; throw Error("No guard getter"); } } });
+  if (kind === "foreign-api") { receiver = createExtensionApiRuntimePorts({ getCommands: api.getCommands } as typeof api, true); }
+  if (kind === "foreign-ports") receiver = { ...ports };
+  if (kind === "proxy-ports") receiver = new Proxy(ports, { get() { gets++; throw Error("No ports proxy probe"); } });
+  assert.equal(Pi.readPiCommandProviderCapture(value, receiver), undefined); assert.equal(gets, 0); assert.equal(calls, 0);
+  assert.equal(Pi.readPiCommandProviderCapture(proof, ports), proof); proof.assertCallable(); assert.deepEqual(proof.getCommands(), []); assert.equal(calls, 1);
+});
+
+for (const value of [false, 0, "true", {}, true])
+test(`Original Pi command provider rejects invalid policy or missing callable (${JSON.stringify(value)})`, () => {
+  assert.throws(() => createExtensionApiRuntimePorts({} as never, value as never), /Original Pi command provider requires/);
+});
+
+for (const kind of ["accessor", "inherited", "proxy", "function-proxy"] as const)
+test(`Original Pi command provider construction requires original own-data API without probes (${kind})`, () => {
+  let gets = 0;
+  const source = { getCommands() { gets++; return []; } };
+  const api = kind === "accessor" ? Object.defineProperty({}, "getCommands", { get() { gets++; return source.getCommands; } }) : kind === "inherited" ? Object.create(source) : kind === "function-proxy" ? { getCommands: new Proxy(source.getCommands, { apply() { gets++; throw Error("No callable proxy"); } }) } : new Proxy(source, { get() { gets++; throw Error("No proxy get"); }, getOwnPropertyDescriptor() { gets++; throw Error("No proxy descriptor"); }, getPrototypeOf() { gets++; throw Error("No proxy prototype"); } });
+  assert.throws(() => createExtensionApiRuntimePorts(api, true), /Original Pi command provider requires/); assert.equal(gets, 0);
+});
+
+for (const boundary of ["method", "getter", "port", "capture"] as const)
+test(`Original Pi command provider final callback barrier withholds returned data after native slot loss (${boundary})`, () => {
+  let gets = 0, calls = 0; const list: Pi.PiSlashCommandInfo[] = [];
+  const api = { getCommands() {
+    calls++;
+    if (boundary === "method") api.getCommands = () => list;
+    if (boundary === "getter") Object.defineProperty(api, "getCommands", { configurable: true, get() { gets++; return () => list; } });
+    if (boundary === "port") ports.getCommands = () => list;
+    if (boundary === "capture") ports.captureCommandProvider = () => proof;
+    return list;
+  } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0];
+  const ports = createExtensionApiRuntimePorts(api, true), proof = ports.captureCommandProvider!();
+  assert.throws(proof.getCommands, /command provider callable/); assert.equal(calls, 1); assert.equal(gets, 0);
+  assert.throws(proof.assertCallable, /command provider callable/); assert.throws(proof.getCommands, /command provider callable/); assert.equal(calls, 1);
+});
+
+for (const reentry of ["read", "capture", "guard", "invoke"] as const)
+test(`Original Pi command provider caught native reentry poisons the outer synchronous observation (${reentry})`, () => {
+  let calls = 0;
+  const api = { getCommands() {
+    calls++;
+    try {
+      if (reentry === "read") Pi.readPiCommandProviderCapture(proof, ports);
+      if (reentry === "capture") ports.captureCommandProvider!();
+      if (reentry === "guard") proof.assertCallable();
+      if (reentry === "invoke") proof.getCommands();
+    } catch {}
+    return [];
+  } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0];
+  const ports = createExtensionApiRuntimePorts(api, true), proof = ports.captureCommandProvider!();
+  assert.throws(proof.getCommands, /command provider callable/); assert.equal(calls, 1); assert.throws(proof.assertCallable, /command provider callable/);
+});
+
+for (const kind of ["error", "object", "thenable"] as const)
+test(`Original Pi command provider refuses unknown callback outcomes without renewal or late getter probes (${kind})`, () => {
+  let gets = 0, calls = 0; const cause = new Error("SDK API instance ended");
+  const api = { getCommands() { calls++; if (kind === "error") throw cause; return kind === "thenable" ? Object.defineProperty({}, "then", { get() { gets++; throw Error("No thenable probe"); } }) : {}; } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0];
+  const ports = createExtensionApiRuntimePorts(api, true), proof = ports.captureCommandProvider!();
+  if (kind === "error") assert.throws(proof.getCommands, error => error === cause); else assert.throws(proof.getCommands, /command provider callable/);
+  assert.equal(gets, 0); assert.equal(calls, 1); assert.throws(proof.getCommands, /command provider callable/); assert.equal(calls, 1);
+});
+
+test("Original Pi command provider pins intrinsic reader and rejects constructor substitution", () => {
+  const api = { getCommands() { return []; } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0], ports = createExtensionApiRuntimePorts(api, true), proof = ports.captureCommandProvider!();
+  const ctor = Object.getPrototypeOf(proof).constructor as { new(...args: unknown[]): unknown; read: (...args: unknown[]) => unknown }, read = ctor.read;
+  try {
+    assert.throws(() => new ctor(Symbol(), api, api.getCommands, ports, ports.getCommands, ports.captureCommandProvider), /command provider callable/);
+    ctor.read = () => Object.freeze({ ...proof }); assert.equal(Pi.readPiCommandProviderCapture(proof, ports), proof); assert.equal(ports.captureCommandProvider!(), proof);
+  } finally { ctor.read = read; }
+});
+
+test("Original Pi command provider callable proof is not inner catalog or result ownership", () => {
+  const first: Pi.PiSlashCommandInfo[] = [{ name: "template", source: "prompt", sourceInfo: { path: "/fixture/template.md" } as never }], second = structuredClone(first);
+  let inner = () => first;
+  const api = { getCommands() { return inner(); } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0], ports = createExtensionApiRuntimePorts(api, true), proof = ports.captureCommandProvider!();
+  assert.equal(proof.getCommands(), first); inner = () => second; assert.equal(proof.getCommands(), second); assert.deepEqual(first, second); proof.assertCallable();
+  assert.equal(ports.captureCommandProvider!(), proof); assert.equal(Object.isFrozen(proof), true);
+});
+
+for (const kind of ["accessor", "inherited", "replacement"] as const)
+test(`Original Pi command provider omission preserves trusted dynamic/getter semantics (${kind})`, () => {
+  let gets = 0, calls = 0, receiver: unknown;
+  const original = function(this: unknown) { calls++; receiver = this; return []; };
+  const api = (kind === "accessor" ? Object.defineProperty({}, "getCommands", { configurable: true, get() { gets++; return original; } }) : kind === "inherited" ? Object.create({ getCommands: original }) : { getCommands: original }) as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0];
+  const ports = createExtensionApiRuntimePorts(api); assert.equal(ports.captureCommandProvider, undefined); assert.equal(Object.hasOwn(ports, "captureCommandProvider"), false); assert.equal(gets, 0);
+  if (kind === "replacement") api.getCommands = original.bind(api);
+  assert.deepEqual(ports.getCommands(), []); assert.equal(receiver, api); assert.equal(calls, 1); assert.equal(gets, kind === "accessor" ? 1 : 0);
+});
+
+for (const mode of ["released", "observed-loss", "retained-capture"] as const)
+test(`Original Pi command provider lifetimes collect without a parallel provider registry (${mode})`, async () => {
+  const api = { getCommands() { return []; } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0], ordinary = createExtensionApiRuntimePorts(api);
+  const gc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+  const state = await (async () => {
+    const ports = createExtensionApiRuntimePorts(api, true), proof = ports.captureCommandProvider!(); proof.assertCallable();
+    if (mode === "observed-loss") { api.getCommands = () => []; assert.throws(proof.assertCallable, /command provider callable/); }
+    return { weakPorts: new WeakRef(ports), weakProof: new WeakRef(proof), retained: mode === "retained-capture" ? proof : undefined };
+  })();
+  try {
+    if (gc) {
+      if (state.retained) {
+        await new Promise(resolve => setImmediate(resolve)); gc(); await new Promise(resolve => setImmediate(resolve)); assert.ok(state.weakPorts.deref()); state.retained.assertCallable();
+      }
+      state.retained = undefined; let collected = false;
+      for (let i = 0; i < 60; i++) { await new Promise(resolve => setImmediate(resolve)); gc(); await new Promise(resolve => setImmediate(resolve)); if (state.weakProof.deref() === undefined && state.weakPorts.deref() === undefined) { collected = true; break; } }
+      assert.ok(collected); assert.deepEqual(ordinary.getCommands(), []);
+      console.log(JSON.stringify({ kind: "pi-command-provider-gc", mode, portsCollected: true, captureCollected: true, ordinaryApiStillOwned: true }));
+    }
+    assert.deepEqual(ordinary.getCommands(), []);
+  } finally { state.retained = undefined; }
+});
+
+test("Original Pi command provider invocation does not consult the callable call property", () => {
+  let gets = 0, receiver: unknown;
+  const api = { getCommands() { receiver = this; return []; } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0];
+  Object.defineProperty(api.getCommands, "call", { get() { gets++; throw Error("No callable call getter"); } });
+  const ports = createExtensionApiRuntimePorts(api, true), proof = ports.captureCommandProvider!();
+  let answer: unknown, failure: unknown; try { answer = proof.getCommands(); } catch (error) { failure = error; }
+  assert.equal(failure, undefined); assert.deepEqual(answer, []); assert.equal(gets, 0); assert.equal(receiver, api);
+});
+
+test("Original Pi command provider construction and final-use barrier pin intrinsic data operations", () => {
+  const own = Object.getOwnPropertyDescriptor, apply = Reflect.apply, array = Array.isArray; let gets = 0, answer: unknown, capture: unknown, failure: unknown;
+  const api = { getCommands() {
+    Object.getOwnPropertyDescriptor = (() => { gets++; throw Error("No late descriptor callback"); }) as typeof own;
+    Array.isArray = (() => { gets++; throw Error("No late Array callback"); }) as unknown as typeof array;
+    Reflect.apply = (() => { gets++; throw Error("No late apply callback"); }) as typeof apply;
+    return [];
+  } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0];
+  try {
+    Object.getOwnPropertyDescriptor = (() => { gets++; throw Error("No constructor descriptor callback"); }) as typeof own;
+    const ports = createExtensionApiRuntimePorts(api, true), proof = ports.captureCommandProvider!(); capture = proof;
+    answer = proof.getCommands(); proof.assertCallable();
+  } catch (error) { failure = error; } finally { Object.getOwnPropertyDescriptor = own; Reflect.apply = apply; Array.isArray = array; }
+  assert.equal(failure, undefined); assert.ok(capture); assert.deepEqual(answer, []); assert.equal(gets, 0);
+});
+
+test("Original Pi command provider passive callable facts do not invent hidden SDK activity", () => {
+  let active = true; const ended = new Error("Original SDK API ended");
+  const api = { getCommands() { if (!active) throw ended; return []; } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0];
+  const ports = createExtensionApiRuntimePorts(api, true), proof = ports.captureCommandProvider!(); active = false;
+  assert.equal(proof.assertCallable(), undefined); assert.equal(ports.captureCommandProvider!(), proof);
+  assert.throws(proof.getCommands, error => error === ended); active = true; assert.throws(proof.assertCallable, /command provider callable/);
+});
+
+for (const phase of ["construction", "after-callback"] as const)
+test(`Original Pi command provider accessor descriptor never reads an inherited value getter (${phase})`, () => {
+  let gets = 0, cause: unknown;
+  const accessor = Object.assign(Object.create(null), { configurable: true, get() { gets++; return () => []; } });
+  const pollution = Object.assign(Object.create(null), { configurable: true, get() { gets++; throw Error("No descriptor prototype getter"); } });
+  const api = { getCommands() {
+    Object.defineProperty(api, "getCommands", accessor);
+    Object.defineProperty(Object.prototype, "value", pollution);
+    return [];
+  } } as unknown as Parameters<typeof createExtensionApiRuntimePorts>[0];
+  const previous = Object.getOwnPropertyDescriptor(Object.prototype, "value");
+  if (phase === "construction") Object.defineProperty(api, "getCommands", accessor);
+  try {
+    if (phase === "construction") Object.defineProperty(Object.prototype, "value", pollution);
+    const ports = createExtensionApiRuntimePorts(api, true);
+    ports.captureCommandProvider!().getCommands();
+  } catch (error) { cause = error; }
+  finally {
+    delete (Object.prototype as Record<string, unknown>).value;
+    if (previous) Object.defineProperty(Object.prototype, "value", previous);
+  }
+  assert.equal(gets, 0);
+  assert.match(String(cause), phase === "construction" ? /Original Pi command provider requires/ : /command provider callable/);
+});
 
 test("Pi context mode helpers feature-detect passive run modes", () => {
   assert.equal(getExtensionContextMode({ mode: "print" }), "print");

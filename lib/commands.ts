@@ -6,7 +6,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { addAbortListener } from "node:events";
-import { isDeepStrictEqual } from "node:util";
+import { isDeepStrictEqual, types } from "node:util";
 
 import type { TelegramActivityPublicationWork } from "./activity.ts";
 import {
@@ -14,6 +14,8 @@ import {
   TELEGRAM_DEFAULT_PROFILE_NAME,
   type TelegramConfigStore,
 } from "./config.ts";
+import type * as Delivery from "./delivery.ts";
+import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
 import type * as Pi from "./pi.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
 import { isPiStaleContextError } from "./pi.ts";
@@ -35,6 +37,7 @@ import {
 import {
   TelegramApiAuthorityError,
   type TelegramApiCallOptions,
+  type TelegramApiUiAuthorityOptions,
 } from "./telegram-api.ts";
 import type { TelegramTarget } from "./target.ts";
 import type { TelegramSessionReplacementIntent } from "./threads.ts";
@@ -42,6 +45,7 @@ import {
   acquireTelegramUpdateRouting,
   carryTelegramUpdateExecutionFence,
   getTelegramUpdateExecutionFence,
+  getTelegramUpdateSourceJournalBinding,
   inspectTelegramDeferredSource,
   prepareTelegramDeferredQueueAdmission,
   reportTelegramQueueAdmission,
@@ -221,6 +225,73 @@ interface TelegramExtensionCommandRegistry {
   commands: Map<string, RegisteredTelegramExtensionCommand>;
 }
 
+const commandMapGet = Map.prototype.get, commandMapForEach = Map.prototype.forEach;
+const commandMapPrototype = Map.prototype, commandIsProxy = types.isProxy;
+const commandData = (value: object, key: PropertyKey): unknown => Object.getOwnPropertyDescriptor(value, key)?.value;
+const commandExclusionUnavailable = () => new Error("Command exclusion registration is unavailable.");
+
+/** Passive enrollment history only; never grants handler execution or physical-source disposition. */
+export interface TelegramExtensionCommandExclusion {
+  readonly name: string;
+  assertCurrent(): void;
+}
+
+function readCommandExclusionRegistry(): Readonly<{ registry: object; map: Map<string, unknown> }> | undefined {
+  const registry = commandData(globalThis, TELEGRAM_EXTENSION_COMMAND_REGISTRY_KEY);
+  if (!registry || typeof registry !== "object" || commandIsProxy(registry)) return undefined;
+  const map = commandData(registry, "commands");
+  if (!map || typeof map !== "object" || commandIsProxy(map) || Object.getPrototypeOf(map) !== commandMapPrototype) return undefined;
+  const ownGet = Object.getOwnPropertyDescriptor(map, "get");
+  if ((ownGet && ownGet.value !== commandMapGet) || commandData(commandMapPrototype, "get") !== commandMapGet) return undefined;
+  try { commandMapGet.call(map, ""); } catch { return undefined; }
+  return { registry, map: map as Map<string, unknown> };
+}
+
+class NativeTelegramCommandRegistration implements RegisteredTelegramExtensionCommand {
+  declare name: string;
+  declare description?: string;
+  declare order: number;
+  declare showInMenu: boolean;
+  declare emoji?: string;
+  declare handler: TelegramExtensionCommandRegistration["handler"];
+  declare selected?: Readonly<TelegramExtensionCommandRegistration["selected"]>;
+  #origin: { registry: object; map: unknown; name: string; handler: RegisteredTelegramExtensionCommand["handler"]; lost: boolean };
+  constructor(registry: TelegramExtensionCommandRegistry, value: RegisteredTelegramExtensionCommand) {
+    this.#origin = { registry, map: commandIsProxy(registry) ? undefined : commandData(registry, "commands"), name: value.name, handler: value.handler, lost: false };
+    Object.assign(this, value);
+    // Keep the pre-existing plain-record prototype, property order, descriptors and handler receiver.
+    Object.setPrototypeOf(this, Object.prototype);
+  }
+  static revoke(value: unknown): void {
+    if (value && typeof value === "object" && #origin in value) value.#origin.lost = true;
+  }
+  static capture(value: unknown, registry: object, map: Map<string, unknown>, name: string): Readonly<TelegramExtensionCommandExclusion> | undefined {
+    if (!value || typeof value !== "object" || !(#origin in value)) return undefined;
+    const origin = value.#origin;
+    if (origin.registry !== registry || origin.map !== map || origin.name !== name) return undefined;
+    const assertCurrent = () => {
+      try {
+        const current = readCommandExclusionRegistry();
+        if (origin.lost || !current || current.registry !== registry || current.map !== map ||
+          commandMapGet.call(map, origin.name) !== value || commandData(value, "name") !== origin.name ||
+          typeof origin.handler !== "function" || commandData(value, "handler") !== origin.handler) throw commandExclusionUnavailable();
+      } catch { origin.lost = true; throw commandExclusionUnavailable(); }
+    };
+    assertCurrent();
+    return Object.freeze({ name: origin.name, assertCurrent });
+  }
+}
+const captureNativeCommandExclusion = NativeTelegramCommandRegistration.capture;
+const revokeNativeCommandEnrollment = NativeTelegramCommandRegistration.revoke;
+
+/** Canonical parsed name only; foreign/absent entries are non-matches without getter/handler/prepare probes. */
+export function captureTelegramExtensionCommandExclusion(name: string): Readonly<TelegramExtensionCommandExclusion> | undefined {
+  if (typeof name !== "string" || !isTelegramExtensionCommandName(name)) return undefined;
+  const current = readCommandExclusionRegistry();
+  if (!current) return undefined;
+  return captureNativeCommandExclusion(commandMapGet.call(current.map, name), current.registry, current.map, name);
+}
+
 function getOrCreateTelegramCommandRegistry(): TelegramExtensionCommandRegistry {
   const existing = (globalThis as Record<string, unknown>)[
     TELEGRAM_EXTENSION_COMMAND_REGISTRY_KEY
@@ -280,7 +351,7 @@ export function registerTelegramCommand(
   if (registry.commands.has(name)) {
     throw new Error(`Telegram command is already registered: ${name}`);
   }
-  const command: RegisteredTelegramExtensionCommand = {
+  const command: RegisteredTelegramExtensionCommand = new NativeTelegramCommandRegistration(registry, {
     name,
     description: registration.description,
     order: registration.order ?? 0,
@@ -290,9 +361,10 @@ export function registerTelegramCommand(
     selected: registration.selected
       ? Object.freeze({ prepare: registration.selected.prepare })
       : undefined,
-  };
+  });
   registry.commands.set(name, command);
   return () => {
+    revokeNativeCommandEnrollment(command);
     if (registry.commands.get(name) === command) registry.commands.delete(name);
   };
 }
@@ -383,7 +455,10 @@ export async function prepareTelegramSelectedExtensionCommand(
 }
 
 export function clearTelegramExtensionCommands(): void {
-  getOrCreateTelegramCommandRegistry().commands.clear();
+  const commands = getOrCreateTelegramCommandRegistry().commands;
+  // Native iteration adds no structural-map method/getter probes before the legacy clear operation.
+  try { commandMapForEach.call(commands, revokeNativeCommandEnrollment); } catch {}
+  commands.clear();
 }
 
 export const TELEGRAM_COMMAND_EMOJI = {
@@ -400,6 +475,7 @@ export const TELEGRAM_COMMAND_EMOJI = {
   stop: "🟥",
   name: "🏷️",
   new: "🆕",
+  quit: "🚪",
 } as const;
 
 export type TelegramCommandEmojiName = keyof typeof TELEGRAM_COMMAND_EMOJI;
@@ -532,6 +608,19 @@ function getVisibleTelegramExtensionBotCommands(): TelegramBotCommandDefinition[
     }));
 }
 
+/** Shared menu membership/order for native registration and slash discovery. */
+function getTelegramBotMenuCommands(): readonly TelegramBotCommandDefinition[] {
+  const extensionCommands = getVisibleTelegramExtensionBotCommands();
+  if (extensionCommands.length === 0) return TELEGRAM_BOT_COMMANDS;
+  const nextCommandIndex = TELEGRAM_BOT_COMMANDS.findIndex(command => command.command === "next");
+  if (nextCommandIndex === -1) return [...TELEGRAM_BOT_COMMANDS, ...extensionCommands];
+  return [
+    ...TELEGRAM_BOT_COMMANDS.slice(0, nextCommandIndex + 1),
+    ...extensionCommands,
+    ...TELEGRAM_BOT_COMMANDS.slice(nextCommandIndex + 1),
+  ];
+}
+
 export function getTelegramReservedCommandNames(): string[] {
   return [
     ...TELEGRAM_RESERVED_COMMAND_NAMES,
@@ -561,23 +650,7 @@ export async function registerTelegramBotCommands(
     assertAuthority?.();
   };
   assertAuthority?.();
-  const extensionCommands = getVisibleTelegramExtensionBotCommands();
-  if (extensionCommands.length === 0) {
-    await setMyCommands(TELEGRAM_BOT_COMMANDS);
-    return;
-  }
-  const nextCommandIndex = TELEGRAM_BOT_COMMANDS.findIndex(
-    (command) => command.command === "next",
-  );
-  if (nextCommandIndex === -1) {
-    await setMyCommands([...TELEGRAM_BOT_COMMANDS, ...extensionCommands]);
-    return;
-  }
-  await setMyCommands([
-    ...TELEGRAM_BOT_COMMANDS.slice(0, nextCommandIndex + 1),
-    ...extensionCommands,
-    ...TELEGRAM_BOT_COMMANDS.slice(nextCommandIndex + 1),
-  ]);
+  await setMyCommands(getTelegramBotMenuCommands());
 }
 
 export function createTelegramBotCommandRegistrar(
@@ -976,6 +1049,7 @@ export const TELEGRAM_RESERVED_COMMAND_NAMES = [
   "stop",
   "name",
   "new",
+  "quit",
   "abort",
   "next",
   "continue",
@@ -1010,6 +1084,7 @@ export type TelegramCommandAction =
   | { kind: "stop"; executionMode: "immediate" }
   | { kind: "name"; executionMode: "immediate" }
   | { kind: "new"; executionMode: "immediate" }
+  | { kind: "quit"; executionMode: "immediate" }
   | { kind: "abort"; executionMode: "immediate" }
   | { kind: "next"; executionMode: "immediate" }
   | { kind: "continue"; executionMode: "immediate" }
@@ -1029,6 +1104,7 @@ export interface TelegramCommandActionDeps<TMessage, TContext> {
   handleStop: (message: TMessage, ctx: TContext) => Promise<void>;
   handleName: (message: TMessage, ctx: TContext, name: string) => Promise<void>;
   handleNew: (message: TMessage, ctx: TContext) => Promise<void>;
+  handleQuit?: (message: TMessage, ctx: TContext) => Promise<void>;
   handleAbort: (message: TMessage, ctx: TContext) => Promise<void>;
   handleNext: (message: TMessage, ctx: TContext) => Promise<void>;
   handleContinue: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -1067,9 +1143,7 @@ export interface TelegramRuntimeEventRecorderPort {
   ) => void;
 }
 
-export interface TelegramCompactConfirmationReplyMarkup {
-  inline_keyboard: { text: string; callback_data: string }[][];
-}
+export type TelegramCompactConfirmationReplyMarkup = TelegramInlineKeyboardMarkup;
 
 /** Pi or Telegram work that must drain before a session-level command may replace or compact the session. */
 export interface TelegramSessionBusyPorts {
@@ -1114,14 +1188,14 @@ export interface TelegramCompactCommandDeps
 }
 
 export interface TelegramCompactConfirmationDeps {
+  confirmations?: Delivery.TelegramDeliveryConfirmationPort;
   sendInteractiveMessage: (
     chatId: number,
     text: string,
     mode: "markdown" | "html" | "plain",
     replyMarkup: TelegramCompactConfirmationReplyMarkup,
-    options?: {
+    options?: TelegramApiUiAuthorityOptions & {
       target?: { chatId: number; threadId?: number };
-      assertAuthority?: TelegramApiCallOptions["assertAuthority"];
     },
   ) => Promise<number | undefined>;
 }
@@ -1138,6 +1212,7 @@ export interface TelegramCompactConfirmationCallbackQuery {
 
 export interface TelegramNewConfirmationCallbackDeps<TContext> {
   ctx: TContext;
+  assertCurrent?: () => void;
   answerCallbackQuery: (
     callbackQueryId: string,
     text?: string,
@@ -1155,6 +1230,7 @@ export interface TelegramNewConfirmationCallbackDeps<TContext> {
 
 export interface TelegramCompactConfirmationCallbackDeps<TContext> {
   ctx: TContext;
+  assertCurrent?: () => void;
   answerCallbackQuery: (
     callbackQueryId: string,
     text?: string,
@@ -1495,6 +1571,14 @@ export interface TelegramCommandOrPromptDispatcherDeps<TMessage, TContext> {
     commandName: string,
     args: string,
   ) => string | undefined;
+  /** Every executable name (built-ins, companion commands, templates, Pi commands); omitted disables slash discovery. */
+  isKnownCommandName?: (name: string) => boolean;
+  /** Answers a discovery request; false keeps the message on the ordinary prompt path. */
+  discoverSlash?: (
+    discovery: TelegramSlashDiscovery,
+    message: TMessage,
+    ctx: TContext,
+  ) => Promise<boolean>;
   replaceMessageText: (message: TMessage, text: string) => TMessage;
   enqueueTurn: (messages: TMessage[], ctx: TContext) => Promise<void>;
   assertExecutionCurrent?: (message: TMessage) => void;
@@ -1621,6 +1705,7 @@ export interface TelegramCommandRuntimeDeps<
     | ((text: string, options?: { parseMode?: "HTML" }) => Promise<void>)
     | undefined;
   sendInteractiveMessage?: TelegramCompactConfirmationDeps["sendInteractiveMessage"];
+  confirmations?: Delivery.TelegramDeliveryConfirmationPort;
   assertExecutionCurrent?: (message: TMessage) => void;
 }
 
@@ -1728,10 +1813,112 @@ export function parseTelegramCommand(
   return { name, args: tail.join(" ").trim() };
 }
 
+/** Telegram bot-command token shape; paths, `/skill:x`, hyphenated names and prose starting with `/` stay ordinary text. */
+const TELEGRAM_SLASH_COMMAND_TOKEN = /^\/[A-Za-z0-9_]{1,64}(?:@[A-Za-z0-9_]+)?$/u;
+
+/** A lone `/` asks for the command catalogue; a bot-command-shaped token nothing recognizes gets it with a refusal. */
+export type TelegramSlashDiscovery =
+  | { kind: "bare" }
+  | { kind: "unknown"; name: string };
+
+/**
+ * Classifies slash text for discovery only after every executable owner (built-ins, companion commands, prompt
+ * templates, Pi commands) declined it; `isKnownName` must cover all of them so recognized names keep their path.
+ */
+export function classifyTelegramSlashDiscovery(
+  text: string,
+  isKnownName: (name: string) => boolean,
+): TelegramSlashDiscovery | undefined {
+  const trimmed = text.trim();
+  if (trimmed === "/") return { kind: "bare" };
+  const token = trimmed.split(/\s+/, 1)[0] ?? "";
+  if (!TELEGRAM_SLASH_COMMAND_TOKEN.test(token)) return undefined;
+  const name = parseTelegramCommand(trimmed)?.name;
+  if (!name || isKnownName(name)) return undefined;
+  return { kind: "unknown", name };
+}
+
+const TELEGRAM_SLASH_CATALOGUE_DESCRIPTION_LIMIT = 100;
+const TELEGRAM_SLASH_CATALOGUE_HTML_LIMIT = 3800;
+// Public built-ins in catalogue order; `help` aliases `/start` and hidden `/quit` never appears.
+const TELEGRAM_SLASH_CATALOGUE_BUILTINS = [
+  "start", "status", "queue", "model", "thinking", "settings", "name",
+  "compact", "new", "continue", "next", "abort", "stop",
+] as const satisfies readonly TelegramReservedCommandName[];
+// Built-ins absent from the curated native bot menu still belong in the full catalogue.
+const TELEGRAM_SLASH_CATALOGUE_EXTRAS: Readonly<
+  Partial<Record<TelegramReservedCommandName, readonly [emoji: string, text: string]>>
+> = {
+  status: [TELEGRAM_COMMAND_EMOJI.status, "Show status"],
+  queue: [TELEGRAM_COMMAND_EMOJI.queue, "Show queue"],
+  model: [TELEGRAM_COMMAND_EMOJI.model, "Choose model"],
+  thinking: [TELEGRAM_COMMAND_EMOJI.thinking, "Set thinking level"],
+  settings: ["⚙️", "Open settings"],
+  name: [TELEGRAM_COMMAND_EMOJI.name, "Name this Thread"],
+};
+
+function truncateTelegramSlashDescription(text: string): string {
+  return text.length <= TELEGRAM_SLASH_CATALOGUE_DESCRIPTION_LIMIT
+    ? text
+    : `${text.slice(0, TELEGRAM_SLASH_CATALOGUE_DESCRIPTION_LIMIT - 1)}…`;
+}
+
+/** Full public catalogue: built-ins, registered companion commands and prompt templates, bounded to one message. */
+export function buildTelegramSlashCatalogueHtml(input: {
+  unknownName?: string;
+  promptTemplates?: readonly TelegramPromptTemplateMenuCommand[];
+}): string {
+  const heading = input.unknownName
+    ? formatTelegramInformationHeading("❓", `Unknown command /${input.unknownName}.`)
+    : formatTelegramInformationHeading("📚", "Commands:");
+  const builtIns = TELEGRAM_SLASH_CATALOGUE_BUILTINS.map((name) => {
+    const extra = TELEGRAM_SLASH_CATALOGUE_EXTRAS[name];
+    if (extra) return [name, `${escapeHtml(extra[0])} /${name} — ${escapeHtml(extra[1])}`] as const;
+    const menu = TELEGRAM_BOT_COMMANDS.find((command) => command.command === name);
+    const prefix = formatTelegramCommandEmojiPrefix(name as TelegramCommandEmojiName);
+    const text = menu?.description.startsWith(prefix)
+      ? menu.description.slice(prefix.length)
+      : (menu?.description ?? name);
+    return [name, `${escapeHtml(prefix.trim())} /${name} — ${escapeHtml(text)}`] as const;
+  });
+  const companions = getTelegramExtensionCommands().map((command) => {
+    const prefix = `${escapeHtml(command.emoji ?? "")} /${escapeHtml(command.name)}`.trim();
+    return [command.name, command.description
+      ? `${prefix} — ${escapeHtml(truncateTelegramSlashDescription(command.description))}`
+      : prefix] as const;
+  });
+  const commands = new Map<string, string>([...builtIns, ...companions]);
+  const menu = getTelegramBotMenuCommands();
+  const menuNames = new Set(menu.map(command => command.command));
+  const listed = menu.map(command => commands.get(command.command)!);
+  const unlisted = [...commands].filter(([name]) => !menuNames.has(name))
+    .sort(([a], [b]) => a.localeCompare(b, "en")).map(([, line]) => line);
+  const templates = [...(input.promptTemplates ?? [])]
+    .sort((a, b) => a.command.localeCompare(b.command, "en"))
+    .map(template => `🧩 /${escapeHtml(template.command)}`);
+  const sections = [listed, unlisted, templates].filter(
+    (lines) => lines.length > 0,
+  );
+  const render = (lines: string[][]) =>
+    [heading, ...lines.map((section) => section.join("\n"))].join("\n\n");
+  let rendered = render(sections);
+  // Trim the tail of the largest section until the catalogue fits one Telegram message.
+  let omitted = 0;
+  while (rendered.length > TELEGRAM_SLASH_CATALOGUE_HTML_LIMIT) {
+    const largest = sections.reduce((a, b) => (b.length >= a.length ? b : a));
+    if (largest.length <= 1) break;
+    largest.pop();
+    omitted += 1;
+    rendered = `${render(sections)}\n\n<i>…and ${omitted} more.</i>`;
+  }
+  return rendered;
+}
+
 export const TELEGRAM_COMMAND_ACTIONS = {
   stop: { kind: "stop", executionMode: "immediate" },
   name: { kind: "name", executionMode: "immediate" },
   new: { kind: "new", executionMode: "immediate" },
+  quit: { kind: "quit", executionMode: "immediate" },
   abort: { kind: "abort", executionMode: "immediate" },
   next: { kind: "next", executionMode: "immediate" },
   continue: { kind: "continue", executionMode: "immediate" },
@@ -1899,49 +2086,45 @@ function dispatchNextQueuedTelegramTurnAfterCompact(
   deps.dispatchNextQueuedTelegramTurn();
 }
 
-function buildTelegramNewConfirmationReplyMarkup(): TelegramCompactConfirmationReplyMarkup {
-  return {
-    inline_keyboard: [
-      [
-        { text: "🆕 Yes, start new", callback_data: "new:confirm" },
-        { text: "❌ No", callback_data: "new:cancel" },
-      ],
-    ],
-  };
-}
-
-/** Send one confirmation to an exact copied recipient, with authority checks around the issued request. */
+/** Publication uses the producer's captured recipient grant; only Delivery owns the pending answer. */
 async function sendTelegramConfirmation(
   target: TelegramCommandMessageTarget,
   deps: TelegramCompactConfirmationDeps,
-  html: string,
-  markup: Parameters<
-    TelegramCompactConfirmationDeps["sendInteractiveMessage"]
-  >[3],
-  assertAuthority?: TelegramApiCallOptions["assertAuthority"],
+  kind: "new" | "compact" | "quit",
+  assertRecipientCurrent?: TelegramApiCallOptions["assertAuthority"],
 ): Promise<void> {
-  const recipientTarget = {
-    chatId: target.chatId,
-    ...(target.threadId !== undefined ? { threadId: target.threadId } : {}),
-  };
-  const options = assertAuthority
-    ? { target: recipientTarget, assertAuthority }
-    : target.threadId !== undefined
-      ? { target: recipientTarget }
-      : undefined;
-  assertAuthority?.();
-  await deps.sendInteractiveMessage(
-    recipientTarget.chatId,
-    html,
-    "html",
-    markup,
-    options,
-  );
-  assertAuthority?.();
-}
-
-function getTelegramNewConfirmationHtml(): string {
-  return "<b>Start a new session?</b>";
+  if (!deps.confirmations) throw new Error("Confirmation delivery is unavailable.");
+  const recipient = { chatId: target.chatId, ...(target.threadId !== undefined ? { threadId: target.threadId } : {}) };
+  let publicationError: unknown;
+  const opened = await deps.confirmations.openConfirmation({
+    owner: "@llblab/pi-telegram",
+    scope: kind === "quit" ? { kind: "instance" } : { kind: "target", target: recipient },
+    question: kind === "quit" ? "Quit this Pi instance?" : kind === "new" ? "Start a new session?" : "Compact session?",
+    confirmLabel: kind === "quit" ? "🚪 Yes, quit" : kind === "new" ? "🆕 Yes, start new" : "🗜 Yes, compact",
+    cancelLabel: "❌ No",
+    timeoutMs: 5 * 60_000,
+    signal: new AbortController().signal,
+  }, {
+    confirmedData: `${kind}:confirm`, cancelledData: `${kind}:cancel`,
+    async publish(destination, html, markup, assertDialogCurrent) {
+      const assertAuthority = () => { assertDialogCurrent(); assertRecipientCurrent?.(); };
+      try {
+        assertAuthority();
+        if (kind === "quit" && (destination.chatId !== recipient.chatId || destination.threadId !== recipient.threadId))
+          throw new Error("Quit requires the current instance target.");
+        const messageId = await deps.sendInteractiveMessage(destination.chatId, html, "html", markup,
+          { target: { ...destination }, assertLocalAuthority: assertAuthority });
+        assertAuthority();
+        if (typeof messageId !== "number" || !Number.isSafeInteger(messageId) || messageId <= 0)
+          throw new Error("Confirmation publication returned no message identity.");
+        return messageId;
+      } catch (error) {
+        publicationError = error;
+        throw error;
+      }
+    },
+  });
+  if (!opened.ok) throw publicationError ?? new Error(`Confirmation delivery failed: ${opened.reason}.`);
 }
 
 export async function openTelegramNewConfirmation(
@@ -1949,56 +2132,94 @@ export async function openTelegramNewConfirmation(
   deps: TelegramCompactConfirmationDeps,
   assertAuthority?: TelegramApiCallOptions["assertAuthority"],
 ): Promise<void> {
-  await sendTelegramConfirmation(
-    target,
-    deps,
-    getTelegramNewConfirmationHtml(),
-    buildTelegramNewConfirmationReplyMarkup(),
-    assertAuthority,
-  );
+  await sendTelegramConfirmation(target, deps, "new", assertAuthority);
 }
 
-export async function handleTelegramNewConfirmationCallback<TContext>(
+type TelegramConfirmationAcceptance = Extract<Delivery.TelegramDeliveryConfirmationAcceptance, { accepted: true }>;
+
+/** One resolved native confirmation tap: validated action and view, with every effect fenced by source and dialog authority. */
+interface TelegramConfirmationResolution {
+  action: "confirm" | "cancel";
+  chatId: number;
+  messageId: number;
+  query: TelegramCompactConfirmationCallbackQuery;
+  perform: (effect: () => Promise<void>) => Promise<void>;
+}
+
+/**
+ * Shared preamble for the new/compact/quit confirmations: unaccepted or wrongly-bound taps answer "expired" and
+ * unrelated callbacks return false; only an accepted exact-kind answer with a concrete message reaches `resolve`.
+ */
+async function runTelegramConfirmationCallback(
+  kind: "new" | "compact" | "quit",
   query: TelegramCompactConfirmationCallbackQuery,
-  deps: TelegramNewConfirmationCallbackDeps<TContext>,
+  deps: {
+    assertCurrent?: () => void;
+    answerCallbackQuery: (callbackQueryId: string, text?: string) => Promise<void>;
+  },
+  confirmation: TelegramConfirmationAcceptance | undefined,
+  resolve: (resolution: TelegramConfirmationResolution) => Promise<void>,
 ): Promise<boolean> {
-  if (query.data !== "new:confirm" && query.data !== "new:cancel") return false;
-  const chatId = query.message?.chat?.id;
-  const messageId = query.message?.message_id;
+  const assertSource = deps.assertCurrent, assertView = confirmation?.assertCurrent;
+  const perform = async (effect: () => Promise<void>): Promise<void> => {
+    assertSource?.(); assertView?.();
+    await effect();
+    assertSource?.(); assertView?.();
+  };
+  const confirmData = `${kind}:confirm`, cancelData = `${kind}:cancel`;
+  const data = confirmation?.callbackData;
+  if (data !== confirmData && data !== cancelData) {
+    if (query.data !== confirmData && query.data !== cancelData) return false;
+    await perform(() => deps.answerCallbackQuery(query.id, "Interactive message expired"));
+    return true;
+  }
+  const chatId = query.message?.chat?.id, messageId = query.message?.message_id;
   if (typeof chatId !== "number" || typeof messageId !== "number") {
-    await deps.answerCallbackQuery(query.id, "Interactive message expired");
+    await perform(() => deps.answerCallbackQuery(query.id, "Interactive message expired"));
     return true;
   }
-  if (query.data === "new:cancel") {
-    await deps.editInteractiveMessage(
-      chatId,
-      messageId,
-      "<b>🚫 New session cancelled.</b>",
-      "html",
-      { inline_keyboard: [] },
-    );
-    await deps.answerCallbackQuery(query.id);
-    return true;
-  }
-  await deps.answerCallbackQuery(query.id);
-  await deps.deleteMessage(chatId, messageId);
-  await deps.runNew(deps.ctx);
+  await resolve({ action: data === confirmData ? "confirm" : "cancel", chatId, messageId, query, perform });
   return true;
 }
 
-function buildTelegramCompactConfirmationReplyMarkup(): TelegramCompactConfirmationReplyMarkup {
-  return {
-    inline_keyboard: [
-      [
-        { text: "🗜 Yes, compact", callback_data: "compact:confirm" },
-        { text: "❌ No", callback_data: "compact:cancel" },
-      ],
-    ],
-  };
+export function handleTelegramNewConfirmationCallback<TContext>(
+  query: TelegramCompactConfirmationCallbackQuery,
+  deps: TelegramNewConfirmationCallbackDeps<TContext>,
+  confirmation?: TelegramConfirmationAcceptance,
+): Promise<boolean> {
+  return runTelegramConfirmationCallback("new", query, deps, confirmation, async ({ action, chatId, messageId, perform }) => {
+    if (action === "cancel") {
+      await perform(() => deps.editInteractiveMessage(chatId, messageId,
+        "<b>🚫 New session cancelled.</b>", "html", { inline_keyboard: [] }));
+      await perform(() => deps.answerCallbackQuery(query.id));
+      return;
+    }
+    await perform(() => deps.answerCallbackQuery(query.id));
+    await perform(() => deps.deleteMessage(chatId, messageId));
+    await perform(() => deps.runNew(deps.ctx));
+  });
 }
 
-function getTelegramCompactConfirmationHtml(): string {
-  return "<b>Compact session?</b>";
+/** Native quit publishes intent feedback but never terminates inside the inbound handler. */
+export function handleTelegramQuitConfirmationCallback<TContext>(
+  query: TelegramCompactConfirmationCallbackQuery,
+  deps: Pick<TelegramNewConfirmationCallbackDeps<TContext>, "assertCurrent" | "answerCallbackQuery" | "editInteractiveMessage"> & {
+    requestQuit?: () => void;
+  },
+  confirmation?: TelegramConfirmationAcceptance,
+): Promise<boolean> {
+  return runTelegramConfirmationCallback("quit", query, deps, confirmation, async ({ action, chatId, messageId, perform }) => {
+    const requestQuit = deps.requestQuit;
+    if (action === "confirm" && !requestQuit) {
+      await perform(() => deps.answerCallbackQuery(query.id, "Quit is unavailable"));
+      return;
+    }
+    await perform(() => deps.editInteractiveMessage(chatId, messageId,
+      action === "cancel" ? "<b>🚫 Quit cancelled.</b>" : "<b>🚪 Quit requested.</b>",
+      "html", { inline_keyboard: [] }));
+    await perform(() => deps.answerCallbackQuery(query.id));
+    if (action === "confirm") await perform(async () => { requestQuit!(); });
+  });
 }
 
 async function openTelegramCompactConfirmation(
@@ -2006,56 +2227,28 @@ async function openTelegramCompactConfirmation(
   deps: TelegramCompactConfirmationDeps,
   assertAuthority?: TelegramApiCallOptions["assertAuthority"],
 ): Promise<void> {
-  await sendTelegramConfirmation(
-    target,
-    deps,
-    getTelegramCompactConfirmationHtml(),
-    buildTelegramCompactConfirmationReplyMarkup(),
-    assertAuthority,
-  );
+  await sendTelegramConfirmation(target, deps, "compact", assertAuthority);
 }
 
-export async function handleTelegramCompactConfirmationCallback<TContext>(
+export function handleTelegramCompactConfirmationCallback<TContext>(
   query: TelegramCompactConfirmationCallbackQuery,
   deps: TelegramCompactConfirmationCallbackDeps<TContext>,
+  confirmation?: TelegramConfirmationAcceptance,
 ): Promise<boolean> {
-  if (query.data !== "compact:confirm" && query.data !== "compact:cancel") {
-    return false;
-  }
-  const callbackMessage = query.message;
-  const chatId = callbackMessage?.chat?.id;
-  const messageId = callbackMessage?.message_id;
-  if (typeof chatId !== "number" || typeof messageId !== "number") {
-    await deps.answerCallbackQuery(query.id, "Interactive message expired");
-    return true;
-  }
-  if (query.data === "compact:cancel") {
-    await deps.editInteractiveMessage(
-      chatId,
-      messageId,
-      "<b>🚫 Compaction cancelled.</b>",
-      "html",
-      { inline_keyboard: [] },
-    );
-    await deps.answerCallbackQuery(query.id);
-    return true;
-  }
-  await deps.editInteractiveMessage(
-    chatId,
-    messageId,
-    TELEGRAM_COMPACTION_STARTED_TEXT,
-    "html",
-    { inline_keyboard: [] },
-  );
-  await deps.answerCallbackQuery(query.id);
-  const threadId = callbackMessage?.message_thread_id;
-  await deps.runCompact(
-    deps.ctx,
-    chatId,
-    messageId,
-    typeof threadId === "number" ? { chatId, threadId } : { chatId },
-  );
-  return true;
+  return runTelegramConfirmationCallback("compact", query, deps, confirmation, async ({ action, chatId, messageId, perform }) => {
+    if (action === "cancel") {
+      await perform(() => deps.editInteractiveMessage(chatId, messageId,
+        "<b>🚫 Compaction cancelled.</b>", "html", { inline_keyboard: [] }));
+      await perform(() => deps.answerCallbackQuery(query.id));
+      return;
+    }
+    await perform(() => deps.editInteractiveMessage(chatId, messageId,
+      TELEGRAM_COMPACTION_STARTED_TEXT, "html", { inline_keyboard: [] }));
+    await perform(() => deps.answerCallbackQuery(query.id));
+    const threadId = query.message?.message_thread_id;
+    await perform(() => deps.runCompact(deps.ctx, chatId, messageId,
+      typeof threadId === "number" ? { chatId, threadId } : { chatId }));
+  });
 }
 
 export interface TelegramNewCommandDeps
@@ -2186,6 +2379,10 @@ export async function executeTelegramCommandAction<TMessage, TContext>(
     case "new":
       await deps.handleNew(message, ctx);
       return true;
+    case "quit":
+      if (!deps.handleQuit) return false;
+      await deps.handleQuit(message, ctx);
+      return true;
     case "abort":
       await deps.handleAbort(message, ctx);
       return true;
@@ -2294,6 +2491,7 @@ export function createTelegramCommandHandlerTargetRuntime<
     compact: deps.compact,
     requestNewSession: deps.requestNewSession,
     sendInteractiveMessage: deps.sendInteractiveMessage,
+    confirmations: deps.confirmations,
     enqueueControlItem: commandTargetRuntime.enqueueControlItem,
     showStatus: commandTargetRuntime.showStatus,
     openModelMenu: commandTargetRuntime.openModelMenu,
@@ -3228,7 +3426,8 @@ export function createTelegramCommandHandler<
         command.name !== name ||
         messages.length !== 1 ||
         !original ||
-        !captured.sendInteractiveMessage
+        !captured.sendInteractiveMessage ||
+        !captured.confirmations
       )
         return undefined;
       const target = getTelegramCommandMessageTarget(original);
@@ -3254,7 +3453,7 @@ export function createTelegramCommandHandler<
           () =>
             openConfirmation(
               target,
-              { sendInteractiveMessage: captured.sendInteractiveMessage! },
+              { sendInteractiveMessage: captured.sendInteractiveMessage!, confirmations: captured.confirmations },
               assertRecipientCurrent,
             ),
           assertRecipientCurrent,
@@ -3747,6 +3946,16 @@ export function createTelegramCommandOrPromptDispatcher<TMessage, TContext>(
     }
     if (await dispatchPromptTemplate(command, messages, ctx)) return;
     deps.assertExecutionCurrent?.(firstMessage);
+    if (deps.discoverSlash && deps.isKnownCommandName && messages.length === 1) {
+      const discovery = classifyTelegramSlashDiscovery(
+        deps.extractRawText(messages),
+        deps.isKnownCommandName,
+      );
+      if (discovery && (await deps.discoverSlash(discovery, firstMessage, ctx))) {
+        deps.assertExecutionCurrent?.(firstMessage);
+        return;
+      }
+    }
     await deps.enqueueTurn(messages, ctx);
   };
 }
@@ -4009,6 +4218,17 @@ async function handleTelegramCommandRuntime<
     };
   const updateStatusFor = (commandCtx: TContext) => () =>
     deps.updateStatus(commandCtx);
+  const confirmFor = (kind: "new" | "compact" | "quit") => async (nextMessage: TMessage, commandCtx: TContext): Promise<void> => {
+    if (!deps.sendInteractiveMessage || !deps.confirmations) {
+      await sendReplyFor(nextMessage)(formatTelegramInformationHeading("🚫", "Confirmation delivery is unavailable."), { parseMode: "HTML" });
+      return;
+    }
+    const target = getTelegramCommandMessageTarget(nextMessage);
+    const captured = { sendInteractiveMessage: deps.sendInteractiveMessage, confirmations: deps.confirmations };
+    const assertCurrent = assertExecutionCurrentFor(nextMessage);
+    scheduleTelegramCommandEffect(commandCtx, kind, "confirmation-render", deps,
+      () => sendTelegramConfirmation(target, captured, kind, assertCurrent), assertCurrent);
+  };
   return executeTelegramCommandAction(
     buildTelegramCommandAction(commandName),
     message,
@@ -4077,66 +4297,9 @@ async function handleTelegramCommandRuntime<
           assertExecutionCurrentFor(nextMessage),
         );
       },
-      handleNew: async (nextMessage, commandCtx) => {
-        if (deps.sendInteractiveMessage) {
-          await openTelegramNewConfirmation(
-            getTelegramCommandMessageTarget(nextMessage),
-            { sendInteractiveMessage: deps.sendInteractiveMessage },
-          );
-          return;
-        }
-        await handleTelegramNewCommand({
-          isIdle: () => deps.isIdle(commandCtx),
-          hasPendingMessages: () => deps.hasPendingMessages(commandCtx),
-          hasActiveTelegramTurn: deps.hasActiveTelegramTurn,
-          hasDispatchPending: deps.hasDispatchPending,
-          hasQueuedTelegramItems: deps.hasQueuedTelegramItems,
-          isCompactionInProgress: deps.isCompactionInProgress,
-          requestNewSession: deps.requestNewSession
-            ? () => deps.requestNewSession!(nextMessage)
-            : undefined,
-          sendTextReply: sendReplyFor(nextMessage),
-          recordRuntimeEvent: deps.recordRuntimeEvent,
-        });
-      },
-      handleCompact: async (nextMessage, commandCtx) => {
-        if (deps.sendInteractiveMessage) {
-          await openTelegramCompactConfirmation(
-            getTelegramCommandMessageTarget(nextMessage),
-            { sendInteractiveMessage: deps.sendInteractiveMessage },
-          );
-          return;
-        }
-        await handleTelegramCompactCommand({
-          isIdle: () => deps.isIdle(commandCtx),
-          hasPendingMessages: () => deps.hasPendingMessages(commandCtx),
-          hasActiveTelegramTurn: deps.hasActiveTelegramTurn,
-          hasDispatchPending: deps.hasDispatchPending,
-          hasQueuedTelegramItems: deps.hasQueuedTelegramItems,
-          isCompactionInProgress: deps.isCompactionInProgress,
-          setCompactionInProgress: deps.setCompactionInProgress,
-          updateStatus: updateStatusFor(commandCtx),
-          dispatchNextQueuedTelegramTurn: () =>
-            deps.dispatchNextQueuedTelegramTurn(commandCtx),
-          requestDeferredDispatchNextQueuedTelegramTurn:
-            deps.requestDeferredDispatchNextQueuedTelegramTurn
-              ? (dispatch) =>
-                  deps.requestDeferredDispatchNextQueuedTelegramTurn?.(() =>
-                    dispatch(),
-                  )
-              : undefined,
-          compact: (callbacks) => deps.compact(commandCtx, callbacks),
-          startTypingLoop: deps.startTypingLoop
-            ? () =>
-                deps.startTypingLoop?.(commandCtx, nextMessage.chat.id, {
-                  target: getTelegramCommandMessageTarget(nextMessage),
-                })
-            : undefined,
-          stopTypingLoop: deps.stopTypingLoop,
-          sendTextReply: sendReplyFor(nextMessage),
-          recordRuntimeEvent: deps.recordRuntimeEvent,
-        });
-      },
+      handleNew: confirmFor("new"),
+      handleQuit: confirmFor("quit"),
+      handleCompact: confirmFor("compact"),
       handleStatus: async (nextMessage, commandCtx) => {
         scheduleTelegramCommandEffect(
           commandCtx,
@@ -4207,6 +4370,7 @@ function delayTelegramSessionAction(delayMs: number): Promise<void> {
 }
 
 export interface TelegramSessionActionRuntimeDeps {
+  getQuitContext?: () => Pick<Pi.ExtensionContext, "abort" | "shutdown"> | undefined;
   sendUserMessage: Pi.ExtensionAPI["sendUserMessage"];
   notifyResult: (
     target: { chatId: number; threadId?: number; messageId: number },
@@ -4216,6 +4380,7 @@ export interface TelegramSessionActionRuntimeDeps {
     ctx: Pi.ExtensionCommandContext,
     updateId: number,
     target: { chatId: number; threadId?: number; messageId: number },
+    isCurrent?: () => boolean,
   ) => Promise<void>;
   recordRuntimeEvent?: (category: string, error: unknown) => void;
 }
@@ -4289,6 +4454,7 @@ function createTelegramSessionReplacementSettlementRuntime<TContext>(deps: {
 }
 
 export interface TelegramSessionActionAssemblyDeps {
+  getQuitContext?: TelegramSessionActionRuntimeDeps["getQuitContext"];
   sendUserMessage: Pi.ExtensionAPI["sendUserMessage"];
   store: {
     load: () => Promise<void>;
@@ -4370,11 +4536,14 @@ export function createTelegramSessionActionAssembly(
     report(new Error("Telegram new-session result delivery failed."));
   };
   const action = createTelegramSessionActionRuntime({
+    getQuitContext: deps.getQuitContext,
     sendUserMessage: deps.sendUserMessage,
     notifyResult(target, result) {
       return sendTerminalResult(target, result);
     },
-    async prepareReplacement(ctx, updateId, target) {
+    async prepareReplacement(ctx, updateId, target, isCurrent = () => true) {
+      const assertCurrent = () => { if (!isCurrent()) throw new Error("Session replacement authority is unavailable."); };
+      assertCurrent();
       const follower =
         !deps.ownsPersistence() &&
         typeof target.threadId === "number" &&
@@ -4384,6 +4553,7 @@ export function createTelegramSessionActionAssembly(
       // Follower memory is not authority; reread the leader-published snapshot.
       if (follower && deps.store.refresh) await deps.store.refresh();
       else await deps.store.load();
+      assertCurrent();
       const sessionId = ctx.sessionManager.getSessionId();
       const binding =
         typeof target.threadId === "number"
@@ -4417,7 +4587,7 @@ export function createTelegramSessionActionAssembly(
           ? follower.requestSessionReplacement("publish", intent)
           : deps.store.commitSessionReplacementIntent(
               intent,
-              deps.ownsPersistence,
+              () => isCurrent() && deps.ownsPersistence(),
             )))
       ) {
         throw new Error(
@@ -4493,10 +4663,16 @@ export function createTelegramSessionActionAssembly(
   return { action, settlement };
 }
 
+interface TelegramSessionActionAuthority {
+  isCurrent?: () => boolean;
+  journalBindingKey?: string;
+}
+
 type TelegramPendingInternalAction = {
-  kind: "replace-session";
+  kind: "replace-session" | "quit";
   token: string;
   updateId: number;
+  authority?: Readonly<TelegramSessionActionAuthority>;
   target: { chatId: number; threadId?: number; messageId: number };
 };
 
@@ -4508,9 +4684,69 @@ export interface TelegramSessionActionRuntime {
   scheduleAfterUpdate: (
     updateId: number,
     target: { chatId: number; threadId?: number; messageId: number },
+    authority?: TelegramSessionActionAuthority,
+    operation?: "new" | "quit",
   ) => boolean;
-  onUpdateCompleted: (updateId: number) => void;
+  onUpdateCompleted: (updateId: number, journalBindingKey?: string) => void;
   hasPending: () => boolean;
+  isQuitting: () => boolean;
+}
+
+/** Bind native lifecycle requests to their original source and semantic session, never a cached Pi context. */
+export function createTelegramSessionActionRequests(deps: {
+  getSessionGeneration: () => number;
+  getProfileName: () => string | undefined;
+  getOperatorId: () => number | undefined;
+  scheduleAfterUpdate: TelegramSessionActionRuntime["scheduleAfterUpdate"];
+}): { requestNewSession(source: unknown): void; requestQuit(source: unknown): void } {
+  const request = (operation: "new" | "quit", source: unknown): void => {
+    const updateId =
+      getTelegramUpdateExecutionFence(source)?.updateId;
+    if (updateId === undefined) {
+      throw new Error(
+        "Telegram session action requires durable update authority.",
+      );
+    }
+    const callbackMessage =
+      source && typeof source === "object" && "message" in source
+        ? (source as { message?: unknown }).message
+        : source;
+    const messageTarget = callbackMessage as
+      | {
+          chat?: { id?: unknown };
+          message_id?: unknown;
+          message_thread_id?: unknown;
+        }
+      | undefined;
+    const target =
+      typeof messageTarget?.chat?.id === "number" &&
+      typeof messageTarget.message_id === "number"
+        ? {
+            chatId: messageTarget.chat.id,
+            messageId: messageTarget.message_id,
+            ...(typeof messageTarget.message_thread_id === "number"
+              ? { threadId: messageTarget.message_thread_id }
+              : {}),
+          }
+        : undefined;
+    if (!target) {
+      throw new Error("Telegram session action target is unavailable.");
+    }
+    getTelegramUpdateExecutionFence(source)!.assertCurrent();
+    const journalBindingKey = getTelegramUpdateSourceJournalBinding(source);
+    if (!journalBindingKey) throw new Error("Session action requires an exact source journal binding.");
+    const generation = deps.getSessionGeneration();
+    const profile = deps.getProfileName(), operatorId = deps.getOperatorId();
+    const isCurrent = () => generation === deps.getSessionGeneration() &&
+      profile === deps.getProfileName() && operatorId === deps.getOperatorId();
+    if (!deps.scheduleAfterUpdate(updateId, target, { isCurrent, journalBindingKey }, operation)) {
+      throw new Error("A Telegram session action is already pending.");
+    }
+  };
+  return {
+    requestNewSession(source) { request("new", source); },
+    requestQuit(source) { request("quit", source); },
+  };
 }
 
 export function createTelegramSessionActionRuntime(
@@ -4525,10 +4761,26 @@ export function createTelegramSessionActionRuntime(
       }
     | undefined;
   let pendingAction: TelegramPendingInternalAction | undefined;
+  let quittingAction: TelegramPendingInternalAction | undefined;
+  let pendingOperation: "new" | "quit" = "new";
+  let pendingAuthority: Readonly<TelegramSessionActionAuthority> | undefined;
+  const isCurrent = (assertion?: () => boolean): boolean => {
+    try { return assertion?.() !== false; } catch { return false; }
+  };
 
-  const reportFailure = (error: unknown): void => {
+  const isQuitting = () =>
+    (pendingUpdateId !== undefined && pendingOperation === "quit" && isCurrent(pendingAuthority?.isCurrent)) ||
+    (pendingAction?.kind === "quit" && isCurrent(pendingAction.authority?.isCurrent)) ||
+    (quittingAction !== undefined && isCurrent(quittingAction.authority?.isCurrent));
+  const forgetStale = (): void => {
+    if (pendingUpdateId !== undefined && !isCurrent(pendingAuthority?.isCurrent)) {
+      pendingUpdateId = undefined; pendingTarget = undefined; pendingAuthority = undefined;
+    }
+    if (pendingAction && !isCurrent(pendingAction.authority?.isCurrent)) pendingAction = undefined;
+  };
+  const reportFailure = (error: unknown, category = "new-session"): void => {
     try {
-      deps.recordRuntimeEvent?.("new-session", error);
+      deps.recordRuntimeEvent?.(category, error);
     } catch {
       // Diagnostics cannot make a completed durable update retryable.
     }
@@ -4539,13 +4791,14 @@ export function createTelegramSessionActionRuntime(
       const action = pendingAction;
       const [operation, token, ...extra] = args.trim().split(/\s+/);
       if (
-        !action || operation !== "new" ||
+        !action || action.kind !== "replace-session" || operation !== "new" ||
         token !== action.token || extra.length !== 0
       ) {
         ctx.ui.notify(TELEGRAM_INTERNAL_MANUAL_USE_MESSAGE, "warning");
         return;
       }
       pendingAction = undefined;
+      if (!isCurrent(action.authority?.isCurrent)) return;
       switch (action.kind) {
         case "replace-session":
           try {
@@ -4553,46 +4806,70 @@ export function createTelegramSessionActionRuntime(
               ctx,
               action.updateId,
               action.target,
+              () => isCurrent(action.authority?.isCurrent),
             );
+            if (!isCurrent(action.authority?.isCurrent)) return;
             const result = await ctx.newSession();
-            if (result.cancelled)
+            if (result.cancelled && isCurrent(action.authority?.isCurrent))
               await deps.notifyResult(action.target, "cancelled");
           } catch (error) {
             reportFailure(error);
-            await deps.notifyResult(action.target, "failure");
+            if (isCurrent(action.authority?.isCurrent)) await deps.notifyResult(action.target, "failure");
           }
           return;
       }
     },
-    scheduleAfterUpdate(updateId, target) {
-      if (pendingUpdateId !== undefined || pendingAction !== undefined)
+    scheduleAfterUpdate(updateId, target, authority, operation = "new") {
+      forgetStale();
+      const captured = authority && Object.freeze({ ...authority });
+      if (pendingUpdateId !== undefined || pendingAction !== undefined || isQuitting() || !isCurrent(captured?.isCurrent))
         return false;
       pendingUpdateId = updateId;
-      pendingTarget = { ...target };
+      pendingTarget = Object.freeze({ ...target });
+      pendingAuthority = captured;
+      pendingOperation = operation;
       return true;
     },
-    onUpdateCompleted(updateId) {
-      if (pendingUpdateId !== updateId) return;
+    onUpdateCompleted(updateId, journalBindingKey) {
+      if (pendingUpdateId !== updateId || (pendingAuthority?.journalBindingKey !== undefined &&
+        pendingAuthority.journalBindingKey !== journalBindingKey)) return;
       pendingUpdateId = undefined;
-      const target = pendingTarget;
+      const target = pendingTarget, authority = pendingAuthority;
       pendingTarget = undefined;
-      if (!target) return;
+      pendingAuthority = undefined;
+      if (!target || !isCurrent(authority?.isCurrent)) return;
       const token = randomUUID();
-      pendingAction = { kind: "replace-session", token, updateId, target };
+      const action: TelegramPendingInternalAction = { kind: pendingOperation === "quit" ? "quit" : "replace-session", token, updateId, target, authority };
+      pendingAction = action;
       void Promise.resolve()
-        .then(() =>
-          deps.sendUserMessage(
+        .then(() => {
+          if (pendingAction !== action) return;
+          if (!isCurrent(action.authority?.isCurrent)) { pendingAction = undefined; return; }
+          if (action.kind === "quit") {
+            quittingAction = action;
+            pendingAction = undefined;
+            const ctx = deps.getQuitContext?.();
+            if (!ctx) throw new Error("Pi shutdown context is unavailable.");
+            try { ctx.abort(); } catch (error) { reportFailure(error, "quit"); }
+            if (!isCurrent(action.authority?.isCurrent)) return;
+            ctx.shutdown();
+            return;
+          }
+          return deps.sendUserMessage(
             `/${TELEGRAM_CONNECT_COMMAND_NAME} ${TELEGRAM_INTERNAL_COMMAND_FLAG} new ${token}`,
             { expandPromptTemplates: true },
-          ),
-        )
+          );
+        })
         .catch((error) => {
-          pendingAction = undefined;
-          reportFailure(error);
+          if (pendingAction === action) pendingAction = undefined;
+          if (quittingAction === action) quittingAction = undefined;
+          reportFailure(error, action.kind === "quit" ? "quit" : "new-session");
         });
     },
     hasPending() {
-      return pendingUpdateId !== undefined || pendingAction !== undefined;
+      forgetStale();
+      return pendingUpdateId !== undefined || pendingAction !== undefined || isQuitting();
     },
+    isQuitting,
   };
 }

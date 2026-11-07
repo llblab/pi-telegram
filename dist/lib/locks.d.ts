@@ -166,6 +166,16 @@ export declare function readTelegramPrivateFile(path: string, maxBytes: number):
 export declare function publishTelegramPrivateFile(path: string, temporaryBasePath: string, contents: string, label: string, onBoundary?: (boundary: "after-write-before-rename" | "after-rename") => void): void;
 /** Rename one Telegram runtime artifact with bounded Windows sharing retries. */
 export declare function renameTelegramPathWithRetry(sourcePath: string, destinationPath: string, options?: TelegramRenameRetryOptions): boolean;
+/** A refusal of guard evidence, never permission to clear the guard or retry its protected operation. */
+export declare class TelegramFileTransactionGuardError extends Error {
+    readonly code = "guard-unverifiable";
+    readonly resource: string;
+    readonly reason: "invalid-layout" | "invalid-owner" | "unavailable-owner";
+    readonly phase: "acquire" | "release";
+    constructor(resource: string, reason: TelegramFileTransactionGuardError["reason"], options?: ErrorOptions & {
+        phase?: "acquire" | "release";
+    });
+}
 export interface TelegramFileTransactionOptions {
     recoveryRename?: typeof renameSync;
     publishRename?: typeof renameSync;
@@ -228,6 +238,8 @@ export declare function createTelegramDirectDeliveryOwnershipChecker<TContext ex
 interface TelegramLockedPollingStartOptions {
     force?: boolean;
     forceFreshLeaderThread?: boolean;
+    /** Automatic stale-owner recovery cannot provision an unremembered Thread. */
+    restoreWorkspaceOnly?: true;
     requestedThreadName?: string;
     election?: {
         expectedOwner?: TelegramLockEntry;
@@ -257,6 +269,8 @@ export interface TelegramLockedPollingRuntime<TContext extends TelegramLockConte
     isSuspended: () => boolean;
     /** Fence one owned polling generation; suspension, restart, conflict or lock loss revokes it. */
     captureTransportAuthority: (ctx: TContext) => (() => boolean) | undefined;
+    /** Capture the owner's real startup context without lending it to a caller; observed loss is terminal. */
+    captureCurrentTransportAuthority: () => (() => boolean) | undefined;
     onPersistentConflict: (ctx: TContext, count: number) => Promise<void>;
     onSessionStart: (_event: unknown, ctx: TContext) => Promise<void>;
     registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry, options?: {
@@ -272,7 +286,11 @@ interface TelegramLockedPollingRuntimeDeps<TContext extends TelegramLockContext>
     hasBotToken: () => boolean;
     getBotTokenDiagnostic?: () => string | undefined;
     canStartPolling?: (ctx: TContext) => boolean;
+    /** Read-only session eligibility before replacing stale transport continuity. */
+    canAutoStartSession?: (ctx: TContext) => Promise<boolean>;
     isContextCurrent?: (ctx: TContext) => boolean;
+    /** Actual session identity from the host owner; captured at polling startup, never synthesized by Delivery. */
+    getSessionId?: (ctx: TContext) => string | undefined;
     formatStartBlockedMessage?: (ctx: TContext) => string;
     startPolling: (ctx: TContext, options?: TelegramLockedPollingStartOptions) => void | Promise<void>;
     stopPolling: () => Promise<void>;

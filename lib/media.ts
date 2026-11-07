@@ -148,6 +148,42 @@ export interface TelegramMediaGroupControllerOptions {
 export type TelegramAttachmentKind =
   "photo" | "document" | "video" | "audio" | "voice" | "animation" | "sticker";
 
+/** @internal Metadata only: no receiver, source-custody, actual-byte or download grant. */
+export interface TelegramAttachmentRequestCandidate {
+  readonly messageId: number;
+  readonly kind: TelegramAttachmentKind;
+  readonly fileId: string;
+  readonly fileName?: string;
+  readonly mimeType?: string;
+  readonly reportedBytes?: number;
+}
+const ATTACHMENT_MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u;
+
+function attachmentString(value: unknown, max: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= max && !!value.trim() && value.isWellFormed() &&
+    !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(value);
+}
+
+/** @internal Shared bounded producer metadata; never a receiver, actual-byte or file-use grant. */
+export function normalizeTelegramAttachmentRequestConstraints(constraints: {
+  readonly accept: readonly string[]; readonly maxBytes: number;
+}): { readonly accept: readonly string[]; readonly maxBytes: number } {
+  const maxBytes = constraints?.maxBytes, accept = constraints?.accept;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 20_971_520 ||
+    !Array.isArray(accept) || accept.length < 1 || accept.length > 16) throw new TypeError("Invalid attachment preflight constraints.");
+  const filters = Array.from({ length: accept.length }, (_, index) => {
+    const descriptor = Object.getOwnPropertyDescriptor(accept, String(index));
+    const filter: unknown = descriptor && "value" in descriptor ? descriptor.value : undefined;
+    if (!attachmentString(filter, 128)) throw new TypeError("Invalid attachment MIME filter.");
+    const mime = filter.trim().toLowerCase();
+    if (mime !== "*/*" && !ATTACHMENT_MIME.test(mime) &&
+      !(mime.endsWith("/*") && ATTACHMENT_MIME.test(`${mime.slice(0, -1)}x`))) throw new TypeError("Invalid attachment MIME filter.");
+    return mime;
+  });
+  if (new Set(filters).size !== filters.length) throw new TypeError("Duplicate attachment MIME filter.");
+  return Object.freeze({ accept: Object.freeze(filters), maxBytes });
+}
+
 /** Where an inbound attachment came from; the download layer turns it into a scoped file name. */
 export interface TelegramAttachmentSource {
   kind: string;

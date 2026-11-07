@@ -178,8 +178,13 @@ Use these in the bot DM.
 | `/continue` | Enqueue a priority continuation prompt |
 | `/abort` | Abort the active run while preserving the queue |
 | `/stop` | Abort the active run and clear waiting Telegram turns |
+| `/` | Send a lone slash to list every public command, including shortcuts, companion commands and prompt templates |
+
+Hidden emergency command `/quit` opens an owner-only confirmation to cancel active work and request orderly exit of this Pi instance when its terminal is unavailable. It is not listed in the bot menu; normal shutdown clears waiting queue work, but does not delete Pi history or force-kill other processes. See the [command contract](./docs/public-api.md#user-facing-api) for limits and on-quit behavior.
 
 Hidden compatibility shortcuts: `/help`, `/status`, `/model`, `/thinking`, `/queue`, and `/settings` jump into the same menu system.
+
+A slash command that nothing recognizes is answered with the same catalogue instead of reaching the model; names Pi knows and text that is not command-shaped, such as paths, `/skill:name` or hyphenated names, continue as ordinary prompts. The catalogue groups bot-menu commands first, other public commands alphabetically next, and prompt-template commands last, with blank lines between blocks.
 
 ## Pi Commands
 
@@ -238,6 +243,8 @@ Answers use Telegram-native Rich Markdown, with clickable commands and links. In
 
 ### Files And Artifacts
 
+Agents can format questions with `telegram_confirm` and `telegram_choice` JSON fences or HTML comments. Buttons begin neutral; a completed answer sends ordinary question/answer JSON, without tags, versions or IDs. Exact-N Choice toggles/checks options locally and submits one label array at N; Choice arrays run a one-message sequential wizard and return one ordered answer array only at completion. No new agent tools or waiting SDK calls are needed. See [Agent Selection Markup](./docs/public-api.md#agent-selection-markup).
+
 Inbound files land under `<agent-dir>/tmp/pi-telegram` and default to a 50 MiB limit. `telegram_attach` is the canonical outbound file path. During Telegram-originated turns it attaches to the active reply; during explicit local/TUI delivery it can send to the paired/default chat or routed Threaded Mode target.
 
 ### Voice And Media
@@ -257,7 +264,7 @@ Classic private DM mode is the base product mode. When Telegram private-chat Thr
 - Each connected instance gets a Telegram thread target.
 - Queued work for a live follower transfers through authenticated exact-journal handoff rather than replaying under the transport owner.
 - Reopening, resuming, or replacing the process for the same Pi session restores its remembered Thread; distinct sessions in one directory keep independent bindings and letter slots.
-- Unknown threads are preserved and offered explicit reroute/restore choices. Retained temporary routing tabs stay protected while choices are pending. Cancel settles exact journal custody even if the Telegram view is unavailable; an unknown tab-deletion outcome never causes another deletion.
+- Unknown threads are preserved and offered explicit reroute/restore choices. Pending choices and accepted work protect routing tabs. Cancel settles exact journal custody even if the Telegram view is unavailable; deferred last-Cancel cleanup rechecks the original session and current protection. An unknown deletion outcome never causes another deletion.
 - When all `A`–`Z` slots are reserved, a new connection may reclaim the oldest inactive, unprotected Thread. **This deletes that Thread and all its messages**, not Pi session history or project files. When every slot is active or protected, nothing is deleted: the new connection takes the least recently used letter instead, and that Thread keeps its history and any accepted work. The leader immediately attempts to replace its old letter title with its retained name (manual titles stay); a failed edit is recorded for later display reconciliation, without undoing reuse or deleting anything. Restoring a remembered session never evicts another binding.
 - Telegram never launches hidden Pi processes.
 

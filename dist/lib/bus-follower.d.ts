@@ -8,9 +8,8 @@
 import type { TelegramPreparedHeldCommand } from "./commands.ts";
 import type { TelegramWorkspaceRestoreExecutor, TelegramWorkspaceRestoreIntent } from "./threads.ts";
 import type { TelegramLiveSourceCompletionReadiness, TelegramUpdateAdmissionLifecycleRuntime } from "./updates.ts";
-import { TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, type TelegramBusAgentMessage, type TelegramBusAgentTargetSelector, type TelegramBusEnvelope, type TelegramBusFollowerQueueHandoffOffer, type TelegramBusForwardOwnership, type TelegramBusLiveRebindApplyObservation, type TelegramBusLiveRebindCommandObservation, type TelegramBusLiveRebindSaveObservation, type TelegramBusLiveRebindSettlementObservation, type TelegramBusLiveRebindWorkObservation, type TelegramBusLiveRebindWorkState, type TelegramBusProtocolIdentity, type TelegramBusSelectedMenuDeliveryObservation, type TelegramBusSelectedMenuTextEffect, type TelegramBusSocketPathSource, type TelegramBusWorkspaceRestoreObservation } from "./bus.ts";
-import type { TelegramConfigStore, TelegramThreadDisplayMode } from "./config.ts";
-import { type TelegramUpdateJournalStoreOptions } from "./journal.ts";
+import { TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, type TelegramBusAgentMessage, type TelegramBusAgentTargetSelector, type TelegramBusEnvelope, type TelegramBusFollowerQueueHandoffOffer, type TelegramBusForwardOwnership, type TelegramBusInstanceRegistration, type TelegramBusLiveRebindApplyObservation, type TelegramBusLiveRebindCommandObservation, type TelegramBusLiveRebindSaveObservation, type TelegramBusLiveRebindSettlementObservation, type TelegramBusLiveRebindWorkObservation, type TelegramBusLiveRebindWorkState, type TelegramBusProtocolIdentity, type TelegramBusSelectedMenuDeliveryObservation, type TelegramBusSelectedMenuTextEffect, type TelegramBusSocketPathSource, type TelegramBusWorkspaceRestoreObservation } from "./bus.ts";
+import type { TelegramThreadDisplayMode } from "./config.ts";
 import { type TelegramLockEntry, type TelegramLockState } from "./locks.ts";
 import * as Machine from "./machine.ts";
 import type { TelegramQueueHandoffStageResult } from "./queue.ts";
@@ -29,7 +28,16 @@ export interface TelegramFollowerSessionHandoff {
 }
 export declare function getTelegramFollowerSessionHandoff(): TelegramFollowerSessionHandoff | undefined;
 export declare function setTelegramFollowerSessionHandoff(handoff: TelegramFollowerSessionHandoff | undefined): void;
+export interface TelegramAttachmentPublicationRegistration {
+    readonly registration: Readonly<TelegramBusInstanceRegistration>;
+    readonly registrationIncarnation: string;
+    readonly leaderSocketPath: string;
+    readonly leaderProtocol: Readonly<TelegramBusProtocolIdentity>;
+    readonly assertCurrent: () => void;
+}
 export interface TelegramBusFollowerRegistrationRuntime<TContext> {
+    /** Private acknowledged registration evidence; not publication, receiver readiness or a source grant. */
+    captureAttachmentPublicationRegistration?: () => TelegramAttachmentPublicationRegistration | undefined;
     registerWithLeader: (ctx: TContext, leader: {
         busSocketPath?: string;
         busSecret?: string;
@@ -50,6 +58,8 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
     setThreadDisplayMode?: (mode: TelegramThreadDisplayMode) => Promise<void>;
     /** Leader-mediated durable publication or successor claim; true only after exact commit. */
     requestSessionReplacement?: (operation: "publish" | "settle", intent: Threads.TelegramSessionReplacementIntent) => Promise<boolean>;
+    /** True only when the leader acknowledges the current registration generation right now; never changes registration state. */
+    probeRegistration?: () => Promise<boolean>;
     stop: () => void;
 }
 export interface TelegramBusFollowerSessionReplacementSuspenderDeps {
@@ -89,6 +99,16 @@ export interface TelegramBusFollowerRegistrationState {
     getDisplayTitle: () => string | undefined;
     setDisplayTitle: (title: string, generation: string) => boolean;
     getGeneration: () => string | undefined;
+    /** Native acknowledged registration lifetime only; neither publication nor file/source authority. */
+    capturePublicationRegistration?: () => {
+        incarnation?: string;
+        apiIncarnation?: string;
+        isCurrent: () => boolean;
+    } | undefined;
+    captureArtifactRegistration?: () => {
+        incarnation: string;
+        isCurrent: () => boolean;
+    } | undefined;
     /** Return the acknowledged session only when it matches the caller's current context. */
     getSessionId: (currentSessionId: string | undefined) => string | undefined;
     beginRecovery: () => number;
@@ -97,6 +117,10 @@ export interface TelegramBusFollowerRegistrationState {
     getLeaderProtocol: () => TelegramBusProtocolIdentity | undefined;
     getEligibleElectionSlots: () => readonly string[];
     setEligibleElectionSlots: (slots: readonly string[]) => void;
+    /** Leader-relayed Thread capability, bound to the registration generation that received it. */
+    setRelayedThreadCapability: (enabled: boolean | undefined, generation: string) => void;
+    /** Fresh relayed capability of the current registration; undefined means the caller must probe itself. */
+    getRelayedThreadCapability: () => boolean | undefined;
     setRegistered: (registered: boolean, target?: TelegramTarget, metadata?: {
         slot?: string;
         threadName?: string;
@@ -104,7 +128,11 @@ export interface TelegramBusFollowerRegistrationState {
         generation?: string;
         sessionId?: string;
         leaderProtocol?: TelegramBusProtocolIdentity;
-    }) => void;
+        registrationIncarnation?: string;
+        apiRegistrationIncarnation?: string;
+    }) => void | {
+        readonly isCurrent: () => boolean;
+    };
 }
 export interface TelegramBusForwardedUpdateReceiverRuntime {
     start: () => Promise<void>;
@@ -120,6 +148,9 @@ export interface TelegramBusFollowerDurableAdmissionPort<TContext> {
     }>, ctx: TContext) => Promise<TelegramBusFollowerDurableAdmissionResult>;
 }
 export interface TelegramBusFollowerClientRuntimeDeps<TMessage = unknown> {
+    getLocalProtocol?: TelegramBusFollowerApiCallerDeps["getLocalProtocol"];
+    getLeaderProtocol?: TelegramBusFollowerApiCallerDeps["getLeaderProtocol"];
+    capturePublicationRegistration?: TelegramBusFollowerRegistrationState["capturePublicationRegistration"];
     socketPath: TelegramBusSocketPathSource;
     instanceId: string;
     getApiAuthSecret?: () => string | undefined;
@@ -144,6 +175,12 @@ export interface TelegramFailureRunSummaryPort {
     failedForMs: number;
 }
 export interface TelegramBusFollowerApiCallerDeps {
+    /** Local guarded wire admission only; neither remote publication nor Artifact authority. */
+    capturePublicationRegistration?: TelegramBusFollowerRegistrationState["capturePublicationRegistration"];
+    /** Private publication negotiation only; absent metadata cannot opt in an older peer. */
+    getLocalProtocol?: () => TelegramBusProtocolIdentity | undefined;
+    getLeaderProtocol?: () => TelegramBusProtocolIdentity | undefined;
+    captureAttachmentPublicationRegistration?: () => TelegramAttachmentPublicationRegistration | undefined;
     socketPath: TelegramBusSocketPathSource;
     instanceId: string;
     createRequestId: () => string;
@@ -244,6 +281,8 @@ export interface TelegramBusFollowerPromotedBinding {
 export interface TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext> {
     registrationState: Pick<TelegramBusFollowerRegistrationState, "getTarget" | "getSlot" | "getThreadName" | "getEligibleElectionSlots" | "beginRecovery" | "setRegistered">;
     getRegistrationRuntime: () => TelegramBusFollowerRegistrationRuntime<TContext>;
+    /** A live acknowledged registration survives a missed heartbeat; absent means every failure re-registers. */
+    probeRegistration?: () => Promise<boolean>;
     getLeaderState: () => TelegramBusFollowerLeaderState;
     setLifecyclePhase: (phase: "electing" | undefined) => void;
     updateStatus: (ctx: TContext) => void;
@@ -389,7 +428,8 @@ export declare function createTelegramBusFollowerWorkspaceRestoreHandler<TContex
 };
 export declare function createTelegramBusFollowerClientRuntime<TContext, TReactionUpdate, TCallbackQuery, TMessage = unknown>(deps: TelegramBusFollowerClientRuntimeDeps<TMessage>): {
     createRequestId: () => string;
-    callApi: (method: string, args: unknown[], localOptions?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<unknown>;
+    callApi: TelegramBusFollowerApiCaller;
+    captureApiAuthority: (scope?: "registration") => (() => void) | undefined;
     agentMessages: {
         resolveTarget: (selector: TelegramBusAgentTargetSelector) => Promise<TelegramTarget & {
             threadId: number;
@@ -442,12 +482,17 @@ export declare function createTelegramBusFollowerSelectedMenuCaller<TContext>(de
     effect: TelegramBusSelectedMenuTextEffect;
     assertAuthority: () => void;
 }) => Promise<TelegramBusSelectedMenuDeliveryObservation>;
-export declare function createTelegramBusFollowerApiCaller(deps: TelegramBusFollowerApiCallerDeps): (method: string, args: unknown[], localOptions?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<unknown>;
+export type TelegramBusFollowerApiCaller = ((method: string, args: unknown[], localOptions?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<unknown>) & {
+    /** Captures one already-ready negotiated native owner; never waits or grants publication/membership. */
+    captureAuthority: (scope?: "registration") => (() => void) | undefined;
+};
+export declare function createTelegramBusFollowerApiCaller(deps: TelegramBusFollowerApiCallerDeps): TelegramBusFollowerApiCaller;
 export declare function createTelegramBusFollowerSessionReplacementSuspender(deps: TelegramBusFollowerSessionReplacementSuspenderDeps): (preserveTarget?: boolean) => Promise<void>;
 export declare function createTelegramBusFollowerSessionRefreshHook<TContext>(deps: TelegramBusFollowerSessionRefreshHookDeps<TContext>): (_event: unknown, ctx: TContext) => Promise<void>;
 export declare function createTelegramBusFollowerControlState(): TelegramBusFollowerControlState;
 export declare function createTelegramBusFollowerRegistrationState(options?: {
     onAvailabilityChanged?: () => void;
+    onRegistrationChanged?: () => void;
 }): TelegramBusFollowerRegistrationState;
 /** Heartbeat-failure recovery that a deliberate local stop halts until the next deliberate registration. */
 export type TelegramBusFollowerHeartbeatRecoveryHandler<TContext> = ((error: unknown, ctx: TContext) => Promise<void>) & {
@@ -500,13 +545,6 @@ export declare function createTelegramBusFollowerHeartbeatRecoveryHandler<TConte
 export declare function createTelegramBusFollowerRegistrationRuntime<TContext extends {
     cwd?: string;
 }>(deps: TelegramBusFollowerRegistrationRuntimeDeps<TContext>): TelegramBusFollowerRegistrationRuntime<TContext>;
-/** Bind source-owned sender checks to the journal's already-admitted synchronous v1 hook. */
-export declare function createTelegramBusFollowerPairedAdmission(deps: {
-    profileName: string;
-    tokenSha256: string;
-    configStore: Pick<TelegramConfigStore, "withPairedUserAdmission">;
-    assertExecutionCurrent: () => void;
-}): NonNullable<TelegramUpdateJournalStoreOptions["withPairedAdmission"]>;
 export declare function prepareTelegramBusFollowerJournaledUpdateForExecution<TUpdate extends {
     message?: unknown;
 } & Record<string, unknown>>(update: TUpdate, prepareForwardedMessage: (message: NonNullable<TUpdate["message"]>, position: "comment" | "forward") => void): TUpdate;
@@ -557,71 +595,6 @@ export declare function createTelegramBusFollowerDurableAdmissionRuntime<TContex
         maxAgeMs: number;
         maxEntries: number;
     };
-}): TelegramBusFollowerDurableAdmissionPort<TContext>;
-export interface TelegramBusFollowerInputCustodyBundle<TContext> {
-    acceptHandoff(input: {
-        sourceRecoveryKey: string;
-        recipientBindingKey: string;
-        source: {
-            journalBindingKey: string;
-            tokenSha256: string;
-            updateId: number;
-        };
-        handoffId: string;
-    }, ctx: TContext): unknown;
-    wakeSource(input: TelegramBusFollowerDurableAdmissionResult & {
-        recipientBindingKey: string;
-        sourceRecoveryKey: string;
-        sourceClaim: {
-            acquisitionId: string;
-            handoffId: string;
-        };
-    }, ctx: TContext): void;
-    resolveForwardReference(input: {
-        sourceUpdateId: number;
-        recipientBindingKey: string;
-    }): {
-        sourceRecoveryKey: string;
-        source: {
-            updateId: number;
-            owner: {
-                acquisitionId: string;
-                handoffId: string;
-            };
-        };
-    } | undefined;
-}
-export declare function createTelegramBusFollowerInputCustodyPorts<TContext>(deps: {
-    getInputCustodyBus(): TelegramBusFollowerInputCustodyBundle<TContext> | undefined;
-}): {
-    isSourceReferenceAdmissionEnabled: () => boolean;
-    handleInputCustodyHandoff(envelope: Extract<TelegramBusEnvelope, {
-        kind: "leader.offerInputCustodyHandoff";
-    }>, ctx: TContext): unknown;
-    sourceReferenceAdmission: TelegramBusFollowerDurableAdmissionPort<TContext>;
-    resolveInputCustodyReference(input: {
-        sourceUpdateId: number;
-        recipientBindingKey: string;
-    }): {
-        sourceRecoveryKey: string;
-        source: {
-            updateId: number;
-            owner: {
-                acquisitionId: string;
-                handoffId: string;
-            };
-        };
-    } | undefined;
-};
-export declare function createTelegramBusFollowerSourceReferenceAdmissionRuntime<TContext>(deps: {
-    wakeSource: (input: TelegramBusFollowerDurableAdmissionResult & {
-        recipientBindingKey: string;
-        sourceRecoveryKey: string;
-        sourceClaim: {
-            acquisitionId: string;
-            handoffId: string;
-        };
-    }, ctx: TContext) => Promise<void> | void;
 }): TelegramBusFollowerDurableAdmissionPort<TContext>;
 export declare function createTelegramBusForwardedUpdateReceiverRuntime<TContext>(deps: TelegramBusForwardedUpdateReceiverRuntimeDeps<TContext>): TelegramBusForwardedUpdateReceiverRuntime;
 export {};

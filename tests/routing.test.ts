@@ -5,7 +5,7 @@
  */
 
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { readFileSync, writeFileSync } from "node:fs";
+import fs, { readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -26,6 +26,7 @@ import { createTelegramBusFollowerSelectedMenuCaller, createTelegramBusFollowerR
 import * as Bindings from "../lib/bindings.ts";
 import * as Activity from "../lib/activity.ts";
 import * as Delivery from "../lib/delivery.ts";
+
 import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
 import * as Journal from "../lib/journal.ts";
 import * as Lifecycle from "../lib/lifecycle.ts";
@@ -36,6 +37,9 @@ import { createTelegramSettingsMenuRuntime } from "../lib/menu-settings.ts";
 import { createTelegramRenderedMessageDeliveryRuntime, resetTransportReplyDedup } from "../lib/replies.ts";
 import * as Model from "../lib/model.ts";
 import * as Ownership from "../lib/ownership.ts";
+import { planTelegramButtonReply } from "../lib/outbound-buttons.ts";
+import { editTelegramSingleMarkdownMessage } from "../lib/replies.ts";
+import { createTelegramApiClient, createTelegramBridgeApiRuntime, setTelegramApiHttpsFetchForTesting, assertTelegramApiCallAuthority } from "../lib/telegram-api.ts";
 import * as Paths from "../lib/paths.ts";
 import * as ThreadDisplay from "../lib/thread-display.ts";
 import * as Turns from "../lib/turns.ts";
@@ -47,6 +51,24 @@ import { createTelegramBusFollowerLiveRebindRuntime, createTelegramBusFollowerDu
 import { createTelegramBusProtocolIdentity, createTelegramBusWorkspaceRestoreController, getTelegramBusFollowerSocketPath,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE } from "../lib/bus.ts";
 import { withWorkspaceRestoreFixture as fixture, restoreFixtureRecipient as recipient } from "./fixtures/workspace.ts";
+import { acceptedForeignUpdateSettlement } from "./fixtures/shared.ts";
+
+/** Wraps a journal so completing update 100 injects the named removal fault and reports each attempt. */
+function injectCompletedRemovalFault<
+  J extends { removeCompletedExact: (...args: any[]) => any },
+>(journal: J, fault: string, onRemoval: () => void): J {
+  return {
+    ...journal,
+    removeCompletedExact(...args: any[]) {
+      if (!args[0].includes(100)) return journal.removeCompletedExact(...args);
+      onRemoval();
+      if (fault === "lost-before") throw new Error("Removal unavailable");
+      const result = journal.removeCompletedExact(...args);
+      if (fault === "lost-after") throw new Error("Removal ACK lost");
+      return fault === "wrong-ack" ? { ...result, removedUpdateIds: [] } : result;
+    },
+  };
+}
 
 for (const selectedName of ["status", "start", "help"] as const)
 for (const fault of ["current", "release-only", "unknown-ack", "complete-no-ack", "wrong-source", "wrong-proof", "wrong-branch", "proof-copy", "query-lost", "recipient-lost", "canonical-lost", "run-replaced", "marker-replaced", "donor-before", "donor-after", "donor-ack", "wrong-command", "group", "null-marker", "non-text", "album", "foreign-source", "mixed", "source-lost", "release-lost", "chooser-current", "chooser-busy", "chooser-unavailable", "chooser-no-preflight", "chooser-capability", "chooser-preflight-replaced", "chooser-preflight-copy", "chooser-port-lost", "chooser-model", "chooser-caption", "chooser-preflight-registry", "chooser-album", "chooser-menu-capability", "chooser-integrated-idle", "chooser-integrated-busy", "chooser-integrated-pre-dispatch", "chooser-integrated-recipient-loss", "chooser-integrated-epoch-loss", "chooser-integrated-issued-loss", "chooser-integrated-report-lost", "chooser-integrated-ack-lost", "chooser-integrated-work-current", "chooser-integrated-work-issued-loss", "chooser-integrated-work-stop", "chooser-integrated-work-stop-loss", "chooser-integrated-work-stop-cleanup", "chooser-integrated-work-report-lost"] as const) {
@@ -1869,13 +1891,7 @@ for (const fault of ["current", "all-source", "source-before", "source-held", "n
       harness.bridgeRuntime.lifecycle.setCompactionInProgress(true); harness.bridgeRuntime.lifecycle.setActiveToolExecutions(1);
       harness.bridgeRuntime.abort.setHandler(() => assert.fail("Dialog cannot abort active work"));
       const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
-        journal: { ...journal, removeCompletedExact(...args) {
-          if (!args[0].includes(100)) return journal.removeCompletedExact(...args);
-          removals++; if (fault === "lost-before") throw new Error("Removal unavailable");
-          const result = journal.removeCompletedExact(...args);
-          if (fault === "lost-after") throw new Error("Removal ACK lost");
-          return fault === "wrong-ack" ? { ...result, removedUpdateIds: [] } : result;
-        } }, getJournalBindingKey: () => key, hasAuthority: () => true, isContextCurrent: value => value === ctx && current,
+        journal: injectCompletedRemovalFault(journal, fault, () => { removals++; }), getJournalBindingKey: () => key, hasAuthority: () => true, isContextCurrent: value => value === ctx && current,
         getQueueOwnerIdentity: () => ({ instanceId: "old", processId: process.pid, processBirthId: `${process.pid}:dialog`, sessionGeneration: 1 }),
         async defaultHandle(update, value, execution) {
           if (update.message) { originals.set(update.update_id, update.message); executions++; }
@@ -2044,13 +2060,7 @@ for (const fault of ["current", "selected-clock", "clock-source", "clock-native"
       harness.bridgeRuntime.lifecycle.setFoldQueuedPromptsIntoHistory(true); harness.bridgeRuntime.lifecycle.setDispatchPending(true);
       harness.bridgeRuntime.lifecycle.setCompactionInProgress(true); harness.bridgeRuntime.lifecycle.setActiveToolExecutions(1);
       const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
-        journal: { ...journal, removeCompletedExact(...args) {
-          if (!args[0].includes(100)) return journal.removeCompletedExact(...args);
-          removals++; if (fault === "lost-before") throw new Error("Removal unavailable");
-          const result = journal.removeCompletedExact(...args);
-          if (fault === "lost-after") throw new Error("Removal ACK lost");
-          return fault === "wrong-ack" ? { ...result, removedUpdateIds: [] } : result;
-        } }, getJournalBindingKey: () => key, hasAuthority: () => true, isContextCurrent: value => value === ctx && current,
+        journal: injectCompletedRemovalFault(journal, fault, () => { removals++; }), getJournalBindingKey: () => key, hasAuthority: () => true, isContextCurrent: value => value === ctx && current,
         getQueueOwnerIdentity: () => ({ instanceId: "old", processId: process.pid, processBirthId: `${process.pid}:producer`, sessionGeneration: 1 }),
         async defaultHandle(update, value, fence) {
           if (update.message) { original = update.message; executions++; }
@@ -2834,7 +2844,8 @@ for (const scenario of ["pre-dispatch", "pre-dispatch-protected", "current", "al
         }, sendTextReply: rendered.sendTextReply,
         async sendInteractiveMessage(...args) {
           if (!selecting) { choosers.push(JSON.stringify(args[3])); return 500; }
-          effectGuard = args[4]?.assertAuthority; return rendered.sendInteractiveMessage(...args);
+          assert.equal(args[4]?.assertAuthority, undefined);
+          effectGuard = args[4]?.assertLocalAuthority; return rendered.sendInteractiveMessage(...args);
         }, async callApi(method) {
           if (fault === "all-source" && method === "createForumTopic") return { message_thread_id: 42 } as never;
           if (method === "editForumTopic") return true as never;
@@ -2872,13 +2883,7 @@ for (const scenario of ["pre-dispatch", "pre-dispatch-protected", "current", "al
         harness.bridgeRuntime.lifecycle.setActiveToolExecutions(0);
       }
       const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
-        journal: { ...journal, removeCompletedExact(...args) {
-          if (!args[0].includes(100)) return journal.removeCompletedExact(...args);
-          removals++; if (fault === "lost-before") throw new Error("Removal unavailable");
-          const result = journal.removeCompletedExact(...args);
-          if (fault === "lost-after") throw new Error("Removal ACK lost");
-          return fault === "wrong-ack" ? { ...result, removedUpdateIds: [] } : result;
-        } }, getJournalBindingKey: () => key, hasAuthority: () => true, isContextCurrent: value => value === ctx && current,
+        journal: injectCompletedRemovalFault(journal, fault, () => { removals++; }), getJournalBindingKey: () => key, hasAuthority: () => true, isContextCurrent: value => value === ctx && current,
         getQueueOwnerIdentity: () => ({ instanceId: "old", processId: process.pid, processBirthId: `${process.pid}:${commandName}`, sessionGeneration: 1 }),
         async defaultHandle(update, value, execution) {
           if (update.message) { originals.set(update.update_id, update.message); executions++; }
@@ -3040,13 +3045,7 @@ for (const fault of ["current", "source", "journal-source", "owner-source", "own
       harness.bridgeRuntime.lifecycle.setActiveToolExecutions(1);
       harness.bridgeRuntime.abort.setHandler(() => assert.fail("Name cannot abort active work"));
       const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
-        journal: { ...journal, removeCompletedExact(...args) {
-          if (!args[0].includes(100)) return journal.removeCompletedExact(...args);
-          removals++; if (fault === "lost-before") throw new Error("Removal unavailable");
-          const result = journal.removeCompletedExact(...args);
-          if (fault === "lost-after") throw new Error("Removal ACK lost");
-          return fault === "wrong-ack" ? { ...result, removedUpdateIds: [] } : result;
-        } }, getJournalBindingKey: () => key, hasAuthority: () => true, isContextCurrent: value => value === ctx && current,
+        journal: injectCompletedRemovalFault(journal, fault, () => { removals++; }), getJournalBindingKey: () => key, hasAuthority: () => true, isContextCurrent: value => value === ctx && current,
         getQueueOwnerIdentity: () => ({ instanceId: "old", processId: process.pid, processBirthId: `${process.pid}:name`, sessionGeneration: 1 }),
         async defaultHandle(update, value, execution) {
           if (update.message) { originals.set(update.update_id, update.message); executions++; }
@@ -3211,13 +3210,7 @@ for (const fault of ["normal", "busy", "all-source", "source", "journal-source",
       harness.bridgeRuntime.lifecycle.setActiveToolExecutions(1);
       harness.bridgeRuntime.abort.setHandler(() => assert.fail("Start never aborts active work"));
       const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
-        journal: { ...journal, removeCompletedExact(...args) {
-          if (!args[0].includes(100)) return journal.removeCompletedExact(...args);
-          removals++; if (fault === "lost-before") throw new Error("Removal unavailable");
-          const result = journal.removeCompletedExact(...args);
-          if (fault === "lost-after") throw new Error("Removal ACK lost");
-          return fault === "wrong-ack" ? { ...result, removedUpdateIds: [] } : result;
-        } }, getJournalBindingKey: () => key, hasAuthority: () => true, isContextCurrent: value => value === ctx,
+        journal: injectCompletedRemovalFault(journal, fault, () => { removals++; }), getJournalBindingKey: () => key, hasAuthority: () => true, isContextCurrent: value => value === ctx,
         getQueueOwnerIdentity: () => ({ instanceId: "old", processId: process.pid, processBirthId: `${process.pid}:start`, sessionGeneration: 1 }),
         async defaultHandle(update, value, execution) {
           if (update.message) { originals.set(update.update_id, update.message); executions++; }
@@ -4130,17 +4123,6 @@ function rerouteFollowerOwnership(instanceId: string) {
       capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] }) };
 }
 
-function acceptedForeignUpdateSettlement(sourceUpdateId = 1) {
-  return {
-    status: "accepted" as const,
-    delivery: {
-      deliveryId: `test-delivery-${sourceUpdateId}`,
-      sourceUpdateId,
-      recipientBindingKey: "test-recipient",
-    },
-  };
-}
-
 function retryableForeignUpdateSettlement() {
   return {
     status: "retryable" as const,
@@ -4519,6 +4501,26 @@ test("Private Thread first contact cannot reach fallback dispatch without pairin
     assert.deepEqual(telegramQueueStore.getQueuedItems(), []);
     assert.equal(events.some((event) => event === "dispatch" || event.startsWith("user:")), false);
   }
+});
+
+test("Routing answers bare and unknown slash text with the command catalogue instead of queueing it", async () => {
+  const { routeRuntime, telegramQueueStore, events } = createRouteHarness({
+    getCommands: () => [{ name: "hostcmd", source: "extension" }],
+  });
+  let id = 20;
+  for (const text of ["/", "/nope arg", "/hostcmd go", "/etc/hosts please"])
+    await routeRuntime.handleUpdate({ message: { message_id: id++, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text } }, { cwd: "/repo" });
+  const replies = events.filter((event) => event.startsWith("reply:"));
+  assert.equal(replies.length, 2);
+  assert.match(replies[0]!, /^reply:<b>📚 Commands:<\/b>/u);
+  assert.match(replies[0]!, /\/status — /u);
+  assert.doesNotMatch(replies[0]!, /\/quit/u);
+  assert.match(replies[1]!, /^reply:<b>❓ Unknown command \/nope\.<\/b>/u);
+  assert.deepEqual(
+    telegramQueueStore.getQueuedItems().map((item) => "content" in item ? (item.content[0] as { text?: string } | undefined)?.text : undefined),
+    ["[telegram] /hostcmd go", "[telegram] /etc/hosts please"],
+    "Only Pi-known and non-command slash text reach the prompt queue",
+  );
 });
 
 test("Routing admission returns exact outcomes and places priority callbacks first", async () => {
@@ -5440,6 +5442,67 @@ for (const action of ["reset", "cancel"] as const) {
   }
 }
 
+for (const command of ["/status", "  /STATUS@sample_bot  ", "/name", "/input_probe sample", "/input_template sample", "/unknown_input sample"])
+test(`Routing Input command precedence preserves the ordinary command path (${command.trim()})`, async () => {
+  await withTopicStore(async (threadStore, path) => {
+    const target = { chatId: 100, threadId: 42 }, ctx = { cwd: "/repo" };
+    threadStore.upsert({ profileKey: "cwd:/repo", target, status: "active", createdAtMs: 1, updatedAtMs: 1,
+      instanceId: "leader-a", slot: "A", threadName: "Anchor" });
+    await threadStore.persist();
+    const templatePath = join(dirname(path), "input-template.md");
+    await writeFile(templatePath, "Template body: $ARGUMENTS");
+    const renamed: string[] = [], extensionArgs: string[] = [], headings: string[] = [];
+    const unregister = Commands.registerTelegramCommand({ name: "input_probe", async handler({ args, reply }) {
+      extensionArgs.push(args); await reply("Extension command handled.");
+    }, selected: { prepare() { assert.fail("Ordinary command interleaving cannot select a prepared command"); } } });
+    const { routeRuntime, events, telegramQueueStore } = createRouteHarness({ threadStore,
+      getCommands: () => [{ name: "input_template", source: "prompt", sourceInfo: { path: templatePath } }],
+      sendInteractiveMessage: async (_chatId, text) => { headings.push(text); return 98 + headings.length; },
+      renameCurrentThread: async (_target, name) => { renamed.push(name); return { ok: true, threadName: name }; },
+    });
+    try {
+      await routeRuntime.handleUpdate(unboundTopicUpdate("/name"), ctx);
+      assert.equal(headings.length, 1);
+      await routeRuntime.handleUpdate(unboundTopicUpdate(command), ctx);
+      assert.deepEqual(renamed, [], "A command must never be submitted to the Name consumer");
+      if (command.trim().toLowerCase().startsWith("/status")) assert.equal(events.includes("status-menu"), true);
+      if (command === "/input_probe sample") {
+        assert.deepEqual(extensionArgs, ["sample"]); assert.ok(events.includes("reply:Extension command handled."));
+      } else assert.deepEqual(extensionArgs, []);
+      assert.equal(headings.length, command === "/name" ? 2 : 1, "Repeat /name opens a fresh input; other commands do not cancel it");
+      const queued = telegramQueueStore.getQueuedItems();
+      const queuesPrompt = command === "/input_template sample";
+      assert.equal(queued.length, queuesPrompt ? 1 : 0, "An unknown command answers the catalogue instead of reaching the model");
+      if (command === "/unknown_input sample")
+        assert.ok(events.some((event) => event.startsWith("reply:<b>❓ Unknown command /unknown_input.</b>")));
+      if (queuesPrompt) {
+        assert.equal(queued[0]!.kind, "prompt");
+        assert.equal(queued[0]!.historyText, "Template body: sample");
+      }
+      await routeRuntime.handleUpdate(unboundTopicUpdate("Navigator"), ctx);
+      assert.deepEqual(renamed, ["Navigator"], "The command path does not silently terminate the active input");
+      assert.equal(telegramQueueStore.getQueuedItems().length, queued.length, "The next name stays outside model admission");
+    } finally { unregister(); }
+  });
+});
+
+for (const name of ["/", "  AC/DC  "])
+test(`Routing Input command precedence preserves non-command names (${name.trim()})`, async () => {
+  await withTopicStore(async threadStore => {
+    threadStore.upsert({ profileKey: "cwd:/repo", target: { chatId: 100, threadId: 42 }, status: "active",
+      createdAtMs: 1, updatedAtMs: 1, instanceId: "leader-a", slot: "A", threadName: "Anchor" });
+    await threadStore.persist();
+    const renamed: string[] = [];
+    const { routeRuntime, telegramQueueStore } = createRouteHarness({ threadStore,
+      renameCurrentThread: async (_target, text) => { renamed.push(text); return { ok: true, threadName: text }; },
+    });
+    await routeRuntime.handleUpdate(unboundTopicUpdate("/name"), { cwd: "/repo" });
+    await routeRuntime.handleUpdate(unboundTopicUpdate(name), { cwd: "/repo" });
+    assert.deepEqual(renamed, [name.trim()]);
+    assert.equal(telegramQueueStore.getQueuedItems().length, 0);
+  });
+});
+
 test("Routing consumes the exact-target name dialog without agent dispatch", async () => {
   await withTopicStore(async (threadStore) => {
     threadStore.upsert({
@@ -5480,7 +5543,8 @@ test("Routing consumes the exact-target name dialog without agent dispatch", asy
       },
     });
     await routeRuntime.handleUpdate(unboundTopicUpdate("/name"), { cwd: "/repo" });
-    assert.equal(events.some((event) => event.includes("Send a Thread name using printable ASCII")), true);
+    assert.equal(events.some((event) => event.includes("<b>🏷️ Send a Thread name using printable ASCII.</b>")), true);
+    assert.equal(events.some((event) => event.includes('"inline_keyboard":[[{"text":"❌ Cancel","callback_data":"thread-name:cancel"}]]')), true);
     assert.equal(events.some((event) => event.includes("Enter name")), false);
     assert.equal(events.some((event) => event.includes("Reset to automatic")), false);
     await routeRuntime.handleUpdate(unboundTopicUpdate("Navigator"), { cwd: "/repo" });
@@ -5489,13 +5553,14 @@ test("Routing consumes the exact-target name dialog without agent dispatch", asy
     const beforeSecondDialog = events.length;
     await routeRuntime.handleUpdate(unboundTopicUpdate("/name"), { cwd: "/repo" });
     const secondDialogEvents = events.slice(beforeSecondDialog);
+    assert.equal(secondDialogEvents.some((event) => event.includes("<b>🏷️ Send a new Thread name using printable ASCII, or reset to automatic.</b>")), true);
     assert.equal(
       secondDialogEvents.some((event) => event.includes("Reset to automatic")),
       true,
     );
     assert.equal(
       secondDialogEvents.some((event) => event.includes(
-        '"inline_keyboard":[[{"text":"↩️ Reset to automatic","callback_data":"thread-name:reset"}],[{"text":"✖ Cancel rename","callback_data":"thread-name:cancel"}]]',
+        '"inline_keyboard":[[{"text":"↩️ Reset to automatic","callback_data":"thread-name:reset"}],[{"text":"❌ Cancel","callback_data":"thread-name:cancel"}]]',
       )),
       true,
     );
@@ -6661,7 +6726,7 @@ test("Routing runtime preserves follower target and marks generated prompt butto
           [
             {
               text: "Approve",
-              callback_data: callbackData,
+              disabled: {},
               style: "primary",
             },
           ],
@@ -6669,6 +6734,135 @@ test("Routing runtime preserves follower target and marks generated prompt butto
       },
     },
   ]);
+});
+
+for (const failure of [false, true])
+test(`Routing multiselect uses guarded native edits and admits one final contextual turn (failed-edit=${failure})`, async () => {
+  let edits = 0;
+  const { buttonActionStore, events, routeRuntime, telegramQueueStore } = createRouteHarness({
+    editMessageReplyMarkup: async (chatId, messageId, next, options) => {
+      assert.equal(chatId, 100); assert.equal(messageId, 44);
+      assert.equal(typeof options?.assertLocalAuthority, "function");
+      options!.assertLocalAuthority!();
+      edits++;
+      if (failure) throw new Error("Unknown selection edit");
+      markup = next;
+      options!.assertLocalAuthority!();
+    },
+    getLocalThreadLabelForTarget: () => "Nimbus",
+  });
+  let markup = planTelegramButtonReply('<!-- telegram_choice {"question":"Two","choices":["A","B","C"],"select":2} -->',
+    { registerAction: buttonActionStore.register }).replyMarkup!;
+  const click = (index: number, sender = 7) => routeRuntime.handleUpdate({
+    callback_query: { id: `multi-${edits}-${index}`, from: { id: sender, is_bot: false },
+      data: markup.inline_keyboard[index]![0]!.callback_data,
+      message: { message_id: 44, message_thread_id: 55, chat: { id: 100, type: "private" },
+        from: { id: 7, is_bot: false }, reply_markup: markup } },
+  }, { cwd: "/repo" });
+  await click(0, 8);
+  assert.equal(edits, 0, "Unpaired input cannot consume the control");
+  if (failure) await assert.rejects(click(0), /Unknown selection edit/u); else await click(0);
+  assert.equal(edits, 1);
+  assert.equal(telegramQueueStore.getQueuedItems().length, 0);
+  await click(1);
+  const queued = telegramQueueStore.getQueuedItems();
+  assert.equal(queued.length, failure ? 0 : 1);
+  if (!failure) {
+    assert.equal(queued[0]!.kind, "prompt");
+    assert.deepEqual(queued[0]!.target, { chatId: 100, threadId: 55 });
+    assert.equal(queued[0]!.replyToMessageId, 44);
+    assert.equal(queued[0]!.kind === "prompt" && queued[0]!.historyText, '{"question":"Two","answer":["A","B"]}');
+    assert.equal(events.filter(event => event === "dispatch").length, 1);
+  }
+});
+
+for (const rendering of ["rich", "html"] as const) for (const failure of [false, true])
+test(`Routing wizard edits in original mode/target and admits only its aggregate (rendering=${rendering}, failed-edit=${failure})`, async () => {
+  let markup: NonNullable<ReturnType<typeof planTelegramButtonReply>["replyMarkup"]>, textEdits = 0, keyboardEdits = 0;
+  const { buttonActionStore, routeRuntime, telegramQueueStore, events } = createRouteHarness({
+    getLocalThreadLabelForTarget: () => "Nimbus",
+    editMessageReplyMarkup: async (_chat, _id, next, options) => {
+      options!.assertLocalAuthority!(); keyboardEdits++; markup = next;
+    },
+    editSelectionMessage: async (chatId, messageId, markdown, mode, next, options) => {
+      assert.equal(chatId, 100); assert.equal(messageId, 44); assert.equal(mode, rendering);
+      assert.match(markdown, /Second\?/u); assert.doesNotMatch(markdown, /First\?/u);
+      options.assertLocalAuthority!(); textEdits++;
+      if (failure) throw new Error("Unknown wizard edit");
+      markup = next; options.assertLocalAuthority!();
+    },
+  });
+  const plan = planTelegramButtonReply('Intro.<!-- telegram_choice [{"question":"First?","choices":["A"]},{"question":"Second?","choices":["B"]}] -->Tail.',
+    { registerAction: buttonActionStore.register, rendering });
+  markup = plan.replyMarkup!;
+  const firstKeys = structuredClone(markup);
+  const click = (data: string | undefined) => routeRuntime.handleUpdate({
+    callback_query: { id: `wizard-${textEdits}-${keyboardEdits}`, from: { id: 7, is_bot: false }, data,
+      message: { message_id: 44, message_thread_id: 55, chat: { id: 100, type: "private" },
+        from: { id: 7, is_bot: false }, reply_markup: markup } },
+  }, { cwd: "/repo" });
+  const first = click(markup.inline_keyboard[0]![0]!.callback_data);
+  if (failure) await assert.rejects(first, /Unknown wizard edit/u); else await first;
+  assert.equal(textEdits, 1); assert.equal(telegramQueueStore.getQueuedItems().length, 0);
+  await click(firstKeys.inline_keyboard[0]![0]!.callback_data);
+  assert.equal(textEdits, 1);
+  if (!failure) await click(markup.inline_keyboard[0]![0]!.callback_data);
+  const queued = telegramQueueStore.getQueuedItems();
+  assert.equal(queued.length, failure ? 0 : 1);
+  assert.equal(keyboardEdits, failure ? 0 : 1);
+  if (!failure) {
+    assert.deepEqual(queued[0]!.target, { chatId: 100, threadId: 55 });
+    assert.equal(queued[0]!.replyToMessageId, 44);
+    assert.equal(queued[0]!.kind === "prompt" && queued[0]!.historyText, '[{"question":"First?","answer":"A"},{"question":"Second?","answer":"B"}]');
+    assert.equal(events.filter(event => event === "dispatch").length, 1);
+  }
+});
+
+for (const direct of [true, false]) for (const rendering of ["rich", "html"] as const)
+test(`Routing wizard reaches native edit and final admission through guarded transport (direct=${direct}, rendering=${rendering})`, async () => {
+  const bodies: Record<string, unknown>[] = [], wire: unknown[][] = [];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    assert.match(String(url), /^https:\/\/api\.telegram\.org\/bot123:wizard-fixture\//u);
+    const body = JSON.parse(String(init?.body)); bodies.push(body);
+    return new Response(JSON.stringify({ ok: true, result: { message_id: body.message_id, chat: { id: body.chat_id } } }));
+  };
+  const restore = setTelegramApiHttpsFetchForTesting(globalThis.fetch);
+  try {
+    const native = createTelegramBridgeApiRuntime({
+      client: createTelegramApiClient(() => "123:wizard-fixture"), tempDir: "/tmp",
+      maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {},
+    });
+    const proxy = BusLeader.createTelegramBusLeaderApiProxy({ call: native.call, callMultipart: native.callMultipart, downloadFile: native.downloadFile });
+    const api = createTelegramBusAwareApiRuntime({ directRuntime: native, ownsDirect: () => direct,
+      async callFollowerApi(method, args, options) {
+        assertTelegramApiCallAuthority(options?.assertAuthority, false);
+        const snapshot = structuredClone(args); wire.push(snapshot);
+        const result = await proxy(method, snapshot);
+        assertTelegramApiCallAuthority(options?.assertAuthority, true);
+        return result;
+      } });
+    const { buttonActionStore, routeRuntime, telegramQueueStore } = createRouteHarness({
+      editMessageReplyMarkup: api.editMessageReplyMarkup,
+      editSelectionMessage: async (chat, message, markdown, rendering, markup, options) =>
+        editTelegramSingleMarkdownMessage(chat, message, markdown, rendering, markup, { editMessage: api.editMessageText }, options),
+    });
+    let markup = planTelegramButtonReply('<!-- telegram_choice [{"question":"One","choices":["A"]},{"question":"Two","choices":["B"]}] -->',
+      { registerAction: buttonActionStore.register, rendering }).replyMarkup!;
+    const click = () => routeRuntime.handleUpdate({ callback_query: {
+      id: `native-${bodies.length}`, from: { id: 7, is_bot: false }, data: markup.inline_keyboard[0]![0]!.callback_data,
+      message: { message_id: 44, message_thread_id: 55, chat: { id: 100, type: "private" }, reply_markup: markup },
+    } }, { cwd: "/repo" });
+    await click();
+    assert.equal(telegramQueueStore.getQueuedItems().length, 0); assert.equal(bodies.length, 1);
+    if (rendering === "rich") assert.deepEqual(bodies[0]!.rich_message, { markdown: "**Two**\n\n2 / 2" });
+    else { assert.match(String(bodies[0]!.text), /<b>Two<\/b>/u); assert.equal(bodies[0]!.parse_mode, "HTML"); assert.equal(bodies[0]!.rich_message, undefined); }
+    assert.equal(bodies[0]!.chat_id, 100); assert.equal(bodies[0]!.message_id, 44);
+    markup = bodies[0]!.reply_markup as typeof markup;
+    await click();
+    assert.equal(bodies.length, 2); assert.equal(telegramQueueStore.getQueuedItems().length, 1);
+    if (!direct) for (const args of wire) assert.deepEqual(args[2], { maxAttempts: 1, retrySafety: "non-idempotent" });
+  } finally { restore(); globalThis.fetch = previousFetch; }
 });
 
 test("All command age policy requires a valid source timestamp and excludes bound threads", () => {
@@ -7019,45 +7213,135 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
   });
 }
 
-test("Cancelling one of several inputs in an unbound tab deletes the tab only with the last unspent input", async () => {
+for (const runtimeChurn of [false, true]) for (const deferredReceipt of [false, true]) for (const readerMode of ["uncomposed", "supported", "changed", "unsupported-origin", "non-leader", "drain-during-toast", "unknown", "session", "binding", "v1-only", "new-work", "reader-issued", "http-fence", "api-false", "new-epoch", "timer-only", "session-hint", "source-lost", "session-renewed", "session-renewed-clear", "session-issued", "same-session-new"] as const)
+test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authority (runtimeChurn=${runtimeChurn}, deferredReceipt=${deferredReceipt}, readers=${readerMode})`, async () => {
   await withTopicStore(async (threadStore, path) => {
-    threadStore.upsert({ profileKey: "cwd:/repo", target: { chatId: 100, threadId: 42 }, status: "active",
+    const chatId = readerMode === "uncomposed" || readerMode === "unsupported-origin" ? 100 : 7;
+    const readerRegistry = Bus.createTelegramBusFollowerRegistry(), readerProtocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "same", capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER, ...(readerMode === "v1-only" ? [] : [Bus.TELEGRAM_BUS_CAPABILITY_ORPHAN_CLEANUP_READER])] });
+    const reader = { instanceId: "reader", profileKey: "manual:reader", registrationGeneration: "g1", connectedAtMs: 1, protocol: readerProtocol };
+    readerRegistry.register(reader);
+    let capturedReaders = false, sessionGeneration = 1, epoch = 1, injected = false, nativeFenceRefused = false;
+    const ledger = createTelegramWorkspaceAdmissionLedger({ path: `${path}.admission`, profileKey: "profile:orphan",
+      owner: { processId: process.pid, processBirthId: `${process.pid}:orphan` }, getProcessLiveness: () => "alive" });
+    const operations = createTelegramWorkspaceOperationRuntime({ getWorkspaceAdmission: () => ledger });
+    threadStore.upsert({ profileKey: "cwd:/repo", target: { chatId, threadId: 42 }, status: "active",
       createdAtMs: 1, updatedAtMs: 1, instanceId: "leader-a", slot: "A", threadName: "Axial" });
     await threadStore.persist();
-    const options = { path: `${path}.inbox`, botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "123:orphan-cancel" }) };
+    const agentDir = join(dirname(path), "agent"), directory = Paths.resolveTelegramTempDir(agentDir);
+    const pollingPath = Paths.resolveTelegramSessionPollingJournalPath("leader", agentDir);
+    const serialize = Journal.createTelegramJournalSourceSerialization(() => join(agentDir, "journals.transaction"));
+    const options = { path: pollingPath, botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "123:orphan-cancel" }), withSourceSerialization: serialize };
     const bindingKey = Journal.createTelegramUpdateJournalBindingKey(options);
     const journal = Journal.createTelegramUpdateJournalStore(options);
+    const workspace = threadStore.workspaceRestore({ profileName: "default", tokenSha256: options.botIdentity.tokenSha256,
+      onPublicationBoundary(boundary) {
+        const cleanup = ledger.read().leases.some(value => value.operationKind === "workspace.temporary-thread");
+        if (readerMode !== "uncomposed") assert.ok(cleanup || ledger.read().leases.some(value => value.operationKind === "workspace.cancel-unbound-routing"), "Original registration or fresh cleanup still holds profile admission");
+        if (deferredReceipt && cleanup && !injected && readerMode === "reader-issued" && boundary === "after-rename") {
+          injected = true; readerRegistry.remove("reader"); readerRegistry.register(reader);
+        }
+        if (deferredReceipt && cleanup && !injected && readerMode === "new-work" && boundary === "after-write-before-rename") {
+          injected = true;
+          independent.appendBatch([{ update_id: 902, message: { message_id: 902, chat: { id: chatId, type: "private" }, from: { id: 7, is_bot: false }, text: "late accepted work" } }]);
+          independent.markQueued({ queueKind: "prompt", receiptId: "late-queue", sourceUpdateIds: [902],
+            owner: { instanceId: "independent", processId: process.pid, processBirthId: `${process.pid}:independent`, sessionGeneration: 1 } });
+        }
+      } });
+    const independent = Journal.createTelegramUpdateJournalStore({ ...options, path: Paths.resolveTelegramSessionJournalPath("other", "manual:other", agentDir) });
+    let receipt: Journal.TelegramUpdateJournalQueuedCompletion | undefined;
+    if (deferredReceipt) {
+      independent.appendBatch([900, 901].map(update_id => ({ update_id, message: { message_id: update_id, message_thread_id: 77,
+        chat: { id: chatId, type: "private" }, from: { id: 7, is_bot: false }, text: "Independent accepted work" } })));
+      independent.markQueued({ queueKind: "prompt", receiptId: "independent", sourceUpdateIds: [900, 901],
+        owner: { instanceId: "independent", processId: process.pid, processBirthId: `${process.pid}:independent`, sessionGeneration: 1 } });
+      receipt = { queueKind: "prompt", receiptId: "independent", sourceUpdateIds: [900, 901], queueOwner: independent.read().entries[0]!.queueOwner! };
+    }
+    const references = Journal.createTelegramUpdateJournalReferenceRegistry();
+    await mkdir(join(directory, "runtime"), { recursive: true });
+    await writeFile(join(directory, "state.json"), "state one", { mode: 0o600 });
+    await writeFile(join(directory, "logs.jsonl"), "first event\n");
+    let inspections = 0;
     const apiCalls: Array<{ method: string; threadId?: unknown }> = [];
     let nextChooser = 200;
+    let heldOriginal: { path: string; held: string; bytes: Buffer } | undefined;
     const events: string[] = [];
-    const { routeRuntime } = createRouteHarness({ threadStore,
+    const harness = createRouteHarness({ threadStore, instanceId: "leader-a", getSessionGeneration: () => sessionGeneration,
+      getWorkspaceRestoreStore: () => workspace, inspectRestoreSourceAbandonment: id => journal.inspectAbandonedPending(id),
+      ...(readerMode !== "uncomposed" ? { captureOrphanIntentReaderCompatibility() { capturedReaders = true; return readerRegistry.captureOrphanIntentReaderCompatibility!(readerProtocol); },
+        hasWorkspaceRestoreAuthority: () => readerMode !== "non-leader",
+        captureOrphanCleanupReaderCompatibility() { return readerRegistry.captureOrphanIntentReaderCompatibility!(readerProtocol, "cleanup"); } } : {}),
       configStore: { get: () => ({} as never), getAllowedUserId: () => 7,
         persistAllowedUserId: async () => true, persist: async () => undefined },
-      getAdmissionJournalBinding: () => bindingKey, isContextActive: () => true, getCurrentLeaderEpoch: () => 1,
-      inspectTemporaryThreadSources: () => [],
-      async runWorkspaceOperation(_input, operation) { return operation(); },
+      getAdmissionJournalBinding: () => bindingKey, isContextActive: () => true, getCurrentLeaderEpoch: () => epoch,
+      inspectTemporaryThreadSources(target, requiredJournalBindingKeys, ownInputs) {
+        inspections++;
+        return serialize(() => Journal.isTelegramThreadCleanupJournalNamespaceClear({ directory, profile: "default", botIdentity: options.botIdentity,
+          pollingPath, requiredJournalBindingKeys, cleanup: { target: { chatId: target.chatId, threadId: target.threadId! }, ownInputs: ownInputs ?? [] },
+          limits: { maxDirectoryEntries: 100, maxFiles: 100, maxBytes: 1_000_000, maxEntries: 100, maxWork: 10000 },
+          withSourceReference(sourcePath, operation) {
+            return references.withReference({ referenceClass: "operator-disposition", recoveryKey: Journal.createTelegramUpdateJournalBindingKey({ path: sourcePath, botIdentity: options.botIdentity }) }, () => {
+              if (runtimeChurn) {
+                fs.appendFileSync(join(directory, "logs.jsonl"), "native cleanup observation\n");
+                fs.writeFileSync(join(directory, "runtime", "next-state"), "state two", { mode: 0o600 });
+                fs.renameSync(join(directory, "runtime", "next-state"), join(directory, "state.json"));
+              }
+              return operation();
+            });
+          },
+        }) ? [] : undefined);
+      },
+      async runWorkspaceOperation(input, operation) { return readerMode === "uncomposed" ? operation() : operations.run(input, operation); },
       async sendInteractiveMessage(_c, _t, _m, kb) { events.push("chooser:" + JSON.stringify(kb).match(/reroutecancel:[a-z0-9]+/)?.[0]); return nextChooser++; },
-      async editInteractiveMessage() { /* chooser surface */ },
-      async callApi(method, body) { apiCalls.push({ method, threadId: (body as { message_thread_id?: unknown } | undefined)?.message_thread_id }); return true as never; },
-      async deleteMessage() { /* chooser deletion */ },
+      async editInteractiveMessage() { if (capturedReaders && readerMode === "changed") { readerRegistry.remove("reader"); readerRegistry.register(reader); } },
+      async callApi(method, body, options) {
+        if (deferredReceipt && method === "deleteForumTopic" && readerMode === "http-fence") {
+          readerRegistry.remove("reader"); readerRegistry.register(reader);
+        }
+        try { options?.assertAuthority?.(); } catch (error) { nativeFenceRefused = true; throw error; }
+        if (method === "deleteForumTopic" && deferredReceipt && workspace.listTemporaryThreads().some(value => value.cleanupIssued)) {
+          assert.equal(options?.maxAttempts, 1); assert.equal(options?.retrySafety, "non-idempotent"); assert.equal(typeof options?.assertAuthority, "function");
+          assert.ok(ledger.read().leases.some(value => value.operationKind === "workspace.temporary-thread"), "HTTP remains inside fresh profile admission");
+          if (readerMode === "session-renewed" || readerMode === "session-renewed-clear") {
+            assert.equal(workspace.listTemporaryThreads()[0]?.orphanCancellation?.sessionGeneration, 2);
+            assert.equal(workspace.listTemporaryThreads()[0]?.source.updateId, 400);
+          }
+          if (readerMode === "new-epoch") {
+            const frame = workspace.listTemporaryThreads()[0]!;
+            assert.equal(frame.executor.leaderEpoch, "2"); assert.equal(frame.orphanCancellation?.executor.leaderEpoch, "1");
+          }
+        }
+        apiCalls.push({ method, threadId: (body as { message_thread_id?: unknown } | undefined)?.message_thread_id });
+        if (method === "deleteForumTopic" && readerMode === "unknown") throw new Error("Issued deletion ACK lost");
+        return (readerMode === "api-false" && method === "deleteForumTopic" ? false : true) as never;
+      },
+      async deleteMessage() { if (capturedReaders && readerMode === "changed") { readerRegistry.remove("reader"); readerRegistry.register(reader); } },
     });
+    const { routeRuntime } = harness;
+    if (readerMode === "drain-during-toast") {
+      const answer = harness.routingDeps.answerCallbackQuery;
+      harness.routingDeps.answerCallbackQuery = async (id, text) => {
+        if (text === "Routing cancelled" && receipt && workspace.listTemporaryThreads().some(value => value.phase === "orphan-cancelled"))
+          assert.deepEqual(independent.completeQueued([receipt]).removedUpdateIds, [900, 901]);
+        await answer(id, text);
+      };
+    }
     const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
       journal, getJournalBindingKey: () => bindingKey, hasAuthority: () => true,
       defaultHandle: (input, ctx) => routeRuntime.handleUpdate(input, ctx),
     });
     const message = (id: number, text: string) => ({ update_id: id, message: { message_id: id, message_thread_id: 99,
-      chat: { id: 100, type: "private" as const }, from: { id: 7, is_bot: false }, text } });
+      chat: { id: chatId, type: "private" as const }, from: { id: 7, is_bot: false }, text } });
     let nextUpdateId = 300;
     const click = async (data: string, messageId: number) => {
       journal.appendBatch([{ update_id: nextUpdateId++, callback_query: { id: `click-${nextUpdateId}`, from: { id: 7, is_bot: false }, data,
-        message: { message_id: messageId, message_thread_id: 99, chat: { id: 100, type: "private" } } } }]);
+        message: { message_id: messageId, message_thread_id: 99, chat: { id: chatId, type: "private" } } } }]);
       worker.signal();
       await worker.waitForDrain();
     };
     try {
       worker.start({ cwd: "/repo" });
       await worker.waitForDrain();
-      journal.appendBatch([message(101, "first private input")]);
+      journal.appendBatch([message(101, "/start")]);
       worker.signal();
       await worker.waitForDrain();
       journal.appendBatch([message(102, "second private input")]);
@@ -7066,11 +7350,239 @@ test("Cancelling one of several inputs in an unbound tab deletes the tab only wi
       await click("reroutecancel:1", 200);
       assert.equal(apiCalls.some(call => call.method === "deleteForumTopic"), false, "A second unspent input still needs the tab");
       await click("reroutecancel:2", 201);
+      await routeRuntime.waitForRestoreSettlement();
       const deletions = apiCalls.filter(call => call.method === "deleteForumTopic");
-      assert.equal(deletions.length, 1, JSON.stringify(apiCalls) + events.join("|"));
-      assert.equal(deletions[0]!.threadId, 99);
+      assert.equal(deletions.length, (deferredReceipt && readerMode !== "drain-during-toast") ? 0 : 1, JSON.stringify(apiCalls) + events.join("|"));
+      if (!deferredReceipt) assert.equal(deletions[0]!.threadId, 99);
+      else {
+        assert.ok(receipt);
+        const renewBlocked = readerMode === "session-renewed" || readerMode === "same-session-new";
+        if (readerMode !== "drain-during-toast" && !renewBlocked) assert.deepEqual(independent.completeQueued([receipt]).removedUpdateIds, [900, 901]);
+        else if (!renewBlocked) assert.deepEqual(independent.read().entries, [], "The native owner drained before the original immediate-delete branch ran");
+        if (!renewBlocked) assert.deepEqual(harness.routingDeps.inspectTemporaryThreadSources!({ chatId, threadId: 99 }, [bindingKey], []), [], "Fresh native clearance now exists after exact-owner disposition");
+        const frames = workspace.listTemporaryThreads();
+        const registered = ["supported", "unknown", "session", "binding", "v1-only", "new-work", "reader-issued", "http-fence", "api-false", "new-epoch", "timer-only", "session-hint", "source-lost", "session-renewed", "session-renewed-clear", "session-issued", "same-session-new"].includes(readerMode);
+        if (registered) {
+          assert.equal(frames.length, 1); assert.equal(frames[0]!.phase, "orphan-cancelled");
+          assert.deepEqual(frames[0]!.inputs, [{ journalBindingKey: bindingKey, updateIds: [102] }]);
+          assert.equal(frames[0]!.orphanCancellation?.sessionGeneration, 1); assert.equal(frames[0]!.cleanupIssued, undefined);
+        } else assert.deepEqual(frames, [], "An absent grant or confirmed cleanup leaves no orphan frame");
+        if (["session-renewed", "session-renewed-clear", "session-issued", "same-session-new"].includes(readerMode)) {
+          const original = frames[0]!, originalBytes = fs.readFileSync(original.orphanCancellation!.originals[0]!.retainedPath);
+          if (readerMode === "session-issued") {
+            const readers = readerRegistry.captureOrphanIntentReaderCompatibility!(readerProtocol, "cleanup")!;
+            await operations.run({ operationId: "issued-before-session", operationKind: "workspace.temporary-thread", scopes: [{ kind: "profile" }] }, async () => {
+              assert.ok(workspace.issueCancelledOrphanThreadCleanup(original, { operatorUserId: 7, executor: original.executor,
+                sessionGeneration: 1, isCurrent: () => sessionGeneration === 1 && readers() }, id => journal.inspectAbandonedPending(id)!));
+            });
+          }
+          if (readerMode !== "same-session-new") sessionGeneration = 2;
+          journal.appendBatch([message(400, "fresh independent input")]); worker.signal(); await worker.waitForDrain();
+          nextUpdateId = 401; await click("reroutecancel:3", 202); await routeRuntime.waitForRestoreSettlement();
+          assert.equal(journal.inspectAbandonedPending(400)?.updateId, 400, "New cancellation retains its own original");
+          assert.deepEqual(fs.readFileSync(original.orphanCancellation!.originals[0]!.retainedPath), originalBytes);
+          if (renewBlocked) {
+            const successor = workspace.listTemporaryThreads()[0]!;
+            assert.equal(successor.source.updateId, readerMode === "session-renewed" ? 400 : 102);
+            assert.equal(successor.orphanCancellation?.sessionGeneration, sessionGeneration);
+            assert.equal(successor.cleanupIssued, undefined);
+            if (readerMode === "session-renewed") assert.notEqual(successor.token, original.token, "A fresh cancellation never rebases the old grant");
+            assert.deepEqual(independent.completeQueued([receipt]).removedUpdateIds, [900, 901]);
+          }
+        }
+        if (readerMode === "session") sessionGeneration = 2;
+        if (readerMode === "new-epoch") epoch = 2;
+        if (readerMode === "source-lost") {
+          const original = frames[0]!.orphanCancellation!.originals[0]!;
+          heldOriginal = { path: original.retainedPath, held: join(dirname(path), "held-original.json"), bytes: fs.readFileSync(original.retainedPath) };
+          fs.renameSync(heldOriginal.path, heldOriginal.held);
+        }
+        if (readerMode === "binding") {
+          threadStore.upsertWorkspaceBinding({ ...Threads.createTelegramWorkspaceBindingIdentity("/replacement", 0, "replacement")!,
+            target: { chatId, threadId: 99 }, slot: "B", updatedAtMs: 1 }); await threadStore.persist();
+        }
+        if (readerMode !== "timer-only") {
+          if (readerMode !== "session-hint") routeRuntime.onDeliverySettled({ cwd: "/repo" });
+          routeRuntime.onSessionSettled({ cwd: "/repo" });
+          if (readerMode === "session-hint") {
+            await routeRuntime.waitForRestoreSettlement();
+            assert.equal(apiCalls.filter(call => call.method === "deleteForumTopic").length, 1, "Session settlement owns an immediate observation, not only the later timer");
+          }
+        }
+        await new Promise(resolve => setTimeout(resolve, 1200)); await routeRuntime.waitForRestoreSettlement();
+        const issued = ["supported", "unknown", "drain-during-toast", "api-false", "new-epoch", "timer-only", "session-hint", "session-renewed", "session-renewed-clear", "same-session-new"].includes(readerMode);
+        assert.equal(apiCalls.filter(call => call.method === "deleteForumTopic").length, issued ? 1 : 0,
+          "Only fresh same-session v2 authority after actual disposition can issue once: " + JSON.stringify({ frames: workspace.listTemporaryThreads(), events: harness.events }));
+        if (["unknown", "reader-issued", "http-fence", "api-false", "session-issued"].includes(readerMode)) {
+          assert.equal(workspace.listTemporaryThreads()[0]?.cleanupIssued, true);
+          const cold = Threads.createTelegramTopicTargetStore({ path }); await cold.load();
+          assert.deepEqual(cold.workspaceRestore({ profileName: "default", tokenSha256: options.botIdentity.tokenSha256 }).listTemporaryThreads(), workspace.listTemporaryThreads(), "Cold readers retain actual issued uncertainty");
+          routeRuntime.onDeliverySettled({ cwd: "/repo" }); routeRuntime.onSessionSettled({ cwd: "/repo" });
+          await new Promise(resolve => setTimeout(resolve, 1100)); await routeRuntime.waitForRestoreSettlement();
+          assert.equal(apiCalls.filter(call => call.method === "deleteForumTopic").length, issued ? 1 : 0, "An issued unknown delete never retries");
+          if (readerMode === "http-fence") assert.equal(nativeFenceRefused, true, "Actual HTTP assertion sees the spent original reader membership");
+        } else if (issued) assert.deepEqual(workspace.listTemporaryThreads(), [], "Confirmed exact cleanup retires only its own frame");
+      }
+      if (deferredReceipt && readerMode === "new-work") {
+        assert.equal(injected, true); assert.equal(workspace.listTemporaryThreads()[0]?.cleanupIssued, undefined);
+        assert.equal(independent.read().entries.find(value => value.updateId === 902)?.queueReceiptId, "late-queue", "New custody is not erased to manufacture clearance");
+      }
       assert.equal(apiCalls.some(call => call.method === "deleteForumTopic" && call.threadId === 42), false, "A bound tab is never touched");
-    } finally { await worker.stop(); }
+      assert.ok(inspections > 0); assert.deepEqual(references.list(), []);
+      if (heldOriginal) { const held = heldOriginal; fs.renameSync(held.held, held.path); heldOriginal = undefined; assert.deepEqual(fs.readFileSync(held.path), held.bytes); }
+      assert.equal(journal.inspectAbandonedPending(101)?.updateId, 101);
+      assert.equal(journal.inspectAbandonedPending(102)?.updateId, 102);
+    } finally { sessionGeneration += 1; if (heldOriginal) fs.renameSync(heldOriginal.held, heldOriginal.path); await worker.stop(); }
+  });
+});
+
+for (const artifact of ["source", "compiled"] as const) for (const scenario of [
+  "clear", "queued", "same-id", "crossed-proof", "reader-loss", "session-loss",
+  "lost-publish-ack", "post-publish-reader", "post-publish-session",
+] as const)
+test(`Session-journal orphan handoff consumes native historical proofs (${artifact}/${scenario})`, async () => {
+  const J = artifact === "source" ? Journal : await import("../dist/lib/journal.js") as unknown as typeof Journal;
+  const U = artifact === "source" ? Updates : await import("../dist/lib/updates.js") as unknown as typeof Updates;
+  const R = artifact === "source" ? Routing : await import("../dist/lib/routing.js") as unknown as typeof Routing;
+  const T = artifact === "source" ? Threads : await import("../dist/lib/threads.js") as unknown as typeof Threads;
+  await withTopicStore(async (initial, path) => {
+    initial.upsert({ profileKey: "cwd:/journal-review", target: { chatId: 7, threadId: 42 }, status: "active",
+      createdAtMs: 1, updatedAtMs: 1, instanceId: "journal-leader", slot: "A", threadName: "Review" });
+    await initial.persist();
+    const threads = artifact === "source" ? initial : T.createTelegramTopicTargetStore({ path }); await threads.load();
+    const agentDir = join(dirname(path), "agent"), directory = Paths.resolveTelegramTempDir(agentDir);
+    const token = "fixture:journal-handoff", identity = J.createTelegramUpdateJournalBotIdentity({ botToken: token, botId: 777 });
+    const nextId = scenario === "same-id" || scenario === "crossed-proof" ? 101 : 401;
+    let pollingPath = Paths.resolveTelegramSessionPollingJournalPath("first", agentDir), generation = 1;
+    const serialize = J.createTelegramJournalSourceSerialization(() => join(directory, "runtime", "journals.transaction"));
+    const references = J.createTelegramUpdateJournalReferenceRegistry();
+    const bindings = J.createTelegramUpdateJournalBindingRuntime({ base: {
+      getProfileName: () => "default", getBotToken: () => token, getBotId: () => 777, withSourceSerialization: serialize,
+      onRecovery() { assert.fail("Historical lookup cannot repair or prepare another source"); },
+    }, getRuntimeDir: () => directory, getLeaderJournalPath: () => pollingPath,
+      getFollowerJournalPath: key => Paths.resolveTelegramSessionJournalPath("other", key, agentDir),
+      getActiveFollowerBindingKey: () => "unused", isFollowerRegistered: () => false });
+    let binding = bindings.resolveLeader()!;
+    const first = binding, oldKey = first.recoveryKey;
+    let publicationFault = false;
+    const workspace = threads.workspaceRestore({ profileName: "default", tokenSha256: identity.tokenSha256,
+      onPublicationBoundary(boundary) {
+        if (generation !== 2 || boundary !== "after-rename" || publicationFault) return;
+        if (!["lost-publish-ack", "post-publish-reader", "post-publish-session"].includes(scenario)) return;
+        publicationFault = true;
+        if (scenario === "lost-publish-ack") throw new Error("Lost replacement publication acknowledgement");
+        if (scenario === "post-publish-reader") { registry.remove("reader"); registry.register(reader); }
+        if (scenario === "post-publish-session") generation = 3;
+      } });
+    const ledger = createTelegramWorkspaceAdmissionLedger({ path: `${path}.admission`, profileKey: "journal-review",
+      owner: { processId: process.pid, processBirthId: `${process.pid}:journal-review` }, getProcessLiveness: () => "alive" });
+    const operations = createTelegramWorkspaceOperationRuntime({ getWorkspaceAdmission: () => ledger });
+    const queued = J.createTelegramUpdateJournalStore({ path: Paths.resolveTelegramSessionJournalPath("other", "manual:other", agentDir), botIdentity: identity });
+    const owner = { instanceId: "independent", processId: process.pid, processBirthId: `${process.pid}:independent`, sessionGeneration: 1 };
+    queued.appendBatch([{ update_id: 900, message: { message_id: 900, message_thread_id: 77, chat: { id: 7, type: "private" }, text: "independent work" } }]);
+    queued.markQueued({ queueKind: "prompt", receiptId: "independent", sourceUpdateIds: [900], owner });
+    const receipt = { queueKind: "prompt" as const, receiptId: "independent", sourceUpdateIds: [900], queueOwner: queued.read().entries[0]!.queueOwner! };
+    const registry = Bus.createTelegramBusFollowerRegistry(), protocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "journal-review",
+      capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER, Bus.TELEGRAM_BUS_CAPABILITY_ORPHAN_CLEANUP_READER] });
+    const reader = { instanceId: "reader", profileKey: "manual:reader", registrationGeneration: "1", connectedAtMs: 1, protocol };
+    registry.register(reader);
+    const births = new WeakMap<object, number>(), lookups: Array<{ key: string; id: number }> = [];
+    let nextMessage = 500, injected = false, deletes = 0;
+    const harness = createRouteHarness({ threadStore: threads, instanceId: "journal-leader", getSessionGeneration: () => generation,
+      isContextActive: ctx => births.get(ctx) === generation, getAdmissionJournalBinding: () => binding.recoveryKey, getCurrentLeaderEpoch: () => 1,
+      getWorkspaceRestoreStore: () => workspace, hasWorkspaceRestoreAuthority: () => true,
+      captureOrphanIntentReaderCompatibility: () => registry.captureOrphanIntentReaderCompatibility!(protocol),
+      captureOrphanCleanupReaderCompatibility: () => registry.captureOrphanIntentReaderCompatibility!(protocol, "cleanup"),
+      inspectRestoreSourceAbandonment(id, key = binding.recoveryKey) {
+        lookups.push({ key, id });
+        return references.withReference({ referenceClass: "operator-disposition", recoveryKey: key }, () => {
+          const proof = bindings.inspectSourceAbandonment(key, id);
+          if (generation === 2 && key === oldKey) {
+            if (scenario === "crossed-proof") return bindings.inspectSourceAbandonment(binding.recoveryKey, nextId);
+            if (!injected && scenario === "reader-loss") { injected = true; registry.remove("reader"); registry.register(reader); }
+            if (!injected && scenario === "session-loss") { injected = true; generation = 3; }
+          }
+          return proof;
+        });
+      },
+      inspectTemporaryThreadSources(target, requiredJournalBindingKeys, ownInputs) {
+        return serialize(() => J.isTelegramThreadCleanupJournalNamespaceClear({ directory, profile: "default", botIdentity: identity,
+          pollingPath, requiredJournalBindingKeys, cleanup: { target: { chatId: target.chatId, threadId: target.threadId! }, ownInputs: ownInputs ?? [] },
+          limits: { maxDirectoryEntries: 200, maxFiles: 100, maxBytes: 1_000_000, maxEntries: 100, maxWork: 10000 },
+          withSourceReference(sourcePath, operation) { return references.withReference({ referenceClass: "operator-disposition",
+            recoveryKey: J.createTelegramUpdateJournalBindingKey({ path: sourcePath, botIdentity: identity }) }, operation); },
+        }) ? [] : undefined);
+      },
+      runWorkspaceOperation: (metadata, operation) => operations.run(metadata, operation),
+      sendInteractiveMessage: async () => nextMessage++, editInteractiveMessage: async () => {}, deleteMessage: async () => {},
+      async callApi(method, body, options) {
+        options?.assertAuthority?.();
+        if (method === "deleteForumTopic") {
+          assert.equal(body.message_thread_id, 99); assert.equal(options?.maxAttempts, 1);
+          const frame = workspace.listTemporaryThreads()[0]!;
+          assert.equal(frame.orphanCancellation?.sessionGeneration, 2); assert.equal(frame.source.journalBindingKey, binding.recoveryKey);
+          assert.equal(frame.cleanupIssued, true); assert.ok(ledger.read().leases.some(value => value.operationKind === "workspace.temporary-thread"));
+          deletes++;
+        }
+        return true as never;
+      },
+    });
+    const runtime = R.createTelegramInboundRouteRuntime<TestUpdate, TestMessage, TestCallbackQuery, TestContext, TestModel>(harness.routingDeps);
+    let worker: ReturnType<typeof U.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>> | undefined;
+    const start = () => {
+      const own = binding, ctx = { cwd: `/session-${generation}` }; births.set(ctx, generation);
+      worker = U.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({ journal: own.journal, getJournalBindingKey: () => own.recoveryKey,
+        hasAuthority: () => births.get(ctx) === generation, defaultHandle: (input, current) => runtime.handleUpdate(input, current) });
+      worker.start(ctx); return ctx;
+    };
+    const message = (id: number, messageId: number) => ({ update_id: id, message: { message_id: messageId, message_thread_id: 99,
+      chat: { id: 7, type: "private" as const }, from: { id: 7, is_bot: false }, text: generation === 1 ? "old private input" : "new private input" } });
+    const cancel = (id: number, button: number, messageId: number) => ({ update_id: id, callback_query: {
+      id: `cancel-${id}`, from: { id: 7, is_bot: false }, data: `reroutecancel:${button}`,
+      message: { message_id: messageId, message_thread_id: 99, chat: { id: 7, type: "private" as const } } } });
+    try {
+      start(); await worker!.waitForDrain();
+      first.journal.appendBatch([message(101, 201)]); worker!.signal(); await worker!.waitForDrain();
+      first.journal.appendBatch([cancel(300, 1, 500)]); worker!.signal(); await worker!.waitForDrain(); await runtime.waitForRestoreSettlement();
+      const previous = workspace.listTemporaryThreads()[0]!;
+      assert.equal(previous.source.journalBindingKey, oldKey); assert.equal(previous.orphanCancellation?.sessionGeneration, 1); assert.equal(deletes, 0);
+      const originalPath = previous.orphanCancellation!.originals[0]!.retainedPath, oldBytes = await readFile(originalPath);
+      await worker!.stop(); worker = undefined;
+      // Historical observation must acquire its own physical family, never reuse stopped worker callables.
+      first.journal.read = () => { assert.fail("Stopped source read callable was reused"); };
+      first.journal.inspectAbandonedPending = () => { assert.fail("Stopped source inspection callable was reused"); };
+      generation = 2; pollingPath = Paths.resolveTelegramSessionPollingJournalPath("second", agentDir); binding = bindings.resolveLeader()!;
+      lookups.length = 0;
+      assert.notEqual(binding.recoveryKey, oldKey);
+      const ctx = start(); await worker!.waitForDrain();
+      binding.journal.appendBatch([message(nextId, 301)]); worker!.signal(); await worker!.waitForDrain();
+      if (scenario !== "queued") assert.deepEqual(queued.completeQueued([receipt]).removedUpdateIds, [900]);
+      binding.journal.appendBatch([cancel(600, 2, 501)]); worker!.signal(); await worker!.waitForDrain(); await runtime.waitForRestoreSettlement();
+      const healthy = ["clear", "queued", "same-id", "lost-publish-ack", "post-publish-reader"].includes(scenario);
+      assert.ok(lookups.some(value => value.key === oldKey && value.id === 101));
+      assert.ok(lookups.some(value => value.key === binding.recoveryKey && value.id === nextId));
+      const fresh = references.withReference({ referenceClass: "operator-disposition", recoveryKey: binding.recoveryKey },
+        () => bindings.inspectSourceAbandonment(binding.recoveryKey, nextId))!;
+      assert.ok(fresh?.originalTarget); assert.equal(fresh.originalTarget.messageId, 301);
+      const freshBytes = await readFile(fresh.retainedPath);
+      if (scenario === "queued") {
+        const successor = workspace.listTemporaryThreads()[0]!;
+        assert.equal(successor.source.journalBindingKey, binding.recoveryKey); assert.equal(successor.cleanupIssued, undefined);
+        assert.equal(queued.read().entries[0]?.state, "queued"); assert.equal(deletes, 0);
+        assert.deepEqual(queued.completeQueued([receipt]).removedUpdateIds, [900]);
+        runtime.onDeliverySettled(ctx); await runtime.waitForRestoreSettlement();
+      }
+      assert.equal(deletes, healthy ? 1 : 0, JSON.stringify(harness.events));
+      if (healthy) assert.deepEqual(workspace.listTemporaryThreads(), []);
+      else if (scenario === "post-publish-session") {
+        const retained = workspace.listTemporaryThreads();
+        assert.equal(retained.length, 1); assert.equal(retained[0]!.source.journalBindingKey, binding.recoveryKey);
+        assert.equal(retained[0]!.orphanCancellation?.sessionGeneration, 2); assert.equal(retained[0]!.cleanupIssued, undefined);
+      } else assert.deepEqual(workspace.listTemporaryThreads(), [previous], "Unknown or spent original authority cannot replace the retained frame");
+      if (["lost-publish-ack", "post-publish-reader", "post-publish-session"].includes(scenario)) assert.equal(publicationFault, true);
+      assert.deepEqual(await readFile(originalPath), oldBytes); assert.deepEqual(await readFile(fresh.retainedPath), freshBytes);
+      assert.deepEqual(references.list(), []); assert.deepEqual(ledger.read().leases, []);
+    } finally { generation++; await worker?.stop(); }
   });
 });
 
@@ -8004,7 +8516,9 @@ function createAllCommandFixture(scenario: AllCommandScenario,
     async callApi(method, body, options) {
       if (["closeForumTopic", "deleteForumTopic"].includes(method) && body.message_thread_id === 55) {
         assert.equal(restoreStore.listTemporaryThreads()[0]?.cleanupIssued, true, "durable issuance precedes every temporary cleanup API call");
-        assert.deepEqual(options, { maxAttempts: 1, retrySafety: "non-idempotent" }, "temporary cleanup disables retries and fallback");
+        assert.deepEqual(options, { maxAttempts: 1, retrySafety: "non-idempotent", assertAuthority: options?.assertAuthority }, "temporary cleanup disables retries and fallback");
+        assert.equal(typeof options?.assertAuthority, "function", "temporary authority reaches the HTTP boundary");
+        options?.assertAuthority?.();
       }
       apiCalls.push({ method, body: body as Record<string, unknown> });
       if (method === "deleteForumTopic" && (scenario === "cancel-delete-fails" || scenario === "cleanup-delete-fails")) throw new Error("fixture deletion failed");
@@ -8578,13 +9092,14 @@ for (const mode of ["unselected", "restart", "cold-leader", "multiple-choosers",
   });
 }
 
-for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["empty", "missing-predecessor", "historical-command", "shared-unknown", "shared-other-target", "queued-group", "shared-offered-group", "shared-control", "corrupt", "unclassified", "reference-refusal", "slow-cancel"] as const) {
+for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["empty", "missing-predecessor", "historical-command", "shared-unknown", "shared-other-target", "shared-retry-message", "shared-retry-callback", "runtime-log-churn", "runtime-state-churn", "queued-group", "shared-offered-group", "shared-control", "corrupt", "unclassified", "reference-refusal", "slow-cancel", "queued-drained-timer", "queued-drained-wake", "queued-drained-claim-refused", "queued-drained-session", "queued-drained-unknown"] as const) {
+  if (mode === "new-world" && fault.startsWith("queued-drained")) continue;
   if (mode === "last-cancel" && fault === "missing-predecessor") continue;
   if (mode === "new-world" && fault === "slow-cancel") continue;
   test(`Native temporary cleanup census protects ${mode} (${fault})`, async () => {
     // A plain waiting input in another tab can never be delivered here, so it no longer protects this tab; neither does
     // the Cancel tap itself when its handler outlasts the quiet period and its update is still in the journal.
-    const cleans = fault === "empty" || fault === "shared-other-target" || fault === "slow-cancel";
+    const cleans = fault === "empty" || fault === "shared-other-target" || fault === "slow-cancel" || fault === "runtime-log-churn" || fault === "runtime-state-churn";
     await fixture(async f => {
       const agentDir = join(await realpath(dirname(f.path)), "agent"), directory = Paths.resolveTelegramTempDir(agentDir);
       const pollingPath = Paths.resolveTelegramSessionPollingJournalPath("leader", agentDir);
@@ -8604,12 +9119,27 @@ for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["
         await writeFile(fault === "historical-command" ? historical : shared, JSON.stringify({ version: 1, revision: 1,
           profile: "default", botIdentity, entries: [{ updateId: 300, update, admittedAtMs: 1, state: "pending" }] }));
       }
-      const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(agentDir, "journals.transaction"));
-      const ownerBearing = ["queued-group", "shared-offered-group", "shared-control"].includes(fault);
+      const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dirname(f.path), "journals.transaction"));
+      const drains = fault.startsWith("queued-drained");
+      const ownerBearing = drains || ["queued-group", "shared-offered-group", "shared-control"].includes(fault);
+      let ownerReceipt: Journal.TelegramUpdateJournalQueuedCompletion | undefined;
       let ownerJournal: Journal.TelegramUpdateJournalStore | undefined;
       let ownerOriginals: Journal.TelegramUpdateJournalEntry[] | undefined;
+      if (fault === "shared-retry-message" || fault === "shared-retry-callback") {
+        ownerJournal = Journal.createTelegramUpdateJournalStore({ path: shared, botIdentity, withSourceSerialization: journalSerialization });
+        const message = { message_id: 300, message_thread_id: 999, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "/start" };
+        ownerJournal.appendBatch([{ update_id: 300, ...(fault === "shared-retry-message" ? { message } : {
+          callback_query: { id: "historical-failed-button", from: { id: 7, is_bot: false }, data: "tgbtn:historical", message },
+        }) }]);
+        const failedAtMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+        ownerJournal.markExecutionFailure({ updateId: 300, expectedAttemptCount: 0, failedAtMs,
+          failureClass: "execution-Error", summary: "Unknown prior execution outcome", disposition: "retry-wait", nextRetryAtMs: failedAtMs + 60000 });
+        ownerOriginals = ownerJournal.read().entries;
+        assert.equal(ownerOriginals[0]!.state, "retry-wait");
+        assert.equal(ownerOriginals[0]!.queueOwner, undefined, "Absent custody is not proof that a failed handler made no effects");
+      }
       if (ownerBearing) {
-        ownerJournal = Journal.createTelegramUpdateJournalStore({ path: fault === "queued-group" ? historical : shared, botIdentity });
+        ownerJournal = Journal.createTelegramUpdateJournalStore({ path: fault === "queued-group" ? historical : shared, botIdentity, withSourceSerialization: journalSerialization });
         const sourceUpdateIds = fault === "shared-control" ? [300] : [300, 301];
         ownerJournal.appendBatch(sourceUpdateIds.map(update_id => ({ update_id, message: {
           message_id: update_id, message_thread_id: 999, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
@@ -8618,6 +9148,7 @@ for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["
           sourceUpdateIds, owner: { instanceId: "independent", processId: process.pid, processBirthId: `${process.pid}:independent`, sessionGeneration: 1 } });
         const entry = ownerJournal.read().entries[0]!;
         const receipt = { queueKind: entry.queueKind!, receiptId: entry.queueReceiptId!, sourceUpdateIds, queueOwner: entry.queueOwner! };
+        ownerReceipt = receipt;
         const ownerReader = Journal.createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => "default",
           getBotToken: () => "fixture:all", getBotId: () => undefined, getJournalPath: () => fault === "queued-group" ? historical : shared,
           withSourceSerialization: journalSerialization })()!;
@@ -8637,6 +9168,8 @@ for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["
       if (fault === "unclassified") await writeFile(unknown, "unclassified source");
       const originals = await Promise.all([historical, shared].map(path => readFile(path, "utf8").catch(() => undefined)));
       const references = Journal.createTelegramUpdateJournalReferenceRegistry();
+      if (fault === "runtime-log-churn") await writeFile(join(directory, "logs.jsonl"), "initial\n");
+      if (fault === "runtime-state-churn") { await mkdir(join(directory, "runtime")); await writeFile(join(directory, "state.json"), "initial state", { mode: 0o600 }); }
       let inspections = 0;
       const inspect: NonNullable<RouteHarnessOptions["inspectTemporaryThreadSources"]> = (target, required, ownInputs) => {
         inspections++;
@@ -8648,7 +9181,11 @@ for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["
           limits: { maxDirectoryEntries: 10_000, maxFiles: 4096, maxBytes: 64 * 1024 * 1024, maxEntries: 10_000, maxWork: 100_000 },
           withSourceReference(path, operation) {
             if (fault === "reference-refusal") throw new Error("fixture observation reference unavailable");
-            return references.withReference({ referenceClass: "operator-disposition", recoveryKey: key(path) }, operation);
+            return references.withReference({ referenceClass: "operator-disposition", recoveryKey: key(path) }, () => {
+              if (fault === "runtime-log-churn") fs.appendFileSync(join(directory, "logs.jsonl"), "cleanup observation\n");
+              if (fault === "runtime-state-churn") { fs.writeFileSync(join(directory, "runtime", "next-state"), "next state", { mode: 0o600 }); fs.renameSync(join(directory, "runtime", "next-state"), join(directory, "state.json")); }
+              return operation();
+            });
           },
         }) ? [] : undefined);
       };
@@ -8669,7 +9206,15 @@ for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["
         assert.deepEqual(calls, cleans ? ["deleteForumTopic"] : [], "Only plain waiting inputs addressed elsewhere are exempt; shared custody and unknown sources still protect");
       } else {
         const tab = createAllCommandFixture("cancel", f, pollingPath);
+        let active = true, generation = 1;
+        const originalApi = tab.harness.routingDeps.callApi!;
         tab.harness = tab.createHarness({ inspectTemporaryThreadSources: inspect, temporaryThreadCleanupDelayMs: 50,
+          isContextActive: () => active, getSessionGeneration: () => generation,
+          ...(fault === "queued-drained-unknown" ? { async callApi<T>(method: string, body: Record<string, unknown>, options?: Parameters<typeof originalApi>[2]) {
+            const result = await originalApi<T>(method, body, options);
+            if (method === "deleteForumTopic") throw new Error("Fixture lost deletion acknowledgement");
+            return result;
+          } } : {}),
           ...(fault === "slow-cancel" ? { async deleteMessage() { await tab.sleep(250); } } : {}) });
         tab.worker = tab.createWorker();
         try {
@@ -8686,13 +9231,45 @@ for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["
           const retained = JSON.parse(await readFile(retention.retainedInputs[0]!.path, "utf8"));
           assert.deepEqual(retained.entry, original, "The cancelled original stays byte-for-byte private");
           await tab.sleep(100); await tab.harness.routeRuntime.waitForRestoreSettlement();
-          assert.equal(tab.deletions().length, cleans ? 1 : 0, "Refused or issued cleanup never repeats on a timer");
+          assert.equal(tab.deletions().length, cleans ? 1 : 0, "No protected or issued cleanup may issue a deletion yet");
+          if (drains) {
+            assert.ok(ownerReceipt && ownerJournal);
+            const before = inspections;
+            if (fault === "queued-drained-claim-refused") {
+              await assert.rejects(async () => {
+                f.threads.upsert({ profileKey: "manual:replacement", target: { chatId: 7, threadId: 55 }, status: "active",
+                  createdAtMs: 2, updatedAtMs: 2, instanceId: "replacement", slot: "B", threadName: "Birch" });
+                await f.threads.persist();
+              }, /Protected temporary Thread target conflict/u);
+              await f.threads.load();
+              assert.deepEqual(f.threads.listWorkspaceBindings(), bindings, "A refused claim cannot supply replacement binding authority");
+            }
+            assert.deepEqual(ownerJournal.completeQueued([ownerReceipt]).removedUpdateIds, [300, 301], "Only the exact whole native receipt owner settles accepted work");
+            assert.deepEqual(ownerJournal.read().entries, []);
+            if (fault === "queued-drained-session") { active = false; generation++; }
+            if (fault !== "queued-drained-timer") tab.harness.routeRuntime.onDeliverySettled({ cwd: "/repo" });
+            await tab.sleep(1200); await tab.harness.routeRuntime.waitForRestoreSettlement();
+            const blocked = fault === "queued-drained-session" || fault === "queued-drained-claim-refused";
+            assert.equal(tab.deletions().length, blocked ? 0 : 1, tab.diagnose());
+            assert.equal(tab.store.listTemporaryThreads().length, blocked || fault === "queued-drained-unknown" ? 1 : 0);
+            if (blocked) assert.equal(tab.store.listTemporaryThreads()[0]!.cleanupIssued, undefined, "Ended authority or a still-observed conflicting claim cannot mint cleanup issuance");
+            if (!blocked) assert.ok(inspections > before, "Drain causes a fresh native namespace observation, not reuse of old clearance");
+            if (fault === "queued-drained-unknown") {
+              assert.equal(tab.store.listTemporaryThreads()[0]!.cleanupIssued, true);
+              tab.harness.routeRuntime.onDeliverySettled({ cwd: "/repo" });
+              await tab.sleep(1200); await tab.harness.routeRuntime.waitForRestoreSettlement();
+              assert.equal(tab.deletions().length, 1, "An issued unknown deletion can never borrow another timer or drain hint");
+            }
+            assert.equal(tab.journal.inspectAbandonedPending(123)?.updateId, 123);
+            assert.deepEqual(JSON.parse(await readFile(retention.retainedInputs[0]!.path, "utf8")).entry, original);
+          }
         } finally { await tab.stop(); }
       }
       assert.ok(inspections > 0); assert.deepEqual(references.list(), []);
-      assert.deepEqual(await Promise.all([historical, shared].map(path => readFile(path, "utf8").catch(() => undefined))), originals,
+      if (drains) assert.equal(await readFile(historical, "utf8"), originals[0], "Native receipt completion cannot alter an unrelated family");
+      else assert.deepEqual(await Promise.all([historical, shared].map(path => readFile(path, "utf8").catch(() => undefined))), originals,
         "Strict protection leaves shared, missing and corrupt evidence untouched");
-      if (ownerJournal) assert.deepEqual(ownerJournal.read().entries, ownerOriginals, "Whole receipt, owner/acquisition and handoff stay exact without disposition or replay");
+      if (ownerJournal) assert.deepEqual(ownerJournal.read().entries, drains ? [] : ownerOriginals, "Only explicit exact-owner settlement may change independent custody");
       if (fault === "unclassified") assert.equal(await readFile(unknown, "utf8"), "unclassified source");
       await f.threads.load(); assert.deepEqual(f.threads.listWorkspaceBindings(), bindings, "Cleanup changes no Workspace binding");
     });
@@ -10629,7 +11206,8 @@ for (const fault of ["lost-delete-reply", "negative-delete-reply", "input-during
         if (method === "createForumTopic") return { message_thread_id: 55 } as never;
         if (method === "closeForumTopic" || method === "deleteForumTopic") {
           assert.equal(f.store.listTemporaryThreads()[0]?.cleanupIssued, true);
-          assert.deepEqual(options, { maxAttempts: 1, retrySafety: "non-idempotent" });
+          assert.deepEqual(options, { maxAttempts: 1, retrySafety: "non-idempotent", assertAuthority: options?.assertAuthority });
+          assert.equal(typeof options?.assertAuthority, "function"); options?.assertAuthority?.();
         }
         if (method === "deleteForumTopic" && fault === "input-during-delete") {
           f.journal.appendBatch([{ update_id: 151, message: { message_id: 31, message_thread_id: 55, date: 1,
@@ -11205,7 +11783,8 @@ for (const scenarios of Object.values(ALL_COMMAND_SCENARIOS)) {
 }
 
 for (const scenario of ["successor", "original", "not-ready", "lost-reply", "old-target", "foreign-session", "relocated",
-  "relocated-old-target", "stale-hint", "leader-owner", "foreign-journal"] as const) {
+  "relocated-old-target", "stale-hint", "leader-owner", "foreign-journal", "artifact-metadata",
+  "hint-registration", "hint-session", "hint-target"] as const) {
   test(`Recipient heartbeat lets a same-session successor inspect an issued Restore after leader succession (${scenario})`, async () => {
     await fixture(async ({ store, threads, auth, path }) => {
       const request = { operationId: "issued-restore", binding: threads.listWorkspaceBindings()[0]!, owner: threads.list()[0]!,
@@ -11221,6 +11800,11 @@ for (const scenario of ["successor", "original", "not-ready", "lost-reply", "old
         protocol, connectedAtMs: 1, lastHeartbeatMs: 1 };
       const registry = Bus.createTelegramBusFollowerRegistry();
       registry.register(successor);
+      // Legacy hints omit Artifact metadata; even a different incarnation is irrelevant to Restore.
+      if (scenario === "artifact-metadata") successor.registrationIncarnation = "a".repeat(48);
+      if (scenario === "hint-registration") successor.registrationGeneration = "obsolete";
+      if (scenario === "hint-session") successor.sessionId = "obsolete";
+      if (scenario === "hint-target") successor.target = request.binding.target;
       const modes: string[] = [];
       let loseReply = scenario === "lost-reply";
       let hintCurrent = scenario !== "stale-hint";
@@ -11246,7 +11830,7 @@ for (const scenario of ["successor", "original", "not-ready", "lost-reply", "old
       };
       const before = await readFile(path, "utf8");
       await heartbeat();
-      const inspects = ["successor", "original", "not-ready", "lost-reply", "relocated"].includes(scenario);
+      const inspects = ["successor", "original", "not-ready", "lost-reply", "relocated", "artifact-metadata"].includes(scenario);
       if (!inspects) {
         assert.deepEqual(modes, [], "ineligible hints never reach the recipient");
         assert.equal(await readFile(path, "utf8"), before, "ineligible hints never adopt or rewrite evidence");
@@ -14617,6 +15201,824 @@ for (const name of ["abort", "stop", "next", "continue", "selected_template"] as
     }, "follower");
   });
 }
+
+for (const direct of [false, true]) for (const threaded of [false, true])
+for (const command of ["new", "compact", "quit"] as const) for (const choice of ["yes", "no"] as const)
+for (const fault of ["current", "local-before-issue", "registration-refused", "late-ack"] as const) {
+  if (fault !== "current" && (direct || !threaded || choice !== "yes")) continue;
+test(`Native confirmation uses real UI API adapters without surrendering source custody (${command}, ${choice}, direct=${direct}, Thread=${threaded}, ${fault})`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-native-ui-adapter-"));
+  const target = { chatId: 7, ...(threaded ? { threadId: 70 } : {}) }, ctx = { cwd: "/repo" };
+  const journalOptions = { path: join(dir, "journal.json"), botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "ui-adapter" }) };
+  const journal = Journal.createTelegramUpdateJournalStore(journalOptions), binding = Journal.createTelegramUpdateJournalBindingKey(journalOptions);
+  const previousFetch = globalThis.fetch, calls: { method: string; body: Record<string, unknown> }[] = [], events: string[] = [];
+  let effects = 0, schedules = 0;
+  globalThis.fetch = async (url, init) => {
+    const method = String(url).split("/").at(-1)!;
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    calls.push({ method, body }); events.push(method);
+    if (fault === "late-ack" && ["answerCallbackQuery", "editMessageText"].includes(method)) harness.deliveryRuntime.shutdown();
+    if (["answerCallbackQuery", "editMessageText", "deleteMessage"].includes(method)) {
+      assert.ok(journal.read().entries.some(row => row.updateId === 200 || row.updateId === 201), "UI effects retain the current inbound source");
+    }
+    return new Response(JSON.stringify({ ok: true, result: method === "sendMessage" ? { message_id: 501 } : true }));
+  };
+  const restoreHttps = TelegramApi.setTelegramApiHttpsFetchForTesting(globalThis.fetch);
+  const native = TelegramApi.createTelegramBridgeApiRuntime({ client: TelegramApi.createTelegramApiClient(() => "123:ui-adapter"),
+    tempDir: dir, maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {} });
+  const proxy = BusLeader.createTelegramBusLeaderApiProxy({ call: native.call, callMultipart: native.callMultipart, downloadFile: native.downloadFile });
+  const api = createTelegramBusAwareApiRuntime({ directRuntime: native, ownsDirect: () => direct, getDefaultTarget: () => target,
+    async callFollowerApi(method, args, localOptions) {
+      const nativeFeedback = ["answerCallbackQuery", "editMessageText"].includes(String(args[0]));
+      if (nativeFeedback && fault === "local-before-issue") harness.deliveryRuntime.shutdown();
+      localOptions?.assertAuthority?.();
+      if (nativeFeedback && fault === "registration-refused") throw new Error("Registered caller no longer current");
+      const result = await proxy(method, structuredClone(args));
+      localOptions?.assertAuthority?.();
+      return result;
+    } });
+  const ui = createTelegramRenderedMessageDeliveryRuntime<Menu.TelegramReplyMarkup>({
+    sendMessage: api.sendMessage, editMessage: api.editMessageText, sendRichMessage: api.sendRichMessage,
+  });
+  const actions = Commands.createTelegramSessionActionRuntime({
+    async sendUserMessage(text) {
+      assert.equal(journal.read().entries.some(row => row.updateId === 200), false);
+      events.push("gateway");
+      await actions.handleInternalAction(String(text).split("--internal ")[1]!, {
+        ui: { notify() { assert.fail(); } }, async newSession() { effects++; events.push("newSession"); return { cancelled: false }; },
+      } as unknown as Parameters<typeof actions.handleInternalAction>[1]);
+    },
+    getQuitContext: () => ({
+      abort() { assert.equal(journal.read().entries.some(row => row.updateId === 200), false); events.push("abort"); },
+      shutdown() { assert.equal(journal.read().entries.some(row => row.updateId === 200), false); effects++; events.push("shutdown"); },
+    }), notifyResult: async () => assert.fail("No successor notice"),
+  });
+  const harness = createRouteHarness({ instanceTarget: target, sendInteractiveMessage: ui.sendInteractiveMessage,
+    editInteractiveMessage: ui.editInteractiveMessage });
+  harness.routingDeps.answerCallbackQuery = api.answerCallbackQuery;
+  harness.routingDeps.deleteMessage = api.deleteMessage;
+  harness.routingDeps.compact = () => { effects++; events.push("compact"); };
+  const schedule = (source: unknown, kind: "new" | "quit") => {
+    assert.equal(Updates.getTelegramUpdateSourceJournalBinding(source), binding);
+    assert.ok(journal.read().entries.some(row => row.updateId === 200));
+    assert.equal(actions.scheduleAfterUpdate(200, { ...target, messageId: 501 }, { journalBindingKey: binding, isCurrent: () => true }, kind), true);
+    schedules++; events.push("schedule");
+  };
+  harness.routingDeps.requestNewSession = source => schedule(source, "new");
+  harness.routingDeps.requestQuit = source => schedule(source, "quit");
+  const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, typeof ctx>({
+    journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    getQueueOwnerIdentity: () => ({ instanceId: "ui-adapter", processId: process.pid, processBirthId: `${process.pid}:ui`, sessionGeneration: 1 }),
+    defaultHandle: (update, context, execution) => harness.routeRuntime.handleUpdate(update, context, execution),
+    onUpdateCompleted(id, _context, namespace) { if (id === 200) events.push("removed"); actions.onUpdateCompleted(id, namespace); },
+  });
+  try {
+    resetTransportReplyDedup(); worker.start(ctx);
+    journal.appendBatch([{ update_id: 100, message: { message_id: 100, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+      text: `/${command}`, ...(threaded ? { message_thread_id: 70 } : {}) } }]);
+    worker.signal(); await worker.waitForDrain(); await new Promise<void>(resolve => setImmediate(resolve));
+    const published = calls.find(call => call.method === "sendMessage");
+    assert.ok(published, JSON.stringify(harness.events));
+    assert.equal(published.body.message_thread_id, target.threadId);
+    const markup = published.body.reply_markup as Menu.TelegramReplyMarkup;
+    const data = markup.inline_keyboard[0]![choice === "yes" ? 0 : 1]!.callback_data!;
+    const query = { id: "ui-confirm", from: { id: 7, is_bot: false }, data,
+      message: { message_id: 501, chat: { id: 7, type: "private" as const }, ...(threaded ? { message_thread_id: 70 } : {}) } };
+    journal.appendBatch([{ update_id: 200, callback_query: query }]);
+    worker.signal(); await worker.waitForDrain(); await new Promise<void>(resolve => setImmediate(resolve));
+    if (fault !== "current") {
+      assert.equal(effects, 0); assert.equal(schedules, 0);
+      assert.ok(journal.read().entries.some(row => row.updateId === 200), "Failed feedback retains original source");
+      const uiCalls = calls.filter(call => call.method !== "sendMessage");
+      assert.equal(uiCalls.length, fault === "late-ack" ? 1 : 0, "No automatic retry or follow-up lifecycle effect");
+      journal.appendBatch([{ update_id: 201, callback_query: { ...query, id: "stale-retry" } }]);
+      worker.signal(); await worker.waitForDrain(); await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(effects, 0); assert.equal(schedules, 0);
+      return;
+    }
+    assert.equal(effects, choice === "yes" ? 1 : 0, JSON.stringify({ events, routing: harness.events }));
+    assert.equal(schedules, choice === "yes" && command !== "compact" ? 1 : 0);
+    assert.ok(calls.some(call => call.method === "answerCallbackQuery"));
+    assert.ok(calls.some(call => call.method === (command === "new" && choice === "yes" ? "deleteMessage" : "editMessageText")));
+    if (schedules) assert.ok(events.indexOf("removed") > events.indexOf("schedule"));
+    if (command === "new" && choice === "yes") assert.ok(events.indexOf("gateway") > events.indexOf("removed"));
+    if (command === "quit" && choice === "yes") assert.ok(events.indexOf("abort") > events.indexOf("removed"));
+    journal.appendBatch([{ update_id: 201, callback_query: { ...query, id: "duplicate" } }]);
+    worker.signal(); await worker.waitForDrain(); await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(effects, choice === "yes" ? 1 : 0, "Consumed nonce cannot repeat an operation");
+    assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+  } finally {
+    harness.deliveryRuntime.shutdown(); await worker.stop(); restoreHttps(); globalThis.fetch = previousFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+}
+
+for (const targeted of [false, true]) for (const loseView of [false, true]) {
+test(`Native new confirmation preserves exact durable source before its gateway (${targeted ? "Thread target" : "Classic"}, view-loss=${loseView})`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-native-confirmation-"));
+  const ctx = { cwd: "/repo" }, target = { chatId: 7, ...(targeted ? { threadId: 70 } : {}) };
+  const options = { path: join(dir, "journal.json"), botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "confirmation-fixture" }) };
+  const journal = Journal.createTelegramUpdateJournalStore(options), binding = Journal.createTelegramUpdateJournalBindingKey(options);
+  const events: string[] = [];
+  const deleteEntered = Promise.withResolvers<void>(), releaseDelete = Promise.withResolvers<void>();
+  let markup: Menu.TelegramReplyMarkup | undefined, scheduled = 0, replacements = 0;
+  const commandContext = {
+    ui: { notify() { assert.fail("The armed gateway must not become a manual command"); } },
+    async newSession() { assert.equal(journal.read().entries.some(row => row.updateId === 200), false); replacements++; events.push("new-session"); return { cancelled: false }; },
+  } as unknown as Parameters<ReturnType<typeof Commands.createTelegramSessionActionRuntime>["handleInternalAction"]>[1];
+  const actions = Commands.createTelegramSessionActionRuntime({
+    async sendUserMessage(text, sendOptions) {
+      assert.match(String(text), /^\/telegram-connect --internal new [a-f0-9-]+$/u);
+      assert.deepEqual(sendOptions, { expandPromptTemplates: true });
+      assert.equal(journal.read().entries.some(row => row.updateId === 200), false);
+      events.push("gateway");
+      await actions.handleInternalAction(String(text).split("--internal ")[1]!, commandContext);
+    },
+    notifyResult: async () => assert.fail("A fresh successful session reports through successor settlement"),
+  });
+  const harness = createRouteHarness({
+    async sendInteractiveMessage(chatId, html, _mode, keyboard, sendOptions) {
+      sendOptions?.assertAuthority?.();
+      assert.equal(chatId, 7);
+      assert.equal(html, "<b>Start a new session?</b>");
+      assert.deepEqual(sendOptions?.target, target);
+      markup = keyboard;
+      return 501;
+    },
+  });
+  harness.routingDeps.answerCallbackQuery = async () => { events.push("ack"); };
+  harness.routingDeps.deleteMessage = async (chatId, messageId, callOptions) => {
+    assert.deepEqual([chatId, messageId], [7, 501]);
+    assert.ok(journal.read().entries.some(row => row.updateId === 200));
+    deleteEntered.resolve();
+    if (loseView) await releaseDelete.promise;
+    callOptions?.assertAuthority?.();
+    events.push("delete");
+  };
+  harness.routingDeps.requestNewSession = source => {
+    assert.equal(Updates.getTelegramUpdateExecutionFence(source)?.updateId, 200);
+    const original = journal.read().entries.find(row => row.updateId === 200)!.update.callback_query;
+    const observed = JSON.parse(JSON.stringify(source));
+    assert.equal(observed.pi_telegram_source_update_id, 200);
+    delete observed.pi_telegram_source_update_id;
+    delete observed.message.pi_telegram_source_update_id;
+    assert.deepEqual(observed, original, "Only existing local source hints may differ; native command data stays unchanged");
+    assert.equal(Updates.getTelegramUpdateSourceJournalBinding(source), binding);
+    assert.equal(actions.scheduleAfterUpdate(200, { ...target, messageId: 501 }, { journalBindingKey: binding, isCurrent: () => true }), true);
+    scheduled++; events.push("schedule");
+  };
+  const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, typeof ctx>({
+    journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    getQueueOwnerIdentity: () => ({ instanceId: "confirmation", processId: process.pid,
+      processBirthId: `${process.pid}:confirmation`, sessionGeneration: 1 }),
+    defaultHandle: (update, context, execution) => harness.routeRuntime.handleUpdate(update, context, execution),
+    onUpdateCompleted(updateId, _context, sourceBinding) {
+      if (updateId === 200) {
+        assert.equal(journal.read().entries.some(row => row.updateId === updateId), false);
+        events.push("removed");
+      }
+      actions.onUpdateCompleted(updateId, sourceBinding);
+    },
+  });
+  try {
+    worker.start(ctx);
+    journal.appendBatch([{ update_id: 100, message: { message_id: 100, chat: { id: 7, type: "private" },
+      from: { id: 7, is_bot: false }, text: "/new", ...(targeted ? { message_thread_id: 70 } : {}) } }]);
+    worker.signal(); await worker.waitForDrain();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(scheduled, 0);
+    const data = markup!.inline_keyboard[0]![0]!.callback_data!;
+    assert.match(data, /^tgconfirm:[a-f0-9]{32}:yes$/u);
+    const query = { id: "new-confirm", from: { id: 7, is_bot: false }, data,
+      message: { message_id: 501, chat: { id: 7, type: "private" as const }, ...(targeted ? { message_thread_id: 70 } : {}) } };
+    journal.appendBatch([{ update_id: 200, callback_query: query }]);
+    worker.signal();
+    if (loseView) {
+      await deleteEntered.promise;
+      harness.deliveryRuntime.shutdown();
+      releaseDelete.resolve();
+    }
+    await worker.waitForDrain();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (loseView) {
+      assert.deepEqual(events, ["ack"]);
+      assert.equal(scheduled, 0); assert.equal(replacements, 0);
+      assert.equal(actions.hasPending(), false);
+      return;
+    }
+    assert.deepEqual(events, ["ack", "delete", "schedule", "removed", "gateway", "new-session"], JSON.stringify({ routing: harness.events, journal: journal.read().entries }));
+    assert.equal(scheduled, 1); assert.equal(replacements, 1);
+    journal.appendBatch([{ update_id: 201, callback_query: { ...query, id: "duplicate" } }]);
+    worker.signal(); await worker.waitForDrain();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(scheduled, 1); assert.equal(replacements, 1);
+    assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+  } finally {
+    releaseDelete.resolve();
+    harness.deliveryRuntime.shutdown();
+    await worker.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+}
+
+for (const threaded of [false, true]) for (const choice of ["yes", "no"] as const) {
+test(`Native hidden quit handles busy instances only after exact source removal (Thread=${threaded}, ${choice})`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-native-quit-"));
+  const ctx = { cwd: "/repo" }, target = { chatId: 7, ...(threaded ? { threadId: 70 } : {}) };
+  const options = { path: join(dir, "journal.json"), botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "quit-fixture" }) };
+  const journal = Journal.createTelegramUpdateJournalStore(options), binding = Journal.createTelegramUpdateJournalBindingKey(options);
+  const events: string[] = [];
+  let markup: Menu.TelegramReplyMarkup | undefined, scheduled = 0;
+  const actions = Commands.createTelegramSessionActionRuntime({
+    sendUserMessage: () => assert.fail("Busy quit must not wait for another Pi command or model turn"),
+    notifyResult: async () => assert.fail("Quit has no replacement successor"),
+    prepareReplacement: async () => assert.fail("Quit cannot publish replacement handoff"),
+    getQuitContext: () => ({
+      abort() { assert.equal(actions.isQuitting(), true); assert.equal(journal.read().entries.some(row => row.updateId === 200), false); events.push("abort"); },
+      shutdown() { assert.equal(journal.read().entries.some(row => row.updateId === 200), false); events.push("shutdown"); },
+    }),
+  });
+  const harness = createRouteHarness({
+    instanceTarget: target,
+    async sendInteractiveMessage(_chat, html, _mode, keyboard, sendOptions) {
+      sendOptions?.assertAuthority?.();
+      assert.equal(html, "<b>Quit this Pi instance?</b>");
+      assert.deepEqual(sendOptions?.target, target);
+      assert.deepEqual(keyboard!.inline_keyboard[0]!.map(button => button.text), ["🚪 Yes, quit", "❌ No"]);
+      markup = keyboard; return 501;
+    },
+  });
+  harness.routingDeps.isIdle = () => false;
+  harness.routingDeps.hasPendingMessages = () => true;
+  harness.routingDeps.editInteractiveMessage = async (_chat, _message, html, _mode, keyboard, callOptions) => {
+    callOptions?.assertAuthority?.();
+    assert.equal(html, choice === "yes" ? "<b>🚪 Quit requested.</b>" : "<b>🚫 Quit cancelled.</b>");
+    assert.deepEqual(keyboard, { inline_keyboard: [] });
+    assert.ok(journal.read().entries.some(row => row.updateId === 200));
+    events.push("feedback");
+  };
+  harness.routingDeps.answerCallbackQuery = async () => { events.push("ack"); };
+  harness.routingDeps.requestQuit = source => {
+    assert.equal(Updates.getTelegramUpdateExecutionFence(source)?.updateId, 200);
+    assert.equal(Updates.getTelegramUpdateSourceJournalBinding(source), binding);
+    assert.ok(journal.read().entries.some(row => row.updateId === 200));
+    assert.equal(actions.scheduleAfterUpdate(200, { ...target, messageId: 501 }, { journalBindingKey: binding, isCurrent: () => true }, "quit"), true);
+    scheduled++; events.push("schedule");
+  };
+  const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, typeof ctx>({
+    journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    getQueueOwnerIdentity: () => ({ instanceId: "quit", processId: process.pid, processBirthId: `${process.pid}:quit`, sessionGeneration: 1 }),
+    defaultHandle: (update, context, execution) => harness.routeRuntime.handleUpdate(update, context, execution),
+    onUpdateCompleted(updateId, _context, sourceBinding) {
+      if (updateId === 200) { assert.equal(journal.read().entries.some(row => row.updateId === 200), false); events.push("removed"); }
+      actions.onUpdateCompleted(updateId, sourceBinding);
+    },
+  });
+  try {
+    worker.start(ctx);
+    journal.appendBatch([{ update_id: 100, message: { message_id: 100, chat: { id: 7, type: "private" },
+      from: { id: 7, is_bot: false }, text: "/quit", ...(threaded ? { message_thread_id: 70 } : {}) } }]);
+    worker.signal(); await worker.waitForDrain(); await new Promise<void>(resolve => setImmediate(resolve));
+    const data = markup!.inline_keyboard[0]![choice === "yes" ? 0 : 1]!.callback_data!;
+    assert.match(data, /^tgconfirm:[a-f0-9]{32}:(yes|no)$/u);
+    const query = { id: "quit-confirm", from: { id: 7, is_bot: false }, data,
+      message: { message_id: 501, chat: { id: 7, type: "private" as const }, ...(threaded ? { message_thread_id: 70 } : {}) } };
+    journal.appendBatch([{ update_id: 199, callback_query: { ...query, id: "foreign-user", from: { id: 8, is_bot: false } } }]);
+    worker.signal(); await worker.waitForDrain();
+    assert.equal(scheduled, 0); assert.deepEqual(events, []);
+    journal.appendBatch([{ update_id: 200, callback_query: query }]);
+    worker.signal(); await worker.waitForDrain(); await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(events, choice === "yes" ? ["feedback", "ack", "schedule", "removed", "abort", "shutdown"] : ["feedback", "ack", "removed"]);
+    assert.equal(scheduled, choice === "yes" ? 1 : 0);
+    journal.appendBatch([{ update_id: 201, callback_query: { ...query, id: "duplicate" } },
+      { update_id: 202, callback_query: { ...query, id: "unbound-legacy", data: "quit:confirm" } }]);
+    worker.signal(); await worker.waitForDrain();
+    assert.equal(events.filter(event => event === "shutdown").length, choice === "yes" ? 1 : 0);
+    assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+  } finally { harness.deliveryRuntime.shutdown(); await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+}
+
+test("Quit refuses a source outside the current instance instead of retargeting its dialog", async () => {
+  let sent = 0, requested = 0;
+  const harness = createRouteHarness({ instanceTarget: { chatId: 7, threadId: 70 },
+    sendInteractiveMessage: async () => { sent++; return 501; } });
+  harness.routingDeps.requestQuit = () => { requested++; };
+  await harness.routeRuntime.handleUpdate({ update_id: 1, message: { message_id: 1, chat: { id: 7, type: "private" },
+    from: { id: 7, is_bot: false }, text: "/quit", message_thread_id: 71 } }, { cwd: "/repo" });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(sent, 0); assert.equal(requested, 0);
+});
+
+test("Native compact confirmation rechecks busy state and a denied choice cannot be replayed", async () => {
+  let busy = false, compactions = 0, markup: Menu.TelegramReplyMarkup | undefined;
+  const harness = createRouteHarness({
+    isIdle: () => !busy,
+    async sendInteractiveMessage(_chat, _text, _mode, keyboard, options) { options?.assertAuthority?.(); markup = keyboard; return 501; },
+  });
+  harness.routingDeps.compact = () => { compactions++; };
+  await harness.routeRuntime.handleUpdate({ message: { message_id: 100, chat: { id: 7, type: "private" },
+    from: { id: 7, is_bot: false }, text: "/compact" } }, { cwd: "/repo" });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  const data = markup!.inline_keyboard[0]![0]!.callback_data!;
+  const query = { id: "compact", from: { id: 7, is_bot: false }, data,
+    message: { message_id: 501, chat: { id: 7, type: "private" as const } } };
+  busy = true;
+  await harness.routeRuntime.handleUpdate({ callback_query: query }, { cwd: "/repo" });
+  assert.equal(compactions, 0);
+  assert.ok(harness.events.some(event => event.includes("Cannot compact while Pi or the Telegram queue is busy")), harness.events.join("\n"));
+  busy = false;
+  await harness.routeRuntime.handleUpdate({ callback_query: { ...query, id: "late" } }, { cwd: "/repo" });
+  assert.equal(compactions, 0);
+  assert.ok(harness.events.includes("answer:Confirmation expired"));
+});
+
+for (const threaded of [false, true]) {
+test(`Routing Delivery Choice consumes only its exact answer, not a native command or model prompt (Thread=${threaded})`, async () => {
+  const target = { chatId: 7, ...(threaded ? { threadId: 70 } : {}) };
+  const runtime = Delivery.createTelegramBridgeDeliveryRuntime({
+    generation: "choice-routing", getProfileName: () => "default",
+    getTargetPolicyView: () => ({ canDeliver: true, ownsDirect: true, allowedChatId: 7,
+      ...(threaded ? { leaderTarget: { chatId: 7, threadId: 70 } } : {}) }),
+    getActiveTurnTarget: () => undefined,
+    api: { async sendMessage(_body, options) { options?.assertAuthority?.(); return { message_id: 501 }; },
+      async editMessageText(_body, options) { options?.assertAuthority?.(); return "edited"; },
+      async deleteMessage() {}, async sendChatAction() { return true; } },
+    recordOwnership() {},
+  });
+  const harness = createRouteHarness({ deliveryRuntime: runtime }), unbind = Delivery.bindTelegramDeliveryRuntime(runtime);
+  harness.routingDeps.requestNewSession = () => assert.fail("A choice ID is not a native execution grant");
+  harness.routingDeps.requestQuit = () => assert.fail("A choice ID cannot quit");
+  harness.routingDeps.compact = () => assert.fail("A choice ID cannot compact");
+  try {
+    const request = { owner: "@llblab/pi-telegram", scope: { kind: "instance" as const },
+      question: "Choose?", choices: [{ id: "quit:confirm", label: "Quit-looking value" }, { id: "disabled", label: "Unavailable", disabled: true }],
+      cancelLabel: "❌ Cancel", timeoutMs: 60_000, signal: new AbortController().signal,
+      confirmedData: "new:confirm", cancelledData: "quit:confirm" };
+    const opened = await Delivery.openTelegramChoice(request);
+    assert.ok(opened.ok);
+    const click = (actor: number, value = "0", messageId = 501, clickTarget = target) =>
+      harness.routeRuntime.handleUpdate({ callback_query: { id: "choice", from: { id: actor, is_bot: false },
+        data: `tgchoice:${opened.handle.id}:${value}`,
+        message: { message_id: messageId, chat: { id: clickTarget.chatId, type: "private" }, ...(clickTarget.threadId !== undefined ? { message_thread_id: clickTarget.threadId } : {}) } } }, { cwd: "/repo" });
+    await click(8); await click(7, "0", 502); await click(7, "1");
+    assert.equal(runtime.hasPendingTarget!(target), true);
+    await click(7);
+    assert.deepEqual(await opened.handle.result, { status: "selected", choiceId: "quit:confirm" });
+    await click(7);
+    await click(7, "garbage");
+    assert.ok(harness.events.includes("answer:Selected"), harness.events.join("\n"));
+    assert.equal(harness.events.filter(event => event === "answer:Choice expired").length, 4);
+    assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+    unbind();
+    await click(7);
+    assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+  } finally { unbind(); runtime.shutdown(); }
+});
+}
+
+for (const threaded of [false, true])
+test(`Routing Task View requests producer cancellation without global abort, commands or model admission (Thread=${threaded})`, async t => {
+  const target = { chatId: 7, ...(threaded ? { threadId: 70 } : {}) };
+  const runtime = Delivery.createTelegramBridgeDeliveryRuntime({ generation: "task-routing", getProfileName: () => "default",
+    getTargetPolicyView: () => ({ canDeliver: true, ownsDirect: true, allowedChatId: 7, ...(threaded ? { leaderTarget: target } : {}) }),
+    getActiveTurnTarget: () => undefined,
+    api: { async sendMessage(_body, options) { options?.assertAuthority?.(); return { message_id: 501 }; },
+      async editMessageText(_body, options) { options?.assertAuthority?.(); return "edited"; }, async deleteMessage() {}, async sendChatAction() { return true; } },
+    recordOwnership() {},
+  });
+  const harness = createRouteHarness({ deliveryRuntime: runtime }), unbind = Delivery.bindTelegramDeliveryRuntime(runtime);
+  t.mock.method(harness.bridgeRuntime.abort, "abortTurn", () => assert.fail("Task View cannot invoke global Pi abort"));
+  harness.routingDeps.requestNewSession = () => assert.fail("Task View is not a new-session grant");
+  harness.routingDeps.requestQuit = () => assert.fail("Task View cannot quit");
+  try {
+    const opened = await Delivery.openTelegramTaskView({ owner: "@test/export", scope: { kind: "instance" }, title: "Export",
+      state: { status: "running", text: "Working" }, cancellable: true, timeoutMs: 60_000, signal: new AbortController().signal });
+    assert.ok(opened.ok);
+    const click = (messageId = 501, data = `tgtask:${opened.handle.id}:cancel`) => harness.routeRuntime.handleUpdate({ callback_query: {
+      id: "task", from: { id: 7, is_bot: false }, data,
+      message: { message_id: messageId, chat: { id: 7, type: "private" }, ...(threaded ? { message_thread_id: 70 } : {}) },
+    } }, { cwd: "/repo" });
+    await click(502); await click();
+    assert.deepEqual(await opened.handle.cancellation, { status: "requested" });
+    assert.ok(harness.events.includes("answer:Cancellation requested"), harness.events.join("\n"));
+    assert.equal(runtime.hasPendingTarget!(target), true, "A cancellation request does not finish the producer's task");
+    await click(); await click(501, "tgtask:malformed");
+    assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+    assert.equal((await opened.handle.update({ status: "cancelled", text: "Producer acknowledged cancellation" })).ok, true);
+    assert.deepEqual(await opened.handle.result, { status: "cancelled" });
+    unbind(); await click(); assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+  } finally { unbind(); runtime.shutdown(); }
+});
+
+for (const threaded of [false, true])
+test(`Routing Attachment controls cancel only their question and reserve stale namespaces (Thread=${threaded})`, async t => {
+  const target = { chatId: 7, ...(threaded ? { threadId: 70 } : {}) };
+  const runtime = Delivery.createTelegramDeliveryRuntime({ generation: "attachment-routing",
+    getInstanceTarget: () => target, getActiveTurnTarget: () => target, getAggregateTarget: () => target,
+    isExplicitTargetAuthorized: candidate => candidate.chatId === 7 && candidate.threadId === target.threadId,
+    getConfirmationAuthority: () => ({ profile: "default", operatorId: 7 }), getAttachmentReceiverBotId: () => 99,
+    renderView: view => [{ text: view.text, parseMode: view.parseMode ?? "plain" }],
+    publishAttachmentQuestion: async (_target, _chunk, options) => { options.assertAuthority?.(); return 501; },
+    sendChunk: async () => assert.fail("Private question cannot use ordinary publication"),
+    editChunk: async (_target, _id, _chunk, options) => { options.assertAuthority?.(); }, async deleteMessage() {}, async sendChatAction() {} });
+  const harness = createRouteHarness({ deliveryRuntime: runtime }), unbind = Delivery.bindTelegramDeliveryRuntime(runtime);
+  t.mock.method(harness.bridgeRuntime.abort, "abortTurn", () => assert.fail("Attachment cancellation cannot abort Pi"));
+  harness.routingDeps.requestNewSession = () => assert.fail("Attachment cancellation cannot replace a session");
+  harness.routingDeps.requestQuit = () => assert.fail("Attachment cancellation cannot quit");
+  try {
+    const opened = await runtime.openAttachmentQuestion!({ owner: "@test/file", scope: { kind: "instance" }, question: "Send report?",
+      cancelLabel: "❌ Cancel", timeoutMs: 60_000, signal: new AbortController().signal }); assert.ok(opened.ok);
+    const click = (messageId = 501, data = `tgattach:${opened.handle.id}:cancel`) => harness.routeRuntime.handleUpdate({ callback_query: {
+      id: "attachment", from: { id: 7, is_bot: false }, data, message: { message_id: messageId, chat: { id: 7, type: "private" },
+        ...(threaded ? { message_thread_id: 70 } : {}) } } }, { cwd: "/repo" });
+    await click(502); await click(); assert.deepEqual(await opened.handle.result, { status: "cancelled" });
+    assert.ok(harness.events.includes("answer:Cancelled"), harness.events.join("\n"));
+    await click(); await click(501, "tgattach:malformed"); unbind(); await click();
+    assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+  } finally { unbind(); runtime.shutdown(); }
+});
+
+async function localPrivateTextRouteFixture(threaded: boolean, fault = "") {
+  const target = { chatId: 7, ...(threaded ? { threadId: 70 } : {}) }, registry = Bus.createTelegramBusFollowerRegistry();
+  const ownership = Ownership.createTelegramBusMessageOwnershipRuntime({ instanceId: "leader-a", getProfileKey: () => "default", listFollowers: registry.list });
+  let botId = 99;
+  const scope = { current: true, onSourceRead: undefined as (() => void) | undefined };
+  const runtime = Delivery.createTelegramBridgeDeliveryRuntime({ generation: "local-private-reply", getProfileName: () => "default",
+    getTextInputReceiverBotId: () => 99, getTargetPolicyView: () => ({ canDeliver: true, ownsDirect: true, allowedChatId: 7,
+      ...(threaded ? { leaderTarget: target } : {}) }), getActiveTurnTarget: () => undefined,
+    captureInputPublication: ownership.captureLocalPublication, recordOwnership() { assert.fail("Private publication is not ordinary metadata"); },
+    api: { async sendMessage(_body, options) { options?.assertAuthority?.(); return { message_id: 501 }; },
+      async editMessageText(_body, options) { options?.assertAuthority?.(); return "edited"; }, async deleteMessage() {}, async sendChatAction() { return true; } } });
+  const harness = createRouteHarness({ deliveryRuntime: runtime,
+    downloadFile: async () => { assert.fail("SDK text replies never download or transcribe media"); }, privateDeliveryReplies: {
+    getBotId: () => botId,
+    getOriginalOwnership(chatId, messageId) { const original = ownership.store.getOriginal(chatId, messageId);
+      if (fault === "bot-changed") botId = 100;
+      if (fault === "source-ended") { scope.current = false; scope.onSourceRead?.(); } return original; },
+    captureOriginalOwnership(chatId, messageId) { const captured = ownership.captureOriginalForwardOwnership(chatId, messageId);
+      if (fault === "origin-lost") ownership.store.clear(); return captured; },
+  }, getMessageOwnership() { assert.fail("Known SDK replies never use replacement ownership"); },
+    foreignOwnedUpdateForwarder: { async forwardMessage() { assert.fail("Private foreign forwarding is not enabled"); },
+      async forwardEditedMessage() { assert.fail("Private edits never enter ordinary foreign forwarding"); },
+      async forwardCallback() { assert.fail("Private input cannot fall into callback forwarding"); },
+      async forwardReaction() { assert.fail("Private input cannot fall into reaction forwarding"); } } });
+  harness.routingDeps.requestQuit = () => assert.fail("SDK text cannot quit");
+  harness.routingDeps.requestNewSession = () => assert.fail("SDK text cannot replace the session");
+  harness.routingDeps.compact = () => assert.fail("SDK text cannot compact");
+  const unbind = Delivery.bindTelegramDeliveryRuntime(runtime), controller = new AbortController();
+  const opened = await runtime.openTextInput!({ owner: "@test/private", scope: { kind: "instance" }, question: "Title?",
+    cancelLabel: "❌ Cancel", timeoutMs: 60_000, signal: controller.signal });
+  assert.ok(opened.ok);
+  const reply = (requestId = opened.handle.id) => ({ message_id: 602, chat: { id: 7, type: "private" as const },
+    from: { id: 7, is_bot: false }, ...(threaded ? { message_thread_id: 70 } : {}), text: "/quit",
+    reply_to_message: { message_id: 501, chat: { id: 7, type: "private" as const }, from: { id: 99, is_bot: true },
+      ...(threaded ? { message_thread_id: 70 } : {}), reply_markup: { inline_keyboard: [[{ text: "Cancel", callback_data: `tginput:${requestId}:cancel` }]] } } });
+  return { ...harness, runtime, ownership, registry, controller, opened, reply, scope,
+    dispose() { unbind(); runtime.shutdown(); } };
+}
+
+for (const threaded of [false, true]) for (const mode of ["local", "foreign", "sparse", "malformed", "invalid-reply-id", "missing-marker", "no-original", "media", "edited", "poisoned", "captured-callables", "captured-fence"] as const) {
+  test(`Private reply evidence classifier does not collect or execute (Thread=${threaded}, ${mode})`, async () => {
+    const f = await localPrivateTextRouteFixture(threaded), message = f.reply();
+    let accepted = 0, settled = false, sourceCurrent = true;
+    const collector = f.runtime.acceptTextInputReply!;
+    f.runtime.acceptTextInputReply = (...args) => { accepted++; return collector(...args); };
+    void f.opened.handle.result.then(() => { settled = true; });
+    let replaceFence: (() => void) | undefined;
+    const ports: Routing.TelegramPrivateDeliveryReplyPorts = { getBotId: () => 99,
+      getOriginalOwnership: f.ownership.store.getOriginal, captureOriginalOwnership(chatId, messageId) {
+        const original = f.ownership.captureOriginalForwardOwnership(chatId, messageId);
+        if (!original || mode !== "captured-fence") return original;
+        const evidence = { ...original };
+        replaceFence = () => { evidence.assertCurrent = () => {}; };
+        return evidence;
+      } };
+    const classify = Routing.createTelegramPrivateTextReplyClassifier(ports, () => { replaceFence?.(); return "leader-a"; });
+    if (mode === "foreign") {
+      f.ownership.store.clear();
+      const peer = { instanceId: "foreign", connectedAtMs: 1, profileKey: "B", registrationGeneration: "g1", sessionId: "B-session",
+        sessionGeneration: 1, pid: 101, processBirthId: "101:birth", cwd: "/B", busSocketPath: "/B/socket",
+        protocol: Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "fixture", capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] }),
+        ...(threaded ? { target: { chatId: 7, threadId: 70 } } : {}) };
+      f.registry.register(peer); f.ownership.captureFollowerPublication(peer, { chatId: 7, ...(threaded ? { threadId: 70 } : {}) })(501);
+    }
+    if (mode === "sparse") message.reply_to_message.reply_markup.inline_keyboard[0]!.length = 2;
+    if (mode === "malformed") message.reply_to_message.reply_markup.inline_keyboard[0]![0]!.callback_data = "tginput:malformed";
+    if (mode === "invalid-reply-id") message.reply_to_message.message_id = 0;
+    if (mode === "missing-marker") Object.assign(message.reply_to_message, { reply_markup: undefined });
+    if (mode === "no-original") f.ownership.store.clear();
+    if (mode === "media") Object.assign(message, { photo: [{ file_id: "private" }] });
+    if (mode === "edited") Object.assign(message, { edit_date: 1 });
+    if (mode === "captured-callables") {
+      ports.getBotId = () => assert.fail("Classifier must retain the captured bot getter");
+      ports.getOriginalOwnership = () => assert.fail("Classifier must retain the original lookup");
+      ports.captureOriginalOwnership = () => assert.fail("Classifier must retain the original capture");
+    }
+    try {
+      const assertSource = () => { if (!sourceCurrent) throw new Error("Source ended"); };
+      const result = classify(message, assertSource);
+      assert.equal(result.kind, mode === "foreign" ? "foreign" : ["sparse", "malformed", "invalid-reply-id", "missing-marker", "no-original"].includes(mode) ? "unavailable" : "local");
+      if (result.kind === "foreign") {
+        result.assertCurrent();
+        assert.equal(result.destination.receiver.bindingKey, "B");
+        assert.equal(result.destination.publicationMessageId, 501);
+        assert.equal(result.destination.requestNonce, f.opened.handle.id);
+        const originalPeer = f.registry.list().find(peer => peer.instanceId === "foreign")!;
+        f.registry.remove("foreign");
+        assert.throws(result.assertCurrent, /unavailable/);
+        f.registry.register(originalPeer);
+        assert.throws(result.assertCurrent, /unavailable/, "Restoring registry evidence cannot unpoison an original fence");
+      }
+      if (result.kind === "local") {
+        result.assertCurrent();
+        if (mode === "poisoned") { sourceCurrent = false; assert.throws(result.assertCurrent, /Source ended/); }
+        f.ownership.store.clear();
+        assert.throws(result.assertCurrent, /unavailable|Source ended/);
+      }
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(accepted, 0); assert.equal(settled, false);
+      assert.deepEqual(f.telegramQueueStore.getQueuedItems(), []);
+      assert.ok(!f.events.some(event => event.startsWith("user:")));
+    } finally { f.dispose(); }
+  });
+}
+
+for (const foreign of [false, true]) for (const loss of ["bot", "instance", "source", "reentry", "late-reentry"] as const)
+test(`Private Text reply authority cannot revive after observed loss or caught reentry (foreign=${foreign}, ${loss})`, async () => {
+  const f = await localPrivateTextRouteFixture(false), message = f.reply();
+  let botId = 99, instanceId = "leader-a", sourceCurrent = true, reenter: (() => void) | undefined, instanceReadsUntilReentry = 0;
+  const runNested = () => { const nested = reenter; reenter = undefined; nested?.(); };
+  let collected = false;
+  void f.opened.handle.result.then(() => { collected = true; });
+  if (foreign) {
+    f.ownership.store.clear();
+    const peer = { instanceId: "foreign", connectedAtMs: 1, profileKey: "B", registrationGeneration: "g1", sessionId: "B-session",
+      sessionGeneration: 1, pid: 101, processBirthId: "101:birth", cwd: "/B", busSocketPath: "/B/socket",
+      protocol: Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "fixture", capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] }) };
+    f.registry.register(peer); f.ownership.captureFollowerPublication(peer, { chatId: 7 })(501);
+  }
+  const classify = Routing.createTelegramPrivateTextReplyClassifier({ getBotId: () => botId,
+    getOriginalOwnership: f.ownership.store.getOriginal, captureOriginalOwnership: f.ownership.captureOriginalForwardOwnership }, () => {
+      if (instanceReadsUntilReentry > 0 && --instanceReadsUntilReentry === 0) runNested();
+      return instanceId;
+    });
+  const sourceFailure = new Error("Private Text source ended");
+  try {
+    const selection = classify(message, () => {
+      if (!sourceCurrent) throw sourceFailure;
+      if (loss === "reentry") runNested();
+    });
+    assert.equal(selection.kind, foreign ? "foreign" : "local");
+    assert.ok(selection.kind === "foreign" || selection.kind === "local");
+    const { assertCurrent } = selection;
+    assertCurrent();
+    if (loss === "bot") botId = 100;
+    if (loss === "instance") instanceId = "replacement";
+    if (loss === "source") sourceCurrent = false;
+    if (loss === "reentry" || loss === "late-reentry") {
+      reenter = () => { try { assertCurrent(); } catch { /* Caught nested refusal must still poison the outer observation. */ } };
+      if (loss === "late-reentry") instanceReadsUntilReentry = 2;
+    }
+    assert.throws(assertCurrent, loss === "source" ? error => error === sourceFailure : /unavailable/);
+    botId = 99; instanceId = "leader-a"; sourceCurrent = true;
+    assert.throws(assertCurrent, /unavailable/, "Restored values cannot renew the captured guard");
+    // New classification is a separate observation, not renewal of the spent guard.
+    const fresh = classify(message, () => {});
+    assert.ok(fresh.kind === "foreign" || fresh.kind === "local"); fresh.assertCurrent();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(collected, false);
+    assert.equal(f.runtime.hasPendingTarget!({ chatId: 7 }), true);
+    assert.deepEqual(f.telegramQueueStore.getQueuedItems(), []);
+  } finally { f.dispose(); }
+});
+
+for (const threaded of [false, true]) for (const mode of ["submit", "wrong-nonce", "edited", "media", "terminal", "no-original", "missing-marker", "old-binding", "unbound", "malformed-marker", "origin-lost", "bot-changed", "foreign"] as const) {
+test(`Known SDK local reply is private before ordinary routing (Thread=${threaded}, ${mode})`, async () => {
+  const f = await localPrivateTextRouteFixture(threaded, mode);
+  let settled = false; void f.opened.handle.result.then(() => { settled = true; });
+  const message = f.reply(mode === "wrong-nonce" ? "f".repeat(32) : f.opened.handle.id);
+  if (mode === "media") Object.assign(message, { text: undefined, caption: "private caption", photo: [{ file_id: "private-photo", file_unique_id: "file", width: 1, height: 1 }] });
+  if (mode === "terminal") f.controller.abort();
+  if (mode === "no-original") f.ownership.store.clear();
+  if (mode === "missing-marker") Object.assign(message.reply_to_message, { reply_markup: undefined });
+  if (mode === "malformed-marker") message.reply_to_message.reply_markup.inline_keyboard[0]![0]!.callback_data = "tginput:malformed";
+  if (mode === "old-binding") { delete f.runtime.acceptTextInputReply; f.runtime.acceptTextInput = () => { assert.fail("An old collector cannot ignore exact request identity"); }; }
+  if (mode === "unbound") Delivery.clearTelegramDeliveryRuntime();
+  if (mode === "foreign") {
+    f.ownership.store.clear();
+    const peer = { instanceId: "foreign", connectedAtMs: 1, profileKey: "manual:peer", registrationGeneration: "g1", sessionId: "session",
+      sessionGeneration: 1, pid: 101, processBirthId: "birth", cwd: "/repo", busSocketPath: "/endpoint",
+      protocol: Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "fixture", capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] }),
+      ...(threaded ? { target: { chatId: 7, threadId: 70 } } : {}) };
+    f.registry.register(peer); f.ownership.captureFollowerPublication(peer, { chatId: 7, ...(threaded ? { threadId: 70 } : {}) })(501);
+  }
+  try {
+    const handle = () => f.routeRuntime.handleUpdate(mode === "edited" ? { edited_message: message } : { message }, { cwd: "/repo" });
+    if (["origin-lost", "bot-changed", "foreign"].includes(mode)) await assert.rejects(handle, /unavailable/);
+    else await handle();
+    if (mode === "submit") assert.deepEqual(await f.opened.handle.result, { status: "submitted", text: "/quit" });
+    else if (mode === "terminal") assert.deepEqual(await f.opened.handle.result, { status: "aborted" });
+    else if (mode === "unbound") assert.deepEqual(await f.opened.handle.result, { status: "invalidated" });
+    else { await new Promise<void>(resolve => setImmediate(resolve)); assert.equal(settled, false); }
+    assert.deepEqual(f.telegramQueueStore.getQueuedItems(), []);
+    assert.ok(!f.events.some(event => event.startsWith("user:")), f.events.join("\n"));
+  } finally { f.dispose(); }
+});
+}
+
+for (const threaded of [false, true])
+for (const shape of ["document", "photo", "voice", "command", "edited", "album", "malformed", "mixed", "status", "wrong-target"] as const)
+test(`Attachment marked reply stays in its native source before private/ordinary admission (Thread=${threaded}, ${shape})`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pt-attachment-held-")), target = { chatId: 7, ...(threaded ? { threadId: 70 } : {}) };
+  const harness = createRouteHarness({ privateDeliveryReplies: { getBotId: () => 99,
+    getOriginalOwnership() { assert.fail("Attachment cannot enter Text provenance or use a missing original as disposition"); },
+    captureOriginalOwnership() { assert.fail("Attachment cannot capture Text ownership"); } },
+    getMessageOwnership() { assert.fail("Attachment cannot enter ordinary/foreign ownership"); },
+    downloadFile: async () => { assert.fail("Held Attachment cannot download or transcribe"); },
+    foreignOwnedUpdateForwarder: { async forwardMessage() { assert.fail("Attachment cannot use ordinary IPC"); },
+      async forwardEditedMessage() { assert.fail("Attachment edit cannot use ordinary IPC"); },
+      async forwardCallback() { assert.fail("Attachment cannot use callback forwarding"); }, async forwardReaction() { assert.fail("Attachment cannot use reaction forwarding"); } } });
+  harness.routingDeps.requestQuit = () => assert.fail("Attachment text cannot quit");
+  harness.routingDeps.requestNewSession = () => assert.fail("Attachment cannot replace session");
+  const message = { message_id: 602, chat: { id: 7, type: "private" as const }, from: { id: 7, is_bot: false }, ...(threaded ? { message_thread_id: target.threadId } : {}),
+    ...(shape === "command" ? { text: "/quit" } : { caption: "private caption" }),
+    reply_to_message: { message_id: 501, chat: { id: shape === "wrong-target" ? 8 : 7, type: "private" as const }, from: { id: 99, is_bot: true },
+      ...(threaded ? { message_thread_id: 70 } : {}), reply_markup: { inline_keyboard: [[{ text: shape === "status" ? "Request status" : "Cancel",
+        callback_data: shape === "malformed" ? "tgattach:malformed" : `tgattach:${"a".repeat(32)}:cancel` }]] } } };
+  if (threaded) Object.assign(message, { message_thread_id: 70 });
+  if (shape === "document") Object.assign(message, { document: { file_id: "secret", file_name: "private.txt" } });
+  if (shape === "photo") Object.assign(message, { photo: [{ file_id: "secret", file_unique_id: "physical", width: 1, height: 1 }] });
+  if (shape === "voice") Object.assign(message, { voice: { file_id: "secret", duration: 1 } });
+  if (shape === "album") Object.assign(message, { media_group_id: "album", photo: [{ file_id: "secret", file_unique_id: "physical", width: 1, height: 1 }] });
+  if (shape === "mixed") message.reply_to_message.reply_markup.inline_keyboard[0]!.push({ text: "Cancel text", callback_data: `tginput:${"b".repeat(32)}:cancel` });
+  const update = { update_id: 51, ...(shape === "edited" ? { edited_message: { ...message, edit_date: 1 } } : { message }) };
+  const options = { path: join(dir, "inbox.json"), profileName: "default", botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "fixture:attachment-source", botId: 99 }) };
+  const journal = Journal.createTelegramUpdateJournalStore(options), binding = Journal.createTelegramUpdateJournalBindingKey(options);
+  journal.appendBatch([update]); const original = journal.read().entries[0]!.update;
+  let completions = 0, attempts = 0, failure: unknown;
+  const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({ journal, getJournalBindingKey: () => binding,
+    hasAuthority: () => true, isContextCurrent: () => true,
+    getQueueOwnerIdentity: () => ({ instanceId: "leader-a", processId: process.pid, processBirthId: "fixture:attachment-source", sessionGeneration: 1 }),
+    async defaultHandle(input, ctx) { attempts++; try { await harness.routeRuntime.handleUpdate(input, ctx); } catch (error) { failure = error; throw error; } },
+    onUpdateCompleted() { completions++; },
+    scheduleRetry: () => 0, cancelRetry() {}, recordRuntimeEvent() {} });
+  try {
+    worker.start({ cwd: "/repo" }); await worker.waitForDrain();
+    assert.equal(attempts, 1); assert.ok(failure instanceof Error); assert.match(failure.message, /Private Attachment input disposition is unavailable/);
+    assert.equal(completions, 0); assert.equal(journal.read().entries.length, 1);
+    assert.deepEqual(journal.read().entries[0]!.update, original); assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+    assert.ok(!harness.events.some(event => event.startsWith("user:")));
+  } finally { await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Attachment reply privacy guard keeps original provider history and sender admission", async () => {
+  const message = { message_id: 602, chat: { id: 7, type: "private" as const }, from: { id: 8, is_bot: false }, text: "/quit",
+    reply_to_message: { message_id: 501, chat: { id: 7, type: "private" as const }, from: { id: 99, is_bot: true },
+      reply_markup: { inline_keyboard: [[{ text: "Cancel", callback_data: `tgattach:${"a".repeat(32)}:cancel` }]] } } };
+  const harness = createRouteHarness({ privateDeliveryReplies: { getBotId() { assert.fail("Unauthorized sender cannot inspect private bot provenance"); },
+    getOriginalOwnership() { assert.fail("Unauthorized sender cannot inspect originals"); }, captureOriginalOwnership() { assert.fail("Unauthorized sender cannot capture originals"); } } });
+  await harness.routeRuntime.handleUpdate({ message }, { cwd: "/repo" }); assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+  const read = () => 99, ports = { getBotId: read }, guard = Routing.createTelegramAttachmentReplyPrivacyGuard(ports);
+  ports.getBotId = () => 99; assert.throws(() => guard(message), /authority is unavailable/);
+  ports.getBotId = read; assert.throws(() => guard(message), /authority is unavailable/);
+});
+
+for (const threaded of [false, true]) for (const mode of ["submit", "source-ended", "removal-failed"] as const) {
+test(`Known SDK local reply uses journal-owned disposition without agent admission (Thread=${threaded}, ${mode})`, async () => {
+  const f = await localPrivateTextRouteFixture(threaded, mode), dir = await mkdtemp(join(tmpdir(), "pt-private-source-"));
+  let now = Date.now(), refuseRemoval = mode === "removal-failed", accepted = 0;
+  const collector = f.runtime.acceptTextInputReply!;
+  f.runtime.acceptTextInputReply = (...args) => { const result = collector(...args); if (result.handled && result.accepted) accepted++; return result; };
+  const options = { path: join(dir, "inbox.json"), profileName: "default",
+    botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "fixture:private-source", botId: 99 }), getNowMs: () => now };
+  const journal = Journal.createTelegramUpdateJournalStore(options), binding = Journal.createTelegramUpdateJournalBindingKey(options);
+  journal.appendBatch([{ update_id: 51, message: f.reply() }]);
+  const completions: Array<[number, string | undefined]> = [], ctx = { cwd: "/repo" };
+  const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
+    journal: { ...journal, removeCompleted(ids) {
+      if (refuseRemoval) throw new Error("Fixture source removal refused"); return journal.removeCompleted(ids);
+    }, removeCompletedExact(...args) {
+      if (refuseRemoval) throw new Error("Fixture source removal refused"); return journal.removeCompletedExact(...args);
+    } }, getJournalBindingKey: () => binding, getNowMs: () => now,
+    hasAuthority: () => true, isContextCurrent: () => f.scope.current,
+    getQueueOwnerIdentity: () => ({ instanceId: "leader-a", processId: process.pid, processBirthId: "fixture:private-source", sessionGeneration: 1 }),
+    defaultHandle: (update, context) => f.routeRuntime.handleUpdate(update, context),
+    onUpdateCompleted(id, _ctx, key) { completions.push([id, key]); },
+    scheduleRetry: () => 0, cancelRetry() {}, recordRuntimeEvent() {},
+  });
+  f.scope.onSourceRead = () => { void worker.stop(); };
+  try {
+    worker.start(ctx); await worker.waitForDrain();
+    assert.deepEqual(f.telegramQueueStore.getQueuedItems(), []);
+    assert.ok(!f.events.some(event => event.startsWith("user:")));
+    if (mode === "source-ended") {
+      assert.equal(accepted, 0); assert.equal(journal.read().entries.length, 1); assert.deepEqual(completions, []);
+    } else {
+      assert.deepEqual(await f.opened.handle.result, { status: "submitted", text: "/quit" }); assert.equal(accepted, 1);
+      if (mode === "removal-failed") {
+        assert.equal(journal.read().entries.length, 1); assert.deepEqual(completions, []);
+        refuseRemoval = false; now += 10_000; worker.signal(); await worker.waitForDrain();
+        assert.equal(accepted, 1, "Journal retry cannot deliver the typed result twice");
+      }
+      assert.deepEqual(journal.read().entries, []); assert.deepEqual(completions, [[51, binding]]);
+    }
+  } finally { await worker.stop(); f.dispose(); await rm(dir, { recursive: true, force: true }); }
+});
+}
+
+for (const mode of ["plain", "ordinary-reply", "other-bot", "denied-sender"] as const) {
+test(`Known SDK reply filter preserves non-private routing and sender admission (${mode})`, async () => {
+  let observations = 0;
+  const harness = createRouteHarness({ privateDeliveryReplies: { getBotId: () => 99,
+    getOriginalOwnership() { observations++; if (mode === "denied-sender") assert.fail("Sender admission precedes private inspection"); return undefined; },
+    captureOriginalOwnership() { assert.fail("Unmatched input has no private receiver authority"); } } });
+  const message = { message_id: 603, chat: { id: 7, type: "private" as const }, from: { id: mode === "denied-sender" ? 8 : 7, is_bot: false }, text: "ordinary input",
+    ...(mode === "plain" ? {} : { reply_to_message: { message_id: 502, chat: { id: 7, type: "private" as const },
+      from: { id: mode === "other-bot" ? 100 : 99, is_bot: true },
+      ...(mode === "denied-sender" ? { reply_markup: { inline_keyboard: [[{ text: "Cancel", callback_data: `tginput:${"a".repeat(32)}:cancel` }]] } } : {}) } }) };
+  await harness.routeRuntime.handleUpdate({ message }, { cwd: "/repo" });
+  assert.equal(harness.telegramQueueStore.getQueuedItems().length, mode === "denied-sender" ? 0 : 1);
+  assert.equal(observations, mode === "plain" || mode === "denied-sender" ? 0 : 1);
+});
+}
+
+for (const bound of [false, true]) {
+test(`Routing consumes reserved Text Input cancel/status controls without prompt or native fallback (bound=${bound})`, async () => {
+  const runtime = Delivery.createTelegramBridgeDeliveryRuntime({
+    generation: "private-input-routing", getProfileName: () => "default", getTextInputReceiverBotId: () => 777,
+    captureInputPublication: () => () => {},
+    getTargetPolicyView: () => ({ canDeliver: true, ownsDirect: true, allowedChatId: 7 }),
+    getActiveTurnTarget: () => undefined, recordOwnership() {},
+    api: { async sendMessage() { return { message_id: 501 }; }, async editMessageText() { return "edited"; },
+      async deleteMessage() {}, async sendChatAction() { return true; } },
+  });
+  const harness = createRouteHarness({ deliveryRuntime: runtime });
+  Delivery.clearTelegramDeliveryRuntime();
+  const unbind = bound ? Delivery.bindTelegramDeliveryRuntime(runtime) : () => {};
+  try {
+    harness.routingDeps.requestQuit = () => assert.fail("Text input never authorizes quit");
+    harness.routingDeps.requestNewSession = () => assert.fail("Text input never authorizes session replacement");
+    const opened = bound ? await runtime.openTextInput!({ owner: "@test/input", scope: { kind: "instance" }, question: "Title?",
+      cancelLabel: "❌ Cancel", timeoutMs: 60_000, signal: new AbortController().signal }) : undefined;
+    if (opened) assert.ok(opened.ok);
+    const id = opened?.ok ? opened.handle.id : "a".repeat(32);
+    const click = (actor: number, data: string) => harness.routeRuntime.handleUpdate({ callback_query: {
+      id: "input", from: { id: actor, is_bot: false }, data, message: { message_id: 501, chat: { id: 7, type: "private" } },
+    } }, { cwd: "/repo" });
+    await click(8, `tginput:${id}:cancel`);
+    await click(7, `tginput:${id}:cancel`);
+    if (opened?.ok) assert.deepEqual(await opened.handle.result, { status: "cancelled" });
+    await click(7, `tginput:${id}:cancel`); await click(7, "tginput:malformed");
+    assert.ok(harness.events.includes(bound ? "answer:Cancelled" : "answer:Input request is no longer available"), harness.events.join("\n"));
+    assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+  } finally { unbind(); runtime.shutdown(); }
+});
+}
+
+test("Routing Delivery confirmations validates the operator and never enqueues a model prompt", async () => {
+  const runtime = Delivery.createTelegramBridgeDeliveryRuntime({
+    generation: "confirmation-routing",
+    getProfileName: () => "default",
+    getTargetPolicyView: () => ({ canDeliver: true, ownsDirect: true, allowedChatId: 7 }),
+    getActiveTurnTarget: () => undefined,
+    api: {
+      async sendMessage(_body, options) { options?.assertAuthority?.(); return { message_id: 501 }; },
+      async editMessageText(_body, options) { options?.assertAuthority?.(); return "edited"; },
+      async deleteMessage() {},
+      async sendChatAction() { return true; },
+    },
+    recordOwnership() {},
+  });
+  const harness = createRouteHarness({ deliveryRuntime: runtime });
+  const unbind = Delivery.bindTelegramDeliveryRuntime(runtime);
+  try {
+    harness.routingDeps.requestNewSession = () => assert.fail("Public owner identity is not an internal command grant");
+    const request = { owner: "@llblab/pi-telegram", scope: { kind: "instance" as const },
+      question: "Proceed?", confirmLabel: "✅ Yes", cancelLabel: "❌ No",
+      timeoutMs: 60_000, signal: new AbortController().signal,
+      confirmedData: "new:confirm", cancelledData: "new:cancel" };
+    const opened = await Delivery.openTelegramConfirm(request);
+    assert.ok(opened.ok);
+    const click = (actor: number, data = `tgconfirm:${opened.handle.id}:yes`) =>
+      harness.routeRuntime.handleUpdate({ callback_query: { id: "confirmation", from: { id: actor, is_bot: false },
+        data, message: { message_id: 501, chat: { id: 7, type: "private" } } } }, { cwd: "/repo" });
+    await click(8);
+    assert.equal(runtime.hasPendingTarget!({ chatId: 7 }), true);
+    await click(7);
+    assert.deepEqual(await opened.handle.result, { status: "confirmed" });
+    await click(7);
+    await click(7, "tgconfirm:malformed:yes");
+    assert.ok(harness.events.includes("answer:Confirmed"), harness.events.join("\n"));
+    assert.equal(harness.events.filter(event => event === "answer:Confirmation expired").length, 2);
+    assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), []);
+  } finally {
+    unbind();
+    runtime.shutdown();
+  }
+});
 
 test("Routing refuses Thinking menu callbacks while the active turn replies by voice", async () => {
   let voice = true;

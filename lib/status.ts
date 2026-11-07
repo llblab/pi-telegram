@@ -1891,6 +1891,7 @@ function buildStatusHtml(
   return lines.join("\n");
 }
 
+// Deliberately local: status is a structural leaf with no local imports.
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, "&amp;")

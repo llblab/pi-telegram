@@ -6,8 +6,8 @@
 import { getCanonicalModelId, modelsMatch, parseTelegramCliScopedModelPatterns, resolveScopedModelPatterns, sortScopedModels, } from "./model.js";
 import { TelegramApiAuthorityError, } from "./telegram-api.js";
 const TELEGRAM_MODEL_MENU_CACHE_TTL_MS = 5000;
-const TELEGRAM_MODEL_MENU_STATE_TTL_MS = 10 * 60 * 1000;
-const MAX_STORED_TELEGRAM_MODEL_MENUS = 50;
+const TELEGRAM_MODEL_MENU_STATE_TTL_MS = 60 * 60 * 1000;
+const MAX_STORED_TELEGRAM_MODEL_MENUS = 60;
 /** Per-open delivery lifetime; never retain this guard in stored callback state. */
 export function createTelegramMenuDelivery(target, options, deps) {
     const assertAuthority = options?.assertAuthority, capturedTarget = { ...target };

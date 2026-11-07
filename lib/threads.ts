@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import {
@@ -381,7 +381,7 @@ export interface TelegramTemporaryThreadCancellationEvidence {
   updateId: number;
   operatorAuthorityId: string;
 }
-/** A bot-created routing tab with an exact creation source; it owns no Pi binding or slot. */
+/** A routing-tab lifecycle frame, or a separately tagged cancelled-orphan intent; neither owns a Pi binding or slot. */
 export interface TelegramTemporaryThreadEntry {
   source: { journalBindingKey: string; updateId: number };
   /** Append-only known source groups. Missing legacy metadata never proves that the creation source was alone. */
@@ -401,7 +401,13 @@ export interface TelegramTemporaryThreadEntry {
   /** Unique title token; the only identity an unacknowledged creation may later be matched by. */
   token: string;
   /** `creating` is published before the one creation request, so after a crash its outcome is unknown. */
-  phase: "creating" | "created";
+  phase: "creating" | "created" | "orphan-cancelled";
+  /** Original Cancel scope and exact retained originals, never implicit-creation evidence or a deletion grant. */
+  orphanCancellation?: {
+    executor: TelegramWorkspaceRestoreExecutor;
+    sessionGeneration: number;
+    originals: { updateId: number; messageId: number; sourceSha256: string; retainedPath: string }[];
+  };
   target?: TelegramTarget & { threadId: number };
   revision: number;
   createdAtMs: number;
@@ -411,6 +417,7 @@ export interface TelegramTemporaryThreadEntry {
 export type TelegramTemporaryThreadTargetObservation =
   | { kind: "bound"; binding: TelegramWorkspaceThreadBinding }
   | { kind: "temporary" }
+  | { kind: "unbound" }
   | { kind: "unknown" };
 interface TelegramWorkspaceRestoreSnapshot {
   version: 1;
@@ -515,7 +522,7 @@ export interface TelegramWorkspaceRestore {
   /** Read-only veto for an already-granted in-flight attempt; never another grant, disposable classification or deletion ACK. */
   isTemporaryThreadCleanupCurrent(
     expected: TelegramTemporaryThreadEntry,
-    authority: TelegramWorkspaceRestoreAuthority,
+    authority: TelegramWorkspaceRestoreAuthority & { sessionGeneration?: number },
   ): boolean;
   /**
    * Publishes `creating` before the caller's single creation request; an existing source entry is returned, never
@@ -534,6 +541,19 @@ export interface TelegramWorkspaceRestore {
     target: TelegramTarget & { threadId: number },
     token: string,
     authority: TelegramWorkspaceRestoreAuthority,
+  ): TelegramTemporaryThreadEntry | undefined;
+  /** Caller holds original live Cancel/profile admission. Persists only an unissued orphan intent; never creation or deletion.
+   * Optional supersession requires an exact unissued same-instance older-generation frame, never adoption of its grant. */
+  registerCancelledOrphanThread(
+    input: TelegramTemporaryThreadInput,
+    target: TelegramTarget & { threadId: number },
+    token: string,
+    authority: TelegramWorkspaceRestoreAuthority & { sessionGeneration: number },
+    inspect: (updateId: number, journalBindingKey?: string) => (TelegramTemporaryThreadCancellationEvidence & {
+      retainedPath: string;
+      originalTarget?: Readonly<{ chatId: number; threadId: number; messageId: number; sourceSha256: string }>;
+    }) | undefined,
+    superseded?: TelegramTemporaryThreadEntry,
   ): TelegramTemporaryThreadEntry | undefined;
   /** Records the exact acknowledged creation target; it never reopens a created entry. */
   acknowledgeTemporaryThread(
@@ -580,6 +600,18 @@ export interface TelegramWorkspaceRestore {
       updateId: number,
     ) => TelegramTemporaryThreadCancellationEvidence | undefined,
   ): TelegramTemporaryThreadEntry | undefined;
+  /** Caller holds fresh profile admission/v2 reader authority and complete namespace clearance; no original Cancel fence is reused. */
+  issueCancelledOrphanThreadCleanup(
+    expected: TelegramTemporaryThreadEntry,
+    authority: TelegramWorkspaceRestoreAuthority & { sessionGeneration: number },
+    inspect: Parameters<TelegramWorkspaceRestore["registerCancelledOrphanThread"]>[4],
+  ): { issued: true; entry: TelegramTemporaryThreadEntry } | undefined;
+  /** Caller observed the exact positive deletion outcome under its live issued grant; no unknown-result retirement. */
+  retireCancelledOrphanThread(
+    expected: TelegramTemporaryThreadEntry,
+    completion: { kind: "confirmed"; target: TelegramTarget & { threadId: number } },
+    authority: TelegramWorkspaceRestoreAuthority & { sessionGeneration: number },
+  ): TelegramTemporaryThreadEntry | undefined;
   /** Caller holds profile admission and proves fresh source/protection clearance; publication grants one attempt, never retry. */
   issueTemporaryThreadCleanup(
     expected: TelegramTemporaryThreadEntry,
@@ -592,7 +624,7 @@ export interface TelegramWorkspaceRestore {
     authority: TelegramWorkspaceRestoreAuthority,
     completed?: TelegramTemporaryThreadInput,
   ): TelegramTemporaryThreadEntry | undefined;
-  /** New-world restart: atomically forgets this operator's Restore intents and temporary entries from previous runtime instances.
+  /** New-world restart: atomically forgets this operator's Restore intents and temporary entries from previous runtime instances, except issued orphan hazards.
    * Caller may preserve exact unbound temporary tokens for clock-bearing sources. Committed bindings stay; nothing is rolled back, replayed or deleted here. */
   forgetPreviousWorld(
     authority: TelegramWorkspaceRestoreAuthority,
@@ -765,7 +797,8 @@ export interface TelegramTopicTargetStore {
     ) => undefined,
   ) => void;
   /** Current live-origin ownership veto; effect callers still require Workspace admission. False is not work/recipient/deletion authority. */
-  hasPreDispatchRebindEvidence: () => boolean;
+  /** Codec requirements from one canonical snapshot; neither execution readiness nor permission to mutate it. */
+  getWorkspaceReaderRequirements: () => { preDispatchRebind: boolean; cancelledOrphanIntent: boolean; cancelledOrphanCleanup: boolean };
   listProtectedLiveRebindTargets: () => TelegramTarget[];
   isWorkspaceLiveRebindCleanupTargetProtected: (
     expected: TelegramWorkspaceLiveRebindIntent,
@@ -2558,6 +2591,29 @@ function isTemporaryThreadInputSubset(
   );
 }
 
+function inspectCancelledOrphanOriginals(
+  input: TelegramTemporaryThreadInput,
+  target: TelegramTarget & { threadId: number },
+  operator: number,
+  inspect: Parameters<TelegramWorkspaceRestore["registerCancelledOrphanThread"]>[4],
+  isCurrent: () => boolean,
+): NonNullable<TelegramTemporaryThreadEntry["orphanCancellation"]>["originals"] | undefined {
+  const originals: NonNullable<TelegramTemporaryThreadEntry["orphanCancellation"]>["originals"] = [];
+  for (const updateId of input.updateIds) {
+    if (!isCurrent()) return undefined;
+    const evidence = inspect(updateId), origin = evidence?.originalTarget;
+    if (!isCurrent() || evidence?.journalBindingKey !== input.journalBindingKey || evidence.updateId !== updateId ||
+      evidence.operatorAuthorityId !== `telegram-owner:${operator}` || !origin ||
+      origin.chatId !== target.chatId || origin.threadId !== target.threadId ||
+      !Number.isSafeInteger(origin.messageId) || origin.messageId <= 0 ||
+      typeof origin.sourceSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(origin.sourceSha256) ||
+      !restoreText(evidence.retainedPath) || !isAbsolute(evidence.retainedPath) || resolve(evidence.retainedPath) !== evidence.retainedPath ||
+      originals.some(value => value.messageId === origin.messageId)) return undefined;
+    originals.push({ updateId, messageId: origin.messageId, sourceSha256: origin.sourceSha256, retainedPath: evidence.retainedPath });
+  }
+  return originals;
+}
+
 function isTemporaryThreadEntry(
   value: unknown,
 ): value is TelegramTemporaryThreadEntry {
@@ -2571,6 +2627,7 @@ function isTemporaryThreadEntry(
       "forwardedInputs",
       "forwardProtocol",
       "cleanupIssued",
+      "orphanCancellation",
       "operatorUserId",
       "executor",
       "token",
@@ -2658,6 +2715,23 @@ function isTemporaryThreadEntry(
       ))
   )
     return false;
+  if (value.phase === "orphan-cancelled") {
+    const proof = value.orphanCancellation, groups = value.inputs;
+    if (!restoreObject(proof) || !restoreKeys(proof, ["executor", "sessionGeneration", "originals"]) ||
+      !isTelegramWorkspaceRestoreExecutor(proof.executor) || !isTelegramWorkspaceRestoreExecutor(value.executor) ||
+      proof.executor.instanceId !== value.executor.instanceId || (!value.cleanupIssued && !isDeepStrictEqual(proof.executor, value.executor)) ||
+      !restoreInteger(proof.sessionGeneration) || !Array.isArray(proof.originals) ||
+      !Array.isArray(groups) || groups.length !== 1 ||
+      !isDeepStrictEqual(value.cancelledInputs, groups) ||
+      value.completedInputs !== undefined || value.forwardedInputs !== undefined ||
+      value.forwardProtocol !== undefined ||
+      proof.originals.length !== groups[0].updateIds.length ||
+      !proof.originals.every((original, index) => restoreObject(original) &&
+        restoreKeys(original, ["updateId", "messageId", "sourceSha256", "retainedPath"]) &&
+        original.updateId === groups[0].updateIds[index] && restoreInteger(original.messageId) && original.messageId > 0 &&
+        typeof original.sourceSha256 === "string" && /^[a-f0-9]{64}$/u.test(original.sourceSha256) && restoreText(original.retainedPath) &&
+        isAbsolute(original.retainedPath) && resolve(original.retainedPath) === original.retainedPath)) return false;
+  } else if (value.orphanCancellation !== undefined) return false;
   if (value.phase === "creating")
     return (
       value.target === undefined &&
@@ -2669,7 +2743,7 @@ function isTemporaryThreadEntry(
     );
   const target = value.target;
   return (
-    value.phase === "created" &&
+    (value.phase === "created" || value.phase === "orphan-cancelled") &&
     restoreObject(target) &&
     restoreKeys(target, ["chatId", "threadId"]) &&
     target.chatId === value.operatorUserId &&
@@ -2708,7 +2782,7 @@ function conflictsWithTemporaryThread(
   return (
     !!target &&
     !!snapshot?.temporaryThreads?.some(
-      (entry) => !!entry.target && targetMatches(entry.target, target),
+      (entry) => (entry.phase !== "orphan-cancelled" || entry.cleanupIssued) && !!entry.target && targetMatches(entry.target, target),
     )
   );
 }
@@ -2869,6 +2943,8 @@ function assertWorkspaceRestoreBindingProtection(
     ...(file.workspaceRestore?.liveRebindings ?? []),
   ];
   for (const entry of file.workspaceRestore?.temporaryThreads ?? []) {
+    // A cancelled-orphan intent owns no target and cannot block a later legitimate Workspace binding.
+    if (entry.phase === "orphan-cancelled" && !entry.cleanupIssued) continue;
     const target = entry.target;
     if (!target) continue;
     const claimed = [
@@ -5155,9 +5231,13 @@ export function createTelegramTopicTargetStore(
       )
         throw new Error("Workspace live-rebind observation changed.");
     },
-    hasPreDispatchRebindEvidence() {
+    getWorkspaceReaderRequirements() {
       const file = parseTopicTargetFile(readStoreSnapshot(getPath(), false) ?? { version: 1, records: [] });
-      return file.workspaceRestore?.liveRebindings?.some(value => value.inputRelease !== undefined) === true;
+      return {
+        preDispatchRebind: file.workspaceRestore?.liveRebindings?.some(value => value.inputRelease !== undefined) === true,
+        cancelledOrphanIntent: file.workspaceRestore?.temporaryThreads?.some(value => value.phase === "orphan-cancelled") === true,
+        cancelledOrphanCleanup: file.workspaceRestore?.temporaryThreads?.some(value => value.phase === "orphan-cancelled" && value.cleanupIssued) === true,
+      };
     },
     listProtectedLiveRebindTargets() {
       const file = parseTopicTargetFile(readStoreSnapshot(getPath(), false) ?? { version: 1, records: [] });
@@ -5429,7 +5509,7 @@ export function createTelegramTopicTargetStore(
         before: ReturnType<typeof read>,
         entry: TelegramTemporaryThreadEntry,
       ): TelegramTemporaryThreadTargetObservation => {
-        if (entry.phase !== "created" || !entry.target)
+        if (!["created", "orphan-cancelled"].includes(entry.phase) || !entry.target)
           return { kind: "unknown" };
         const file = parseTopicTargetFile(before.file);
         // Normalization omissions never prove an unbound target.
@@ -5472,7 +5552,7 @@ export function createTelegramTopicTargetStore(
           // implicit creation). An unlocated Workspace create is not its owner; keep that intent unresolved,
           // but veto a concrete target collision. Generic unknown-target/Restore cleanup keeps its own guards.
           file.pendingProvisions?.some(
-            (value) => !!value.target && targetMatches(value.target, target),
+            (value) => value.target ? targetMatches(value.target, target) : entry.phase === "orphan-cancelled",
           ) ||
           file.pendingCleanups?.some((value) =>
             targetMatches(value.target, target),
@@ -5485,6 +5565,19 @@ export function createTelegramTopicTargetStore(
           )
         )
           return { kind: "unknown" };
+        if (entry.phase === "orphan-cancelled") {
+          if ([...workspaceBindings.values(), ...records.values(), ...reservations, ...pendingCleanups].some(value =>
+            targetMatches(value.target, target)) || pendingProvisions.some(value => !value.target || targetMatches(value.target, target)) ||
+            workspaceRetirements.some(value => targetMatches(value.binding.target, target))) return { kind: "unknown" };
+          if (before.state.liveRebindings?.some(value => targetMatches(value.request.target, target) ||
+            targetMatches(value.request.binding.target, target))) return { kind: "unknown" };
+          for (const claim of workspaceClaims.values()) {
+            const matches = (file.workspaceBindings ?? []).filter(value => value.bindingKey === claim.identity.bindingKey);
+            if (matches.length !== 1 || (["cwd", "workspaceKey", "instanceSlot", "sessionId", "sessionKey", "slot"] as const).some(key =>
+              matches[0]![key] !== claim.identity[key]) || targetMatches(matches[0]!.target, target)) return { kind: "unknown" };
+          }
+          return { kind: "unbound" };
+        }
         return { kind: "temporary" };
       };
       const classifyTemporaryTarget = (
@@ -5554,7 +5647,7 @@ export function createTelegramTopicTargetStore(
           if (live) {
             const target = intent.request.target;
             const temporary = state.temporaryThreads?.find(
-              (entry) => !!entry.target && targetMatches(entry.target, target),
+              (entry) => (entry.phase !== "orphan-cancelled" || entry.cleanupIssued) && !!entry.target && targetMatches(entry.target, target),
             );
             if (
               temporary &&
@@ -5564,7 +5657,7 @@ export function createTelegramTopicTargetStore(
               return false;
             // Binding consumes the chooser frame, not its journal inputs or another recipient's custody.
             const remaining = state.temporaryThreads?.filter(
-              (entry) => !entry.target || !targetMatches(entry.target, target),
+              (entry) => entry.phase === "orphan-cancelled" || !entry.target || !targetMatches(entry.target, target),
             );
             if (remaining?.length) restore.temporaryThreads = remaining;
             else delete restore.temporaryThreads;
@@ -5625,11 +5718,13 @@ export function createTelegramTopicTargetStore(
                   classifyTemporaryTarget(before, entry).kind !== "temporary"
                 )
                   return false;
+                if (!prior && entry.phase === "orphan-cancelled" &&
+                  classifyTemporaryTarget(before, entry).kind !== "unbound") return false;
                 if (!entry.cleanupIssued) continue;
                 if (
                   !prior?.cleanupIssued &&
                   (!prior ||
-                    classifyTemporaryTarget(before, prior).kind !== "temporary")
+                    classifyTemporaryTarget(before, prior).kind !== (prior.phase === "orphan-cancelled" ? "unbound" : "temporary"))
                 )
                   return false;
               }
@@ -5830,6 +5925,7 @@ export function createTelegramTopicTargetStore(
             );
             if (
               !entry ||
+              entry.phase === "orphan-cancelled" ||
               entry.operatorUserId !== operator ||
               (!adopt && !isDeepStrictEqual(entry.executor, executor))
             )
@@ -5996,11 +6092,15 @@ export function createTelegramTopicTargetStore(
         },
         isTemporaryThreadCleanupCurrent(expected, authority) {
           const executor = structuredClone(authority.executor),
-            operator = authority.operatorUserId;
+            operator = authority.operatorUserId, generation = authority.sessionGeneration;
+          const orphan = expected.phase === "orphan-cancelled";
+          if (orphan && (!expected.orphanCancellation || generation !== expected.orphanCancellation.sessionGeneration ||
+            executor.instanceId !== expected.orphanCancellation.executor.instanceId)) return false;
           const current = () =>
             currentScope() &&
             authority.isCurrent() &&
             authority.operatorUserId === operator &&
+            (!orphan || authority.sessionGeneration === generation) &&
             isDeepStrictEqual(authority.executor, executor);
           if (
             !expected.cleanupIssued ||
@@ -6019,7 +6119,8 @@ export function createTelegramTopicTargetStore(
               );
             return (
               !!entry &&
-              inspectTemporaryOwnership(before, entry).kind === "temporary" &&
+              inspectTemporaryOwnership(before, entry).kind === (orphan ? "unbound" : "temporary") &&
+              (!orphan || authority.sessionGeneration === generation) &&
               current()
             );
           });
@@ -6386,6 +6487,71 @@ export function createTelegramTopicTargetStore(
             },
           );
         },
+        registerCancelledOrphanThread(inputValue, targetValue, token, authority, inspect, supersededValue) {
+          const executor = structuredClone(authority.executor), operator = authority.operatorUserId,
+            generation = authority.sessionGeneration, originalCurrent = authority.isCurrent;
+          let lost = false;
+          const owned = (): boolean => {
+            if (lost) return false;
+            if (authority.isCurrent !== originalCurrent || !originalCurrent() ||
+              authority.operatorUserId !== operator || authority.sessionGeneration !== generation ||
+              !isDeepStrictEqual(authority.executor, executor)) lost = true;
+            return !lost;
+          };
+          const input = structuredClone(inputValue), target = structuredClone(targetValue),
+            superseded = supersededValue === undefined ? undefined : structuredClone(supersededValue);
+          if (!owned() || !restoreInteger(generation) || !isTelegramWorkspaceRestoreExecutor(executor) ||
+            !restoreInteger(operator) || operator <= 0 || typeof inspect !== "function") return undefined;
+          if (!isTemporaryThreadInput(input) || target.chatId !== operator ||
+            !Number.isSafeInteger(target.threadId) || target.threadId <= 0 || !/^[a-f0-9]{32}$/u.test(token)) return undefined;
+          if (superseded && (!isTemporaryThreadEntry(superseded) || superseded.phase !== "orphan-cancelled" ||
+            superseded.cleanupIssued || superseded.operatorUserId !== operator || !targetMatches(superseded.target!, target) ||
+            superseded.token === token || superseded.executor.instanceId !== executor.instanceId ||
+            superseded.orphanCancellation!.executor.instanceId !== executor.instanceId ||
+            superseded.orphanCancellation!.sessionGeneration >= generation ||
+            getTelegramTemporaryThreadInputs(superseded).some(group => group.journalBindingKey === input.journalBindingKey &&
+              group.updateIds.some(id => input.updateIds.includes(id))))) return undefined;
+          const observe = () => inspectCancelledOrphanOriginals(input, target, operator, id => inspect(id, input.journalBindingKey), owned);
+          const previousOriginals = () => superseded && inspectCancelledOrphanOriginals(
+            getTelegramTemporaryThreadInputs(superseded)[0]!, target, operator,
+            id => inspect(id, superseded.source.journalBindingKey), owned);
+          const originals = observe();
+          if (!originals || superseded && (originals.some(value => superseded.orphanCancellation!.originals.some(old => old.messageId === value.messageId)) ||
+            !isDeepStrictEqual(previousOriginals(), superseded.orphanCancellation!.originals)) || !owned()) return undefined;
+          const at = now();
+          if (!restoreInteger(at)) throw new Error("Invalid Workspace Restore clock.");
+          const candidate: TelegramTemporaryThreadEntry = { source: { journalBindingKey: input.journalBindingKey, updateId: input.updateIds[0]! },
+            inputs: [input], cancelledInputs: [input], target, operatorUserId: operator, executor, token,
+            phase: "orphan-cancelled", orphanCancellation: { executor, sessionGeneration: generation, originals },
+            revision: 0, createdAtMs: at, updatedAtMs: at };
+          if (!isTemporaryThreadEntry(candidate)) return undefined;
+          const current = (): boolean => {
+            if (!owned()) return false;
+            if (!isDeepStrictEqual(observe(), originals) || superseded && !isDeepStrictEqual(previousOriginals(), superseded.orphanCancellation!.originals) || !owned()) { lost = true; return false; }
+            const snapshot = read(), entries = snapshot.state.temporaryThreads ?? [];
+            if (classifyTemporaryTarget(snapshot, candidate).kind !== "unbound" || superseded && !entries.some(value =>
+              isDeepStrictEqual(value, superseded) || isDeepStrictEqual(value, candidate))) lost = true;
+            return !lost;
+          };
+          const entry = mutate<TelegramTemporaryThreadEntry>({ ...authority, isCurrent: current }, (file) => {
+            const entries = file.temporaryThreads ?? [], existing = entries.find(value =>
+              value.source.journalBindingKey === input.journalBindingKey && value.source.updateId === input.updateIds[0]);
+            if (existing) return isDeepStrictEqual({ ...candidate, revision: existing.revision,
+              createdAtMs: existing.createdAtMs, updatedAtMs: existing.updatedAtMs }, existing) ? existing : undefined;
+            const previousIndex = superseded ? entries.findIndex(value => isDeepStrictEqual(value, superseded)) : -1;
+            if (superseded && previousIndex < 0) return undefined;
+            if (entries.some((value, index) => index !== previousIndex && (value.token === token || value.target && targetMatches(value.target, target) ||
+              getTelegramTemporaryThreadInputs(value).some(other => other.journalBindingKey === input.journalBindingKey &&
+                other.updateIds.some(id => input.updateIds.includes(id)))))) return undefined;
+            if (previousIndex >= 0) entries.splice(previousIndex, 1, candidate);
+            else {
+              if (entries.length >= TEMPORARY_THREAD_CAPACITY) throw new Error("Temporary Thread capacity reached.");
+              file.temporaryThreads = [...entries, candidate];
+            }
+            return candidate;
+          });
+          return entry && current() ? entry : undefined;
+        },
         acknowledgeTemporaryThread(expected, targetInput, authority) {
           const target = {
             chatId: targetInput.chatId,
@@ -6637,6 +6803,42 @@ export function createTelegramTopicTargetStore(
             return true;
           });
         },
+        issueCancelledOrphanThreadCleanup(expectedValue, authority, inspect) {
+          const executor = structuredClone(authority.executor), operator = authority.operatorUserId,
+            generation = authority.sessionGeneration, originalCurrent = authority.isCurrent;
+          let lost = false;
+          const owned = (): boolean => {
+            if (lost) return false;
+            if (authority.isCurrent !== originalCurrent || !originalCurrent() || authority.operatorUserId !== operator ||
+              authority.sessionGeneration !== generation || !isDeepStrictEqual(authority.executor, executor)) lost = true;
+            return !lost;
+          };
+          if (!owned() || !isTelegramWorkspaceRestoreExecutor(executor) || !restoreInteger(operator)) return undefined;
+          const expected = structuredClone(expectedValue), origin = expected.orphanCancellation;
+          if (!isTemporaryThreadEntry(expected) || expected.phase !== "orphan-cancelled" || expected.cleanupIssued || !expected.target || !origin ||
+            !restoreInteger(generation) || generation !== origin.sessionGeneration || origin.executor.instanceId !== executor.instanceId ||
+            expected.operatorUserId !== operator || typeof inspect !== "function") return undefined;
+          if (expected.revision === Number.MAX_SAFE_INTEGER) throw new Error("Workspace Restore operation revision exhausted.");
+          const at = now();
+          if (!restoreInteger(at)) throw new Error("Invalid Workspace Restore clock.");
+          const issued: TelegramTemporaryThreadEntry = { ...expected, cleanupIssued: true, executor,
+            revision: expected.revision + 1, updatedAtMs: Math.max(at, expected.updatedAtMs) };
+          const current = (): boolean => {
+            if (!owned()) return false;
+            const before = read(), retained = before.state.temporaryThreads?.find(value => value.token === expected.token);
+            if ((!isDeepStrictEqual(retained, expected) && !isDeepStrictEqual(retained, issued)) ||
+              !isDeepStrictEqual(inspectCancelledOrphanOriginals(expected.inputs![0]!, expected.target!, operator, inspect, owned), origin.originals) ||
+              !owned() || inspectTemporaryOwnership(read(), expected).kind !== "unbound") lost = true;
+            return !lost && owned();
+          };
+          const entry = mutate<TelegramTemporaryThreadEntry>({ ...authority, isCurrent: current }, (file) => {
+            const index = file.temporaryThreads?.findIndex(value => isDeepStrictEqual(value, expected)) ?? -1;
+            if (index < 0) return undefined;
+            file.temporaryThreads![index] = issued;
+            return issued;
+          });
+          return entry && current() ? { issued: true, entry } : undefined;
+        },
         issueTemporaryThreadCleanup(expected, authority) {
           const entry = advanceTemporary(expected, authority, (value) => {
             if (
@@ -6650,6 +6852,28 @@ export function createTelegramTopicTargetStore(
           });
           return entry ? { issued: true, entry } : undefined;
         },
+        retireCancelledOrphanThread(expectedValue, completionValue, authority) {
+          const executor = structuredClone(authority.executor), operator = authority.operatorUserId,
+            generation = authority.sessionGeneration, originalCurrent = authority.isCurrent;
+          const expected = structuredClone(expectedValue), completion = structuredClone(completionValue), origin = expected.orphanCancellation;
+          let lost = false;
+          const current = () => {
+            lost ||= authority.isCurrent !== originalCurrent || !originalCurrent() || authority.operatorUserId !== operator ||
+              authority.sessionGeneration !== generation || !isDeepStrictEqual(authority.executor, executor);
+            return !lost;
+          };
+          if (expected.phase !== "orphan-cancelled" || !expected.cleanupIssued || !origin ||
+            completion.kind !== "confirmed" || !isDeepStrictEqual(completion.target, expected.target) ||
+            origin.sessionGeneration !== generation || origin.executor.instanceId !== executor.instanceId ||
+            !isDeepStrictEqual(expected.executor, executor) || expected.operatorUserId !== operator || !current()) return undefined;
+          return mutate<TelegramTemporaryThreadEntry>({ ...authority, isCurrent: current }, file => {
+            const index = file.temporaryThreads?.findIndex(value => isDeepStrictEqual(value, expected)) ?? -1;
+            if (index < 0) return undefined;
+            file.temporaryThreads!.splice(index, 1);
+            if (!file.temporaryThreads!.length) delete file.temporaryThreads;
+            return expected;
+          });
+        },
         retireTemporaryThread(expected, authority, completed) {
           return mutate<TelegramTemporaryThreadEntry>(
             authority,
@@ -6661,6 +6885,7 @@ export function createTelegramTopicTargetStore(
               const entry = entries[index];
               if (
                 !entry ||
+                entry.phase === "orphan-cancelled" ||
                 entry.operatorUserId !== operator ||
                 !isDeepStrictEqual(entry.executor, executor) ||
                 (getTelegramTemporaryThreadInputs(entry).length > 1 &&
@@ -6699,7 +6924,8 @@ export function createTelegramTopicTargetStore(
           const before = storage.read(),
             file = structuredClone(before);
           const forgetTemporary = (value: TelegramTemporaryThreadEntry) =>
-            previous(value) && !preserveTemporaryTokens.includes(value.token);
+            previous(value) && !preserveTemporaryTokens.includes(value.token) &&
+            !(value.phase === "orphan-cancelled" && value.cleanupIssued);
           const forgetLive = (value: TelegramWorkspaceLiveRebindIntent) =>
             previous(value);
           const liveRebindings = (file.liveRebindings ?? []).filter(forgetLive);
@@ -8994,23 +9220,7 @@ export async function provisionOwnBusTopic(
     );
     const cleanup = await ThreadReconciler.applyThreadReconciliationPlan(
       { actions: [action] },
-      {
-        isCleanupTargetProtected,
-        callApi: deps.callApi,
-        markStaleByTarget: (target, syncStatus, lastSyncError) =>
-          deps.store.markStaleByTarget(target, syncStatus, lastSyncError),
-        persist: () => deps.store.persist(),
-        removePendingProvisionById: (id) =>
-          deps.store.removePendingProvision(id),
-        getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
-        recordRuntimeEvent(category, error, details) {
-          deps.recordEvent(
-            category,
-            error instanceof Error ? error.message : String(error),
-            details,
-          );
-        },
-      },
+      { ...reservationCleanupPorts, isCleanupTargetProtected },
     );
     deps.recordEvent("bus", "Bus leader previous-topic cleanup applied", {
       phase: "leader-topic-previous-cleanup-duration",
@@ -9372,7 +9582,7 @@ export interface TelegramLeaderThreadStateRuntime {
   clear(): void;
 }
 
-export function createTelegramLeaderThreadStateRuntime(): TelegramLeaderThreadStateRuntime {
+export function createTelegramLeaderThreadStateRuntime(options: { onTargetChanged?: () => void } = {}): TelegramLeaderThreadStateRuntime {
   let identity:
     | (TelegramInstanceThreadIdentityCandidate & { target: TelegramTarget })
     | undefined;
@@ -9380,10 +9590,14 @@ export function createTelegramLeaderThreadStateRuntime(): TelegramLeaderThreadSt
     getTarget: () => identity?.target,
     getIdentity: () => identity,
     set(input) {
+      const previous = identity?.target;
       identity = { ...input, target: { ...input.target } };
+      if (previous?.chatId !== identity.target.chatId || previous?.threadId !== identity.target.threadId) options.onTargetChanged?.();
     },
     clear() {
+      if (!identity) return;
       identity = undefined;
+      options.onTargetChanged?.();
     },
   };
 }

@@ -16,6 +16,7 @@ import {
 } from "./target.ts";
 import type {
   TelegramApiCallOptions,
+  TelegramApiUiAuthorityOptions,
   TelegramInputRichMessage,
   TelegramReplyParameters,
   TelegramSendRichMessageBody,
@@ -23,6 +24,8 @@ import type {
 } from "./telegram-api.ts";
 import {
   assertTelegramApiCallAuthority,
+  captureTelegramUiAuthorityOptions,
+  getTelegramUiAuthorityAssertion,
   isTelegramApiCommitUnknownError,
   TelegramApiAuthorityError,
 } from "./telegram-api.ts";
@@ -235,7 +238,7 @@ export interface TelegramReplyDeliveryDeps<TReplyMarkup> {
       reply_to_message_id?: number;
       message_thread_id?: number;
     },
-    options?: Pick<TelegramApiCallOptions, "assertAuthority">,
+    options?: TelegramApiUiAuthorityOptions,
   ) => Promise<TelegramSentMessage>;
   editMessage: (
     body: {
@@ -247,7 +250,7 @@ export interface TelegramReplyDeliveryDeps<TReplyMarkup> {
       reply_markup?: TReplyMarkup;
       message_thread_id?: number;
     },
-    options?: Pick<TelegramApiCallOptions, "assertAuthority">,
+    options?: TelegramApiUiAuthorityOptions,
   ) => Promise<unknown>;
 }
 
@@ -259,11 +262,14 @@ export interface TelegramReplyTargetOptions extends Pick<
   replyToMessageId?: number;
 }
 
+/** UI-only local lifetime fences never become remote execution authority. */
+export type TelegramUiReplyTargetOptions = Omit<TelegramReplyTargetOptions, "assertAuthority"> & TelegramApiUiAuthorityOptions;
+
 export interface TelegramReplyTransport<TReplyMarkup> {
   sendRenderedChunks: (
     chatId: number,
     chunks: TelegramRenderedChunk[],
-    options?: TelegramReplyTargetOptions & {
+    options?: TelegramUiReplyTargetOptions & {
       replyMarkup?: TReplyMarkup;
     },
   ) => Promise<number | undefined>;
@@ -271,7 +277,7 @@ export interface TelegramReplyTransport<TReplyMarkup> {
     chatId: number,
     messageId: number,
     chunks: TelegramRenderedChunk[],
-    options?: TelegramReplyTargetOptions & { replyMarkup?: TReplyMarkup },
+    options?: TelegramUiReplyTargetOptions & { replyMarkup?: TReplyMarkup },
   ) => Promise<number | undefined>;
 }
 
@@ -298,7 +304,7 @@ export async function sendTelegramRenderedChunks<TReplyMarkup>(
   chatId: number,
   chunks: TelegramRenderedChunk[],
   deps: TelegramReplyDeliveryDeps<TReplyMarkup>,
-  options?: TelegramReplyTargetOptions & {
+  options?: TelegramUiReplyTargetOptions & {
     replyMarkup?: TReplyMarkup;
   },
 ): Promise<number | undefined> {
@@ -330,7 +336,7 @@ async function sendTelegramChunkSequence<TChunk, TReplyMarkup>(
   chunks: readonly TChunk[],
   replyToMessageId: number | undefined,
   options:
-    (TelegramReplyTargetOptions & { replyMarkup?: TReplyMarkup }) | undefined,
+    (TelegramUiReplyTargetOptions & { replyMarkup?: TReplyMarkup }) | undefined,
   recordOwnership: TelegramReplyOwnershipRecorder["record"] | undefined,
   send: (
     chunk: TChunk,
@@ -339,11 +345,12 @@ async function sendTelegramChunkSequence<TChunk, TReplyMarkup>(
       reply_parameters?: TelegramReplyParameters;
       message_thread_id?: number;
     },
-    callOptions: Pick<TelegramApiCallOptions, "assertAuthority"> | undefined,
+    callOptions: TelegramApiUiAuthorityOptions | undefined,
   ) => Promise<TelegramSentMessage>,
 ): Promise<number | undefined> {
+  const authorityOptions = captureTelegramUiAuthorityOptions(options);
   const target = options?.target && { ...options.target },
-    assertAuthority = options?.assertAuthority,
+    assertAuthority = getTelegramUiAuthorityAssertion(authorityOptions),
     replyMarkup = options?.replyMarkup;
   assertTelegramInlineKeyboardCallbackData(replyMarkup);
   let lastMessageId: number | undefined;
@@ -361,7 +368,7 @@ async function sendTelegramChunkSequence<TChunk, TReplyMarkup>(
             ...(replyParameters ? { reply_parameters: replyParameters } : {}),
             ...(target ? getTelegramTargetThreadParams(target) : {}),
           },
-          assertAuthority ? { assertAuthority } : undefined,
+          authorityOptions,
         );
         assertTelegramApiCallAuthority(assertAuthority, true);
         return sent;
@@ -380,10 +387,11 @@ export async function editTelegramRenderedMessage<TReplyMarkup>(
   messageId: number,
   chunks: TelegramRenderedChunk[],
   deps: TelegramReplyDeliveryDeps<TReplyMarkup>,
-  options?: TelegramReplyTargetOptions & { replyMarkup?: TReplyMarkup },
+  options?: TelegramUiReplyTargetOptions & { replyMarkup?: TReplyMarkup },
 ): Promise<number | undefined> {
   options = { ...options, target: options?.target && { ...options.target } };
-  const assertAuthority = options.assertAuthority;
+  const authorityOptions = captureTelegramUiAuthorityOptions(options);
+  const assertAuthority = getTelegramUiAuthorityAssertion(authorityOptions);
   assertTelegramApiCallAuthority(assertAuthority, false);
   assertTelegramInlineKeyboardCallbackData(options?.replyMarkup);
   if (chunks.length === 0) return messageId;
@@ -400,7 +408,7 @@ export async function editTelegramRenderedMessage<TReplyMarkup>(
         remainingChunks.length === 0 ? options?.replyMarkup : undefined,
       ...(options?.target ? getTelegramTargetThreadParams(options.target) : {}),
     },
-    assertAuthority ? { assertAuthority } : undefined,
+    authorityOptions,
   );
   assertTelegramApiCallAuthority(assertAuthority, true);
   if (assertAuthority)
@@ -410,10 +418,35 @@ export async function editTelegramRenderedMessage<TReplyMarkup>(
     return sendTelegramRenderedChunks(chatId, remainingChunks, deps, {
       replyMarkup: options?.replyMarkup,
       target: options?.target,
-      assertAuthority,
+      ...authorityOptions,
     });
   }
   return messageId;
+}
+
+/** Edit one fixed assistant message without chunk spill, rendering downgrade or transport fallback. */
+export async function editTelegramSingleMarkdownMessage<TReplyMarkup>(
+  chatId: number,
+  messageId: number,
+  markdown: string,
+  rendering: "rich" | "html",
+  replyMarkup: TReplyMarkup,
+  deps: Pick<TelegramReplyDeliveryDeps<TReplyMarkup>, "editMessage">,
+  options?: TelegramApiUiAuthorityOptions,
+): Promise<void> {
+  const captured = captureTelegramUiAuthorityOptions(options);
+  const assertAuthority = getTelegramUiAuthorityAssertion(captured);
+  assertTelegramApiCallAuthority(assertAuthority, false);
+  assertTelegramInlineKeyboardCallbackData(replyMarkup);
+  const chunks = rendering === "rich" ? splitTelegramNativeMarkdown(markdown) :
+    renderTelegramMessage(markdown, { mode: "markdown" });
+  if (chunks.length !== 1) throw new TypeError("Telegram Markdown edit must fit one message.");
+  const chunk = chunks[0]!;
+  await deps.editMessage({
+    chat_id: chatId, message_id: messageId, reply_markup: replyMarkup,
+    ...(typeof chunk === "string" ? { rich_message: { markdown: chunk } } : { text: chunk.text, parse_mode: chunk.parseMode }),
+  }, captured);
+  assertTelegramApiCallAuthority(assertAuthority, true);
 }
 
 export interface TelegramTextReplyOptions extends TelegramReplyTargetOptions {
@@ -844,14 +877,14 @@ export interface TelegramRenderedMessageRuntime<TReplyMarkup> {
     text: string,
     mode: TelegramRenderMode,
     replyMarkup: TReplyMarkup,
-    options?: TelegramReplyTargetOptions,
+    options?: TelegramUiReplyTargetOptions,
   ) => Promise<void>;
   sendInteractiveMessage: (
     chatId: number,
     text: string,
     mode: TelegramRenderMode,
     replyMarkup: TReplyMarkup,
-    options?: TelegramReplyTargetOptions,
+    options?: TelegramUiReplyTargetOptions,
   ) => Promise<number | undefined>;
   sendSectionRichMessage: (
     chatId: number,
@@ -987,7 +1020,7 @@ export function createTelegramRenderedMessageRuntime<TReplyMarkup>(
           replyMarkup,
           target: options?.target,
           replyToMessageId: options?.replyToMessageId,
-          assertAuthority: options.assertAuthority,
+          ...captureTelegramUiAuthorityOptions(options),
         },
       );
     },

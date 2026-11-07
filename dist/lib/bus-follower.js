@@ -6,10 +6,11 @@
  * It must not spawn Pi processes or create hidden Telegram-originated instances.
  */
 import { createHash } from "node:crypto";
+import { getTelegramAttachmentControlId, getTelegramTextInputControlId } from "./delivery.js";
 import { basename } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { getTelegramBusTransportRetryPolicy, TELEGRAM_BUS_REGISTRATION_RETRY, } from "./bus-transport.js";
-import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusForeignOwnedUpdateForwarder, createTelegramBusLocalServer, createTelegramBusRequestIdFactory, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusProtocolCompatibility, getTelegramBusSocketPath, hasTelegramBusCapability, hasTelegramBusSteerQueueHandoffCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES, getTelegramBusHeldCommandCapabilities, TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES, TelegramBusLocalAuthorityError, TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE, } from "./bus.js";
+import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusForeignOwnedUpdateForwarder, createTelegramBusLocalServer, createTelegramBusRequestIdFactory, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusProtocolCompatibility, getTelegramBusSocketPath, hasTelegramBusCapability, hasTelegramBusSteerQueueHandoffCapability, isTelegramBusEnvelopeAuthorized, isSameTelegramBusFollowerRegistration, parseTelegramBusEnvelope, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION, TELEGRAM_BUS_CAPABILITY_GUARDED_API_AUTHORITY, TELEGRAM_BUS_CAPABILITY_API_REGISTRATION_AUTHORITY, TELEGRAM_BUS_ATTACHMENT_PUBLICATION_RECEIPT, parseTelegramBusAttachmentPublicationReceipt, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES, getTelegramBusHeldCommandCapabilities, TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES, TelegramBusLocalAuthorityError, TelegramBusArtifactIpcError, TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE, } from "./bus.js";
 import { parseTelegramUpdateJournalQueueOwner, } from "./journal.js";
 import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS, } from "./locks.js";
 import * as Machine from "./machine.js";
@@ -24,6 +25,10 @@ const TELEGRAM_BUS_FOLLOWER_PROMOTION_GRACE_MS = 2_500;
 const TELEGRAM_FOLLOWER_SESSION_HANDOFF_TTL_MS = 30_000;
 const TELEGRAM_BUS_FOLLOWER_CLIENT_TIMEOUT_MS = 30_000;
 const TELEGRAM_BUS_FOLLOWER_API_SLOW_CALL_MS = 1_500;
+/** One extra liveness probe before a missed heartbeat discards the registration; short so a dead leader still fails over fast. */
+const TELEGRAM_BUS_FOLLOWER_REGISTRATION_PROBE_MS = 2_000;
+/** A relayed capability older than a few missed heartbeats is stale and the follower probes for itself again. */
+const TELEGRAM_BUS_FOLLOWER_RELAYED_CAPABILITY_MAX_AGE_MS = 5_000;
 const TELEGRAM_BUS_FOLLOWER_REGISTRATION_WAIT_MS = 30_000;
 export const TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_MS = TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS;
 const TELEGRAM_BUS_FOLLOWER_REGISTRATION_RETRY_ATTEMPTS = TELEGRAM_BUS_REGISTRATION_RETRY.attempts;
@@ -211,6 +216,11 @@ export function createTelegramBusFollowerRuntimeAssembly(ports) {
         registrationState: ports.registrationState,
         recordRuntimeEvent: ports.recordRuntimeEvent,
         getRegistrationRuntime: () => baseRegistration,
+        // Only a registration this follower still considers live can be kept; a cleared one must re-register.
+        async probeRegistration() {
+            return ports.registrationState.isRegistered() &&
+                (await baseRegistration.probeRegistration?.()) === true;
+        },
     });
     registration = createTelegramBusFollowerRegistrationRuntime({
         ...ports.registration,
@@ -672,15 +682,14 @@ export function createTelegramBusFollowerClientRuntime(deps) {
         timeoutMs,
         waitForRegistrationGeneration: deps.waitForRegistrationGeneration,
     };
+    const callApi = createTelegramBusFollowerApiCaller({ ...sharedClientDeps,
+        getLocalProtocol: deps.getLocalProtocol, getLeaderProtocol: deps.getLeaderProtocol,
+        capturePublicationRegistration: deps.capturePublicationRegistration, instanceId: deps.instanceId,
+        getAuthSecret: deps.getApiAuthSecret, getRegistrationGeneration: deps.getRegistrationGeneration, recordRuntimeEvent: deps.recordRuntimeEvent });
     return {
         createRequestId,
-        callApi: createTelegramBusFollowerApiCaller({
-            ...sharedClientDeps,
-            instanceId: deps.instanceId,
-            getAuthSecret: deps.getApiAuthSecret,
-            getRegistrationGeneration: deps.getRegistrationGeneration,
-            recordRuntimeEvent: deps.recordRuntimeEvent,
-        }),
+        callApi,
+        captureApiAuthority: callApi.captureAuthority,
         agentMessages: createTelegramBusAgentMessageClient({
             ...sharedClientDeps,
             instanceId: deps.instanceId,
@@ -951,33 +960,220 @@ export function createTelegramBusFollowerApiCaller(deps) {
     const getNowMs = deps.getNowMs ?? Date.now;
     const timeoutMs = deps.timeoutMs ?? TELEGRAM_BUS_FOLLOWER_CLIENT_TIMEOUT_MS;
     const slowCallMs = deps.slowCallMs ?? TELEGRAM_BUS_FOLLOWER_API_SLOW_CALL_MS;
+    const birth = { endpoint: deps.socketPath, instanceId: deps.instanceId, auth: deps.getAuthSecret, generation: deps.getRegistrationGeneration,
+        capture: deps.capturePublicationRegistration, local: deps.getLocalProtocol, peer: deps.getLeaderProtocol };
+    const captureAuthority = (scope) => {
+        const bound = () => deps.socketPath === birth.endpoint && deps.instanceId === birth.instanceId && deps.getAuthSecret === birth.auth &&
+            deps.getRegistrationGeneration === birth.generation && deps.capturePublicationRegistration === birth.capture && deps.getLocalProtocol === birth.local && deps.getLeaderProtocol === birth.peer &&
+            Object.getOwnPropertyDescriptor(api, "captureAuthority")?.value === captureAuthority;
+        try {
+            if (!bound() || scope !== undefined && scope !== "registration")
+                return undefined;
+            const generation = birth.generation(), native = generation ? birth.capture?.() : undefined, check = native?.isCurrent;
+            if (!native || typeof check !== "function")
+                return undefined;
+            const auth = birth.auth?.(), endpoint = resolveTelegramBusSocketPath(birth.endpoint), local = structuredClone(birth.local?.()), peer = structuredClone(birth.peer?.());
+            if (!auth || !local || !peer || !hasTelegramBusCapability(local, TELEGRAM_BUS_CAPABILITY_GUARDED_API_AUTHORITY) ||
+                !hasTelegramBusCapability(peer, TELEGRAM_BUS_CAPABILITY_GUARDED_API_AUTHORITY) || !getTelegramBusProtocolCompatibility({ local, remote: peer }).compatible)
+                return undefined;
+            const apiIncarnation = scope === "registration" ? native.apiIncarnation : undefined;
+            if (scope === "registration" && (!apiIncarnation || !/^[a-f0-9]{48}$/u.test(apiIncarnation) ||
+                !hasTelegramBusCapability(local, TELEGRAM_BUS_CAPABILITY_API_REGISTRATION_AUTHORITY) || !hasTelegramBusCapability(peer, TELEGRAM_BUS_CAPABILITY_API_REGISTRATION_AUTHORITY)))
+                return undefined;
+            const assertNative = () => {
+                const observed = check.call(native);
+                if (observed !== true) {
+                    void Promise.resolve(observed).catch(() => { });
+                    throw new TelegramApiAuthorityError(false);
+                }
+            };
+            let lost = false, checking = false;
+            const assertCurrent = () => {
+                if (lost || checking) {
+                    lost = true;
+                    throw new TelegramApiAuthorityError(false);
+                }
+                checking = true;
+                try {
+                    const current = () => bound() && (scope !== "registration" || native.apiIncarnation === apiIncarnation) && birth.generation() === generation && birth.auth?.() === auth && resolveTelegramBusSocketPath(birth.endpoint) === endpoint &&
+                        isDeepStrictEqual(birth.local?.(), local) && isDeepStrictEqual(birth.peer?.(), peer) && bound();
+                    if (!current() || native.isCurrent !== check)
+                        throw new TelegramApiAuthorityError(false);
+                    assertNative();
+                    if (!current() || native.isCurrent !== check)
+                        throw new TelegramApiAuthorityError(false);
+                    assertNative();
+                    if (!bound())
+                        throw new TelegramApiAuthorityError(false);
+                }
+                catch (error) {
+                    lost = true;
+                    throw error;
+                }
+                finally {
+                    checking = false;
+                }
+            };
+            assertCurrent();
+            return assertCurrent;
+        }
+        catch {
+            return undefined;
+        }
+    };
     const caller = async (method, args, localOptions, timing) => {
+        const ports = { endpoint: deps.socketPath, instanceId: deps.instanceId, auth: deps.getAuthSecret,
+            generation: deps.getRegistrationGeneration, wait: deps.waitForRegistrationGeneration, capture: deps.capturePublicationRegistration };
         const assertion = localOptions?.assertAuthority;
-        const assertCurrent = () => assertTelegramApiCallAuthority(assertion, false);
+        let assertOriginal, wireAuth, wireProtocol, wireApiIncarnation;
+        let assertAttachment, attachmentScope;
+        const assertCurrent = () => assertTelegramApiCallAuthority(() => { assertion?.(); assertOriginal?.(); assertAttachment?.(); }, false);
         assertCurrent();
         // Match IPC's JSON semantics once, before awaits; send and refusal metadata share this identity.
         const requestArgs = JSON.parse(JSON.stringify(args));
         const apiMethod = (method === "call" || method === "callMultipart") && typeof requestArgs[0] === "string"
             ? requestArgs[0] : method;
         timing.apiMethod = apiMethod;
-        const registration = await resolveTelegramBusFollowerRegistration(deps, timeoutMs);
+        const artifact = method === "sendArtifactDocument";
+        const attachment = method === "call" && apiMethod === "sendMessage" && getTelegramAttachmentControlId(isRecord(requestArgs[1]) ? requestArgs[1].reply_markup : undefined);
+        if (attachment) {
+            const readLocal = deps.getLocalProtocol, readLeader = deps.getLeaderProtocol, readGeneration = deps.getRegistrationGeneration, readAuth = deps.getAuthSecret, capture = deps.captureAttachmentPublicationRegistration;
+            assertTelegramApiCallAuthority(() => { attachmentScope = capture?.(); }, false);
+            const scope = attachmentScope, assertRegistration = scope?.assertCurrent;
+            let local, leader, generation, auth;
+            const endpoint = resolveTelegramBusSocketPath(deps.socketPath), instanceId = deps.instanceId, body = requestArgs[1];
+            assertTelegramApiCallAuthority(() => { local = structuredClone(readLocal?.()); leader = structuredClone(readLeader?.()); generation = readGeneration(); auth = readAuth?.(); }, false);
+            let live = true, checking = false;
+            const bound = () => live && deps.instanceId === instanceId && deps.getLocalProtocol === readLocal && deps.getLeaderProtocol === readLeader && deps.getRegistrationGeneration === readGeneration &&
+                deps.getAuthSecret === readAuth && deps.captureAttachmentPublicationRegistration === capture && scope?.assertCurrent === assertRegistration;
+            assertAttachment = () => {
+                if (checking) {
+                    live = false;
+                    throw new Error("Attachment publication peer is unavailable.");
+                }
+                checking = true;
+                try {
+                    if (!bound() || !scope || !assertRegistration || requestArgs.length !== 2 || !isRecord(body) || !generation || !auth || !readLocal || !readLeader || !local || !leader)
+                        throw new Error("Attachment publication peer is unavailable.");
+                    assertRegistration.call(scope);
+                    if (!hasTelegramBusCapability(local, TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION) ||
+                        !hasTelegramBusCapability(leader, TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION) || !getTelegramBusProtocolCompatibility({ local, remote: leader }).compatible ||
+                        scope.registration.instanceId !== instanceId || scope.registration.registrationGeneration !== generation || scope.leaderSocketPath !== endpoint ||
+                        scope.registration.target?.chatId !== body.chat_id || scope.registration.target?.threadId !== body.message_thread_id ||
+                        !/^[a-f0-9]{48}$/u.test(scope.registrationIncarnation) || !isDeepStrictEqual(scope.registration.protocol, local) || !isDeepStrictEqual(scope.leaderProtocol, leader) ||
+                        deps.instanceId !== instanceId || readGeneration() !== generation || readAuth?.() !== auth || resolveTelegramBusSocketPath(deps.socketPath) !== endpoint ||
+                        !isDeepStrictEqual(readLocal(), local) || !isDeepStrictEqual(readLeader(), leader) || !bound())
+                        throw new Error("Attachment publication peer is unavailable.");
+                    assertRegistration.call(scope);
+                    if (!bound())
+                        throw new Error("Attachment publication peer is unavailable.");
+                }
+                catch (error) {
+                    live = false;
+                    throw error;
+                }
+                finally {
+                    checking = false;
+                }
+            };
+            assertCurrent();
+        }
+        const fixedGeneration = artifact || attachment ? deps.getRegistrationGeneration() : undefined;
+        if ((artifact || attachment) && !fixedGeneration)
+            throw new TelegramApiAuthorityError(false);
+        const scoped = !!assertion && !artifact && !attachment;
+        const bound = () => deps.socketPath === ports.endpoint && deps.instanceId === ports.instanceId && deps.getAuthSecret === ports.auth &&
+            deps.getRegistrationGeneration === ports.generation && deps.waitForRegistrationGeneration === ports.wait && deps.capturePublicationRegistration === ports.capture;
+        if (scoped && !bound())
+            throw new TelegramApiAuthorityError(false);
+        const readyGeneration = scoped ? ports.generation() : undefined;
+        let native = scoped && readyGeneration ? ports.capture?.() : undefined;
+        // An already-ready attempt captures its native lifetime before any await can replace equal fields.
+        const registration = artifact || attachment ? { generation: fixedGeneration, remainingTimeoutMs: timeoutMs } : readyGeneration
+            ? { generation: readyGeneration, remainingTimeoutMs: timeoutMs }
+            : await resolveTelegramBusFollowerRegistration(scoped ? { getRegistrationGeneration: ports.generation, waitForRegistrationGeneration: ports.wait, getNowMs } : deps, timeoutMs);
+        if (scoped) {
+            if (!bound())
+                throw new TelegramApiAuthorityError(false);
+            if (!readyGeneration)
+                native = ports.capture?.();
+            const check = native?.isCurrent;
+            if (ports.capture && (!native || typeof check !== "function"))
+                throw new TelegramApiAuthorityError(false);
+            const auth = ports.auth?.(), endpoint = resolveTelegramBusSocketPath(ports.endpoint);
+            let lost = false, checking = false;
+            assertOriginal = () => {
+                if (lost || checking) {
+                    lost = true;
+                    throw new Error("Original follower API admission is unavailable.");
+                }
+                checking = true;
+                try {
+                    const current = () => bound() && ports.generation() === registration.generation && ports.auth?.() === auth && resolveTelegramBusSocketPath(ports.endpoint) === endpoint && bound();
+                    if (!current() || native && native.isCurrent !== check)
+                        throw new Error("Original follower API admission is unavailable.");
+                    const observed = check?.call(native);
+                    if (check && observed !== true) {
+                        void Promise.resolve(observed).catch(() => { });
+                        throw new Error("Original follower API admission is unavailable.");
+                    }
+                    if (!current() || native && native.isCurrent !== check)
+                        throw new Error("Original follower API admission is unavailable.");
+                }
+                catch (error) {
+                    lost = true;
+                    throw error;
+                }
+                finally {
+                    checking = false;
+                }
+            };
+            wireAuth = auth;
+            const options = isRecord(requestArgs[2]) ? requestArgs[2] : undefined;
+            if (method === "call" && requestArgs.length === 3 && options?.maxAttempts === 1 && options.retrySafety === "non-idempotent" &&
+                !getTelegramTextInputControlId(isRecord(requestArgs[1]) ? requestArgs[1].reply_markup : undefined) &&
+                hasTelegramBusCapability(deps.getLocalProtocol?.(), TELEGRAM_BUS_CAPABILITY_GUARDED_API_AUTHORITY) &&
+                hasTelegramBusCapability(deps.getLeaderProtocol?.(), TELEGRAM_BUS_CAPABILITY_GUARDED_API_AUTHORITY)) {
+                const authority = captureAuthority(), original = assertOriginal;
+                if (!authority)
+                    throw new TelegramApiAuthorityError(false);
+                assertTelegramApiCallAuthority(() => { wireProtocol = structuredClone(deps.getLeaderProtocol()); }, false);
+                const registered = hasTelegramBusCapability(deps.getLocalProtocol?.(), TELEGRAM_BUS_CAPABILITY_API_REGISTRATION_AUTHORITY) &&
+                    hasTelegramBusCapability(wireProtocol, TELEGRAM_BUS_CAPABILITY_API_REGISTRATION_AUTHORITY);
+                const registrationAuthority = registered ? captureAuthority("registration") : undefined;
+                if (registered && !registrationAuthority)
+                    throw new TelegramApiAuthorityError(false);
+                if (registered)
+                    wireApiIncarnation = native?.apiIncarnation;
+                assertOriginal = () => { original(); authority(); registrationAuthority?.(); original(); };
+                assertTelegramApiCallAuthority(assertOriginal, false);
+            }
+        }
         timing.registeredAtMs = getNowMs();
         assertCurrent();
         const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
         let response;
+        const requestId = deps.createRequestId();
+        let ipcIssued = false;
         try {
             response = await sendTelegramBusOperation(socketPath, registration.remainingTimeoutMs, {
                 kind: "follower.callApi",
-                requestId: deps.createRequestId(),
-                auth: deps.getAuthSecret?.(),
+                requestId,
+                auth: scoped ? wireAuth : deps.getAuthSecret?.(),
                 instanceId: deps.instanceId,
                 registrationGeneration: registration.generation,
+                ...(wireApiIncarnation ? { apiRegistrationIncarnation: wireApiIncarnation } : {}),
+                ...(attachmentScope ? { attachmentRegistrationIncarnation: attachmentScope.registrationIncarnation } : {}),
                 method,
                 args: requestArgs,
                 sentAtMs: getNowMs(),
-            }, assertion ? assertCurrent : undefined);
+            }, assertion || attachment ? assertCurrent : undefined, artifact || attachment ? () => { ipcIssued = true; } : undefined);
         }
         catch (error) {
+            if (artifact)
+                throw new TelegramBusArtifactIpcError(ipcIssued, error);
+            if (attachment && (ipcIssued || error instanceof TelegramBusLocalAuthorityError && error.requestIssued))
+                throw new TelegramApiCommitUnknownError("sendMessage", error);
             if (error instanceof TelegramBusLocalAuthorityError)
                 throw new TelegramApiAuthorityError(error.requestIssued);
             if (!isTelegramApiMethodRetrySafe(apiMethod)) {
@@ -985,13 +1181,54 @@ export function createTelegramBusFollowerApiCaller(deps) {
             }
             throw error;
         }
-        if (response?.kind === "bus.ack" && response.ok)
+        if (assertOriginal)
+            assertTelegramApiCallAuthority(assertCurrent, true);
+        if (artifact) {
+            const result = response?.kind === "bus.ack" && response.ok && response.requestId === requestId ? response.result : undefined;
+            const wire = requestArgs[0];
+            if (!isRecord(result) || Object.keys(result).some(key => !["version", "requestId", "registrationIncarnation", "effect", "reason", "messageId", "httpIssued", "telegramRejected"].includes(key)) ||
+                result.version !== 1 || result.requestId !== requestId || result.registrationIncarnation !== wire?.registrationIncarnation ||
+                typeof result.httpIssued !== "boolean" || typeof result.telegramRejected !== "boolean" ||
+                result.effect === "not-issued" && result.httpIssued !== false || result.effect !== "not-issued" && result.httpIssued !== true ||
+                result.telegramRejected !== (result.effect === "rejected") || result.effect === "sent" && result.messageId === undefined ||
+                !["not-issued", "rejected", "unknown", "sent"].includes(String(result.effect)) ||
+                typeof result.reason !== "string" || result.reason.length > 64 ||
+                (result.messageId !== undefined && (!Number.isSafeInteger(result.messageId) || result.messageId <= 0)))
+                throw new TelegramApiCommitUnknownError(method, new Error("Artifact acknowledgement is unconfirmed."));
+            assertTelegramApiCallAuthority(assertion, true);
+            return result;
+        }
+        if (attachment) {
+            try {
+                assertCurrent();
+                if (response?.kind !== "bus.ack" || response.requestId !== requestId)
+                    throw new Error("Attachment acknowledgement is unconfirmed.");
+                if (response.ok) {
+                    const result = response.result, body = requestArgs[1];
+                    if (!isRecord(result) || !isRecord(body))
+                        throw new Error("Attachment publication result is unavailable.");
+                    const receipt = parseTelegramBusAttachmentPublicationReceipt(result[TELEGRAM_BUS_ATTACHMENT_PUBLICATION_RECEIPT]);
+                    if (!receipt || receipt.requestId !== requestId || receipt.nonce !== attachment || receipt.instanceId !== deps.instanceId ||
+                        receipt.registrationGeneration !== registration.generation || receipt.registrationIncarnation !== attachmentScope?.registrationIncarnation || receipt.messageId !== result.message_id || receipt.target.chatId !== body.chat_id ||
+                        receipt.target.threadId !== body.message_thread_id || !isDeepStrictEqual(response.protocol, deps.getLeaderProtocol?.()))
+                        throw new Error("Attachment publication receipt is unconfirmed.");
+                    return response.result;
+                }
+            }
+            catch (error) {
+                throw new TelegramApiCommitUnknownError("sendMessage", error);
+            }
+        }
+        if (response?.kind !== "bus.ack" || response.requestId !== requestId || wireProtocol && !isDeepStrictEqual(response.protocol, wireProtocol)) {
+            const error = new Error("Telegram bus API acknowledgement is unconfirmed.");
+            if (!isTelegramApiMethodRetrySafe(apiMethod))
+                throw new TelegramApiCommitUnknownError(apiMethod, error);
+            throw error;
+        }
+        if (response.ok)
             return response.result;
-        const message = response?.kind === "bus.ack"
-            ? response.message
-            : "Telegram bus API call did not return an acknowledgement.";
-        if (response?.kind === "bus.ack" &&
-            response.error?.code === "stale-target" &&
+        const message = response.message;
+        if (response.error?.code === "stale-target" &&
             response.error.chatId !== undefined &&
             response.error.threadId !== undefined) {
             throw new TelegramApiStaleTargetError(message ?? "Telegram thread target is stale.", {
@@ -999,12 +1236,10 @@ export function createTelegramBusFollowerApiCaller(deps) {
                 threadId: response.error.threadId,
             });
         }
-        if (response?.kind === "bus.ack" &&
-            response.error?.code === "commit-unknown") {
+        if (response.error?.code === "commit-unknown") {
             throw new TelegramApiCommitUnknownError(response.error.method ?? method, new Error(message ?? "Telegram bus API call result is ambiguous."));
         }
-        const refusedMethod = response?.kind === "bus.ack" && !response.ok &&
-            response.error?.code === "follower-api-not-allowed" &&
+        const refusedMethod = response.error?.code === "follower-api-not-allowed" &&
             response.error.method === apiMethod
             ? apiMethod : undefined;
         if (refusedMethod || message === TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE) {
@@ -1019,7 +1254,7 @@ export function createTelegramBusFollowerApiCaller(deps) {
         }
         throw new Error(message ?? "Telegram bus API call failed.");
     };
-    return async (method, args, localOptions) => {
+    const api = Object.assign(async (method, args, localOptions) => {
         const startedAtMs = getNowMs();
         const timing = {};
         let outcome = "ok";
@@ -1051,7 +1286,8 @@ export function createTelegramBusFollowerApiCaller(deps) {
                 }
             }
         }
-    };
+    }, { captureAuthority });
+    return api;
 }
 async function resolveTelegramBusFollowerRegistration(deps, timeoutMs) {
     const current = deps.getRegistrationGeneration();
@@ -1199,6 +1435,8 @@ export function createTelegramBusFollowerControlState() {
 }
 export function createTelegramBusFollowerRegistrationState(options = {}) {
     let registered = false;
+    let registrationLifetime = {};
+    let registrationIncarnation, apiRegistrationIncarnation;
     let target;
     let slot;
     let threadName;
@@ -1207,6 +1445,7 @@ export function createTelegramBusFollowerRegistrationState(options = {}) {
     let sessionId;
     let leaderProtocol;
     let eligibleElectionSlots = [];
+    let relayedThreadCapability;
     let recoveryEpoch = 0;
     let activeRecoveryEpoch;
     const generationWaiters = new Set();
@@ -1216,8 +1455,20 @@ export function createTelegramBusFollowerRegistrationState(options = {}) {
                 waiter.settle(value);
         }
     };
+    const capturePublicationRegistration = () => {
+        if (!registered || !generation)
+            return undefined;
+        const lifetime = registrationLifetime, incarnation = registrationIncarnation, apiIncarnation = apiRegistrationIncarnation;
+        let lost = false;
+        return { incarnation, apiIncarnation, isCurrent() { lost ||= !registered || registrationLifetime !== lifetime || registrationIncarnation !== incarnation || apiRegistrationIncarnation !== apiIncarnation; return !lost; } };
+    };
     return {
         isRegistered: () => registered,
+        capturePublicationRegistration,
+        captureArtifactRegistration() {
+            const registration = capturePublicationRegistration();
+            return registration?.incarnation ? { incarnation: registration.incarnation, isCurrent: registration.isCurrent } : undefined;
+        },
         getTarget: () => (target ? { ...target } : undefined),
         getSlot: () => slot,
         getThreadName: () => threadName,
@@ -1275,7 +1526,28 @@ export function createTelegramBusFollowerRegistrationState(options = {}) {
         setEligibleElectionSlots: (slots) => {
             eligibleElectionSlots = Array.from(new Set(slots.filter((slot) => /^[A-Z]$/.test(slot)))).sort();
         },
+        setRelayedThreadCapability: (enabled, relayGeneration) => {
+            relayedThreadCapability =
+                enabled === undefined || !registered || generation !== relayGeneration
+                    ? undefined
+                    : { enabled, generation: relayGeneration, atMs: Date.now() };
+        },
+        getRelayedThreadCapability: () => {
+            const relayed = relayedThreadCapability;
+            return registered &&
+                relayed &&
+                relayed.generation === generation &&
+                Date.now() - relayed.atMs <= TELEGRAM_BUS_FOLLOWER_RELAYED_CAPABILITY_MAX_AGE_MS
+                ? relayed.enabled
+                : undefined;
+        },
         setRegistered: (next, nextTarget, metadata) => {
+            relayedThreadCapability = undefined;
+            registrationLifetime = {};
+            registrationIncarnation = next && typeof metadata?.registrationIncarnation === "string" && /^[a-f0-9]{48}$/u.test(metadata.registrationIncarnation)
+                ? metadata.registrationIncarnation : undefined;
+            apiRegistrationIncarnation = next && typeof metadata?.apiRegistrationIncarnation === "string" && /^[a-f0-9]{48}$/u.test(metadata.apiRegistrationIncarnation)
+                ? metadata.apiRegistrationIncarnation : undefined;
             const retainedDisplayTitle = next &&
                 registered &&
                 generation === metadata?.generation &&
@@ -1308,12 +1580,18 @@ export function createTelegramBusFollowerRegistrationState(options = {}) {
                         capabilities: [...metadata.leaderProtocol.capabilities],
                     }
                     : undefined;
+            // Retain this exact mutation before callouts: reentry with equal data must not return a renewed scope.
+            const lifetime = registrationLifetime;
+            let lost = false;
+            const retained = next && generation ? Object.freeze({ isCurrent() { lost ||= !registered || registrationLifetime !== lifetime; return !lost; } }) : undefined;
             if (availabilityChanged)
                 options.onAvailabilityChanged?.();
             if (generation) {
                 activeRecoveryEpoch = undefined;
                 settleGenerationWaiters(generation);
             }
+            options.onRegistrationChanged?.();
+            return retained;
         },
     };
 }
@@ -1567,6 +1845,15 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler(deps) {
                 expectedOwner: candidateState.kind === "stale" ? candidateState.lock : undefined,
             });
         };
+        // A leader that stalled past the heartbeat timeout but still holds this registration needs no new generation;
+        // re-registering would invalidate every forward already in flight to the old one.
+        if ((await deps.probeRegistration?.()) === true) {
+            if (isCurrent())
+                deps.recordRuntimeEvent("bus", "Telegram follower kept its registration: the leader answered after a missed heartbeat.", { phase: "follower-heartbeat-registration-kept" });
+            return;
+        }
+        if (!isCurrent())
+            return;
         deps.registrationState.beginRecovery();
         const initialBinding = carriedBinding ?? snapshotBinding();
         try {
@@ -1661,7 +1948,7 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler(deps) {
 }
 export function createTelegramBusFollowerRegistrationRuntime(deps) {
     const getNowMs = deps.getNowMs ?? Date.now;
-    const getPid = deps.getPid ?? (() => process.pid);
+    const pidProvider = deps.getPid, getPid = pidProvider ?? (() => process.pid);
     const heartbeatMs = deps.heartbeatMs ?? 1000;
     const heartbeatTimeoutMs = deps.heartbeatTimeoutMs ??
         deps.timeoutMs ??
@@ -1679,6 +1966,7 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
     let activeRegistrationGeneration;
     let registrationAttempt;
     let activeContext;
+    let attachmentRegistration;
     let lastKnownTarget;
     let lastKnownSlot;
     let lastKnownThreadName;
@@ -1766,6 +2054,9 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
                     ? heartbeatResult.eligibleElectionSlots.filter((slot) => typeof slot === "string")
                     : [];
                 deps.registrationState?.setEligibleElectionSlots(slots);
+                deps.registrationState?.setRelayedThreadCapability(typeof heartbeatResult?.threadCapability === "boolean"
+                    ? heartbeatResult.threadCapability
+                    : undefined, registrationGeneration);
                 if (typeof heartbeatResult?.displayTitle === "string" &&
                     isDeepStrictEqual(deps.registrationState?.getTarget(), heartbeatTarget) &&
                     deps.registrationState?.setDisplayTitle(heartbeatResult.displayTitle, registrationGeneration) &&
@@ -1827,8 +2118,52 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
         }, heartbeatMs);
         heartbeatInterval.unref?.();
     };
+    const probeRegistration = async () => {
+        const leaderSocketPath = activeLeaderSocketPath;
+        const registrationGeneration = activeRegistrationGeneration;
+        const probeContext = activeContext;
+        if (!leaderSocketPath || !registrationGeneration)
+            return false;
+        try {
+            const response = await sendTelegramBusOperation(leaderSocketPath, TELEGRAM_BUS_FOLLOWER_REGISTRATION_PROBE_MS, {
+                kind: "follower.heartbeat",
+                requestId: deps.createRequestId(),
+                auth: activeAuthSecret,
+                instanceId: deps.instanceId,
+                registrationGeneration,
+                sentAtMs: getNowMs(),
+            });
+            if (activeLeaderSocketPath !== leaderSocketPath ||
+                activeRegistrationGeneration !== registrationGeneration ||
+                activeContext !== probeContext ||
+                response?.kind !== "bus.ack" ||
+                !response.ok)
+                return false;
+            heartbeatFailureLog.settled();
+            return true;
+        }
+        catch {
+            return false;
+        }
+    };
     return {
+        probeRegistration,
+        captureAttachmentPublicationRegistration() {
+            try {
+                attachmentRegistration?.assertCurrent();
+                return attachmentRegistration;
+            }
+            catch {
+                return undefined;
+            }
+        },
         registerWithLeader: async (ctx, leader, options) => {
+            attachmentRegistration = undefined;
+            const readers = { state: deps.registrationState, profile: deps.getProfileKey, session: deps.getSessionId, generation: deps.getSessionGeneration,
+                birth: deps.getProcessBirthId, pid: pidProvider, endpoint: deps.getFollowerBusSocketPath, leaderEndpoint: deps.getLeaderSocketPath,
+                auth: deps.getLeaderAuthSecret, active: deps.isContextActive, protocol: deps.protocolIdentity,
+                target: deps.registrationState?.getTarget, slot: deps.registrationState?.getSlot, ackSession: deps.registrationState?.getSessionId,
+                ackGeneration: deps.registrationState?.getGeneration, peer: deps.registrationState?.getLeaderProtocol, set: deps.registrationState?.setRegistered };
             if (deps.isContextActive?.(ctx) === false)
                 return false;
             const sessionGeneration = deps.getSessionGeneration?.();
@@ -1922,6 +2257,8 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
                     connectedAtMs: getNowMs(),
                 },
             };
+            const issued = structuredClone(registrationEnvelope.registration);
+            const localProtocol = structuredClone(issued.protocol), leaderEndpoint = leader.busSocketPath, leaderSecret = leader.busSecret;
             let response;
             try {
                 response = await sendTelegramBusLocalEnvelope({
@@ -1956,9 +2293,14 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
                 await abandonOwnedRequest();
                 return false;
             }
+            // Correlate the original bootstrap before protocol/error interpretation or publishing readiness.
+            if (response?.kind !== "bus.ack" || response.requestId !== registrationGeneration) {
+                await failRegistration();
+                throw new Error("Telegram follower registration acknowledgement is unconfirmed.");
+            }
             const compatibility = getTelegramBusProtocolCompatibility({
                 local: deps.protocolIdentity,
-                remote: response?.kind === "bus.ack" ? response.protocol : undefined,
+                remote: response.protocol,
             });
             // An identity-less error ACK is a rejection/transport failure, not evidence of an incompatible leader.
             const unidentifiedRejection = response?.kind === "bus.ack" &&
@@ -1983,8 +2325,10 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
             }
             if (response?.kind === "bus.ack" && response.ok) {
                 const registrationResult = parseRegistrationResult(response.result);
-                deps.registrationState?.setRegistered(true, registrationResult.target, {
+                const lifetime = deps.registrationState?.setRegistered(true, registrationResult.target, {
                     ...registrationResult,
+                    apiRegistrationIncarnation: hasTelegramBusCapability(localProtocol, TELEGRAM_BUS_CAPABILITY_API_REGISTRATION_AUTHORITY) &&
+                        hasTelegramBusCapability(response.protocol, TELEGRAM_BUS_CAPABILITY_API_REGISTRATION_AUTHORITY) ? registrationResult.apiRegistrationIncarnation : undefined,
                     generation: registrationGeneration,
                     sessionId,
                     ...(response.protocol ? { leaderProtocol: response.protocol } : {}),
@@ -1995,6 +2339,67 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
                 activeLeaderSocketPath = leaderSocketPath;
                 activeRegistrationGeneration = registrationGeneration;
                 activeContext = ctx;
+                const recipient = structuredClone({ ...issued, target: registrationResult.target, slot: registrationResult.slot, threadName: registrationResult.threadName });
+                const peerProtocol = response.protocol ? structuredClone(response.protocol) : undefined, secret = activeAuthSecret;
+                if (lifetime && response.requestId === registrationGeneration && registrationResult.registrationIncarnation && secret &&
+                    [recipient.instanceId, recipient.profileKey, recipient.sessionId, recipient.processBirthId, recipient.cwd, recipient.busSocketPath].every(value => typeof value === "string" && !!value.trim()) &&
+                    Number.isSafeInteger(recipient.pid) && recipient.pid > 0 && Number.isSafeInteger(recipient.sessionGeneration) && recipient.sessionGeneration >= 0 &&
+                    recipient.target && (recipient.target.threadId === undefined || /^[A-Z]$/u.test(recipient.slot ?? "")) &&
+                    hasTelegramBusCapability(localProtocol, TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION) &&
+                    hasTelegramBusCapability(peerProtocol, TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION)) {
+                    if (recipient.target)
+                        Object.freeze(recipient.target);
+                    if (recipient.protocol) {
+                        Object.freeze(recipient.protocol.capabilities);
+                        Object.freeze(recipient.protocol);
+                    }
+                    Object.freeze(recipient);
+                    Object.freeze(peerProtocol.capabilities);
+                    Object.freeze(peerProtocol);
+                    let lost = false, checking = false;
+                    const portsCurrent = () => deps.registrationState === readers.state && deps.getProfileKey === readers.profile && deps.getSessionId === readers.session &&
+                        deps.getSessionGeneration === readers.generation && deps.getProcessBirthId === readers.birth && deps.getPid === readers.pid &&
+                        deps.getFollowerBusSocketPath === readers.endpoint && deps.getLeaderSocketPath === readers.leaderEndpoint &&
+                        deps.getLeaderAuthSecret === readers.auth && deps.isContextActive === readers.active && deps.protocolIdentity === readers.protocol &&
+                        readers.state?.getTarget === readers.target && readers.state?.getSlot === readers.slot && readers.state?.getSessionId === readers.ackSession &&
+                        readers.state?.getGeneration === readers.ackGeneration && readers.state?.getLeaderProtocol === readers.peer && readers.state?.setRegistered === readers.set;
+                    const assertCurrent = () => {
+                        if (lost || checking) {
+                            lost = true;
+                            throw new Error("Attachment publication registration is unavailable.");
+                        }
+                        checking = true;
+                        const currentContext = activeContext;
+                        try {
+                            if (!portsCurrent() || !lifetime.isCurrent() || registrationAttempt !== attempt || !activeContext ||
+                                !isLeaderSessionCurrent(leaderSocketPath, registrationGeneration) || activeAuthSecret !== secret ||
+                                leader.busSocketPath !== leaderEndpoint || leader.busSecret !== leaderSecret ||
+                                (leader.busSocketPath ?? readers.leaderEndpoint?.() ?? getTelegramBusSocketPath()) !== leaderSocketPath ||
+                                (readers.auth ? readers.auth(leader) : leader.busSecret) !== secret ||
+                                readers.active?.(activeContext) === false ||
+                                !isSameTelegramBusFollowerRegistration({ ...recipient, instanceId: deps.instanceId, cwd: activeContext.cwd,
+                                    profileKey: readers.profile?.(activeContext) ?? (activeContext.cwd ? `cwd:${activeContext.cwd}` : undefined),
+                                    sessionId: readers.session?.(activeContext), sessionGeneration: readers.generation?.(), pid: getPid(), processBirthId: readers.birth?.(),
+                                    busSocketPath: readers.endpoint?.() ?? deps.followerBusSocketPath, protocol: deps.protocolIdentity,
+                                    target: readers.state?.getTarget(), slot: readers.state?.getSlot(), registrationGeneration: readers.state?.getGeneration() }, recipient) ||
+                                readers.state?.getSessionId(recipient.sessionId) !== recipient.sessionId || !isDeepStrictEqual(readers.state?.getTarget(), recipient.target) ||
+                                !isDeepStrictEqual(readers.state?.getLeaderProtocol(), peerProtocol) ||
+                                !isDeepStrictEqual(deps.protocolIdentity, localProtocol) || !portsCurrent() || !lifetime.isCurrent() ||
+                                registrationAttempt !== attempt || activeContext !== currentContext || deps.instanceId !== recipient.instanceId ||
+                                activeLeaderSocketPath !== leaderSocketPath || activeRegistrationGeneration !== registrationGeneration || activeAuthSecret !== secret || lost)
+                                throw new Error("Attachment publication registration is unavailable.");
+                        }
+                        catch (error) {
+                            lost = true;
+                            throw error;
+                        }
+                        finally {
+                            checking = false;
+                        }
+                    };
+                    attachmentRegistration = Object.freeze({ registration: recipient, registrationIncarnation: registrationResult.registrationIncarnation,
+                        leaderSocketPath, leaderProtocol: peerProtocol, assertCurrent });
+                }
                 try {
                     await deps.onRegistered?.(ctx);
                 }
@@ -2235,52 +2640,15 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
     };
 }
 const TELEGRAM_FOLLOWER_FORWARD_BATCH_POSITION_FIELD = "pi_telegram_forward_comment_batch_position";
-/** Bind source-owned sender checks to the journal's already-admitted synchronous v1 hook. */
-export function createTelegramBusFollowerPairedAdmission(deps) {
-    return (updates, publish) => {
-        if (updates.length !== 1)
-            return { admitted: false };
-        const update = updates[0];
-        const keys = Object.keys(update).filter((key) => key !== "update_id" &&
-            key !== TELEGRAM_FOLLOWER_FORWARD_BATCH_POSITION_FIELD);
-        if (keys.length !== 1)
-            return { admitted: false };
-        const kind = keys[0];
-        if (kind !== "message" &&
-            kind !== "edited_message" &&
-            kind !== "callback_query" &&
-            kind !== "message_reaction")
-            return { admitted: false };
-        const position = update[TELEGRAM_FOLLOWER_FORWARD_BATCH_POSITION_FIELD];
-        if (position !== undefined &&
-            (kind !== "message" || (position !== "comment" && position !== "forward")))
-            return { admitted: false };
-        const carrier = update[kind];
-        if (!Number.isSafeInteger(update.update_id) ||
-            update.update_id < 0 ||
-            !isRecord(carrier) ||
-            carrier.pi_telegram_source_update_id !== update.update_id ||
-            carrier.sender_chat !== undefined ||
-            carrier.actor_chat !== undefined)
-            return { admitted: false };
-        const sender = kind === "message_reaction" ? carrier.user : carrier.from;
-        if (!isRecord(sender) ||
-            typeof sender.id !== "number" ||
-            !Number.isSafeInteger(sender.id) ||
-            sender.id <= 0 ||
-            sender.is_bot !== false)
-            return { admitted: false };
-        return deps.configStore.withPairedUserAdmission(deps.profileName, deps.tokenSha256, sender.id, publish, deps.assertExecutionCurrent);
-    };
-}
 /** One authenticated local operation request with the shared operation retry policy; no replay semantics. */
-function sendTelegramBusOperation(socketPath, timeoutMs, envelope, assertAuthority) {
+function sendTelegramBusOperation(socketPath, timeoutMs, envelope, assertAuthority, onRequestIssued) {
     return sendTelegramBusLocalEnvelope({
         socketPath,
         timeoutMs,
         envelope,
         assertAuthority,
-        retry: assertAuthority ? { attempts: 1, delayMs: 0 } : getTelegramBusTransportRetryPolicy({
+        onRequestIssued,
+        retry: assertAuthority || onRequestIssued ? { attempts: 1, delayMs: 0 } : getTelegramBusTransportRetryPolicy({
             endpoint: socketPath,
             operation: "operation",
         }),
@@ -2830,75 +3198,6 @@ export function createTelegramBusFollowerDurableAdmissionRuntime(deps) {
         },
     };
 }
-export function createTelegramBusFollowerInputCustodyPorts(deps) {
-    const getRequired = () => {
-        const bundle = deps.getInputCustodyBus();
-        if (!bundle)
-            throw new Error("Telegram input custody bus binding is unavailable.");
-        return bundle;
-    };
-    return {
-        isSourceReferenceAdmissionEnabled: () => Boolean(deps.getInputCustodyBus()),
-        handleInputCustodyHandoff(envelope, ctx) {
-            return getRequired().acceptHandoff({
-                sourceRecoveryKey: envelope.sourceRecoveryKey,
-                recipientBindingKey: envelope.recipientBindingKey,
-                source: envelope.source,
-                handoffId: envelope.handoffId,
-            }, ctx);
-        },
-        sourceReferenceAdmission: createTelegramBusFollowerSourceReferenceAdmissionRuntime({
-            wakeSource(input, ctx) {
-                getRequired().wakeSource(input, ctx);
-            },
-        }),
-        resolveInputCustodyReference(input) {
-            return deps.getInputCustodyBus()?.resolveForwardReference(input);
-        },
-    };
-}
-export function createTelegramBusFollowerSourceReferenceAdmissionRuntime(deps) {
-    return {
-        async admit(envelope, ctx) {
-            const delivery = envelope.delivery;
-            if (!delivery)
-                throw new Error("Telegram follower source-reference admission requires delivery identity.");
-            if (!delivery.sourceRecoveryKey)
-                throw new Error("Telegram follower source-reference admission requires a recovery key.");
-            if (!delivery.sourceClaim)
-                throw new Error("Telegram follower source-reference admission requires exact claim evidence.");
-            const expected = createTelegramBusFollowerDeliveryIdentity({
-                kind: envelope.kind,
-                recipientBindingKey: delivery.recipientBindingKey,
-                sourceUpdateId: delivery.sourceUpdateId,
-            });
-            if (expected.deliveryId !== delivery.deliveryId)
-                throw new Error("Invalid Telegram follower source-reference delivery id.");
-            const carrier = envelope.kind === "leader.wakeInputCustody"
-                ? undefined
-                : envelope.kind === "leader.forwardCallback"
-                    ? envelope.query
-                    : envelope.kind === "leader.forwardReaction"
-                        ? envelope.reactionUpdate
-                        : envelope.message;
-            if (envelope.kind !== "leader.wakeInputCustody" &&
-                (!isRecord(carrier) ||
-                    carrier.pi_telegram_source_update_id !== delivery.sourceUpdateId))
-                throw new Error("Telegram follower source-reference update id mismatch.");
-            await deps.wakeSource({
-                deliveryId: delivery.deliveryId,
-                sourceUpdateId: delivery.sourceUpdateId,
-                recipientBindingKey: delivery.recipientBindingKey,
-                sourceRecoveryKey: delivery.sourceRecoveryKey,
-                sourceClaim: { ...delivery.sourceClaim },
-            }, ctx);
-            return {
-                deliveryId: delivery.deliveryId,
-                sourceUpdateId: delivery.sourceUpdateId,
-            };
-        },
-    };
-}
 export function createTelegramBusForwardedUpdateReceiverRuntime(deps) {
     const server = createTelegramBusLocalServer({
         socketPath: deps.socketPath,
@@ -3149,6 +3448,8 @@ function parseRegistrationResult(value) {
         return {};
     const target = parseTarget(isRecord(value.target) ? value.target : value);
     return {
+        ...(typeof value.registrationIncarnation === "string" && /^[a-f0-9]{48}$/u.test(value.registrationIncarnation) ? { registrationIncarnation: value.registrationIncarnation } : {}),
+        ...(typeof value.apiRegistrationIncarnation === "string" && /^[a-f0-9]{48}$/u.test(value.apiRegistrationIncarnation) ? { apiRegistrationIncarnation: value.apiRegistrationIncarnation } : {}),
         ...(target ? { target } : {}),
         ...(typeof value.slot === "string" ? { slot: value.slot } : {}),
         ...(typeof value.threadName === "string"

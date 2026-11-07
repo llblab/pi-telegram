@@ -18,7 +18,7 @@ import { getTelegramProcessBirthIdentity } from "./process-identity.js";
 import { parseTelegramQueueHandoffPayload, TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BYTES, } from "./queue.js";
 import { areTelegramTargetsEqual, parseTelegramTarget as parseTarget, } from "./target.js";
 import { normalizeTelegramSessionReplacementIntent, } from "./threads.js";
-import { hasOnlyWireKeys, isWireRecord as isRecord } from "./wire.js";
+import { hasOnlyWireKeys, isTelegramArtifactCaption, isTelegramArtifactFileName, isWireRecord as isRecord, TELEGRAM_ARTIFACT_MAX_BYTES, } from "./wire.js";
 export function createCurrentTelegramBusProcessRuntime(input) {
     return createTelegramBusProcessRuntime({
         getActiveProfileName: input.getActiveProfileName,
@@ -62,6 +62,10 @@ export const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT = "session-repla
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE = "workspace-restore-v1";
 /** Shared Workspace readers understand independent pre-dispatch input/cleanup state. */
 export const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND = "live-rebind-pre-dispatch-reader-v2";
+/** Shared Workspace decoder understands non-creating, unissued cancelled-orphan intents; no execution/deletion grant. */
+export const TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER = "workspace-orphan-intent-reader-v1";
+/** Adds the irreversible issued marker and its original-scope/current-executor codec; independent of execution authority. */
+export const TELEGRAM_BUS_CAPABILITY_ORPHAN_CLEANUP_READER = "workspace-orphan-intent-reader-v2";
 export const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION = "live-rebind-pre-dispatch-v1";
 export const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE = "live-thread-rebind-save-v1";
 export const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY = "live-thread-rebind-apply-v1";
@@ -186,16 +190,6 @@ export function hasTelegramBusCapability(identity, capability) {
 export function hasTelegramBusSteerQueueHandoffCapability(identity) {
     return hasTelegramBusCapability(identity, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF) &&
         hasTelegramBusCapability(identity, TELEGRAM_BUS_CAPABILITY_QUEUE_STEER);
-}
-export function getTelegramInputCustodyPeerReadiness(followers) {
-    return followers.map((follower) => {
-        if (!follower.registrationGeneration || !follower.protocol)
-            return "unknown";
-        return hasTelegramBusCapability(follower.protocol, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION) &&
-            hasTelegramBusCapability(follower.protocol, TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE)
-            ? "ready"
-            : "legacy";
-    });
 }
 /** Both peers advertise every required capability over a compatible protocol; reads only the two identities. */
 export function hasTelegramBusSharedCapabilities(local, remote, required) {
@@ -859,6 +853,15 @@ export class TelegramBusLocalAuthorityError extends Error {
             ? `Telegram bus local authority is unavailable: ${reason}`
             : "Telegram bus local authority is unavailable.");
         this.name = "TelegramBusLocalAuthorityError";
+        this.requestIssued = requestIssued;
+    }
+}
+/** Origin-local proof only; never serialized as a remote execution grant. */
+export class TelegramBusArtifactIpcError extends Error {
+    requestIssued;
+    constructor(requestIssued, cause) {
+        super("Artifact IPC operation did not complete.", { cause });
+        this.name = "TelegramBusArtifactIpcError";
         this.requestIssued = requestIssued;
     }
 }
@@ -1618,12 +1621,23 @@ export function createTelegramBusLocalServer(deps) {
         return `${envelope.auth ?? ""}:${identity}:${envelope.requestId}`;
     };
     const handleEnvelopeOnce = (envelope) => {
-        const key = getRequestLedgerKey(envelope);
-        const fingerprint = JSON.stringify(envelope);
+        const artifact = envelope.kind === "follower.callApi" && envelope.method === "sendArtifactDocument";
+        const artifactGuard = artifact ? deps.captureArtifactAuthority?.(envelope) : undefined;
+        const refused = () => rejectTelegramBusRequest(envelope.requestId, "Artifact authority is unavailable.");
+        if (artifact && !artifactGuard?.())
+            return Promise.resolve(refused());
+        const release = (result) => artifact
+            ? result.then(value => artifactGuard?.() ? value : refused()) : result;
+        const rawKey = getRequestLedgerKey(envelope);
+        const key = artifact ? Buffer.from(rawKey, "utf8").toString("utf8") : rawKey;
+        const fingerprint = artifact ? createHash("sha256").update(JSON.stringify(envelope)).digest("hex") : JSON.stringify(envelope);
         const existing = requestLedger.get(key);
         if (existing) {
-            if (existing.fingerprint === fingerprint)
-                return existing.result;
+            if (existing.fingerprint === fingerprint) {
+                if (artifact && !existing.artifactGuard?.())
+                    return Promise.resolve(refused());
+                return release(artifact ? existing.result.then(value => existing.artifactGuard?.() ? value : refused()) : existing.result);
+            }
             return Promise.resolve({
                 kind: "bus.ack",
                 requestId: envelope.requestId,
@@ -1648,15 +1662,18 @@ export function createTelegramBusLocalServer(deps) {
         }
         const entry = {
             fingerprint,
+            ...(artifactGuard ? { artifactGuard } : {}),
             settled: false,
-            result: Promise.resolve().then(() => deps.handleEnvelope(envelope)),
+            result: artifact
+                ? Promise.resolve().then(() => deps.handleEnvelope(envelope)).catch(() => rejectTelegramBusRequest(Buffer.from(envelope.requestId, "utf8").toString("utf8"), "Artifact operation outcome is unconfirmed."))
+                : Promise.resolve().then(() => deps.handleEnvelope(envelope)),
         };
         requestLedger.set(key, entry);
         const settled = () => {
             entry.settled = true;
         };
         void entry.result.then(settled, settled);
-        return entry.result;
+        return release(entry.result);
     };
     let server;
     let activeSocketPath;
@@ -1929,6 +1946,7 @@ function sendTelegramBusLocalEnvelopeOnce(options) {
                 const encoded = encodeTelegramBusEnvelope(options.envelope);
                 assertCurrent();
                 issued = true;
+                options.onRequestIssued?.();
                 socket.write(encoded);
             }
             catch (error) {
@@ -2002,6 +2020,67 @@ export async function sendTelegramBusLocalEnvelope(options) {
         }
     }
 }
+/** Ordinary guarded call authority only; neither question membership nor Input receiver readiness. */
+export const TELEGRAM_BUS_CAPABILITY_GUARDED_API_AUTHORITY = "guarded-api-authority-v1";
+/** Existing registry incarnation, acknowledged independently of Artifact and matched by guarded API calls. */
+export const TELEGRAM_BUS_CAPABILITY_API_REGISTRATION_AUTHORITY = "api-registration-authority-v1";
+/** Private publication contract only; never add to production advertisement before input privacy readiness. */
+export const TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION = "attachment-original-publication-v1";
+export const TELEGRAM_BUS_ATTACHMENT_PUBLICATION_RECEIPT = "__piTelegramAttachmentPublication";
+/** Private decoded-data evidence, not a receiver, source submission or business grant. */
+export function parseTelegramBusAttachmentPublicationReceipt(raw) {
+    if (!isRecord(raw) || Object.keys(raw).length !== 9 || Object.keys(raw).some(key => !["version", "requestId", "nonce", "instanceId", "registrationGeneration", "registrationIncarnation", "botId", "messageId", "target"].includes(key)) || raw.version !== 1 ||
+        [raw.requestId, raw.instanceId, raw.registrationGeneration].some(value => typeof value !== "string" || !value.trim() ||
+            value !== value.trim() || value.length > 512 || !value.isWellFormed() || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) ||
+        typeof raw.registrationIncarnation !== "string" || !/^[a-f0-9]{48}$/u.test(raw.registrationIncarnation) ||
+        typeof raw.nonce !== "string" || !/^[a-f0-9]{32}$/u.test(raw.nonce) || !Number.isSafeInteger(raw.botId) || raw.botId <= 0 ||
+        !Number.isSafeInteger(raw.messageId) || raw.messageId <= 0 || !isRecord(raw.target) ||
+        Object.keys(raw.target).some(key => key !== "chatId" && key !== "threadId") ||
+        !Number.isSafeInteger(raw.target.chatId) || raw.target.chatId <= 0 ||
+        raw.target.threadId !== undefined && (!Number.isSafeInteger(raw.target.threadId) || raw.target.threadId <= 0))
+        return undefined;
+    return Object.freeze({ version: 1, requestId: raw.requestId, nonce: raw.nonce, instanceId: raw.instanceId,
+        registrationGeneration: raw.registrationGeneration, registrationIncarnation: raw.registrationIncarnation, botId: raw.botId, messageId: raw.messageId,
+        target: Object.freeze({ chatId: raw.target.chatId, ...(raw.target.threadId !== undefined ? { threadId: raw.target.threadId } : {}) }) });
+}
+export const TELEGRAM_BUS_CAPABILITY_ARTIFACT_DOCUMENT = "artifact-document-v1";
+/** Avoid RegExp's process-wide last-input retention for payload-bearing strings. */
+function isCanonicalArtifactBase64(encoded, byteLength) {
+    if (encoded.length !== 4 * Math.ceil(byteLength / 3))
+        return false;
+    const padding = (3 - byteLength % 3) % 3, end = encoded.length - padding;
+    for (let i = 0; i < end; i++) {
+        const c = encoded.charCodeAt(i);
+        if (!(c >= 65 && c <= 90 || c >= 97 && c <= 122 || c >= 48 && c <= 57 || c === 43 || c === 47))
+            return false;
+    }
+    for (let i = end; i < encoded.length; i++)
+        if (encoded.charCodeAt(i) !== 61)
+            return false;
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    return padding === 0 || (alphabet.indexOf(encoded[end - 1]) & (padding === 2 ? 15 : 3)) === 0;
+}
+/** Strict bounded wire validation does not decode bytes or grant source/business authority. */
+export function parseTelegramBusArtifactDocument(args) {
+    if (args.length !== 1)
+        return undefined;
+    const value = args[0];
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        return undefined;
+    const v = value, t = v.target;
+    if (Object.keys(v).some(k => !["version", "registrationIncarnation", "target", "fileName", "byteLength", "bytesBase64", "caption", "expiresAt"].includes(k)) ||
+        v.version !== 1 || typeof v.registrationIncarnation !== "string" || !/^[a-f0-9]{48}$/u.test(v.registrationIncarnation) ||
+        !t || typeof t !== "object" || Array.isArray(t) || Object.keys(t).some(k => k !== "chatId" && k !== "threadId") ||
+        !Number.isSafeInteger(t.chatId) || t.chatId <= 0 ||
+        (t.threadId !== undefined && (!Number.isSafeInteger(t.threadId) || t.threadId <= 0)) ||
+        !isTelegramArtifactFileName(v.fileName) ||
+        !Number.isSafeInteger(v.byteLength) || v.byteLength < 1 || v.byteLength > TELEGRAM_ARTIFACT_MAX_BYTES ||
+        typeof v.bytesBase64 !== "string" || !isCanonicalArtifactBase64(v.bytesBase64, v.byteLength) ||
+        (v.caption !== undefined && !isTelegramArtifactCaption(v.caption)) ||
+        !Number.isSafeInteger(v.expiresAt) || v.expiresAt <= Date.now())
+        return undefined;
+    return value;
+}
 export function createTelegramBusForwardOwnershipValidator(registry) {
     return (ownership) => {
         const follower = registry.get(ownership.instanceId);
@@ -2027,6 +2106,7 @@ function hasTelegramBusFollowerIdentityOverlap(first, second) {
 }
 export function createTelegramBusFollowerRegistry() {
     const followers = new Map();
+    let membership = {};
     const observations = new Set();
     const clone = (follower) => ({
         ...follower,
@@ -2040,8 +2120,43 @@ export function createTelegramBusFollowerRegistry() {
             }
             : {}),
     });
-    return {
+    const captureLifetime = (owned) => {
+        // Keep owner-created scalars, never a payload-backed registering peer's object.
+        const id = owned.instanceId, incarnation = owned.registrationIncarnation;
+        let lost = false;
+        const current = () => { lost ||= followers.get(id)?.registrationIncarnation !== incarnation; return !lost; };
+        return current() ? current : undefined;
+    };
+    const registry = {
+        captureOrphanIntentReaderCompatibility(local, mode = "intent") {
+            if (mode !== "intent" && mode !== "cleanup")
+                return undefined;
+            const required = [TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER,
+                ...(mode === "cleanup" ? [TELEGRAM_BUS_CAPABILITY_ORPHAN_CLEANUP_READER] : [])];
+            const born = membership, protocol = structuredClone(local);
+            const keys = ["captureOrphanIntentReaderCompatibility", "list", "get", "register", "remove", "clear", "pruneStale"];
+            const methods = keys.map(key => registry[key]);
+            let lost = false;
+            if (required.some(capability => !hasTelegramBusCapability(protocol, capability)) ||
+                [...followers.values()].some(row => !row.registrationGeneration ||
+                    required.some(capability => !hasTelegramBusCapability(row.protocol, capability))))
+                return undefined;
+            const current = () => {
+                lost ||= membership !== born || !isDeepStrictEqual(local, protocol) || keys.some((key, index) => registry[key] !== methods[index]);
+                return !lost;
+            };
+            return current() ? current : undefined;
+        },
+        captureRegistration(instanceId, generation) {
+            const owned = followers.get(instanceId);
+            return owned?.registrationGeneration === generation ? captureLifetime(owned) : undefined;
+        },
+        captureArtifactRegistration(instanceId, incarnation) {
+            const owned = followers.get(instanceId);
+            return owned?.registrationIncarnation === incarnation ? captureLifetime(owned) : undefined;
+        },
         register: (registration) => {
+            membership = {};
             const existing = followers.get(registration.instanceId);
             for (const [instanceId, follower] of followers.entries()) {
                 if (instanceId === registration.instanceId)
@@ -2051,6 +2166,7 @@ export function createTelegramBusFollowerRegistry() {
             }
             const next = {
                 ...registration,
+                registrationIncarnation: randomBytes(24).toString("hex"),
                 target: registration.target ? { ...registration.target } : undefined,
                 ...(registration.protocol
                     ? {
@@ -2093,8 +2209,15 @@ export function createTelegramBusFollowerRegistry() {
             return undefined;
         },
         list: () => [...followers.values()].map(clone),
-        remove: (instanceId) => followers.delete(instanceId),
+        remove: (instanceId) => {
+            const removed = followers.delete(instanceId);
+            if (removed)
+                membership = {};
+            return removed;
+        },
         clear: () => {
+            if (followers.size)
+                membership = {};
             followers.clear();
             for (const observation of observations)
                 observation.current = false;
@@ -2124,9 +2247,12 @@ export function createTelegramBusFollowerRegistry() {
                 followers.delete(instanceId);
                 removed.push(clone(follower));
             }
+            if (removed.length)
+                membership = {};
             return removed;
         },
     };
+    return registry;
 }
 async function handleTelegramBusSocketLine(line, socket, handleEnvelope, recordTransportEvent, socketPath, shouldDropResponse) {
     const envelope = parseTelegramBusEnvelope(line);
@@ -2620,6 +2746,8 @@ function parseSelectedMenuDeliveryEnvelope(value, requestId) {
 }
 function parseCallApiEnvelope(value, requestId) {
     return typeof value.instanceId === "string" &&
+        (value.apiRegistrationIncarnation === undefined || typeof value.apiRegistrationIncarnation === "string" && /^[a-f0-9]{48}$/u.test(value.apiRegistrationIncarnation)) &&
+        (value.attachmentRegistrationIncarnation === undefined || typeof value.attachmentRegistrationIncarnation === "string" && /^[a-f0-9]{48}$/u.test(value.attachmentRegistrationIncarnation)) &&
         typeof value.method === "string" &&
         Array.isArray(value.args) &&
         typeof value.sentAtMs === "number"
@@ -2630,6 +2758,8 @@ function parseCallApiEnvelope(value, requestId) {
             ...(typeof value.registrationGeneration === "string"
                 ? { registrationGeneration: value.registrationGeneration }
                 : {}),
+            ...(typeof value.apiRegistrationIncarnation === "string" ? { apiRegistrationIncarnation: value.apiRegistrationIncarnation } : {}),
+            ...(typeof value.attachmentRegistrationIncarnation === "string" ? { attachmentRegistrationIncarnation: value.attachmentRegistrationIncarnation } : {}),
             method: value.method,
             args: value.args,
             sentAtMs: value.sentAtMs,

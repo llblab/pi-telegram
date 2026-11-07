@@ -13,6 +13,8 @@ export interface TelegramSessionFolderSweeperDeps {
     getProfileName: () => string | undefined;
     /** Sessions holding a Workspace slot binding, live registrations and this process's own session. */
     getKeptSessionIds: () => Iterable<string | undefined>;
+    /** Private opt-in whole-sweep hold; unknown history cannot be classified by a missing marker. */
+    preserveJournalFamilies?: true;
     getNowMs?: () => number;
     intervalMs?: number;
 }

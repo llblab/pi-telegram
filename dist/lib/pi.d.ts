@@ -49,6 +49,13 @@ export declare function isExtensionContextPassiveRunMode(ctx: unknown): boolean;
 export declare function canStartPollingInExtensionContext(ctx: unknown): boolean;
 export declare function formatPollingStartBlockedByRunMode(ctx: unknown): string;
 export declare function getSessionCompactionReason(event: unknown): "manual" | "threshold" | "overflow" | "unknown";
+/** Original API callable only, not API activity, catalog/resource lifetime or source authority. */
+export interface PiCommandProviderCapture {
+    assertCallable(): void;
+    getCommands: ExtensionAPI["getCommands"];
+}
+/** Intrinsic non-match probes no supplied DTO/receiver fields and does not revoke the genuine owner. */
+export declare function readPiCommandProviderCapture(value: unknown, ports: PiExtensionApiRuntimePorts): Readonly<PiCommandProviderCapture> | undefined;
 export interface PiExtensionApiRuntimePorts {
     sendUserMessage: ExtensionAPI["sendUserMessage"];
     exec: ExtensionAPI["exec"];
@@ -59,8 +66,9 @@ export interface PiExtensionApiRuntimePorts {
     setActiveTools: ExtensionAPI["setActiveTools"];
     setModel: ExtensionAPI["setModel"];
     registerCommand: ExtensionAPI["registerCommand"];
+    captureCommandProvider?(): Readonly<PiCommandProviderCapture>;
 }
-export declare function createExtensionApiRuntimePorts(api: Pick<ExtensionAPI, "sendUserMessage" | "exec" | "getCommands" | "getThinkingLevel" | "setThinkingLevel" | "getActiveTools" | "setActiveTools" | "setModel" | "registerCommand">): PiExtensionApiRuntimePorts;
+export declare function createExtensionApiRuntimePorts(api: Pick<ExtensionAPI, "sendUserMessage" | "exec" | "getCommands" | "getThinkingLevel" | "setThinkingLevel" | "getActiveTools" | "setActiveTools" | "setModel" | "registerCommand">, commandProvider?: true): PiExtensionApiRuntimePorts;
 export declare function normalizeSettingsManager(manager: unknown): PiSettingsManager;
 export declare function createSettingsManager(cwd: string): Promise<PiSettingsManager>;
 export declare function createScopedModelPatternPersister(deps: {

@@ -80,6 +80,7 @@ export declare function createTelegramQueueBindingRuntime<TContext>(deps: {
     hasPendingMessages: (ctx: TContext) => boolean;
     isContextCurrent?: (ctx: TContext) => boolean;
     isContextAborted?: (ctx: TContext) => boolean;
+    isShutdownRequested?: () => boolean;
     updateStatus: (ctx: TContext, error?: string) => void;
     sendTextReply: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendTextReply"];
     sendUserMessage: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendUserMessage"];
@@ -102,6 +103,13 @@ export declare function createTelegramGenerativeAppBoundButtonActionInvoker<TQue
     };
 }>(deps: {
     agentDir: string;
+    /** @internal Native callback-worker ownership only; no disposition or successor permission. */
+    callbackWorkerDrain?: true;
+    /** @internal App-only predecessor; bound mode preserves legacy unbound prompts without fabricating lineage. */
+    callbackSuccessor?: true | "bound";
+    /** @internal Qualified mode joins issued native origins without requiring provenance for legacy execution. */
+    callbackDispatch?: true | "qualified";
+    onOwnerObserved?: GenerativeApps.GenerativeAppRuntimeOptions["onOwnerObserved"];
     assertExecutionCurrent: (query: TQuery) => void;
     getExecutionFence: (query: TQuery) => GenerativeApps.GenerativeAppExecutionFence | undefined;
     getActiveProfileName?: () => string | undefined;
@@ -109,8 +117,11 @@ export declare function createTelegramGenerativeAppBoundButtonActionInvoker<TQue
     planOutput: ReturnType<typeof OutboundHandlers.createTelegramOutboundReplyPlanner>;
     sendMarkdownReply: (chatId: number, replyToMessageId: number, markdown: string, options?: {
         replyMarkup?: OutboundHandlers.TelegramOutboundButtonMarkup;
+        target?: TelegramTarget;
     }) => Promise<unknown>;
     editInteractiveMessage?: (chatId: number, messageId: number, markdown: string, mode: "markdown", replyMarkup: OutboundHandlers.TelegramOutboundButtonMarkup) => Promise<void>;
+    /** App output uses its configured Markdown carrier; harness-owned interactive menus stay HTML. */
+    editMarkdownMessage?: (chatId: number, messageId: number, markdown: string, replyMarkup: OutboundHandlers.TelegramOutboundButtonMarkup, options?: Parameters<typeof Replies.editTelegramSingleMarkdownMessage>[6]) => Promise<void>;
     recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }): (action: OutboundHandlers.TelegramOutboundButtonAction, query: TQuery) => Promise<false | "new" | "edit">;
 export interface TelegramAgentMessageToolRoutingRuntime {

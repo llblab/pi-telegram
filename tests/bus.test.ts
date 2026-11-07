@@ -27,8 +27,70 @@ import {
   getTelegramBusTransportRetryPolicy,
   probeTelegramBusEndpoint,
 } from "../lib/bus-transport.ts";
+for (const artifact of ["source", "compiled"] as const) for (const mode of ["empty", "supported", "legacy", "local-legacy", "no-generation", "heartbeat", "replacement", "add-remove", "remove", "clear", "prune", "provider", "local-loss", "remove-absent"] as const)
+test(`Native orphan reader capture owns the whole original membership (${artifact}/${mode})`, async () => {
+  const createRegistry = (artifact === "source" ? createTelegramBusFollowerRegistry : (await import("../dist/lib/bus.js")).createTelegramBusFollowerRegistry) as typeof createTelegramBusFollowerRegistry;
+  const registry = createRegistry(), capability = TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER;
+  const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "same-build", capabilities: [capability] });
+  const local = createTelegramBusProtocolIdentity({ runtimeBuild: "same-build", capabilities: mode === "local-legacy" ? [] : [capability] });
+  const row = { instanceId: "reader", profileKey: "manual:reader", registrationGeneration: "g1", connectedAtMs: 1, protocol };
+  if (mode !== "empty") registry.register({ ...row, ...(mode === "no-generation" ? { registrationGeneration: undefined } : {}),
+    ...(mode === "legacy" ? { protocol: createTelegramBusProtocolIdentity({ runtimeBuild: "same-build", capabilities: [] }) } : {}) });
+  assert.equal(typeof registry.captureOrphanIntentReaderCompatibility, "function");
+  const current = registry.captureOrphanIntentReaderCompatibility!(local);
+  if (["legacy", "local-legacy", "no-generation"].includes(mode)) { assert.equal(current, undefined); return; }
+  assert.ok(current); assert.equal(current(), true);
+  if (mode === "heartbeat") registry.heartbeat("reader", 2000);
+  if (mode === "remove-absent") registry.remove("absent");
+  if (mode === "replacement") registry.register(row);
+  if (mode === "add-remove") { registry.register({ ...row, instanceId: "transient", profileKey: "manual:transient" }); registry.remove("transient"); }
+  if (mode === "remove") registry.remove("reader");
+  if (mode === "clear") registry.clear();
+  if (mode === "prune") registry.pruneStale(10000, 1);
+  if (mode === "provider") { const list = registry.list; registry.list = () => []; assert.equal(current(), false); registry.list = list; }
+  if (mode === "local-loss") { local.capabilities = []; assert.equal(current(), false); local.capabilities = [capability]; }
+  const live = ["empty", "supported", "heartbeat", "remove-absent"].includes(mode);
+  assert.equal(current(), live);
+  if (!live) { registry.clear(); registry.register(row); assert.equal(current(), false, "Equal restored roster/provider fields cannot revive a spent capture"); }
+});
+
+for (const artifact of ["source", "compiled"] as const) for (const localV2 of [false, true]) for (const remoteV2 of [false, true])
+test(`Orphan issued-state reader support is negotiated independently (${artifact}/${localV2}/${remoteV2})`, async () => {
+  const createRegistry = (artifact === "source" ? createTelegramBusFollowerRegistry : (await import("../dist/lib/bus.js")).createTelegramBusFollowerRegistry) as typeof createTelegramBusFollowerRegistry;
+  const protocol = (v2: boolean) => createTelegramBusProtocolIdentity({ runtimeBuild: "same-build", capabilities: [TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER,
+    ...(v2 ? [TELEGRAM_BUS_CAPABILITY_ORPHAN_CLEANUP_READER] : [])] });
+  const registry = createRegistry(), local = protocol(localV2);
+  registry.register({ instanceId: "reader", registrationGeneration: "g1", connectedAtMs: 1, protocol: protocol(remoteV2) });
+  assert.equal(registry.captureOrphanIntentReaderCompatibility!(local)?.(), true, "V1 still suffices for an unissued intent");
+  const cleanup = registry.captureOrphanIntentReaderCompatibility!(local, "cleanup");
+  assert.equal(cleanup?.() === true, localV2 && remoteV2, "Equal builds or V1 do not certify the issued codec");
+});
+
+test("Attachment publication receipt is bounded immutable evidence and never a default capability", () => {
+  const raw = { version: 1, requestId: "publication", nonce: "a".repeat(32), instanceId: "follower", registrationGeneration: "g1", registrationIncarnation: "b".repeat(48),
+    botId: 777, messageId: 501, target: { chatId: 7, threadId: 11 } };
+  const receipt = parseTelegramBusAttachmentPublicationReceipt(raw); assert.ok(receipt && Object.isFrozen(receipt) && Object.isFrozen(receipt.target));
+  raw.target.chatId = 99; assert.equal(receipt.target.chatId, 7);
+  for (const changed of [{ version: 2 }, { requestId: "" }, { requestId: "x".repeat(513) }, { nonce: "a".repeat(33) },
+    { instanceId: "bad\ninstance" }, { registrationGeneration: null }, { registrationIncarnation: "" }, { registrationIncarnation: "x".repeat(48) }, { botId: 0 }, { messageId: 1.5 }, { unknown: true },
+    { target: { chatId: 0 } }, { target: { chatId: 7, threadId: -1 } }, { target: { chatId: 7, extra: true } }])
+    assert.equal(parseTelegramBusAttachmentPublicationReceipt({ ...raw, ...changed }), undefined);
+  assert.equal(createTelegramCurrentBusProtocolIdentity().capabilities.includes(TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION), false);
+  const envelope = { kind: "follower.callApi", requestId: "publication", instanceId: "follower", registrationGeneration: "g1",
+    attachmentRegistrationIncarnation: "b".repeat(48), method: "call", args: ["sendMessage", {}], sentAtMs: 1 };
+  assert.deepEqual(parseTelegramBusEnvelope(JSON.stringify(envelope)), envelope);
+  for (const invalid of [null, "", "b".repeat(47), "x".repeat(48), 42])
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, attachmentRegistrationIncarnation: invalid })), undefined);
+});
+
 import {
   createCurrentTelegramBusProcessRuntime,
+  parseTelegramBusAttachmentPublicationReceipt,
+  createTelegramCurrentBusProtocolIdentity,
+  TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION,
+  TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER,
+  TELEGRAM_BUS_CAPABILITY_ORPHAN_CLEANUP_READER,
+  parseTelegramBusArtifactDocument,
   canUseTelegramBusInputCustodyReference,
   createTelegramBusFollowerDeliveryIdentity,
   createTelegramBusForwardOwnershipValidator,
@@ -47,7 +109,6 @@ import {
   getTelegramBusEnvelopeTrafficClass,
   getTelegramBusFollowerSocketPath,
   getTelegramBusProtocolCompatibility,
-  getTelegramInputCustodyPeerReadiness,
   getTelegramBusSocketPath,
   getTelegramFollowerTargetOwnership,
   hasTelegramBusCapability,
@@ -465,19 +526,6 @@ test("Bus protocol compatibility ignores build skew and enforces capabilities", 
       ],
     },
   );
-});
-
-test("Bus custody peer readiness uses only live generation and protocol evidence", () => {
-  const ready = createTelegramBusProtocolIdentity({ runtimeBuild: "0.45.0",
-    capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
-      TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE] });
-  const legacy = createTelegramBusProtocolIdentity({ runtimeBuild: "0.44.0" });
-  assert.deepEqual(getTelegramInputCustodyPeerReadiness([
-    { registrationGeneration: "g1", protocol: ready },
-    { registrationGeneration: "g2", protocol: legacy },
-    { registrationGeneration: "g3" },
-    { protocol: ready },
-  ]), ["ready", "legacy", "unknown", "unknown"]);
 });
 
 test("Bus custody reference requires mutual capability and exact accepted handoff", () => {
@@ -1204,6 +1252,36 @@ test("Bus contract rejects malformed envelopes", () => {
   );
 });
 
+for (const kind of ["artifact", "ordinary"] as const)
+for (const change of ["heartbeat", "equal-register", "rename", "remove-readd", "overlap", "prune", "clear"] as const)
+test(`Native registry lifetime is owned and nonrenewing (${kind}/${change})`, () => {
+  const registry = createTelegramBusFollowerRegistry(), registration = { instanceId: "artifact", connectedAtMs: 1, registrationGeneration: "same", profileKey: "profile", target: { chatId: 7, threadId: 8 } };
+  const first = registry.register(registration), incarnation = first.registrationIncarnation!;
+  assert.match(incarnation, /^[a-f0-9]{48}$/u);
+  const capture = kind === "artifact" ? registry.captureArtifactRegistration!(registration.instanceId, incarnation)! : registry.captureRegistration!(registration.instanceId, "same")!;
+  assert.equal(registry.captureRegistration!(registration.instanceId, "foreign"), undefined);
+  assert.equal(capture(), true);
+  if (change === "heartbeat") registry.heartbeat(registration.instanceId, 5);
+  else if (change === "equal-register") registry.register(registration);
+  else if (change === "rename") registry.register({ ...registration, threadName: "new" });
+  else if (change === "remove-readd") { registry.remove(registration.instanceId); registry.register(registration); }
+  else if (change === "overlap") registry.register({ ...registration, instanceId: "other" });
+  else if (change === "prune") registry.pruneStale(100, 5);
+  else registry.clear();
+  assert.equal(capture(), change === "heartbeat");
+  if (change !== "heartbeat") { registry.register(registration); assert.equal(capture(), false); }
+  else assert.equal(registry.get(registration.instanceId)?.registrationIncarnation, incarnation);
+});
+
+test("Artifact wire rejects noncanonical base64, keys and mismatched declared size without payload allocation", () => {
+  const good = { version: 1, registrationIncarnation: "a".repeat(48), target: { chatId: 7, threadId: 8 }, fileName: "file", byteLength: 1, bytesBase64: "YQ==", expiresAt: Date.now() + 10000 };
+  assert.ok(parseTelegramBusArtifactDocument([good]));
+  for (const bad of [{ ...good, bytesBase64: "YR==" }, { ...good, bytesBase64: "YQ==\n" }, { ...good, bytesBase64: "AAAA" }, { ...good, byteLength: 2 }, { ...good, extra: true }, { ...good, fileName: "../path" }, { ...good, expiresAt: 1 }, { ...good, target: { chatId: 7, aggregate: true } }])
+    assert.equal(parseTelegramBusArtifactDocument([bad]), undefined);
+  const bytes = Buffer.alloc(1_048_576, 255);
+  assert.ok(parseTelegramBusArtifactDocument([{ ...good, byteLength: bytes.length, bytesBase64: bytes.toString("base64") }]));
+});
+
 test("Bus follower registry registers, heartbeats, and prunes live instances", () => {
   const registry = createTelegramBusFollowerRegistry();
 
@@ -1220,6 +1298,7 @@ test("Bus follower registry registers, heartbeats, and prunes live instances", (
       target: { chatId: 1 },
       connectedAtMs: 1000,
       lastHeartbeatMs: 1000,
+      registrationIncarnation: registry.get("inst-a")?.registrationIncarnation,
     },
   );
   registry.register({

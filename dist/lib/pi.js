@@ -3,6 +3,7 @@
  * Zones: pi agent sdk boundary, shared adapters
  * Owns direct pi SDK imports and exposes narrow bridge-facing helpers/types for the extension composition layer
  */
+import { types } from "node:util";
 import { SettingsManager, } from "@earendil-works/pi-coding-agent";
 function isPiRunMode(value) {
     return (value === "tui" || value === "rpc" || value === "json" || value === "print");
@@ -40,8 +41,85 @@ export function getSessionCompactionReason(event) {
         ? reason
         : "unknown";
 }
-export function createExtensionApiRuntimePorts(api) {
-    return {
+const COMMAND_PROVIDER_KEY = Symbol("original Pi command callable");
+const commandProviderIsProxy = types.isProxy;
+const commandProviderOwn = Object.getOwnPropertyDescriptor;
+const commandProviderApply = Reflect.apply;
+const commandProviderArray = Array.isArray;
+function commandProviderData(value, key) {
+    const descriptor = commandProviderOwn(value, key);
+    // A native accessor descriptor has no own value; do not consult its prototype.
+    return descriptor && commandProviderOwn(descriptor, "value")?.value;
+}
+const commandProviderUnavailable = () => new Error("Pi command provider callable is unavailable.");
+class NativePiCommandProvider {
+    #owner;
+    assertCallable = () => {
+        if (this.#owner.busy) {
+            this.#owner.lost = true;
+            throw commandProviderUnavailable();
+        }
+        this.#assertFields();
+    };
+    getCommands = () => {
+        this.assertCallable();
+        const owner = this.#owner;
+        owner.busy = true;
+        try {
+            const value = commandProviderApply(owner.get, owner.api, []);
+            this.#assertFields();
+            if (!commandProviderArray(value))
+                throw commandProviderUnavailable();
+            return value;
+        }
+        catch (error) {
+            owner.lost = true;
+            throw error;
+        }
+        finally {
+            owner.busy = false;
+        }
+    };
+    constructor(key, api, get, ports, portGet, capture) {
+        if (key !== COMMAND_PROVIDER_KEY)
+            throw commandProviderUnavailable();
+        this.#owner = { api, get, ports, portGet, capture, lost: false, busy: false };
+        Object.freeze(this);
+    }
+    #assertFields() {
+        const owner = this.#owner;
+        if (owner.lost || commandProviderData(owner.api, "getCommands") !== owner.get ||
+            commandProviderData(owner.ports, "getCommands") !== owner.portGet ||
+            commandProviderData(owner.ports, "captureCommandProvider") !== owner.capture) {
+            owner.lost = true;
+            throw commandProviderUnavailable();
+        }
+    }
+    static read(value, ports) {
+        if (!value || typeof value !== "object" || !(#owner in value) || value.#owner.ports !== ports)
+            return undefined;
+        value.assertCallable();
+        return value;
+    }
+}
+const readNativePiCommandProvider = NativePiCommandProvider.read;
+/** Intrinsic non-match probes no supplied DTO/receiver fields and does not revoke the genuine owner. */
+export function readPiCommandProviderCapture(value, ports) {
+    return readNativePiCommandProvider(value, ports);
+}
+export function createExtensionApiRuntimePorts(api, commandProvider) {
+    const refusal = () => new TypeError("Original Pi command provider requires true and an own-data callable.");
+    if (commandProvider !== undefined && commandProvider !== true)
+        throw refusal();
+    let original;
+    if (commandProvider) {
+        if (!api || typeof api !== "object" || commandProviderIsProxy(api))
+            throw refusal();
+        original = commandProviderData(api, "getCommands");
+        if (typeof original !== "function" || commandProviderIsProxy(original))
+            throw refusal();
+    }
+    const ports = {
         sendUserMessage: (content, options) => api.sendUserMessage(content, options),
         exec: (command, args, options) => api.exec(command, args, options),
         getCommands: () => api.getCommands(),
@@ -52,6 +130,12 @@ export function createExtensionApiRuntimePorts(api) {
         setModel: (model) => api.setModel(model),
         registerCommand: (name, options) => api.registerCommand(name, options),
     };
+    if (original) {
+        const capture = () => readNativePiCommandProvider(provider, ports);
+        const provider = new NativePiCommandProvider(COMMAND_PROVIDER_KEY, api, original, ports, ports.getCommands, capture);
+        ports.captureCommandProvider = capture;
+    }
+    return ports;
 }
 function readEnabledModels(value) {
     if (value === undefined)

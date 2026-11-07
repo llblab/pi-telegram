@@ -266,12 +266,6 @@ export declare function runWithTelegramWorkspaceAdmissions<T>(input: {
     scopes: readonly TelegramWorkspaceAdmissionScope[];
     operation: () => T;
 }): T;
-export declare function createTelegramWorkspaceJournalWriterAdmission(input: {
-    ledger: Pick<TelegramWorkspaceAdmissionLedger, "acquireAdmission" | "acquireJournalWriterAdmission" | "releaseAdmission">;
-    protocolAuthority?: Omit<Parameters<TelegramWorkspaceAdmissionLedger["acquireJournalWriterAdmission"]>[0], "operationId">;
-    createOperationId?: () => string;
-    onReleaseError?: (error: unknown) => void;
-}): <T>(operation: () => T) => T;
 export declare function runWithTelegramWorkspaceAdmissionsAsync<T>(input: {
     ledger: Pick<TelegramWorkspaceAdmissionLedger, "acquireAdmission" | "releaseAdmission">;
     operationId: string;

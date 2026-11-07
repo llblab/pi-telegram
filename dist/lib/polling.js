@@ -3,6 +3,22 @@
  * Zones: telegram transport, polling runtime
  * Owns polling request builders, stop conditions, and the long-poll loop runtime for Telegram updates
  */
+/** A faulty diagnostics port must not break probes, the interval callback or a completed outcome. */
+function guardTelegramRepeatedFailureLog(port) {
+    const guarded = (call) => (...args) => {
+        try {
+            call(...args);
+        }
+        catch {
+            // Diagnostics are best-effort.
+        }
+    };
+    return {
+        record: guarded((error, details) => port.record(error, details)),
+        settled: guarded(() => port.settled()),
+        reset: guarded(() => port.reset()),
+    };
+}
 const TELEGRAM_INITIAL_SYNC_OFFSET = -1;
 const TELEGRAM_INITIAL_SYNC_LIMIT = 1;
 const TELEGRAM_INITIAL_SYNC_TIMEOUT_SECONDS = 0;
@@ -219,6 +235,7 @@ export function createTelegramPollingControllerRuntime(deps) {
             deleteWebhook: deps.deleteWebhook,
             getUpdates: deps.getUpdates,
             getUpdatesRequestBudgetMs: deps.getUpdatesRequestBudgetMs,
+            onFirstUpdateBatch: deps.onFirstUpdateBatch,
             persistConfig: deps.persistConfig,
             appendUpdateBatch: deps.appendUpdateBatch,
             getAcceptedThroughUpdateId: deps.getAcceptedThroughUpdateId,
@@ -457,6 +474,7 @@ export function createTelegramThreadCapabilityOrchestration(deps) {
         topicTargetStore: deps.topicTargetStore,
         ownsLock: deps.ownsLock,
         isFollowerRegistered: deps.isFollowerRegistered,
+        getRelayedThreadCapability: deps.getRelayedThreadCapability,
         getPollingStartedWithTelegramBus: deps.state.isBusPollingStarted,
         setPollingStartedWithTelegramBus: deps.state.setBusPollingStarted,
         setTopicModeUnavailable: deps.state.setTopicModeUnavailable,
@@ -691,6 +709,14 @@ export function createTelegramThreadAwarePollingPorts(deps) {
         }
         if (!isCurrent())
             return;
+        const knownClassic = startupThreadCapability === false ||
+            startupThreadCapability === undefined && deps.topicTargetStore.getBotState().threadMode === "disabled";
+        if (options?.restoreWorkspaceOnly && !knownClassic && !deps.hasRememberedWorkspaceBinding?.(ctx)) {
+            deps.recordEvent("bus", "Telegram automatic Thread startup refused: session binding is unavailable.", {
+                phase: "leader-auto-connect-skip", reason: "session-binding-unavailable",
+            });
+            throw new Error("Telegram automatic Thread startup requires a remembered session binding.");
+        }
         deps.setTopicModeUnavailable(startupThreadCapability !== true);
         if (deps.isBusRuntimeEnabled()) {
             deps.setTopicModeUnavailable(false);
@@ -778,6 +804,14 @@ export function createTelegramThreadAwarePollingPorts(deps) {
     return {
         startPolling,
         stopPolling,
+        canAutoStartSession: async (ctx) => {
+            if (deps.topicTargetStore.refresh)
+                await deps.topicTargetStore.refresh();
+            else
+                await deps.topicTargetStore.load();
+            // Known classic continuity has no Workspace binding; unknown mode cannot authorize a new Thread.
+            return deps.hasRememberedWorkspaceBinding?.(ctx) === true || deps.topicTargetStore.getBotState().threadMode === "disabled";
+        },
         registerFollowerWithOwner,
         restoreFollowerWithOwner,
         stopFollowerRegistration: deps.stopFollowerRegistration,
@@ -815,33 +849,7 @@ export function createTelegramThreadCapabilityMonitor(deps) {
     let transitionPromise;
     let consecutiveDisabledProbes = 0;
     // An absent leader endpoint repeats one identical probe failure every interval; the port collapses the run.
-    // Running it through one guard keeps a faulty diagnostics port from breaking probes or the interval callback.
-    const capabilityFailureLog = {
-        record(error, details) {
-            try {
-                deps.failureLog.record(error, details);
-            }
-            catch {
-                // Monitor diagnostics cannot create an uncaught interval exception.
-            }
-        },
-        settled() {
-            try {
-                deps.failureLog.settled();
-            }
-            catch {
-                // Monitor diagnostics cannot fail a completed probe.
-            }
-        },
-        reset() {
-            try {
-                deps.failureLog.reset();
-            }
-            catch {
-                // Monitor diagnostics cannot fail a monitor stop.
-            }
-        },
-    };
+    const capabilityFailureLog = guardTelegramRepeatedFailureLog(deps.failureLog);
     const stop = () => {
         generation += 1;
         capabilityFailureLog.reset();
@@ -858,7 +866,9 @@ export function createTelegramThreadCapabilityMonitor(deps) {
         const isLifecycleCurrent = deps.lifecycle?.capture() ?? (() => true);
         const isCurrent = () => generation === expectedGeneration && isLifecycleCurrent();
         let tracked;
-        tracked = readTelegramThreadCapability(deps)
+        // A registered follower learns the capability from the leader's heartbeat instead of probing through the bus.
+        const relayed = deps.ownsLock(ctx) ? undefined : deps.getRelayedThreadCapability?.();
+        tracked = (relayed !== undefined ? Promise.resolve(relayed) : readTelegramThreadCapability(deps))
             .then(async (threadModeEnabled) => {
             if (!isCurrent())
                 return;
@@ -1002,6 +1012,74 @@ export async function admitTelegramPollingUpdateBatch(deps) {
     }
     return { updateCount: deps.updates.length, latestUpdateId };
 }
+const POLLING_FIRST_OBSERVATION_KEY = Symbol("polling-first-observation");
+class PollingFirstObservation {
+    #consumed = false;
+    requestedAfterUpdateId;
+    updates;
+    assertCurrent;
+    constructor(key, requestedAfterUpdateId, updates, assertCurrent) {
+        if (key !== POLLING_FIRST_OBSERVATION_KEY)
+            throw new Error("Telegram polling first observation is unavailable.");
+        this.requestedAfterUpdateId = requestedAfterUpdateId;
+        this.updates = updates;
+        this.assertCurrent = assertCurrent;
+        Object.freeze(this);
+    }
+    static consume(scope) {
+        if (scope.#consumed)
+            throw new Error("Telegram polling first observation is already consumed.");
+        scope.#consumed = true;
+        scope.assertCurrent();
+    }
+}
+function observeFirstTelegramPollingBatch(updates, requestedAfterUpdateId, observe, assertOwner) {
+    const unavailable = () => new Error("Telegram polling first observation is unavailable.");
+    assertOwner();
+    if (!Number.isSafeInteger(requestedAfterUpdateId) || requestedAfterUpdateId < 0 || updates.length > TELEGRAM_LONG_POLL_LIMIT)
+        throw unavailable();
+    validateTelegramPollingBatch(updates, requestedAfterUpdateId);
+    if (!updates.length)
+        return;
+    const wire = JSON.stringify(updates), snapshot = JSON.parse(wire);
+    const scoped = Object.freeze(snapshot.map(update => Object.freeze(update)));
+    let active = true, lost = false, checking = false;
+    const assertCurrent = (update) => {
+        if (!active || lost || checking) {
+            lost = true;
+            throw unavailable();
+        }
+        checking = true;
+        try {
+            assertOwner();
+            if ((update !== undefined && !scoped.includes(update)) || JSON.stringify(updates) !== wire || JSON.stringify(scoped) !== wire)
+                throw unavailable();
+            assertOwner();
+            if (lost || !active)
+                throw unavailable();
+        }
+        catch {
+            lost = true;
+            throw unavailable();
+        }
+        finally {
+            checking = false;
+        }
+    };
+    try {
+        assertCurrent();
+        if (observe(new PollingFirstObservation(POLLING_FIRST_OBSERVATION_KEY, requestedAfterUpdateId, scoped, assertCurrent)) !== undefined)
+            throw unavailable();
+        assertCurrent();
+    }
+    catch {
+        lost = true;
+        throw unavailable();
+    }
+    finally {
+        active = false;
+    }
+}
 export function sleepTelegramPollingRetry(ms, signal) {
     if (ms <= 0 || signal?.aborted)
         return Promise.resolve();
@@ -1035,6 +1113,7 @@ export function createTelegramPollLoopRunner(deps) {
         deleteWebhook: deps.deleteWebhook,
         getUpdates: deps.getUpdates,
         getUpdatesRequestBudgetMs: deps.getUpdatesRequestBudgetMs,
+        onFirstUpdateBatch: deps.onFirstUpdateBatch,
         persistConfig: deps.persistConfig,
         appendUpdateBatch: deps.appendUpdateBatch,
         getAcceptedThroughUpdateId: deps.getAcceptedThroughUpdateId,
@@ -1086,7 +1165,7 @@ function reportTelegramPollingResponse(deps, updateCount) {
 function getTelegramPollingAbortReason(signal) {
     return signal.reason ?? new DOMException("Aborted", "AbortError");
 }
-async function requestTelegramUpdatesWithinBudget(deps, body) {
+async function requestTelegramUpdatesWithinBudget(deps, body, originalGetUpdates) {
     if (deps.signal.aborted)
         throw getTelegramPollingAbortReason(deps.signal);
     const configuredBudgetMs = deps.getUpdatesRequestBudgetMs?.(body);
@@ -1118,6 +1197,12 @@ async function requestTelegramUpdatesWithinBudget(deps, body) {
         .then(() => {
         if (controller.signal.aborted) {
             throw getTelegramPollingAbortReason(controller.signal);
+        }
+        if (originalGetUpdates) {
+            const port = Object.getOwnPropertyDescriptor(deps, "getUpdates");
+            if (!port || !Object.hasOwn(port, "value") || port.value !== originalGetUpdates)
+                throw new Error("Telegram polling first-observation request port changed.");
+            return originalGetUpdates.call(deps, body, controller.signal);
         }
         return deps.getUpdates(body, controller.signal);
     })
@@ -1196,9 +1281,25 @@ export async function runTelegramPollLoop(deps) {
     while (!deps.signal.aborted) {
         try {
             currentUpdateId = undefined;
-            const request = buildTelegramLongPollRequest(deps.getAcceptedThroughUpdateId?.());
+            const requestedAfterUpdateId = deps.getAcceptedThroughUpdateId?.();
+            const request = buildTelegramLongPollRequest(requestedAfterUpdateId);
             reportTelegramPollingPhase(deps, "long-poll");
-            const updates = await requestTelegramUpdatesWithinBudget(deps, request);
+            const observe = deps.onFirstUpdateBatch;
+            const owner = observe ? { ctx: deps.ctx, signal: deps.signal, config: deps.config, getUpdates: deps.getUpdates,
+                getUpdatesRequestBudgetMs: deps.getUpdatesRequestBudgetMs, appendUpdateBatch: deps.appendUpdateBatch,
+                getAcceptedThroughUpdateId: deps.getAcceptedThroughUpdateId, signalUpdateWorker: deps.signalUpdateWorker, onFirstUpdateBatch: observe } : undefined;
+            const token = owner?.config.botToken;
+            const updates = await requestTelegramUpdatesWithinBudget(deps, request, owner?.getUpdates);
+            const observedPort = Object.getOwnPropertyDescriptor(deps, "onFirstUpdateBatch");
+            if ((observedPort && !Object.hasOwn(observedPort, "value")) || observedPort?.value !== observe)
+                throw new Error("Telegram polling first-observation port changed.");
+            if (observe && owner)
+                observeFirstTelegramPollingBatch(updates, requestedAfterUpdateId, observe, () => {
+                    const fields = Object.getOwnPropertyDescriptors(deps), credential = Object.getOwnPropertyDescriptor(owner.config, "botToken");
+                    if (owner.signal.aborted || !credential || !Object.hasOwn(credential, "value") || credential.value !== token ||
+                        Object.entries(owner).some(([key, value]) => fields[key] ? !Object.hasOwn(fields[key], "value") || fields[key].value !== value : value !== undefined))
+                        throw new Error("Telegram polling first-observation owner changed.");
+                });
             reportTelegramPollingResponse(deps, updates.length);
             consecutiveGetUpdatesConflicts = 0;
             currentUpdateId = updates[0]?.update_id;

@@ -572,26 +572,53 @@ export function createTelegramWorkspaceAdmissionRuntimeBinding(input) {
     const { getProfileName, getBotToken, getPath, getStatePath } = input;
     if ((getPath === undefined) === (getStatePath === undefined))
         invalidInput("Telegram admission binding must select one storage identity.");
+    let current;
     return {
         resolve() {
-            const botToken = getBotToken();
-            if (!botToken)
-                return undefined;
-            const configuredProfileName = getProfileName();
-            const profileKey = createTelegramWorkspaceAdmissionProfileKey({
-                profileName: configuredProfileName ?? "default",
-                botToken,
-            });
-            return createTelegramWorkspaceAdmissionLedger({
-                path: getStatePath ? getStatePath() : getPath(configuredProfileName),
-                ...(getStatePath
-                    ? { stateProfile: configuredProfileName ?? "default" }
-                    : {}),
-                profileKey,
-                owner: input.owner,
-                getNowMs: input.getNowMs,
-                getProcessLiveness: input.getProcessLiveness,
-            });
+            try {
+                const botToken = getBotToken();
+                if (!botToken) {
+                    current = undefined;
+                    return undefined;
+                }
+                const configuredProfileName = getProfileName();
+                const profileKey = createTelegramWorkspaceAdmissionProfileKey({
+                    profileName: configuredProfileName ?? "default",
+                    botToken,
+                });
+                const options = {
+                    path: getStatePath ? getStatePath() : getPath(configuredProfileName),
+                    ...(getStatePath
+                        ? { stateProfile: configuredProfileName ?? "default" }
+                        : {}),
+                    profileKey,
+                    owner: input.owner,
+                    getNowMs: input.getNowMs,
+                    getProcessLiveness: input.getProcessLiveness,
+                };
+                // Validate even on reuse; snapshot metadata separately from the ledger's live owner fence.
+                validateOptions(options);
+                const authority = { ...options, owner: { ...options.owner },
+                    getNowMs: options.getNowMs ?? Date.now,
+                    getProcessLiveness: options.getProcessLiveness ?? getTelegramProcessLiveness };
+                if (current && current.botToken === botToken &&
+                    current.authority.path === authority.path &&
+                    current.authority.stateProfile === authority.stateProfile &&
+                    current.authority.profileKey === authority.profileKey &&
+                    areOwnersEqual(current.authority.owner, authority.owner) &&
+                    areOwnersEqual(current.options.owner, current.authority.owner) &&
+                    current.authority.getNowMs === authority.getNowMs &&
+                    current.authority.getProcessLiveness === authority.getProcessLiveness)
+                    return current.ledger;
+                current = undefined;
+                const ledger = createTelegramWorkspaceAdmissionLedger(options);
+                current = { ledger, options, authority, botToken };
+                return ledger;
+            }
+            catch (error) {
+                current = undefined;
+                throw error;
+            }
         },
     };
 }
@@ -674,52 +701,6 @@ export function runWithTelegramWorkspaceAdmissions(input) {
     if (!outcome.ok)
         throw outcome.error;
     return outcome.value;
-}
-export function createTelegramWorkspaceJournalWriterAdmission(input) {
-    let pendingOperationId;
-    let active = false;
-    return (operation) => {
-        if (active)
-            invalidState("Telegram Workspace journal writer admission is already active.");
-        const operationId = pendingOperationId ??
-            input.createOperationId?.() ??
-            `journal-writer:${randomUUID()}`;
-        validateOperationId(operationId);
-        pendingOperationId = operationId;
-        const result = input.protocolAuthority
-            ? input.ledger.acquireJournalWriterAdmission({
-                operationId,
-                ...input.protocolAuthority,
-            })
-            : input.ledger.acquireAdmission({
-                operationId,
-                operationKind: "journal-write",
-                scope: { kind: "profile" },
-            });
-        if (result.kind === "blocked") {
-            throw new TelegramWorkspaceAdmissionError("admission-blocked", "Telegram Workspace journal writer is blocked by destructive closure.");
-        }
-        pendingOperationId = undefined;
-        active = true;
-        try {
-            return operation();
-        }
-        finally {
-            active = false;
-            try {
-                if (!input.ledger.releaseAdmission(result.lease))
-                    authorityChanged("Telegram Workspace journal writer lease disappeared before release.");
-            }
-            catch (error) {
-                try {
-                    input.onReleaseError?.(error);
-                }
-                catch {
-                    /* Diagnostics cannot change the journal outcome. */
-                }
-            }
-        }
-    };
 }
 export async function runWithTelegramWorkspaceAdmissionsAsync(input) {
     const scopes = normalizeTelegramWorkspaceAdmittedScopes(input);

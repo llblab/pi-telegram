@@ -48,6 +48,10 @@ export declare const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT: "sessio
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE: "workspace-restore-v1";
 /** Shared Workspace readers understand independent pre-dispatch input/cleanup state. */
 export declare const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND: "live-rebind-pre-dispatch-reader-v2";
+/** Shared Workspace decoder understands non-creating, unissued cancelled-orphan intents; no execution/deletion grant. */
+export declare const TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER: "workspace-orphan-intent-reader-v1";
+/** Adds the irreversible issued marker and its original-scope/current-executor codec; independent of execution authority. */
+export declare const TELEGRAM_BUS_CAPABILITY_ORPHAN_CLEANUP_READER: "workspace-orphan-intent-reader-v2";
 export declare const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION: "live-rebind-pre-dispatch-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE: "live-thread-rebind-save-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY: "live-thread-rebind-apply-v1";
@@ -199,7 +203,6 @@ export declare function createTelegramBusProtocolIdentity(input: {
 export declare function createTelegramCurrentBusProtocolIdentity(capabilities?: readonly string[]): TelegramBusProtocolIdentity;
 export declare function hasTelegramBusCapability(identity: TelegramBusProtocolIdentity | undefined, capability: string): boolean;
 export declare function hasTelegramBusSteerQueueHandoffCapability(identity: TelegramBusProtocolIdentity | undefined): boolean;
-export declare function getTelegramInputCustodyPeerReadiness(followers: readonly Pick<TelegramBusFollowerView, "registrationGeneration" | "protocol">[]): ("ready" | "legacy" | "unknown")[];
 /** Both peers advertise every required capability over a compatible protocol; reads only the two identities. */
 export declare function hasTelegramBusSharedCapabilities(local: TelegramBusProtocolIdentity, remote: TelegramBusProtocolIdentity | undefined, required: readonly string[]): boolean;
 export declare function getTelegramBusProtocolCompatibility(input: {
@@ -226,6 +229,8 @@ export interface TelegramBusInstanceRegistration {
     connectedAtMs: number;
 }
 export interface TelegramBusFollowerView extends TelegramBusInstanceRegistration {
+    /** Leader-owned identity; never accepted from a registering peer. */
+    registrationIncarnation?: string;
     lastHeartbeatMs: number;
 }
 /** Whether a live follower is still exactly the captured registration: identity, process, session, endpoint and negotiated protocol. */
@@ -533,6 +538,10 @@ export type TelegramBusEnvelope = ({
     requestId: string;
     instanceId: string;
     registrationGeneration?: string;
+    /** Ordinary API binding identity from the original acknowledged registry row. */
+    apiRegistrationIncarnation?: string;
+    /** Private Attachment publication; fences the acknowledged recipient before HTTP. */
+    attachmentRegistrationIncarnation?: string;
     method: string;
     args: unknown[];
     sentAtMs: number;
@@ -617,6 +626,10 @@ interface TelegramBusLocalServerDeps {
     beforeEndpointPublication?: () => Promise<void> | void;
     commitEndpointPublication?: (commit: () => void) => boolean;
     requestLedgerMaxEntries?: number;
+    /** Artifact-only gate, called before every lookup and again before releasing an ACK. */
+    captureArtifactAuthority?: (envelope: Extract<TelegramBusEnvelope, {
+        kind: "follower.callApi";
+    }>) => (() => boolean) | undefined;
     shouldDropResponse?: (request: TelegramBusEnvelope, response: TelegramBusEnvelope) => boolean;
 }
 /** Local IPC issuance proof only: this callback/error never enters the envelope or certifies a remote API effect. */
@@ -624,8 +637,14 @@ export declare class TelegramBusLocalAuthorityError extends Error {
     readonly requestIssued: boolean;
     constructor(requestIssued: boolean, reason?: string);
 }
+/** Origin-local proof only; never serialized as a remote execution grant. */
+export declare class TelegramBusArtifactIpcError extends Error {
+    readonly requestIssued: boolean;
+    constructor(requestIssued: boolean, cause: unknown);
+}
 interface TelegramBusLocalClientOptions {
     assertAuthority?: () => void;
+    onRequestIssued?: () => void;
     socketPath: string;
     envelope: TelegramBusEnvelope;
     timeoutMs?: number;
@@ -751,8 +770,46 @@ export declare function rejectTelegramBusRequest(requestId: string, message: str
 export declare function createUnauthorizedBusAck(requestId: string): TelegramBusEnvelope;
 export declare function createTelegramBusLocalServer(deps: TelegramBusLocalServerDeps): TelegramBusLocalServer;
 export declare function sendTelegramBusLocalEnvelope(options: TelegramBusLocalClientOptions): Promise<TelegramBusEnvelope | undefined>;
+/** Ordinary guarded call authority only; neither question membership nor Input receiver readiness. */
+export declare const TELEGRAM_BUS_CAPABILITY_GUARDED_API_AUTHORITY: "guarded-api-authority-v1";
+/** Existing registry incarnation, acknowledged independently of Artifact and matched by guarded API calls. */
+export declare const TELEGRAM_BUS_CAPABILITY_API_REGISTRATION_AUTHORITY: "api-registration-authority-v1";
+/** Private publication contract only; never add to production advertisement before input privacy readiness. */
+export declare const TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION: "attachment-original-publication-v1";
+export declare const TELEGRAM_BUS_ATTACHMENT_PUBLICATION_RECEIPT: "__piTelegramAttachmentPublication";
+export interface TelegramBusAttachmentPublicationReceipt {
+    readonly version: 1;
+    readonly requestId: string;
+    readonly nonce: string;
+    readonly instanceId: string;
+    readonly registrationGeneration: string;
+    readonly registrationIncarnation: string;
+    readonly botId: number;
+    readonly messageId: number;
+    readonly target: Readonly<TelegramTarget>;
+}
+/** Private decoded-data evidence, not a receiver, source submission or business grant. */
+export declare function parseTelegramBusAttachmentPublicationReceipt(raw: unknown): Readonly<TelegramBusAttachmentPublicationReceipt> | undefined;
+export declare const TELEGRAM_BUS_CAPABILITY_ARTIFACT_DOCUMENT: "artifact-document-v1";
+export interface TelegramBusArtifactDocument {
+    version: 1;
+    registrationIncarnation: string;
+    target: TelegramTarget;
+    fileName: string;
+    byteLength: number;
+    bytesBase64: string;
+    caption?: string;
+    expiresAt: number;
+}
+/** Strict bounded wire validation does not decode bytes or grant source/business authority. */
+export declare function parseTelegramBusArtifactDocument(args: unknown[]): TelegramBusArtifactDocument | undefined;
 export interface TelegramBusFollowerRegistry {
     register: (registration: TelegramBusInstanceRegistration) => TelegramBusFollowerView;
+    /** Native registry lifetime only; not Artifact, publication or source custody authority. */
+    captureRegistration?: (instanceId: string, generation: string) => (() => boolean) | undefined;
+    captureArtifactRegistration?: (instanceId: string, incarnation: string) => (() => boolean) | undefined;
+    /** Native whole-roster codec compatibility; membership churn spends the capture, heartbeat alone does not. Not a write grant. */
+    captureOrphanIntentReaderCompatibility?: (local: TelegramBusProtocolIdentity, mode?: "intent" | "cleanup") => (() => boolean) | undefined;
     heartbeat: (instanceId: string, nowMs: number) => TelegramBusFollowerView | undefined;
     get: (instanceId: string) => TelegramBusFollowerView | undefined;
     getByTarget: (target: TelegramTarget) => TelegramBusFollowerView | undefined;

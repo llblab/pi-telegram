@@ -1,6 +1,24 @@
 # Direct Delivery And Threads
 
-Read this reference only for explicit local/TUI Telegram delivery, cross-target delivery, or Thread routing.
+Read this reference for explicit delivery, Thread routing, or structured selection markup.
+
+## Selection Markup
+
+Use `telegram_confirm` or `telegram_choice` as a strict JSON Markdown fence or HTML-comment marker, not an agent tool. Confirm accepts a JSON question string or an object with `question`; optional `confirmLabel,cancelLabel,confirmStyle,id,timeoutMs`. Choice requires `question,choices`; prefer an array of plain string labels, JSON cells/rows, or a JSON string containing CML, such as `[[{JSON|json}{CSV|csv}]]`. Cells use `label,value,style,disabled`; style is post-click feedback only.
+
+Final output renders bold question text and neutral footer controls. A completed single-question click sends bare JSON containing only question and the visible answer label. Do not add IDs, type/version/status or selection-tag wrappers to model context. A scalar Confirm/Choice closes all alternative branches after the first selection; separate questions and ordinary prompt peers stay independent. It does not resume a tool or execute a cell value. Wizard/multiselect must accumulate through supported runtime collection; never imitate them by generating independent intermediate model prompts. Never wait on or inspect SDK handles for agent choices. SDK APIs for companion extensions remain a separate contract.
+
+### Choose The Smallest Interaction
+
+- Use ordinary `telegram_button` controls for independent follow-up requests/actions.
+- Use a single Choice for one answer: `{"question":"Format?","choices":["PDF","HTML"]}`.
+- Use `select:N` for exactly N options: `{"question":"Pick two sections","choices":["Charts","Tables","Notes"],"select":2}`. Taps toggle locally, show checkmarks/count, and create no model turns. The Nth selection completes automatically; the final answer is an array of visible labels in declared order. Cancel returns the cancel label, not a partial selection. There is no Submit/review phase.
+- Use a Choice question array for a fixed wizard only when no intermediate answer needs model reasoning. For example: `[{"question":"Format?","choices":["PDF","HTML"]},{"question":"Pick two sections","choices":["Charts","Tables","Notes"],"select":2}]`. Runtime shows one question at a time, advances locally, and sends one final ordered array of question/answer pairs. An array of one question still returns an array. Do not imitate a wizard with independent buttons or new tools.
+- Keep each final view within 60 active callbacks, counting cancel controls and the widest future wizard step; disabled cells cost no callback slot. Ordinary prompt/app-bound buttons share this budget, while system menus have a separate 60-message budget. Capacity may retire old groups, so never treat a stale keyboard as a waiting execution grant.
+- Keep the wizard and surrounding content short enough for one message. Its earliest declared timeout bounds the whole sequence and never renews; the default is one hour. Cancel ends it with completed answers plus the current question/cancel label; unseen questions and uncompleted option sets are omitted. Expiry/lost authority does not generate an unsolicited model result.
+- Keep use-case policy in this Skill, not a growing runtime business API. If the next question needs reasoning, return to the model instead of predeclaring a wizard.
+
+As with `telegram_button`, HTML comments are active even inside code; escape `<!--` as `&lt;!--` for a literal example. Enclosing Markdown fences keep inner fences literal. Text/file request markup, task controllers and artifact-sending blocks are not implemented; keep ordinary file delivery on `telegram_attach`.
 
 ## Direct Delivery
 

@@ -1,7 +1,7 @@
 /**
  * Telegram inbound routing composition
  * Zones: telegram inbound, orchestration, queue/menu/command composition
- * Wires authorized updates into menus, commands, media grouping, and prompt queueing, and owns exact assistant-output target/route authority capture
+ * Wires authorized updates into known private SDK collection, menus, commands, media grouping, and prompt queueing; owns exact assistant-output target/route authority capture
  */
 import { createHash, randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -9,6 +9,8 @@ import { basename, dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import * as Bus from "./bus.js";
 import * as Commands from "./commands.js";
+import { resolveTelegramBotToken } from "./config.js";
+import * as Delivery from "./delivery.js";
 import * as Media from "./media.js";
 import * as Menu from "./menu.js";
 import * as OutboundHandlers from "./outbound.js";
@@ -1024,6 +1026,116 @@ export function createTelegramInboundBusProjectionRuntime(deps) {
         },
     };
 }
+/** Reject-only privacy fence. Attachment input cannot certify disposition through the Text/ordinary lanes. */
+export function createTelegramAttachmentReplyPrivacyGuard(ports) {
+    const { getBotId } = ports;
+    let live = true;
+    const assertBinding = () => {
+        if (!live || ports.getBotId !== getBotId) {
+            live = false;
+            throw new Error("Private Attachment reply authority is unavailable.");
+        }
+    };
+    return message => {
+        const assertSource = Updates.createTelegramUpdateExecutionFenceGuard(message);
+        assertSource();
+        assertBinding();
+        const source = Delivery.readTelegramAttachmentReplySource(message, getBotId());
+        assertSource();
+        assertBinding();
+        if (source)
+            throw new Error("Private Attachment input disposition is unavailable.");
+    };
+}
+export function createTelegramPrivateTextReplyClassifier(ports, getCurrentInstanceId) {
+    const { getBotId, getOriginalOwnership, captureOriginalOwnership } = ports;
+    return (message, assertSource) => {
+        assertSource();
+        if (!message || typeof message !== "object")
+            return { kind: "not-private" };
+        const input = message;
+        const replyId = input.reply_to_message?.message_id;
+        if (!Number.isSafeInteger(replyId) || replyId <= 0)
+            return {
+                kind: Delivery.readTelegramTextInputReplySource(message, getBotId()) ? "unavailable" : "not-private",
+            };
+        const botId = getBotId(), source = Delivery.readTelegramTextInputReplySource(message, botId);
+        const original = getOriginalOwnership(input.chat?.id, replyId);
+        if (!source && !original)
+            return { kind: "not-private" };
+        assertSource();
+        if (!source || source.kind === "unavailable" || !original || input.chat?.type !== "private" ||
+            source.target.chatId !== input.chat?.id || source.target.threadId !== input.message_thread_id ||
+            original.record.target.chatId !== source.target.chatId || original.record.target.threadId !== source.target.threadId)
+            return { kind: "unavailable" };
+        const captured = captureOriginalOwnership(input.chat.id, replyId);
+        if (!captured)
+            return { kind: "unavailable" };
+        // Capture callable and original identities before the next observation; never read a replaced fence later.
+        const { assertCurrent: assertOriginal } = captured;
+        const ownership = structuredClone(captured.ownership), recipient = captured.recipient && structuredClone(captured.recipient);
+        const localInstanceId = getCurrentInstanceId(), local = ownership.instanceId === localInstanceId;
+        let live = true, checking = false;
+        const unavailable = () => new Error("Private Delivery reply authority is unavailable.");
+        const assertCurrent = () => {
+            if (!live || checking) {
+                live = false;
+                throw unavailable();
+            }
+            checking = true;
+            try {
+                assertSource();
+                if (getBotId() !== botId || getCurrentInstanceId() !== localInstanceId)
+                    throw unavailable();
+                assertOriginal();
+                assertSource();
+                if (!live || getBotId() !== botId || getCurrentInstanceId() !== localInstanceId)
+                    throw unavailable();
+                // A captured observation may catch a nested refusal; it still ends this guard.
+                if (!live)
+                    throw unavailable();
+            }
+            catch (error) {
+                live = false;
+                throw error;
+            }
+            finally {
+                checking = false;
+            }
+        };
+        if (local)
+            return { kind: "local", requestNonce: source.requestId, assertCurrent };
+        if (!localInstanceId || !recipient || !ownership.recipientBindingKey || !recipient.registrationGeneration ||
+            recipient.sessionGeneration === undefined || !recipient.processBirthId ||
+            !recipient.protocol || !recipient.sessionId || !recipient.pid || !recipient.cwd || !recipient.busSocketPath ||
+            recipient.instanceId !== ownership.instanceId || recipient.profileKey !== ownership.recipientBindingKey)
+            return { kind: "foreign-unavailable" };
+        return { kind: "foreign", botId: botId, assertCurrent, destination: {
+                sourceTarget: { ...source.target }, sourceMessageId: input.message_id,
+                publicationTarget: { ...source.target }, publicationMessageId: source.messageId, requestNonce: source.requestId,
+                receiver: { instanceId: recipient.instanceId, profileKey: recipient.profileKey, bindingKey: ownership.recipientBindingKey,
+                    registrationGeneration: recipient.registrationGeneration, sessionId: recipient.sessionId, sessionGeneration: recipient.sessionGeneration,
+                    pid: recipient.pid, processBirthId: recipient.processBirthId, cwd: recipient.cwd, endpoint: recipient.busSocketPath,
+                    ...(recipient.slot ? { slot: recipient.slot } : {}), ...(recipient.target ? { target: { ...recipient.target } } : {}),
+                    protocol: { ...recipient.protocol, capabilities: [...recipient.protocol.capabilities] } },
+            } };
+    };
+}
+export function createTelegramLocalTextInputReplyHandler(ports, getCurrentInstanceId) {
+    const classify = createTelegramPrivateTextReplyClassifier(ports, getCurrentInstanceId);
+    return (message, edited) => {
+        const result = classify(message, Updates.createTelegramUpdateExecutionFenceGuard(message));
+        if (result.kind === "not-private")
+            return false;
+        if (result.kind === "foreign" || result.kind === "foreign-unavailable")
+            throw new Error("Private foreign input disposition is unavailable.");
+        if (result.kind === "local") {
+            result.assertCurrent();
+            Delivery.acceptTelegramTextInputReply(message, result.requestNonce, result.assertCurrent, edited);
+        }
+        return true;
+    };
+}
 const TELEGRAM_OWNED_CALLBACK_PREFIXES = [
     "allmenu:",
     TELEGRAM_UNBOUND_REROUTE_CALLBACK_PREFIX,
@@ -1042,6 +1154,69 @@ const TELEGRAM_OWNED_CALLBACK_PREFIXES = [
 function isTelegramOwnedCallbackData(data) {
     return TELEGRAM_OWNED_CALLBACK_PREFIXES.some((prefix) => data.startsWith(prefix));
 }
+const TELEGRAM_ORDINARY_SELECTION_LIMIT = 1024;
+function ordinaryInputRecord(value, keys) {
+    if (!value || typeof value !== "object" || ![Object.prototype, null].includes(Object.getPrototypeOf(value)))
+        return false;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    return Reflect.ownKeys(descriptors).every(key => typeof key === "string" && keys.includes(key) &&
+        "value" in descriptors[key]);
+}
+/** Positive syntax region only; receiver/source/session authority is checked by the runtime. */
+function readOrdinaryInputEnvelope(value, purpose, coreCommandFrame, companionCommands) {
+    const positive = (n) => typeof n === "number" && Number.isSafeInteger(n) && n > 0;
+    const nonnegative = (n) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+    const strings = (record, keys) => keys.every(key => record[key] === undefined || typeof record[key] === "string");
+    if (!ordinaryInputRecord(value, ["update_id", "message"]) || !nonnegative(value.update_id))
+        return undefined;
+    const message = value.message;
+    if (!ordinaryInputRecord(message, ["message_id", "chat", "from", "text", "date", "message_thread_id", "is_topic_message", "entities"]) ||
+        !positive(message.message_id) || typeof message.text !== "string" ||
+        (purpose === "continue" ? message.text !== "/continue" :
+            !message.text.trim() || purpose === "text-prompt" && message.text.trimStart().startsWith("/") ||
+                message.entities !== undefined && (purpose !== "text-frame" || !message.text.startsWith("/"))) ||
+        (message.date !== undefined && !nonnegative(message.date)) ||
+        (message.message_thread_id !== undefined && !positive(message.message_thread_id)) ||
+        (message.is_topic_message !== undefined && typeof message.is_topic_message !== "boolean"))
+        return undefined;
+    const chat = message.chat, sender = message.from;
+    if (!ordinaryInputRecord(chat, ["id", "type", "first_name", "last_name", "username"]) || !positive(chat.id) ||
+        chat.type !== "private" || !strings(chat, ["first_name", "last_name", "username"]) ||
+        !ordinaryInputRecord(sender, ["id", "is_bot", "first_name", "last_name", "username", "language_code", "is_premium"]) ||
+        !positive(sender.id) || sender.is_bot !== false ||
+        !strings(sender, ["first_name", "last_name", "username", "language_code"]) ||
+        (sender.is_premium !== undefined && typeof sender.is_premium !== "boolean"))
+        return undefined;
+    if (message.entities !== undefined) {
+        if (!Array.isArray(message.entities) || message.entities.length !== 1 ||
+            Reflect.ownKeys(message.entities).some(key => key !== "0" && key !== "length"))
+            return undefined;
+        const entity = Object.getOwnPropertyDescriptor(message.entities, "0");
+        if (!entity || !("value" in entity) || !ordinaryInputRecord(entity.value, ["type", "offset", "length"]) ||
+            entity.value.type !== "bot_command" || entity.value.offset !== 0 ||
+            entity.value.length !== (purpose === "text-frame" ? message.text.split(/\s/u, 1)[0].length : 9))
+            return undefined;
+    }
+    const plainText = !message.text.trimStart().startsWith("/");
+    if (purpose === "text-frame" && coreCommandFrame && !plainText) {
+        const name = Commands.parseTelegramCommand(message.text)?.name;
+        if (!Commands.isTelegramReservedCommandName(name)) {
+            const command = name && companionCommands && captureNativeCompanionExclusion(name);
+            if (!command)
+                return undefined;
+            companionCommands.push(command);
+        }
+    }
+    if (purpose === "continue") {
+        const command = Commands.parseTelegramCommand(message.text);
+        if (command?.name !== "continue" || command.args !== "" ||
+            !Commands.getTelegramReservedCommandNames().includes("continue"))
+            return undefined;
+    }
+    return { updateId: value.update_id, messageId: message.message_id, operator: sender.id, chatId: chat.id,
+        threadId: message.message_thread_id, topic: message.is_topic_message, plainText };
+}
+const captureNativeCompanionExclusion = Commands.captureTelegramExtensionCommandExclusion;
 export function createTelegramInboundRouteRuntime(deps) {
     /** The command a chooser routes, read from its own source exactly as the root heading named it. */
     const getPendingRerouteCommandName = (pending) => pending.dispatchKind === "command"
@@ -1402,6 +1577,7 @@ export function createTelegramInboundRouteRuntime(deps) {
                         const result = await deps.callApi(method, body, {
                             maxAttempts: 1,
                             retrySafety: "non-idempotent",
+                            assertAuthority: assertExecutionCurrent,
                         });
                         assertExecutionCurrent?.();
                         if (result !== true)
@@ -1487,6 +1663,7 @@ export function createTelegramInboundRouteRuntime(deps) {
             operatorUserId,
             journalBindingKey,
             epoch,
+            generation,
             authority,
             isCurrent,
             adopt: (entry) => isDeepStrictEqual(entry.executor, authority.executor)
@@ -1992,11 +2169,13 @@ export function createTelegramInboundRouteRuntime(deps) {
                 Bus.hasTelegramBusCapability(live.protocol, Bus.TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE) &&
                 isDeepStrictEqual({
                     ...live,
+                    registrationIncarnation: undefined,
                     lastHeartbeatMs: undefined,
                     connectedAtMs: undefined,
                     threadName: undefined,
                 }, {
                     ...follower,
+                    registrationIncarnation: undefined,
                     lastHeartbeatMs: undefined,
                     connectedAtMs: undefined,
                     threadName: undefined,
@@ -4186,9 +4365,7 @@ export function createTelegramInboundRouteRuntime(deps) {
         for (const wake of [...liveRebindCleanupWakers.values()])
             wake(reason);
     };
-    const onSessionSettled = (ctx) => wakeLiveRebindCleanup(ctx, "session-settled");
-    const onDeliverySettled = (ctx) => {
-        wakeLiveRebindCleanup(ctx, "delivery-drained");
+    const wakeTemporaryThreadCleanup = (ctx) => {
         const cap = captureTemporaryThreadAuthority(ctx);
         if (!cap?.isCurrent())
             return;
@@ -4196,7 +4373,7 @@ export function createTelegramInboundRouteRuntime(deps) {
             for (const entry of cap.store.listTemporaryThreads()) {
                 if (!cap.isCurrent())
                     return;
-                if (entry.phase === "created" && entry.target && !entry.cleanupIssued &&
+                if ((entry.phase === "created" || entry.phase === "orphan-cancelled") && entry.target && !entry.cleanupIssued &&
                     Threads.isTelegramTemporaryThreadFullyResolved(entry))
                     scheduleTemporaryThreadCleanup(entry.target, ctx);
             }
@@ -4205,6 +4382,8 @@ export function createTelegramInboundRouteRuntime(deps) {
             deps.recordRuntimeEvent?.("routing", error, { phase: "temporary-thread-cleanup-drain" });
         }
     };
+    const onSessionSettled = (ctx) => { wakeLiveRebindCleanup(ctx, "session-settled"); wakeTemporaryThreadCleanup(ctx); };
+    const onDeliverySettled = (ctx) => { wakeLiveRebindCleanup(ctx, "delivery-drained"); wakeTemporaryThreadCleanup(ctx); };
     const restoreWorkspace = deps.workspaceRestoreRecipient
         ? async (input) => {
             const ports = deps.workspaceRestoreRecipient;
@@ -4919,8 +5098,58 @@ export function createTelegramInboundRouteRuntime(deps) {
      * absence of chooser and journal custody, and the ordinary protection checks must all hold again. The attempt is
      * durably issued once; a skipped or unknown removal keeps the entry protecting the tab across restart.
      */
+    const runCancelledOrphanCleanup = async (initial, cap, captureReaders, readers) => {
+        const store = cap.store, target = initial.target, origin = initial.orphanCancellation, generation = cap.generation, inspect = deps.inspectRestoreSourceAbandonment, leader = deps.hasWorkspaceRestoreAuthority, getStore = deps.getWorkspaceRestoreStore, sources = deps.inspectTemporaryThreadSources, callApi = deps.callApi, issue = store.issueCancelledOrphanThreadCleanup, retire = store.retireCancelledOrphanThread, cleanupCurrent = store.isTemporaryThreadCleanupCurrent;
+        if (initial.phase !== "orphan-cancelled" || !target || !origin || generation === undefined || initial.cleanupIssued || !inspect || !leader || !getStore || !sources || !callApi || !readers ||
+            generation !== origin.sessionGeneration || cap.authority.executor.instanceId !== origin.executor.instanceId)
+            return;
+        let entry = initial, lost = false;
+        const base = () => cap.isCurrent() && deps.captureOrphanCleanupReaderCompatibility === captureReaders && readers() &&
+            deps.hasWorkspaceRestoreAuthority === leader && leader() && deps.getWorkspaceRestoreStore === getStore && getStore() === store &&
+            deps.inspectRestoreSourceAbandonment === inspect && deps.inspectTemporaryThreadSources === sources && deps.callApi === callApi &&
+            store.issueCancelledOrphanThreadCleanup === issue && store.retireCancelledOrphanThread === retire &&
+            store.isTemporaryThreadCleanupCurrent === cleanupCurrent && cap.isCurrent() && readers();
+        const originalsCurrent = () => origin.originals.every(original => {
+            const evidence = inspect(original.updateId, initial.source.journalBindingKey), native = evidence?.originalTarget;
+            return evidence?.journalBindingKey === initial.source.journalBindingKey && evidence.updateId === original.updateId &&
+                evidence.operatorAuthorityId === `telegram-owner:${cap.operatorUserId}` && evidence.retainedPath === original.retainedPath &&
+                native?.chatId === target.chatId && native.threadId === target.threadId && native.messageId === original.messageId && native.sourceSha256 === original.sourceSha256;
+        });
+        const current = () => {
+            if (!lost)
+                lost = !(base() && originalsCurrent() && !hasPendingRerouteForTarget(target) &&
+                    !isRerouteTargetProtected(target, undefined, entry) && base());
+            return !lost;
+        };
+        const authority = { ...cap.authority, sessionGeneration: generation, isCurrent: current };
+        if (!current())
+            return;
+        const issued = issue.call(store, initial, authority, id => {
+            const evidence = inspect(id, initial.source.journalBindingKey);
+            return evidence?.retainedPath && evidence.originalTarget ? { ...evidence, retainedPath: evidence.retainedPath } : undefined;
+        });
+        if (!issued)
+            return;
+        entry = issued.entry;
+        const assertCurrent = () => {
+            if (!current() || !cleanupCurrent.call(store, entry, authority))
+                throw new Error("Cancelled orphan cleanup authority or exact issued grant changed.");
+        };
+        assertCurrent();
+        if (await closeReroutedUnboundTopic(target, undefined, assertCurrent, entry)) {
+            assertCurrent();
+            retire.call(store, entry, { kind: "confirmed", target }, authority);
+        }
+    };
     const runTemporaryThreadCleanup = async (token, cap, reconcileExpiry) => {
-        const store = cap.store;
+        const store = cap.store, captureReaders = deps.captureOrphanCleanupReaderCompatibility;
+        let readers;
+        try {
+            readers = captureReaders?.();
+        }
+        catch (error) {
+            deps.recordRuntimeEvent?.("routing", error, { phase: "orphan-cleanup-reader-capture" });
+        }
         if ((!deps.inspectRestoreSourceAbandonment &&
             !deps.inspectRoutingInputGroupExpiry) ||
             !deps.runWorkspaceOperation ||
@@ -4937,7 +5166,7 @@ export function createTelegramInboundRouteRuntime(deps) {
             let entry = store
                 .listTemporaryThreads()
                 .find((value) => value.token === token &&
-                value.phase === "created" &&
+                (value.phase === "created" || value.phase === "orphan-cancelled") &&
                 !!value.target);
             const target = entry?.target;
             if (!entry ||
@@ -4946,6 +5175,10 @@ export function createTelegramInboundRouteRuntime(deps) {
                 entry.operatorUserId !== cap.operatorUserId ||
                 entry.source.journalBindingKey !== cap.journalBindingKey)
                 return;
+            if (entry.phase === "orphan-cancelled") {
+                await runCancelledOrphanCleanup(entry, cap, captureReaders, readers);
+                return;
+            }
             const owner = `telegram-owner:${cap.operatorUserId}`;
             if (reconcileExpiry && deps.inspectRoutingInputGroupExpiry) {
                 for (const group of Threads.getTelegramTemporaryThreadInputs(entry)) {
@@ -5052,19 +5285,25 @@ export function createTelegramInboundRouteRuntime(deps) {
                     Threads.isTelegramTemporaryThreadFullyResolved(retained) &&
                     cap.store.inspectTemporaryThreadTarget(retained, cap.authority)?.kind === "temporary" && cap.isCurrent())
                     queueTemporaryThreadCleanup(token, cap, 1000, reconcileExpiry, true);
+                else if (retained?.phase === "orphan-cancelled" && !retained.cleanupIssued && retained.orphanCancellation &&
+                    retained.orphanCancellation.sessionGeneration === cap.generation &&
+                    retained.orphanCancellation.executor.instanceId === cap.authority.executor.instanceId &&
+                    deps.hasWorkspaceRestoreAuthority?.() === true && deps.captureOrphanCleanupReaderCompatibility?.()?.() === true &&
+                    cap.store.inspectTemporaryThreadTarget(retained, cap.authority)?.kind === "unbound" && cap.isCurrent())
+                    queueTemporaryThreadCleanup(token, cap, 1000, false, true);
             })
                 .catch((error) => {
                 deps.recordRuntimeEvent?.("routing", error, {
                     phase: "temporary-thread-cleanup",
                 });
-                if (!reconcileExpiry || !cap.isCurrent())
+                if (!cap.isCurrent())
                     return;
                 try {
                     const retained = cap.store
                         .listTemporaryThreads()
                         .find((value) => value.token === token);
-                    if (retained && !retained.cleanupIssued && cap.isCurrent())
-                        queueTemporaryThreadCleanup(token, cap, 60_000, true, true);
+                    if (retained && !retained.cleanupIssued && (reconcileExpiry || retained.phase === "orphan-cancelled") && cap.isCurrent())
+                        queueTemporaryThreadCleanup(token, cap, 60_000, reconcileExpiry, true);
                 }
                 catch {
                     /* Unknown grant state never licenses a retry. */
@@ -5090,7 +5329,7 @@ export function createTelegramInboundRouteRuntime(deps) {
         try {
             entry = cap.store
                 .listTemporaryThreads()
-                .find((value) => value.phase === "created" &&
+                .find((value) => (value.phase === "created" || value.phase === "orphan-cancelled") &&
                 isDeepStrictEqual(value.target, target));
         }
         catch (error) {
@@ -5103,6 +5342,9 @@ export function createTelegramInboundRouteRuntime(deps) {
             entry.cleanupIssued ||
             entry.operatorUserId !== cap.operatorUserId ||
             entry.source.journalBindingKey !== cap.journalBindingKey)
+            return;
+        if (entry.phase === "orphan-cancelled" && (!entry.orphanCancellation || entry.orphanCancellation.sessionGeneration !== cap.generation ||
+            entry.orphanCancellation.executor.instanceId !== cap.authority.executor.instanceId))
             return;
         if (!reconcileExpiry &&
             !Threads.isTelegramTemporaryThreadFullyResolved(entry)) {
@@ -5433,6 +5675,17 @@ export function createTelegramInboundRouteRuntime(deps) {
             throw new Error("Temporary Thread source authority changed.");
         return held;
     };
+    /** Captures leader epoch and admission journal binding now; the guard fails once either, the context or the signal changes. */
+    const captureHistoricalRoutingGuard = (ctx, signal) => {
+        const epoch = deps.getCurrentLeaderEpoch?.();
+        const binding = deps.getAdmissionJournalBinding?.();
+        return () => !signal.aborted &&
+            deps.isContextActive?.(ctx) === true &&
+            epoch !== undefined &&
+            deps.getCurrentLeaderEpoch?.() === epoch &&
+            !!binding &&
+            deps.getAdmissionJournalBinding?.() === binding;
+    };
     /**
      * A restarted owner revives a chooser only when its saved clock proves nothing was selected, its tab is still
      * unbound and live threads exist to choose from; anything else keeps the protective startup hold.
@@ -5450,13 +5703,7 @@ export function createTelegramInboundRouteRuntime(deps) {
             message.from.is_bot !== false ||
             Object.keys(entry.update).some((key) => key !== "update_id" && key !== "message"))
             return false;
-        const epoch = deps.getCurrentLeaderEpoch?.(), binding = deps.getAdmissionJournalBinding?.();
-        const current = () => !signal.aborted &&
-            deps.isContextActive?.(ctx) === true &&
-            epoch !== undefined &&
-            deps.getCurrentLeaderEpoch?.() === epoch &&
-            !!binding &&
-            deps.getAdmissionJournalBinding?.() === binding;
+        const current = captureHistoricalRoutingGuard(ctx, signal);
         if (!current())
             return false;
         await deps.threadStore.load();
@@ -5505,14 +5752,7 @@ export function createTelegramInboundRouteRuntime(deps) {
             return false;
         if (signal.aborted)
             throw new Error("Historical routing generation ended.");
-        const epoch = deps.getCurrentLeaderEpoch?.();
-        const binding = deps.getAdmissionJournalBinding?.();
-        const current = () => !signal.aborted &&
-            deps.isContextActive?.(ctx) === true &&
-            epoch !== undefined &&
-            deps.getCurrentLeaderEpoch?.() === epoch &&
-            !!binding &&
-            deps.getAdmissionJournalBinding?.() === binding;
+        const current = captureHistoricalRoutingGuard(ctx, signal);
         if (!current() || !deps.threadStore)
             throw new Error("Historical routing authority is unavailable.");
         await deps.threadStore.load();
@@ -5881,6 +6121,50 @@ export function createTelegramInboundRouteRuntime(deps) {
      * Workspace/Restore record or retained journal arrival still names the tab, it is deleted like a routing tab. Any
      * missing proof or failure keeps the tab; this never retries and never blocks the Cancel outcome.
      */
+    const retainCancelledOrphanIntent = (pending, ctx, isCancelCurrent, readers) => {
+        const { chatId, threadId } = pending.sourceTarget;
+        if (!readers || threadId === undefined || pending.temporaryThread || isTemporaryTabTarget(pending.sourceTarget) ||
+            hasPendingRerouteForTarget(pending.sourceTarget) || !pending.abandonment || !isPendingRerouteCancelled(pending))
+            return;
+        try {
+            const leader = deps.hasWorkspaceRestoreAuthority, inspect = deps.inspectRestoreSourceAbandonment, sources = deps.inspectTemporaryThreadSources, getStore = deps.getWorkspaceRestoreStore;
+            if (!leader || !inspect || !sources || !getStore)
+                return;
+            const extra = () => isCancelCurrent() && readers() && deps.hasWorkspaceRestoreAuthority === leader && leader() &&
+                deps.inspectRestoreSourceAbandonment === inspect && deps.inspectTemporaryThreadSources === sources && deps.getWorkspaceRestoreStore === getStore &&
+                isCancelCurrent() && readers();
+            if (!extra())
+                return;
+            const cap = captureTemporaryThreadAuthority(ctx, extra);
+            if (!cap || cap.generation === undefined || !Number.isSafeInteger(cap.generation) || cap.generation < 0 || !cap.isCurrent() ||
+                cap.journalBindingKey !== pending.abandonment.journalBindingKey)
+                return;
+            const input = { journalBindingKey: cap.journalBindingKey, updateIds: Updates.collectTelegramAdmissionSourceUpdateIds(pending.messages) };
+            const list = cap.store.listTemporaryThreads;
+            const retained = list.call(cap.store).filter(value => value.target?.chatId === chatId && value.target.threadId === threadId);
+            const prior = retained.length === 1 ? retained[0] : undefined;
+            const superseded = prior?.phase === "orphan-cancelled" && !prior.cleanupIssued &&
+                prior.operatorUserId === cap.operatorUserId && prior.executor.instanceId === cap.authority.executor.instanceId &&
+                prior.orphanCancellation && prior.orphanCancellation.sessionGeneration < cap.generation ? prior : undefined;
+            // A clear Cancel keeps its immediate path unless an ended-generation frame still vetoes that target.
+            if (sources({ chatId, threadId }, [input.journalBindingKey], [input])?.length === 0 && !superseded || !cap.isCurrent())
+                return;
+            const register = cap.store.registerCancelledOrphanThread;
+            if (typeof register !== "function")
+                return;
+            register.call(cap.store, input, { chatId, threadId }, randomBytes(16).toString("hex"), {
+                ...cap.authority, sessionGeneration: cap.generation,
+                isCurrent: () => cap.isCurrent() && getStore() === cap.store && cap.store.registerCancelledOrphanThread === register &&
+                    cap.store.listTemporaryThreads === list && cap.isCurrent(),
+            }, (id, key = input.journalBindingKey) => {
+                const evidence = inspect(id, key);
+                return evidence?.retainedPath && evidence.originalTarget ? { ...evidence, retainedPath: evidence.retainedPath } : undefined;
+            }, superseded);
+        }
+        catch (error) {
+            deps.recordRuntimeEvent?.("routing", error, { phase: "orphan-cancel-intent-registration", chatId, threadId });
+        }
+    };
     const deleteCancelledOrphanTab = async (pending, cancellation, isAuthorityCurrent) => {
         const { chatId, threadId } = pending.sourceTarget;
         if (threadId === undefined ||
@@ -5923,6 +6207,17 @@ export function createTelegramInboundRouteRuntime(deps) {
         const cancellation = pending?.abandonment;
         const sources = pending?.messages ?? [];
         const execution = Updates.getTelegramUpdateExecutionFence(query);
+        const captureReaders = deps.captureOrphanIntentReaderCompatibility;
+        let readerScope;
+        if (pending && cancellation && execution) {
+            try {
+                readerScope = captureReaders?.();
+            }
+            catch (error) {
+                deps.recordRuntimeEvent?.("routing", error, { phase: "orphan-cancel-reader-capture" });
+            }
+        }
+        const readers = readerScope ? () => deps.captureOrphanIntentReaderCompatibility === captureReaders && readerScope() : undefined;
         const isAuthorityCurrent = () => !!cancellation &&
             execution?.isCurrent() === true &&
             sources.length > 0 &&
@@ -5985,6 +6280,7 @@ export function createTelegramInboundRouteRuntime(deps) {
                 }
                 if ((await retireCancellationChooser(rerouteId, pending, isCurrent)) &&
                     isAuthorityCurrent()) {
+                    retainCancelledOrphanIntent(pending, ctx, isAuthorityCurrent, readers);
                     scheduleTemporaryThreadCleanup(pending.sourceTarget, ctx);
                     closed = true;
                 }
@@ -6712,6 +7008,61 @@ export function createTelegramInboundRouteRuntime(deps) {
     const callbackHandler = async (query, ctx) => {
         const assertExecutionCurrent = Updates.createTelegramUpdateExecutionFenceGuard(query);
         assertExecutionCurrent();
+        const task = deps.confirmations?.acceptTaskCancel
+            ? deps.confirmations.acceptTaskCancel(query, assertExecutionCurrent)
+            : Delivery.acceptTelegramTaskViewCallback(query, assertExecutionCurrent);
+        if (task.handled) {
+            const assertTaskCurrent = () => { assertExecutionCurrent(); if (task.accepted)
+                task.assertCurrent(); };
+            await deps.answerCallbackQuery(query.id, task.accepted ? "Cancellation requested" : "Task View is no longer available", { assertLocalAuthority: assertTaskCurrent });
+            assertTaskCurrent();
+            return;
+        }
+        const attachment = Delivery.acceptTelegramAttachmentQuestionCallback(query, assertExecutionCurrent);
+        if (attachment.handled) {
+            const assertAttachmentCurrent = () => { assertExecutionCurrent(); if (attachment.accepted)
+                attachment.assertCurrent(); };
+            await deps.answerCallbackQuery(query.id, attachment.accepted ? "Cancelled" : "Attachment request is no longer available", { assertLocalAuthority: assertAttachmentCurrent });
+            assertAttachmentCurrent();
+            return;
+        }
+        const input = Delivery.acceptTelegramTextInputCallback(query, assertExecutionCurrent);
+        if (input.handled) {
+            const assertInputCurrent = () => { assertExecutionCurrent(); if (input.accepted)
+                input.assertCurrent(); };
+            await deps.answerCallbackQuery(query.id, input.accepted ? "Cancelled" : "Input request is no longer available", { assertLocalAuthority: assertInputCurrent });
+            assertInputCurrent();
+            return;
+        }
+        const choice = deps.confirmations?.acceptChoice
+            ? deps.confirmations.acceptChoice(query, assertExecutionCurrent)
+            : Delivery.acceptTelegramChoiceCallback(query, assertExecutionCurrent);
+        if (choice.handled) {
+            const assertChoiceCurrent = () => { assertExecutionCurrent(); if (choice.accepted)
+                choice.assertCurrent(); };
+            await deps.answerCallbackQuery(query.id, choice.accepted
+                ? choice.decision.status === "selected" ? "Selected" : "Cancelled"
+                : "Choice expired", { assertLocalAuthority: assertChoiceCurrent });
+            assertChoiceCurrent();
+            return;
+        }
+        const confirmation = deps.confirmations
+            ? deps.confirmations.acceptConfirmation(query, assertExecutionCurrent)
+            : Delivery.acceptTelegramConfirmationCallback(query, assertExecutionCurrent);
+        const ownedConfirmation = confirmation.handled && confirmation.accepted &&
+            /^(new|compact|quit):(confirm|cancel)$/u.test(confirmation.callbackData ?? "") ? confirmation : undefined;
+        const assertCallbackCurrent = () => {
+            assertExecutionCurrent();
+            if (confirmation.handled && confirmation.accepted)
+                confirmation.assertCurrent();
+        };
+        if (confirmation.handled && !ownedConfirmation) {
+            await deps.answerCallbackQuery(query.id, confirmation.accepted
+                ? confirmation.decision.status === "confirmed" ? "Confirmed" : "Cancelled"
+                : "Confirmation expired", { assertLocalAuthority: assertCallbackCurrent });
+            assertCallbackCurrent();
+            return;
+        }
         if (await handleCancellationReview(query, ctx))
             return;
         if (await handleUnboundRerouteCancelCallback(query, ctx))
@@ -6731,10 +7082,46 @@ export function createTelegramInboundRouteRuntime(deps) {
                         invokeBoundAction: (buttonQuery, action, context) => deps.invokeBoundButtonAction(action, buttonQuery, context),
                     }
                     : {}),
+                updateSelectionMessage: deps.editSelectionMessage
+                    ? async (buttonQuery, markdown, rendering, replyMarkup, assertSelectionCurrent) => {
+                        const edit = deps.editSelectionMessage;
+                        const assertCurrent = () => {
+                            assertExecutionCurrent();
+                            assertSelectionCurrent();
+                            if (deps.editSelectionMessage !== edit)
+                                throw new Error("Telegram selection transport changed.");
+                        };
+                        assertCurrent();
+                        await edit(buttonQuery.message.chat.id, buttonQuery.message.message_id, markdown, rendering, replyMarkup, { assertLocalAuthority: assertCurrent });
+                        assertCurrent();
+                    }
+                    : undefined,
+                updateSelectionKeyboard: deps.editMessageReplyMarkup
+                    ? async (buttonQuery, replyMarkup, assertSelectionCurrent) => {
+                        const edit = deps.editMessageReplyMarkup;
+                        const assertCurrent = () => {
+                            assertExecutionCurrent();
+                            assertSelectionCurrent();
+                            if (deps.editMessageReplyMarkup !== edit)
+                                throw new Error("Telegram selection transport changed.");
+                        };
+                        assertCurrent();
+                        await edit(buttonQuery.message.chat.id, buttonQuery.message.message_id, replyMarkup, { assertLocalAuthority: assertCurrent });
+                        assertCurrent();
+                    }
+                    : undefined,
                 editMessageReplyMarkup: deps.editMessageReplyMarkup
                     ? async (chatId, messageId, replyMarkup) => {
                         try {
-                            await deps.editMessageReplyMarkup?.(chatId, messageId, replyMarkup);
+                            const edit = deps.editMessageReplyMarkup;
+                            const assertCurrent = () => {
+                                assertExecutionCurrent();
+                                if (deps.editMessageReplyMarkup !== edit)
+                                    throw new Error("Telegram button transport changed.");
+                            };
+                            assertCurrent();
+                            await edit(chatId, messageId, replyMarkup, { assertLocalAuthority: assertCurrent });
+                            assertCurrent();
                         }
                         catch (error) {
                             deps.recordRuntimeEvent?.("telegram", error, {
@@ -6922,11 +7309,19 @@ export function createTelegramInboundRouteRuntime(deps) {
             }
             return;
         }
+        if (await Commands.handleTelegramQuitConfirmationCallback(query, {
+            assertCurrent: assertCallbackCurrent,
+            answerCallbackQuery: (id, text) => deps.answerCallbackQuery(id, text, { assertLocalAuthority: assertCallbackCurrent }),
+            editInteractiveMessage: (chat, message, text, mode, markup) => deps.editInteractiveMessage?.(chat, message, text, mode, markup, { target: ownedConfirmation?.handle.target, assertLocalAuthority: assertCallbackCurrent }) ?? Promise.resolve(),
+            requestQuit: deps.requestQuit ? () => deps.requestQuit(query) : undefined,
+        }, ownedConfirmation))
+            return;
         const handledByNew = await Commands.handleTelegramNewConfirmationCallback(query, {
             ctx,
-            answerCallbackQuery: deps.answerCallbackQuery,
-            editInteractiveMessage: deps.editInteractiveMessage ?? (async () => { }),
-            deleteMessage: deps.deleteMessage ?? (async () => { }),
+            assertCurrent: assertCallbackCurrent,
+            answerCallbackQuery: (id, text) => deps.answerCallbackQuery(id, text, { assertLocalAuthority: assertCallbackCurrent }),
+            editInteractiveMessage: (chat, message, text, mode, markup) => deps.editInteractiveMessage?.(chat, message, text, mode, markup, { target: ownedConfirmation?.handle.target, assertLocalAuthority: assertCallbackCurrent }) ?? Promise.resolve(),
+            deleteMessage: (chat, message) => deps.deleteMessage?.(chat, message, { assertAuthority: assertCallbackCurrent }) ?? Promise.resolve(),
             runNew: async (newCtx) => {
                 await Commands.handleTelegramNewCommand({
                     isIdle: () => deps.isIdle(newCtx),
@@ -6948,14 +7343,15 @@ export function createTelegramInboundRouteRuntime(deps) {
                     recordRuntimeEvent: deps.recordRuntimeEvent,
                 });
             },
-        });
+        }, ownedConfirmation);
         assertExecutionCurrent();
         if (handledByNew)
             return;
         const handledByCompact = await Commands.handleTelegramCompactConfirmationCallback(query, {
             ctx,
-            answerCallbackQuery: deps.answerCallbackQuery,
-            editInteractiveMessage: deps.editInteractiveMessage ?? (async () => { }),
+            assertCurrent: assertCallbackCurrent,
+            answerCallbackQuery: (id, text) => deps.answerCallbackQuery(id, text, { assertLocalAuthority: assertCallbackCurrent }),
+            editInteractiveMessage: (chat, message, text, mode, markup) => deps.editInteractiveMessage?.(chat, message, text, mode, markup, { target: ownedConfirmation?.handle.target, assertLocalAuthority: assertCallbackCurrent }) ?? Promise.resolve(),
             runCompact: async (compactCtx, chatId, replyToMessageId, target) => {
                 await Commands.handleTelegramCompactCommand({
                     isIdle: () => deps.isIdle(compactCtx),
@@ -6987,7 +7383,7 @@ export function createTelegramInboundRouteRuntime(deps) {
                     recordRuntimeEvent: deps.recordRuntimeEvent,
                 });
             },
-        });
+        }, ownedConfirmation);
         assertExecutionCurrent();
         if (handledByCompact)
             return;
@@ -7041,6 +7437,28 @@ export function createTelegramInboundRouteRuntime(deps) {
         }
         await menuCallbackHandler(query, ctx);
     };
+    const continueProviders = {
+        config: deps.configStore, bridge: deps.bridgeRuntime, queueState: deps.bridgeRuntime.queue,
+        lifecycle: deps.bridgeRuntime.lifecycle, queue: deps.queueMutationRuntime,
+        inbound: deps.inboundHandlerRuntime, threads: deps.threadStore,
+        process: deps.inboundHandlerRuntime.process, download: deps.downloadFile, timeLine: deps.resolveTimeLine,
+        operator: deps.configStore.getAllowedUserId, scope: deps.getAdmissionScope, binding: deps.getAdmissionJournalBinding,
+        allocateItem: deps.bridgeRuntime.queue.allocateItemOrder, allocateControl: deps.bridgeRuntime.queue.allocateControlOrder,
+        fold: deps.bridgeRuntime.lifecycle.setFoldQueuedPromptsIntoHistory, append: deps.queueMutationRuntime.append,
+        dispatch: deps.dispatchNextQueuedTelegramTurn, deferredDispatch: deps.requestDeferredDispatchNextQueuedTelegramTurn,
+    };
+    const continueProvidersCurrent = () => deps.configStore === continueProviders.config &&
+        deps.bridgeRuntime === continueProviders.bridge && deps.bridgeRuntime.queue === continueProviders.queueState &&
+        deps.bridgeRuntime.lifecycle === continueProviders.lifecycle && deps.queueMutationRuntime === continueProviders.queue &&
+        deps.inboundHandlerRuntime === continueProviders.inbound && deps.threadStore === continueProviders.threads &&
+        deps.inboundHandlerRuntime.process === continueProviders.process && deps.downloadFile === continueProviders.download &&
+        deps.resolveTimeLine === continueProviders.timeLine && deps.configStore.getAllowedUserId === continueProviders.operator &&
+        deps.getAdmissionScope === continueProviders.scope && deps.getAdmissionJournalBinding === continueProviders.binding &&
+        deps.bridgeRuntime.queue.allocateItemOrder === continueProviders.allocateItem &&
+        deps.bridgeRuntime.queue.allocateControlOrder === continueProviders.allocateControl &&
+        deps.bridgeRuntime.lifecycle.setFoldQueuedPromptsIntoHistory === continueProviders.fold &&
+        deps.queueMutationRuntime.append === continueProviders.append && deps.dispatchNextQueuedTelegramTurn === continueProviders.dispatch &&
+        deps.requestDeferredDispatchNextQueuedTelegramTurn === continueProviders.deferredDispatch;
     const preparePromptTurn = Turns.createTelegramPromptTurnRuntimePreparer({
         allocateQueueOrder: deps.bridgeRuntime.queue.allocateItemOrder,
         downloadFile: deps.downloadFile,
@@ -7230,17 +7648,17 @@ export function createTelegramInboundRouteRuntime(deps) {
                     binding.target.threadId === target.threadId &&
                     typeof binding.manualThreadName === "string") ?? false;
                 const instructions = hasManualName
-                    ? "<b>🏷️ Send a new Thread name using printable ASCII, reset to automatic, or cancel.</b>"
-                    : "<b>🏷️ Send a Thread name using printable ASCII, or cancel.</b>";
+                    ? "<b>🏷️ Send a new Thread name using printable ASCII, or reset to automatic.</b>"
+                    : "<b>🏷️ Send a Thread name using printable ASCII.</b>";
                 const buttons = hasManualName
                     ? [
                         {
                             text: "↩️ Reset to automatic",
                             callback_data: "thread-name:reset",
                         },
-                        { text: "✖ Cancel rename", callback_data: "thread-name:cancel" },
+                        { text: "❌ Cancel", callback_data: "thread-name:cancel" },
                     ]
-                    : [{ text: "✖ Cancel rename", callback_data: "thread-name:cancel" }];
+                    : [{ text: "❌ Cancel", callback_data: "thread-name:cancel" }];
                 assertSemanticCurrent?.();
                 if (!lifetime.isCurrent())
                     return;
@@ -7277,6 +7695,7 @@ export function createTelegramInboundRouteRuntime(deps) {
             };
         },
         sendInteractiveMessage: deps.sendInteractiveMessage,
+        confirmations: deps.confirmations,
         recordRuntimeEvent: deps.recordRuntimeEvent,
     });
     const promptEnqueueController = Queue.createTelegramPromptEnqueueController({
@@ -7297,6 +7716,18 @@ export function createTelegramInboundRouteRuntime(deps) {
         dispatchNextQueuedTelegramTurn: requestDispatchNextQueuedTelegramTurn,
         assertExecutionCurrent: (messages) => Updates.assertTelegramUpdateExecutionCurrent(messages[0]),
     });
+    const textExecutionProviders = {
+        store: deps.telegramQueueStore, getItems: deps.telegramQueueStore.getQueuedItems, setItems: deps.telegramQueueStore.setQueuedItems,
+        pending: deps.bridgeRuntime.lifecycle.hasDispatchPending, fold: deps.bridgeRuntime.lifecycle.shouldFoldQueuedPromptsIntoHistory,
+        status: deps.updateStatus, deferred: deps.hasDeferredDispatchContext,
+        displayTitle: deps.getDisplayTitle, localLabel: deps.getLocalThreadLabelForTarget,
+    };
+    const textExecutionProvidersCurrent = () => continueProvidersCurrent() && deps.telegramQueueStore === textExecutionProviders.store &&
+        deps.telegramQueueStore.getQueuedItems === textExecutionProviders.getItems && deps.telegramQueueStore.setQueuedItems === textExecutionProviders.setItems &&
+        deps.bridgeRuntime.lifecycle.hasDispatchPending === textExecutionProviders.pending &&
+        deps.bridgeRuntime.lifecycle.shouldFoldQueuedPromptsIntoHistory === textExecutionProviders.fold &&
+        deps.updateStatus === textExecutionProviders.status && deps.hasDeferredDispatchContext === textExecutionProviders.deferred &&
+        deps.getDisplayTitle === textExecutionProviders.displayTitle && deps.getLocalThreadLabelForTarget === textExecutionProviders.localLabel;
     const promptEnqueue = async (messages, ctx) => {
         return promptEnqueueController.enqueue(messages, ctx, (turn) => {
             reportQueueAdmission(messages, turn.admissionReceipts ?? []);
@@ -7924,11 +8355,13 @@ export function createTelegramInboundRouteRuntime(deps) {
                     ? { assertAuthority: assertResultAuthority }
                     : {}),
             });
+            const name = Media.extractFirstTelegramMessageText(messages).trim();
+            if (Commands.parseTelegramCommand(name))
+                return false;
             if (!isCurrent()) {
                 lifetime.finish();
                 return true;
             }
-            const name = Media.extractFirstTelegramMessageText(messages).trim();
             const reset = /^[A-Z]$/.test(name) && !!resetCurrentThreadName;
             if (!reset) {
                 const validationError = validateThreadName?.(name);
@@ -8029,6 +8462,26 @@ export function createTelegramInboundRouteRuntime(deps) {
             return true;
         },
         expandPromptTemplateCommand,
+        isKnownCommandName: (name) => Commands.isTelegramReservedCommandName(name) ||
+            !!Commands.findTelegramExtensionCommand(name) ||
+            getPromptTemplateCommands().some((template) => template.command === name) ||
+            deps.getCommands().some((command) => command.name.toLowerCase() === name),
+        async discoverSlash(discovery, message) {
+            // Captions and media keep their ordinary path; only a plain text message asks for discovery.
+            if (typeof message.text !== "string")
+                return false;
+            const sourceTarget = Updates.getTelegramMessageTarget(message);
+            const assertExecutionCurrent = Updates.createTelegramUpdateExecutionFenceGuard(message);
+            assertExecutionCurrent();
+            await deps.sendTextReply(message.chat.id, message.message_id, Commands.buildTelegramSlashCatalogueHtml({
+                ...(discovery.kind === "unknown"
+                    ? { unknownName: discovery.name }
+                    : {}),
+                promptTemplates: getPromptTemplateCommands(),
+            }), { parseMode: "HTML", target: sourceTarget });
+            assertExecutionCurrent();
+            return true;
+        },
         replaceMessageText: (message, text) => Updates.carryTelegramUpdateExecutionFence(message, {
             ...message,
             text,
@@ -8267,6 +8720,9 @@ export function createTelegramInboundRouteRuntime(deps) {
         deps.updateStatus(ctx);
         requestDispatchNextQueuedTelegramTurn(ctx);
     };
+    const privateTextReply = deps.privateDeliveryReplies
+        ? createTelegramLocalTextInputReplyHandler(deps.privateDeliveryReplies, deps.getCurrentInstanceId ?? (() => undefined)) : undefined;
+    const privateAttachmentReply = deps.privateDeliveryReplies ? createTelegramAttachmentReplyPrivacyGuard(deps.privateDeliveryReplies) : undefined;
     const runtime = Updates.createTelegramPairedUpdateRuntime({
         getAllowedUserId: deps.configStore.getAllowedUserId,
         getCurrentInstanceId: deps.getCurrentInstanceId,
@@ -8286,6 +8742,10 @@ export function createTelegramInboundRouteRuntime(deps) {
         answerGuestQuery: deps.answerGuestQuery,
         handleAuthorizedTelegramCallbackQuery: callbackHandler,
         sendTextReply: deps.sendTextReply,
+        handleAuthorizedTelegramDeliveryReply: privateTextReply ? async (message, _ctx, edited) => {
+            privateAttachmentReply?.(message);
+            return privateTextReply(message, edited);
+        } : undefined,
         handleAuthorizedTelegramMessage: async (message, ctx) => {
             const assertExecutionCurrent = Updates.createTelegramUpdateExecutionFenceGuard(message);
             assertExecutionCurrent();
@@ -8665,8 +9125,222 @@ export function createTelegramInboundRouteRuntime(deps) {
             }, operation);
         },
     });
+    const ordinarySelections = new Map();
+    let selectingOrdinary;
+    function selectOrdinaryInput(candidate, ctx, purpose) {
+        if (selectingOrdinary) {
+            selectingOrdinary.poisoned = true;
+            return undefined;
+        }
+        const attempt = { poisoned: false };
+        const label = purpose === "continue" ? "Ordinary continuation" : "Ordinary text prompt";
+        selectingOrdinary = attempt;
+        try {
+            const source = readOrdinaryInputEnvelope(candidate.entry.update, purpose);
+            if (!source || attempt.poisoned || candidate.entry.updateId !== source.updateId ||
+                candidate.source.updateId !== source.updateId || candidate.expectedSource.updateId !== source.updateId)
+                return undefined;
+            const { configStore, threadStore, getSessionGeneration, getSessionId, isContextActive, getAdmissionScope, getAdmissionJournalBinding, getCurrentInstanceId, getTargetOwnership, getCommandReplyTarget } = deps;
+            const getConfig = configStore.get, getOperator = configStore.getAllowedUserId;
+            const readBotState = threadStore?.getBotState, listThreads = threadStore?.list;
+            if (!threadStore || !getSessionGeneration || !getSessionId || !isContextActive || !getAdmissionScope ||
+                !getAdmissionJournalBinding || !getCurrentInstanceId || !getCommandReplyTarget)
+                return undefined;
+            const config = getConfig(), token = resolveTelegramBotToken(config.botToken), botId = config.botId;
+            const generation = getSessionGeneration(), sessionId = getSessionId(ctx), binding = getAdmissionJournalBinding(), scope = getAdmissionScope(), instance = getCurrentInstanceId(), operator = getOperator();
+            if (candidate.source.journalBindingKey !== binding || candidate.botIdentity.botId !== botId ||
+                candidate.owner.instanceId !== instance || candidate.owner.sessionGeneration !== generation ||
+                candidate.sessionId !== sessionId || !token ||
+                createHash("sha256").update(token).digest("hex") !== candidate.source.tokenSha256 || !Number.isSafeInteger(botId) || botId <= 0 || !sessionId || !binding || !scope || !instance ||
+                !Number.isSafeInteger(generation) || generation < 0 || operator !== source.operator || operator !== source.chatId)
+                return undefined;
+            const key = JSON.stringify([binding, generation, sessionId, source.updateId]);
+            const previous = ordinarySelections.get(key);
+            if (previous) {
+                previous.poisoned = true;
+                return undefined;
+            }
+            if (ordinarySelections.size >= TELEGRAM_ORDINARY_SELECTION_LIMIT)
+                return undefined;
+            ordinarySelections.set(key, attempt);
+            let consumed = false, checking = false, executionIssued = false;
+            const target = { chatId: source.chatId, ...(source.threadId === undefined ? {} : { threadId: source.threadId }) };
+            const messageTarget = { message_id: source.messageId, chat: { id: source.chatId, type: "private" },
+                ...(source.threadId === undefined ? {} : { message_thread_id: source.threadId }) };
+            const ownership = getTargetOwnership?.(target);
+            const ownedTarget = ownership ? structuredClone(ownership) : undefined;
+            const portsCurrent = () => (purpose !== "continue" || continueProvidersCurrent()) && deps.configStore === configStore && configStore.get === getConfig &&
+                configStore.getAllowedUserId === getOperator && deps.threadStore === threadStore &&
+                deps.getSessionGeneration === getSessionGeneration && deps.getSessionId === getSessionId &&
+                deps.isContextActive === isContextActive && deps.getAdmissionScope === getAdmissionScope &&
+                deps.getAdmissionJournalBinding === getAdmissionJournalBinding && deps.getCurrentInstanceId === getCurrentInstanceId &&
+                deps.getTargetOwnership === getTargetOwnership && deps.getCommandReplyTarget === getCommandReplyTarget &&
+                threadStore.getBotState === readBotState && threadStore.list === listThreads;
+            const routeCurrent = () => {
+                if (!portsCurrent())
+                    return false;
+                const liveConfig = getConfig(), mode = readBotState.call(threadStore).threadMode;
+                const localThread = source.threadId === undefined || listThreads.call(threadStore).some(record => record.status === "active" && record.instanceId === instance &&
+                    record.target.chatId === target.chatId && record.target.threadId === source.threadId);
+                return ordinarySelections.get(key) === attempt && isContextActive(ctx) === true &&
+                    getSessionId(ctx) === sessionId && getSessionGeneration() === generation && getCurrentInstanceId() === instance &&
+                    getAdmissionScope() === scope && getAdmissionJournalBinding() === binding && getOperator() === operator &&
+                    resolveTelegramBotToken(liveConfig.botToken) === token && liveConfig.botId === botId &&
+                    isDeepStrictEqual(getCommandReplyTarget(messageTarget), target) && localThread &&
+                    (source.threadId === undefined ? mode === "disabled" && source.topic !== true : mode === "enabled") &&
+                    (ownedTarget === undefined || ownedTarget.instanceId === instance) &&
+                    isDeepStrictEqual(getTargetOwnership?.(target), ownedTarget) && portsCurrent();
+            };
+            const assertCurrent = value => {
+                if (value !== candidate || checking || attempt.poisoned) {
+                    attempt.poisoned = true;
+                    throw new Error(`${label} selection is unavailable.`);
+                }
+                checking = true;
+                try {
+                    if (!routeCurrent())
+                        throw new Error(`${label} route changed.`);
+                    // inspect may retire expired state or invoke owner observations; it is deliberately not called pure.
+                    for (let i = 0; i < 2; i++) {
+                        const candidate = threadNameDialog.inspect(target);
+                        if (candidate?.scope === instance || attempt.poisoned)
+                            throw new Error(`${label} is held by Thread input.`);
+                    }
+                    if (!routeCurrent() || attempt.poisoned)
+                        throw new Error(`${label} observation changed.`);
+                }
+                catch (error) {
+                    attempt.poisoned = true;
+                    throw error;
+                }
+                finally {
+                    checking = false;
+                }
+            };
+            assertCurrent(candidate);
+            const selection = Object.freeze({ updateId: source.updateId, assertCurrent,
+                consume() {
+                    if (consumed) {
+                        attempt.poisoned = true;
+                        throw new Error(`${label} selection was already consumed.`);
+                    }
+                    consumed = true;
+                    assertCurrent(candidate);
+                    return assertCurrent;
+                } });
+            if (purpose === "text-prompt")
+                return selection;
+            return Object.freeze({ ...selection,
+                async execute(execution) {
+                    if (!consumed || executionIssued) {
+                        attempt.poisoned = true;
+                        throw new Error("Ordinary continuation cannot execute twice.");
+                    }
+                    executionIssued = true;
+                    try {
+                        const message = Updates.readTelegramOrdinaryV4Execution(execution, candidate);
+                        assertCurrent(candidate);
+                        await enqueueContinueTurn(message, ctx);
+                        assertCurrent(candidate);
+                        Updates.readTelegramOrdinaryV4Execution(execution, candidate);
+                    }
+                    catch (error) {
+                        attempt.poisoned = true;
+                        throw error;
+                    }
+                } });
+        }
+        catch {
+            attempt.poisoned = true;
+            return undefined;
+        }
+        finally {
+            selectingOrdinary = undefined;
+        }
+    }
+    const prepareOrdinaryTextPrompt = (candidate, ctx) => {
+        let live = true, checking = false, consumed = false, issued = false;
+        const unavailable = () => new Error("Ordinary text execution authority is unavailable.");
+        const assertProviders = () => {
+            if (!live || !textExecutionProvidersCurrent() || textExecutionProviders.fold.call(continueProviders.lifecycle) !== false ||
+                !textExecutionProvidersCurrent() || !live)
+                throw unavailable();
+        };
+        try {
+            assertProviders();
+            const selection = selectOrdinaryInput(candidate, ctx, "text-prompt");
+            if (!selection)
+                return undefined;
+            const assertCurrent = actual => {
+                if (!live || checking || actual !== candidate) {
+                    live = false;
+                    throw unavailable();
+                }
+                checking = true;
+                try {
+                    assertProviders();
+                    selection.assertCurrent(actual);
+                    assertProviders();
+                }
+                catch (error) {
+                    live = false;
+                    throw error;
+                }
+                finally {
+                    checking = false;
+                }
+            };
+            assertCurrent(candidate);
+            return Object.freeze({ purpose: "text-prompt", updateId: selection.updateId, assertCurrent,
+                consume() {
+                    if (consumed) {
+                        live = false;
+                        throw unavailable();
+                    }
+                    consumed = true;
+                    try {
+                        assertCurrent(candidate);
+                        selection.consume();
+                        assertCurrent(candidate);
+                        return assertCurrent;
+                    }
+                    catch (error) {
+                        live = false;
+                        throw error;
+                    }
+                },
+                async execute(execution) {
+                    if (!consumed || issued) {
+                        live = false;
+                        throw unavailable();
+                    }
+                    issued = true;
+                    try {
+                        const message = Updates.readTelegramOrdinaryV4TextExecution(execution, candidate);
+                        const assertExecution = () => { assertCurrent(candidate); Updates.readTelegramOrdinaryV4TextExecution(execution, candidate); };
+                        assertExecution();
+                        await promptEnqueueController.enqueue([message], ctx, turn => {
+                            assertExecution();
+                            reportQueueAdmission([message], turn.admissionReceipts ?? []);
+                        }, { preserveQueued: true, assertCurrent: assertExecution });
+                        assertExecution();
+                    }
+                    catch (error) {
+                        live = false;
+                        throw error;
+                    }
+                } });
+        }
+        catch {
+            live = false;
+            return undefined;
+        }
+    };
     return {
         ...runtime,
+        selectOrdinaryContinue: (candidate, ctx) => selectOrdinaryInput(candidate, ctx, "continue"),
+        selectOrdinaryTextPrompt: (candidate, ctx) => selectOrdinaryInput(candidate, ctx, "text-prompt"),
+        prepareOrdinaryTextPrompt,
         expireRoutingInput,
         shouldReviewHistoricalInput,
         shouldHoldPendingInput,

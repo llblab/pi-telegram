@@ -4,12 +4,16 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile, symlink, rm, rename, link, chmod } from "node:fs/promises";
+import fileSystem from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { mock } from "node:test";
 
 import {
+  captureTelegramArtifactSource,
   createTelegramQueuedOutboundAttachmentSender,
   createTelegramRichOutboundAttachmentSender,
   deliverTelegramGuestCachedAttachment,
@@ -32,6 +36,58 @@ import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 import { resetTransportReplyDedup, sendTelegramNativeMarkdownReply } from "../lib/replies.ts";
 
 test.beforeEach(resetTransportReplyDedup);
+
+test("Artifact source captures private bounded bytes through an authorized symlink without changing original", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pt-artifact-source-"));
+  try {
+    const path = join(dir, "original"), link = join(dir, "link");
+    await writeFile(path, Buffer.from([0, 255, 1, 2]));
+    await symlink(path, link);
+    const captured = await captureTelegramArtifactSource(link, 4);
+    await writeFile(path, "replacement");
+    assert.deepEqual(captured, Buffer.from([0, 255, 1, 2]));
+    await assert.rejects(captureTelegramArtifactSource(path, 4), { reason: "size-exceeded" });
+    await assert.rejects(captureTelegramArtifactSource(dir, 4), { reason: "source-invalid" });
+    await writeFile(path, "");
+    await assert.rejects(captureTelegramArtifactSource(path, 4), { reason: "source-invalid" });
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+for (const change of ["replace-before-open", "grow-after-read", "truncate-after-read", "mutate-after-read", "fifo-before-open"] as const)
+test(`Artifact descriptor capture rejects observed source races (${change})`, { skip: change === "fifo-before-open" && process.platform === "win32" }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pt-artifact-race-")), path = join(dir, "source"), saved = join(dir, "saved");
+  await writeFile(path, "original");
+  const actualOpen = fileSystem.open;
+  let closed = false, readsSettled = false;
+  const mocked = mock.method(fileSystem, "open", async (...args: Parameters<typeof actualOpen>) => {
+    if (change === "replace-before-open" || change === "fifo-before-open") {
+      await rename(path, saved);
+      if (change === "fifo-before-open") assert.equal(spawnSync("mkfifo", [path]).status, 0); else await writeFile(path, "replaced");
+    }
+    const fd = await actualOpen(...args), read = fd.read.bind(fd), close = fd.close.bind(fd);
+    fd.read = (async (...readArgs: unknown[]) => {
+      const result = await Reflect.apply(read, fd, readArgs);
+      if (change.endsWith("after-read")) await writeFile(path, change === "grow-after-read" ? "original-extra" : change === "truncate-after-read" ? "x" : "modified");
+      readsSettled = true; return result;
+    }) as typeof fd.read;
+    fd.close = async () => { assert.ok(readsSettled || !change.endsWith("after-read")); await close(); closed = true; };
+    return fd;
+  });
+  syncBuiltinESMExports();
+  try { await assert.rejects(captureTelegramArtifactSource(path), { reason: "source-changed" }); assert.equal(closed, true); }
+  finally { mocked.mock.restore(); syncBuiltinESMExports(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Artifact source bounds do not impose private-runtime permissions or single-link policy", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pt-artifact-bounds-")), path = join(dir, "source"), alias = join(dir, "alias");
+  try {
+    await writeFile(path, Buffer.alloc(1_048_576, 42)); await chmod(path, 0o644); await link(path, alias);
+    assert.equal((await captureTelegramArtifactSource(alias)).length, 1_048_576);
+    await assert.rejects(captureTelegramArtifactSource(path, 10), { reason: "size-exceeded" });
+    await writeFile(path, Buffer.alloc(1_048_577)); await assert.rejects(captureTelegramArtifactSource(path), { reason: "size-exceeded" });
+    await writeFile(path, Buffer.from([42])); assert.deepEqual(await captureTelegramArtifactSource(path), Buffer.from([42]));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
 
 function createAttachmentQueueTarget(
   queuedAttachments: TelegramOutboundAttachmentQueueTargetView["queuedAttachments"] = [],
