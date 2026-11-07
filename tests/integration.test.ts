@@ -25,11 +25,12 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
-import testRoot, { after, mock, type TestContext } from "node:test";
+import nativeTest, { after, mock, type TestContext, type TestOptions } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
 import { runNodeEval } from "./fixtures/node-eval.ts";
+import { createIntegrationShardSelector } from "./fixtures/shared.ts";
 import * as RoutingFixture from "./fixtures/routing.ts";
 import { createTelegramActivityVerbosityRuntime } from "../lib/activity-verbosity.ts";
 import * as AgentMessages from "../lib/agent-messages.ts";
@@ -74,11 +75,20 @@ import { setTestFetch } from "./fixtures/shared.ts";
 
 // Production timers are unref'd so they never hold Pi open; a live Pi process keeps the loop alive. Mirror that so
 // Node 22's runner does not abort runtime tests that await those timers.
+const inventoryOnly = process.env.PI_TELEGRAM_INTEGRATION_LIST === "1";
+const selectIntegrationTest = createIntegrationShardSelector(process.env.PI_TELEGRAM_INTEGRATION_SHARD);
+const selectedTestNames: string[] = [];
 const eventLoopKeepAlive = setInterval(() => {}, 60_000);
-after(() => { clearInterval(eventLoopKeepAlive); });
+if (!inventoryOnly) after(() => { clearInterval(eventLoopKeepAlive); });
 
 type RuntimeTestHandler = (context: TestContext) => void | Promise<void>;
 type RuntimeTelegramExtension = (typeof import("../index.ts"))["default"];
+
+function testRoot(name: string, options: TestOptions, fn: RuntimeTestHandler): void {
+  if (!selectIntegrationTest(name)) return;
+  if (inventoryOnly) selectedTestNames.push(name);
+  else void nativeTest(name, options, fn);
+}
 
 function test(
   name: string,
@@ -16206,3 +16216,8 @@ test("Extension runtime delays model-switch abort until the active tool finishes
     await telegramConfig.restore();
   }
 });
+
+if (inventoryOnly) {
+  clearInterval(eventLoopKeepAlive);
+  console.log(`integration-inventory:${JSON.stringify(selectedTestNames)}`);
+}

@@ -13,6 +13,7 @@ import { join, normalize, relative } from "node:path";
 import test from "node:test";
 import ts from "typescript";
 import { runNodeEval } from "./fixtures/node-eval.ts";
+import { createIntegrationShardSelector } from "./fixtures/shared.ts";
 
 const PROJECT_ROOT = process.cwd();
 const releaseWorkflowSource = readFileSync(
@@ -68,32 +69,66 @@ test("Unreleased changelog respects the project release-entry budget", () => {
   );
 });
 
-test("macOS CI shards cover every test file exactly once without widening deadlines", () => {
-  const runner = join(PROJECT_ROOT, "scripts", "run-macos-tests.mjs");
+test("CI shards cover every domain file exactly once without widening deadlines", () => {
+  const runner = join(PROJECT_ROOT, "scripts", "run-ci-tests.mjs");
   const inventory = readdirSync(join(PROJECT_ROOT, "tests"))
     .filter((name) => name.endsWith(".test.ts")).map((name) => `tests/${name}`).sort();
   const list = (shard: string, phase: string): string[] => JSON.parse(execFileSync(
-    process.execPath, [runner, shard, phase, "--list"], { encoding: "utf8" },
+    process.execPath, [runner, phase, shard, "--list"], { encoding: "utf8" },
   ));
   const realProcess = "tests/process-shutdown.test.ts";
   assert.deepEqual(list("0", "process"), [realProcess]);
   assert.deepEqual(list("1", "process"), []);
-  const first = list("0", "remaining"), second = list("1", "remaining");
+  const first = list("0", "domains"), second = list("1", "domains");
   assert.ok(first.length > 0 && second.length > 0);
   assert.ok(Math.abs(first.length - second.length) <= 1);
   const all = [...list("0", "process"), ...first, ...second];
   assert.equal(new Set(all).size, all.length, "Shards cannot overlap");
-  assert.deepEqual(all.sort(), inventory, "No test file can disappear from macOS CI");
-  assert.deepEqual(list("0", "remaining"), first, "Selection is deterministic");
-  assert.deepEqual(Array.from(validateWorkflowSource.matchAll(/- os: macos-26-intel\s+shard: (\d+)/g),
+  assert.deepEqual(all.sort(), inventory.filter(name => name !== "tests/integration.test.ts"), "No domain file can disappear from macOS CI");
+  assert.deepEqual(list("all", "domains").sort(), inventory.filter(name => name !== "tests/integration.test.ts"));
+  assert.deepEqual(list("0", "domains"), first, "Selection is deterministic");
+  assert.deepEqual(Array.from(validateWorkflowSource.matchAll(/- os: macos-26-intel\s+suite: domains\s+shard: (\d+)/g),
     (match) => Number(match[1])), [0, 1]);
+  for (const os of ["ubuntu-latest", "windows-latest", "macos-26-intel"]) {
+    const matrix = new RegExp(`- os: ${os}\\s+suite: integration\\s+integrationShard: (\\d+)`, "g");
+    assert.deepEqual(Array.from(validateWorkflowSource.matchAll(matrix), match => Number(match[1])), [0, 1, 2, 3]);
+  }
   assert.match(validateWorkflowSource, /timeout-minutes: 30/);
-  assert.match(validateWorkflowSource, /matrix\.os == 'macos-26-intel' && matrix\.shard == 0/);
-  assert.match(validateWorkflowSource, /run: node scripts\/run-macos-tests\.mjs 0 process/);
-  assert.match(validateWorkflowSource, /run: node scripts\/run-macos-tests\.mjs \$\{\{ matrix\.shard \}\} remaining/);
-  assert.match(readFileSync(runner, "utf8"), /"--test-concurrency=1"/);
-  for (const args of [["2", "remaining"], ["0", "unknown"], ["0", "process", "extra"]])
+  assert.match(validateWorkflowSource, /matrix\.os == 'macos-26-intel' && matrix\.suite == 'domains' && matrix\.shard == 0/);
+  assert.match(validateWorkflowSource, /run: node scripts\/run-ci-tests\.mjs process 0/);
+  assert.match(validateWorkflowSource, /run: node scripts\/run-ci-tests\.mjs domains \$\{\{ matrix\.shard \}\}/);
+  assert.match(validateWorkflowSource, /run: node scripts\/run-ci-tests\.mjs integration \$\{\{ matrix\.integrationShard \}\}/);
+  assert.match(readFileSync(runner, "utf8"), /\? 4 : 1/);
+  for (const args of [["domains", "2"], ["unknown", "0"], ["process", "0", "extra"], ["integration", "4"]])
     assert.throws(() => execFileSync(process.execPath, [runner, ...args], { stdio: "pipe" }));
+});
+
+test("Integration CI name shards are exhaustive, disjoint and use actual registrations", t => {
+  const list = (specification?: string): string[] => {
+    const env: NodeJS.ProcessEnv = { ...process.env, PI_TELEGRAM_INTEGRATION_LIST: "1" };
+    delete env.PI_TELEGRAM_INTEGRATION_SHARD;
+    if (specification !== undefined) env.PI_TELEGRAM_INTEGRATION_SHARD = specification;
+    const output = execFileSync(process.execPath, ["--experimental-strip-types", "tests/integration.test.ts"], {
+      cwd: PROJECT_ROOT, env, encoding: "utf8", maxBuffer: 4 * 1024 * 1024,
+    });
+    const lines = output.split(/\r?\n/u).filter(line => line.startsWith("integration-inventory:"));
+    assert.equal(lines.length, 1); return JSON.parse(lines[0]!.slice("integration-inventory:".length)) as string[];
+  };
+  const all = list(); assert.ok(all.length > 0);
+  const shards = [0, 1, 2, 3].map(index => {
+    const spec = `${index}/4`, selected = list(spec), selector = createIntegrationShardSelector(spec);
+    assert.ok(selected.length > 0); assert.deepEqual(selected, all.filter(selector)); return selected;
+  });
+  assert.deepEqual(shards.flat().sort(), [...all].sort(), "Every registration must execute exactly once, including duplicate names");
+  for (const name of new Set(all)) assert.equal(shards.filter(shard => shard.includes(name)).length, 1, name);
+  for (const value of ["", "4/4", "-1/4", "01/4", "0/0", "0/5", "0/4x", " 0/4"]) {
+    assert.throws(() => createIntegrationShardSelector(value), /Integration shard/);
+  }
+  assert.ok(all.every(createIntegrationShardSelector()));
+  const source = readFileSync(join(PROJECT_ROOT, "tests/integration.test.ts"), "utf8");
+  assert.equal([...source.matchAll(/\bnativeTest\(/gu)].length, 1, "Every registration must pass the selector");
+  assert.match(source, /if \(!selectIntegrationTest\(name\)\) return/);
+  t.diagnostic(`Integration registrations: ${all.length}; shard sizes: ${shards.map(shard => shard.length).join(", ")}`);
 });
 
 test("Release CI validates exact tags and publishes through npm Trusted Publisher", () => {

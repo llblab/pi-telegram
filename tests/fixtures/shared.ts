@@ -1,5 +1,14 @@
 /** Cross-suite test primitives: global fetch swap, bounded condition wait and the accepted foreign-settlement fixture. Zones: shared utils. */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+
+/** CI-only partition of complete integration test names; absent configuration preserves local execution. */
+export function createIntegrationShardSelector(specification?: string): (name: string) => boolean {
+  if (specification === undefined) return () => true;
+  if (!/^[0-3]\/4$/u.test(specification)) throw new Error("Integration shard must be 0/4, 1/4, 2/4 or 3/4");
+  const index = Number(specification[0]);
+  return name => createHash("sha256").update(name).digest().readUInt32BE(0) % 4 === index;
+}
 
 /** Installs a fetch double and returns its restorer. */
 export function setTestFetch(fetchImpl: typeof fetch): () => void {

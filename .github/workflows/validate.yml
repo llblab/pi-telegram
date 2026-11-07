@@ -18,16 +18,67 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            shardName: ""
+            suite: domains
+            shardName: ", domains"
           - os: windows-latest
-            shardName: ""
-          # Keep files serial inside each Intel runner without exhausting one job's 30-minute budget.
+            suite: domains
+            shardName: ", domains"
           - os: macos-26-intel
+            suite: domains
             shard: 0
-            shardName: ", shard 1/2"
+            shardName: ", domains 1/2"
           - os: macos-26-intel
+            suite: domains
             shard: 1
-            shardName: ", shard 2/2"
+            shardName: ", domains 2/2"
+          - os: ubuntu-latest
+            suite: integration
+            integrationShard: 0
+            shardName: ", integration 1/4"
+          - os: ubuntu-latest
+            suite: integration
+            integrationShard: 1
+            shardName: ", integration 2/4"
+          - os: ubuntu-latest
+            suite: integration
+            integrationShard: 2
+            shardName: ", integration 3/4"
+          - os: ubuntu-latest
+            suite: integration
+            integrationShard: 3
+            shardName: ", integration 4/4"
+          - os: windows-latest
+            suite: integration
+            integrationShard: 0
+            shardName: ", integration 1/4"
+          - os: windows-latest
+            suite: integration
+            integrationShard: 1
+            shardName: ", integration 2/4"
+          - os: windows-latest
+            suite: integration
+            integrationShard: 2
+            shardName: ", integration 3/4"
+          - os: windows-latest
+            suite: integration
+            integrationShard: 3
+            shardName: ", integration 4/4"
+          - os: macos-26-intel
+            suite: integration
+            integrationShard: 0
+            shardName: ", integration 1/4"
+          - os: macos-26-intel
+            suite: integration
+            integrationShard: 1
+            shardName: ", integration 2/4"
+          - os: macos-26-intel
+            suite: integration
+            integrationShard: 2
+            shardName: ", integration 3/4"
+          - os: macos-26-intel
+            suite: integration
+            integrationShard: 3
+            shardName: ", integration 4/4"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -45,7 +96,7 @@ jobs:
       - name: Run typecheck
         run: npm run typecheck
       - name: Run Windows bus lifecycle probes
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-latest' && matrix.suite == 'domains'
         timeout-minutes: 2
         run: >-
           node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts
@@ -53,25 +104,28 @@ jobs:
           --test-name-pattern="active profile endpoint|replacement endpoint generation|Leader assembly serializes follower provisioning"
           tests/bus.test.ts tests/bus-leader.test.ts
       - name: Run Windows outbound voice executable probe
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-latest' && matrix.suite == 'domains'
         timeout-minutes: 2
         run: >-
           node --experimental-strip-types --test --test-reporter=spec
           --test-name-pattern="Windows cmd|multipart voice calls|scoped follower API calls"
           tests/command-templates.test.ts tests/outbound-voice.test.ts
           tests/bus-follower.test.ts tests/bus-leader.test.ts
-      - name: Run tests
-        if: matrix.os != 'macos-26-intel'
-        run: npm test
+      - name: Run domain tests
+        if: matrix.os != 'macos-26-intel' && matrix.suite == 'domains'
+        run: node scripts/run-ci-tests.mjs domains all
       # Real-process tests run alone, exactly once; the runner also keeps the local Pi CLI on PATH.
       - name: Run real-process tests alone
-        if: matrix.os == 'macos-26-intel' && matrix.shard == 0
-        run: node scripts/run-macos-tests.mjs 0 process
+        if: matrix.os == 'macos-26-intel' && matrix.suite == 'domains' && matrix.shard == 0
+        run: node scripts/run-ci-tests.mjs process 0
       - name: Run remaining shard tests one file at a time
-        if: matrix.os == 'macos-26-intel'
-        run: node scripts/run-macos-tests.mjs ${{ matrix.shard }} remaining
+        if: matrix.os == 'macos-26-intel' && matrix.suite == 'domains'
+        run: node scripts/run-ci-tests.mjs domains ${{ matrix.shard }}
+      - name: Run integration name shard
+        if: matrix.suite == 'integration'
+        run: node scripts/run-ci-tests.mjs integration ${{ matrix.integrationShard }}
       - name: Check package contents
         run: npm run pack:check
       - name: Audit dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-latest' && matrix.suite == 'domains'
         run: npm run audit
