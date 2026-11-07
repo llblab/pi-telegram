@@ -3381,6 +3381,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
         leader.busSocketPath ??
         deps.getLeaderSocketPath?.() ??
         getTelegramBusSocketPath();
+      const attachmentLeaderSocketPath = resolveTelegramBusSocketPath(leaderSocketPath);
       await deps.startReceiving?.();
       if (!isCurrentRequest()) {
         await abandonOwnedRequest();
@@ -3568,7 +3569,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
             finally { checking = false; }
           };
           attachmentRegistration = Object.freeze({ registration: recipient, registrationIncarnation: registrationResult.registrationIncarnation,
-            leaderSocketPath, leaderProtocol: peerProtocol!, assertCurrent });
+            leaderSocketPath: attachmentLeaderSocketPath, leaderProtocol: peerProtocol!, assertCurrent });
         }
         try {
           await deps.onRegistered?.(ctx);

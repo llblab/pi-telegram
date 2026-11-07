@@ -313,6 +313,27 @@ test("Node eval fixture retains early Node option refusal with large pending inp
   assert.match(result.stderr, /bad option|unknown option/iu);
 });
 
+test("Node eval readiness bounds startup separately from execution and actual drain", async () => {
+  const result = await runNodeEval('await new Promise(resolve => setTimeout(resolve, 700)); console.log("fixture-ready"); console.log("after-ready");', {
+    timeoutMs: 500, readiness: { stdoutPrefix: "fixture-ready", startupTimeoutMs: 3000 },
+  });
+  assert.equal(result.code, 0, result.stderr); assert.match(result.stdout, /after-ready/u);
+  const started = performance.now();
+  await assert.rejects(runNodeEval('console.log("fixture-ready"); setInterval(() => console.log("fixture-ready"), 100);', {
+    timeoutMs: 500, readiness: { stdoutPrefix: "fixture-ready", startupTimeoutMs: 3000 },
+  }), /did not exit \(execution\/drain\)/u);
+  assert.ok(performance.now() - started < 3000, "Extra startup allowance cannot conceal post-ready retained handles or marker renewal");
+});
+
+test("Node eval readiness refuses missing checkpoints within its startup bound", async () => {
+  await assert.rejects(runNodeEval('setInterval(() => {}, 1000);', {
+    timeoutMs: 1000, readiness: { stdoutPrefix: "fixture-ready", startupTimeoutMs: 300 },
+  }), /did not exit \(startup\)/u);
+  await assert.rejects(runNodeEval('console.log("not-ready");', {
+    timeoutMs: 500, readiness: { stdoutPrefix: "fixture-ready", startupTimeoutMs: 3000 },
+  }), /closed before readiness/u);
+});
+
 test("Domain test filenames mirror their owning lib domain", () => {
   const libDomains = new Set(
     readdirSync(join(PROJECT_ROOT, "lib"))

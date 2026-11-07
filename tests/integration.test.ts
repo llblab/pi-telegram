@@ -5711,8 +5711,8 @@ function getRuntimeTelegramApiText(
   return String(body?.text ?? richMessage?.html ?? richMessage?.markdown ?? "");
 }
 
-async function createRuntimeTelegramConfigFixture() {
-  const agentDir = await ensureRuntimeAgentDir();
+async function createRuntimeTelegramConfigFixture(agentDirectory?: string) {
+  const agentDir = agentDirectory ?? await ensureRuntimeAgentDir();
   const configPath = join(agentDir, "telegram.json");
   const previousConfig = await readFile(configPath, "utf8").catch(
     () => undefined,
@@ -7232,11 +7232,12 @@ test(`Production question root uses original SDK binding at birth, not ACK (${so
       phase("shutdown-done");
       Delivery.clearTelegramDeliveryRuntime(); Worker.prototype.terminate = terminate; clearInterval(keepAlive); await rm(dir, { recursive: true, force: true });
     }
-  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: callbackKind.startsWith("timed-direct") ? 20000 : 12000 });
+  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: callbackKind.startsWith("timed-direct") ? 20000 : 12000,
+    readiness: { stdoutPrefix: "root-question-phase:import-complete:", startupTimeoutMs: 10000 } });
   assert.equal(result.code, 0, result.stdout + result.stderr); assert.match(result.stdout, /root-question-original-binding-pass/u);
   assert.match(result.stdout, /root-question-phase:import-complete:elapsedMs=\d+/u);
   assert.match(result.stdout, /root-question-phase:shutdown-done:elapsedMs=\d+/u);
-}, callbackKind.startsWith("timed-direct") ? 25000 : 15000);
+}, callbackKind.startsWith("timed-direct") ? 35000 : 25000);
 
 for (const source of [true, false]) for (const [foreign, foreignBootstrap, replaceReceiver, noArtifact, carrier, rich] of [
   [false, false, false, false, "complete", false],
@@ -10733,13 +10734,22 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
   }, 15000);
 }
 
-test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn into pi", async () => {
-  const telegramConfig = await createRuntimeTelegramConfigFixture();
+test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn into pi", async t => {
+  const extension = await getRuntimeTelegramExtension(), previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-first-pair-")));
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const telegramConfig = await createRuntimeTelegramConfigFixture(agentDir);
   const sentMessages: RuntimeHarnessMessage[] = [];
+  let phase = "created", completed = false;
   let resolveDispatch: ((value: RuntimeHarnessMessage) => void) | undefined;
-  const dispatched = new Promise<RuntimeHarnessMessage>((resolve) => {
-    resolveDispatch = resolve;
+  let rejectDispatch: ((reason: Error) => void) | undefined;
+  const dispatched = new Promise<RuntimeHarnessMessage>((resolve, reject) => {
+    resolveDispatch = resolve; rejectDispatch = reject;
   });
+  // A timed-out attempt must unwind and run its captured shutdown rather than retain an unsettled waiter.
+  void dispatched.catch(() => {});
+  const onAbort = () => rejectDispatch?.(new Error(`Runtime dispatch aborted during ${phase}`));
+  t.signal.addEventListener("abort", onAbort, { once: true });
   const { handlers, commands, pi } = createRuntimePiHarness({
     sendUserMessage: (content) => {
       sentMessages.push(content);
@@ -10788,27 +10798,43 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     }
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
-  try {
-    await telegramConfig.write({ botToken: "123:abc", lastUpdateId: 0 });
-    (await getRuntimeTelegramExtension())(pi);
-    const ctx = createRuntimeExtensionContext();
-    await handlers.get("session_start")?.({}, ctx);
-    await commands.get("telegram-connect")?.handler("", ctx);
-    const dispatchedContent = await dispatched;
-    await flushMicrotasks();
-    assert.equal(sentMessages.length, 1);
-    assert.equal(Array.isArray(dispatchedContent), true);
-    assert.equal(apiCalls.includes("sendMessage"), true);
-    assert.equal(sendMessageCalls, 2);
-    assert.equal(apiCalls.includes("sendChatAction"), true);
-    const promptBlock = getRuntimeHarnessTextBlock(dispatchedContent);
-    assert.equal(promptBlock.type, "text");
-    assert.match(promptBlock.text ?? "", /^\[telegram\] hello from telegram$/);
-    await handlers.get("session_shutdown")?.({}, ctx);
-  } finally {
-    restoreFetch();
-    await telegramConfig.restore();
-  }
+  const ctx = createRuntimeExtensionContext();
+  t.after(async () => {
+    t.signal.removeEventListener("abort", onAbort);
+    if (!completed) {
+      console.error(`pair-dispatch-phase:${JSON.stringify({ phase, getUpdatesCalls, sendMessageCalls, sent: sentMessages.length, apiCalls })}`);
+      const log = await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8").catch(() => "<unavailable>");
+      console.error(`pair-dispatch-events:${log.slice(-12000)}`);
+    }
+    try { await handlers.get("session_shutdown")?.({}, ctx); }
+    finally {
+      restoreFetch(); await telegramConfig.restore();
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+    if (!completed) console.error("pair-dispatch-cleanup:done");
+  });
+  phase = "config";
+  await telegramConfig.write({ botToken: "123:first-pair-dispatch", lastUpdateId: 0 });
+  phase = "construct";
+  extension(pi);
+  phase = "session-start";
+  await handlers.get("session_start")?.({}, ctx);
+  phase = "connect";
+  await commands.get("telegram-connect")?.handler("", ctx);
+  phase = "await-dispatch";
+  const dispatchedContent = await dispatched;
+  phase = "assertions";
+  await flushMicrotasks();
+  assert.equal(sentMessages.length, 1);
+  assert.equal(Array.isArray(dispatchedContent), true);
+  assert.equal(apiCalls.includes("sendMessage"), true);
+  assert.equal(sendMessageCalls, 2);
+  assert.equal(apiCalls.includes("sendChatAction"), true);
+  const promptBlock = getRuntimeHarnessTextBlock(dispatchedContent);
+  assert.equal(promptBlock.type, "text");
+  assert.match(promptBlock.text ?? "", /^\[telegram\] hello from telegram$/);
+  completed = true;
 });
 
 for (const scenario of ["acknowledged", "lost-registration-reply"] as const) {

@@ -4221,11 +4221,11 @@ test("Bus follower queue handoff client requires an exact staged acknowledgement
 });
 
 for (const threaded of [false, true])
-for (const fault of ["known", "old-local", "old-leader", "missing-meta", "same-version", "missing-receipt", "bad-version", "wrong-outer-id", "wrong-receipt-id",
+for (const fault of ["known", "known-long-endpoint", "old-local", "old-leader", "missing-meta", "same-version", "missing-receipt", "bad-version", "wrong-outer-id", "wrong-receipt-id",
   "wrong-nonce", "wrong-generation", "wrong-instance", "wrong-target", "wrong-incarnation", "mismatched-message", "missing-protocol", "late-protocol", "late-generation", "lost-ack",
   "missing-scope", "scope-error", "scope-reader", "scope-ended", "scope-target", "scope-session", "scope-process", "scope-endpoint", "late-scope-rebind", "late-scope-restore", "late-scope-stop"] as const)
 test(`Attachment caller requires negotiated peer and exact receipt without fallback (Thread=${threaded}, ${fault})`, async () => {
-  const dir = mkdtempSync(join(tmpdir(), "pt-attachment-peer-")), socketPath = join(dir, "bus.sock"), target = { chatId: 7, ...(threaded ? { threadId: 11 } : {}) };
+  const dir = mkdtempSync(join(tmpdir(), "pt-attachment-peer-")), socketPath = join(dir, ...(fault === "known-long-endpoint" ? ["long-context-".repeat(12)] : []), "bus.sock"), target = { chatId: 7, ...(threaded ? { threadId: 11 } : {}) };
   const local = createTelegramBusProtocolIdentity({ runtimeBuild: "0.58.3", capabilities: fault === "old-local" ? [] : [TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION] });
   const remote = createTelegramBusProtocolIdentity({ runtimeBuild: "0.58.3", capabilities: ["old-leader", "same-version"].includes(fault) ? [] : [TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION] });
   const state = createTelegramBusFollowerRegistrationState(), registry = createTelegramBusFollowerRegistry();
@@ -4280,8 +4280,9 @@ test(`Attachment caller requires negotiated peer and exact receipt without fallb
     if (fault === "scope-endpoint") endpoint += "changed";
     const operation = call("call", ["sendMessage", { chat_id: fault === "scope-target" ? 8 : 7, ...(threaded ? { message_thread_id: 11 } : {}), text: "Question?",
       reply_markup: { inline_keyboard: [[{ text: "Cancel", callback_data: `tgattach:${"a".repeat(32)}:cancel` }]] } }]);
-    if (fault === "known") {
+    if (fault === "known" || fault === "known-long-endpoint") {
       const result = await operation as Record<string, unknown>; assert.ok(parseTelegramBusAttachmentPublicationReceipt(result[TELEGRAM_BUS_ATTACHMENT_PUBLICATION_RECEIPT]));
+      assert.equal(registration.captureAttachmentPublicationRegistration!()!.leaderSocketPath, resolveTelegramBusSocketPath(socketPath));
     } else if (preflight) await assert.rejects(operation, error => error instanceof TelegramApiAuthorityError && !error.requestIssued);
     else await assert.rejects(operation, isTelegramApiCommitUnknownError);
     assert.equal(wires, preflight ? 0 : 1);

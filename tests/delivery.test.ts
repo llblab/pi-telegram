@@ -4806,9 +4806,9 @@ test(`Non-Attachment question rejects an Attachment publication-shaped transport
 });
 
 for (const threaded of [false, true])
-for (const fault of ["known", "missing-transport", "missing-pinner", "bare-pinner", "origin-lost", "scope-lost", "bot-mismatch", "unknown", "ordinary-ack", "duplicate", "capture-lost", "waiting-stop", "waiting-rebind", "waiting-reentry"] as const)
+for (const fault of ["known", "known-long-endpoint", "missing-transport", "missing-pinner", "bare-pinner", "origin-lost", "scope-lost", "bot-mismatch", "unknown", "ordinary-ack", "duplicate", "capture-lost", "waiting-stop", "waiting-rebind", "waiting-reentry"] as const)
 test(`Attachment consumer pins native follower publication before exposing exact receiver (Thread=${threaded}, ${fault})`, async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pt-attach-consumer-")), socketPath = join(dir, "bus.sock"), destination = { chatId: 42, ...(threaded ? { threadId: 7 } : {}) };
+  const dir = await mkdtemp(join(tmpdir(), "pt-attach-consumer-")), socketPath = join(dir, ...(fault === "known-long-endpoint" ? ["long-context-".repeat(12)] : []), "bus.sock"), destination = { chatId: 42, ...(threaded ? { threadId: 7 } : {}) };
   const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "consumer", capabilities: [TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] });
   const registry = createTelegramBusFollowerRegistry(), state = createTelegramBusFollowerRegistrationState(); let sequence = 0, sends = 0, originProfile = "default", bot = 777, nonce = "", pins = 0;
   const leaderOwnership = createTelegramBusMessageOwnershipRuntime({ instanceId: "leader", getProfileKey: () => "default", listFollowers: registry.list });
@@ -4872,15 +4872,15 @@ test(`Attachment consumer pins native follower publication before exposing exact
   try {
     await server.start(); assert.equal(await registration.registerWithLeader({ cwd: "/repo" }, { busSocketPath: socketPath }), true);
     const result = await runtime.openAttachmentQuestion!(attachmentQuestion());
-    if (["known", "waiting-stop", "waiting-rebind", "waiting-reentry"].includes(fault)) {
+    if (["known", "known-long-endpoint", "waiting-stop", "waiting-rebind", "waiting-reentry"].includes(fault)) {
       assert.ok(result.ok); assert.ok(leaderOwnership.store.getOriginal(42, 501)); assert.ok(consumerOwnership.store.getOriginal(42, 501));
       assert.equal(consumerOwnership.store.getOriginal(42, 501)!.record.instanceId, "consumer"); assert.equal(pins, 1);
       const identity = { requestId: result.handle.id, messageId: 501, operatorId: 42, botId: 777, profile: "default", target: destination };
       const receiver = runtime.captureAttachmentReceiver!(identity); assert.ok(receiver); receiver.assertCurrent();
-      if (fault === "known") await assert.rejects(publication!.publish({ chat_id: 42, text: "Repeat", ...((threaded) ? { message_thread_id: 7 } : {}),
+      if (fault === "known" || fault === "known-long-endpoint") await assert.rejects(publication!.publish({ chat_id: 42, text: "Repeat", ...((threaded) ? { message_thread_id: 7 } : {}),
         reply_markup: { inline_keyboard: [[{ text: "Cancel", callback_data: `tgattach:${nonce}:cancel` }]] } }, () => {}),
         error => error instanceof TelegramApiAuthorityError && !error.requestIssued);
-      if (fault !== "known") {
+      if (fault !== "known" && fault !== "known-long-endpoint") {
         let settled = false; void result.handle.result.then(() => { settled = true; });
         if (fault === "waiting-reentry") { receiverReentry = receiver.assertCurrent; reenter = true; }
         else if (fault === "waiting-stop") registration.stop();
