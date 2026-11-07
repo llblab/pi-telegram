@@ -29,12 +29,10 @@ export function runNodeEval(
       ...(options.nodeArgs ?? []),
       "--experimental-strip-types",
       "--input-type=module",
-      "--eval",
-      source,
     ],
     {
       env: { ...process.env, ...options.env },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     },
   );
   let stdout = "";
@@ -61,9 +59,18 @@ export function runNodeEval(
       clearTimeout(timeout);
       reject(error);
     });
-    child.on("exit", (code, signal) => {
+    child.on("close", (code, signal) => {
       clearTimeout(timeout);
       resolve({ code, signal, stdout, stderr });
     });
+    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+      // Early option/launch refusal can close stdin before the fixture source is consumed.
+      if (error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED") return;
+      clearTimeout(timeout);
+      child.kill("SIGKILL");
+      reject(error);
+    });
+    // Keep eval/import/argv semantics without putting large fixtures in the Windows command line.
+    child.stdin.end(source);
   });
 }

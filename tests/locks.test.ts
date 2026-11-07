@@ -979,7 +979,7 @@ function proposedGuardMarkerIdentity(marker: string) {
 for (const artifact of ["source", "compiled"] as const)
 for (const scenario of ["repeated", "contenders"] as const)
 for (const metadata of ["complete", "empty"] as const)
-test(`Proposed guard claim filesystem model retains original identity (${artifact}/${scenario}/${metadata})`, async () => {
+test(`Proposed guard model retains evidence without granting raced rename authority (${artifact}/${scenario}/${metadata})`, async t => {
   const locks = artifact === "source" ? await import("../lib/locks.ts") : await import("../dist/lib/locks.js");
   const temp = createTempLockPath(), path = `${temp.path}.transaction`;
   try {
@@ -1034,8 +1034,16 @@ test(`Proposed guard claim filesystem model retains original identity (${artifac
       return { marker, recovererPid: fields.recoverer.pid, recovererNonce: fields.recoverer.nonce };
     };
     assertClosed();
-    if (scenario === "contenders") assert.deepEqual((await Promise.all([claim(initialMarker), claim(initialMarker)])).sort(), ["claimed", "lost"]);
-    else assert.equal(await claim(initialMarker), "claimed");
+    if (scenario === "contenders") {
+      const reports = await Promise.all([claim(initialMarker), claim(initialMarker)]);
+      assert.ok(reports.every(report => report === "claimed" || report === "lost"));
+      readClaim(); assertClosed();
+      // Windows can report success twice: a raced source rename is not a portable CAS or grant.
+      t.diagnostic(`Observed rename reports: ${reports.join(", ")}; recovery authority remains unproved`);
+      assert.equal(existsSync(join(temp.dir, "retired")), false);
+      return;
+    }
+    assert.equal(await claim(initialMarker), "claimed");
     const first = readClaim(); assertClosed();
     if (scenario === "repeated") {
       assert.equal(await claim(first.marker), "claimed");
