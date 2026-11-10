@@ -4889,6 +4889,7 @@ test("Storage reference preparation rejects historical aliases without redirecti
     import * as Config from ${JSON.stringify(new URL("../lib/config.ts", import.meta.url).href)};
     import * as Journal from ${JSON.stringify(new URL("../lib/journal.ts", import.meta.url).href)};
     import * as Admission from ${JSON.stringify(new URL("../lib/workspace-admission.ts", import.meta.url).href)};
+    console.log("reference-preparation-checkpoint ready");
     const originalCwd = process.cwd();
     const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "pi-telegram-reference-")));
     const snapshot = (directory) => fs.readdirSync(directory, { withFileTypes: true })
@@ -4991,10 +4992,11 @@ test("Storage reference preparation rejects historical aliases without redirecti
       process.chdir(originalCwd);
       fs.rmSync(root, { recursive: true, force: true });
     }
-  `);
-  assert.equal(result.code, 0, result.stderr || result.stdout);
-  assert.equal(result.stdout.trim(), "reference-preparation-ok");
-}, 10_000);
+  `, { timeoutMs: 5000, readiness: { stdoutPrefix: "reference-preparation-checkpoint ready", startupTimeoutMs: 10000 } });
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.deepEqual(result.stdout.trim().split(/\r?\n/u), ["reference-preparation-checkpoint ready", "reference-preparation-ok"]);
+}, 20_000);
 
 test("Cross-instance agent turns route in both leader and follower directions", async () => {
   const followerRegistry = Bus.createTelegramBusFollowerRegistry();
@@ -5508,7 +5510,9 @@ for (const scenario of [
     };
     const net = (await import("node:net")).default, originalConnect = net.createConnection;
     const wireBoundaries: Array<{ attempt: number; phase: string }> = [];
+    let observingForward = false, lifecycleConnections = 0;
     const connectionMock = mock.method(net, "createConnection", (...args: unknown[]) => {
+      if (!observingForward) { lifecycleConnections++; return Reflect.apply(originalConnect, net, args) as import("node:net").Socket; }
       assertValidated("pre-connect");
       wireBoundaries.push({ attempt: requests, phase: "pre-connect" });
       const socket = Reflect.apply(originalConnect, net, args) as import("node:net").Socket;
@@ -5574,6 +5578,12 @@ for (const scenario of [
     });
     try {
       await receiver.start();
+      const beforeProbe = lifecycleConnections;
+      const lifecycleProbe = await BusTransport.probeTelegramBusEndpoint({ endpoint: Bus.resolveTelegramBusSocketPath(socketPath), timeoutMs: 50 });
+      assert.equal(lifecycleProbe.reachable, true, "A transport-only probe must not enter semantic forwarding observations");
+      assert.equal(lifecycleConnections, beforeProbe + 1);
+      assert.equal(requests, 0); assert.equal(ownershipChecks.length, 0); assert.equal(wireBoundaries.length, 0);
+      observingForward = true;
       leaderJournal.appendBatch([source]);
       worker.start("leader-ctx");
       for (let failureCount = 1; failureCount <= 2; failureCount++) {
@@ -5630,6 +5640,7 @@ for (const scenario of [
         assert.deepEqual(envelope.delivery, delivery);
       }
     } finally {
+      observingForward = false;
       connectionMock.mock.restore(); syncBuiltinESMExports();
       assert.equal(net.createConnection, originalConnect, "Native global exports are restored before another fixture runs");
       await worker.stop();
@@ -12633,8 +12644,9 @@ for (const outcome of ["ready", "ack-after-connect", "expired", "scope", "port",
 test(`Native held connect keeps readiness and ACK lifetimes separate (${artifact}/${outcome})`, async () => {
   const run = async () => {
     let dispatch!: () => void, selected = 0, connected = 0, written = 0, issued = 0, received = 0, waits = 0, current = true, forceExpired = false, settled = false;
+    let capturingConnect = false, lifecycleConnections = 0;
     let socket: import("node:net").Socket | undefined;
-    await holdNativeConnectEvents({ select: () => { selected++; return true; }, connected(native, invoke) { connected++; socket = native; dispatch = invoke; }, written() { written++; } });
+    await holdNativeConnectEvents({ select: () => { if (!capturingConnect) { lifecycleConnections++; return false; } selected++; return true; }, connected(native, invoke) { connected++; socket = native; dispatch = invoke; }, written() { written++; } });
     const Bus: typeof import("../lib/bus.ts") = await import(artifact === "source" ? "./lib/bus.ts" : "./dist/lib/bus.js");
     const dir = await mkdtemp(join(tmpdir(), "pt-held-connect-")), socketPath = join(dir, "bus.sock");
     const server = Bus.createTelegramBusLocalServer({ socketPath, async handleEnvelope(request) {
@@ -12646,6 +12658,13 @@ test(`Native held connect keeps readiness and ACK lifetimes separate (${artifact
     let pending: Promise<{ result?: unknown; error?: unknown }> | undefined;
     try {
       await server.start();
+      const Transport = await import(artifact === "source" ? "./lib/bus-transport.ts" : "./dist/lib/bus-transport.js");
+      const beforeProbe = lifecycleConnections;
+      const lifecycleProbe = await Transport.probeTelegramBusEndpoint({ endpoint: Bus.resolveTelegramBusSocketPath(socketPath), timeoutMs: 50 });
+      assert.equal(lifecycleProbe.reachable, true, "A native lifecycle probe must not be held as the governed request");
+      assert.equal(lifecycleConnections, beforeProbe + 1);
+      assert.equal(selected, 0); assert.equal(connected, 0); assert.equal(issued, 0); assert.equal(written, 0); assert.equal(received, 0);
+      capturingConnect = true;
       const born = performance.now(), readiness = { remainingMs: () => forceExpired ? 0 : (outcome === "expired" ? 80 : 2000) - (performance.now() - born), async wait() { waits++; return true; } };
       pending = Bus.sendTelegramBusLocalEnvelope({ socketPath, timeoutMs: 200,
         envelope: { kind: "follower.register", requestId: "held-connect", registration: { instanceId: "fixture", connectedAtMs: 0 } },
@@ -12679,7 +12698,7 @@ test(`Native held connect keeps readiness and ACK lifetimes separate (${artifact
       assert.equal(selected, 1); assert.equal(connected, 1); assert.equal(waits, 0, "A held native connect or issued request is not a failed-connect retry proof");
       const unissued = ["expired", "scope", "port"].includes(outcome), unwritten = unissued || outcome === "marker-expired";
       assert.equal(issued, unissued ? 0 : 1); assert.equal(written, unwritten ? 0 : 1); assert.equal(received, written);
-    } finally { dispatch?.(); await pending; await server.stop(); await rm(dir, { recursive: true, force: true }); }
+    } finally { capturingConnect = false; dispatch?.(); await pending; await server.stop(); await rm(dir, { recursive: true, force: true }); }
   };
   const result = await runNodeEval(`
     import assert from "node:assert/strict";
