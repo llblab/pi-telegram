@@ -2,6 +2,8 @@
 
 > Each release keeps at most 8 outcome records of at most 512 characters.
 
+## Unreleased
+
 ## 0.59.0-rc.2: Runtime Recovery And Lifetime Fences
 
 - `Admission lifetimes`: Same-process workers retain source-qualified execution exclusion across Root reconstruction until actual handler settlement. Waiter cancellation and DTO mutation cannot release or strand the original claim; profile/bot/journal namespaces remain independent. Root assembly now forwards existing source-reference admission to leader/follower lifecycles, so refused leases block before worker source I/O. Integrated/platform/live gates remain separate.

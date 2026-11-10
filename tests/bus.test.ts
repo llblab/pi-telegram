@@ -2102,6 +2102,8 @@ test("Stale bus server cannot publish over a replacement endpoint generation", a
     const staleStart = stale.start();
     await publicationReady;
     await replacement.start();
+    // Unix has already registered its listener here; a pending Windows pipe has not entered the active-server map.
+    await stale.stop();
     releasePublication?.();
     await assert.rejects(staleStart, /cancelled or superseded/);
     assert.equal(commitCalls, 0, "A stopped startup cannot even consult a fresh publication grant");
