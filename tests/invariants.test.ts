@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
@@ -477,6 +477,134 @@ test("Integration CI name shards are exhaustive, disjoint and use actual registr
   const source = readFileSync(join(PROJECT_ROOT, "tests/integration.test.ts"), "utf8");
   assert.equal([...source.matchAll(/\bnativeTest\(/gu)].length, 1, "Every registration must pass the selector");
   assert.match(source, /if \(!selectIntegrationTest\(name\)\) return/);
+});
+
+async function createNativeBuildFixture() {
+  const root = await mkdtemp(join(tmpdir(), "pt-build-#%-λ-"));
+  for (const path of ["scripts", ".git", "node_modules/typescript/bin", "skills", "lib"])
+    await mkdir(join(root, path), { recursive: true });
+  await writeFile(join(root, "scripts/build-dist.mjs"), readFileSync(join(PROJECT_ROOT, "scripts/build-dist.mjs")));
+  await writeFile(join(root, "package.json"), '{"type":"module"}');
+  await writeFile(join(root, ".git/HEAD"), "ab".repeat(20) + "\n");
+  await writeFile(join(root, "skills/probe.md"), "fixture asset\n");
+  await writeFile(join(root, "lib/generative-app-worker.mjs"), "export {};\n");
+  await writeFile(join(root, "node_modules/typescript/package.json"), '{"type":"commonjs"}');
+  await writeFile(join(root, "node_modules/typescript/bin/tsc"), `
+    const { mkdirSync, writeFileSync, existsSync } = require("node:fs");
+    const { join } = require("node:path");
+    const { setTimeout: delay } = require("node:timers/promises");
+    (async () => {
+      if (process.env.BUILD_FIXTURE_ENTERED) writeFileSync(process.env.BUILD_FIXTURE_ENTERED, "entered");
+      while (process.env.BUILD_FIXTURE_RELEASE && !existsSync(process.env.BUILD_FIXTURE_RELEASE)) await delay(10);
+      writeFileSync(join(process.cwd(), "compiler-argv.json"), JSON.stringify(process.execArgv));
+      const out = process.argv[process.argv.indexOf("--outDir") + 1];
+      mkdirSync(join(out, "lib"), { recursive: true });
+      writeFileSync(join(out, "index.js"), "export default function() {}\\r\\n");
+      console.log("original compiler stdout"); console.error("original compiler stderr");
+      if (process.env.BUILD_FIXTURE_FAILURE === "signal") { process.kill(process.pid, "SIGTERM"); return; }
+      process.exitCode = Number(process.env.BUILD_FIXTURE_FAILURE ?? 0);
+    })();
+  `);
+  return root;
+}
+
+function readNativeBuildRecords(stdout: string): Record<string, unknown>[] {
+  return stdout.split(/\r?\n/u).filter(line => line.startsWith("::notice title=CI native build::"))
+    .map(line => JSON.parse(line.slice("::notice title=CI native build::".length)) as Record<string, unknown>);
+}
+
+test("CI build checkpoints retain native compiler outcomes and rollback-safe publication", { timeout: 20000 }, async () => {
+  const root = await createNativeBuildFixture();
+  const run = (github = "true", args: string[] = [], failure = "0") => spawnSync(process.execPath, ["scripts/build-dist.mjs", ...args], {
+    cwd: root, encoding: "utf8", timeout: 5000,
+    env: { ...process.env, GITHUB_ACTIONS: github, BUILD_FIXTURE_FAILURE: failure, PRIVATE_BUILD_FIXTURE: "never disclose this value" },
+  });
+  try {
+    const built = run(); assert.equal(built.status, 0, built.stdout + built.stderr); assert.equal(built.signal, null);
+    const records = readNativeBuildRecords(built.stdout);
+    assert.deepEqual(records.map(r => r.phase), ["build-entered", "compiler-invoking", "compiler-node-entered", "compiler-node-exiting", "compiler-returned", "assets-prepared", "publication-invoking", "publication-complete"]);
+    assert.equal(records[1]!.detachedHead, "ab".repeat(20));
+    assert.equal(records[0]!.pid, built.pid); assert.equal(records[2]!.ppid, built.pid);
+    assert.equal(records[2]!.pid, records[4]!.childPid); assert.equal(records[3]!.code, 0); assert.equal(records[4]!.code, 0);
+    assert.ok(built.stdout.includes("original compiler stdout")); assert.ok(built.stderr.includes("original compiler stderr"));
+    assert.ok(Buffer.byteLength(built.stdout.split(/\r?\n/u).filter(line => line.startsWith("::notice title=CI native build::")).join("\n")) <= 4096);
+    const fields = new Set(["v", "build", "phase", "pid", "ppid", "uptimeMs", "check", "detachedHead", "childPid", "code", "signal", "spawnError"]);
+    assert.match(String(records[0]!.build), /^[a-f0-9]{16}$/u);
+    assert.ok(records.every(r => r.build === records[0]!.build));
+    assert.ok(records.every(r => Object.keys(r).every(key => fields.has(key))));
+    assert.ok(records.every(r => Object.values(r).every(value => typeof value !== "string" || !value.includes(root) && !value.includes("never disclose"))));
+    for (const pid of new Set(records.map(r => r.pid))) {
+      const clock = records.filter(r => r.pid === pid).map(r => Number(r.uptimeMs));
+      assert.ok(clock.every((at, i) => Number.isSafeInteger(at) && at >= 0 && (!i || at >= clock[i - 1]!)));
+    }
+    const checked = run("true", ["--check"]); assert.equal(checked.status, 0, checked.stdout + checked.stderr);
+    assert.equal(readNativeBuildRecords(checked.stdout).at(-1)!.phase, "publication-complete");
+    assert.notEqual(readNativeBuildRecords(checked.stdout)[0]!.build, records[0]!.build, "Another build cannot borrow the original invocation identity");
+    const originalDist = readFileSync(join(root, "dist/index.js"));
+    const failed = run("true", [], "7"); assert.equal(failed.status, 1); assert.equal(failed.signal, null);
+    const failure = readNativeBuildRecords(failed.stdout);
+    assert.equal(failure.find(r => r.phase === "compiler-node-exiting")!.code, 7);
+    assert.equal(failure.find(r => r.phase === "compiler-returned")!.code, 7);
+    assert.ok(!failure.some(r => r.phase === "publication-complete")); assert.match(failed.stderr, /exited with status 7/);
+    assert.deepEqual(readFileSync(join(root, "dist/index.js")), originalDist);
+    const nativeSignal = spawnSync(process.execPath, ["node_modules/typescript/bin/tsc", "--outDir", join(root, "signal-reference")], {
+      cwd: root, encoding: "utf8", timeout: 5000, env: { ...process.env, BUILD_FIXTURE_FAILURE: "signal" },
+    });
+    assert.equal(nativeSignal.error, undefined);
+    assert.ok(nativeSignal.signal !== null || nativeSignal.status !== 0, "Original signal control must not be a healthy compiler exit");
+    const signalled = run("true", [], "signal"), signalRecord = readNativeBuildRecords(signalled.stdout).find(r => r.phase === "compiler-returned")!;
+    assert.equal(signalled.status, 1); assert.equal(signalRecord.code, nativeSignal.status); assert.equal(signalRecord.signal, nativeSignal.signal);
+    assert.ok(!readNativeBuildRecords(signalled.stdout).some(r => r.phase === "publication-complete"));
+    assert.deepEqual(readFileSync(join(root, "dist/index.js")), originalDist);
+    await writeFile(join(root, "dist/index.js"), "stale dist");
+    const stale = run("true", ["--check"]); assert.equal(stale.status, 1); assert.match(stale.stderr, /dist\/index.js is stale/);
+    assert.ok(!readNativeBuildRecords(stale.stdout).some(r => r.phase === "publication-complete"));
+    assert.equal(readFileSync(join(root, "dist/index.js"), "utf8"), "stale dist");
+    for (const github of ["false", "TRUE", ""]) {
+      const ordinary = run(github); assert.equal(ordinary.status, 0, ordinary.stdout + ordinary.stderr);
+      assert.deepEqual(readNativeBuildRecords(ordinary.stdout), []);
+      assert.deepEqual(JSON.parse(readFileSync(join(root, "compiler-argv.json"), "utf8")), [], "Non-CI compiler arguments remain unchanged");
+    }
+    assert.ok(!readdirSync(root).some(name => name.startsWith(".dist-build-") || name.startsWith(".dist-backup-")));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("CI build compiler entry cannot certify held body completion or publication", { timeout: 20000 }, async () => {
+  const root = await createNativeBuildFixture(), entered = join(root, "entered"), release = join(root, "release");
+  const child = spawn(process.execPath, ["scripts/build-dist.mjs"], { cwd: root,
+    env: { ...process.env, GITHUB_ACTIONS: "true", BUILD_FIXTURE_ENTERED: entered, BUILD_FIXTURE_RELEASE: release }, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "", stderr = "", closed = false;
+  child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+  child.stdout.on("data", chunk => { stdout += chunk; }); child.stderr.on("data", chunk => { stderr += chunk; });
+  const completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject); child.once("close", (code, signal) => { closed = true; resolve({ code, signal }); });
+  });
+  try {
+    const deadline = performance.now() + 2000;
+    while ((!existsSync(entered) || !readNativeBuildRecords(stdout).some(r => r.phase === "compiler-node-entered")) && !closed && performance.now() < deadline)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(existsSync(entered), "Original compiler body must enter within its startup observation");
+    assert.ok(readNativeBuildRecords(stdout).some(r => r.phase === "compiler-node-entered"), "Original compiler Node entry must be visible while its body is held");
+    assert.equal(closed, false); assert.equal(existsSync(join(root, "dist")), false);
+    assert.ok(!readNativeBuildRecords(stdout).some(r => ["compiler-node-exiting", "compiler-returned", "publication-complete"].includes(String(r.phase))));
+    await writeFile(release, "release");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const result = await Promise.race([completion, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Native build did not drain after original compiler release")), 2000);
+    })]).finally(() => clearTimeout(timer));
+    assert.equal(result.code, 0, stdout + stderr); assert.equal(result.signal, null);
+    assert.equal(readNativeBuildRecords(stdout).at(-1)!.phase, "publication-complete");
+  } finally {
+    await writeFile(release, "release");
+    if (!closed) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([completion.catch(() => {}), new Promise(resolve => { timer = setTimeout(resolve, 1000); })])
+        .finally(() => clearTimeout(timer));
+    }
+    if (!closed) child.kill("SIGKILL");
+    await completion.catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Release CI validates exact tags and publishes through npm Trusted Publisher", () => {
