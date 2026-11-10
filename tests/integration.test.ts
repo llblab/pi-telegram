@@ -13304,13 +13304,14 @@ test(`Production early follower waits for original leader readiness without manu
   const leaderCtx = createRuntimeExtensionContext({ cwd: "/readiness-leader" });
   const followerCtx = createRuntimeExtensionContext({ cwd: "/readiness-follower" });
   let release!: () => void, probeStarted = false, polls = 0, topics = 40, takeovers = 0, sends = 0;
-  const notices: string[] = [];
+  const notices: string[] = [], methods: string[] = [];
   Object.assign(followerCtx.ui, { notify(text: string) { notices.push(text); } });
   const capability = new Promise<void>(resolve => { release = resolve; });
   const commandCtx = followerCtx as typeof followerCtx & { ui: { confirm: () => Promise<boolean> } };
   commandCtx.ui.confirm = async () => { takeovers++; return false; };
   const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
+    methods.push(method);
     if (method === "getMe") { probeStarted = true; await capability; return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: outcome !== "classic" }); }
     if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: ++topics, name: "Fixture" });
     if (method === "getUpdates" && ++polls === 1) return createRuntimeTelegramApiResponse([]);
@@ -13322,6 +13323,25 @@ test(`Production early follower waits for original leader readiness without manu
     if (["deleteWebhook", "setMyCommands", "editForumTopic", "sendChatAction"].includes(method)) return createRuntimeTelegramApiResponse(true);
     throw new Error(`Unexpected readiness method ${method}`);
   });
+  const readEvents = async () => (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8"))
+    .split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(event => event.kind === "event");
+  const readReadinessEvents = async () => (await readEvents()).filter(event =>
+    event.details?.phase === "follower-readiness-wait" || event.details?.phase === "follower-readiness-expired");
+  const assertDebugReadiness = async () => {
+    const originalEvents = await readReadinessEvents(), beforeDebug = notices.length, beforeMethods = methods.slice();
+    await follower.commands.get("telegram-status")!.handler("--debug", commandCtx);
+    const debug = notices.slice(beforeDebug).join("\n");
+    for (const event of originalEvents) {
+      const lines = debug.split("\n").filter(line => line.includes(event.message));
+      assert.equal(lines.length, 1, "Debug must expose the same original readiness event once");
+      assert.ok(lines[0]!.includes(new Date(event.at).toISOString()));
+      assert.ok(lines[0]!.includes("bus: " + event.message));
+      for (const [key, value] of Object.entries(event.details)) assert.ok(lines[0]!.includes(`${key}=${JSON.stringify(value)}`));
+    }
+    assert.equal(debug.includes(bot.botToken), false);
+    assert.deepEqual(methods, beforeMethods, "Readiness debug cannot issue another Bot API request");
+    assert.deepEqual(await readReadinessEvents(), originalEvents, "Debug cannot duplicate or renew readiness evidence");
+  };
   let connecting: Promise<void> | undefined, following: Promise<void> | undefined, followerSettled = false;
   try {
     process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -13333,6 +13353,14 @@ test(`Production early follower waits for original leader readiness without manu
     following = follower.commands.get("telegram-connect")!.handler(profile ?? "", commandCtx).finally(() => { followerSettled = true; });
     await waitForAsyncCondition(async () => fs.existsSync(Paths.resolveTelegramRuntimeLogPath(agentDir)) &&
       (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")).includes("follower-readiness-wait"));
+    const initialEvents = await readReadinessEvents();
+    assert.equal(initialEvents.length, 1, "One original native wait produces one event, not a substring match");
+    const waitingEvent = initialEvents[0]!;
+    assert.equal(waitingEvent.category, "bus");
+    assert.equal(waitingEvent.message, "Waiting for original Telegram leader Thread mode.");
+    assert.deepEqual(waitingEvent.details, { phase: "follower-readiness-wait" });
+    assert.equal(waitingEvent.profile, profile ?? "default");
+    await assertDebugReadiness();
     assert.equal(followerSettled, false, "The original command, not a second admission, waits for capability publication");
     assert.equal(takeovers, 0, "Unknown capability cannot be offered as classic takeover");
     assert.equal(polls, 0); assert.equal(topics, 40);
@@ -13344,7 +13372,17 @@ test(`Production early follower waits for original leader readiness without manu
     if (["timeout", "disconnect", "owner"].includes(outcome)) {
       await following;
       assert.equal(polls, 0); assert.equal(topics, 40, "An expired/cancelled wait cannot provision before leader capability settles");
-      if (outcome === "timeout") assert.ok(notices.some(text => text.includes("Timed out waiting for Telegram leader readiness")));
+      if (outcome === "timeout") {
+        assert.ok(notices.some(text => text.includes("Timed out waiting for Telegram leader readiness")));
+        await waitForAsyncCondition(async () => (await readReadinessEvents()).some(event => event.details?.phase === "follower-readiness-expired"));
+        const expired = (await readReadinessEvents()).filter(event => event.details?.phase === "follower-readiness-expired");
+        assert.equal(expired.length, 1, "Only the actual native deadline emits one expiry outcome");
+        assert.equal(expired[0]!.category, "bus");
+        assert.equal(expired[0]!.message, "Original Telegram leader readiness deadline elapsed.");
+        assert.deepEqual(expired[0]!.details, { phase: "follower-readiness-expired", reason: "readiness-deadline" });
+        assert.equal(expired[0]!.profile, profile ?? "default");
+        await assertDebugReadiness();
+      }
     }
     release(); await connecting;
     if (outcome !== "owner") await waitForCondition(() => polls >= 2);
@@ -13366,6 +13404,12 @@ test(`Production early follower waits for original leader readiness without manu
       await assert.rejects(follower.tools.get("telegram_message")!.execute("still-not-ready", { text: "Fixture", chat_id: 77, thread_id: 999 }));
       assert.equal(sends, sendsBefore);
     }
+    const finalEvents = await readReadinessEvents();
+    assert.deepEqual(finalEvents.filter(event => event.details?.phase === "follower-readiness-wait"), initialEvents,
+      "Late capability and terminal observation cannot renew the original wait");
+    assert.equal(finalEvents.filter(event => event.details?.phase === "follower-readiness-expired").length, outcome === "timeout" ? 1 : 0,
+      "Classic, success, disconnect and owner loss are not deadline expiry");
+    assert.equal((await readEvents()).some(event => event.details?.phase === "state-reset"), false);
   } finally {
     release(); await connecting; await following;
     await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, commandCtx);
