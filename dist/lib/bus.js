@@ -1695,6 +1695,7 @@ export function createTelegramBusLocalServer(deps) {
             const generation = stopGeneration;
             const ports = { socketPath: deps.socketPath, before: deps.beforeEndpointPublication, commit: deps.commitEndpointPublication,
                 record: deps.recordTransportEvent };
+            const endpointClock = performance.now.bind(performance);
             let lost = false, checking = false, originalPath;
             const assertStarting = () => {
                 if (lost || checking) {
@@ -1757,25 +1758,28 @@ export function createTelegramBusLocalServer(deps) {
                         chmodSync(dirname(socketPath), 0o700);
                         if (existsSync(listenPath))
                             unlinkSync(listenPath);
-                        const legacyDeadlineMs = Date.now() + 2000;
-                        for (;;) {
-                            assertStarting();
-                            let legacy = false;
+                    }
+                    // Windows reuses the canonical pipe name; a prior process may still be standing down after losing ownership.
+                    const endpointDrainDeadlineMs = endpointClock() + 2000;
+                    for (;;) {
+                        assertStarting();
+                        let occupied = usesWindowsPipe;
+                        if (!usesWindowsPipe) {
                             try {
-                                legacy = lstatSync(socketPath).isSocket();
+                                occupied = lstatSync(socketPath).isSocket();
                             }
                             catch { /* Endpoint does not exist. */ }
-                            if (!legacy)
-                                break;
-                            const probe = await probeTelegramBusEndpoint({ endpoint: socketPath, timeoutMs: 50 });
-                            assertStarting();
-                            if (!probe.reachable)
-                                break;
-                            if (Date.now() >= legacyDeadlineMs)
-                                throw new Error(`Timed out waiting for legacy Telegram bus endpoint: ${socketPath}`);
-                            await delayTelegramBusTransportRetry(25);
-                            assertStarting();
                         }
+                        if (!occupied)
+                            break;
+                        const probe = await probeTelegramBusEndpoint({ endpoint: socketPath, timeoutMs: 50 });
+                        assertStarting();
+                        if (!probe.reachable)
+                            break;
+                        if (endpointClock() >= endpointDrainDeadlineMs)
+                            throw new Error(`Timed out waiting for ${usesWindowsPipe ? "previous" : "legacy"} Telegram bus endpoint: ${socketPath}`);
+                        await delayTelegramBusTransportRetry(25);
+                        assertStarting();
                     }
                     const publish = (effect) => {
                         assertStarting();

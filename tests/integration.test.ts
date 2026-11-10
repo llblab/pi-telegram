@@ -11584,7 +11584,11 @@ test(`Production warm namespace loss preserves independent original lifetimes ($
   assert.match(result.stdout, /warm-original-pass/u);
 }, 20000);
 
+let productionRootFixtureSequence = 0;
+
 function launchProductionRootFixture<TStats extends { pid: number }>(role: string, source: string, executionMs = 20000) {
+  const launchOrdinal = ++productionRootFixtureSequence;
+  let readyOrdinal: number | undefined;
   const child = spawn(process.execPath, ["--experimental-strip-types", "--experimental-test-module-mocks", "--input-type=module"], { stdio: ["pipe", "pipe", "pipe", "ipc"] });
   assert.ok(child.stdin && child.stdout && child.stderr);
   let sequence = 0, stdout = "", stderr = "", closed = false, failure: Error | undefined, checkpoint = "module-linking";
@@ -11603,7 +11607,10 @@ function launchProductionRootFixture<TStats extends { pid: number }>(role: strin
   child.on("message", raw => {
     const message = raw as { id: number; result: TStats; error?: string; fixtureCheckpoint?: string; pid?: number };
     if (message.fixtureCheckpoint && message.pid === child.pid) { checkpoint = message.fixtureCheckpoint; return; }
-    if (message.id === 0) { clearTimeout(timer); timer = setTimeout(() => deadline("execution/drain timeout"), executionMs); }
+    if (message.id === 0) {
+      if (message.result?.pid === child.pid && readyOrdinal === undefined) readyOrdinal = ++productionRootFixtureSequence;
+      clearTimeout(timer); timer = setTimeout(() => deadline("execution/drain timeout"), executionMs);
+    }
     const waiter = pending.get(message.id); pending.delete(message.id);
     if (message.error) waiter?.reject(new Error(message.error)); else waiter?.resolve(message.result);
   });
@@ -11624,7 +11631,7 @@ function launchProductionRootFixture<TStats extends { pid: number }>(role: strin
     const id = ++sequence; pending.set(id, { resolve, reject }); child.send({ id, command });
   });
   return { pid: child.pid, ready, request,
-    diagnostics: () => ({ role, pid: child.pid, checkpoint, closed, stdout, stderr, firstFailure: failure?.message }),
+    diagnostics: () => ({ role, pid: child.pid, launchOrdinal, readyOrdinal, checkpoint, closed, stdout, stderr, firstFailure: failure?.message }),
     async stop() { if (!closed) await request("stop"); await completion; } };
 }
 
@@ -12142,7 +12149,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
         return changed;
       } }), start = runtime.start;
       runtime.start = async (...args: Parameters<typeof start>) => {
-        starts++;
+        starts++; lastStartOk = undefined;
         const result = await start(...args); lastStartOk = result.ok; return result;
       };
       return runtime;
@@ -12416,13 +12423,20 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     `;
     return launchProductionRootFixture<Stats>(role, source);
   };
-  const leader = launch("leader"), follower = launch("follower");
+  const leader = launch("leader");
+  let followerForCleanup: ReturnType<typeof launch> | undefined;
   let publication: Promise<{ result?: Stats; error?: unknown }> | undefined, settled = false, reconnect: Promise<Stats> | undefined;
   const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
   let stage = "native-roots-ready", primaryFailure: unknown, failed = false;
   let initialFollower: Stats | undefined, initialLeader: unknown, publicationObservation: unknown, reconnectObservation: Stats | undefined, finalObservation: unknown;
   try {
-    const [l, f] = await Promise.all([leader.ready, follower.ready]);
+    const l = await leader.ready;
+    // Namespace-loss witnesses need two live roots, not competing module bootstraps; synchronized startup has its own matrix.
+    const follower = followerForCleanup = launch("follower");
+    const f = await follower.ready;
+    const leaderBootstrap = leader.diagnostics(), followerBootstrap = follower.diagnostics();
+    assert.ok(leaderBootstrap.readyOrdinal !== undefined);
+    assert.ok(followerBootstrap.launchOrdinal > leaderBootstrap.readyOrdinal, "The follower bootstrap must follow actual native leader readiness");
     assert.equal(l.pid, leader.pid); assert.equal(f.pid, follower.pid);
     assert.notEqual(l.pid, f.pid); assert.notEqual(l.pid, process.pid); assert.notEqual(f.pid, process.pid);
     stage = "initial-leader-connect-before-fault";
@@ -12548,6 +12562,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     if (loss) assert.equal(last.namespaceHash, canonical, "Neither original completion republishes the lost namespace");
   } catch (error) { failed = true; primaryFailure = error; throw error; }
   finally {
+    const follower = followerForCleanup;
     const diagnosticFailures: PromiseRejectedResult[] = [];
     if (evidenceDir) {
       try {
@@ -12560,15 +12575,15 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
         const evidence = { version: 1, artifact, profile: profile ?? "default", loss, refreshBoundary, ownershipFault, ipcLoss, stage,
           failed, failure: primaryFailure instanceof Error ? { name: primaryFailure.name, message: primaryFailure.message, stack: primaryFailure.stack } : String(primaryFailure),
           initialFollower, initialLeader, publicationObservation, reconnectObservation, finalObservation,
-          leader: leader.diagnostics(), follower: follower.diagnostics(), runtimeLog };
+          leader: leader.diagnostics(), follower: follower?.diagnostics() ?? { notStarted: true }, runtimeLog };
         await mkdir(evidenceDir, { recursive: true });
         await writeFile(join(evidenceDir, `${artifact}-${profile ?? "default"}-${loss}-${refreshBoundary ?? "none"}-${ownershipFault}-${ipcLoss}.json`),
           JSON.stringify(evidence, null, 2).replaceAll("123:os-original", "<fixture-token>") + "\n", { flag: "wx" });
       } catch (reason) { diagnosticFailures.push({ status: "rejected", reason }); }
     }
-    await follower.request("release-refresh").catch(() => undefined);
+    await follower?.request("release-refresh").catch(() => undefined);
     await leader.request("release").catch(() => undefined); await publication?.catch(() => undefined); await reconnect?.catch(() => undefined);
-    const stopped = await Promise.allSettled([follower.stop(), leader.stop()]);
+    const stopped = await Promise.allSettled([follower?.stop(), leader.stop()]);
     const removed = await Promise.allSettled([rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })]);
     for (const result of [...diagnosticFailures, ...stopped, ...removed]) if (result.status === "rejected") {
       if (!failed) throw result.reason;

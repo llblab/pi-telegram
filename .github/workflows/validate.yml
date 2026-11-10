@@ -101,7 +101,7 @@ jobs:
         run: >-
           node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts
           --test --test-concurrency=1 --test-reporter=spec
-          --test-name-pattern="active profile endpoint|replacement endpoint generation|Leader assembly serializes follower provisioning"
+          --test-name-pattern="active profile endpoint|replacement endpoint generation|occupied native endpoint|Leader assembly serializes follower provisioning"
           tests/bus.test.ts tests/bus-leader.test.ts
       - name: Run Windows outbound voice executable probe
         if: matrix.os == 'windows-latest' && matrix.suite == 'domains'

@@ -1,6 +1,7 @@
 /**
  * Regression tests for Telegram multi-instance bus helpers
  * Covers the serializable leader/follower IPC contract and live follower registry behavior
+ * Zones: telegram, test infrastructure
  */
 
 import assert from "node:assert/strict";
@@ -2066,6 +2067,53 @@ test(`Original native startup guard does not become receiver lifetime (${artifac
     assert.ok(response?.kind === "bus.ack" && response.ok);
     assert.equal(calls, beforeRequest, "Inbound receiver authority is independent of the ended startup caller");
   } finally { release(); await pending; await joined; await server.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+for (const outcome of ["released", "stopped", "replacement", "revoked", "busy"] as const)
+test(`Bus startup waits for occupied native endpoint (${artifact}/${outcome})`, { timeout: 10000 }, async () => {
+  const Model = artifact === "source" ? { createTelegramBusLocalServer, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope } : await import("../dist/lib/bus.js");
+  const dir = mkdtempSync(join(tmpdir(), "pt-endpoint-drain-")), socketPath = join(dir, "bus.sock"), endpoint = Model.resolveTelegramBusSocketPath(socketPath);
+  let entered!: () => void, commits = 0, current = true, settled = false;
+  const probed = new Promise<void>(resolve => { entered = resolve; });
+  const original = createServer(socket => { entered(); socket.end(); });
+  await new Promise<void>((resolve, reject) => { original.once("error", reject); original.listen(endpoint, resolve); });
+  const server = Model.createTelegramBusLocalServer({ socketPath,
+    commitEndpointPublication(commit) { commits++; assert.equal(original.listening, false, "An occupied native listener cannot grant publication"); commit(); return true; },
+    handleEnvelope: request => ({ kind: "bus.ack", requestId: request.requestId, ok: true, message: "original-start" }),
+  });
+  const replacement = Model.createTelegramBusLocalServer({ socketPath,
+    handleEnvelope: request => ({ kind: "bus.ack", requestId: request.requestId, ok: true, message: "replacement" }),
+  });
+  const pending = server.start(() => { if (!current) throw new Error("Original occupied-endpoint caller ended"); })
+    .then(() => ({ ok: true as const }), error => ({ error })).finally(() => { settled = true; });
+  const retireOriginal = async () => { if (original.listening) await new Promise<void>(resolve => original.close(() => resolve())); };
+  try {
+    await Promise.race([probed, pending.then(result => {
+      if ("error" in result) throw result.error;
+      throw new Error("Startup settled before observing the live original endpoint");
+    })]);
+    await new Promise<void>(resolve => setTimeout(resolve, 60));
+    assert.equal(settled, false); assert.equal(commits, 0); assert.equal(original.listening, true);
+    if (outcome === "stopped" || outcome === "replacement") await server.stop();
+    if (outcome === "revoked") current = false;
+    if (outcome !== "busy") await retireOriginal();
+    if (outcome === "replacement") await replacement.start();
+    const result = await pending;
+    if (outcome === "released") { assert.deepEqual(result, { ok: true }); assert.equal(commits, 1); }
+    else {
+      assert.ok("error" in result && result.error instanceof Error);
+      assert.equal(commits, 0, "A canceled, revoked or still-occupied start cannot consult publication authority");
+      assert.match(result.error.message, outcome === "busy" ? /Timed out waiting for (legacy|previous) Telegram bus endpoint/ : outcome === "revoked" ? /Original occupied-endpoint caller ended/ : /cancelled or superseded/);
+    }
+    if (outcome === "released" || outcome === "replacement") {
+      const response = await Model.sendTelegramBusLocalEnvelope({ socketPath,
+        envelope: { kind: "follower.heartbeat", requestId: "after-actual-listener-close", instanceId: "fixture", sentAtMs: 0 } });
+      assert.ok(response?.kind === "bus.ack" && response.ok);
+      assert.equal(response.message, outcome === "replacement" ? "replacement" : "original-start");
+    }
+    if (outcome === "busy") assert.equal((await probeTelegramBusEndpoint({ endpoint, timeoutMs: 50 })).reachable, true, "Refusal cannot remove the original listener");
+  } finally { current = false; await server.stop(); await pending; await replacement.stop(); await retireOriginal(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("Stale bus server cannot publish over a replacement endpoint generation", async () => {
