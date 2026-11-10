@@ -487,6 +487,8 @@ async function createNativeBuildFixture() {
   await writeFile(join(root, "package.json"), '{"type":"module"}');
   await writeFile(join(root, ".git/HEAD"), "ab".repeat(20) + "\n");
   await writeFile(join(root, "skills/probe.md"), "fixture asset\n");
+  await mkdir(join(root, "skills/nested λ#"));
+  await writeFile(join(root, "skills/nested λ#/percent %.md"), "nested Unicode asset\n");
   await writeFile(join(root, "lib/generative-app-worker.mjs"), "export {};\n");
   await writeFile(join(root, "node_modules/typescript/package.json"), '{"type":"commonjs"}');
   await writeFile(join(root, "node_modules/typescript/bin/tsc"), `
@@ -515,7 +517,16 @@ function readNativeBuildRecords(stdout: string): Record<string, unknown>[] {
 
 test("CI build checkpoints retain native compiler outcomes and rollback-safe publication", { timeout: 20000 }, async () => {
   const root = await createNativeBuildFixture();
-  const run = (github = "true", args: string[] = [], failure = "0") => spawnSync(process.execPath, ["scripts/build-dist.mjs", ...args], {
+  const copyProbe = "data:text/javascript," + encodeURIComponent(`
+    import { mock } from "node:test";
+    import fs from "node:fs";
+    mock.module("node:fs", { namedExports: { ...fs, cpSync(source, destination, options) {
+      if (options?.recursive && (typeof options.filter !== "function" || options.filter(source, destination) !== true))
+        throw new Error("Build directory copy must use the portable explicit-filter traversal");
+      return fs.cpSync(source, destination, options);
+    } } });
+  `);
+  const run = (github = "true", args: string[] = [], failure = "0") => spawnSync(process.execPath, ["--experimental-test-module-mocks", "--import", copyProbe, "scripts/build-dist.mjs", ...args], {
     cwd: root, encoding: "utf8", timeout: 5000,
     env: { ...process.env, GITHUB_ACTIONS: github, BUILD_FIXTURE_FAILURE: failure, PRIVATE_BUILD_FIXTURE: "never disclose this value" },
   });
@@ -540,6 +551,7 @@ test("CI build checkpoints retain native compiler outcomes and rollback-safe pub
     const checked = run("true", ["--check"]); assert.equal(checked.status, 0, checked.stdout + checked.stderr);
     assert.equal(readNativeBuildRecords(checked.stdout).at(-1)!.phase, "publication-complete");
     assert.notEqual(readNativeBuildRecords(checked.stdout)[0]!.build, records[0]!.build, "Another build cannot borrow the original invocation identity");
+    assert.equal(readFileSync(join(root, "dist/skills/nested λ#/percent %.md"), "utf8"), "nested Unicode asset\n");
     const originalDist = readFileSync(join(root, "dist/index.js"));
     const failed = run("true", [], "7"); assert.equal(failed.status, 1); assert.equal(failed.signal, null);
     const failure = readNativeBuildRecords(failed.stdout);

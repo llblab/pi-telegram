@@ -132,7 +132,8 @@ try {
     "utf8",
   );
   normalizeTextFiles(candidate);
-  cpSync("skills", join(candidate, "skills"), { recursive: true });
+  // Keep directory traversal in Node's JavaScript path, including Unicode Windows build roots.
+  cpSync("skills", join(candidate, "skills"), { recursive: true, filter: () => true });
   cpSync("package.json", join(candidate, "package.json"));
   cpSync(
     join("lib", "generative-app-worker.mjs"),

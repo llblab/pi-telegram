@@ -9916,6 +9916,15 @@ test(`Production Root Restore chooser separates native source ACK from issued me
     const readWorkspace = () => LockModel.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(dir), "state.json.transaction"), () => LockModel.readTelegramRuntimeState(Paths.resolveTelegramStatePath(dir)).profiles.default?.workspace);
     const threadUrl = new URL(artifact === "source" ? "./lib/threads.ts" : "./dist/lib/threads.js", import.meta.url);
     const ThreadModel: typeof Threads = await import(threadUrl.href);
+    // This Root fixture owns a fake Pi/model registry; installed SDK settings loading has separate source/dist probes.
+    const piUrl = new URL(artifact === "source" ? "./lib/pi.ts" : "./dist/lib/pi.js", import.meta.url);
+    const PiModel: typeof import("../lib/pi.ts") = await import(piUrl.href);
+    let settingsCalls = 0;
+    mock.module(piUrl.href, { namedExports: { ...PiModel, async createSettingsManager(cwd: string) {
+      assert.equal(cwd, "/actual-root-live-origin"); settingsCalls++;
+      return PiModel.normalizeSettingsManager({ flush() {}, getEnabledModels: () => undefined,
+        setEnabledModels() { assert.fail("The source-ACK/publication fixture must not persist model settings"); } });
+    } } });
     const originalViews = new Set<Threads.TelegramWorkspaceRestore>();
     mock.module(threadUrl.href, { namedExports: { ...ThreadModel, createTelegramWorkspaceRestoreResolver(options: Parameters<typeof ThreadModel.createTelegramWorkspaceRestoreResolver>[0]) {
       const resolve = ThreadModel.createTelegramWorkspaceRestoreResolver(options);
@@ -10020,6 +10029,7 @@ test(`Production Root Restore chooser separates native source ACK from issued me
         workspace: readWorkspace(),
         logs: await readFile(Paths.resolveTelegramRuntimeLogPath(dir), "utf8").catch(() => "missing") }), { cause: error }); }
       assert.ok(source && completion && sourceBinding); assert.equal(removalCount, 1); assert.equal(menuReturned, 0);
+      assert.equal(settingsCalls, 1, "The real menu still consumes its fixture-owned settings port before publication");
       assert.equal(source.read().entries.some(row => row.updateId === 100), false);
       assert.deepEqual(UpdatesModel.inspectTelegramDeferredSourceCompletion(originalCarrier), completion);
       assert.deepEqual(completion, { ...removedDigest, journalBindingKey: sourceBinding });
