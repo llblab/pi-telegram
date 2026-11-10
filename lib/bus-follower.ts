@@ -25,6 +25,7 @@ import type {
 import {
   getTelegramBusTransportRetryPolicy,
   TELEGRAM_BUS_REGISTRATION_RETRY,
+  TelegramBusConnectionReadinessExpiredError,
 } from "./bus-transport.ts";
 import {
   createTelegramBusFollowerDeliveryIdentity,
@@ -93,6 +94,7 @@ import {
   type TelegramLockState,
 } from "./locks.ts";
 import * as Machine from "./machine.ts";
+import { TelegramFollowerRegistrationCancelledError, TelegramFollowerReadinessExpiredError, type TelegramFollowerReadiness } from "./polling.ts";
 import { isPiStaleContextError } from "./pi.ts";
 import type { TelegramQueueHandoffStageResult } from "./queue.ts";
 import {
@@ -203,6 +205,9 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
       previousInstanceId?: string;
       restoreWorkspace?: boolean;
       recoverConnection?: boolean;
+      /** Process-local original connect attempt; never serialized or retained as membership authority. */
+      assertAuthority?: () => void;
+      connectionReadiness?: TelegramFollowerReadiness;
     },
   ) => Promise<boolean>;
   setContext: (ctx: TContext) => void | Promise<void>;
@@ -312,7 +317,7 @@ export interface TelegramBusFollowerRegistrationState {
 }
 
 export interface TelegramBusForwardedUpdateReceiverRuntime {
-  start: () => Promise<void>;
+  start: (assertAuthority?: () => void) => Promise<void>;
   stop: () => Promise<void>;
 }
 
@@ -420,7 +425,7 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<
   followerBusSocketPath?: string;
   getFollowerBusSocketPath?: () => string;
   getLeaderSocketPath?: () => string;
-  startReceiving?: () => Promise<void>;
+  startReceiving?: (assertAuthority?: () => void) => Promise<void>;
   stopReceiving?: () => Promise<void> | void;
   registrationState?: TelegramBusFollowerRegistrationState;
   isContextActive?: (ctx: TContext) => boolean;
@@ -3318,6 +3323,22 @@ export function createTelegramBusFollowerRegistrationRuntime<
       catch { return undefined; }
     },
     registerWithLeader: async (ctx, leader, options) => {
+      const assertCaller = options?.assertAuthority, connectionSource = options?.connectionReadiness, startReceiving = deps.startReceiving;
+      const remainingMs = connectionSource?.remainingMs, wait = connectionSource?.wait;
+      const connectionReadiness = connectionSource ? { remainingMs: () => remainingMs!.call(connectionSource), wait: () => wait!.call(connectionSource) } : undefined;
+      let connectionIssued = false;
+      let callerLost = false, checkingCaller = false;
+      const isCallerCurrent = () => {
+        if (callerLost || checkingCaller) { callerLost = true; return false; }
+        checkingCaller = true;
+        try {
+          assertCaller?.();
+          if (!connectionIssued && connectionSource && (connectionSource.remainingMs !== remainingMs || connectionSource.wait !== wait)) callerLost = true;
+        } catch { callerLost = true; }
+        finally { checkingCaller = false; }
+        return !callerLost;
+      };
+      if (!isCallerCurrent()) return false;
       attachmentRegistration = undefined;
       const readers = { state: deps.registrationState, profile: deps.getProfileKey, session: deps.getSessionId, generation: deps.getSessionGeneration,
         birth: deps.getProcessBirthId, pid: pidProvider, endpoint: deps.getFollowerBusSocketPath, leaderEndpoint: deps.getLeaderSocketPath,
@@ -3333,7 +3354,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
         registrationAttempt === attempt &&
         deps.getSessionGeneration?.() === sessionGeneration &&
         deps.getSessionId?.(ctx) === sessionId &&
-        deps.isContextActive?.(ctx) !== false;
+        deps.isContextActive?.(ctx) !== false && isCallerCurrent();
       const abandonOwnedRequest = async (): Promise<void> => {
         if (registrationAttempt !== attempt) return;
         registrationAttempt = undefined;
@@ -3357,6 +3378,13 @@ export function createTelegramBusFollowerRegistrationRuntime<
         deps.registrationState?.setRegistered(false);
         deps.setActiveAuthSecret?.(undefined);
         await deps.stopReceiving?.();
+      };
+      const expireRegistration = async (): Promise<never> => {
+        try { await failRegistration(); }
+        catch (cleanupError) {
+          try { deps.recordRuntimeEvent?.("bus", cleanupError, { phase: "follower-register-readiness-cleanup" }); } catch { /* Keep protective expiry even if diagnostics fail. */ }
+        }
+        throw new TelegramFollowerReadinessExpiredError();
       };
       // A fresh handoff belongs to this same process, so a replaced session reuses its Thread: the tab keeps
       // one identity and only its owner rotates. Explicit options still override the preserved target.
@@ -3382,7 +3410,23 @@ export function createTelegramBusFollowerRegistrationRuntime<
         deps.getLeaderSocketPath?.() ??
         getTelegramBusSocketPath();
       const attachmentLeaderSocketPath = resolveTelegramBusSocketPath(leaderSocketPath);
-      await deps.startReceiving?.();
+      const assertReceiving = () => {
+        if (deps.startReceiving !== startReceiving) callerLost = true;
+        if (!isCurrentRequest()) throw new TelegramFollowerRegistrationCancelledError();
+        if (connectionReadiness) {
+          const remaining = connectionReadiness.remainingMs();
+          if (!Number.isFinite(remaining) || remaining <= 0 || remaining > 2_147_483_647) throw new TelegramFollowerReadinessExpiredError();
+        }
+        if (!isCurrentRequest()) throw new TelegramFollowerRegistrationCancelledError();
+      };
+      if (!isCurrentRequest()) { await abandonOwnedRequest(); return false; }
+      try { assertReceiving(); await startReceiving?.call(deps, assertReceiving); assertReceiving(); }
+      catch (error) {
+        if (!isCurrentRequest()) { await abandonOwnedRequest(); return false; }
+        if (error instanceof TelegramFollowerReadinessExpiredError) return await expireRegistration();
+        await failRegistration();
+        throw error;
+      }
       if (!isCurrentRequest()) {
         await abandonOwnedRequest();
         return false;
@@ -3440,6 +3484,10 @@ export function createTelegramBusFollowerRegistrationRuntime<
           socketPath: leaderSocketPath,
           timeoutMs: registrationTimeoutMs,
           envelope: registrationEnvelope,
+          ...(connectionReadiness ? { connectionReadiness, onRequestIssued() { connectionIssued = true; } } : {}),
+          assertAuthority() {
+            if (!isCurrentRequest()) throw new Error("Telegram follower registration authority changed.");
+          },
           retry: getTelegramBusTransportRetryPolicy({
             endpoint: leaderSocketPath,
             operation: "registration",
@@ -3460,6 +3508,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
           await abandonOwnedRequest();
           return false;
         }
+        if (error instanceof TelegramBusConnectionReadinessExpiredError) return await expireRegistration();
         await failRegistration();
         throw error;
       }
@@ -3503,6 +3552,11 @@ export function createTelegramBusFollowerRegistrationRuntime<
           );
           return false;
         }
+        try {
+          deps.recordRuntimeEvent?.("bus", response.message ?? "Telegram leader rejected follower registration.", {
+            phase: "follower-register-rejected", source: "leader", reason: response.error?.code ?? "leader-rejected",
+          });
+        } catch { /* Diagnostics cannot replace the original correlated leader rejection. */ }
         throw new Error(
           response.message ??
             "Telegram bus follower registration was rejected.",
@@ -3510,6 +3564,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
       }
       if (response?.kind === "bus.ack" && response.ok) {
         const registrationResult = parseRegistrationResult(response.result);
+        if (!isCurrentRequest()) { await abandonOwnedRequest(); return false; }
         const lifetime = deps.registrationState?.setRegistered(true, registrationResult.target, {
           ...registrationResult,
           apiRegistrationIncarnation: hasTelegramBusCapability(localProtocol, TELEGRAM_BUS_CAPABILITY_API_REGISTRATION_AUTHORITY) &&
@@ -3571,6 +3626,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
           attachmentRegistration = Object.freeze({ registration: recipient, registrationIncarnation: registrationResult.registrationIncarnation,
             leaderSocketPath: attachmentLeaderSocketPath, leaderProtocol: peerProtocol!, assertCurrent });
         }
+        if (!isCurrentRequest()) { await abandonOwnedRequest(); return false; }
         try {
           await deps.onRegistered?.(ctx);
         } catch (error) {

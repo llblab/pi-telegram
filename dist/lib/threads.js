@@ -20,6 +20,19 @@ import { createTelegramSessionKey, createTelegramWorkspaceBindingIdentityWithKey
 import { planTelegramWorkspaceSlotAllocation, selectTelegramWorkspaceReusableSlot, TELEGRAM_WORKSPACE_SLOTS, TelegramWorkspaceSlotUnavailableError, } from "./workspace-slots.js";
 export { createTelegramWorkspaceBindingIdentity, createTelegramWorkspaceDirectoryKey, normalizeTelegramSessionId, normalizeTelegramWorkspacePath, } from "./workspace-identity.js";
 const TELEGRAM_THREAD_RESERVATION_TTL_MS = 15 * 60 * 1000;
+export class TelegramWorkspaceRestoreEvidenceError extends Error {
+    code = "workspace-restore-evidence-conflict";
+    reason;
+    retainedRevision;
+    observedRevision;
+    constructor(reason, retainedRevision, observedRevision) {
+        super(`Workspace Restore evidence moved backwards or changed without revision (${reason}).`);
+        this.name = "TelegramWorkspaceRestoreEvidenceError";
+        this.reason = reason;
+        this.retainedRevision = retainedRevision;
+        this.observedRevision = observedRevision;
+    }
+}
 function getNextMonotonicSlot(records, reservations, pendingProvisions, nowMs, lastSlot) {
     let cursorCode;
     if (lastSlot && /^[A-Z]$/.test(lastSlot)) {
@@ -1934,7 +1947,7 @@ export function createTelegramTopicTargetStore(options) {
     let followerRecoveryHints = new Map();
     let loaded = false;
     let loadedPath;
-    let loadedProfile;
+    let loadedProfile, readScopeVersion = 0;
     let observedWorkspaceSemantic;
     let dirty = false;
     let mutationRevision = 0;
@@ -2036,6 +2049,13 @@ export function createTelegramTopicTargetStore(options) {
         return { ...owner, telegramProfile };
     };
     const activeProfile = () => getTelegramProfile() ?? "default";
+    let observedReadScope;
+    const observeReadScope = (path = getPath(), profile = activeProfile()) => {
+        if (observedReadScope && (observedReadScope.path !== path || observedReadScope.profile !== profile))
+            readScopeVersion++;
+        observedReadScope = { path, profile };
+        return observedReadScope;
+    };
     const scopeMatches = (path, profile) => getPath() === path && activeProfile() === profile;
     const loadedScopeMatches = (path) => loadedPath === path && (!consolidated || loadedProfile === activeProfile());
     const workspaceIO = consolidated
@@ -2168,6 +2188,7 @@ export function createTelegramTopicTargetStore(options) {
         }
     };
     const resetForPath = (path) => {
+        observeReadScope(path);
         if (loadedScopeMatches(path))
             return;
         botState = { threadMode: "unknown" };
@@ -2192,14 +2213,15 @@ export function createTelegramTopicTargetStore(options) {
         observedWorkspaceSemantic = undefined;
     };
     const observeWorkspaceRestore = (incoming) => {
-        if (workspaceRestore &&
-            (!incoming ||
-                incoming.profileName !== workspaceRestore.profileName ||
-                incoming.tokenSha256 !== workspaceRestore.tokenSha256 ||
-                incoming.revision < workspaceRestore.revision ||
-                (incoming.revision === workspaceRestore.revision &&
-                    !isDeepStrictEqual(incoming, workspaceRestore))))
-            throw new Error("Workspace Restore evidence moved backwards or changed without revision.");
+        if (!workspaceRestore)
+            return;
+        const reason = !incoming ? "missing-snapshot" :
+            incoming.profileName !== workspaceRestore.profileName ? "profile-changed" :
+                incoming.tokenSha256 !== workspaceRestore.tokenSha256 ? "token-changed" :
+                    incoming.revision < workspaceRestore.revision ? "revision-regressed" :
+                        incoming.revision === workspaceRestore.revision && !isDeepStrictEqual(incoming, workspaceRestore) ? "same-revision-conflict" : undefined;
+        if (reason)
+            throw new TelegramWorkspaceRestoreEvidenceError(reason, workspaceRestore.revision, incoming?.revision);
     };
     const withRestoreRegistration = (candidate, publish) => {
         const path = getPath();
@@ -2247,7 +2269,7 @@ export function createTelegramTopicTargetStore(options) {
             observedWorkspaceSemantic = getTelegramStateSemanticSnapshot(rawFile);
         if (rawFile === undefined) {
             if (workspaceRestore?.revision)
-                throw new Error("Workspace Restore evidence disappeared.");
+                throw new TelegramWorkspaceRestoreEvidenceError("missing-snapshot", workspaceRestore.revision);
             botState = { threadMode: "unknown" };
             records = new Map();
             identities = new Map();
@@ -2948,6 +2970,33 @@ export function createTelegramTopicTargetStore(options) {
         return true;
     };
     return {
+        captureReadScope(expected) {
+            const pathPort = options.path, profilePort = options.telegramProfile;
+            const { path, profile } = observeReadScope(), version = readScopeVersion;
+            let lost = !!expected && (expected.path !== path || expected.profile !== profile), checking = false;
+            const current = () => {
+                if (lost || checking) {
+                    lost = true;
+                    return false;
+                }
+                checking = true;
+                try {
+                    const observed = observeReadScope();
+                    if (options.path !== pathPort || options.telegramProfile !== profilePort || observed.path !== path || observed.profile !== profile ||
+                        readScopeVersion !== version)
+                        lost = true;
+                }
+                catch {
+                    lost = true;
+                }
+                finally {
+                    checking = false;
+                }
+                return !lost;
+            };
+            current();
+            return current;
+        },
         async load() {
             if (workspaceIO && dirty && !loadedScopeMatches(getPath()))
                 throw new Error("Workspace projection must refresh after scope change.");
@@ -3195,12 +3244,13 @@ export function createTelegramTopicTargetStore(options) {
                     (state.profileName !== profileName ||
                         state.tokenSha256 !== tokenSha256))
                     throw new Error("Invalid or foreign Workspace Restore evidence.");
-                if (observed &&
-                    (!state ||
-                        state.revision < observed.revision ||
-                        (state.revision === observed.revision &&
-                            !isDeepStrictEqual(state, observed))))
-                    throw new Error("Workspace Restore evidence moved backwards or changed without revision.");
+                if (observed) {
+                    const reason = !state ? "missing-snapshot" :
+                        state.revision < observed.revision ? "revision-regressed" :
+                            state.revision === observed.revision && !isDeepStrictEqual(state, observed) ? "same-revision-conflict" : undefined;
+                    if (reason)
+                        throw new TelegramWorkspaceRestoreEvidenceError(reason, observed.revision, state?.revision);
+                }
                 if (state && Buffer.byteLength(JSON.stringify(state)) > maxBytes)
                     throw new Error("Workspace Restore byte capacity reached.");
                 observed = structuredClone(state);

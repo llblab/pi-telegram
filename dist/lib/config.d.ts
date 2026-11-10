@@ -98,12 +98,15 @@ export declare function getTelegramProfileNames(config: TelegramConfig): string[
 export interface TelegramConfigStore {
     get: () => TelegramConfig;
     getStoredConfig: () => TelegramConfig;
+    /** Read-only original config/profile/token lifetime; never pairing or transport authority. */
+    captureConnectionScope: (expectedProfile?: string) => () => boolean;
     set: (config: TelegramConfig) => void;
     setProfile: (profileName: string, profile: TelegramBotProfile) => void;
     update: (mutate: (config: TelegramConfig) => void) => void;
     activateProfile: (profileName: string | undefined) => boolean;
     getActiveProfileName: () => string | undefined;
-    getBotToken: () => string | undefined;
+    /** Resolve one profile without changing the active identity; omission selects the active profile. */
+    getBotToken: (profileName?: string) => string | undefined;
     getBotTokenDiagnostic: () => string | undefined;
     hasBotToken: () => boolean;
     getAllowedUserId: () => number | undefined;

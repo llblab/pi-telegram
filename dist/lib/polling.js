@@ -431,6 +431,14 @@ export function createTelegramThreadTargetObservationBinding() {
         },
     };
 }
+/** Cancellation is not failed membership, endpoint unresponsiveness or takeover evidence. */
+export class TelegramFollowerRegistrationCancelledError extends Error {
+    constructor() { super("Telegram follower registration was cancelled or superseded."); this.name = "TelegramFollowerRegistrationCancelledError"; }
+}
+/** A native pre-issuance deadline is not membership failure or takeover proof. */
+export class TelegramFollowerReadinessExpiredError extends Error {
+    constructor() { super("Telegram original connection readiness expired."); this.name = "TelegramFollowerReadinessExpiredError"; }
+}
 export function createTelegramThreadCapabilityStateRuntime() {
     let busPollingStarted = false;
     let topicModeUnavailable = false;
@@ -689,7 +697,7 @@ export async function applyTelegramThreadCapability(ctx, threadModeEnabled, phas
     deps.updateStatus(ctx);
 }
 export function createTelegramThreadAwarePollingPorts(deps) {
-    let generation = 0;
+    let generation = 0, followerGeneration = 0;
     const startPolling = async (ctx, options) => {
         const expectedGeneration = ++generation;
         deps.lifecycle?.invalidate();
@@ -770,22 +778,105 @@ export function createTelegramThreadAwarePollingPorts(deps) {
         }
         await deps.stopClassicPolling();
     };
-    const refreshFollowerState = async () => {
-        if (deps.topicTargetStore.refresh) {
-            await deps.topicTargetStore.refresh();
+    const refreshFollowerState = async (assertAuthority) => {
+        const store = deps.topicTargetStore, refresh = store.refresh ?? store.load;
+        assertAuthority?.();
+        try {
+            await refresh.call(store);
         }
-        else {
-            await deps.topicTargetStore.load();
+        catch (error) {
+            try {
+                deps.recordEvent("bus", error, { phase: "follower-readiness-refresh-refused", source: "local" });
+            }
+            catch { /* Diagnostics cannot replace the original local refusal. */ }
+            throw error;
         }
-        return deps.topicTargetStore.getBotState().threadMode === "enabled";
+        assertAuthority?.();
+        return store.getBotState().threadMode;
     };
     const registerFollowerWithOwner = async (ctx, owner, options) => {
-        if (!(await refreshFollowerState()))
-            return undefined;
-        return deps.registerFollowerWithLeader(ctx, owner, options);
+        const request = ++followerGeneration, expectedGeneration = generation;
+        const assertCaller = options?.assertAuthority, remainingMs = options?.readiness?.remainingMs, wait = options?.readiness?.wait;
+        assertCaller?.();
+        const recoverConnection = options?.recoverConnection;
+        const store = deps.topicTargetStore, delegate = deps.registerFollowerWithLeader;
+        const refresh = store.refresh, load = store.load, getState = store.getBotState, lifecycle = deps.lifecycle;
+        const lifecycleCurrent = lifecycle?.capture() ?? (() => true);
+        let lost = false, checking = false;
+        const assertAuthority = () => {
+            if (lost || checking) {
+                lost = true;
+                throw new TelegramFollowerRegistrationCancelledError();
+            }
+            checking = true;
+            try {
+                assertCaller?.();
+                if (request !== followerGeneration || expectedGeneration !== generation || deps.lifecycle !== lifecycle || !lifecycleCurrent() ||
+                    deps.topicTargetStore !== store || store.refresh !== refresh || store.load !== load || store.getBotState !== getState ||
+                    deps.registerFollowerWithLeader !== delegate || lost)
+                    throw new TelegramFollowerRegistrationCancelledError();
+            }
+            catch (error) {
+                lost = true;
+                throw error;
+            }
+            finally {
+                checking = false;
+            }
+        };
+        const readRemaining = () => {
+            assertAuthority();
+            const remaining = remainingMs?.();
+            assertAuthority();
+            return remaining;
+        };
+        const firstRemaining = readRemaining();
+        if (firstRemaining !== undefined && (!Number.isFinite(firstRemaining) || firstRemaining <= 0))
+            return "readiness-expired";
+        let waiting = false;
+        for (;;) {
+            const before = readRemaining();
+            if (before !== undefined && (!Number.isFinite(before) || before <= 0))
+                return "readiness-expired";
+            const mode = await refreshFollowerState(assertAuthority);
+            const remaining = readRemaining();
+            if (remaining !== undefined && (!Number.isFinite(remaining) || remaining <= 0))
+                return "readiness-expired";
+            if (mode === "disabled")
+                return undefined;
+            if (mode === "enabled")
+                break;
+            if (remaining === undefined || !wait)
+                return "pending";
+            if (!waiting) {
+                waiting = true;
+                try {
+                    deps.recordEvent("bus", "Waiting for original Telegram leader Thread mode.", { phase: "follower-readiness-wait" });
+                }
+                catch { /* Diagnostics cannot turn unknown readiness into registration failure. */ }
+            }
+            assertAuthority();
+            const canObserve = await wait();
+            assertAuthority();
+            if (!canObserve)
+                return "readiness-expired";
+        }
+        // The same original budget may wait for native connection only; the issued request keeps its independent ACK timeout.
+        try {
+            const result = await delegate.call(deps, ctx, owner, { ...(recoverConnection === undefined ? {} : { recoverConnection }), assertAuthority,
+                ...(remainingMs && wait ? { connectionReadiness: { remainingMs, wait } } : {}), });
+            assertAuthority();
+            return result;
+        }
+        catch (error) {
+            assertAuthority();
+            if (error instanceof TelegramFollowerReadinessExpiredError)
+                return "readiness-expired";
+            throw error;
+        }
     };
     const restoreFollowerWithOwner = async (ctx, owner) => {
-        if (!(await refreshFollowerState())) {
+        if ((await refreshFollowerState()) !== "enabled") {
             deps.recordEvent("bus", "Telegram follower auto-connect skipped: Threaded Mode is not enabled.", {
                 phase: "follower-auto-connect-skip",
                 reason: "thread-mode-unavailable",
@@ -814,7 +905,7 @@ export function createTelegramThreadAwarePollingPorts(deps) {
         },
         registerFollowerWithOwner,
         restoreFollowerWithOwner,
-        stopFollowerRegistration: deps.stopFollowerRegistration,
+        stopFollowerRegistration() { followerGeneration++; deps.stopFollowerRegistration(); },
     };
 }
 function createTelegramThreadTargetObservationHandler(deps) {

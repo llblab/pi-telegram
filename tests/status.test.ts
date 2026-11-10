@@ -262,11 +262,77 @@ test("Connection notices name known causes and one recovery action without raw d
     ["Telegram unfinished Thread creation does not match this session binding.", "Telegram Thread creation is unresolved. Check /telegram-status --debug."],
     [new Error("stale ctx: use withSession; raw token secret"), "Telegram connection failed. Check /telegram-status --debug."],
     [null, "Telegram connection failed. Check /telegram-status --debug."],
+    ["Timed out waiting for Telegram leader readiness.", "Timed out waiting for Telegram leader readiness. Check /telegram-status --debug."],
+    [new Error("Timed out waiting for Telegram leader readiness."), "Timed out waiting for Telegram leader readiness. Check /telegram-status --debug."],
+    ["private Timed out waiting for Telegram leader readiness. secret", "Telegram connection failed. Check /telegram-status --debug."],
   ];
   for (const [error, expected] of cases) {
     assert.equal(formatTelegramConnectionFailure(error), expected);
     assert.ok(expected.length < 100);
     assert.ok(!expected.includes("secret"));
+  }
+});
+
+for (const [reason, cause] of [
+  ["missing-snapshot", "history is missing"],
+  ["profile-changed", "profile changed"],
+  ["token-changed", "bot identity changed"],
+  ["revision-regressed", "revision moved backwards"],
+  ["same-revision-conflict", "history changed without a revision"],
+] as const)
+for (const carrier of ["error", "message", "registration"] as const)
+test(`Connection Restore notice names the finite cause without copying private context (${reason}/${carrier})`, () => {
+  const message = `Workspace Restore evidence moved backwards or changed without revision (${reason}).`;
+  const value = carrier === "error" ? Object.assign(new Error(message), { code: "workspace-restore-evidence-conflict", reason }) :
+    carrier === "registration" ? `Telegram bridge is active in another Pi instance (pid 42, cwd /private/secret); follower registration failed: ${message}` : message;
+  const notice = formatTelegramConnectionFailure(value);
+  assert.equal(notice, `Telegram Workspace Restore ${cause}. Connection blocked to protect prior work. Check /telegram-status --debug.`);
+  assert.doesNotMatch(notice, /secret|private|pid 42|unavailable|Retry|takeover|reset/iu);
+});
+
+test("Connection Restore notices support legacy and unknown reasons without inventing recovery", () => {
+  const generic = "Telegram Workspace Restore history conflicts with current state. Connection blocked to protect prior work. Check /telegram-status --debug.";
+  for (const value of [
+    "Workspace Restore evidence moved backwards or changed without revision.",
+    "Follower registration failed: Workspace Restore evidence moved backwards or changed without revision (unknown-secret).",
+    { code: "workspace-restore-evidence-conflict", reason: "secret" },
+  ]) assert.equal(formatTelegramConnectionFailure(value), generic);
+  assert.equal(formatTelegramConnectionFailure("Workspace Restore evidence disappeared."),
+    "Telegram Workspace Restore history is missing. Connection blocked to protect prior work. Check /telegram-status --debug.");
+  for (const value of ["Workspace Restore unrecognised secret", "Workspace Restore evidence disappearedly secret",
+    "Workspace Restore evidence moved backwards or changed without revisionless secret"])
+    assert.equal(formatTelegramConnectionFailure(value), "Telegram connection failed. Check /telegram-status --debug.",
+      "Unrecognised prose is not a classified Restore conflict");
+});
+
+test("Connection Restore causes survive incidental context while explicit transport causes stay separate", () => {
+  const detail = "Workspace Restore evidence moved backwards or changed without revision (missing-snapshot).";
+  const expected = "Telegram Workspace Restore history is missing. Connection blocked to protect prior work. Check /telegram-status --debug.";
+  for (const prefix of ["fetch failed", "Workspace slots exhausted", "Unsupported journal version", "protocol mismatch"])
+    assert.equal(formatTelegramConnectionFailure(`Telegram bridge is active in another Pi instance (cwd /private/${prefix}); follower registration failed: ${detail}`), expected);
+  for (const [metadata, notice] of [
+    [{ status: 401 }, "Telegram token rejected. Run /telegram-setup."],
+    [{ status: 403 }, "Telegram access denied. Check /telegram-status --debug."],
+    [{ code: "ECONNREFUSED" }, "Telegram network unavailable. Retry /telegram-connect."],
+    [{ code: "incompatible-protocol" }, "Telegram instances are incompatible. Update them together."],
+  ] as const) assert.equal(formatTelegramConnectionFailure(Object.assign(new Error(detail), metadata)), notice);
+});
+
+test("Recovery event evidence stays finite and cannot be downgraded by caller details", () => {
+  const recorder = createTelegramRuntimeEventRecorder({ getBotToken: () => "123:secret" });
+  recorder.record("connection", Object.assign(new Error("unavailable"), { name: "TelegramApiAuthorityError", requestIssued: true }),
+    { phase: "connect", requestIssued: false });
+  assert.deepEqual(recorder.getEvents()[0]!.details, { phase: "connect", requestIssued: true });
+  recorder.record("connection", { code: "guard-unverifiable", reason: "123:secret", phase: "123:secret", cause: { body: "123:secret" } });
+  assert.deepEqual(recorder.getEvents()[1]!.details, { errorCode: "guard-unverifiable" });
+  for (const error of [
+    Object.assign(new Error("opaque"), { name: "OtherError", requestIssued: true, kind: "unknown-secret", code: "unknown-secret" }),
+    Object.assign(new Error("opaque"), { name: "TelegramApiAuthorityError", requestIssued: "true" }),
+    { name: "TelegramBusLocalAuthorityError", requestIssued: true },
+  ]) {
+    recorder.record("connection", error);
+    assert.equal(recorder.getEvents().at(-1)!.details, undefined, "Unknown fields and wire-shaped copies are not native issuance evidence");
+    assert.equal(formatTelegramConnectionFailure(error), "Telegram connection failed. Check /telegram-status --debug.");
   }
 });
 

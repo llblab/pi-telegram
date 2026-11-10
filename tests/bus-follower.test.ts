@@ -8,9 +8,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { readFile } from "node:fs/promises";
+import net from "node:net";
+import { syncBuiltinESMExports } from "node:module";
 import { advanceTelegramWorkspaceRestore } from "../lib/routing.ts";
 import { withWorkspaceRestoreFixture as fixture, restoreFixtureRecipient as recipient } from "./fixtures/workspace.ts";
-import test from "node:test";
+import test, { mock } from "node:test";
 
 test("Native registration notifications include equal-field replacement without widening legacy publication evidence", () => {
   let availability = 0;
@@ -369,15 +371,20 @@ for (const fault of ["current", "immutable", "entry", "callback-replacement", "r
 for (const boundary of ["entry", "connect", "response"] as const) {
   test(`Local IPC authority stays process-local and fences actual wire (${boundary})`, async () => {
     const dir = mkdtempSync(join(tmpdir(), "menu-ipc-guard-")), socketPath = join(dir, "bus.sock");
-    let checks = 0, messages = 0;
-    const server = createRawTelegramBusLocalServer({ socketPath, handleEnvelope: envelope => { messages++; return { kind: "bus.ack", requestId: envelope.requestId, ok: true }; } });
+    let checks = 0, messages = 0, current = true;
+    const server = createRawTelegramBusLocalServer({ socketPath, handleEnvelope: envelope => {
+      messages++; if (boundary === "response") current = false;
+      return { kind: "bus.ack", requestId: envelope.requestId, ok: true };
+    } });
     await server.start();
     try {
       await assert.rejects(sendTelegramBusLocalEnvelope({ socketPath, retry: { attempts: 3, delayMs: 0 },
         envelope: { kind: "follower.heartbeat", requestId: "guard", instanceId: "peer", sentAtMs: 1 }, assertAuthority() {
-          checks++; if (checks === (boundary === "entry" ? 1 : boundary === "connect" ? 2 : 4)) throw new Error("local revoked");
+          checks++; if (!current || boundary === "entry" || boundary === "connect" && checks === 2) throw new Error("local revoked");
         } }), error => error instanceof TelegramBusLocalAuthorityError && error.requestIssued === (boundary === "response"));
-      assert.equal(messages, boundary === "response" ? 1 : 0); assert.equal(checks, boundary === "entry" ? 1 : boundary === "connect" ? 2 : 4);
+      assert.equal(messages, boundary === "response" ? 1 : 0);
+      if (boundary === "response") assert.ok(checks >= 4, "Actual receipt revokes the guard before interpreting its ACK");
+      else assert.equal(checks, boundary === "entry" ? 1 : 2);
     } finally { await server.stop(); rmSync(dir, { recursive: true, force: true }); }
   });
 }
@@ -2216,7 +2223,55 @@ test("Bus follower heartbeat recovery swallows stale-context status updates", as
   );
 });
 
-for (const scenario of ["stable", "session-drift", "session-id-drift", "superseded", "stopped", "startup-drift", "refreshed-during-heartbeat"] as const) {
+for (const loss of ["none", "entry", "connect", "receiver-port"] as const)
+test(`Native registration guards the original caller before the actual socket write (${loss})`, { timeout: 5000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-register-wire-")), socketPath = join(dir, "leader.sock");
+  let current = loss !== "entry", requests = 0, receiving = 0, stops = 0;
+  const state = createTelegramBusFollowerRegistrationState();
+  if (loss === "entry") state.setRegistered(true, { chatId: 7, threadId: 42 }, { generation: "retained" });
+  const server = createTelegramBusLocalServer({ socketPath, handleEnvelope(envelope) {
+    if (envelope.kind === "follower.register") requests++;
+    assert.equal(Object.hasOwn(envelope, "assertAuthority"), false, "Original caller authority never becomes a wire field");
+    return { kind: "bus.ack", requestId: envelope.requestId, ok: true, protocol: TEST_BUS_PROTOCOL_IDENTITY,
+      result: { target: { chatId: 7, threadId: 42 }, slot: "A" } };
+  } });
+  const original = net.createConnection;
+  const replacement = mock.method(net, "createConnection", (...args: unknown[]) => {
+    const socket = Reflect.apply(original, net, args) as net.Socket;
+    socket.once("connect", () => { if (loss === "connect") current = false; });
+    return socket;
+  });
+  syncBuiltinESMExports();
+  let sequence = 0;
+  const deps = { instanceId: "fixture", registrationState: state, getSessionId: () => "test-session",
+    protocolIdentity: TEST_BUS_PROTOCOL_IDENTITY, createRequestId: () => `fixture:${++sequence}`, heartbeatMs: 60_000,
+    startReceiving: async (assertAuthority?: () => void) => {
+      receiving++; assert.equal(typeof assertAuthority, "function");
+      if (loss === "receiver-port") {
+        const original = deps.startReceiving;
+        deps.startReceiving = async () => {};
+        assert.throws(assertAuthority!, /cancelled or superseded/);
+        deps.startReceiving = original;
+        assert.throws(assertAuthority!, /cancelled or superseded/, "Restoring the original method cannot revive spent startup authority");
+      }
+    }, stopReceiving: async () => { stops++; },
+  };
+  const runtime = createRawTelegramBusFollowerRegistrationRuntime(deps);
+  try {
+    await server.start();
+    assert.equal(await runtime.registerWithLeader({ cwd: "/fixture" }, { busSocketPath: socketPath }, {
+      assertAuthority() { if (!current) throw new Error("Original caller ended"); },
+    }), loss === "none");
+    assert.equal(requests, loss === "none" ? 1 : 0);
+    assert.equal(receiving, loss === "entry" ? 0 : 1);
+    assert.equal(state.isRegistered(), loss !== "connect" && loss !== "receiver-port");
+    if (loss === "entry") { assert.equal(stops, 0); assert.equal(state.getGeneration(), "retained"); }
+  } finally {
+    replacement.mock.restore(); syncBuiltinESMExports(); runtime.stop(); await server.stop(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const scenario of ["stable", "session-drift", "session-id-drift", "superseded", "stopped", "startup-drift", "refreshed-during-heartbeat", "caller-startup", "caller-response"] as const) {
 test(`Registration response retains exact request/session authority (${scenario})`, { timeout: 5000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-registration-authority-"));
   const socketPath = join(dir, "leader.sock");
@@ -2227,7 +2282,7 @@ test(`Registration response retains exact request/session authority (${scenario}
   let sessionGeneration = 1;
   let sequence = 0;
   let receivingStops = 0;
-  let sessionId = "session-before-reply";
+  let sessionId = "session-before-reply", callerCurrent = true;
   const requests: Array<number | undefined> = [];
   const prepared: number[] = [];
   const server = createTelegramBusLocalServer({ socketPath, async handleEnvelope(envelope) {
@@ -2248,15 +2303,18 @@ test(`Registration response retains exact request/session authority (${scenario}
     createRequestId: () => `fixture:${++sequence}`, getSessionGeneration: () => sessionGeneration,
     getSessionId: () => sessionId,
     isContextActive: current => current === ctx, heartbeatMs: 60_000,
-    async startReceiving() { if (scenario === "startup-drift") { entered.resolve(); await released.promise; } },
+    async startReceiving() { if (scenario === "startup-drift" || scenario === "caller-startup") { entered.resolve(); await released.promise; } },
     stopReceiving: async () => { receivingStops++; },
     onRegistered: () => { prepared.push(sessionGeneration); },
   });
   let first: Promise<boolean> | undefined;
   try {
     await server.start();
-    first = runtime.registerWithLeader(ctx, { busSocketPath: socketPath });
+    first = runtime.registerWithLeader(ctx, { busSocketPath: socketPath }, { assertAuthority() {
+      if (!callerCurrent) throw new Error("Original caller ended");
+    } });
     await entered.promise;
+    if (scenario === "caller-startup" || scenario === "caller-response") callerCurrent = false;
     if (scenario === "session-drift" || scenario === "startup-drift") sessionGeneration++;
     if (scenario === "session-id-drift") sessionId = "session-after-reply";
     if (scenario === "stopped") runtime.stop();
@@ -2281,7 +2339,7 @@ test(`Registration response retains exact request/session authority (${scenario}
       assert.equal(state.isRegistered(), scenario === "stable");
       assert.deepEqual(prepared, scenario === "stable" ? [1] : []);
     }
-    assert.deepEqual(requests, scenario === "startup-drift" ? [] : scenario === "superseded" ? [1, 1] : [1]);
+    assert.deepEqual(requests, scenario === "startup-drift" || scenario === "caller-startup" ? [] : scenario === "superseded" ? [1, 1] : [1]);
     if (scenario === "session-drift" || scenario === "session-id-drift") {
       assert.equal(await runtime.registerWithLeader(ctx, { busSocketPath: socketPath }), true);
       assert.deepEqual(prepared, [sessionGeneration]);
@@ -2718,6 +2776,7 @@ test("Bus follower restore-only registration exits quietly without a remembered 
   const socketPath = join(dir, "bus.sock");
   let restoreOnly = false;
   const reasons: string[] = [];
+  const phases: string[] = [];
   const registry = createTelegramBusFollowerRegistry();
   const server = createTelegramBusLocalServer({
     socketPath,
@@ -2736,6 +2795,7 @@ test("Bus follower restore-only registration exits quietly without a remembered 
     registrationState: state,
     recordRuntimeEvent(_category, _message, details) {
       if (typeof details?.reason === "string") reasons.push(details.reason);
+      if (typeof details?.phase === "string") phases.push(details.phase);
     },
   });
   try {
@@ -2750,6 +2810,7 @@ test("Bus follower restore-only registration exits quietly without a remembered 
     );
     assert.equal(restoreOnly, true);
     assert.deepEqual(reasons, ["leader-binding-unavailable"]);
+    assert.deepEqual(phases, ["follower-auto-connect-skip"]);
     assert.equal(state.isRegistered(), false);
     assert.equal(registry.get("inst-a"), undefined);
   } finally {
@@ -3109,6 +3170,25 @@ test("Bus follower registration runtime retries while leader endpoint is startin
   }
 });
 
+for (const origin of ["receiver", "connection"] as const)
+for (const cleanup of ["ok", "stop-fails", "diagnostic-fails"] as const)
+test(`Native connection deadline is a protective registration outcome (${origin}/${cleanup})`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-register-expiry-")), socketPath = join(dir, "missing.sock"), state = createTelegramBusFollowerRegistrationState();
+  let stopped = 0, waits = 0;
+  const events: unknown[] = [];
+  const runtime = createTelegramBusFollowerRegistrationRuntime({ instanceId: "fixture", registrationState: state, createRequestId: () => "original",
+    async stopReceiving() { stopped++; if (cleanup !== "ok") throw new Error("Fixture receiver stop failed"); },
+    recordRuntimeEvent(_category, _error, details) { events.push(details?.phase); if (cleanup === "diagnostic-fails") throw new Error("Fixture diagnostics failed"); },
+  });
+  try {
+    await assert.rejects(runtime.registerWithLeader({ cwd: "/repo" }, { busSocketPath: socketPath }, {
+      assertAuthority() {}, connectionReadiness: { remainingMs: () => origin === "receiver" ? 0 : 1000, async wait() { waits++; return false; } },
+    }), error => error instanceof Error && error.name === "TelegramFollowerReadinessExpiredError");
+    assert.equal(state.isRegistered(), false); assert.equal(stopped, 1); assert.equal(waits, origin === "receiver" ? 0 : 1);
+    assert.equal(events.includes("follower-register-readiness-cleanup"), cleanup !== "ok");
+  } finally { runtime.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("Bus follower registration runtime waits for slow target provisioning", async () => {
   const dir = mkdtempSync(
     join(tmpdir(), "pi-telegram-bus-follower-slow-register-"),
@@ -3447,13 +3527,15 @@ test("Bus follower registration runtime registers and explicitly disconnects", a
 });
 
 for (const outcome of ["success", "refused", "incompatible", "identityless"] as const) for (const matching of [true, false])
-test(`Registration admission requires its original bootstrap ACK (${outcome}/${matching ? "matching" : "foreign"})`, async () => {
+for (const bounded of [false, true])
+test(`Registration admission requires its original bootstrap ACK (${outcome}/${matching ? "matching" : "foreign"}/${bounded ? "bounded" : "legacy"})`, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pt-bootstrap-origin-")), socketPath = join(dir, "bus.sock"), state = createTelegramBusFollowerRegistrationState();
   state.setRegistered(true, { chatId: 7, threadId: 41 }, { generation: "previous", leaderProtocol: TEST_BUS_PROTOCOL_IDENTITY });
   const previous = state.capturePublicationRegistration!()!;
   let admitted = 0, requests = 0, receiverStops = 0, auth: string | undefined;
   const server = createRawTelegramBusLocalServer({ socketPath, handleEnvelope(envelope) {
     assert.equal(envelope.kind, "follower.register"); requests++;
+    assert.equal(Object.hasOwn(envelope, "connectionReadiness"), false); assert.equal(Object.hasOwn(envelope.registration, "connectionReadiness"), false);
     const protocol = outcome === "incompatible" ? { ...TEST_BUS_PROTOCOL_IDENTITY, protocolVersion: 1 } : TEST_BUS_PROTOCOL_IDENTITY;
     return { kind: "bus.ack", requestId: matching ? envelope.requestId : "foreign-registration", ok: outcome === "success" || outcome === "incompatible",
       ...(outcome === "identityless" ? {} : { protocol }), message: "Original broker refusal", result: { target: { chatId: 7, threadId: 42 }, slot: "A", registrationIncarnation: "a".repeat(48) } };
@@ -3466,7 +3548,9 @@ test(`Registration admission requires its original bootstrap ACK (${outcome}/${m
     createRequestId() { assert.fail("Inspecting a birth cannot issue API calls"); } });
   try {
     await server.start();
-    const pending = runtime.registerWithLeader({ cwd: "/repo" }, { busSocketPath: socketPath });
+    const pending = runtime.registerWithLeader({ cwd: "/repo" }, { busSocketPath: socketPath }, bounded ? {
+      assertAuthority() {}, connectionReadiness: { remainingMs: () => 5000, async wait() { assert.fail("A correlated refusal or ACK is never pending readiness"); } },
+    } : undefined);
     if (matching && outcome === "success") {
       assert.equal(await pending, true); assert.equal(state.isRegistered(), true); assert.equal(state.getGeneration(), "original-registration"); assert.equal(admitted, 1);
     } else {
@@ -3999,7 +4083,8 @@ test("Bus follower registration runtime heartbeats until stopped", async () => {
   }
 });
 
-test("Bus follower registration runtime surfaces leader rejection reasons", async () => {
+for (const loggingFails of [false, true])
+test(`Bus follower registration runtime attributes leader rejection without replacing it (${loggingFails})`, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-follower-reject-"));
   const socketPath = join(dir, "bus.sock");
   const server = createTelegramBusLocalServer({
@@ -4011,12 +4096,17 @@ test("Bus follower registration runtime surfaces leader rejection reasons", asyn
       message: "Unauthorized Telegram bus envelope.",
     }),
   });
-  const stopped: string[] = [];
+  const stopped: string[] = [], rejected: Array<Record<string, unknown> | undefined> = [];
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
     stopReceiving: () => {
       stopped.push("stop");
+    },
+    recordRuntimeEvent(_category, _error, details) {
+      if (details?.phase !== "follower-register-rejected") return;
+      rejected.push(details);
+      if (loggingFails) throw new Error("Fixture diagnostics failed");
     },
   });
   try {
@@ -4030,6 +4120,7 @@ test("Bus follower registration runtime surfaces leader rejection reasons", asyn
       /Unauthorized Telegram bus envelope/,
     );
     assert.deepEqual(stopped, ["stop"]);
+    assert.deepEqual(rejected, [{ phase: "follower-register-rejected", source: "leader", reason: "leader-rejected" }]);
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });

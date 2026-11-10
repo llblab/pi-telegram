@@ -782,6 +782,32 @@ export function createTelegramThreadTargetObservationBinding<
   };
 }
 
+/** Local registration observation: pending capability is neither classic fallback nor acknowledged membership. */
+export type TelegramFollowerRegistrationResult = boolean | undefined | "pending" | "readiness-expired";
+
+/** One original observation/connection budget; never applies to an issued request's ACK. */
+export interface TelegramFollowerReadiness {
+  remainingMs: () => number;
+  wait: () => Promise<boolean>;
+}
+
+/** Process-local original-attempt evidence; never sent in registration packets. */
+export interface TelegramFollowerRegistrationOptions {
+  recoverConnection?: boolean;
+  assertAuthority?: () => void;
+  readiness?: TelegramFollowerReadiness;
+}
+
+/** Cancellation is not failed membership, endpoint unresponsiveness or takeover evidence. */
+export class TelegramFollowerRegistrationCancelledError extends Error {
+  constructor() { super("Telegram follower registration was cancelled or superseded."); this.name = "TelegramFollowerRegistrationCancelledError"; }
+}
+
+/** A native pre-issuance deadline is not membership failure or takeover proof. */
+export class TelegramFollowerReadinessExpiredError extends Error {
+  constructor() { super("Telegram original connection readiness expired."); this.name = "TelegramFollowerReadinessExpiredError"; }
+}
+
 export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
   startPolling: (
     ctx: TContext,
@@ -792,8 +818,8 @@ export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
   registerFollowerWithOwner: (
     ctx: TContext,
     owner: TOwner,
-    options?: { recoverConnection?: boolean },
-  ) => Promise<boolean | undefined>;
+    options?: TelegramFollowerRegistrationOptions,
+  ) => Promise<TelegramFollowerRegistrationResult>;
   restoreFollowerWithOwner: (
     ctx: TContext,
     owner: TOwner,
@@ -812,7 +838,7 @@ export interface TelegramThreadAwarePollingControls<TContext, TOwner> {
   registerFollowerWithLeader: (
     ctx: TContext,
     owner: TOwner,
-    options?: { recoverConnection?: boolean },
+    options?: { recoverConnection?: boolean; assertAuthority?: () => void; connectionReadiness?: TelegramFollowerReadiness },
   ) => Promise<boolean | undefined>;
   restoreFollowerWithLeader?: (
     ctx: TContext,
@@ -1141,7 +1167,7 @@ export async function applyTelegramThreadCapability<TContext>(
 export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
   deps: TelegramThreadAwarePollingDeps<TContext, TOwner>,
 ): TelegramThreadAwarePollingPorts<TContext, TOwner> {
-  let generation = 0;
+  let generation = 0, followerGeneration = 0;
   const startPolling = async (
     ctx: TContext,
     options?: { forceFreshLeaderThread?: boolean; restoreWorkspaceOnly?: true },
@@ -1219,27 +1245,90 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
     }
     await deps.stopClassicPolling();
   };
-  const refreshFollowerState = async (): Promise<boolean> => {
-    if (deps.topicTargetStore.refresh) {
-      await deps.topicTargetStore.refresh();
-    } else {
-      await deps.topicTargetStore.load();
+  const refreshFollowerState = async (assertAuthority?: () => void) => {
+    const store = deps.topicTargetStore, refresh = store.refresh ?? store.load;
+    assertAuthority?.();
+    try {
+      await refresh.call(store);
+    } catch (error) {
+      try {
+        deps.recordEvent("bus", error, { phase: "follower-readiness-refresh-refused", source: "local" });
+      } catch { /* Diagnostics cannot replace the original local refusal. */ }
+      throw error;
     }
-    return deps.topicTargetStore.getBotState().threadMode === "enabled";
+    assertAuthority?.();
+    return store.getBotState().threadMode;
   };
   const registerFollowerWithOwner = async (
     ctx: TContext,
     owner: TOwner,
-    options?: { recoverConnection?: boolean },
-  ): Promise<boolean | undefined> => {
-    if (!(await refreshFollowerState())) return undefined;
-    return deps.registerFollowerWithLeader(ctx, owner, options);
+    options?: TelegramFollowerRegistrationOptions,
+  ): Promise<TelegramFollowerRegistrationResult> => {
+    const request = ++followerGeneration, expectedGeneration = generation;
+    const assertCaller = options?.assertAuthority, remainingMs = options?.readiness?.remainingMs, wait = options?.readiness?.wait;
+    assertCaller?.();
+    const recoverConnection = options?.recoverConnection;
+    const store = deps.topicTargetStore, delegate = deps.registerFollowerWithLeader;
+    const refresh = store.refresh, load = store.load, getState = store.getBotState, lifecycle = deps.lifecycle;
+    const lifecycleCurrent = lifecycle?.capture() ?? (() => true);
+    let lost = false, checking = false;
+    const assertAuthority = () => {
+      if (lost || checking) { lost = true; throw new TelegramFollowerRegistrationCancelledError(); }
+      checking = true;
+      try {
+        assertCaller?.();
+        if (request !== followerGeneration || expectedGeneration !== generation || deps.lifecycle !== lifecycle || !lifecycleCurrent() ||
+          deps.topicTargetStore !== store || store.refresh !== refresh || store.load !== load || store.getBotState !== getState ||
+          deps.registerFollowerWithLeader !== delegate || lost)
+          throw new TelegramFollowerRegistrationCancelledError();
+      } catch (error) { lost = true; throw error; }
+      finally { checking = false; }
+    };
+    const readRemaining = () => {
+      assertAuthority();
+      const remaining = remainingMs?.();
+      assertAuthority();
+      return remaining;
+    };
+    const firstRemaining = readRemaining();
+    if (firstRemaining !== undefined && (!Number.isFinite(firstRemaining) || firstRemaining <= 0)) return "readiness-expired";
+    let waiting = false;
+    for (;;) {
+      const before = readRemaining();
+      if (before !== undefined && (!Number.isFinite(before) || before <= 0)) return "readiness-expired";
+      const mode = await refreshFollowerState(assertAuthority);
+      const remaining = readRemaining();
+      if (remaining !== undefined && (!Number.isFinite(remaining) || remaining <= 0)) return "readiness-expired";
+      if (mode === "disabled") return undefined;
+      if (mode === "enabled") break;
+      if (remaining === undefined || !wait) return "pending";
+      if (!waiting) {
+        waiting = true;
+        try { deps.recordEvent("bus", "Waiting for original Telegram leader Thread mode.", { phase: "follower-readiness-wait" }); }
+        catch { /* Diagnostics cannot turn unknown readiness into registration failure. */ }
+      }
+      assertAuthority();
+      const canObserve = await wait();
+      assertAuthority();
+      if (!canObserve) return "readiness-expired";
+    }
+    // The same original budget may wait for native connection only; the issued request keeps its independent ACK timeout.
+    try {
+      const result = await delegate.call(deps, ctx, owner, { ...(recoverConnection === undefined ? {} : { recoverConnection }), assertAuthority,
+        ...(remainingMs && wait ? { connectionReadiness: { remainingMs, wait } } : {}), });
+      assertAuthority();
+      return result;
+    } catch (error) {
+      assertAuthority();
+      if (error instanceof TelegramFollowerReadinessExpiredError) return "readiness-expired";
+      throw error;
+    }
   };
   const restoreFollowerWithOwner = async (
     ctx: TContext,
     owner: TOwner,
   ): Promise<boolean | undefined> => {
-    if (!(await refreshFollowerState())) {
+    if ((await refreshFollowerState()) !== "enabled") {
       deps.recordEvent(
         "bus",
         "Telegram follower auto-connect skipped: Threaded Mode is not enabled.",
@@ -1274,7 +1363,7 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
     },
     registerFollowerWithOwner,
     restoreFollowerWithOwner,
-    stopFollowerRegistration: deps.stopFollowerRegistration,
+    stopFollowerRegistration() { followerGeneration++; deps.stopFollowerRegistration(); },
   };
 }
 

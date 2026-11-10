@@ -1,7 +1,7 @@
 /**
  * Telegram updates domain helpers
  * Zones: telegram inbound, authorization, routing plans
- * Owns update extraction, authorization, execution planning, generation-fenced journal draining, and the public update-handler registry
+ * Owns update extraction, authorization, execution planning, source-qualified actual-execution exclusion, generation-fenced journal draining, and the public update-handler registry
  */
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -1057,6 +1057,29 @@ class TelegramUpdateAdmissionOutcomeError extends Error {
     }
 }
 const TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED = Symbol("telegram.update-worker.execution-aborted");
+const TELEGRAM_UPDATE_WORKER_EXECUTION_RECHECK = Symbol("telegram.update-worker.execution-recheck");
+const TELEGRAM_SOURCE_EXECUTIONS = Symbol.for("pi-telegram.update-source-executions.v1");
+/** Additional same-process exclusion only; neither this index nor its absence grants source authority. */
+function getTelegramSourceExecutionPool() {
+    const host = globalThis;
+    if (host[TELEGRAM_SOURCE_EXECUTIONS] === undefined)
+        Object.defineProperty(host, TELEGRAM_SOURCE_EXECUTIONS, { value: new Map() });
+    const pool = host[TELEGRAM_SOURCE_EXECUTIONS];
+    if (!(pool instanceof Map))
+        throw new Error("Telegram source execution index is unavailable.");
+    return pool;
+}
+function getTelegramSourceExecutionIndex(key, create = false) {
+    const pool = getTelegramSourceExecutionPool();
+    let index = pool.get(key);
+    if (index !== undefined && !(index instanceof Map))
+        throw new Error("Telegram source execution index is invalid.");
+    if (!index && create) {
+        index = new Map();
+        pool.set(key, index);
+    }
+    return index;
+}
 /** The receipt's only journal entry when it is exactly this prompt update, queued unchanged under this owner. */
 function findExactQueuedPromptEntry(snapshot, receiptId, updateId, queueOwner, update) {
     if (!isTelegramUpdateJournalLegacyFamilyVersion(snapshot.version))
@@ -1361,6 +1384,47 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
     const claims = new Map();
     const deferredSources = new Map();
     const unsettledExecutionsByUpdateId = new Map();
+    const readExecutionBinding = deps.getJournalBindingKey;
+    const captureExecutionSource = (expected) => {
+        const scope = expected.executionSource ??= { checking: false, lost: false };
+        if (scope.checking || scope.lost || deps.getJournalBindingKey !== readExecutionBinding) {
+            scope.lost = true;
+            throw new Error("Telegram original execution source changed.");
+        }
+        if (!("key" in scope)) {
+            scope.checking = true;
+            try {
+                const key = readExecutionBinding?.call(deps);
+                if (scope.lost || deps.getJournalBindingKey !== readExecutionBinding)
+                    throw new Error("Telegram original execution source changed.");
+                // Legacy unqualified labels retain worker-local exclusion; never join distinct sources by numeric ID alone.
+                scope.key = key && getTelegramUpdateJournalBindingPath(key) !== undefined ? key : undefined;
+            }
+            catch (error) {
+                scope.lost = true;
+                throw error;
+            }
+            finally {
+                scope.checking = false;
+            }
+        }
+        return scope;
+    };
+    const getUnsettledExecutions = (updateId, expected = owner) => {
+        const pending = new Set(unsettledExecutionsByUpdateId.get(updateId));
+        const key = expected && captureExecutionSource(expected).key;
+        if (key) {
+            const shared = getTelegramSourceExecutionIndex(key)?.get(updateId);
+            if (shared !== undefined && !(shared instanceof Set))
+                throw new Error("Telegram source execution claim is invalid.");
+            for (const execution of shared ?? []) {
+                if (!(execution instanceof Promise))
+                    throw new Error("Telegram source execution claim is invalid.");
+                pending.add(execution);
+            }
+        }
+        return pending;
+    };
     const committedQueueReceipts = new Map();
     const requiredScopedQueueReceipts = new Set();
     const scopedQueueCompletionAttempts = new Map();
@@ -1399,7 +1463,7 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
         return (!sourceOwner.startupUpdateIds?.has(updateId) &&
             !source?.historical &&
             !source?.liveReleaseIssued &&
-            !unsettledExecutionsByUpdateId.has(updateId));
+            getUnsettledExecutions(updateId, sourceOwner).size === 0);
     };
     const updateClaimCounts = () => {
         let deferredClaimCount = 0;
@@ -1864,16 +1928,65 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
         transition("blocked", currentUpdateId, "authority-lost");
         return "blocked";
     };
+    const waitWithinOwner = async (expected, work) => {
+        const signal = expected.controller.signal;
+        if (owner !== expected || signal.aborted)
+            return TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED;
+        let cancel = () => { };
+        const aborted = new Promise(resolve => {
+            cancel = () => resolve(TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED);
+            signal.addEventListener("abort", cancel, { once: true });
+            if (signal.aborted)
+                cancel();
+        });
+        try {
+            return await Promise.race([work, aborted]);
+        }
+        finally {
+            signal.removeEventListener("abort", cancel);
+        }
+    };
     const executeWithinOwner = async (expectedOwner, update, preparedExecute, target) => {
+        const updateId = update.update_id;
         if (expectedOwner.controller.signal.aborted) {
             return TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED;
         }
+        const source = captureExecutionSource(expectedOwner);
+        if (owner !== expectedOwner || expectedOwner.controller.signal.aborted)
+            return TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED;
+        if (source.key) {
+            source.checking = true;
+            try {
+                if (deps.getJournalBindingKey !== readExecutionBinding || readExecutionBinding?.call(deps) !== source.key || deps.getJournalBindingKey !== readExecutionBinding)
+                    source.lost = true;
+            }
+            catch (error) {
+                source.lost = true;
+                throw error;
+            }
+            finally {
+                source.checking = false;
+            }
+        }
+        if (source.lost)
+            throw new Error("Telegram original execution source changed.");
         const custodied = deps.executeCustodiedUpdate !== undefined;
-        const execution = Promise.resolve().then(async () => preparedExecute
-            ? preparedExecute(update, expectedOwner.ctx, expectedOwner.controller.signal)
-            : deps.executeCustodiedUpdate
-                ? deps.executeCustodiedUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal)
-                : deps.executeUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal, target));
+        if (owner !== expectedOwner || expectedOwner.controller.signal.aborted)
+            return TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED;
+        // A concurrent claim after the drain's earlier check invalidates its whole entry snapshot.
+        if (getUnsettledExecutions(updateId, expectedOwner).size)
+            return TELEGRAM_UPDATE_WORKER_EXECUTION_RECHECK;
+        // Check/register is synchronous: a second worker cannot pass between observing and claiming the source.
+        const sharedIndex = source.key ? getTelegramSourceExecutionIndex(source.key, true) : undefined;
+        const execution = Promise.resolve().then(async () => {
+            if (owner !== expectedOwner || expectedOwner.controller.signal.aborted)
+                throw new Error("Telegram update execution was cancelled before invocation.");
+            return preparedExecute
+                ? preparedExecute(update, expectedOwner.ctx, expectedOwner.controller.signal)
+                : deps.executeCustodiedUpdate
+                    ? deps.executeCustodiedUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal)
+                    : deps.executeUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal, target);
+        });
         const settlement = execution.then((outcome) => custodied
             ? {
                 ok: true,
@@ -1882,17 +1995,28 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
             }
             : { ok: true, outcome: outcome }, (error) => ({ ok: false, error }));
         unsettledExecutions.add(settlement);
-        const updateExecutions = unsettledExecutionsByUpdateId.get(update.update_id) ?? new Set();
+        const updateExecutions = unsettledExecutionsByUpdateId.get(updateId) ?? new Set();
         updateExecutions.add(settlement);
-        unsettledExecutionsByUpdateId.set(update.update_id, updateExecutions);
+        unsettledExecutionsByUpdateId.set(updateId, updateExecutions);
+        if (sharedIndex)
+            sharedIndex.set(updateId, updateExecutions);
         state.unsettledExecutionCount = unsettledExecutions.size;
         notifyStateChange();
         void settlement.then((result) => {
             unsettledExecutions.delete(settlement);
-            const currentExecutions = unsettledExecutionsByUpdateId.get(update.update_id);
+            const currentExecutions = unsettledExecutionsByUpdateId.get(updateId);
             currentExecutions?.delete(settlement);
             if (currentExecutions?.size === 0) {
-                unsettledExecutionsByUpdateId.delete(update.update_id);
+                unsettledExecutionsByUpdateId.delete(updateId);
+            }
+            if (sharedIndex && source.key) {
+                const pending = sharedIndex.get(updateId);
+                pending?.delete(settlement);
+                if (pending?.size === 0)
+                    sharedIndex.delete(updateId);
+                const pool = getTelegramSourceExecutionPool();
+                if (sharedIndex.size === 0 && pool.get(source.key) === sharedIndex)
+                    pool.delete(source.key);
             }
             state.unsettledExecutionCount = unsettledExecutions.size;
             if (owner !== expectedOwner || expectedOwner.controller.signal.aborted) {
@@ -1901,27 +2025,12 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
                     : result.error, {
                     phase: result.ok ? "late-execution-success" : "late-execution",
                     generation: expectedOwner.generation,
-                    updateId: update.update_id,
+                    updateId,
                 });
             }
             notifyStateChange();
         });
-        let removeAbortListener = () => { };
-        const aborted = new Promise((resolve) => {
-            const onAbort = () => resolve(TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED);
-            removeAbortListener = () => expectedOwner.controller.signal.removeEventListener("abort", onAbort);
-            expectedOwner.controller.signal.addEventListener("abort", onAbort, {
-                once: true,
-            });
-            if (expectedOwner.controller.signal.aborted)
-                onAbort();
-        });
-        try {
-            return await Promise.race([settlement, aborted]);
-        }
-        finally {
-            removeAbortListener();
-        }
+        return waitWithinOwner(expectedOwner, settlement);
     };
     const commitQueuedOutcome = (expectedOwner, currentUpdateId, outcome) => {
         const normalized = normalizeQueueReceipt(outcome);
@@ -2142,7 +2251,7 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
                 entry.state !== "pending" ||
                 !binding ||
                 claims.get(entry.updateId) === "queued" ||
-                unsettledExecutionsByUpdateId.get(entry.updateId)?.size)
+                getUnsettledExecutions(entry.updateId, expectedOwner).size)
                 continue;
             // Classify the first startup snapshot before constructing any historical expiry carrier.
             if (expectedOwner.startupUpdateIds?.has(entry.updateId) &&
@@ -2401,14 +2510,15 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
                 if (livePreparation?.ids.has(entry.updateId) &&
                     (!livePreparation.released || livePreparation.status?.issued))
                     continue;
-                const priorExecutions = unsettledExecutionsByUpdateId.get(entry.updateId);
-                if (priorExecutions?.size) {
+                const priorExecutions = getUnsettledExecutions(entry.updateId, expectedOwner);
+                if (priorExecutions.size) {
                     const completionResult = commitCompletedBatch(expectedOwner, completedUpdateIds);
                     if (completionResult)
                         return completionResult;
                     transition("blocked", entry.updateId, "prior-generation-executing");
-                    await Promise.allSettled([...priorExecutions]);
-                    if (owner !== expectedOwner ||
+                    const waited = await waitWithinOwner(expectedOwner, Promise.allSettled([...priorExecutions]));
+                    if (waited === TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED ||
+                        owner !== expectedOwner ||
                         expectedOwner.controller.signal.aborted) {
                         return "aborted";
                     }
@@ -2588,6 +2698,10 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
                         return admitted.outcome;
                     }
                     : undefined, prepared?.target);
+                if (execution === TELEGRAM_UPDATE_WORKER_EXECUTION_RECHECK) {
+                    snapshotInvalidated = true;
+                    break;
+                }
                 if (execution === TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED) {
                     return "aborted";
                 }
@@ -3173,7 +3287,7 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
                 ids.some((id) => !Number.isSafeInteger(id) ||
                     id < 0 ||
                     claims.has(id) ||
-                    unsettledExecutionsByUpdateId.has(id) ||
+                    getUnsettledExecutions(id, expectedOwner).size > 0 ||
                     (state.phase === "executing" && state.currentUpdateId === id)))
                 return undefined;
             let before;
@@ -3215,7 +3329,7 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
                             entry.queueHandoff ||
                             "inputProvenance" in entry ||
                             claims.has(entry.updateId) ||
-                            unsettledExecutionsByUpdateId.has(entry.updateId)))
+                            getUnsettledExecutions(entry.updateId, expectedOwner).size > 0))
                         return undefined;
                     return entries;
                 }
@@ -5729,6 +5843,9 @@ export function createTelegramUpdateAdmissionRuntimeAssembly(deps) {
     const owner = createTelegramUpdateWorkerOwnerRuntime(deps.owner);
     const lifecycle = createTelegramUpdateAdmissionLifecycleAssembly({
         runtimeBinding: deps.runtimeBinding,
+        ...(deps.acquireSourceReference
+            ? { acquireSourceReference: deps.acquireSourceReference }
+            : {}),
         worker: {
             ...deps.worker,
             ...owner,

@@ -4302,7 +4302,24 @@ async function handleFollowerApiCall(
     attachmentEpoch !== undefined && !!attachmentProfile && Number.isSafeInteger(attachmentOperator) && attachmentOperator! > 0 &&
     attachmentScope.epoch?.() === attachmentEpoch && attachmentScope.profile?.() === attachmentProfile && attachmentScope.operator?.() === attachmentOperator;
   let attachmentInvoked = false, attachmentIssued = false;
-  // Guarded ordinary calls snapshot their wire descriptor; omitted/legacy calls keep prior semantics.
+  // Ordinary legacy calls still need the configured leader's original transport, independently of richer publication proofs.
+  const transportCapture = !input && !scopedApi ? deps.captureApiTransport : undefined, originalCall = deps.callApi;
+  let ordinaryTransport: (() => boolean) | undefined, transportLost = false, transportChecking = false, transportIssued = false;
+  const assertTransport = () => {
+    if (transportLost || transportChecking) { transportLost = true; throw new TelegramApiAuthorityError(transportIssued); }
+    transportChecking = true;
+    try {
+      if (deps.captureApiTransport !== transportCapture || deps.callApi !== originalCall || ordinaryTransport?.() !== true ||
+          deps.captureApiTransport !== transportCapture || deps.callApi !== originalCall || transportLost)
+        throw new TelegramApiAuthorityError(transportIssued);
+    } catch (error) { transportLost = true; throw error; }
+    finally { transportChecking = false; }
+  };
+  if (transportCapture) {
+    try { ordinaryTransport = transportCapture(); assertTransport(); }
+    catch { return rejectTelegramBusRequest(envelope.requestId, "Original follower API transport authority is unavailable."); }
+    envelope = structuredClone(envelope);
+  }
   if (input || scopedApi) envelope = structuredClone(envelope);
   const followerResolution = resolveRegisteredTelegramBusFollower(
     deps.followerRegistry,
@@ -4387,6 +4404,7 @@ async function handleFollowerApiCall(
     );
   }
   try {
+    if (transportCapture) assertTransport();
     let recordInput: ((messageId: number) => void) | undefined, assertInputReceiver: (() => void) | undefined;
     let attachmentPublication: { botId: number; target: TelegramTarget } | undefined;
     if (attachment && (!hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION) ||
@@ -4450,7 +4468,16 @@ async function handleFollowerApiCall(
     assertBroker?.();
     attachmentInvoked = !!attachment;
     brokerInvoked = !!assertBroker;
-    const result = await deps.callApi(envelope.method, brokerArgs ?? args);
+    const transportArgs = transportCapture ? structuredClone(args) : undefined;
+    const index = envelope.method === "call" ? 2 : envelope.method === "callMultipart" ? 5 : undefined;
+    if (transportArgs && index !== undefined) {
+      const options = asRecord(transportArgs[index]);
+      transportArgs[index] = { ...options, assertAuthority: assertTransport, onRequestIssued() {
+        transportIssued = true;
+        assertTransport();
+      } };
+    }
+    const result = await deps.callApi(envelope.method, brokerArgs ?? transportArgs ?? args);
     brokerCompleted = !!assertBroker;
     assertBroker?.();
     if (assertBroker && (initial.apiMethod === "sendMessage" || initial.apiMethod === "sendRichMessage")) {

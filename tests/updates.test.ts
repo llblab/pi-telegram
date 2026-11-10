@@ -95,6 +95,7 @@ import {
 import { createTelegramJournalSourceSerialization,
   createTelegramUpdateJournalBindingKey,
   createTelegramUpdateJournalRuntimeBindingResolver,
+  createTelegramUpdateJournalReferenceRegistry,
   createTelegramUpdateJournalEntryDigest,
   createTelegramUpdateJournalBotIdentity,
   createTelegramUpdateJournalStore,
@@ -5739,6 +5740,44 @@ test("Admission runtime assembly owns queue identity and leader/follower workers
   await runtimeBinding.onSessionShutdown();
 });
 
+for (const role of ["leader", "follower"] as const)
+test(`Admission runtime assembly fences source I/O on reference admission (${role})`, async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  const references = createTelegramUpdateJournalReferenceRegistry();
+  const binding = { runtimeKey: `runtime-${role}`, recoveryKey: `binding-${role}`, journal: {
+    ...storage.journal, appendBatch: () => ({ nonExcludedUpdateIds: [] }),
+  } };
+  let denied = true, executions = 0;
+  const runtimeBinding = createTelegramUpdateAdmissionRuntimeBinding<string>({ isFollowerRegistered: () => role === "follower" });
+  const assembly = createTelegramUpdateAdmissionRuntimeAssembly<TelegramJournaledUpdate & TelegramUpdateFlow, string>({
+    runtimeBinding,
+    acquireSourceReference(actualRole, source) {
+      assert.equal(actualRole, role); assert.equal(source.recoveryKey, binding.recoveryKey);
+      assert.equal(source.journal, binding.journal);
+      if (denied) throw new Error("Original source reference refused");
+      return references.acquire({ referenceClass: actualRole === "leader" ? "leader-lifecycle" : "follower-lifecycle", recoveryKey: source.recoveryKey });
+    },
+    owner: { instanceId: "reference-owner", processId: 42, processBirthId: "42:start:1", getSessionGeneration: () => 1,
+      isContextCurrent: () => true, dispatchNext() {}, requestQueueHandoffReconciliation() {} },
+    worker: { async defaultHandle() { executions++; } },
+    leader: { resolveBinding: () => binding, hasAuthority: () => true },
+    follower: { resolveBinding: () => binding, isRegistered: () => role === "follower", getGeneration: () => "generation-1", prepareUpdateForExecution: update => update },
+  });
+  const lifecycle = assembly[role];
+  try {
+    await assert.rejects(lifecycle.onSessionStart(TEST_CONTEXT), /Original source reference refused/);
+    assert.equal(storage.getReadCount(), 0, "Reference admission must precede worker source I/O and construction");
+    assert.equal(executions, 0); assert.deepEqual(references.list(), []);
+    denied = false;
+    await lifecycle.onSessionStart(TEST_CONTEXT);
+    await waitForUpdateWorkerCondition(() => storage.getUpdateIds().length === 0, "Admitted source did not execute");
+    assert.equal(executions, 1);
+    assert.deepEqual(references.list(), [{ referenceClass: role === "leader" ? "leader-lifecycle" : "follower-lifecycle", recoveryKey: binding.recoveryKey }]);
+    await lifecycle.onSessionShutdown();
+    assert.deepEqual(references.list(), [], "Native lifecycle stop must release its own actual source lease");
+  } finally { await runtimeBinding.onSessionShutdown(); }
+});
+
 test("Admission live preparation uses a retained source reference without pausing ordinary work or adopting leader originals", async () => {
   await withLiveInputWorker(1, async f => {
     let references = 0;
@@ -8756,6 +8795,133 @@ test("Update worker reconstructs durable queue claims after session replacement"
   await replacement.waitForDrain();
   assert.deepEqual(storage.getUpdateIds(), []);
   await replacement.stop();
+});
+
+for (const completion of ["success", "failure"] as const)
+test(`Source-qualified workers retain actual execution across cancellation (${completion})`, async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  const identity = { tokenSha256: "a".repeat(64) };
+  const coordinates = { path: `/source-exclusion-${completion}/inbox.json`, profileName: "test", botIdentity: identity };
+  const binding = createTelegramUpdateJournalBindingKey(coordinates);
+  let resolveFirst!: (value: TelegramUpdateAdmissionOutcome) => void, rejectFirst!: (error: Error) => void;
+  const firstExecution = new Promise<TelegramUpdateAdmissionOutcome>((resolve, reject) => { resolveFirst = resolve; rejectFirst = reject; });
+  let donorCalls = 0, waiterCalls = 0, recipientCalls = 0, independentCalls = 0;
+  const donor = createTelegramUpdateWorkerRuntime({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    executeUpdate() { donorCalls++; return firstExecution; } });
+  const waiter = createTelegramUpdateWorkerRuntime({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    executeUpdate() { waiterCalls++; return { kind: "complete" }; } });
+  // Only the structural legacy-worker port crosses module copies, never branded private-input capabilities.
+  const recipientFactory = completion === "success"
+    ? (await import("../dist/lib/updates.js")).createTelegramUpdateWorkerRuntime as unknown as typeof createTelegramUpdateWorkerRuntime
+    : createTelegramUpdateWorkerRuntime;
+  const recipient = recipientFactory({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    executeUpdate() { recipientCalls++; return { kind: "complete" }; } });
+  const workers = [donor, waiter, recipient];
+  try {
+    donor.start(TEST_CONTEXT);
+    await waitForUpdateWorkerCondition(() => donorCalls === 1, "original execution did not enter");
+    await donor.stop();
+    assert.equal(donor.getState().unsettledExecutionCount, 1);
+    waiter.start(TEST_CONTEXT);
+    await waitForUpdateWorkerCondition(() => waiter.getState().blockedReason === "prior-generation-executing", "new worker did not retain original execution exclusion");
+    let stopped = false;
+    const stopping = waiter.stop().then(() => { stopped = true; });
+    await waitForUpdateWorkerCondition(() => stopped, "cancellation waited for another worker's unsettled handler");
+    await stopping;
+    assert.equal(waiterCalls, 0);
+    recipient.start(TEST_CONTEXT);
+    await waitForUpdateWorkerCondition(() => recipient.getState().blockedReason === "prior-generation-executing", "stopping a waiter released someone else's execution");
+    for (const alternate of [
+      { ...coordinates, profileName: "other" },
+      { ...coordinates, path: coordinates.path + ".other" },
+      { ...coordinates, botIdentity: { tokenSha256: "b".repeat(64) } },
+    ]) {
+      const independent = createTestUpdateWorkerJournal([1]);
+      const worker = createTelegramUpdateWorkerRuntime({ journal: { ...independent.journal, read: () => ({ ...independent.journal.read(), profile: alternate.profileName, botIdentity: alternate.botIdentity }) },
+        getJournalBindingKey: () => createTelegramUpdateJournalBindingKey(alternate), hasAuthority: () => true,
+        executeUpdate() { independentCalls++; return { kind: "complete" }; } });
+      workers.push(worker); worker.start(TEST_CONTEXT);
+      let drained = false;
+      const draining = worker.waitForDrain().then(() => { drained = true; });
+      await waitForUpdateWorkerCondition(() => drained, "An unrelated full source binding was blocked");
+      await draining;
+      assert.deepEqual(independent.getUpdateIds(), [], "A different full binding with the same numeric ID must remain independent");
+    }
+    assert.equal(independentCalls, 3);
+    assert.equal(recipientCalls, 0);
+    assert.deepEqual(storage.getUpdateIds(), [1]);
+    if (completion === "success") resolveFirst({ kind: "complete" }); else rejectFirst(new Error("Original handler failed after stop"));
+    await recipient.waitForDrain();
+    assert.equal(donorCalls, 1); assert.equal(waiterCalls, 0); assert.equal(recipientCalls, 1);
+    assert.deepEqual(storage.getRemovals(), [[1]], "Only current recipient authority settles the original entry");
+    const pool = (globalThis as unknown as Record<symbol, Map<string, unknown>>)[Symbol.for("pi-telegram.update-source-executions.v1")];
+    assert.equal(pool?.has(binding), false, "Actual settlement releases the private process-local exclusion record");
+  } finally {
+    resolveFirst({ kind: "complete" });
+    await Promise.allSettled(workers.map(worker => worker.stop()));
+  }
+});
+
+for (const completion of ["success", "failure"] as const)
+test(`Source-qualified execution cleanup retains the original mutable DTO identity (${completion})`, async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  const binding = createTelegramUpdateJournalBindingKey({ path: `/source-exclusion-mutated-${completion}/inbox.json`, profileName: "test", botIdentity: { tokenSha256: "a".repeat(64) } });
+  let release!: () => void, entered = false, recipientCalls = 0;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const donor = createTelegramUpdateWorkerRuntime({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    async executeUpdate(update) { entered = true; update.update_id = 999; await held; if (completion === "failure") throw new Error("Late mutated handler failed"); return { kind: "complete" as const }; } });
+  const recipient = createTelegramUpdateWorkerRuntime({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    executeUpdate(update) { assert.equal(update.update_id, 1); recipientCalls++; return { kind: "complete" }; } });
+  const pool = () => (globalThis as unknown as Record<symbol, Map<string, Map<number, unknown>>>)[Symbol.for("pi-telegram.update-source-executions.v1")];
+  try {
+    donor.start(TEST_CONTEXT);
+    await waitForUpdateWorkerCondition(() => entered, "Mutable handler did not enter");
+    await donor.stop();
+    assert.deepEqual([...pool().get(binding)!.keys()], [1], "Only the original source identity owns this in-flight claim");
+    release();
+    await waitForUpdateWorkerCondition(() => donor.getState().unsettledExecutionCount === 0, "Actual mutated execution did not settle");
+    assert.equal(pool().has(binding), false, "Actual settlement must not leave a ghost claim under the original ID");
+    assert.deepEqual(storage.getUpdateIds(), [1]); assert.deepEqual(storage.getRemovals(), []);
+    recipient.start(TEST_CONTEXT); await recipient.waitForDrain();
+    assert.equal(recipientCalls, 1); assert.deepEqual(storage.getRemovals(), [[1]]);
+  } finally { release(); await Promise.allSettled([donor.stop(), recipient.stop()]); }
+});
+
+test("Source-qualified workers atomically recheck a claim after asynchronous preparation", async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  const binding = createTelegramUpdateJournalBindingKey({ path: "/source-exclusion-race/inbox.json", profileName: "test", botIdentity: { tokenSha256: "a".repeat(64) } });
+  let releasePreparation!: () => void, releaseExecution!: (value: TelegramUpdateAdmissionOutcome) => void;
+  const preparation = new Promise<void>(resolve => { releasePreparation = resolve; });
+  const execution = new Promise<TelegramUpdateAdmissionOutcome>(resolve => { releaseExecution = resolve; });
+  let prepared = 0, calls = 0, active = 0, maximumActive = 0, yields = 0, firstContext: string | undefined;
+  const makeWorker = () => createTelegramUpdateWorkerRuntime<string>({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    // This fixture's bounded observer also runs on immediates; do not race a production zero-delay timer against its tick budget.
+    yieldToEventLoop: () => new Promise<void>(resolve => { yields++; setImmediate(resolve); }),
+    async shouldReviewHistoricalInput() { prepared++; await preparation; return false; },
+    executeUpdate(_update, ctx) {
+      calls++; active++; maximumActive = Math.max(maximumActive, active);
+      if (calls === 1) { firstContext = ctx; return execution.finally(() => { active--; }); }
+      active--; return { kind: "complete" };
+    } });
+  const one = makeWorker(), two = makeWorker();
+  try {
+    one.start("one"); two.start("two");
+    await waitForUpdateWorkerCondition(() => prepared === 2, "Both entry snapshots were not captured before preparation");
+    releasePreparation();
+    await waitForUpdateWorkerCondition(() => calls > 0, "No actual handler entered");
+    const original = firstContext === "one" ? one : two, successor = original === one ? two : one;
+    await original.stop();
+    assert.equal(calls, 1);
+    await waitForUpdateWorkerCondition(() => successor.getState().blockedReason === "prior-generation-executing", "Late competing snapshot bypassed the actual claim");
+    releaseExecution({ kind: "complete" });
+    await successor.waitForDrain();
+    assert.equal(calls, 2); assert.equal(maximumActive, 1);
+    assert.ok(yields > 0, "The stale snapshot was invalidated, not executed after the competing claim");
+    assert.deepEqual(storage.getRemovals(), [[1]]);
+  } finally {
+    releasePreparation(); releaseExecution({ kind: "complete" });
+    await Promise.allSettled([one.stop(), two.stop()]);
+  }
 });
 
 test("Update worker delays replacement replay until an abort-ignoring generation settles", async () => {

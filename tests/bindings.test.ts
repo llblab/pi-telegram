@@ -1546,18 +1546,15 @@ test("Command binding rejects a missing profile without stopping active polling"
 test("Named profile connect completes old teardown before activating new identity", async () => {
   const harness = createBindingApiHarness();
   const events: string[] = [];
+  const storedConfig = { profiles: { active: { botToken: "active-token" }, work: { botToken: "work-token" } } };
   let activeProfileName: string | undefined = "active";
   let stopCompleted = false;
   registerTelegramCommandsAndTools({
     pi: harness.api,
     configStore: {
       get: () => ({ botToken: `${activeProfileName}-token` }),
-      getStoredConfig: () => ({
-        profiles: {
-          active: { botToken: "active-token" },
-          work: { botToken: "work-token" },
-        },
-      }),
+      getStoredConfig: () => storedConfig,
+      getBotToken: (profileName = activeProfileName) => storedConfig.profiles[profileName as keyof typeof storedConfig.profiles]?.botToken,
       getActiveProfileName: () => activeProfileName,
       activateProfile: (profileName?: string) => {
         assert.equal(stopCompleted, true);
@@ -1575,6 +1572,9 @@ test("Named profile connect completes old teardown before activating new identit
     setup: { start: () => true, finish: () => {} },
     activeTurnRuntime: { get: () => undefined },
     lockedPollingRuntime: {
+      prepareConnection: (_ctx: unknown, isCurrent: () => boolean) => {
+        assert.equal(isCurrent(), true); events.push("prepare");
+      },
       start: async () => {
         events.push(`start:${activeProfileName}`);
         return { ok: true };
@@ -1606,6 +1606,7 @@ test("Named profile connect completes old teardown before activating new identit
   assert.equal(activeProfileName, "work");
   assert.deepEqual(events, [
     "load",
+    "prepare",
     "stop:active",
     "activate:work",
     "start:work",
@@ -1622,6 +1623,76 @@ test("Named profile connect completes old teardown before activating new identit
       options: { deliverAs: "nextTurn" },
     },
   ]);
+});
+
+for (const named of [false, true])
+for (const boundary of ["known", "cancel-before-prep", "cancel-in-prep", "profile-in-prep", "config-in-prep", "token-in-prep", "config-in-stop", "cancel-in-stop", "config-after-activate", "profile-after-activate", "cancel-after-activate", "prepare-error", "reset", "cancel-in-refresh", "config-in-refresh", "refresh-error", "refresh-unavailable"] as const)
+test(`Connect preparation pins selected profile before old cleanup (${named ? "named" : "default"}/${boundary})`, async () => {
+  const harness = createBindingApiHarness(), events: string[] = [];
+  const env: NodeJS.ProcessEnv = { SELECTED_CONNECT_TOKEN: "123:selected" };
+  const selected = named ? "work" : "default";
+  const store = Config.createTelegramConfigStore({ env, initialConfig: { profiles: {
+    default: { botToken: "$SELECTED_CONNECT_TOKEN" }, work: { botToken: "$SELECTED_CONNECT_TOKEN" }, old: { botToken: "123:old" },
+  } } });
+  store.activateProfile("old");
+  const activate = store.activateProfile;
+  store.activateProfile = profile => { events.push("activate"); return activate(profile); };
+  let current = true, generation = 1;
+  store.load = async () => { if (boundary === "cancel-before-prep") current = false; };
+  const changeConfig = () => store.setProfile(selected, { botToken: "$SELECTED_CONNECT_TOKEN" });
+  registerTelegramCommandsAndTools({
+    pi: harness.api, configStore: store, setup: { start: () => true, finish() {} }, activeTurnRuntime: { get: () => undefined },
+    lockedPollingRuntime: {
+      prepareConnection(_ctx: unknown, isCurrent: () => boolean) {
+        events.push("prepare");
+        assert.equal(store.getActiveProfileName(), "old", "Inspection does not lend old teardown the new identity");
+        assert.equal(store.getBotToken(selected), "123:selected");
+        if (boundary === "cancel-in-prep") current = false;
+        if (boundary === "profile-in-prep") activate("work");
+        if (boundary === "config-in-prep") changeConfig();
+        if (boundary === "token-in-prep") env.SELECTED_CONNECT_TOKEN = "123:replacement";
+        if (boundary === "prepare-error") throw new Error("Fixture preparation refused");
+        if (!isCurrent()) throw new Error("Fixture preparation superseded");
+        return ["reset", "cancel-in-refresh", "config-in-refresh", "refresh-error", "refresh-unavailable"].includes(boundary);
+      },
+      start: async () => { events.push("start"); assert.equal(store.getActiveProfileName(), named ? "work" : undefined); return { ok: true }; },
+      stop: async () => assert.fail("The captured composed teardown port owns this stop"),
+    },
+    stopPolling: async () => {
+      events.push("stop"); assert.equal(store.getActiveProfileName(), "old");
+      await Promise.resolve();
+      if (boundary === "config-in-stop") changeConfig();
+      if (boundary === "cancel-in-stop") generation++;
+    },
+    ...(boundary === "refresh-unavailable" ? {} : { refreshProfileStateAfterReset: async () => {
+      events.push("refresh");
+      assert.equal(store.getActiveProfileName(), named ? "work" : undefined);
+      await Promise.resolve();
+      if (boundary === "cancel-in-refresh") generation++;
+      if (boundary === "config-in-refresh") changeConfig();
+      if (boundary === "refresh-error") throw new Error("Fixture selected projection refused");
+    } }),
+    onTransportChanged: async () => {
+      await Promise.resolve();
+      if (boundary === "config-after-activate") changeConfig();
+      if (boundary === "profile-after-activate") activate("old");
+      if (boundary === "cancel-after-activate") generation++;
+    },
+    getSessionGeneration: () => generation, isContextCurrent: () => current,
+    getStatusLines: () => [], buttonActionStore: { register: () => "fixture" },
+    sendMarkdownReply: async () => 1, callMultipart: async () => ({ ok: true }), getDefaultChatId: () => 42,
+    canSendDirect: () => true, updateStatus() {}, recordRuntimeEvent() {},
+  } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
+  const connect = harness.commands.get("telegram-connect") as { handler: (args: string, ctx: ExtensionContext) => Promise<void> };
+  await connect.handler(named ? "work" : "", { cwd: "/repo", ui: { notify() {} } } as unknown as ExtensionContext);
+  if (boundary === "known") assert.deepEqual(events, ["prepare", "stop", "activate", "start"]);
+  else if (boundary === "reset") assert.deepEqual(events, ["prepare", "stop", "activate", "refresh", "start"]);
+  else if (["cancel-in-refresh", "config-in-refresh", "refresh-error"].includes(boundary)) assert.deepEqual(events, ["prepare", "stop", "activate", "refresh"]);
+  else if (boundary === "refresh-unavailable") assert.deepEqual(events, ["prepare", "stop", "activate"]);
+  else if (boundary === "cancel-before-prep") assert.deepEqual(events, []);
+  else if (boundary.endsWith("in-stop")) assert.deepEqual(events, ["prepare", "stop"]);
+  else if (boundary.endsWith("after-activate")) assert.deepEqual(events, ["prepare", "stop", "activate"]);
+  else assert.deepEqual(events, ["prepare"], "A refused preparation cannot start old cleanup or change identity");
 });
 
 test("Named profile setup cancellation preserves the active runtime", async () => {
@@ -1752,10 +1823,11 @@ test("Named setup preserves a display preference changed while the token form wa
 test("Lifecycle binding drains diagnostics before quit cleanup and preserves cleanup after failure", async () => {
   const events: string[] = [];
   const callbacks = createTelegramButtonActionStore();
-  let holdDiagnostics = false, current = true;
+  let holdDiagnostics = false, current = true, generation = 1;
   let releaseDiagnostics: (() => void) | undefined;
   let disconnectFails = false;
   let automaticCleanupEnabled = true;
+  let cleanupPreferenceGate: Promise<void> | undefined, disconnectGate: Promise<void> | undefined;
   const harness = createBindingApiHarness();
   const deps = {
     diagnostics: {
@@ -1766,6 +1838,7 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
       },
     },
     isSessionContextActive: () => current,
+    getSessionGeneration: () => generation,
     pi: harness.api,
     activityRuntime: {
       recordInputSource: () => {},
@@ -1845,13 +1918,16 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
     modelContextAvailabilityRuntime: { reconcile: () => {} },
     disconnectOnQuit: async () => {
       events.push("disconnect-on-quit");
+      if (disconnectGate) await disconnectGate;
       if (disconnectFails) throw new Error("cleanup unavailable");
     },
     shutdownGenerativeAppLiveSurfaces: () => {
       events.push("live-surfaces-shutdown");
     },
-    resolveAutomaticThreadCleanupEnabled: async () =>
-      automaticCleanupEnabled,
+    resolveAutomaticThreadCleanupEnabled: async () => {
+      if (cleanupPreferenceGate) { events.push("cleanup-preference"); await cleanupPreferenceGate; }
+      return automaticCleanupEnabled;
+    },
     buttonActionStore: callbacks,
     callMultipart: async () => ({ ok: true }),
     sendChatAction: async () => ({ ok: true }),
@@ -1888,7 +1964,7 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
   assert.strictEqual(step.entries[0], preceding);
   assert.equal(step.entries[1]!.customType, "telegram-steer");
   assert.equal(step.continue, true);
-  assert.deepEqual(events, [], "Model-step insertion cannot reset active reply/lifecycle ownership");
+  assert.equal(events.length, 0, "Model-step insertion cannot reset active reply/lifecycle ownership");
   await getRequiredBindingHandler(harness.handlers, "session_before_compact")(
     { type: "session_before_compact" },
     {} as ExtensionContext,
@@ -1950,6 +2026,27 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
   assert.equal(finished, false, "A diagnostic failure must not skip actual callback cleanup drain");
   buttons.resolve();
   assert.equal(await failed, diagnosticFailure);
+  automaticCleanupEnabled = true; disconnectFails = false;
+  const reused = {} as ExtensionContext;
+  for (const boundary of ["diagnostics", "cleanup-preference", "disconnect"] as const) {
+    events.length = 0;
+    const pending = Promise.withResolvers<void>();
+    deps.diagnostics!.onSessionShutdown = () => {
+      events.push("diagnostics:suspend");
+      return boundary === "diagnostics" ? pending.promise : Promise.resolve();
+    };
+    cleanupPreferenceGate = boundary === "cleanup-preference" ? pending.promise : undefined;
+    disconnectGate = boundary === "disconnect" ? pending.promise : undefined;
+    let returned = false;
+    const old = Promise.resolve(shutdown({ type: "session_shutdown", reason: "quit" }, reused)).then(() => { returned = true; });
+    await waitForTurn();
+    assert.equal(returned, false, "The selected original teardown operation is still awaited");
+    if (boundary !== "diagnostics") assert.ok(events.includes(boundary === "disconnect" ? "disconnect-on-quit" : "cleanup-preference"));
+    generation++;
+    pending.resolve(); await old;
+    assert.equal(events.includes("composed-shutdown"), false, "Late original completion cannot enter the successor's composed teardown");
+    assert.equal(events.includes("disconnect-on-quit"), boundary === "disconnect", "A superseded preference read cannot issue destructive cleanup");
+  }
 });
 
 test("Lifecycle binding routes native typing, previews, and normalized activity", async () => {

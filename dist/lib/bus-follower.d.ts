@@ -12,6 +12,7 @@ import { TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY, TELEGRAM_BUS_CAPABILITY_SELE
 import type { TelegramThreadDisplayMode } from "./config.ts";
 import { type TelegramLockEntry, type TelegramLockState } from "./locks.ts";
 import * as Machine from "./machine.ts";
+import { type TelegramFollowerReadiness } from "./polling.ts";
 import type { TelegramQueueHandoffStageResult } from "./queue.ts";
 import { type TelegramTarget } from "./target.ts";
 import { type TelegramApiCallOptions } from "./telegram-api.ts";
@@ -46,6 +47,9 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
         previousInstanceId?: string;
         restoreWorkspace?: boolean;
         recoverConnection?: boolean;
+        /** Process-local original connect attempt; never serialized or retained as membership authority. */
+        assertAuthority?: () => void;
+        connectionReadiness?: TelegramFollowerReadiness;
     }) => Promise<boolean>;
     setContext: (ctx: TContext) => void | Promise<void>;
     disconnectFromLeader?: () => Promise<boolean>;
@@ -135,7 +139,7 @@ export interface TelegramBusFollowerRegistrationState {
     };
 }
 export interface TelegramBusForwardedUpdateReceiverRuntime {
-    start: () => Promise<void>;
+    start: (assertAuthority?: () => void) => Promise<void>;
     stop: () => Promise<void>;
 }
 export interface TelegramBusFollowerDurableAdmissionResult {
@@ -211,7 +215,7 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<TContext extends {
     followerBusSocketPath?: string;
     getFollowerBusSocketPath?: () => string;
     getLeaderSocketPath?: () => string;
-    startReceiving?: () => Promise<void>;
+    startReceiving?: (assertAuthority?: () => void) => Promise<void>;
     stopReceiving?: () => Promise<void> | void;
     registrationState?: TelegramBusFollowerRegistrationState;
     isContextActive?: (ctx: TContext) => boolean;

@@ -1065,13 +1065,15 @@ test("Stopped capability transitions cannot restart health, fall back, or mutate
   }
 });
 
-test("Thread-aware polling returns disabled mode to classic takeover despite retained thread history", async () => {
+for (const mode of ["disabled", "unknown", "enabled", undefined] as const)
+test(`Thread-aware polling distinguishes pending mode from classic takeover (${mode ?? "missing"})`, async () => {
+  let registrations = 0;
   const callApi = async <TResponse,>(): Promise<TResponse> => ({}) as TResponse;
   const store = {
     async load() {},
     async persist() {},
     getBotState() {
-      return { threadMode: "disabled" as const };
+      return { threadMode: mode };
     },
     setBotState() {},
     list() {
@@ -1099,15 +1101,126 @@ test("Thread-aware polling returns disabled mode to classic takeover despite ret
     async stopBusLeaderPolling() {},
     startLeaderHealth() {},
     stopLeaderHealth() {},
-    registerFollowerWithLeader: async () => true,
+    registerFollowerWithLeader: async () => { registrations++; return true; },
     stopFollowerRegistration() {},
     recordEvent() {},
   });
 
   assert.equal(
     await ports.registerFollowerWithOwner?.(TEST_CONTEXT, { pid: 1 }),
-    undefined,
+    mode === "disabled" ? undefined : mode === "enabled" ? true : "pending",
   );
+  assert.equal(registrations, mode === "enabled" ? 1 : 0, "Unknown capability cannot authorize registration from retained history");
+});
+
+for (const fault of ["none", "caller-loss", "stop", "superseded", "delegate-replaced", "lifecycle-loss", "reentry", "callback-replaced"] as const)
+test(`Follower refresh carries its original attempt to delegation (${fault})`, async () => {
+  let release!: () => void, entered!: () => void, refreshes = 0, registrations = 0, effects = 0, current = true, lifecycleCurrent = true;
+  let forwarded: (() => void) | undefined, reenter = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const deps = {
+    getAllowedUserId: () => 42, callApi: async <TResponse,>() => ({}) as TResponse,
+    topicTargetStore: { async load() {}, async refresh() { if (++refreshes === 1) { entered(); await gate; } },
+      async persist() {}, getBotState: () => ({ threadMode: "enabled" as const }), setBotState() {} },
+    lifecycle: { capture: () => () => lifecycleCurrent, invalidate() { lifecycleCurrent = false; } },
+    isBusRuntimeEnabled: () => false, isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false, setPollingStartedWithTelegramBus() {}, setForceFreshLeaderThreadOnNextStart() {}, setTopicModeUnavailable() {},
+    startClassicPolling() {}, async stopClassicPolling() {}, async startBusLeaderPolling() {}, async stopBusLeaderPolling() {}, startLeaderHealth() {}, stopLeaderHealth() {},
+    registerFollowerWithLeader: async (_ctx: typeof TEST_CONTEXT, _owner: { pid: number }, options?: { assertAuthority?: () => void }) => {
+      registrations++;
+      assert.ok(options?.assertAuthority, "Native registration must receive the original process-local guard");
+      if (fault === "reentry") { forwarded = options.assertAuthority; reenter = true; }
+      options.assertAuthority(); effects++; return true;
+    }, stopFollowerRegistration() {}, recordEvent() {},
+  };
+  const ports = createTelegramThreadAwarePollingPorts(deps);
+  const options = { recoverConnection: true, assertAuthority() {
+    if (reenter) { reenter = false; try { forwarded!(); } catch { /* Producer catches the original reentry refusal. */ } }
+    if (!current) throw new Error("Fixture original caller ended");
+  } };
+  const pending = ports.registerFollowerWithOwner(TEST_CONTEXT, { pid: 1 }, options).then(value => ({ value }), error => ({ error }));
+  try {
+    await waiting;
+    if (fault === "caller-loss") current = false;
+    if (fault === "callback-replaced") { current = false; options.assertAuthority = () => {}; }
+    if (fault === "stop") ports.stopFollowerRegistration();
+    if (fault === "lifecycle-loss") lifecycleCurrent = false;
+    if (fault === "delegate-replaced") deps.registerFollowerWithLeader = async () => { registrations++; return true; };
+    if (fault === "superseded") assert.equal(await ports.registerFollowerWithOwner(TEST_CONTEXT, { pid: 1 }), true);
+    release();
+    const outcome = await pending;
+    if (fault === "none") assert.deepEqual(outcome, { value: true });
+    else assert.ok("error" in outcome && outcome.error instanceof Error, "A stale refresh cannot delegate after its original scope ends");
+    assert.equal(registrations, fault === "none" || fault === "superseded" || fault === "reentry" ? 1 : 0);
+    assert.equal(effects, fault === "none" || fault === "superseded" ? 1 : 0, "Caught reentry cannot restore the original authority");
+  } finally { release(); await pending; }
+});
+
+for (const outcome of ["enabled", "classic", "timeout", "late-refresh", "long-ack", "rejected", "negative", "restore", "cancelled", "getter-replaced", "constant-clock", "logging"] as const)
+test(`Original readiness observation ends before one native registration (${outcome})`, async () => {
+  let now = 0, mode: "unknown" | "enabled" | "disabled" = "unknown", waits = 0, refreshes = 0, issues = 0, current = true;
+  const original = new Error("Fixture protected refusal");
+  const records: unknown[] = [];
+  const store = { async load() {}, async refresh() {
+    refreshes++;
+    if (waits && outcome === "restore") throw original;
+    if (waits && outcome === "late-refresh") { await Promise.resolve(); now = 600; mode = "enabled"; }
+  }, async persist() {}, getBotState: () => ({ threadMode: mode }), setBotState() {} };
+  const ports = createTelegramThreadAwarePollingPorts({
+    getAllowedUserId: () => 42, callApi: async <T,>() => ({}) as T, topicTargetStore: store,
+    isBusRuntimeEnabled: () => false, isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false, setPollingStartedWithTelegramBus() {}, setForceFreshLeaderThreadOnNextStart() {}, setTopicModeUnavailable() {},
+    startClassicPolling() { assert.fail("Readiness cannot poll"); }, async stopClassicPolling() {}, async startBusLeaderPolling() { assert.fail("Readiness cannot lead"); },
+    async stopBusLeaderPolling() {}, startLeaderHealth() {}, stopLeaderHealth() {}, stopFollowerRegistration() {},
+    registerFollowerWithLeader: async (_ctx, _owner, options) => {
+      assert.equal(Object.hasOwn(options!, "readiness"), false, "The local readiness budget never enters native registration");
+      options?.assertAuthority?.(); issues++;
+      if (outcome === "long-ack") { now = 60_000; await Promise.resolve(); options?.assertAuthority?.(); }
+      if (outcome === "rejected") throw original;
+      return outcome !== "negative";
+    }, recordEvent(_category, _error, details) { records.push(details?.phase); if (outcome === "logging") throw original; },
+  });
+  const pending = ports.registerFollowerWithOwner(TEST_CONTEXT, { pid: 1 }, {
+    readiness: {
+      remainingMs: () => outcome === "constant-clock" ? 600 : 600 - now,
+      async wait() {
+        waits++; now += 150;
+        if (outcome === "cancelled") current = false;
+        if (outcome === "getter-replaced") store.getBotState = () => ({ threadMode: "enabled" });
+        if (!["timeout", "late-refresh", "restore", "constant-clock"].includes(outcome)) mode = outcome === "classic" ? "disabled" : "enabled";
+        return waits < 4;
+      },
+    },
+    assertAuthority() { if (!current) throw original; },
+  });
+  if (["rejected", "restore", "cancelled", "getter-replaced"].includes(outcome))
+    await assert.rejects(pending, error => outcome === "getter-replaced" ? error instanceof Error : error === original);
+  else assert.equal(await pending, ["timeout", "late-refresh", "constant-clock"].includes(outcome) ? "readiness-expired" : outcome === "classic" ? undefined : outcome !== "negative");
+  assert.equal(issues, ["enabled", "long-ack", "rejected", "negative", "logging"].includes(outcome) ? 1 : 0);
+  assert.equal(records.filter(phase => phase === "follower-readiness-wait").length, 1);
+  assert.ok(waits <= 4 && refreshes <= 5, "A frozen clock cannot extend the original observation count");
+});
+
+for (const loggingFails of [false, true])
+test(`Follower refresh refusal is local and preserves the original error (${loggingFails})`, async () => {
+  const original = new Error("Workspace Restore evidence fixture refusal");
+  const records: Array<{ error: unknown; details?: Record<string, unknown> }> = [];
+  let registrations = 0;
+  const ports = createTelegramThreadAwarePollingPorts({
+    getAllowedUserId: () => 42, callApi: async <TResponse,>() => ({}) as TResponse,
+    topicTargetStore: { async load() { throw original; }, async refresh() { throw original; }, async persist() {}, getBotState: () => ({ threadMode: "enabled" }), setBotState() {} },
+    isBusRuntimeEnabled: () => false, isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false, setPollingStartedWithTelegramBus() {}, setForceFreshLeaderThreadOnNextStart() {}, setTopicModeUnavailable() {},
+    startClassicPolling() {}, async stopClassicPolling() {}, async startBusLeaderPolling() {}, async stopBusLeaderPolling() {}, startLeaderHealth() {}, stopLeaderHealth() {},
+    registerFollowerWithLeader: async () => { registrations++; return true; }, stopFollowerRegistration() {},
+    recordEvent(_category, error, details) { records.push({ error, details }); if (loggingFails) throw new Error("Fixture diagnostics failed"); },
+  });
+  await assert.rejects(ports.registerFollowerWithOwner(TEST_CONTEXT, { pid: 1 }), error => error === original);
+  assert.equal(registrations, 0, "Local view refusal cannot send a registration request");
+  assert.equal(records.length, 1);
+  assert.equal(records[0]?.error, original);
+  assert.deepEqual(records[0]?.details, { phase: "follower-readiness-refresh-refused", source: "local" });
 });
 
 test("Thread-aware polling refreshes owner-published enabled mode over stale local classic state", async () => {

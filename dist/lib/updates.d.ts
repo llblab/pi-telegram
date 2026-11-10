@@ -1,7 +1,7 @@
 /**
  * Telegram updates domain helpers
  * Zones: telegram inbound, authorization, routing plans
- * Owns update extraction, authorization, execution planning, generation-fenced journal draining, and the public update-handler registry
+ * Owns update extraction, authorization, execution planning, source-qualified actual-execution exclusion, generation-fenced journal draining, and the public update-handler registry
  */
 import type { TelegramBusEnvelope, TelegramBusFollowerView, TelegramBusForeignUpdateSettlement, TelegramBusFollowerQueueHandoffOffer, TelegramBusForwardOwnership, TelegramBusLeaderQueueHandoffOffer } from "./bus.ts";
 import { type TelegramAuthorizationState, type TelegramUserPairingRuntimeDeps } from "./config.ts";

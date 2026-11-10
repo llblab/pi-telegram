@@ -553,7 +553,7 @@ export function createTelegramLiveTargetWorkObserver(deps) {
         };
     };
 }
-export function registerTelegramCommandsAndTools({ pi, handleInternalAction, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, getDisconnectThreadName, onTransportChanged, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, }) {
+export function registerTelegramCommandsAndTools({ pi, handleInternalAction, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, getDisconnectThreadName, onTransportChanged, refreshProfileStateAfterReset, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, }) {
     GenerativeApps.registerTelegramBindTool(pi, {
         agentDir,
         onOwnerObserved: buttonActionStore.observeAppOwner,
@@ -697,20 +697,44 @@ export function registerTelegramCommandsAndTools({ pi, handleInternalAction, age
         getSessionGeneration,
         connectionIntent,
         getProfileNames: () => Config.getTelegramProfileNames(configStore.getStoredConfig()),
-        activateDefaultProfileConfig: async (_ctx, isCurrent) => {
+        activateDefaultProfileConfig: async (ctx, isCurrent) => {
             const previousProfileName = configStore.getActiveProfileName();
             await configStore.load();
             if (!isCurrent())
                 return;
+            const selectedConfig = configStore.getStoredConfig();
+            const selectedToken = configStore.getBotToken(Config.TELEGRAM_DEFAULT_PROFILE_NAME);
+            const isSelectionCurrent = (expectedProfile = previousProfileName) => {
+                if (!isCurrent())
+                    return false;
+                if (configStore.getStoredConfig() !== selectedConfig ||
+                    configStore.getActiveProfileName() !== (expectedProfile === Config.TELEGRAM_DEFAULT_PROFILE_NAME ? undefined : expectedProfile) ||
+                    configStore.getBotToken(Config.TELEGRAM_DEFAULT_PROFILE_NAME) !== selectedToken)
+                    throw new Error("Telegram connection profile selection changed.");
+                return true;
+            };
+            const reset = selectedToken ? lockedPollingRuntime.prepareConnection(ctx, isSelectionCurrent) : false;
+            if (!isSelectionCurrent())
+                return;
             if (previousProfileName) {
                 await (stopPolling ?? lockedPollingRuntime.stop)();
-                if (!isCurrent())
+                if (!isSelectionCurrent())
                     return;
             }
             configStore.activateProfile(undefined);
+            if (!isSelectionCurrent(Config.TELEGRAM_DEFAULT_PROFILE_NAME))
+                return;
+            if (reset) {
+                if (!refreshProfileStateAfterReset)
+                    throw new Error("Telegram profile refresh after state reset is unavailable.");
+                await refreshProfileStateAfterReset();
+                if (!isSelectionCurrent(Config.TELEGRAM_DEFAULT_PROFILE_NAME))
+                    return;
+            }
             await onTransportChanged?.();
+            isSelectionCurrent(Config.TELEGRAM_DEFAULT_PROFILE_NAME);
         },
-        activateProfileConfig: async (_ctx, profileName, isCurrent) => {
+        activateProfileConfig: async (ctx, profileName, isCurrent) => {
             const previousProfileName = configStore.getActiveProfileName();
             await configStore.load();
             if (!isCurrent())
@@ -720,15 +744,37 @@ export function registerTelegramCommandsAndTools({ pi, handleInternalAction, age
             const storedConfig = configStore.getStoredConfig();
             if (!storedConfig.profiles?.[profileName])
                 return false;
+            const selectedToken = configStore.getBotToken(profileName);
+            const isSelectionCurrent = (expectedProfile = previousProfileName) => {
+                if (!isCurrent())
+                    return false;
+                if (configStore.getStoredConfig() !== storedConfig ||
+                    configStore.getActiveProfileName() !== (expectedProfile === Config.TELEGRAM_DEFAULT_PROFILE_NAME ? undefined : expectedProfile) ||
+                    configStore.getBotToken(profileName) !== selectedToken)
+                    throw new Error("Telegram connection profile selection changed.");
+                return true;
+            };
+            const reset = selectedToken ? lockedPollingRuntime.prepareConnection(ctx, isSelectionCurrent) : false;
+            if (!isSelectionCurrent())
+                return false;
             if (previousProfileName !== profileName) {
                 await (stopPolling ?? lockedPollingRuntime.stop)();
-                if (!isCurrent())
+                if (!isSelectionCurrent())
                     return false;
             }
             if (!configStore.activateProfile(profileName))
                 return false;
+            if (!isSelectionCurrent(profileName))
+                return false;
+            if (reset) {
+                if (!refreshProfileStateAfterReset)
+                    throw new Error("Telegram profile refresh after state reset is unavailable.");
+                await refreshProfileStateAfterReset();
+                if (!isSelectionCurrent(profileName))
+                    return false;
+            }
             await onTransportChanged?.();
-            return true;
+            return isSelectionCurrent(profileName);
         },
     });
 }
@@ -1013,7 +1059,9 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
             onSessionStarted?.(event, ctx);
         },
         async onSessionShutdown(event, ctx) {
-            if (!isSessionContextActive(ctx))
+            const generation = getSessionGeneration?.();
+            const isCurrent = () => (!getSessionGeneration || Object.is(getSessionGeneration(), generation)) && isSessionContextActive(ctx);
+            if (!isCurrent())
                 return;
             buttonActionStore.clear?.();
             const buttonsStopped = buttonActionStore.waitForPublicationIdle?.();
@@ -1032,11 +1080,13 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
             for (const outcome of stopped)
                 if (outcome.status === "rejected")
                     throw outcome.reason;
-            if (!isSessionContextActive(ctx))
+            if (!isCurrent())
                 return;
             if (event.reason === "quit" && disconnectOnQuit) {
                 try {
                     const automaticCleanupEnabled = (await resolveAutomaticThreadCleanupEnabled?.()) ?? true;
+                    if (!isCurrent())
+                        return;
                     if (automaticCleanupEnabled)
                         await disconnectOnQuit();
                 }
@@ -1046,6 +1096,8 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
                     });
                 }
             }
+            if (!isCurrent())
+                return;
             await sessionLifecycleRuntime.onSessionShutdown(event, ctx);
         },
         async onSessionBeforeCompact(event, ctx) {

@@ -229,6 +229,27 @@ export interface TelegramThreadTargetObservationBinding<TContext> {
     set(handler: TelegramThreadTargetObservationHandler<TContext>): void;
 }
 export declare function createTelegramThreadTargetObservationBinding<TContext>(): TelegramThreadTargetObservationBinding<TContext>;
+/** Local registration observation: pending capability is neither classic fallback nor acknowledged membership. */
+export type TelegramFollowerRegistrationResult = boolean | undefined | "pending" | "readiness-expired";
+/** One original observation/connection budget; never applies to an issued request's ACK. */
+export interface TelegramFollowerReadiness {
+    remainingMs: () => number;
+    wait: () => Promise<boolean>;
+}
+/** Process-local original-attempt evidence; never sent in registration packets. */
+export interface TelegramFollowerRegistrationOptions {
+    recoverConnection?: boolean;
+    assertAuthority?: () => void;
+    readiness?: TelegramFollowerReadiness;
+}
+/** Cancellation is not failed membership, endpoint unresponsiveness or takeover evidence. */
+export declare class TelegramFollowerRegistrationCancelledError extends Error {
+    constructor();
+}
+/** A native pre-issuance deadline is not membership failure or takeover proof. */
+export declare class TelegramFollowerReadinessExpiredError extends Error {
+    constructor();
+}
 export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
     startPolling: (ctx: TContext, options?: {
         forceFreshLeaderThread?: boolean;
@@ -236,9 +257,7 @@ export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
     }) => Promise<void>;
     stopPolling: () => Promise<void>;
     canAutoStartSession: (ctx: TContext) => Promise<boolean>;
-    registerFollowerWithOwner: (ctx: TContext, owner: TOwner, options?: {
-        recoverConnection?: boolean;
-    }) => Promise<boolean | undefined>;
+    registerFollowerWithOwner: (ctx: TContext, owner: TOwner, options?: TelegramFollowerRegistrationOptions) => Promise<TelegramFollowerRegistrationResult>;
     restoreFollowerWithOwner: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
     stopFollowerRegistration: () => void;
 }
@@ -252,6 +271,8 @@ export interface TelegramThreadAwarePollingControls<TContext, TOwner> {
     stopLeaderHealth: () => void;
     registerFollowerWithLeader: (ctx: TContext, owner: TOwner, options?: {
         recoverConnection?: boolean;
+        assertAuthority?: () => void;
+        connectionReadiness?: TelegramFollowerReadiness;
     }) => Promise<boolean | undefined>;
     restoreFollowerWithLeader?: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
     hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;

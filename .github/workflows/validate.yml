@@ -123,7 +123,17 @@ jobs:
         run: node scripts/run-ci-tests.mjs domains ${{ matrix.shard }}
       - name: Run integration name shard
         if: matrix.suite == 'integration'
+        env:
+          PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR: ${{ runner.temp }}/recovery-integration
         run: node scripts/run-ci-tests.mjs integration ${{ matrix.integrationShard }}
+      - name: Preserve recovery integration evidence
+        if: always() && matrix.suite == 'integration'
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-integration-${{ matrix.os }}-${{ matrix.integrationShard }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/recovery-integration
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Check package contents
         run: npm run pack:check
       - name: Audit dependencies

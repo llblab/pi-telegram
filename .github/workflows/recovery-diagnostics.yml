@@ -1,0 +1,41 @@
+name: Recovery diagnostics
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    name: recovery observations (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-26-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v5
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build exact candidate
+        run: npm run build
+      # Observe every fresh process cohort; any failure keeps the job red, even if later rounds pass.
+      - name: Run ten bounded recovery observations
+        run: node scripts/run-recovery-diagnostics.mjs 10 "${{ runner.temp }}/recovery-diagnostics"
+      - name: Preserve all observations and native failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-${{ matrix.os }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/recovery-diagnostics
+          if-no-files-found: ignore
+          retention-days: 14

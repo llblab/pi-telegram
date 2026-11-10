@@ -2083,12 +2083,15 @@ export default function (pi) {
     const threadAwarePollingPorts = telegramThreadCapabilityRuntime.pollingPorts;
     const lockedPollingRuntime = Locks.createTelegramLockedPollingRuntime({
         lock: lockRuntime,
+        captureConfigScope: configStore.captureConnectionScope,
+        captureStorageScope: threadStore.captureReadScope,
+        getLeaderEndpoint: getTelegramBusSocketPath,
         proveOwnerUnresponsive: proveTelegramLeaderUnresponsive,
-        resetDamagedState() {
+        resetDamagedState(assertCurrent) {
             return Locks.resetDamagedTelegramRuntimeState(Paths.resolveTelegramStatePath(), function (profile, sections) {
                 Threads.parseTelegramWorkspaceStateSection(sections.workspace, profile);
                 WorkspaceAdmission.assertTelegramConsolidatedAdmissionSection(sections.admission, profile);
-            });
+            }, assertCurrent);
         },
         transportMonitor: telegramThreadCapabilityMonitor,
         hasBotToken: configStore.hasBotToken,
@@ -2401,7 +2404,8 @@ export default function (pi) {
         activeTurnRuntime,
         lockedPollingRuntime,
         stopPolling: disconnectTelegramAndDeleteCurrentThread,
-        // Consolidated envelope failures remain protective; legacy whole-file recovery cannot reset sibling authority.
+        refreshProfileStateAfterReset: threadStore.refresh,
+        // Ordinary disconnect failures remain protective; explicit connect alone prepares the approved envelope reset.
         getDisconnectThreadName() {
             const record = findCurrentThreadRecord();
             if (!record?.target.threadId)

@@ -55,6 +55,7 @@ import {
   type TelegramWorkspaceRestoreIntent,
   type TelegramWorkspaceLiveRebindIntent,
   type TelegramWorkspaceRestoreSourceAcceptance,
+  TelegramWorkspaceRestoreEvidenceError,
 } from "../lib/threads.ts";
 import { createTelegramLockRuntime } from "../lib/locks.ts";
 import { createTelegramWorkspaceAdmissionLedger } from "../lib/workspace-admission.ts";
@@ -70,6 +71,29 @@ import { withWorkspaceRelocationFixture, withWorkspaceRestoreFixture as fixture,
 import { createTelegramUpdateJournalStore, createTelegramUpdateJournalBotIdentity, createTelegramUpdateJournalBindingKey, createTelegramUpdateJournalEntryDigest, createTelegramUpdateJournalBindingRuntime, createTelegramJournalSourceSerialization, createTelegramUpdateJournalReferenceRegistry, isTelegramThreadCleanupJournalNamespaceClear } from "../lib/journal.ts";
 import { createTelegramUpdateWorkerRuntime } from "../lib/updates.ts";
 import { createTelegramBusFollowerDeliveryIdentity } from "../lib/bus.ts";
+
+for (const fault of ["none", "path", "profile", "loaded-path-aba", "provider", "caught-loss", "data-only", "selected-profile"] as const)
+test(`Workspace observation scope binds logical storage without changing retained evidence (${fault})`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pt-read-scope-"));
+  let path = join(dir, "original.json"), profile: string | undefined;
+  const options = { path: () => path, telegramProfile: () => profile };
+  const store = createTelegramTopicTargetStore(options);
+  try {
+    await store.load();
+    if (fault === "selected-profile") profile = "work";
+    const current = store.captureReadScope();
+    assert.equal(current(), true);
+    if (fault === "path") path = join(dir, "replacement.json");
+    if (fault === "profile") profile = "work";
+    if (fault === "provider") options.path = () => path;
+    if (fault === "loaded-path-aba") { path = join(dir, "replacement.json"); await store.load(); path = join(dir, "original.json"); await store.load(); }
+    if (fault === "caught-loss") { profile = "work"; assert.equal(current(), false); profile = undefined; }
+    if (fault === "data-only") store.setBotState({ threadMode: "enabled" });
+    if (fault === "selected-profile") await store.refresh!();
+    assert.equal(current(), fault === "none" || fault === "data-only" || fault === "selected-profile");
+    assert.equal(existsSync(path), false, "Read-scope capture cannot write or repair a namespace");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
 
 async function withConsolidatedWorkspaceFixture(run: (f: {
   rootPath: string;
@@ -1851,6 +1875,73 @@ for (const fault of ["missing", "rollback", "same-revision"] as const) {
     });
   });
 }
+
+for (const retired of [false, true])
+for (const reason of ["missing-snapshot", "profile-changed", "token-changed", "revision-regressed", "same-revision-conflict"] as const)
+test(`Warm Restore refusal diagnostics retain original scope without bodies (${reason}, retired=${retired})`, async () => {
+  await withWorkspaceRelocationFixture("leader", async (store, path) => {
+    assert.equal(await relocate(store, "restore", store.listWorkspaceBindings()[0]!, store.list()[0]!, { chatId: 7, threadId: 42 }, () => true), true);
+    const originalIntent = structuredClone(restorations(store)[0]!);
+    if (retired) assert.equal(removeStoredRestore(store, settleStoredRestore(store), () => true), true);
+    if (!retired && reason === "revision-regressed") {
+      // Keep the older incoming snapshot structurally valid; this tests monotonic observation, not malformed intent revisions.
+      const later = JSON.parse(await readFile(path, "utf8"));
+      later.workspaceRestore.revision++;
+      await writeFile(path, JSON.stringify(later));
+      await store.refresh!();
+    }
+    const file = JSON.parse(await readFile(path, "utf8"));
+    const retainedRevision = file.workspaceRestore.revision;
+    if (reason === "missing-snapshot") delete file.workspaceRestore;
+    if (reason === "profile-changed") file.workspaceRestore.profileName = "work";
+    if (reason === "token-changed") file.workspaceRestore.tokenSha256 = "b".repeat(64);
+    if (reason === "revision-regressed") file.workspaceRestore.revision--;
+    if (reason === "same-revision-conflict") file.workspaceRestore.operations = retired ? [originalIntent] : [];
+    await writeFile(path, JSON.stringify(file));
+    const before = await readFile(path, "utf8");
+    await assert.rejects(store.refresh!(), error => {
+      assert.ok(error instanceof TelegramWorkspaceRestoreEvidenceError);
+      assert.equal(error.code, "workspace-restore-evidence-conflict");
+      assert.equal(error.reason, reason);
+      assert.equal(error.retainedRevision, retainedRevision);
+      assert.equal(error.observedRevision, file.workspaceRestore?.revision);
+      assert.doesNotMatch(JSON.stringify(error), /fixture-journal|tokenSha256|operationId|request|source/u);
+      assert.equal(JSON.stringify(error).includes("a".repeat(64)) || JSON.stringify(error).includes("b".repeat(64)), false);
+      return true;
+    });
+    await assert.rejects(store.persist(), /Restore evidence/u, "Diagnostic classification grants no overwrite or replay");
+    assert.equal(await readFile(path, "utf8"), before);
+  });
+});
+
+for (const reason of ["missing-snapshot", "revision-regressed", "same-revision-conflict"] as const)
+test(`Private Restore reader retains its original history without a loaded parent projection (${reason})`, async () => {
+  await fixture(async f => {
+    const relocated = await f.store.commit(f.request, f.auth); assert.ok(relocated);
+    const older = JSON.parse(await readFile(f.path, "utf8"));
+    const recipient = { kind: "leader" as const, instanceId: "old", sessionId: "session", generation: "registration" };
+    const issued = f.store.issueRecipient(relocated, recipient, f.auth); assert.ok(issued);
+    // A private reader can outlive or exist independently from a loaded parent projection; do not borrow the parent's guard.
+    const parent = createTelegramTopicTargetStore({ path: f.path });
+    const original = parent.workspaceRestore({ profileName: "default", tokenSha256: "a".repeat(64) });
+    assert.deepEqual(original.list(), [issued.intent]);
+    const file = JSON.parse(await readFile(f.path, "utf8"));
+    const retainedRevision = file.workspaceRestore.revision;
+    if (reason === "missing-snapshot") delete file.workspaceRestore;
+    if (reason === "revision-regressed") file.workspaceRestore = older.workspaceRestore;
+    if (reason === "same-revision-conflict") file.workspaceRestore.operations = [];
+    await writeFile(f.path, JSON.stringify(file));
+    const before = await readFile(f.path, "utf8");
+    assert.throws(() => original.confirmReady(issued.intent, recipient, f.auth), error => {
+      assert.ok(error instanceof TelegramWorkspaceRestoreEvidenceError);
+      assert.equal(error.reason, reason);
+      assert.equal(error.retainedRevision, retainedRevision);
+      assert.equal(error.observedRevision, file.workspaceRestore?.revision);
+      return true;
+    });
+    assert.equal(await readFile(f.path, "utf8"), before, "A late private continuation neither forgets history nor republishes it");
+  });
+});
 
 test("Restore revision exhaustion retains the exact operation without wrapping", async () => {
   await withWorkspaceRelocationFixture("leader", async (store, path) => {

@@ -31,6 +31,9 @@ import {
   resolveTelegramTempDir,
 } from "../lib/paths.ts";
 import { createTelegramSessionFolderSweeper } from "../lib/recovery.ts";
+import { TelegramFollowerRegistrationCancelledError, type TelegramFollowerRegistrationResult, type TelegramFollowerRegistrationOptions } from "../lib/polling.ts";
+import { createTelegramConfigStore } from "../lib/config.ts";
+import { createTelegramTopicTargetStore } from "../lib/threads.ts";
 import {
   createTelegramLockedPollingRuntime,
   createTelegramLockKeyResolver,
@@ -314,6 +317,67 @@ test("Healthy runtime state is never reset and elections never reset", async () 
     await assert.rejects(runtime.start({ cwd: "/repo" }, { election: {} }));
     assert.equal(resets, 0, "a follower election never resets shared state");
     assert.equal(readFileSync(path, "utf8"), "{");
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const phase of ["entry", "validation", "staged", "published"] as const)
+test(`Explicit state recovery rechecks original authority around publication (${phase})`, () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json"), runtimeDir = join(temp.dir, "runtime");
+  const before = JSON.stringify({ version: 2, profiles: { default: { workspace: "invalid-fixture" } } });
+  let active = true, checks = 0;
+  const assertCurrent = () => {
+    checks++;
+    if (phase === "entry" || phase === "staged" && existsSync(runtimeDir) && readdirSync(runtimeDir).some(name => name.endsWith(".tmp")) ||
+      phase === "published" && readFileSync(path, "utf8") !== before) active = false;
+    if (!active) throw new Error("Original recovery authority ended");
+  };
+  try {
+    writeFileSync(path, before, { mode: 0o600 });
+    assert.throws(() => resetDamagedTelegramRuntimeState(path, () => {
+      if (phase === "validation") active = false;
+      throw new Error("Fixture invalid Workspace");
+    }, assertCurrent), /Original recovery authority ended/u);
+    assert.ok(checks > 0);
+    if (phase === "published") assert.deepEqual(readTelegramRuntimeState(path), { version: 2, profiles: {} }, "Lost post-publication authority cannot roll back the committed reset");
+    else assert.equal(readFileSync(path, "utf8"), before, "Lost authority before rename preserves the original state");
+    if (existsSync(runtimeDir)) assert.deepEqual(readdirSync(runtimeDir), [], "Only fixture-owned temporary preparation is removed");
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const loss of ["caller", "context", "session", "generation", "callout", "reentry"] as const)
+test(`Connection preparation cannot revive an observed original loss (${loss})`, async () => {
+  const temp = createTempLockPath(), ctx = { cwd: "/repo" };
+  let caller = true, context = true, session = "original", resets = 0, stopped: Promise<void> | undefined;
+  let readError = false, reentry = false, originalAssert: (() => void) | undefined;
+  const isCurrent = () => {
+    if (readError) throw new Error("Fixture currentness read failed");
+    if (reentry) { try { originalAssert!(); } catch {} }
+    return caller;
+  };
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ statePath: join(temp.dir, "state.json") }),
+    hasBotToken: () => true, isContextCurrent: () => context, getSessionId: () => session,
+    startPolling: async () => assert.fail("Preparation cannot start a poller"), stopPolling: async () => {}, updateStatus() {},
+    resetDamagedState(assertCurrent) {
+      resets++;
+      originalAssert = assertCurrent;
+      if (loss === "callout") readError = true;
+      if (loss === "reentry") reentry = true;
+      if (loss === "caller") caller = false;
+      if (loss === "context") context = false;
+      if (loss === "session") session = "replacement";
+      if (loss === "generation") stopped = runtime.suspend();
+      assert.throws(assertCurrent, /cancelled or superseded|currentness read failed/u);
+      caller = context = true; session = "original"; readError = reentry = false;
+      assert.throws(assertCurrent, /cancelled or superseded/u, "Equal restored fields cannot revive the spent preparation");
+      return false;
+    },
+  });
+  try {
+    assert.throws(() => runtime.prepareConnection(ctx, isCurrent), /cancelled or superseded/u);
+    assert.equal(resets, 1);
+    assert.equal(existsSync(join(temp.dir, "state.json")), false);
+    await stopped;
   } finally { rmSync(temp.dir, { recursive: true, force: true }); }
 });
 
@@ -2254,6 +2318,35 @@ test("Locked polling runtime prevents inherited child sessions from polling the 
   }
 });
 
+for (const fault of ["none", "heartbeat", "profile", "epoch", "endpoint", "auth", "runtime", "missing", "caught-loss", "caller-object"] as const)
+test(`Follower owner scope binds its original profile and immutable routing identity (${fault})`, () => {
+  const temp = createTempLockPath();
+  let profile = "default";
+  const expected = { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "epoch", runtimeGeneration: 1,
+    busSocketPath: "original.sock", busSecret: "fixture-secret", heartbeatMs: 1 };
+  const write = (owner: typeof expected) => writeFileSync(temp.path, JSON.stringify({ default: owner, work: { ...expected } }));
+  const lock = createTelegramLockRuntime({ locksPath: temp.path, key: () => profile, pid: 10, isProcessAlive: pid => pid === 99 });
+  try {
+    write(expected);
+    const current = lock.captureFollowerRegistrationScope(expected);
+    assert.equal(current(), true);
+    if (fault === "profile") profile = "work";
+    if (fault === "epoch") write({ ...expected, leaderEpoch: "replacement" });
+    if (fault === "endpoint") write({ ...expected, busSocketPath: "replacement.sock" });
+    if (fault === "auth") write({ ...expected, busSecret: "replacement-secret" });
+    if (fault === "runtime") write({ ...expected, runtimeGeneration: 2 });
+    if (fault === "heartbeat") write({ ...expected, heartbeatMs: 2 });
+    if (fault === "missing") writeFileSync(temp.path, "{}");
+    if (fault === "caught-loss") { profile = "work"; assert.equal(current(), false); profile = "default"; }
+    if (fault === "caller-object") expected.leaderEpoch = "caller-mutated";
+    const before = readFileSync(temp.path, "utf8");
+    const positive = fault === "none" || fault === "heartbeat" || fault === "caller-object";
+    assert.equal(current(), positive);
+    assert.equal(readFileSync(temp.path, "utf8"), before, "Scope observation cannot acquire, repair or publish state");
+    if (!positive) { profile = "default"; write(expected); assert.equal(current(), false, "Equal owner restoration cannot renew the old scope"); }
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
 test("Locked polling runtime registers as follower when another live owner blocks start", async () => {
   const temp = createTempLockPath();
   const recovery: boolean[] = [];
@@ -2309,6 +2402,276 @@ test("Locked polling runtime registers as follower when another live owner block
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
+});
+
+for (const mode of ["pending", "classic", "registered"] as const)
+test(`Locked polling classifies original follower readiness without truthy grants (${mode})`, async () => {
+  const temp = createTempLockPath(), before = JSON.stringify({ [TELEGRAM_LOCK_KEY]: { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "original" } });
+  let starts = 0, statuses = 0, proofs = 0;
+  const phases: unknown[] = [];
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ locksPath: temp.path, pid: 10, isProcessAlive: pid => pid === 99 }),
+    hasBotToken: () => true, registerFollowerWithOwner: async () => mode === "pending" ? "pending" : mode === "registered" ? true : undefined,
+    proveOwnerUnresponsive: async () => { proofs++; return true; },
+    startPolling: async () => { starts++; }, stopPolling: async () => {}, updateStatus: () => { statuses++; },
+    recordRuntimeEvent(_category, _error, details) { phases.push(details?.phase); },
+  });
+  try {
+    writeFileSync(temp.path, before);
+    const result = await runtime.start({ cwd: "/recipient" });
+    assert.equal(result.ok, mode === "registered");
+    assert.equal(result.canTakeover, mode === "classic");
+    assert.equal(statuses, mode === "registered" ? 1 : 0);
+    assert.equal(starts, 0, "A follower readiness observation never starts a local poller");
+    assert.equal(proofs, 0, "Pending capability is not a failed registration or unresponsiveness proof");
+    assert.deepEqual(phases, mode === "pending" ? ["follower-readiness-pending"] : []);
+    assert.equal(readFileSync(temp.path, "utf8"), before);
+    if (mode === "pending") {
+      assert.equal(await runtime.registerFollowerWithOwner!({ cwd: "/recipient" }, { pid: 99 }), "pending");
+      assert.equal(statuses, 0, "The exposed adapter must not project pending as successful membership");
+    }
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Pending follower observation cannot cross a reused context's session identity", async () => {
+  const temp = createTempLockPath(), ctx = { cwd: "/recipient" };
+  let session = "original", statuses = 0, release!: (value: "pending") => void;
+  const pending = new Promise<"pending">(resolve => { release = resolve; });
+  let entered!: () => void;
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ locksPath: temp.path, pid: 10, isProcessAlive: pid => pid === 99 }),
+    hasBotToken: () => true, getSessionId: () => session, isContextCurrent: () => true,
+    registerFollowerWithOwner: async () => { entered(); return pending; },
+    startPolling: async () => assert.fail("A stale observation cannot poll"), stopPolling: async () => {}, updateStatus: () => { statuses++; },
+    proveOwnerUnresponsive: async () => assert.fail("A stale observation cannot request takeover proof"),
+  });
+  try {
+    writeFileSync(temp.path, JSON.stringify({ [TELEGRAM_LOCK_KEY]: { pid: 99, cwd: "/leader" } }));
+    const start = runtime.start(ctx);
+    await waiting;
+    session = "replacement";
+    release("pending");
+    const result = await start;
+    assert.equal(result.ok, false); assert.equal(result.canTakeover, false);
+    assert.match(result.message!, /cancelled or superseded/u);
+    assert.equal(statuses, 0);
+  } finally { release("pending"); rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+for (const fault of ["none", "config", "profile", "path", "owner", "endpoint", "intent", "caught-owner-restore"] as const)
+test(`Follower startup binds original selected scope before registration awaits (${artifact}/${fault})`, async () => {
+  const ConfigModel = artifact === "source" ? { createTelegramConfigStore } : await import("../dist/lib/config.js");
+  const ThreadModel = artifact === "source" ? { createTelegramTopicTargetStore } : await import("../dist/lib/threads.js");
+  const LockModel = artifact === "source" ? { createTelegramLockRuntime, createTelegramLockedPollingRuntime } : await import("../dist/lib/locks.js");
+  const temp = createTempLockPath();
+  const config = ConfigModel.createTelegramConfigStore({ initialConfig: { botToken: "123:scope", profiles: { work: { botToken: "123:scope" } } } });
+  let path = join(temp.dir, "original.json"), caller = true, effects = 0, statuses = 0, proofs = 0, entered!: () => void, release!: () => void;
+  let assertOriginal: (() => void) | undefined;
+  const store = ThreadModel.createTelegramTopicTargetStore({ path: () => path, telegramProfile: config.getActiveProfileName });
+  const owner = { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "original", busSocketPath: "original.sock" };
+  const write = (value: typeof owner) => writeFileSync(temp.path, JSON.stringify({ default: value, work: { ...owner } }));
+  const waiting = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  const runtime = LockModel.createTelegramLockedPollingRuntime({
+    lock: LockModel.createTelegramLockRuntime({ locksPath: temp.path, key: () => config.getActiveProfileName() ?? "default", pid: 10, isProcessAlive: pid => pid === 99 }),
+    captureConfigScope: config.captureConnectionScope, captureStorageScope: store.captureReadScope, hasBotToken: config.hasBotToken,
+    async registerFollowerWithOwner(_ctx, selected, options) {
+      assertOriginal = options?.assertAuthority; entered(); await gate;
+      assert.deepEqual(JSON.parse(JSON.stringify(selected)), owner); assert.equal(Object.isFrozen(selected), true);
+      assert.ok(assertOriginal); assertOriginal(); effects++; return true;
+    },
+    startPolling: async () => assert.fail("A foreign scope cannot poll"), stopPolling: async () => {}, updateStatus() { statuses++; },
+    proveOwnerUnresponsive: async () => { proofs++; return true; },
+  });
+  let pending: ReturnType<typeof runtime.start> | undefined;
+  try {
+    write(owner);
+    pending = runtime.start({ cwd: "/recipient" }, { assertAuthority() { if (!caller) throw new Error("Original command ended"); } });
+    await waiting;
+    if (fault === "config") config.set(config.get());
+    if (fault === "profile") config.activateProfile("work");
+    if (fault === "path") path = join(temp.dir, "replacement.json");
+    if (fault === "owner") write({ ...owner, leaderEpoch: "replacement" });
+    if (fault === "endpoint") write({ ...owner, busSocketPath: "replacement.sock" });
+    if (fault === "intent") caller = false;
+    if (fault === "caught-owner-restore") { write({ ...owner, leaderEpoch: "replacement" }); assert.throws(assertOriginal!); write(owner); }
+    const before = readFileSync(temp.path, "utf8");
+    release();
+    const result = await pending;
+    assert.equal(result.ok, fault === "none"); assert.equal(result.canTakeover, false);
+    assert.equal(effects, fault === "none" ? 1 : 0); assert.equal(statuses, fault === "none" ? 1 : 0); assert.equal(proofs, 0);
+    assert.equal(readFileSync(temp.path, "utf8"), before, "Selection checks cannot repair or rebind the canonical owner");
+  } finally { release(); await pending; rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const fault of ["deadline", "deadline-logging", "backwards", "nan", "throw", "reentry", "profile", "session", "locator", "registration-port", "birth-invalid", "constant-clock"] as const)
+test(`Original readiness budget cannot renew its clock or selected scope (${fault})`, async () => {
+  const temp = createTempLockPath(), statePath = join(temp.dir, "state.json");
+  const config = createTelegramConfigStore({ initialConfig: { botToken: "123:scope", profiles: { work: { botToken: "123:scope" } } } });
+  const store = createTelegramTopicTargetStore({ path: statePath, telegramProfile: config.getActiveProfileName });
+  const owner = { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "epoch", busSecret: "fixture", runtimeGeneration: 1 };
+  let now = 100, session = "original", locator = "original.sock", throwing = false, reenter = false, remaining: (() => number) | undefined, statuses = 0, proofs = 0;
+  if (fault === "birth-invalid") now = Number.MAX_VALUE;
+  const deps = {
+    lock: createTelegramLockRuntime({ statePath, pid: 10, isProcessAlive: (pid: number) => pid === 99 }),
+    captureConfigScope: config.captureConnectionScope, captureStorageScope: store.captureReadScope, hasBotToken: config.hasBotToken,
+    getSessionId: () => session, getLeaderEndpoint: () => locator, waitForReadiness: async () => {},
+    readinessClock() { if (throwing) throw new Error("clock failed"); if (reenter) { reenter = false; try { remaining!(); } catch { /* A provider catches its reentry. */ } } return now; },
+    async registerFollowerWithOwner(_ctx: { cwd: string }, _owner: TelegramLockEntry, options?: TelegramFollowerRegistrationOptions): Promise<TelegramFollowerRegistrationResult> {
+      remaining = options?.readiness?.remainingMs; assert.ok(remaining);
+      if (fault === "birth-invalid") { assert.equal(remaining(), 0); return "readiness-expired"; }
+      assert.equal(remaining(), 8000);
+      if (fault === "constant-clock") {
+        let observations = 0;
+        while (await options!.readiness!.wait()) observations++;
+        assert.equal(observations, 54, "A frozen clock cannot grow the original bus-cadence observation count");
+        assert.equal(remaining(), 0);
+        return "readiness-expired";
+      }
+      if (fault === "deadline" || fault === "deadline-logging") { now = 8099; assert.equal(remaining(), 1); now = 8100; }
+      if (fault === "backwards") now = 99;
+      if (fault === "nan") now = NaN;
+      if (fault === "throw") throwing = true;
+      if (fault === "reentry") reenter = true;
+      if (fault === "profile") config.activateProfile("work");
+      if (fault === "session") session = "replacement";
+      if (fault === "locator") locator = "replacement.sock";
+      if (fault === "registration-port") deps.registerFollowerWithOwner = async () => true;
+      if (["reentry", "profile", "session", "locator", "registration-port"].includes(fault)) assert.throws(remaining);
+      else { assert.equal(remaining(), 0); now = 100; throwing = false; assert.equal(remaining(), 0, "Restored clock fields cannot renew the deadline"); }
+      return "readiness-expired" as const;
+    },
+    startPolling: async () => assert.fail("Readiness cannot poll"), stopPolling: async () => {}, updateStatus() { statuses++; },
+    proveOwnerUnresponsive: async () => { proofs++; return true; },
+    recordRuntimeEvent() { if (fault === "deadline-logging") throw new Error("Fixture logging failure"); },
+  };
+  try {
+    mutateTelegramRuntimeStateSection(statePath, "default", "transport", () => ({ value: owner, result: undefined }), { isCurrent: () => true });
+    const before = readFileSync(statePath, "utf8");
+    const result = await createTelegramLockedPollingRuntime(deps).start({ cwd: "/recipient" }, { assertAuthority() {} });
+    assert.equal(result.ok, false); assert.equal(result.canTakeover, false); assert.equal(statuses, 0); assert.equal(proofs, 0);
+    assert.equal(readFileSync(statePath, "utf8"), before);
+    assert.match(result.message!, ["deadline", "deadline-logging", "backwards", "nan", "throw", "birth-invalid", "constant-clock"].includes(fault) ? /Timed out waiting/ : /cancelled or superseded/);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Original readiness deadline is born before an existing transport drain", async () => {
+  const temp = createTempLockPath(), statePath = join(temp.dir, "state.json");
+  const config = createTelegramConfigStore({ initialConfig: { botToken: "123:scope" } });
+  const store = createTelegramTopicTargetStore({ path: statePath, telegramProfile: config.getActiveProfileName });
+  let now = 100, hold = false, draining = false, release!: () => void, calls = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ statePath, instanceId: "local", pid: 10, isProcessAlive: () => true }),
+    hasBotToken: config.hasBotToken, captureConfigScope: config.captureConnectionScope, captureStorageScope: store.captureReadScope,
+    getSessionId: () => "session", readinessClock: () => now, ownershipCheckMs: 1, ownershipRefreshMs: 1,
+    startPolling: async () => {}, stopPolling: async () => { if (hold) { draining = true; await gate; } }, updateStatus() {},
+    registerFollowerWithOwner: async (_ctx, _owner, options) => { calls++; assert.ok(options?.readiness); assert.equal(options.readiness.remainingMs(), 0); return "readiness-expired" as const; },
+  });
+  let pending: ReturnType<typeof runtime.start> | undefined;
+  try {
+    assert.equal((await runtime.start({ cwd: "/local" })).ok, true);
+    hold = true;
+    mutateTelegramRuntimeStateSection(statePath, "default", "transport", () => ({ value: {
+      pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "epoch", busSecret: "fixture", busSocketPath: "original.sock", runtimeGeneration: 1,
+    }, result: undefined }), { isCurrent: () => true });
+    await waitForCondition(() => draining);
+    pending = runtime.start({ cwd: "/recipient" }, { assertAuthority() {} });
+    now = 8100; release();
+    const result = await pending;
+    assert.equal(result.ok, false); assert.equal(result.canTakeover, false); assert.equal(calls, 1);
+    assert.match(result.message!, /Timed out waiting/);
+  } finally { release(); await pending; await runtime.stop(); rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const mismatch of ["none", "profile", "path"] as const)
+test(`Consolidated follower admission cross-binds config and Workspace to native transport coordinates (${mismatch})`, async () => {
+  const temp = createTempLockPath(), statePath = join(temp.dir, "state.json");
+  const config = createTelegramConfigStore({ initialConfig: { botToken: "123:scope", profiles: { work: { botToken: "123:scope" } } } });
+  const store = createTelegramTopicTargetStore({ path: mismatch === "path" ? join(temp.dir, "other.json") : statePath,
+    telegramProfile: config.getActiveProfileName });
+  const owner = { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "epoch" };
+  let registrations = 0;
+  const lock = createTelegramLockRuntime({ statePath, key: () => mismatch === "profile" ? "work" : "default", pid: 10, isProcessAlive: pid => pid === 99 });
+  const runtime = createTelegramLockedPollingRuntime({ lock, hasBotToken: config.hasBotToken,
+    captureConfigScope: config.captureConnectionScope, captureStorageScope: store.captureReadScope,
+    registerFollowerWithOwner: async () => { registrations++; return true; },
+    startPolling: async () => assert.fail("A foreign binding cannot poll"), stopPolling: async () => {}, updateStatus() {},
+  });
+  try {
+    for (const profile of ["default", "work"]) mutateTelegramRuntimeStateSection(statePath, profile, "transport", () => ({ value: owner, result: undefined }), { isCurrent: () => true });
+    const before = readFileSync(statePath, "utf8");
+    const result = await runtime.start({ cwd: "/recipient" });
+    assert.equal(result.ok, mismatch === "none"); assert.equal(result.canTakeover, false);
+    assert.equal(registrations, mismatch === "none" ? 1 : 0, "Individually current but mismatched scopes cannot certify one original selection");
+    assert.equal(readFileSync(statePath, "utf8"), before);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const replace of [false, true])
+test(`Follower owner selection precedes an existing ownership-drain await (${replace})`, async () => {
+  const temp = createTempLockPath();
+  let release!: () => void, registrations = 0, draining = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let hold = false;
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ locksPath: temp.path, pid: 10, isProcessAlive: () => true }),
+    hasBotToken: () => true, ownershipCheckMs: 1, ownershipRefreshMs: 1,
+    startPolling: async () => {}, stopPolling: async () => { if (hold) { draining = true; await gate; } }, updateStatus() {},
+    registerFollowerWithOwner: async (_ctx, _owner, options) => { options?.assertAuthority?.(); registrations++; return true; },
+  });
+  let starting: ReturnType<typeof runtime.start> | undefined;
+  try {
+    assert.equal((await runtime.start({ cwd: "/original" })).ok, true);
+    const owner = { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "original" };
+    writeFileSync(temp.path, JSON.stringify({ default: owner }));
+    hold = true; await waitForCondition(() => draining);
+    starting = runtime.start({ cwd: "/recipient" });
+    if (replace) writeFileSync(temp.path, JSON.stringify({ default: { ...owner, leaderEpoch: "replacement" } }));
+    release();
+    const result = await starting;
+    assert.equal(result.ok, !replace); assert.equal(result.canTakeover, false);
+    assert.equal(registrations, replace ? 0 : 1, "A drain cannot authorize adopting the leader that replaced the selected original");
+  } finally { release(); await starting; await runtime.stop(); rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const fault of ["session", "context", "stop", "caught-loss", "producer"] as const)
+test(`Locked polling passes original cancellation through registration without takeover proof (${fault})`, async () => {
+  const temp = createTempLockPath(), ctx = { cwd: "/recipient" };
+  let session = "original", active = true, statuses = 0, proofs = 0, entered!: () => void, release!: () => void;
+  let assertOriginal: (() => void) | undefined;
+  const waiting = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ locksPath: temp.path, pid: 10, isProcessAlive: pid => pid === 99 }),
+    hasBotToken: () => true, getSessionId: () => session, isContextCurrent: () => active,
+    registerFollowerWithOwner: async (_ctx, _owner, options) => {
+      assertOriginal = options?.assertAuthority;
+      entered(); await gate;
+      assert.ok(assertOriginal);
+      if (fault === "producer") throw new TelegramFollowerRegistrationCancelledError();
+      assertOriginal(); return true;
+    },
+    startPolling: async () => assert.fail("A cancelled registration cannot poll"), stopPolling: async () => {}, updateStatus: () => { statuses++; },
+    proveOwnerUnresponsive: async () => { proofs++; return true; },
+  });
+  let pending: ReturnType<typeof runtime.start> | undefined;
+  try {
+    const original = JSON.stringify({ [TELEGRAM_LOCK_KEY]: { pid: 99, cwd: "/leader" } });
+    writeFileSync(temp.path, original);
+    pending = runtime.start(ctx);
+    await waiting;
+    if (fault === "session") session = "replacement";
+    if (fault === "context") active = false;
+    if (fault === "stop") await runtime.stop();
+    if (fault === "caught-loss") { active = false; assert.throws(assertOriginal!); active = true; }
+    release();
+    const result = await pending;
+    assert.equal(result.ok, false); assert.equal(result.canTakeover, false);
+    assert.match(result.message!, /cancelled or superseded/u);
+    assert.equal(statuses, 0); assert.equal(proofs, 0, "Cancellation is not evidence of an unavailable leader");
+    assert.equal(readFileSync(temp.path, "utf8"), original);
+  } finally { release(); await pending; rmSync(temp.dir, { recursive: true, force: true }); }
 });
 
 test("Locked polling runtime falls back to takeover when follower registration is not applicable", async () => {
@@ -3690,6 +4053,8 @@ test("Locked polling runtime tolerates a transient unverified ownership check", 
     getOwnedLeaderEpoch: () => undefined,
     getJournalPath: () => undefined,
     owns: () => !unverifiedNextCheck,
+    captureFollowerRegistrationScope: () => () => false,
+    getStorageScope: () => undefined,
     commitIfOwned: (commit: () => void) => {
       commit();
       return true;
@@ -3759,6 +4124,8 @@ for (const ownsReadable of [true, false]) test(`Locked polling runtime records r
     getOwnedLeaderEpoch: () => undefined,
     getJournalPath: () => undefined,
     owns: () => ownsReadable || refreshCalls < 2,
+    captureFollowerRegistrationScope: () => () => false,
+    getStorageScope: () => undefined,
     commitIfOwned: (commit: () => void) => {
       commit();
       return true;

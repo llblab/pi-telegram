@@ -267,12 +267,15 @@ export function getTelegramProfileNames(config: TelegramConfig): string[] {
 export interface TelegramConfigStore {
   get: () => TelegramConfig;
   getStoredConfig: () => TelegramConfig;
+  /** Read-only original config/profile/token lifetime; never pairing or transport authority. */
+  captureConnectionScope: (expectedProfile?: string) => () => boolean;
   set: (config: TelegramConfig) => void;
   setProfile: (profileName: string, profile: TelegramBotProfile) => void;
   update: (mutate: (config: TelegramConfig) => void) => void;
   activateProfile: (profileName: string | undefined) => boolean;
   getActiveProfileName: () => string | undefined;
-  getBotToken: () => string | undefined;
+  /** Resolve one profile without changing the active identity; omission selects the active profile. */
+  getBotToken: (profileName?: string) => string | undefined;
   getBotTokenDiagnostic: () => string | undefined;
   hasBotToken: () => boolean;
   getAllowedUserId: () => number | undefined;
@@ -642,7 +645,7 @@ export function createTelegramConfigStore(
   let persistedConfig: TelegramConfig = {};
   let mutationVersion = 0;
   let persistQueue: Promise<void> = Promise.resolve();
-  let activeProfileName: string | undefined;
+  let activeProfileName: string | undefined, profileGeneration = 0;
   let lastLoadRecoveredInvalidConfig = false;
   const agentDir = options.agentDir ?? resolveAgentDir();
   const configPath = options.configPath ?? getConfigPath();
@@ -710,6 +713,23 @@ export function createTelegramConfigStore(
   return {
     get: getEffectiveConfig,
     getStoredConfig: () => config,
+    captureConnectionScope(expectedProfile) {
+      const originalConfig = config, profile = activeProfileName, generation = profileGeneration;
+      const token = resolveTelegramBotToken(applyTelegramProfile(originalConfig, profile).botToken, env);
+      let lost = !token || expectedProfile !== undefined && (profile ?? TELEGRAM_DEFAULT_PROFILE_NAME) !== expectedProfile, checking = false;
+      const current = () => {
+        if (lost || checking) { lost = true; return false; }
+        checking = true;
+        try {
+          const observed = resolveTelegramBotToken(applyTelegramProfile(config, activeProfileName).botToken, env);
+          if (config !== originalConfig || activeProfileName !== profile || profileGeneration !== generation || observed !== token) lost = true;
+        } catch { lost = true; }
+        finally { checking = false; }
+        return !lost;
+      };
+      current();
+      return current;
+    },
     set: setEffectiveConfig,
     setProfile: (profileName, profile) => {
       config = {
@@ -734,12 +754,13 @@ export function createTelegramConfigStore(
       if (normalizedProfileName && !config.profiles?.[normalizedProfileName]) {
         return false;
       }
+      if (activeProfileName !== normalizedProfileName) profileGeneration++;
       activeProfileName = normalizedProfileName;
       return true;
     },
     getActiveProfileName: () => activeProfileName,
-    getBotToken: () =>
-      resolveTelegramBotToken(getEffectiveConfig().botToken, env),
+    getBotToken: (profileName = activeProfileName) =>
+      resolveTelegramBotToken(applyTelegramProfile(config, profileName).botToken, env),
     getBotTokenDiagnostic: () =>
       getTelegramBotTokenDiagnostic(getEffectiveConfig().botToken, env),
     hasBotToken: () =>

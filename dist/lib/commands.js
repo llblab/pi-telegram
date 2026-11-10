@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { addAbortListener } from "node:events";
 import { isDeepStrictEqual, types } from "node:util";
 import { pairTelegramUserIfNeeded, TELEGRAM_DEFAULT_PROFILE_NAME, } from "./config.js";
-import { isPiStaleContextError } from "./pi.js";
+import { getExtensionContextSessionId, isPiStaleContextError } from "./pi.js";
 import { createTelegramControlItemBuilder, createTelegramControlQueueController, createTelegramQueueAdmissionReceipt, } from "./queue.js";
 import { escapeHtml } from "./rendering.js";
 import { formatTelegramConnectionFailure, } from "./status.js";
@@ -509,12 +509,22 @@ export function registerTelegramBridgeCommands(pi, deps) {
                 return;
             }
             const sessionGeneration = deps.getSessionGeneration?.();
+            let sessionId;
+            try {
+                if (deps.isContextCurrent?.(ctx) === false)
+                    return;
+                sessionId = getExtensionContextSessionId(ctx);
+            }
+            catch {
+                return;
+            }
             let intentId;
             // Pi context getters throw after replacement; check plain intent/generation first.
             const isCurrent = () => (!intentId || deps.connectionIntent?.isActive(intentId) !== false) &&
                 (sessionGeneration === undefined ||
                     deps.getSessionGeneration?.() === sessionGeneration) &&
-                deps.isContextCurrent?.(ctx) !== false;
+                deps.isContextCurrent?.(ctx) !== false &&
+                getExtensionContextSessionId(ctx) === sessionId;
             if (!isCurrent())
                 return;
             if (args
@@ -559,8 +569,31 @@ export function registerTelegramBridgeCommands(pi, deps) {
                     return;
                 }
                 const startPolling = async (options) => {
+                    let lost = false, checking = false;
+                    const assertAuthority = () => {
+                        if (lost || checking) {
+                            lost = true;
+                            throw new Error("Telegram connection attempt was cancelled or superseded.");
+                        }
+                        checking = true;
+                        try {
+                            if (!isCurrent())
+                                lost = true;
+                        }
+                        catch {
+                            lost = true;
+                        }
+                        finally {
+                            checking = false;
+                        }
+                        if (lost)
+                            throw new Error("Telegram connection attempt was cancelled or superseded.");
+                    };
                     try {
-                        return await deps.startPolling(ctx, options);
+                        assertAuthority();
+                        const result = await deps.startPolling(ctx, { ...options, assertAuthority });
+                        assertAuthority();
+                        return result;
                     }
                     catch (error) {
                         if (!isCurrent())

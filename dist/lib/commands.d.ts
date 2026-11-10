@@ -168,6 +168,8 @@ export declare function createTelegramBotCommandRegistrar(deps: TelegramBotComma
 export interface TelegramBridgeCommandStartPollingOptions {
     force?: boolean;
     forceFreshLeaderThread?: boolean;
+    /** Original command admission, not connected membership authority. */
+    assertAuthority?: () => void;
 }
 export interface TelegramBridgeCommandStartPollingResult {
     ok: boolean;

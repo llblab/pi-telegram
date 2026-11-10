@@ -1130,6 +1130,50 @@ test("Bare and explicit default setup/connect commands select the same profile",
   ]);
 });
 
+test("Connect checks original context admission before reading an already stale session manager", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  let reads = 0, effects = 0;
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => { effects++; }, getStatusLines: () => [], reloadConfig: async () => { effects++; },
+    hasBotToken: () => true, startPolling: async () => { effects++; }, stopPolling: async () => {}, updateStatus() {},
+    isContextCurrent: () => false,
+  });
+  const ctx = createBridgeCommandContext();
+  Object.defineProperty(ctx, "sessionManager", { get() { reads++; throw new Error("Stale SDK context"); } });
+  await getRequiredCommand(harness.commands, "telegram-connect").handler("", ctx);
+  assert.equal(reads, 0); assert.equal(effects, 0);
+});
+
+for (const fault of ["none", "intent", "session", "caught-loss"] as const)
+test(`Connect carries its original command admission into startup (${fault})`, async () => {
+  const { createTelegramConnectionIntentRuntime } = await import("../lib/lifecycle.ts");
+  const harness = createCommandRegistrationApiHarness(), intent = createTelegramConnectionIntentRuntime({ store: {} });
+  let session = "original", effects = 0, contexts = 0, entered!: () => void, release!: () => void, assertOriginal: (() => void) | undefined;
+  const waiting = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {}, getStatusLines: () => [], reloadConfig: async () => {}, hasBotToken: () => true,
+    async startPolling(_ctx, options) {
+      assertOriginal = options?.assertAuthority; entered(); await gate; assert.ok(assertOriginal);
+      if (fault !== "caught-loss") { assertOriginal(); effects++; }
+      return { ok: true };
+    },
+    stopPolling: async () => {}, updateStatus() {}, isContextCurrent: () => true, connectionIntent: intent,
+    queueAgentConnectionContext() { contexts++; },
+  });
+  const ctx = createBridgeCommandContext();
+  Object.defineProperty(ctx, "sessionManager", { value: { getSessionId: () => session } });
+  const pending = getRequiredCommand(harness.commands, "telegram-connect").handler("", ctx);
+  try {
+    await waiting;
+    if (fault === "intent") intent.suspend({ reason: "resume", cwd: "/repo", targetSessionFile: "/destination", connected: false });
+    if (fault === "session") session = "replacement";
+    if (fault === "caught-loss") { session = "replacement"; assert.throws(assertOriginal!); session = "original"; }
+    release(); await pending;
+    assert.equal(effects, fault === "none" ? 1 : 0);
+    assert.equal(contexts, fault === "none" ? 1 : 0, "A producer's caught refusal and successful return cannot republish connected context");
+  } finally { release(); await pending; }
+});
+
 test("Connect fences invalidated Pi getters and preserves pending intent before inspecting the command context", async () => {
   const { createTelegramConnectionIntentRuntime } = await import("../lib/lifecycle.ts");
   const cases = (["config", "polling", "polling-error"] as const)
@@ -1351,6 +1395,52 @@ test("Connection failures keep opaque details in redacted diagnostics, never the
     assert.match(diagnostics, /redacted-token/);
     assert.ok(!diagnostics.includes("123:secret"));
   }
+});
+
+test("Connection recovery diagnostics preserve native issuance and guard refusals without retry advice", async () => {
+  const Status = await import("../lib/status.ts");
+  const { TelegramFileTransactionGuardError } = await import("../lib/locks.ts");
+  const { TelegramBusLocalAuthorityError } = await import("../lib/bus.ts");
+  const { TelegramApiAuthorityError, TelegramApiCommitUnknownError } = await import("../lib/telegram-api.ts");
+  const generic = "Telegram connection failed. Check /telegram-status --debug.";
+  const unconfirmed = "Telegram request outcome is unconfirmed. Do not repeat it; check /telegram-status --debug.";
+  const cases: Array<{ error: Error; notice: string; details: Record<string, unknown> }> = [];
+  for (const reason of ["invalid-layout", "invalid-owner", "unavailable-owner"] as const)
+    for (const phase of ["acquire", "release"] as const)
+      cases.push({ error: new TelegramFileTransactionGuardError("/private/fetch failed/123:secret", reason, { phase }),
+        notice: "Telegram state guard cannot be verified. Connection blocked. Check /telegram-status --debug.",
+        details: { errorCode: "guard-unverifiable", guardReason: reason, guardPhase: phase } });
+  for (const requestIssued of [false, true])
+    for (const error of [new TelegramApiAuthorityError(requestIssued), new TelegramBusLocalAuthorityError(requestIssued)])
+      cases.push({ error, notice: requestIssued ? unconfirmed : generic, details: { requestIssued } });
+  cases.push({ error: new TelegramApiCommitUnknownError("createForumTopic", Object.assign(new Error("fetch failed 123:secret"), { code: "ETIMEDOUT" })),
+    notice: unconfirmed, details: { outcome: "commit-unknown" } });
+  for (const faultAt of ["config", "polling"] as const)
+    for (const { error, notice, details } of cases) {
+      const harness = createCommandRegistrationApiHarness(), notices: string[] = [];
+      const recorder = Status.createTelegramRuntimeEventRecorder({ getBotToken: () => "123:secret" });
+      let starts = 0, stops = 0;
+      registerTelegramBridgeCommands(harness.api, {
+        promptForConfig: async () => {}, getStatusLines: () => [], hasBotToken: () => true,
+        reloadConfig: async () => { if (faultAt === "config") throw error; },
+        startPolling: async () => { starts++; throw error; }, stopPolling: async () => { stops++; }, updateStatus() {},
+        recordConnectionEvent: (original, phase) => {
+          assert.equal(original, error, "Presentation must retain the original producer error");
+          recorder.record("connection", original, { phase });
+        },
+      });
+      await getRequiredCommand(harness.commands, "telegram-connect").handler("", createBridgeCommandContext(text => { notices.push(text); }));
+      assert.deepEqual(notices, [notice]);
+      const events = recorder.getEvents();
+      assert.equal(events.length, 1);
+      assert.deepEqual(events[0]!.details, { phase: "connect", ...details });
+      const debug = Status.buildTelegramRuntimeEventLines(events).join("\n");
+      assert.doesNotMatch(JSON.stringify(events), /123:secret/);
+      for (const [key, value] of Object.entries(details)) assert.ok(debug.includes(`${key}=${JSON.stringify(value)}`));
+      assert.doesNotMatch(notice, /private|secret|Retry \/telegram-connect|takeover|reset/iu);
+      assert.equal(starts, faultAt === "config" ? 0 : 1);
+      assert.equal(stops, 0, "Diagnostic classification grants no reset, stop or retry effect");
+    }
 });
 
 test("Delayed disconnect errors never touch replaced Pi context getters", async () => {

@@ -1,6 +1,6 @@
 {
   "name": "@llblab/pi-telegram",
-  "version": "0.59.0-rc.1",
+  "version": "0.59.0-rc.2",
   "private": false,
   "publishConfig": {
     "access": "public"

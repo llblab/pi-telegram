@@ -4797,6 +4797,73 @@ test("Bus leader records ownership for follower-sent messages", async () => {
   ]);
 });
 
+for (const method of ["call", "callMultipart"] as const)
+for (const loss of [false, true])
+test(`Unmarked API carries transport through native options (${method}/${loss})`, async () => {
+  const registry = createTelegramBusFollowerRegistry();
+  registry.register({ instanceId: "follower", registrationGeneration: "same", target: { chatId: 7, threadId: 42 }, connectedAtMs: 1 });
+  let current = true, effects = 0;
+  const optionsIndex = method === "call" ? 2 : 5;
+  const args: unknown[] = method === "call" ? ["sendMessage", { chat_id: 7, text: "Plain" }, { maxAttempts: 2 }]
+    : ["sendDocument", { chat_id: "7" }, "document", "fixture.bin", "fixture.bin", { maxAttempts: 2 }];
+  const original = structuredClone(args);
+  const handle = createRawTelegramBusLeaderEnvelopeHandler({ followerRegistry: registry, authSecret: "secret", protocolIdentity: createTelegramBusProtocolIdentity({ runtimeBuild: "unmarked-options" }),
+    captureApiTransport: () => () => current, authorizeFollowerApiCall: ({ args: wireArgs }) => {
+      assert.deepEqual(structuredClone(wireArgs), original, "Authorization sees only the wire descriptor, never native authority callbacks");
+      return true;
+    },
+    async callApi(_method, nativeArgs) {
+      const options = nativeArgs[optionsIndex] as { maxAttempts: number; assertAuthority: () => void; onRequestIssued: () => void };
+      assert.equal(options.maxAttempts, 2); assert.equal(typeof options.assertAuthority, "function");
+      await Promise.resolve();
+      if (loss) current = false;
+      options.assertAuthority(); options.onRequestIssued(); effects++;
+      return { message_id: 55 };
+    } });
+  const ack = await handle({ kind: "follower.callApi", requestId: "unmarked-options", auth: "secret", instanceId: "follower", registrationGeneration: "same", sentAtMs: 1, method, args });
+  assert.equal(ack.kind === "bus.ack" && ack.ok, !loss); assert.equal(effects, loss ? 0 : 1);
+  assert.deepEqual(args, original, "The incoming wire descriptor never receives process-local authority callbacks");
+});
+
+for (const fault of ["healthy", "missing", "authorize", "before-http", "issued", "provider"] as const)
+test(`Unmarked follower API pins original native leader transport (${fault})`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-unmarked-transport-")), ctx = { cwd: dir, sessionId: "original" };
+  const lock = createTelegramLockRuntime({ locksPath: join(dir, "owners.json"), instanceId: "leader" });
+  const sessions = createTelegramSessionContextStore<typeof ctx>(); sessions.set(ctx);
+  const polling = createTelegramLockedPollingRuntime({ lock, hasBotToken: () => true, isContextCurrent: sessions.isCurrent, getSessionId: value => value.sessionId,
+    startPolling() {}, async stopPolling() {}, updateStatus() {} });
+  await polling.start(ctx);
+  const registry = createTelegramBusFollowerRegistry();
+  registry.register({ instanceId: "follower", registrationGeneration: "same", target: { chatId: 7, threadId: 42 }, connectedAtMs: 1 });
+  let effects = 0;
+  const lose = () => sessions.set({ ...ctx, sessionId: "replacement" });
+  const previous = globalThis.fetch;
+  globalThis.fetch = async () => {
+    effects++; if (fault === "issued") lose();
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 55, chat: { id: 7 }, message_thread_id: 42 } }));
+  };
+  const restore = setTelegramApiHttpsFetchForTesting(globalThis.fetch);
+  const api = createTelegramBridgeApiRuntime({ client: createTelegramApiClient(() => "123:unmarked"), tempDir: dir, maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {} });
+  const proxy = createTelegramBusLeaderApiProxy(api);
+  const deps = { followerRegistry: registry, authSecret: "secret", protocolIdentity: createTelegramBusProtocolIdentity({ runtimeBuild: "unmarked-transport" }),
+    captureApiTransport: fault === "missing" ? () => undefined : polling.captureCurrentTransportAuthority,
+    authorizeFollowerApiCall() {
+      if (fault === "authorize") lose();
+      if (fault === "provider") deps.captureApiTransport = () => polling.captureCurrentTransportAuthority();
+      return true;
+    }, callApi(method: string, args: unknown[]) {
+      if (fault === "before-http") lose();
+      return proxy(method, args);
+    } };
+  try {
+    const ack = await createRawTelegramBusLeaderEnvelopeHandler(deps)({ kind: "follower.callApi", requestId: "unmarked", auth: "secret", instanceId: "follower", registrationGeneration: "same", sentAtMs: 1,
+      method: "call", args: ["sendMessage", { chat_id: 7, message_thread_id: 42, text: "Unmarked" }] });
+    assert.equal(ack.kind === "bus.ack" && ack.ok, fault === "healthy");
+    assert.equal(effects, fault === "healthy" || fault === "issued" ? 1 : 0, "Only actual issued HTTP may have an effect after authority loss");
+    if (ack.kind === "bus.ack" && !ack.ok) assert.notEqual(ack.error?.code, "follower-api-not-allowed", "Transport refusal is not a reusable no-effect policy certificate");
+  } finally { await polling.stop(); restore(); globalThis.fetch = previous; rmSync(dir, { recursive: true, force: true }); }
+});
+
 for (const phase of ["authorize", "http", "record"] as const)
 for (const fault of ["healthy", "registration", "transport", "operator", "profile", "capture-provider", "call-provider", ...(phase === "authorize" ? ["legacy", "policy-refused", "native-rejected", "wire-mutation"] as const : [])] as const)
 test(`Scoped ordinary broker retains original native authority (${phase}/${fault})`, async () => {

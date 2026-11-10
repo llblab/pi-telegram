@@ -12784,10 +12784,11 @@ const queuedProofCases = ["queue-proof", "queue-before-rename", "queue-after-ren
   "queue-post-admission-recipient", "queue-cold", ...queuedGroupCases, ...queuedTerminalCases.filter(value => !queuedGroupCases.includes(value))];
 const forwardProofCases = ["acceptance-before-rename", "acceptance-after-rename", "acceptance-return-no-proof",
   "acceptance-source-changed", "source-removal-before-write", "source-removal-lost-ack", "source-cas-changed"];
+const producerHistoryLossCases = ["history-before-recipient-ack", "history-after-source-ack"];
 for (const role of ["leader", "follower"] as const) {
   for (const lostReply of [false, true]) {
     for (const delivery of lostReply ? ["normal", "local-regression", "canonical-regression", ...(role === "leader" ? leaderBoundaryFaults : [])] : role === "follower"
-      ? ["normal", "lost-ack", "registration-change", "cleanup-unknown", "authority-ended", "settlement-publication-interrupted", "session-change", "target-change", "queued-before", "queued-during", "active-before", "canonical-before-ack", "canonical-after-ready", "registry-recovery", "registry-disk-regression", ...journalProtectionCases, ...sessionReferenceCases, ...cleanupWakeCases, ...recipientWakeCases, ...forwardProofCases, ...warmCleanupCases, ...warmDisposalCases, "warm-cleanup-registration"]
+      ? ["normal", "lost-ack", "registration-change", "cleanup-unknown", "authority-ended", "settlement-publication-interrupted", "session-change", "target-change", "queued-before", "queued-during", "active-before", "canonical-before-ack", "canonical-after-ready", "registry-recovery", "registry-disk-regression", ...journalProtectionCases, ...sessionReferenceCases, ...cleanupWakeCases, ...recipientWakeCases, ...forwardProofCases, ...producerHistoryLossCases, ...warmCleanupCases, ...warmDisposalCases, "warm-cleanup-registration"]
       : ["normal", "cleanup-unknown", "authority-ended", "settlement-publication-interrupted", "session-change", "target-change", "queued-before", "queued-during", "active-before", "canonical-before-ack", "canonical-after-ready", ...leaderBoundaryFaults, ...journalProtectionCases, ...cleanupWakeCases, ...queuedProofCases, ...warmCleanupCases, ...warmDisposalCases]) {
     test(`Restore button uses durable relocation at full capacity (${role}, lost reply: ${lostReply}, delivery: ${delivery})`, async (t) => {
       await withTopicStore(async (threadStore, path) => {
@@ -12946,6 +12947,27 @@ for (const role of ["leader", "follower"] as const) {
           getContextAuthority: () => current ? { profileBindingKey: "profile:restore", operatorUserId: 7,
             executor: { instanceId: "leader-a", leaderEpoch: "epoch" }, sessionId: "session", cwd: "/repo", generation: 1,
             leaderProtocol: protocol } : undefined });
+        const producerHistoryLoss = producerHistoryLossCases.includes(delivery);
+        let releaseRecipientAck = () => {}, releaseRecipientWork = () => {};
+        let enteredRecipientAdmission = () => {}, enteredRecipientWork = () => {};
+        const recipientAckHold = new Promise<void>(resolve => { releaseRecipientAck = resolve; });
+        const recipientWorkHold = new Promise<void>(resolve => { releaseRecipientWork = resolve; });
+        const recipientAdmissionEntered = new Promise<void>(resolve => { enteredRecipientAdmission = resolve; });
+        const recipientWorkEntered = new Promise<void>(resolve => { enteredRecipientWork = resolve; });
+        let recipientAdmitted = false, recipientReturned = false, recipientWorking = false, recipientFinished = false;
+        let historyLost = false, lostHistoryBytes: string | undefined;
+        let originalCompletion: Parameters<typeof journal.inspectSourceCompletion>[0] | undefined;
+        const loseProducerHistory = () => {
+          assert.equal(historyLost, false);
+          const snapshot = JSON.parse(readFileSync(path, "utf8"));
+          assert.ok(snapshot.workspaceRestore?.operations.length === 1, "The chooser producer, not a private fixture birth, published this operation");
+          assert.deepEqual(snapshot.workspaceRestore.operations[0].request.source, { journalBindingKey, updateIds: [100] });
+          assert.equal(snapshot.workspaceRestore.operations[0].routing?.acceptances?.length ?? 0, delivery === "history-after-source-ack" ? 1 : 0);
+          delete snapshot.workspaceRestore;
+          lostHistoryBytes = JSON.stringify(snapshot);
+          writeFileSync(path, lostHistoryBytes, { mode: 0o600 });
+          historyLost = true;
+        };
         const admissionPort = createTelegramBusFollowerDurableAdmissionRuntime({ journal: recipientJournal,
           signalWorker() {
             calls.push("forward");
@@ -12962,6 +12984,12 @@ for (const role of ["leader", "follower"] as const) {
           },
           durableAdmission: { async admit(envelope, context) {
             const receipt = await admissionPort.admit(envelope, context);
+            if (producerHistoryLoss) {
+              recipientAdmitted = true;
+              enteredRecipientAdmission();
+              if (delivery === "history-before-recipient-ack") await recipientAckHold;
+              recipientReturned = true;
+            }
             if (delivery === "lost-ack" || delivery === "recipient-lost-source") throw new Error("Reply lost after recipient append");
             if (delivery === "acceptance-source-changed") journal.markQueued({ queueKind: "prompt", receiptId: "independent-source",
               sourceUpdateIds: [100], owner: { instanceId: "independent", processId: process.pid,
@@ -13325,7 +13353,15 @@ for (const role of ["leader", "follower"] as const) {
         const recipientExecutions: number[] = [];
         const recipientWorker = Updates.createTelegramUpdateAdmissionWorkerRuntime<Journal.TelegramJournaledUpdate, TestContext>({
           journal: recipientJournal, hasAuthority: () => true,
-          async defaultHandle(update) { recipientExecutions.push(update.update_id); },
+          async defaultHandle(update) {
+            recipientExecutions.push(update.update_id);
+            if (producerHistoryLoss) {
+              recipientWorking = true;
+              enteredRecipientWork();
+              await recipientWorkHold;
+              recipientFinished = true;
+            }
+          },
         });
         const failures: unknown[] = [];
         const workerOwner = Updates.createTelegramUpdateWorkerOwnerRuntime<TestContext>({ instanceId: "leader-a",
@@ -13347,7 +13383,7 @@ for (const role of ["leader", "follower"] as const) {
             if (delivery === "authority-ended") current = false;
           }, afterUpdateCompleted(id, context, sourceBinding) {
             routeRuntime.onUpdateCompleted(id, context, sourceBinding);
-            if (id !== 100) return;
+            if (id !== 100 || producerHistoryLoss) return;
             repeatAck = () => routeRuntime.onUpdateCompleted(id, context, sourceBinding);
             assert.equal(store.list()[0]?.routing?.cleanup, undefined, "ACK cannot reenter the still-held dispatch gate");
             if (delivery === "authority-ended") current = false;
@@ -13378,6 +13414,12 @@ for (const role of ["leader", "follower"] as const) {
               if (delivery === "source-removal-before-write") throw new Error("Fixture source removal not published");
             }
             const result = journal.removeCompletedExact(updateIds, expectedSources, completions);
+            if (delivery === "history-after-source-ack" && updateIds.includes(100)) {
+              assert.equal(completions?.length, 1);
+              originalCompletion = completions![0]!;
+              assert.deepEqual(journal.inspectSourceCompletion(originalCompletion), originalCompletion, "Native source ACK exists before history loss");
+              loseProducerHistory();
+            }
             if (updateIds.includes(100) && (delivery === "source-removal-lost-ack" || warmDisposal)) throw new Error("Fixture source removal ACK lost");
             return result;
           } }, getJournalBindingKey: () => journalBindingKey, hasAuthority: () => true,
@@ -13422,6 +13464,57 @@ for (const role of ["leader", "follower"] as const) {
             assert.match(events.join("\n"), /reroutenew:1:7/, "the shared Restore selection names the same binding");
           }
           assert.equal(journal.read().entries[0]?.state, "pending");
+          if (producerHistoryLoss) {
+            const originalSource = structuredClone(journal.read().entries.find(entry => entry.updateId === 100)!);
+            let producerDrained = false;
+            const producer = click("reroutenew:1:7").finally(() => { producerDrained = true; });
+            if (delivery === "history-before-recipient-ack") {
+              await Promise.race([recipientAdmissionEntered, producer.then(() => assert.fail("Source callback drained before native recipient admission"))]);
+              assert.equal(recipientAdmitted, true, "Actual durable recipient admission precedes the held native reply");
+              assert.equal(recipientReturned, false); assert.equal(producerDrained, false);
+              assert.deepEqual(journal.read().entries.find(entry => entry.updateId === 100), originalSource);
+              assert.equal(recipientJournal.read().entries.find(entry => entry.updateId === 100)?.state, "pending");
+              loseProducerHistory();
+              releaseRecipientAck();
+            }
+            await producer; await routeRuntime.waitForRestoreSettlement();
+            assert.equal(recipientAdmitted, true); assert.equal(recipientReturned, true); assert.equal(producerDrained, true);
+            assert.equal(operationIds.length, 1);
+            assert.equal(historyLost, true, `Producer history-loss boundary was not reached: ${failures.map(String).join("; ")}`);
+            const sourceDisposed = delivery === "history-after-source-ack";
+            assert.deepEqual(journal.read().entries.find(entry => entry.updateId === 100), sourceDisposed ? undefined : originalSource,
+              "Recipient acceptance and source removal remain distinct after chooser callback processing drains");
+            if (sourceDisposed) {
+              assert.ok(originalCompletion);
+              assert.equal(originalCompletion.updateId, originalSource.updateId);
+              assert.equal(originalCompletion.sourceSha256, createHash("sha256").update(JSON.stringify(originalSource)).digest("hex"));
+              assert.deepEqual(resolveJournal()!.journal.inspectSourceCompletion(originalCompletion), originalCompletion);
+            } else {
+              assert.equal(journal.read().sourceCompletions?.some(value => value.updateId === 100) ?? false, false);
+            }
+            assert.throws(() => store.list(), error => error instanceof Threads.TelegramWorkspaceRestoreEvidenceError && error.reason === "missing-snapshot");
+            assert.equal(recipientJournal.read().entries.find(entry => entry.updateId === 100)?.state, "pending", "An ended chooser callback is not recipient worker drain");
+            recipientWorker.start(ctx);
+            let workerDrained = false;
+            const drain = recipientWorker.waitForDrain().finally(() => { workerDrained = true; });
+            await Promise.race([recipientWorkEntered, drain.then(() => assert.fail("Recipient drained without entering its original handler"))]);
+            assert.equal(recipientWorking, true); assert.equal(recipientFinished, false); assert.equal(workerDrained, false);
+            releaseRecipientWork(); await drain;
+            assert.equal(recipientFinished, true); assert.equal(workerDrained, true); assert.deepEqual(recipientExecutions, [100]);
+            assert.equal(recipientJournal.read().entries.length, 0);
+            await click("reroutenew:1:7"); await routeRuntime.waitForRestoreSettlement();
+            assert.equal(journal.read().entries.find(entry => entry.updateId === callbackId)?.state, "retry-wait", "A failed original-history guard retains the new callback rather than reauthorizing it");
+            assert.equal(calls.filter(value => value === "apply").length, 1);
+            assert.equal(calls.filter(value => value === "forward").length, 1);
+            assert.equal(calls.includes("closeForumTopic") || calls.includes("deleteForumTopic"), false);
+            assert.equal(readFileSync(path, "utf8"), lostHistoryBytes, "Neither completion, fresh worker drain nor reclick republishes lost history");
+            if (originalCompletion) assert.deepEqual(journal.inspectSourceCompletion(originalCompletion), originalCompletion, "Independent recipient drain preserves the original scoped ACK without another grant");
+            assert.deepEqual(journal.read().entries.find(entry => entry.updateId === 100), sourceDisposed ? undefined : originalSource);
+            assert.deepEqual(admission.read().leases, []);
+            assert.ok(failures.length > 0, "A fresh callback records the protective original-history refusal");
+            assert.ok(failures.every(error => error instanceof Threads.TelegramWorkspaceRestoreEvidenceError && error.reason === "missing-snapshot"), "History loss must not masquerade as network, timeout or generic failure");
+            return;
+          }
           await click("reroutenew:1:7");
           if (leaderBoundaryFaults.includes(delivery)) {
             if (lostReply) await click("reroutenew:1:7");
@@ -14082,6 +14175,7 @@ for (const role of ["leader", "follower"] as const) {
           await click("reroutenew:1:7");
           assert.equal(operationIds.length, role === "follower" && lostReply ? 2 : 1, "completed chooser cannot dispatch again");
         } finally {
+          releaseRecipientAck(); releaseRecipientWork();
           await worker.stop(); await recipientWorker.stop(); await receiver.stop();
           if (recipientWakeCases.includes(delivery)) await heartbeatRuntime.stopPolling();
           if (!grouped && queuedProofCases.includes(delivery) && !queuedTerminalCases.includes(delivery) && !["queue-proof", "queue-after-rename"].includes(delivery)) {
@@ -14100,7 +14194,7 @@ for (const role of ["leader", "follower"] as const) {
           } else if (warmDisposal) {
             assert.equal(failures.length, 1);
             assert.match(String(failures[0]), /Fixture warm .*disposal|Fixture source removal ACK lost/);
-          } else if (!grouped) assert.deepEqual(failures, []);
+          } else if (!grouped && !producerHistoryLoss) assert.deepEqual(failures, []);
         }
       });
     });

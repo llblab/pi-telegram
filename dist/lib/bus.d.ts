@@ -7,6 +7,7 @@
 import { type TelegramBusEndpointLayout, type TelegramBusTransportEventRecorder, type TelegramBusTransportRetryPolicy } from "./bus-transport.ts";
 import type { TelegramThreadDisplayMode } from "./config.ts";
 import { type TelegramLockEntry, type TelegramLockState } from "./locks.ts";
+import type { TelegramFollowerReadiness } from "./polling.ts";
 import { type TelegramQueueHandoffPayload } from "./queue.ts";
 import { type TelegramTarget } from "./target.ts";
 import { type TelegramSessionReplacementIntent } from "./threads.ts";
@@ -613,7 +614,7 @@ export declare function createTelegramBusLeaderUnresponsivenessProof(deps: {
     sleep?: (ms: number) => Promise<void>;
 }): (owner: TelegramLockEntry) => Promise<boolean>;
 interface TelegramBusLocalServer {
-    start: () => Promise<void>;
+    start: (assertAuthority?: () => void) => Promise<void>;
     stop: () => Promise<void>;
     ensureEndpoint: () => Promise<boolean>;
 }
@@ -643,6 +644,8 @@ export declare class TelegramBusArtifactIpcError extends Error {
     constructor(requestIssued: boolean, cause: unknown);
 }
 interface TelegramBusLocalClientOptions {
+    /** Original registration-only budget. Never consulted after issuance or serialized. */
+    connectionReadiness?: TelegramFollowerReadiness;
     assertAuthority?: () => void;
     onRequestIssued?: () => void;
     socketPath: string;

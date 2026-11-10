@@ -18,7 +18,7 @@ import type * as Delivery from "./delivery.ts";
 import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
 import type * as Pi from "./pi.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
-import { isPiStaleContextError } from "./pi.ts";
+import { getExtensionContextSessionId, isPiStaleContextError } from "./pi.ts";
 import type { TelegramPromptTemplateCommand } from "./prompt-templates.ts";
 import {
   createTelegramControlItemBuilder,
@@ -688,6 +688,8 @@ export function createTelegramBotCommandRegistrar(
 export interface TelegramBridgeCommandStartPollingOptions {
   force?: boolean;
   forceFreshLeaderThread?: boolean;
+  /** Original command admission, not connected membership authority. */
+  assertAuthority?: () => void;
 }
 
 export interface TelegramBridgeCommandStartPollingResult {
@@ -896,13 +898,19 @@ export function registerTelegramBridgeCommands(
         return;
       }
       const sessionGeneration = deps.getSessionGeneration?.();
+      let sessionId: string | undefined;
+      try {
+        if (deps.isContextCurrent?.(ctx) === false) return;
+        sessionId = getExtensionContextSessionId(ctx);
+      } catch { return; }
       let intentId: string | undefined;
       // Pi context getters throw after replacement; check plain intent/generation first.
       const isCurrent = () =>
         (!intentId || deps.connectionIntent?.isActive(intentId) !== false) &&
         (sessionGeneration === undefined ||
           deps.getSessionGeneration?.() === sessionGeneration) &&
-        deps.isContextCurrent?.(ctx) !== false;
+        deps.isContextCurrent?.(ctx) !== false &&
+        getExtensionContextSessionId(ctx) === sessionId;
       if (!isCurrent()) return;
       if (
         args
@@ -956,8 +964,19 @@ export function registerTelegramBridgeCommands(
         const startPolling = async (
           options: TelegramBridgeCommandStartPollingOptions,
         ): Promise<void | TelegramBridgeCommandStartPollingResult> => {
+          let lost = false, checking = false;
+          const assertAuthority = () => {
+            if (lost || checking) { lost = true; throw new Error("Telegram connection attempt was cancelled or superseded."); }
+            checking = true;
+            try { if (!isCurrent()) lost = true; } catch { lost = true; }
+            finally { checking = false; }
+            if (lost) throw new Error("Telegram connection attempt was cancelled or superseded.");
+          };
           try {
-            return await deps.startPolling(ctx, options);
+            assertAuthority();
+            const result = await deps.startPolling(ctx, { ...options, assertAuthority });
+            assertAuthority();
+            return result;
           } catch (error) {
             if (!isCurrent()) return;
             throw error;

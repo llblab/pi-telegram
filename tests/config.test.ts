@@ -27,6 +27,25 @@ import { promisify } from "node:util";
 import test from "node:test";
 
 import type { TelegramConfig } from "../lib/config.ts";
+
+for (const fault of ["none", "config", "profile", "profile-aba", "token", "caught-token-loss", "reentry"] as const)
+test(`Connection config scope retains original profile/token history (${fault})`, () => {
+  let token = "123:scope", reenter = false, nested: (() => boolean) | undefined;
+  const env = {} as NodeJS.ProcessEnv;
+  Object.defineProperty(env, "SCOPE_TOKEN", { get() { if (reenter) { reenter = false; nested?.(); } return token; } });
+  const store = createTelegramConfigStore({ env, initialConfig: { botToken: "$SCOPE_TOKEN", profiles: { work: { botToken: "123:scope" } } } });
+  assert.equal(typeof store.captureConnectionScope, "function");
+  const current = store.captureConnectionScope(); nested = current;
+  assert.equal(current(), true);
+  if (fault === "config") store.set(store.get());
+  if (fault === "profile" || fault === "profile-aba") store.activateProfile("work");
+  if (fault === "profile-aba") store.activateProfile(undefined);
+  if (fault === "token") token = "123:other";
+  if (fault === "caught-token-loss") { token = "123:other"; assert.equal(current(), false); token = "123:scope"; }
+  if (fault === "reentry") reenter = true;
+  assert.equal(current(), fault === "none");
+  if (fault !== "none") { token = "123:scope"; store.activateProfile(undefined); assert.equal(current(), false, "Equal restored fields cannot renew the old scope"); }
+});
 import {
   getTelegramBotTokenDiagnostic,
   resolveTelegramBotToken,
@@ -1817,6 +1836,24 @@ test("Setup prompt runtime guards concurrent setup and stores successful config"
     "finish",
     "start",
   ]);
+});
+
+test("Profile-token inspection preserves active identity and uses the store environment", () => {
+  const env: NodeJS.ProcessEnv = { DEFAULT_TEST_TOKEN: "123:default", WORK_TEST_TOKEN: "123:work" };
+  const store = createTelegramConfigStore({ env, initialConfig: { profiles: {
+    default: { botToken: "$DEFAULT_TEST_TOKEN" }, work: { botToken: "${WORK_TEST_TOKEN}" }, missing: { botToken: "$ABSENT_TEST_TOKEN" },
+  } } });
+  assert.equal(store.activateProfile("work"), true);
+  const original = store.getStoredConfig();
+  assert.equal(store.getBotToken(), "123:work");
+  assert.equal(store.getBotToken("default"), "123:default");
+  assert.equal(store.getBotToken("work"), "123:work");
+  assert.equal(store.getBotToken("missing"), undefined);
+  assert.equal(store.getBotToken("unknown"), undefined);
+  delete env.WORK_TEST_TOKEN;
+  assert.equal(store.getBotToken("work"), undefined);
+  assert.equal(store.getActiveProfileName(), "work");
+  assert.equal(store.getStoredConfig(), original, "Inspection never activates or rewrites a profile");
 });
 
 test("Stored token references resolve from the configured environment", () => {

@@ -331,6 +331,15 @@ export type TelegramTemporaryThreadTargetObservation = {
 } | {
     kind: "unknown";
 };
+/** Diagnostic classification only; no reason certifies quiescence, no effect or permission to forget evidence. */
+export type TelegramWorkspaceRestoreEvidenceRefusal = "missing-snapshot" | "profile-changed" | "token-changed" | "revision-regressed" | "same-revision-conflict";
+export declare class TelegramWorkspaceRestoreEvidenceError extends Error {
+    readonly code = "workspace-restore-evidence-conflict";
+    readonly reason: TelegramWorkspaceRestoreEvidenceRefusal;
+    readonly retainedRevision: number;
+    readonly observedRevision?: number;
+    constructor(reason: TelegramWorkspaceRestoreEvidenceRefusal, retainedRevision: number, observedRevision?: number);
+}
 interface TelegramWorkspaceRestoreSnapshot {
     version: 1;
     profileName: string;
@@ -506,6 +515,11 @@ export interface TelegramTopicTargetStore {
     load: () => Promise<void>;
     /** Discard process-local projections and reload owner-published state. */
     refresh?: () => Promise<void>;
+    /** Read-only logical storage/profile lifetime; does not forget projections or grant publication. */
+    captureReadScope: (expected?: {
+        path: string;
+        profile: string;
+    }) => () => boolean;
     /** Optional caller fence supplements, never replaces, captured publication authority. */
     persist: (isCurrent?: () => boolean) => Promise<void>;
     invalidateTarget: (target: TelegramTarget, isCurrent: () => boolean, lastSyncError: string) => Promise<boolean>;
