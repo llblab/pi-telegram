@@ -35,11 +35,17 @@ else if (files.length) {
   delete env.PI_TELEGRAM_INTEGRATION_SHARD; delete env.PI_TELEGRAM_INTEGRATION_LIST;
   if (phase === "integration") env.PI_TELEGRAM_INTEGRATION_SHARD = integrationShard;
   console.log(`CI ${phase} ${shard}: ${files.length} test file(s)`);
+  const reporters = [`--test-reporter=${phase === "integration" ? "tap" : phase === "process" ? "spec" : "dot"}`];
+  if (phase === "integration" && env.GITHUB_ACTIONS === "true") {
+    // Keep the original TAP on stdout; GitHub consumes the separate bounded notice records there too.
+    reporters.push("--test-reporter-destination=stdout", `--test-reporter=${join(root, "scripts", "ci-test-progress.mjs")}`,
+      "--test-reporter-destination=stdout");
+  }
   const result = spawnSync(process.execPath, [
     "--experimental-strip-types", "--import", "./tests/fixtures/canonical-tmpdir.ts",
     "--test", `--test-concurrency=${phase === "domains" && shard === "all" ? 4 : 1}`,
     // TAP publishes each integration failure with native details before a later test or job deadline can hide it.
-    `--test-reporter=${phase === "integration" ? "tap" : phase === "process" ? "spec" : "dot"}`, ...files,
+    ...reporters, ...files,
   ], { cwd: root, stdio: "inherit", env });
   if (result.error) throw result.error;
   if (result.signal) console.error(`CI test child terminated by ${result.signal}`);

@@ -70,6 +70,182 @@ test("Unreleased changelog respects the project release-entry budget", () => {
   );
 });
 
+test("CI native progress stays finite, body-free and separate from native completion", async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { createHash } from "node:crypto";
+    import { resolve } from "node:path";
+    import nativeReporter, { createNativeTestProgressProjection } from "./scripts/ci-test-progress.mjs";
+    const file = "/fixture/tests/integration.test.ts";
+    const name = "123:private-title\n::error::must-not-escape";
+    const data = (title, extra = {}) => ({ file, name: title, nesting: 0, line: 92, column: 13, ...extra });
+    const dequeue = title => ({ type: "test:dequeue", data: data(title, { type: "test" }) });
+    const complete = (title, passed, extra = {}) => ({ type: "test:complete", data: data(title, { details: { passed, type: "test", get error() { throw new Error("Do not inspect native error bodies"); } }, ...extra }) });
+    const summary = (count, extra = {}) => ({ type: "test:summary", data: { file, success: !extra.failed, counts: { tests: count, passed: count, failed: 0, cancelled: 0, skipped: 0, todo: 0, ...extra } } });
+    const project = createNativeTestProgressProjection(file), output = [];
+    const observe = event => { const row = project(event); if (row) output.push(row); return row; };
+    assert.equal(observe({ type: "test:stdout", get data() { throw new Error("Do not inspect stdout bodies"); } }), undefined);
+    assert.equal(observe({ type: "test:dequeue", data: { file: "/foreign", get name() { throw new Error("Foreign event cannot enter projection"); } } }), undefined);
+    assert.equal(observe({ type: "test:dequeue", data: data("nested", { nesting: 1, type: "test" }) }), undefined);
+    assert.equal(observe({ type: "test:dequeue", data: data(file, { line: 1, column: 1, type: "test" }) }), undefined, "The native file wrapper is not a top-level body");
+    for (let index = 1; index <= 1024; index++) {
+      observe(dequeue(name));
+      observe(complete(name, index !== 500, index === 7 ? { skip: "123:skip-reason" } : {}));
+    }
+    observe(summary(1024, { passed: 1022, failed: 1, skipped: 1 }));
+    assert.equal(output.length, 8, "Six milestones, one first failure and one original summary are the entire output budget");
+    assert.deepEqual(output.filter(row => row.phase === "dequeued").map(row => row.dequeued), [1, 64, 128, 192, 256, 320]);
+    const failure = output.find(row => row.phase === "native-test-failed");
+    assert.equal(failure.dequeued, 500); assert.equal(failure.nativeCompleted, 500);
+    assert.equal(failure.id, createHash("sha256").update(name).digest("hex"));
+    assert.equal(output.at(-1).phase, "native-summary"); assert.equal(output.at(-1).counts.skipped, 1);
+    const encoded = output.map(row => JSON.stringify(row)).join("\n");
+    assert.ok(Buffer.byteLength(encoded) <= 4096);
+    assert.equal(encoded.includes("123:"), false, "Progress must never contain raw private labels"); assert.equal(encoded.includes("::error"), false);
+    assert.equal(encoded.includes(file), false); assert.equal(encoded.includes("body"), false);
+    assert.equal(observe(dequeue(name)), undefined, "A native summary cannot be renewed by later events");
+    const lost = createNativeTestProgressProjection(file);
+    assert.equal(lost(complete(name, true))?.phase, "unavailable");
+    assert.equal(lost(dequeue(name)), undefined, "Missing original dequeue cannot be reconstructed from completion");
+    const duplicate = createNativeTestProgressProjection(file);
+    duplicate(dequeue(name)); duplicate(complete(name, true));
+    assert.equal(duplicate(complete(name, true)).phase, "unavailable");
+    const partial = createNativeTestProgressProjection(file);
+    partial(dequeue(name));
+    assert.equal(partial(summary(1)).phase, "unavailable", "A summary cannot settle a held or missing completion");
+    const changed = createNativeTestProgressProjection(file);
+    changed(dequeue(name));
+    assert.equal(changed(complete("replacement", true)).phase, "unavailable");
+    const oversized = createNativeTestProgressProjection(file);
+    assert.equal(oversized(dequeue("x".repeat(513))).phase, "unavailable");
+    const ordered = createNativeTestProgressProjection(file);
+    assert.equal(ordered({ type: "test:start", data: data(name) }), undefined, "Reporting order is not dequeue authority");
+    const chunks = [];
+    const incomplete = async function* () { yield { type: "test:dequeue", data: { ...dequeue(name).data, file: resolve("tests/integration.test.ts") } }; };
+    for await (const chunk of nativeReporter(incomplete())) chunks.push(chunk);
+    assert.equal(chunks.length, 1); assert.equal(chunks[0].includes("native-summary"), false, "Stream EOF is not a native test summary");
+    for (const flag of ["true", "false", "TRUE", ""]) {
+      process.env.GITHUB_ACTIONS = flag;
+      const events = async function* () {
+        for (let index = 1; index <= 1024; index++) {
+          yield { ...dequeue(name), data: { ...dequeue(name).data, file: resolve("tests/integration.test.ts") } };
+          yield { ...complete(name, index !== 500), data: { ...complete(name, index !== 500).data, file: resolve("tests/integration.test.ts") } };
+        }
+        yield { ...summary(1024, { passed: 1023, failed: 1 }), data: { ...summary(1024, { passed: 1023, failed: 1 }).data, file: resolve("tests/integration.test.ts") } };
+      };
+      const framed = [];
+      for await (const chunk of nativeReporter(events())) framed.push(chunk);
+      assert.equal(framed.length, 8);
+      assert.ok(Buffer.byteLength(framed.join("")) <= 4096, "Workflow framing must retain the entire finite byte budget");
+      const prefix = flag === "true" ? "::notice title=CI native progress::" : "ci-native-progress:";
+      for (const line of framed) {
+        assert.ok(line.startsWith(prefix), "Only exact GitHub CI selects the constant notice command");
+        assert.equal(line.split("\n").length, 2, "One record cannot inject a second command line");
+        const payload = line.slice(prefix.length).trim();
+        assert.equal(payload.includes("123:"), false); assert.equal(payload.includes("::error"), false);
+        assert.equal(payload.includes(file), false); assert.equal(payload.includes("%"), false);
+        assert.equal(JSON.parse(payload).v, 1);
+      }
+    }
+    console.log("finite-native-progress-pass");
+  `, { timeoutMs: 5000 });
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /finite-native-progress-pass/u);
+});
+
+test("CI progress reporter observes public native events without changing TAP or cancellation", { timeout: 20000 }, async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { spawn } from "node:child_process";
+    import { createHash } from "node:crypto";
+    import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+    import { join, resolve } from "node:path";
+    import { tmpdir } from "node:os";
+    import { setTimeout as delay } from "node:timers/promises";
+    const reporter = resolve("scripts/ci-test-progress.mjs");
+    const name = "held-123:private-title\n::error::not-a-command";
+    for (const github of [false, true]) for (const mode of ["healthy", "failure", "timeout", "SIGTERM", "SIGKILL"]) {
+      const root = mkdtempSync(join(tmpdir(), "pt-progress-native-"));
+      mkdirSync(join(root, "tests"));
+      const entered = join(root, "entered"), release = join(root, "release");
+      writeFileSync(join(root, "tests", "integration.test.ts"), [
+        'import assert from "node:assert/strict"; import test from "node:test";',
+        'import { existsSync, writeFileSync } from "node:fs"; import { setTimeout as delay } from "node:timers/promises";',
+        'test(' + JSON.stringify(name) + ', { timeout: ' + (mode === "timeout" ? 150 : 4000) + ' }, async () => {',
+        'writeFileSync(' + JSON.stringify(entered) + ', "body-entered"); const end = performance.now() + 3000;',
+        'while (!existsSync(' + JSON.stringify(release) + ')) { if (performance.now() >= end) throw new Error("Probe release missing"); await delay(10); }',
+        ...(mode === "failure" ? ['assert.fail("123:assertion-body");'] : []),
+        '});',
+        'test("skip-123:hidden", { skip: "123:reason" }, () => assert.fail("Skipped body cannot run"));',
+        'test("last-native-pass", () => {});',
+      ].join("\n"));
+      const env = { ...process.env, GITHUB_ACTIONS: github ? "true" : "false" }; delete env.NODE_TEST_CONTEXT;
+      const child = spawn(process.execPath, ["--experimental-strip-types", "--test", "--test-concurrency=1",
+        "--test-reporter=tap", "--test-reporter-destination=stdout", "--test-reporter=" + reporter,
+        "--test-reporter-destination=" + (github ? "stdout" : "stderr"), "tests/integration.test.ts"], { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "", closed = false;
+      child.stdout.on("data", data => { stdout += String(data); }); child.stderr.on("data", data => { stderr += String(data); });
+      const completion = new Promise((resolve, reject) => {
+        child.once("error", reject); child.once("close", (code, signal) => { closed = true; resolve({ code, signal }); });
+      });
+      const prefix = github ? "::notice title=CI native progress::" : "ci-native-progress:";
+      const records = () => (github ? stdout : stderr).split("\n").filter(line => line.startsWith(prefix)).map(line => JSON.parse(line.slice(prefix.length)));
+      const until = async predicate => { const end = performance.now() + 2000; while (!predicate() && !closed && performance.now() < end) await delay(10); return predicate(); };
+      let native, primary;
+      try {
+        assert.equal(await until(() => existsSync(entered) && records().length > 0), true, mode + ": " + stderr);
+        assert.deepEqual(records(), [{ v: 1, phase: "dequeued", dequeued: 1, nativeCompleted: 0, id: createHash("sha256").update(name).digest("hex") }]);
+        assert.equal(closed, false); assert.equal(existsSync(release), false);
+        if (mode === "timeout") {
+          assert.equal(await until(() => records().some(row => row.phase === "native-test-failed")), true, stderr);
+          assert.equal(existsSync(release), false, "A native timeout record cannot certify original-body drain");
+        }
+        if (mode === "SIGTERM" || mode === "SIGKILL") { assert.equal(child.kill(mode), true); await delay(75); }
+      } catch (error) { primary = error; throw error; }
+      finally {
+        writeFileSync(release, "release");
+        let timer;
+        try {
+          native = await Promise.race([completion, new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error("Native progress reporter did not drain after original body release")), 2000);
+          })]);
+        } catch (error) {
+          if (!closed) child.kill("SIGKILL");
+          await completion;
+          if (!primary) throw error;
+          console.error("Secondary native progress cleanup failure:", error);
+        } finally {
+          clearTimeout(timer);
+          writeFileSync(join(root, "stdout.log"), stdout); writeFileSync(join(root, "stderr.log"), stderr);
+        }
+      }
+      const projected = records();
+      assert.equal(JSON.stringify(projected).includes("123:"), false); assert.equal(JSON.stringify(projected).includes(root), false);
+      assert.equal(stdout.includes("ci-native-progress:"), false);
+      assert.equal(stdout.includes("::notice title=CI native progress::"), github);
+      assert.equal(projected.some(row => row.phase === "unavailable"), false, stderr);
+      if (mode === "SIGTERM" || mode === "SIGKILL") {
+        const forced = mode === "SIGKILL" || process.platform === "win32";
+        assert.deepEqual(native, forced ? { code: null, signal: mode } : { code: 1, signal: null });
+        assert.equal(projected.some(row => row.phase === "native-summary" || row.phase === "native-test-failed"), false);
+        assert.doesNotMatch(stdout, /# tests 3\b/u);
+      } else {
+        assert.deepEqual(native, { code: mode === "healthy" ? 0 : 1, signal: null });
+        assert.match(stdout, /# tests 3\b/u); assert.match(stdout, /# skipped 1\b/u);
+        assert.equal(projected.at(-1).phase, "native-summary", stderr);
+        assert.equal(projected.at(-1).counts.tests, 3); assert.equal(projected.at(-1).counts.skipped, 1);
+        assert.equal(projected.filter(row => row.phase === "native-test-failed").length, mode === "healthy" ? 0 : 1);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+    console.log("native-progress-boundaries-pass");
+  `, { timeoutMs: 15000 });
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /native-progress-boundaries-pass/u);
+});
+
 test("Recovery diagnostic runner never turns later success or missing coverage into a passing cohort", { timeout: 15000 }, async () => {
   const result = await runNodeEval(`
     import assert from "node:assert/strict";
@@ -128,7 +304,8 @@ test("CI integration failures retain native details before a later test drains",
     const root = mkdtempSync(join(tmpdir(), "pt-ci-stream-"));
     const entered = join(root, "entered"), release = join(root, "release");
     mkdirSync(join(root, "scripts")); mkdirSync(join(root, "tests", "fixtures"), { recursive: true });
-    writeFileSync(join(root, "scripts", "run-ci-tests.mjs"), readFileSync("scripts/run-ci-tests.mjs"));
+    for (const script of ["run-ci-tests.mjs", "ci-test-progress.mjs"])
+      writeFileSync(join(root, "scripts", script), readFileSync("scripts/" + script));
     writeFileSync(join(root, "tests", "fixtures", "canonical-tmpdir.ts"), "export {};\n");
     writeFileSync(join(root, "tests", "process-shutdown.test.ts"), "export {};\n");
     writeFileSync(join(root, "tests", "integration.test.ts"), [
@@ -140,7 +317,7 @@ test("CI integration failures retain native details before a later test drains",
       "while (!existsSync(" + JSON.stringify(release) + ")) { if (Date.now() >= deadline) throw new Error('Held fixture did not drain'); await delay(10); }",
       "});",
     ].join("\n"));
-    const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
+    const env = { ...process.env, GITHUB_ACTIONS: "true" }; delete env.NODE_TEST_CONTEXT;
     const child = spawn(process.execPath, [join(root, "scripts", "run-ci-tests.mjs"), "integration", "0"], { cwd: root, stdio: ["ignore", "pipe", "pipe"], env });
     let stdout = "", stderr = "", closed = false;
     child.stdout.on("data", chunk => { stdout += chunk; }); child.stderr.on("data", chunk => { stderr += chunk; });
@@ -152,10 +329,14 @@ test("CI integration failures retain native details before a later test drains",
       while (!predicate() && !closed && Date.now() < deadline) await delay(10);
       return predicate();
     };
-    let earlyDetails = false, result;
+    let earlyDetails = false, earlyProgress = false, result;
     try {
       assert.equal(await until(() => existsSync(entered), 5000), true, "Native test startup must reach its held checkpoint: " + stderr);
-      earlyDetails = await until(() => stdout.includes("not ok 1 - early-native-failure") && stdout.includes("early-native-details"), 2000);
+      await until(() => {
+        earlyDetails = stdout.includes("not ok 1 - early-native-failure") && stdout.includes("early-native-details");
+        earlyProgress = stdout.includes('"phase":"native-test-failed"');
+        return earlyDetails && earlyProgress;
+      }, 2000);
       assert.equal(closed, false, "The native runner must still await the later test");
     } finally {
       writeFileSync(release, "drain"); result = await completion;
@@ -164,7 +345,12 @@ test("CI integration failures retain native details before a later test drains",
     assert.deepEqual(result, { code: 1, signal: null }, "Expected failure must settle naturally, not by cancellation");
     assert.equal(child.killed, false);
     assert.equal(earlyDetails, true, "Original native failure details must be available before release/EOF: " + stdout);
+    assert.equal(earlyProgress, true, "Original finite notice must be available before release/EOF: " + stdout);
     assert.match(stdout, /# tests 2/); assert.match(stdout, /# fail 1/);
+    const notices = stdout.split("\n").filter(line => line.startsWith("::notice title=CI native progress::"));
+    assert.equal(notices.length, 3, "The existing CI runner must publish dequeue, first failure and original summary");
+    assert.equal(notices.join("").includes("early-native"), false, "Notice data cannot borrow original TAP error bodies");
+    assert.equal(JSON.parse(notices.at(-1).slice("::notice title=CI native progress::".length)).success, false);
   `, { timeoutMs: 15_000 });
   assert.equal(observation.signal, null);
   assert.equal(observation.code, 0, observation.stdout + observation.stderr);
@@ -212,23 +398,41 @@ test("CI runner forwards the exact shard to its native child without inherited f
   const root = await mkdtemp(join(tmpdir(), "pi-telegram-ci-spec-"));
   try {
     await mkdir(join(root, "scripts")); await mkdir(join(root, "tests", "fixtures"), { recursive: true });
-    await writeFile(join(root, "scripts", "run-ci-tests.mjs"), readFileSync(join(PROJECT_ROOT, "scripts", "run-ci-tests.mjs")));
+    for (const script of ["run-ci-tests.mjs", "ci-test-progress.mjs"])
+      await writeFile(join(root, "scripts", script), readFileSync(join(PROJECT_ROOT, "scripts", script)));
     await writeFile(join(root, "tests", "fixtures", "canonical-tmpdir.ts"), "export {};\n");
     await writeFile(join(root, "tests", "process-shutdown.test.ts"), "export {};\n");
     for (const [argument, expected] of [["0", "0/4"], ["0/4", "0/4"], ["7/8", "7/8"]] as const) {
       await writeFile(join(root, "tests", "integration.test.ts"), [
-        'import assert from "node:assert/strict";',
+        'import assert from "node:assert/strict"; import test from "node:test";',
+        'test("native-shard-body", () => {',
         `assert.equal(process.env.PI_TELEGRAM_INTEGRATION_SHARD, ${JSON.stringify(expected)});`,
         'assert.equal(process.env.PI_TELEGRAM_INTEGRATION_LIST, undefined);',
         'console.log("native-shard-accepted");',
+        '});',
       ].join("\n"));
-      const env: NodeJS.ProcessEnv = { ...process.env, PI_TELEGRAM_INTEGRATION_SHARD: "foreign", PI_TELEGRAM_INTEGRATION_LIST: "1" };
+      const env: NodeJS.ProcessEnv = { ...process.env, GITHUB_ACTIONS: argument === "0/4" ? "true" : "false", PI_TELEGRAM_INTEGRATION_SHARD: "foreign", PI_TELEGRAM_INTEGRATION_LIST: "1" };
       delete env.NODE_TEST_CONTEXT;
       const result = spawnSync(process.execPath, [join(root, "scripts", "run-ci-tests.mjs"), "integration", argument],
         { cwd: root, env, encoding: "utf8", timeout: 10000 });
       assert.ifError(result.error); assert.equal(result.signal, null);
       assert.equal(result.status, 0, result.stdout + result.stderr);
       assert.match(result.stdout, /native-shard-accepted/u); assert.match(result.stdout, /# pass 1\b/u);
+      assert.equal(result.stdout.includes("::notice title=CI native progress::"), env.GITHUB_ACTIONS === "true");
+      assert.equal(result.stdout.includes("ci-native-progress:"), false);
+    }
+    await writeFile(join(root, "tests", "integration.test.ts"), "export {};\n");
+    const empty = spawnSync(process.execPath, [join(root, "scripts", "run-ci-tests.mjs"), "integration", "0/4"],
+      { cwd: root, env: { ...process.env, GITHUB_ACTIONS: "true", NODE_TEST_CONTEXT: undefined }, encoding: "utf8", timeout: 10000 });
+    assert.ifError(empty.error); assert.equal(empty.signal, null); assert.equal(empty.status, 0, empty.stdout + empty.stderr);
+    assert.equal(empty.stdout.includes("::notice title=CI native progress::"), false, "File-only TAP success is not a semantic test progress witness");
+    await rm(join(root, "scripts", "ci-test-progress.mjs"));
+    for (const [phase, argument] of [["process", "0"], ["domains", "all"]] as const) {
+      const nonIntegration = spawnSync(process.execPath, [join(root, "scripts", "run-ci-tests.mjs"), phase, argument],
+        { cwd: root, env: { ...process.env, GITHUB_ACTIONS: "true", NODE_TEST_CONTEXT: undefined }, encoding: "utf8", timeout: 10000 });
+      assert.ifError(nonIntegration.error); assert.equal(nonIntegration.signal, null);
+      assert.equal(nonIntegration.status, 0, nonIntegration.stdout + nonIntegration.stderr);
+      assert.equal(nonIntegration.stdout.includes("::notice title=CI native progress::"), false, "Other CI phases must not even load the progress reporter");
     }
   } finally { await rm(root, { recursive: true, force: true }); }
 });
