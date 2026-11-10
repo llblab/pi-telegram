@@ -11748,7 +11748,7 @@ function launchProductionRootFixture<TStats extends { pid: number }>(role: strin
     if (closed) { reject(new Error("OS root already closed")); return; }
     const id = ++sequence; pending.set(id, { resolve, reject }); child.send({ id, command });
   });
-  return { pid: child.pid, ready, request,
+  return { pid: child.pid, ready, request, waitForExit: () => completion,
     diagnostics: () => ({ role, pid: child.pid, launchOrdinal, readyOrdinal, checkpoint, checkpoints: checkpoints.map(row => ({ ...row })), closed, stdout, stderr, firstFailure: failure?.message }),
     async stop() { if (!closed) await request("stop"); await completion; } };
 }
@@ -11788,6 +11788,158 @@ test("OS-root diagnostic snapshot does not invent a first failure after healthy 
   assert.equal(observed.closed, true); assert.equal(observed.firstFailure, undefined);
   assert.match(observed.stdout, /fixture healthy stdout/u);
 }, 15000);
+
+for (const artifact of ["source", "compiled"] as const)
+for (const profile of [undefined, "work"] as const)
+test(`Production dead queue-owner cleanup retains native process and receipt proof (${artifact}/${profile ?? "default"})`, async (t) => {
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-native-dead-queue-")));
+  const bot = { botToken: "123:native-dead-queue", botId: 123, allowedUserId: 77, lastUpdateId: 0 };
+  await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
+  const journalPath = Paths.resolveTelegramSessionPollingJournalPath("native-donor-session", agentDir, profile);
+  const childRun = async (role: "donor" | "recipient") => {
+    const { readFile } = await import("node:fs/promises"), { existsSync } = await import("node:fs");
+    const JournalModel: typeof Journal = await import(artifact === "source" ? "./lib/journal.ts" : "./dist/lib/journal.js");
+    const extension = (await import(artifact === "source" ? "./index.ts" : "./dist/index.js")).default;
+    const dispatches: unknown[] = [], notices: string[] = [];
+    const harness = createRuntimePiHarness({ sendUserMessage: message => { dispatches.push(message); } });
+    const ctx = createRuntimeExtensionContext({ cwd: `/native-queue-${role}`, isIdle: () => role !== "donor",
+      sessionManager: { getSessionId: () => role === "donor" ? "native-donor-session" : "native-recipient-session" } });
+    Object.assign(ctx.ui, { notify(message: string) { notices.push(message); } });
+    const path = Paths.resolveTelegramSessionPollingJournalPath("native-donor-session", agentDir, profile);
+    const journal = JournalModel.createTelegramUpdateJournalStore({ path, profileName: profile,
+      botIdentity: JournalModel.createTelegramUpdateJournalBotIdentity({ botToken: "123:native-dead-queue", botId: 123 }) });
+    const updates: unknown[] = [];
+    let polls = 0, reply: ((response: Response) => void) | undefined;
+    const restoreFetch = setTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input), body = parseJsonRequestBody(init);
+      if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: false });
+      if (method === "getUpdates") {
+        polls++;
+        if (updates.length || Number(body?.timeout ?? 0) === 0) return createRuntimeTelegramApiResponse(updates.splice(0));
+        return await new Promise<Response>((resolve, reject) => {
+          reply = resolve;
+          const abort = () => { if (reply === resolve) reply = undefined; reject(new DOMException("fixture stop", "AbortError")); };
+          if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      if (method === "sendMessage" || method === "sendRichMessage")
+        return createRuntimeTelegramApiResponse({ message_id: 500, chat: { id: 77, type: "private" } });
+      if (["deleteWebhook", "setMyCommands", "sendChatAction", "setMessageReaction"].includes(method ?? ""))
+        return createRuntimeTelegramApiResponse(true);
+      throw new Error(`Unexpected native queue method ${method}`);
+    });
+    const stats = async () => {
+      const logPath = Paths.resolveTelegramRuntimeLogPath(agentDir);
+      const events = existsSync(logPath) ? (await readFile(logPath, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
+      return { pid: process.pid, polls, dispatches: dispatches.length, notices,
+        entry: existsSync(path) ? journal.read().entries.find(row => row.updateId === 901) : undefined,
+        cleanup: events.filter(event => event.kind === "event" && event.details?.phase === "dead-queue-owner-cleanup"),
+        resets: events.filter(event => event.kind === "event" && event.details?.phase === "state-reset") };
+    };
+    extension(harness.pi); await harness.handlers.get("session_start")?.({}, ctx);
+    process.on("message", raw => {
+      const { id, command } = raw as { id: number; command: string };
+      const perform = async () => {
+        if (command === "connect") await harness.commands.get("telegram-connect")!.handler(profile ?? "", ctx);
+        else if (command === "admit") {
+          assert.equal(role, "donor");
+          updates.push({ update_id: 901, message: { message_id: 901, date: 1, chat: { id: 77, type: "private" },
+            from: { id: 77, is_bot: false, first_name: "Fixture" }, text: "Native accepted input must never replay" } });
+          if (reply) { const resolve = reply; reply = undefined; resolve(createRuntimeTelegramApiResponse(updates.splice(0))); }
+        } else if (command === "disconnect") await harness.commands.get("telegram-disconnect")!.handler("", ctx);
+        else if (command === "debug") await harness.commands.get("telegram-status")!.handler("--debug", ctx);
+        else if (command === "stop") {
+          await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx); restoreFetch();
+          return { pid: process.pid, stopped: true };
+        } else assert.ok(command === "stats" || command === "exit-host");
+        return stats();
+      };
+      void perform().then(result => process.send?.({ id, result }, () => {
+        // Transport was explicitly drained, but this intentionally omits session shutdown: accepted custody survives host exit.
+        if (command === "stop" || command === "exit-host") process.disconnect?.();
+      }), error => process.send?.({ id, error: String(error instanceof Error ? error.stack : error) }));
+    });
+    process.send?.({ id: 0, result: { pid: process.pid } });
+  };
+  type Stats = { pid: number; polls: number; dispatches: number; notices: string[]; entry?: Journal.TelegramUpdateJournalEntry;
+    cleanup: Array<{ category: string; message: string; at: number; profile: string; details: { phase: string; receiptId: string; removedUpdateCount: number } }>;
+    resets: unknown[] };
+  const launch = (role: "donor" | "recipient") => launchProductionRootFixture<Stats>(`native-queue-${role}`, `
+    import assert from "node:assert/strict";
+    import * as Paths from "./lib/paths.ts";
+    const artifact = ${JSON.stringify(artifact)}, profile = ${JSON.stringify(profile)}, agentDir = ${JSON.stringify(agentDir)};
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const parseJsonRequestBody = ${parseJsonRequestBody.toString()};
+    const getRuntimeTelegramApiMethod = ${getRuntimeTelegramApiMethod.toString()};
+    const createRuntimeTelegramApiResponse = ${createRuntimeTelegramApiResponse.toString()};
+    const setTestFetch = ${setTestFetch.toString()};
+    await (${childRun.toString()})(${JSON.stringify(role)});
+  `);
+  const roots: ReturnType<typeof launch>[] = [];
+  let completed = false;
+  try {
+    const donor = launch("donor"); roots.push(donor);
+    assert.equal((await donor.ready).pid, donor.pid);
+    await donor.request("connect"); await donor.request("admit");
+    let original: Stats | undefined;
+    await waitForAsyncCondition(async () => { original = await donor.request("stats"); return original.entry?.state === "queued"; }, 5000);
+    const entry = original!.entry!;
+    assert.ok(entry.queueOwner && entry.queueReceiptId);
+    assert.equal(entry.queueOwner.processId, donor.pid);
+    assert.equal(original!.dispatches, 0);
+    const detached = await donor.request("disconnect");
+    assert.deepEqual(detached.entry, entry, "Transport release cannot dispose or re-key the live session's accepted receipt");
+    assert.equal(ProcessIdentity.isProcessAlive(entry.queueOwner.processId), true);
+    const identity = { instanceId: "native-recovery-observer", processId: process.pid,
+      processBirthId: ProcessIdentity.getTelegramProcessBirthIdentity(process.pid, "native-recovery-observer") };
+    const journal = Journal.createTelegramUpdateJournalStore({ path: journalPath, profileName: profile, queueRuntimeIdentity: identity,
+      botIdentity: Journal.createTelegramUpdateJournalBotIdentity(bot) });
+    const protectedResult = journal.recoverDeadQueueOwner({ queueKind: "prompt", receiptId: entry.queueReceiptId,
+      sourceUpdateIds: [901], deadOwner: entry.queueOwner, recoveryOwner: { ...identity, sessionGeneration: 1 } });
+    assert.ok(protectedResult.status === "owner-alive" || protectedResult.status === "owner-unverifiable",
+      "A live or unverifiable process retains the exact receipt even after transport release");
+    t.diagnostic(`Native owner protection: ${protectedResult.status}`);
+    assert.deepEqual(journal.read().entries, [entry]);
+    assert.equal(detached.cleanup.length, 0);
+    await donor.request("exit-host"); await donor.waitForExit();
+    assert.equal(ProcessIdentity.getTelegramProcessLiveness(entry.queueOwner), "dead",
+      "Natural native close and fresh PID/birth proof, not elapsed time, precede replacement recovery");
+    assert.deepEqual(journal.read().entries, [entry], "Host exit alone cannot settle the original source");
+    const recipient = launch("recipient"); roots.push(recipient);
+    assert.equal((await recipient.ready).pid, recipient.pid);
+    const recovered = await recipient.request("connect");
+    assert.ok(recovered.polls >= 1, "Replacement polling starts independently of receipt disposition");
+    assert.equal(recovered.entry, undefined);
+    assert.equal(recovered.dispatches, 0);
+    assert.equal(recovered.cleanup.length, 1, "One native CAS recovery emits one exact cleanup event");
+    const event = recovered.cleanup[0]!;
+    assert.equal(event.category, "inbound-worker");
+    assert.equal(event.message, "Discarded session-owned queue authority from a confirmed-dead process.");
+    assert.equal(event.profile, profile ?? "default");
+    assert.deepEqual(event.details, { phase: "dead-queue-owner-cleanup", receiptId: entry.queueReceiptId, removedUpdateCount: 1 });
+    const debug = await recipient.request("debug");
+    assert.ok(debug.notices.some(line => line.includes(new Date(event.at).toISOString()) && line.includes(event.message) && line.includes(entry.queueReceiptId!)));
+    assert.equal(debug.resets.length, 0, "Dead queued-owner cleanup is not damaged-envelope reset");
+    assert.deepEqual(journal.read().entries, []);
+    const reconnected = await recipient.request("connect");
+    assert.deepEqual(reconnected.cleanup, recovered.cleanup, "Healthy reconnect cannot renew the old recovery event");
+    assert.equal(reconnected.dispatches, 0, "Terminal dead-owner cleanup never replays the accepted prompt");
+    completed = true;
+  } finally {
+    const cleanup = await Promise.allSettled(roots.map(async root => {
+      try { await root.stop(); } finally { await root.waitForExit(); }
+    }));
+    if (roots.every(root => root.diagnostics().closed)) await rm(agentDir, { recursive: true, force: true });
+    const failed = cleanup.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") {
+      if (completed) throw failed.reason;
+      console.error("Secondary native queue fixture cleanup failure:", failed.reason);
+    }
+  }
+}, 65000);
 
 for (const artifact of ["source", "compiled"] as const)
 for (const profile of [undefined, "work"] as const)
@@ -12025,6 +12177,9 @@ test(`Production separate OS startup converges through original admission (${art
   const connections: Promise<Stats>[] = [];
   let originalOwner: Pick<Stats, "ownerPid" | "ownerEpoch"> | undefined;
   let issuedBinding: Pick<Stats, "target" | "bindingKey" | "slot"> | undefined;
+  const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
+  let stage = "native-roots-ready", failed = false, primaryFailure: unknown;
+  let connectResults: Stats[] | undefined, startupObservation: Stats[] | undefined, publicationObservation: Stats[] | undefined;
   try {
     const [a, b] = await Promise.all([first.ready, second.ready]);
     assert.equal(a.pid, first.pid); assert.equal(b.pid, second.pid); assert.notEqual(a.pid, b.pid); assert.notEqual(a.pid, process.pid); assert.notEqual(b.pid, process.pid);
@@ -12066,6 +12221,7 @@ test(`Production separate OS startup converges through original admission (${art
         await second.request("probe");
       }
     }
+    stage = "native-connect-release";
     await Promise.all([first.request("release"), second.request("release")]);
     if (phase === "held-receiver-threaded" || phase === "cancel-receiver-threaded") {
       await connections[0];
@@ -12131,9 +12287,11 @@ test(`Production separate OS startup converges through original admission (${art
       await first.request("release-ack");
       await waitForAsyncCondition(async () => (await first.request("stats")).releasedAcks === 1);
     }
-    await Promise.all(connections);
+    connectResults = await Promise.all(connections);
+    stage = "native-poller-convergence";
     await waitForAsyncCondition(async () => (await first.request("stats")).activePollers + (await second.request("stats")).activePollers === 1);
-    const states = [await first.request("stats"), await second.request("stats")];
+    const states = startupObservation = [await first.request("stats"), await second.request("stats")];
+    stage = "native-startup-assertions";
     assert.equal(states[0]!.ownerPid, states[1]!.ownerPid);
     if (originalOwner) for (const state of states) assert.deepEqual({ ownerPid: state.ownerPid, ownerEpoch: state.ownerEpoch }, originalOwner, "The original leader epoch survives the peer command and late capability completion");
     const leader = states.find(row => row.pid === row.ownerPid), follower = states.find(row => row.pid !== row.ownerPid);
@@ -12197,7 +12355,8 @@ test(`Production separate OS startup converges through original admission (${art
       assert.equal(follower.localRegistered, true); assert.deepEqual(follower.localTarget, follower.target); assert.equal(follower.everRegistered, true);
       await first.request("publish"); await second.request("publish");
     }
-    const final = [await first.request("stats"), await second.request("stats")], outputs = final.flatMap(row => row.publications);
+    const final = publicationObservation = [await first.request("stats"), await second.request("stats")], outputs = final.flatMap(row => row.publications);
+    stage = "native-publication-assertions";
     const singleOutput = phase === "early-classic" || phase.startsWith("cancel-") || phase === "lost-ack-threaded" || phase === "silent-ack-timeout-threaded";
     assert.equal(outputs.length, singleOutput ? 1 : 2);
     assert.equal(final.find(row => row.pid === follower.pid)!.publications.length, 0, "Follower output crossed actual leader IPC, not its own HTTP");
@@ -12206,12 +12365,35 @@ test(`Production separate OS startup converges through original admission (${art
       const sent = outputs.filter(row => row.text.includes(`os-startup-output-${role}`));
       assert.equal(sent.length, 1); assert.deepEqual(sent[0]!.target, states[index]!.target ?? { chatId: 77 });
     }
-  } finally {
+  } catch (error) { failed = true; primaryFailure = error; throw error; }
+  finally {
+    const diagnosticFailures: PromiseRejectedResult[] = [];
+    if (evidenceDir) {
+      try {
+        const logPath = Paths.resolveTelegramRuntimeLogPath(agentDir);
+        let runtimeLog: unknown;
+        try {
+          runtimeLog = fs.statSync(logPath).size <= 2 * 1024 * 1024
+            ? { available: true, text: await readFile(logPath, "utf8") } : { available: false, reason: "over-limit" };
+        } catch (error) { runtimeLog = { available: false, error: String(error) }; }
+        const evidence = { version: 1, artifact, profile: profile ?? "default", phase, stage, failed,
+          failure: primaryFailure instanceof Error ? { name: primaryFailure.name, message: primaryFailure.message, stack: primaryFailure.stack } : String(primaryFailure),
+          connectResults, startupObservation, publicationObservation, originalOwner, issuedBinding,
+          first: first.diagnostics(), second: second.diagnostics(), runtimeLog };
+        await mkdir(evidenceDir, { recursive: true });
+        await writeFile(join(evidenceDir, `startup-${artifact}-${profile ?? "default"}-${phase}.json`),
+          JSON.stringify(evidence, null, 2).replaceAll("123:os-startup", "<fixture-token>") + "\n", { flag: "wx" });
+      } catch (reason) { diagnosticFailures.push({ status: "rejected", reason }); }
+    }
     await Promise.allSettled([first.request("release"), second.request("release"), first.request("release-ack"), second.request("release-receiver")]);
     await Promise.allSettled(connections);
-    const stopped = await Promise.allSettled([first.stop(), second.stop()]);
-    await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
-    for (const result of stopped) if (result.status === "rejected") throw result.reason;
+    const stopped = await Promise.allSettled([first, second].map(root => root.stop().finally(() => root.waitForExit())));
+    const removed = first.diagnostics().closed && second.diagnostics().closed
+      ? await Promise.allSettled([rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })]) : [];
+    for (const result of [...diagnosticFailures, ...stopped, ...removed]) if (result.status === "rejected") {
+      if (!failed) throw result.reason;
+      console.error("OS-startup secondary diagnostic/cleanup failure:", result.reason);
+    }
   }
 }, phase === "silent-ack-timeout-threaded" ? 65000 : 40000);
 

@@ -3491,13 +3491,15 @@ for (const scenario of ["current", "render-loss", "response-local", "response-le
       let initial = readFileSync(workspace.path, "utf8");
       const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "fixture", capabilities: rootMode ? ["live-thread-rebind-save-v1", "live-thread-rebind-apply-v1", "live-thread-rebind-settle-v1", "live-thread-rebind-command-set-v1", TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY] : [TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY] });
       const registry = createTelegramBusFollowerRegistry();
-      registry.register({ instanceId: "old", registrationGeneration: "registration", sessionId: "session", sessionGeneration: 1, pid: process.pid, processBirthId: `${process.pid}:follower`,
-        profileKey: workspace.request.owner.profileKey, cwd: "/repo", slot: "A", target: workspace.request.target, protocol, connectedAtMs: 1 });
+      const registration = registry.register({ instanceId: "old", registrationGeneration: "registration", sessionId: "session", sessionGeneration: 1, pid: process.pid, processBirthId: `${process.pid}:follower`,
+        profileKey: workspace.request.owner.profileKey, cwd: "/repo", slot: "A", target: workspace.request.target, protocol, connectedAtMs: Date.now() });
       const stateOwner = createTelegramBusFollowerRegistrationState(); stateOwner.setRegistered(true, rootMode ? workspace.request.binding.target : workspace.request.target, { slot: "A", generation: "registration", leaderProtocol: protocol });
       const ledger = createTelegramWorkspaceAdmissionLedger({ path: `${workspace.path}.menu-admission`, profileKey: "bot:menu", owner: { processId: process.pid, processBirthId: `${process.pid}:menu` }, getProcessLiveness: () => "alive" });
       const operations = createTelegramWorkspaceOperationRuntime({ getWorkspaceAdmission: () => ledger });
       const requests: Record<string, unknown>[] = [], remote: number[] = [], local: number[] = [];
       const render = Promise.withResolvers<void>(), http = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>(), finished = Promise.withResolvers<void>();
+      const pruned = Promise.withResolvers<void>();
+      const pruneEvents: { phase?: string; message: string }[] = [];
       let sessionGeneration = 1;
       let assertRecipient = () => { if (!recipientCurrent) throw new Error("Recipient replaced"); };
       const originalFetch = globalThis.fetch;
@@ -3525,6 +3527,8 @@ for (const scenario of ["current", "render-loss", "response-local", "response-le
       const localServer = createTelegramBusLocalServer({ socketPath: endpoint, handleEnvelope: handle });
       const rootServer = rootMode ? createTelegramBusLeaderRuntime({ socketPath: endpoint, followerRegistry: registry, protocolIdentity: protocol,
         authSecret: "secret", selectedMenuDelivery: leader, isFollowerProcessAlive: () => true, startPolling() {}, stopPolling() {},
+        afterFollowerPrune: () => pruned.resolve(),
+        recordRuntimeEvent(_category, error, details) { pruneEvents.push({ phase: typeof details?.phase === "string" ? details.phase : undefined, message: error instanceof Error ? error.message : String(error) }); },
         callApi() { assert.fail("Root runtime must not borrow ordinary proxy"); } }) : undefined;
       const server = { start: () => rootServer ? rootServer.startPolling(f.ctx) : localServer.start(), stop: () => rootServer ? rootServer.stopPolling() : localServer.stop() };
       const context = createTelegramBusFollowerRestoreContextGetter<typeof f.ctx>({ capability: TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
@@ -3633,8 +3637,15 @@ for (const scenario of ["current", "render-loss", "response-local", "response-le
         if (rootMode) { assert.equal(rootGetters, 1); assert.equal(rootPreparations, 1); assertRecipient(); }
         if (mode === "render-loss") recipientCurrent = false;
         if (mode === "session-loss") sessionGeneration++;
+        if (rootMode) {
+          // This runtime prunes on real time; the Workspace fixture's frozen clock cannot date its registration.
+          const guard = setTimeout(() => pruned.reject(new Error("Native follower prune did not complete")), 5_000);
+          try { await pruned.promise; } finally { clearTimeout(guard); }
+          assert.deepEqual(registry.get("old"), registration, "Native pruning must retain the original fresh registration");
+          assert.equal(pruneEvents.some(event => event.phase === "follower-pruned"), false);
+        }
         render.resolve();
-        if (!["render-loss", "session-loss", "wire-scope"].includes(mode)) await Promise.race([entered.promise, finished.promise.then(() => { assert.fail("No native API attempt"); })]);
+        if (!["render-loss", "session-loss", "wire-scope"].includes(mode)) await Promise.race([entered.promise, finished.promise.then(() => { assert.fail(`No native API attempt: ${JSON.stringify({ diagnostics: f.diagnostics, registered: !!registry.get("old"), pruneEvents })}`); })]);
         http.resolve(); await finished.promise; await new Promise(resolve => setImmediate(resolve));
         const success = ["current", "chunks", "edit", "edit-loss", "busy"].includes(mode);
         assert.equal(stored, success ? 1 : 0); assert.equal(completed, 1);
