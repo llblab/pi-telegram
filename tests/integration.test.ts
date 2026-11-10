@@ -5858,6 +5858,17 @@ function createRuntimeWorkspaceReader(path: string): Threads.TelegramTopicTarget
     consolidated: { captureAuthority: () => undefined, publishIfOwned: () => ({ committed: false }) } });
 }
 
+/** End an owned default-profile fixture through its real disconnect; a suspended Root still has a live OS PID. */
+async function disconnectRuntimeTelegramFixtureRoot(
+  root: Pick<ReturnType<typeof createRuntimePiHarness>, "commands" | "handlers">,
+  ctx: ReturnType<typeof createRuntimeExtensionContext>,
+): Promise<void> {
+  const disconnect = root.commands.get("telegram-disconnect"); assert.ok(disconnect);
+  await disconnect.handler("", ctx);
+  assert.equal((await readRuntimeTelegramLocks()).default?.pid, undefined, "An ended fixture must release its own transport owner, not leave a replacement-only suspension");
+  await root.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+}
+
 async function readRuntimeTelegramLocks(): Promise<Record<string, Record<string, unknown>>> {
   const state = Locks.readTelegramRuntimeState(join(await ensureRuntimeAgentDir(), "tmp", "pi-telegram", "state.json"));
   return Object.fromEntries(Object.entries(state.profiles).filter(([, sections]) => sections.transport !== undefined)
@@ -15824,7 +15835,8 @@ test("Extension runtime resolves stale same-cwd lock before proactive local resu
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentBodies: Array<Record<string, unknown>> = [];
   let getUpdatesCalls = 0;
-  const { handlers, pi } = createRuntimePiHarness();
+  const { handlers, commands, pi } = createRuntimePiHarness();
+  let shutdownContext: ReturnType<typeof createRuntimeExtensionContext> | undefined, completed = false;
   const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "getMe") return createRuntimeTelegramApiResponse({ has_topics_enabled: false });
@@ -15865,6 +15877,7 @@ test("Extension runtime resolves stale same-cwd lock before proactive local resu
     });
     (await getRuntimeTelegramExtension())(pi);
     const ctx = createRuntimeExtensionContext({ cwd });
+    shutdownContext = ctx;
     await handlers.get("session_start")?.({}, ctx);
     await waitForEventLoopCondition(() => getUpdatesCalls >= 1, 5000);
     await handlers.get("input")?.(
@@ -15920,10 +15933,11 @@ test("Extension runtime resolves stale same-cwd lock before proactive local resu
       ),
       /Local \*\*done\*\*/,
     );
-    await handlers.get("session_shutdown")?.({}, ctx);
+    completed = true;
   } finally {
-    restoreFetch();
-    await telegramConfig.restore();
+    try { if (shutdownContext) await disconnectRuntimeTelegramFixtureRoot({ handlers, commands }, shutdownContext); }
+    catch (error) { if (completed) throw error; console.error("Secondary stale-owner fixture cleanup failure:", error); }
+    finally { restoreFetch(); await telegramConfig.restore(); }
   }
 });
 
@@ -16088,7 +16102,8 @@ test("Extension runtime drops queued proactive blocks after session replacement"
   const firstSendGate = new Promise<void>((resolve) => {
     releaseFirstSend = resolve;
   });
-  const { handlers, pi } = createRuntimePiHarness();
+  const { handlers, commands, pi } = createRuntimePiHarness();
+  let shutdownContext: ReturnType<typeof createRuntimeExtensionContext> | undefined, completed = false;
   const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "getMe") return createRuntimeTelegramApiResponse({ has_topics_enabled: false });
@@ -16126,6 +16141,7 @@ test("Extension runtime drops queued proactive blocks after session replacement"
     });
     (await getRuntimeTelegramExtension())(pi);
     const oldCtx = createRuntimeExtensionContext({ cwd });
+    shutdownContext = oldCtx;
     await handlers.get("session_start")?.({}, oldCtx);
     await waitForEventLoopCondition(() => getUpdatesCalls >= 1, 5000);
     await handlers.get("input")?.(
@@ -16188,17 +16204,23 @@ test("Extension runtime drops queued proactive blocks after session replacement"
       oldCtx,
     );
     await firstSendStarted;
-    await handlers.get("session_shutdown")?.({}, oldCtx);
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, oldCtx);
+    shutdownContext = undefined;
     const newCtx = createRuntimeExtensionContext({ cwd });
+    shutdownContext = newCtx;
     await handlers.get("session_start")?.({}, newCtx);
     releaseFirstSend();
     await flushMicrotasks(50);
     assert.equal(sendCalls, 1);
-    await handlers.get("session_shutdown")?.({}, newCtx);
+    completed = true;
   } finally {
     releaseFirstSend();
-    restoreFetch();
-    await telegramConfig.restore();
+    try {
+      if (shutdownContext) await disconnectRuntimeTelegramFixtureRoot({ handlers, commands }, shutdownContext);
+    } catch (error) {
+      if (completed) throw error;
+      console.error("Secondary proactive fixture cleanup failure:", error);
+    } finally { restoreFetch(); await telegramConfig.restore(); }
   }
 });
 
