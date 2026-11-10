@@ -4755,6 +4755,19 @@ function runQueueOwnerReplacementProcess(
   });
 }
 
+async function isolateRetainedRuntimeAgentFixture(t: TestContext): Promise<void> {
+  // Retain this scenario's continuity, not its Threaded state in unrelated Classic fixtures.
+  const previousAgentDir = runtimeAgentDir;
+  const previousAgentEnv = process.env.PI_CODING_AGENT_DIR;
+  runtimeAgentDir = await mkdtemp(join(tmpdir(), "pi-telegram-retained-agent-"));
+  process.env.PI_CODING_AGENT_DIR = runtimeAgentDir;
+  t.after(() => {
+    runtimeAgentDir = previousAgentDir;
+    if (previousAgentEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentEnv;
+  });
+}
+
 async function ensureRuntimeAgentDir(): Promise<string> {
   if (!runtimeAgentDir) {
     runtimeAgentDir = await mkdtemp(
@@ -6273,7 +6286,8 @@ for (const supersedingCommand of ["abort", "stop"] as const) {
   });
 }
 
-test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-connect ownership", async () => {
+test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-connect ownership", async (t) => {
+  await isolateRetainedRuntimeAgentFixture(t);
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const { handlers, commands, pi } = createRuntimePiHarness();
   const methods: Array<{ method: string; body?: Record<string, unknown> }> = [];
@@ -6413,6 +6427,12 @@ test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-c
       chat_id: 77,
       message_thread_id: 42,
     }, deleteCall ? undefined : await getRuntimeIntegrationDiagnostics(methods));
+    const retainedState = Locks.readTelegramRuntimeState(join(runtimeAgentPath, "tmp", "pi-telegram", "state.json"));
+    const retainedWorkspace = retainedState.profiles.default?.workspace;
+    assert.ok(retainedWorkspace && typeof retainedWorkspace === "object" && "bot" in retainedWorkspace);
+    assert.ok(retainedWorkspace.bot && typeof retainedWorkspace.bot === "object" && "threadMode" in retainedWorkspace.bot);
+    assert.equal(retainedWorkspace.bot.threadMode, "enabled");
+    assert.deepEqual(journal.read().entries.map(entry => entry.updateId), [1], "Scenario isolation must not erase accepted legacy input");
   } finally {
     restoreFetch();
     await telegramConfig.restore();
@@ -6636,7 +6656,8 @@ test("Native connect failure emits one compact notice and retains redacted debug
   }
 }, 20_000);
 
-test("Bare connect followed immediately by resume starts the destination through the native runtime", async () => {
+test("Bare connect followed immediately by resume starts the destination through the native runtime", async (t) => {
+  await isolateRetainedRuntimeAgentFixture(t);
   for (const remembered of [false, true]) {
     const config = await createRuntimeTelegramConfigFixture();
     const source = createRuntimePiHarness();
