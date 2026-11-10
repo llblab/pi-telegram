@@ -520,6 +520,16 @@ test("Release CI validates exact tags and publishes through npm Trusted Publishe
   assert.doesNotMatch(releaseWorkflowSource, /NPM_TOKEN|NODE_AUTH_TOKEN/);
 });
 
+test("Release CI keeps prerelease tags out of GitHub and npm latest", () => {
+  assert.match(releaseWorkflowSource, /npm publish --access public --provenance --tag \$\{\{ contains\(github\.ref_name, '-'\) && 'next' \|\| 'latest' \}\}/);
+  const commands = [...releaseWorkflowSource.matchAll(/gh release (?:edit|create) "\$TAG_NAME"[\s\S]*?(?=\n\s*(?:else|fi)\b)/gu)];
+  assert.equal(commands.length, 2, "Both existing and new releases must retain the same tag classification");
+  for (const [command] of commands) {
+    assert.match(command, /--prerelease=\$\{\{ contains\(github\.ref_name, '-'\) \}\}/);
+    assert.match(command, /--latest=\$\{\{ !contains\(github\.ref_name, '-'\) \}\}/);
+  }
+});
+
 function getProjectSourceFiles(): string[] {
   return [
     "index.ts",

@@ -4,7 +4,7 @@
  * Owns direct pi SDK imports and exposes narrow bridge-facing helpers/types for the extension composition layer
  */
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
-import { type AgentEndEvent, type AgentSettledEvent, type AgentStartEvent, type BeforeAgentStartEvent, type BeforeAgentStartEventResult, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type InputEvent, type MessageEndEvent, type SessionBeforeCompactEvent, type SessionCompactEvent, type SessionShutdownEvent, type SessionStartEvent, type SlashCommandInfo, type TurnEndEvent, type TurnEndEventResult, type UIPromptEndEvent, type UIPromptStartEvent } from "@earendil-works/pi-coding-agent";
+import type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, BeforeAgentStartEvent, BeforeAgentStartEventResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionShutdownEvent, SessionStartEvent, SlashCommandInfo, TurnEndEvent, TurnEndEventResult, UIPromptEndEvent, UIPromptStartEvent } from "@earendil-works/pi-coding-agent";
 export type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, BeforeAgentStartEventResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionShutdownEvent, SessionStartEvent, SlashCommandInfo, TurnEndEvent, TurnEndEventResult, UIPromptEndEvent, UIPromptStartEvent, };
 export interface SessionCompactFailedEvent {
     type: "session_compact_failed";

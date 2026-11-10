@@ -6,27 +6,26 @@
 
 import { types } from "node:util";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
-import {
-  type AgentEndEvent,
-  type AgentSettledEvent,
-  type AgentStartEvent,
-  type BeforeAgentStartEvent,
-  type BeforeAgentStartEventResult,
-  type ExtensionAPI,
-  type ExtensionCommandContext,
-  type ExtensionContext,
-  type InputEvent,
-  type MessageEndEvent,
-  type SessionBeforeCompactEvent,
-  type SessionCompactEvent,
-  type SessionShutdownEvent,
-  type SessionStartEvent,
-  type SlashCommandInfo,
-  type TurnEndEvent,
-  type TurnEndEventResult,
-  type UIPromptEndEvent,
-  type UIPromptStartEvent,
-  SettingsManager,
+import type {
+  AgentEndEvent,
+  AgentSettledEvent,
+  AgentStartEvent,
+  BeforeAgentStartEvent,
+  BeforeAgentStartEventResult,
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+  InputEvent,
+  MessageEndEvent,
+  SessionBeforeCompactEvent,
+  SessionCompactEvent,
+  SessionShutdownEvent,
+  SessionStartEvent,
+  SlashCommandInfo,
+  TurnEndEvent,
+  TurnEndEventResult,
+  UIPromptEndEvent,
+  UIPromptStartEvent,
 } from "@earendil-works/pi-coding-agent";
 
 export type {
@@ -333,6 +332,8 @@ export async function createSettingsManager(
   // Pi returns its legacy settings surface synchronously. Compatible hosts may
   // resolve a generic settings service asynchronously; normalize both once at
   // the SDK boundary instead of leaking host distinctions into menu domains.
+  // Queue and transport helpers must not load the whole host SDK during cold Root imports.
+  const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
   const factory = SettingsManager as unknown as PiSettingsManagerFactory;
   return normalizeSettingsManager(await factory.create(cwd));
 }

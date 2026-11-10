@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as Pi from "../lib/pi.ts";
+import { runNodeEval } from "./fixtures/node-eval.ts";
 
 import {
   canStartPollingInExtensionContext,
@@ -357,6 +358,61 @@ test("Pi API runtime ports bind methods without losing receiver context", async 
     "model:gpt-5",
     "command:telegram-connect",
   ]);
+});
+
+for (const source of [true, false])
+test(`Pi cold Root imports defer the settings SDK until first use (${source ? "source" : "compiled"})`, { timeout: 25000 }, async () => {
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { register } from "node:module";
+    register("data:text/javascript," + encodeURIComponent(\`
+      export function resolve(specifier, context, nextResolve) {
+        if (specifier === "@earendil-works/pi-coding-agent")
+          throw new Error("Settings SDK import refused by original cold-import probe");
+        return nextResolve(specifier, context);
+      }
+    \`), import.meta.url);
+    const base = ${JSON.stringify(source ? "./lib/" : "./dist/lib/")}, suffix = ${JSON.stringify(source ? ".ts" : ".js")};
+    const Pi = await import(base + "pi" + suffix);
+    assert.equal(Pi.isPiStaleContextError(new Error("stale ctx")), true);
+    for (const name of ["outbound", "bindings", "extension"]) await import(base + name + suffix);
+    console.log("pi-cold-root-import-ready");
+    await assert.rejects(Pi.createSettingsManager("unused-cold-probe"), /Settings SDK import refused by original cold-import probe/);
+    console.log("pi-lazy-settings-boundary-pass");
+  `, { timeoutMs: 12000, readiness: { stdoutPrefix: "pi-cold-root-import-ready", startupTimeoutMs: 10000 } });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.equal(result.signal, null);
+  assert.match(result.stdout, /pi-lazy-settings-boundary-pass/);
+});
+
+test("Pi settings first use retains the installed SDK and source/compiled persistence", { timeout: 25000 }, async () => {
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { mkdtemp, mkdir, rm } from "node:fs/promises";
+    import { join } from "node:path";
+    import { tmpdir } from "node:os";
+    const dir = await mkdtemp(join(tmpdir(), "pt-pi-settings-"));
+    process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
+    await mkdir(process.env.PI_CODING_AGENT_DIR);
+    try {
+      const adapters = [await import("./lib/pi.ts"), await import("./dist/lib/pi.js")];
+      const first = await adapters[0].createSettingsManager(dir);
+      console.log("pi-settings-sdk-ready");
+      first.setEnabledModels(["openai/original-settings-probe"]);
+      await first.flush();
+      const second = await adapters[1].createSettingsManager(dir);
+      await second.reload();
+      assert.deepEqual(second.getEnabledModels(), ["openai/original-settings-probe"]);
+      second.setEnabledModels(["openai/compiled-settings-probe"]);
+      await second.flush();
+      await first.reload();
+      assert.deepEqual(first.getEnabledModels(), ["openai/compiled-settings-probe"]);
+      console.log("pi-native-settings-persistence-pass");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  `, { timeoutMs: 12000, readiness: { stdoutPrefix: "pi-settings-sdk-ready", startupTimeoutMs: 10000 } });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.equal(result.signal, null);
+  assert.match(result.stdout, /pi-native-settings-persistence-pass/);
 });
 
 test("Pi settings adapter preserves legacy and generic host capabilities", async () => {

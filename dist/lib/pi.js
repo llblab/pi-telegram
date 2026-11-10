@@ -4,7 +4,6 @@
  * Owns direct pi SDK imports and exposes narrow bridge-facing helpers/types for the extension composition layer
  */
 import { types } from "node:util";
-import { SettingsManager, } from "@earendil-works/pi-coding-agent";
 function isPiRunMode(value) {
     return (value === "tui" || value === "rpc" || value === "json" || value === "print");
 }
@@ -182,6 +181,8 @@ export async function createSettingsManager(cwd) {
     // Pi returns its legacy settings surface synchronously. Compatible hosts may
     // resolve a generic settings service asynchronously; normalize both once at
     // the SDK boundary instead of leaking host distinctions into menu domains.
+    // Queue and transport helpers must not load the whole host SDK during cold Root imports.
+    const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
     const factory = SettingsManager;
     return normalizeSettingsManager(await factory.create(cwd));
 }
