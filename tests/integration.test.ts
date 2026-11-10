@@ -6891,13 +6891,14 @@ test(`Production question root uses original SDK binding at birth, not ACK (${so
     const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
     const base = ${JSON.stringify(source ? "./lib/" : "./dist/lib/")}, suffix = ${JSON.stringify(source ? ".ts" : ".js")};
     const rows = [], captured = { sdkBirths: [] }, threaded = ${threaded}, callbackKind = ${JSON.stringify(callbackKind)};
-    const started = performance.now();
-    const phase = name => console.log("root-question-phase:" + name + ":elapsedMs=" + Math.round(performance.now() - started));
+    const now = performance.now.bind(performance), started = now();
+    const phase = name => console.log("root-question-phase:" + name + ":elapsedMs=" + Math.round(now() - started) + ":pid=" + process.pid);
     phase("import-start");
     const timedDirect = callbackKind.startsWith("timed-direct"), qualifiedDirect = callbackKind === "timed-direct" || callbackKind === "timed-direct-pure" || callbackKind === "timed-direct-later", timers = new Map(), refreshEntered = Promise.withResolvers(), refreshRelease = Promise.withResolvers(), refreshFinished = Promise.withResolvers();
     const retained = callbackKind.includes("retained"), textRetention = callbackKind.startsWith("retained-text"), pure = retained && callbackKind !== "retained-text-mixed" || ["pure", "deferred", "conditional", "lost-sdk", "second-sdk"].includes(callbackKind);
     const feedbackEntered = Promise.withResolvers(), feedbackRelease = Promise.withResolvers(), editorEntered = Promise.withResolvers(), editorRelease = Promise.withResolvers(), resultBegan = Promise.withResolvers();
     const appsUrl = new URL(base + "generative-apps" + suffix, import.meta.url), apps = await import(appsUrl.href);
+    phase("apps-import-complete");
     mock.module(appsUrl.href, { namedExports: { ...apps, registerTelegramBindTool(pi, deps) {
       if (timedDirect) {
         const plan = deps.planOutput, edit = deps.editView, setRuntime = deps.setLiveSurfaceRuntime;
@@ -6918,7 +6919,9 @@ test(`Production question root uses original SDK binding at birth, not ACK (${so
       if (options.callbackInvocation) { assert.equal(captured.invocation, undefined); captured.invocation = options.callbackInvocation; }
       return apps.invokeGenerativeApp(options);
     } } });
+    phase("apps-mock-complete");
     const { Worker } = await import("node:worker_threads");
+    phase("worker-import-complete");
     const terminate = Worker.prototype.terminate;
     const nativeExit = Promise.withResolvers(), workerExit = Promise.withResolvers(), workerRelease = Promise.withResolvers();
     let holdWorker = false, callbackPlans = 0, executionCaptures = 0, callbackResults = 0;
@@ -6931,8 +6934,11 @@ test(`Production question root uses original SDK binding at birth, not ACK (${so
     const dir = await realpath(await mkdtemp(join(tmpdir(), "pt-root-question-")));
     process.env.PI_CODING_AGENT_DIR = dir;
     const keepAlive = setInterval(() => {}, 60000);
+    phase("fixture-directory-ready");
     for (const [module, factory] of [["outbound", "createTelegramButtonActionStore"], ["delivery", "createTelegramBridgeDeliveryLifecycleHooks"], ["bindings", "createTelegramGenerativeAppBoundButtonActionInvoker"], ["bus-leader", "createTelegramBusLeaderRuntimeAssembly"], ["bus-api", "createTelegramBusAwareApiRuntime"]]) {
+      phase("mock-import-" + module);
       const url = new URL(base + module + suffix, import.meta.url), original = await import(url.href);
+      phase("mock-install-" + module);
       mock.module(url.href, { namedExports: { ...original, [factory](options) {
         if (module === "bindings") {
           const capture = options.getExecutionFence, plan = options.planOutput, record = options.recordRuntimeEvent;
@@ -7002,8 +7008,13 @@ test(`Production question root uses original SDK binding at birth, not ACK (${so
         else if (module === "bus-api") { captured.api = value; captured.apiDeps = options; }
         return value;
       } } });
+      phase("mock-ready-" + module);
     }
-    const Delivery = await import(base + "delivery" + suffix), NativeApps = await import(base + "generative-apps" + suffix);
+    phase("delivery-import");
+    const Delivery = await import(base + "delivery" + suffix);
+    phase("app-binding-import");
+    const NativeApps = await import(base + "generative-apps" + suffix);
+    phase("root-import");
     const { default: extension } = await import(base + "extension" + suffix);
     phase("import-complete");
     const ingress = Promise.withResolvers(), dispatched = Promise.withResolvers(), callbacks = Promise.withResolvers(), callbackDone = Promise.withResolvers();
@@ -7281,9 +7292,15 @@ test(`Production question root uses original SDK binding at birth, not ACK (${so
     }
   `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: callbackKind.startsWith("timed-direct") ? 20000 : 12000,
     readiness: { stdoutPrefix: "root-question-phase:import-complete:", startupTimeoutMs: 10000 } });
+  assert.equal(result.signal, null);
   assert.equal(result.code, 0, result.stdout + result.stderr); assert.match(result.stdout, /root-question-original-binding-pass/u);
-  assert.match(result.stdout, /root-question-phase:import-complete:elapsedMs=\d+/u);
-  assert.match(result.stdout, /root-question-phase:shutdown-done:elapsedMs=\d+/u);
+  const phases = [...result.stdout.matchAll(/^root-question-phase:([^:\r\n]+):elapsedMs=(\d+):pid=(\d+)$/gmu)];
+  assert.equal(new Set(phases.map(row => row[3])).size, 1);
+  assert.ok(phases.every((row, index) => Number(row[3]) > 0 && (index === 0 || Number(row[2]) >= Number(phases[index - 1]![2]))));
+  assert.deepEqual(phases.map(row => row[1]).filter(name => name!.startsWith("mock-")),
+    ["outbound", "delivery", "bindings", "bus-leader", "bus-api"].flatMap(module => ["mock-import-", "mock-install-", "mock-ready-"].map(prefix => prefix + module)));
+  assert.match(result.stdout, /root-question-phase:import-complete:elapsedMs=\d+:pid=\d+/u);
+  assert.match(result.stdout, /root-question-phase:shutdown-done:elapsedMs=\d+:pid=\d+/u);
 }, callbackKind.startsWith("timed-direct") ? 35000 : 25000);
 
 for (const source of [true, false]) for (const [foreign, foreignBootstrap, replaceReceiver, noArtifact, carrier, rich] of [
