@@ -12420,7 +12420,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
   let publication: Promise<{ result?: Stats; error?: unknown }> | undefined, settled = false, reconnect: Promise<Stats> | undefined;
   const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
   let stage = "native-roots-ready", primaryFailure: unknown, failed = false;
-  let initialFollower: Stats | undefined, initialLeader: unknown, publicationObservation: unknown;
+  let initialFollower: Stats | undefined, initialLeader: unknown, publicationObservation: unknown, reconnectObservation: Stats | undefined, finalObservation: unknown;
   try {
     const [l, f] = await Promise.all([leader.ready, follower.ready]);
     assert.equal(l.pid, leader.pid); assert.equal(f.pid, follower.pid);
@@ -12526,7 +12526,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     }
     if (refreshBoundary) {
       await follower.request("release-refresh");
-      const resumed = await reconnect!;
+      const resumed = reconnectObservation = await reconnect!;
       assert.equal(resumed.refreshReturned, 1); assert.equal(resumed.refreshFailed, 0);
       assert.equal(resumed.starts, refreshBoundary === "held" ? 2 : 1, "Public cancellation spends the original command before its late native refresh completion");
       if (refreshBoundary === "held") { assert.equal(resumed.lastStartOk, true); assert.ok(resumed.target); }
@@ -12538,6 +12538,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     }
     if (ownershipFault || loss === "damaged" && refreshBoundary !== "held") await follower.request("probe");
     const last = await leader.request("inspect"), other = await follower.request("stats");
+    finalObservation = { leader: last, follower: other };
     assert.equal(last.issued, 1); assert.equal(last.completed, 1); assert.equal(last.polls, 2); assert.equal(other.polls, refreshBoundary === "held" ? 2 : 0); assert.equal(last.continuations, refreshBoundary ? 2 : 1);
     assert.deepEqual(last.publicationTarget, acknowledged.target, "The original acknowledged Thread, not All or a sibling, receives the issued output");
     assert.equal(last.creations, 2); assert.equal(other.creations, refreshBoundary === "held" ? 1 : 0); assert.equal(last.deletions + other.deletions + last.takeovers + other.takeovers, 0);
@@ -12558,7 +12559,8 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
         } catch (error) { runtimeLog = { available: false, error: String(error) }; }
         const evidence = { version: 1, artifact, profile: profile ?? "default", loss, refreshBoundary, ownershipFault, ipcLoss, stage,
           failed, failure: primaryFailure instanceof Error ? { name: primaryFailure.name, message: primaryFailure.message, stack: primaryFailure.stack } : String(primaryFailure),
-          initialFollower, initialLeader, publicationObservation, leader: leader.diagnostics(), follower: follower.diagnostics(), runtimeLog };
+          initialFollower, initialLeader, publicationObservation, reconnectObservation, finalObservation,
+          leader: leader.diagnostics(), follower: follower.diagnostics(), runtimeLog };
         await mkdir(evidenceDir, { recursive: true });
         await writeFile(join(evidenceDir, `${artifact}-${profile ?? "default"}-${loss}-${refreshBoundary ?? "none"}-${ownershipFault}-${ipcLoss}.json`),
           JSON.stringify(evidence, null, 2).replaceAll("123:os-original", "<fixture-token>") + "\n", { flag: "wx" });

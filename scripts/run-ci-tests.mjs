@@ -36,7 +36,8 @@ else if (files.length) {
   const result = spawnSync(process.execPath, [
     "--experimental-strip-types", "--import", "./tests/fixtures/canonical-tmpdir.ts",
     "--test", `--test-concurrency=${phase === "domains" && shard === "all" ? 4 : 1}`,
-    `--test-reporter=${phase === "process" ? "spec" : "dot"}`, ...files,
+    // TAP publishes each integration failure with native details before a later test or job deadline can hide it.
+    `--test-reporter=${phase === "integration" ? "tap" : phase === "process" ? "spec" : "dot"}`, ...files,
   ], { cwd: root, stdio: "inherit", env });
   if (result.error) throw result.error;
   if (result.signal) console.error(`CI test child terminated by ${result.signal}`);

@@ -116,6 +116,59 @@ test("Recovery diagnostic runner never turns later success or missing coverage i
   assert.equal(result.code, 0, result.stdout + result.stderr);
 });
 
+test("CI integration failures retain native details before a later test drains", async () => {
+  const observation = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { spawn } from "node:child_process";
+    import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+    import { tmpdir } from "node:os";
+    import { join } from "node:path";
+    import { setTimeout as delay } from "node:timers/promises";
+    const root = mkdtempSync(join(tmpdir(), "pt-ci-stream-"));
+    const entered = join(root, "entered"), release = join(root, "release");
+    mkdirSync(join(root, "scripts")); mkdirSync(join(root, "tests", "fixtures"), { recursive: true });
+    writeFileSync(join(root, "scripts", "run-ci-tests.mjs"), readFileSync("scripts/run-ci-tests.mjs"));
+    writeFileSync(join(root, "tests", "fixtures", "canonical-tmpdir.ts"), "export {};\n");
+    writeFileSync(join(root, "tests", "process-shutdown.test.ts"), "export {};\n");
+    writeFileSync(join(root, "tests", "integration.test.ts"), [
+      "import assert from 'node:assert/strict'; import test from 'node:test';",
+      "import { existsSync, writeFileSync } from 'node:fs'; import { setTimeout as delay } from 'node:timers/promises';",
+      "test('early-native-failure', () => assert.fail('early-native-details'));",
+      "test('later-held-test', async () => {",
+      "writeFileSync(" + JSON.stringify(entered) + ", 'ready'); const deadline = Date.now() + 8000;",
+      "while (!existsSync(" + JSON.stringify(release) + ")) { if (Date.now() >= deadline) throw new Error('Held fixture did not drain'); await delay(10); }",
+      "});",
+    ].join("\n"));
+    const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
+    const child = spawn(process.execPath, [join(root, "scripts", "run-ci-tests.mjs"), "integration", "0"], { cwd: root, stdio: ["ignore", "pipe", "pipe"], env });
+    let stdout = "", stderr = "", closed = false;
+    child.stdout.on("data", chunk => { stdout += chunk; }); child.stderr.on("data", chunk => { stderr += chunk; });
+    const completion = new Promise((resolve, reject) => {
+      child.once("error", reject); child.once("close", (code, signal) => { closed = true; resolve({ code, signal }); });
+    });
+    const until = async (predicate, ms) => {
+      const deadline = Date.now() + ms;
+      while (!predicate() && !closed && Date.now() < deadline) await delay(10);
+      return predicate();
+    };
+    let earlyDetails = false, result;
+    try {
+      assert.equal(await until(() => existsSync(entered), 5000), true, "Native test startup must reach its held checkpoint: " + stderr);
+      earlyDetails = await until(() => stdout.includes("not ok 1 - early-native-failure") && stdout.includes("early-native-details"), 2000);
+      assert.equal(closed, false, "The native runner must still await the later test");
+    } finally {
+      writeFileSync(release, "drain"); result = await completion;
+      rmSync(root, { recursive: true, force: true });
+    }
+    assert.deepEqual(result, { code: 1, signal: null }, "Expected failure must settle naturally, not by cancellation");
+    assert.equal(child.killed, false);
+    assert.equal(earlyDetails, true, "Original native failure details must be available before release/EOF: " + stdout);
+    assert.match(stdout, /# tests 2/); assert.match(stdout, /# fail 1/);
+  `, { timeoutMs: 15_000 });
+  assert.equal(observation.signal, null);
+  assert.equal(observation.code, 0, observation.stdout + observation.stderr);
+});
+
 test("CI shards cover every domain file exactly once without widening deadlines", () => {
   const runner = join(PROJECT_ROOT, "scripts", "run-ci-tests.mjs");
   const inventory = readdirSync(join(PROJECT_ROOT, "tests"))
