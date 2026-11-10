@@ -9547,6 +9547,13 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
   const dispatches: string[] = [], errors: string[] = [], updates: unknown[] = [], methods: string[] = [], notices: string[] = [], compactionReasons: string[] = [];
   let pollReply: ((response: Response) => void) | undefined, callback: string | undefined, buttonMessageId = 0;
   let releaseTool = () => {}, toolStarted = false, toolAborts = 0, compactions = 0, messageId = 100;
+  const sdkClock = performance.now.bind(performance), sdkBorn = sdkClock();
+  const sdkPhases: Array<{ phase: string; elapsedMs: number }> = [];
+  let sdkPhasesDropped = 0, unsubscribeSdk = () => {};
+  const sdkPhase = (phase: string) => {
+    if (sdkPhases.length < 64) sdkPhases.push({ phase, elapsedMs: Math.round(sdkClock() - sdkBorn) });
+    else sdkPhasesDropped++;
+  };
   let reloadRequested = false, reloadDone = false, resourceBirths = 0;
   const reloadEvents: string[] = [];
   let questionIssued = 0, questionReturned = 0, releaseQuestion = () => {}, openingSettled = false;
@@ -9622,7 +9629,7 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
     modelRuntime.registerNativeProvider(faux.provider);
     faux.setResponses([() => fauxAssistantMessage(fauxToolCall("telegram_message", { text: 'Fixture button\n<!-- telegram_button {▶️ Queued fixture|button fixture} -->' }), { stopReason: "toolUse" }),
       () => fauxAssistantMessage("Fixture button prepared"), () => fauxAssistantMessage(fauxToolCall("hold_fixture", {}, { id: "held-tool" }), { stopReason: "toolUse" }),
-      ...(settlement === "auto-overflow" ? [() => fauxAssistantMessage("", { stopReason: "error", errorMessage: "context_length_exceeded" })] : []),
+      ...(settlement === "auto-overflow" ? [() => { const response = fauxAssistantMessage("", { stopReason: "error", errorMessage: "context_length_exceeded" }); sdkPhase("provider:overflow"); return response; }] : []),
       ...Array.from({ length: 8 }, () => () => fauxAssistantMessage("Fixture finished"))]);
     const settings = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 1,
       reserveTokens: settlement === "auto-threshold" ? 4000 : 128 }, retry: { enabled: false } });
@@ -9691,6 +9698,7 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
           reloadEvents.push(`shutdown-return:${birth}`);
         });
         pi.on("session_before_compact", async event => {
+          sdkPhase("extension:compaction-enter:" + event.reason);
           compactionReasons.push(event.reason);
           if (settlement.startsWith("auto-")) {
             session!.setAutoCompactionEnabled(false);
@@ -9698,6 +9706,7 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
             await waitForTimeout(1100);
             assert.equal(dispatches.length, beforeCompaction, "Watchdog cannot inject into actual SDK compaction");
           }
+          sdkPhase("extension:compaction-prepared:" + event.reason);
           return { compaction: { summary: "Isolated fixture summary", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
         });
         pi.on("session_compact", () => { compactions++; });
@@ -9716,6 +9725,11 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
     assert.deepEqual(resources.getExtensions().errors, []);
     ({ session } = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime, model: faux.getModel(), thinkingLevel: "off", resourceLoader: resources,
       settingsManager: settings, sessionManager: SessionManager.create(dir, join(dir, "sessions")), tools: ["hold_fixture", "telegram_message"] }));
+    unsubscribeSdk = session.subscribe(event => {
+      if (event.type === "compaction_start") sdkPhase("sdk:compaction_start:" + event.reason);
+      else if (event.type === "compaction_end") sdkPhase("sdk:compaction_end:" + event.reason + (event.errorMessage ? ":error" : event.aborted ? ":aborted" : event.result ? ":result" : ":no-result"));
+      else if (["agent_start", "agent_end", "agent_settled", "tool_execution_start", "tool_execution_end"].includes(event.type)) sdkPhase("sdk:" + event.type);
+    });
     await session.bindExtensions({ mode: "rpc", uiContext: { notify(message) { notices.push(message); } } as import("@earendil-works/pi-coding-agent").ExtensionUIContext,
       ...(reloadCase ? { commandContextActions: {
         waitForIdle: () => session!.waitForIdle(), reload: () => session!.reload(),
@@ -9819,10 +9833,20 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
       assert.equal(toolAborts, 1, "Only explicit manual SDK compaction aborts the held tool");
     } else {
       if (settlement.startsWith("auto-")) session.setAutoCompactionEnabled(true);
-      releaseTool();
+      sdkPhase("fixture:tool-release"); releaseTool();
       if (settlement.startsWith("auto-")) {
-        await waitForCondition(() => compactions === 1);
-        assert.deepEqual(compactionReasons, [settlement === "auto-threshold" ? "threshold" : "overflow"], "SDK itself chooses automatic compaction, not manual compact()");
+        try { await waitForCondition(() => compactions === 1); }
+        catch (error) {
+          // Capture only existing native observations before cleanup; diagnostic failure cannot replace this exact timeout.
+          try { console.error("sdk-compaction-wait-failure " + JSON.stringify({ settlement, compactions, compactionReasons,
+            dispatchCount: dispatches.length, errorCount: errors.length, toolStarted, toolAborts, sdkPhases, sdkPhasesDropped,
+            streaming: session.isStreaming, compacting: session.isCompacting, retrying: session.isRetrying })); } catch {}
+          throw error;
+        }
+        const reason = settlement === "auto-threshold" ? "threshold" : "overflow";
+        assert.deepEqual(compactionReasons, [reason], "SDK itself chooses automatic compaction, not manual compact()");
+        assert.ok(sdkPhases.some(row => row.phase === "sdk:compaction_start:" + reason));
+        assert.ok(sdkPhases.some(row => row.phase === "extension:compaction-prepared:" + reason));
       }
     }
     try { await waitForCondition(() => dispatches.length === 4); }
@@ -9837,6 +9861,7 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
     }
     assert.deepEqual(errors, []);
   } finally {
+    unsubscribeSdk();
     releaseTool(); releaseQuestion(); releaseInbound();
     for (const dispose of inboundDisposers) dispose();
     await Promise.allSettled([questionOpening, reloadWork]);
