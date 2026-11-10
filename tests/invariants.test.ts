@@ -76,7 +76,7 @@ test("CI native progress stays finite, body-free and separate from native comple
     import { createHash } from "node:crypto";
     import { resolve } from "node:path";
     import nativeReporter, { createNativeTestProgressProjection } from "./scripts/ci-test-progress.mjs";
-    const file = "/fixture/tests/integration.test.ts";
+    const file = resolve("fixture", "tests", "integration.test.ts");
     const name = "123:private-title\n::error::must-not-escape";
     const data = (title, extra = {}) => ({ file, name: title, nesting: 0, line: 92, column: 13, ...extra });
     const dequeue = title => ({ type: "test:dequeue", data: data(title, { type: "test" }) });
@@ -163,11 +163,15 @@ test("CI progress reporter observes public native events without changing TAP or
     import { join, resolve } from "node:path";
     import { tmpdir } from "node:os";
     import { setTimeout as delay } from "node:timers/promises";
-    const reporter = resolve("scripts/ci-test-progress.mjs");
+    import { pathToFileURL } from "node:url";
+    const reporterSource = resolve("scripts/ci-test-progress.mjs");
     const name = "held-123:private-title\n::error::not-a-command";
     for (const github of [false, true]) for (const mode of ["healthy", "failure", "timeout", "SIGTERM", "SIGKILL"]) {
-      const root = mkdtempSync(join(tmpdir(), "pt-progress-native-"));
+      const root = mkdtempSync(join(tmpdir(), "pt-progress-native # % λ-"));
       mkdirSync(join(root, "tests"));
+      const reporterPath = join(root, "progress # % λ.mjs");
+      writeFileSync(reporterPath, readFileSync(reporterSource));
+      const reporter = pathToFileURL(reporterPath).href;
       const entered = join(root, "entered"), release = join(root, "release");
       writeFileSync(join(root, "tests", "integration.test.ts"), [
         'import assert from "node:assert/strict"; import test from "node:test";',
@@ -301,7 +305,7 @@ test("CI integration failures retain native details before a later test drains",
     import { tmpdir } from "node:os";
     import { join } from "node:path";
     import { setTimeout as delay } from "node:timers/promises";
-    const root = mkdtempSync(join(tmpdir(), "pt-ci-stream-"));
+    const root = mkdtempSync(join(tmpdir(), "pt-ci-stream # % λ-"));
     const entered = join(root, "entered"), release = join(root, "release");
     mkdirSync(join(root, "scripts")); mkdirSync(join(root, "tests", "fixtures"), { recursive: true });
     for (const script of ["run-ci-tests.mjs", "ci-test-progress.mjs"])
@@ -395,7 +399,7 @@ test("CI shards cover every domain file exactly once without widening deadlines"
 });
 
 test("CI runner forwards the exact shard to its native child without inherited filters", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-telegram-ci-spec-"));
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-ci-spec # % λ-"));
   try {
     await mkdir(join(root, "scripts")); await mkdir(join(root, "tests", "fixtures"), { recursive: true });
     for (const script of ["run-ci-tests.mjs", "ci-test-progress.mjs"])

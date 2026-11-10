@@ -6,7 +6,7 @@
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { delimiter, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const [phase, shard, mode, ...extra] = process.argv.slice(2);
 const integrationShard = /^[0-3]$/u.test(shard ?? "") ? `${shard}/4` : shard;
@@ -38,7 +38,7 @@ else if (files.length) {
   const reporters = [`--test-reporter=${phase === "integration" ? "tap" : phase === "process" ? "spec" : "dot"}`];
   if (phase === "integration" && env.GITHUB_ACTIONS === "true") {
     // Keep the original TAP on stdout; GitHub consumes the separate bounded notice records there too.
-    reporters.push("--test-reporter-destination=stdout", `--test-reporter=${join(root, "scripts", "ci-test-progress.mjs")}`,
+    reporters.push("--test-reporter-destination=stdout", `--test-reporter=${pathToFileURL(join(root, "scripts", "ci-test-progress.mjs")).href}`,
       "--test-reporter-destination=stdout");
   }
   const result = spawnSync(process.execPath, [
