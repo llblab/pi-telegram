@@ -11333,10 +11333,14 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
     const bot = { botToken: "123:reset-root", botId: 123, allowedUserId: 77 };
     await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
     const { handlers, commands, tools, pi } = createRuntimePiHarness();
+    const notices: string[] = [];
     const ctx = createRuntimeExtensionContext({ cwd: "/reset-root" });
+    ctx.ui.notify = (...args: unknown[]) => { notices.push(String(args[0] ?? "")); };
     let polls = 0, outbound = 0;
+    const methods: Array<string | undefined> = [];
     const restoreFetch = setTestFetch(async (input, init) => {
       const method = getRuntimeTelegramApiMethod(input);
+      methods.push(method);
       if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot" });
       if (method === "sendMessage" || method === "sendRichMessage") { outbound++; return createRuntimeTelegramApiResponse({ message_id: 1 }); }
       if (method === "getUpdates" && ++polls === 1) return createRuntimeTelegramApiResponse([]);
@@ -11359,8 +11363,30 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
       WorkspaceAdmission.assertTelegramConsolidatedAdmissionSection(sections?.admission, profile ?? "default");
       await tools.get("telegram_message")!.execute("fixture-recovered-send", { text: "Recovered outbound fixture", chat_id: 77 });
       assert.equal(outbound, 1, "Actual production outbound delivery succeeds through the recovered admission ledger");
-      const logs = await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8");
-      assert.match(logs, /state-reset/u, "the reset leaves one diagnostic event");
+      const readResetEvents = async () => (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8"))
+        .split("\n").filter(Boolean).map(line => JSON.parse(line))
+        .filter(event => event.kind === "event" && event.details?.phase === "state-reset");
+      const resetEvents = await readResetEvents();
+      assert.equal(resetEvents.length, 1, "One positively returned native reset must produce one event, not a substring match");
+      const resetEvent = resetEvents[0]!;
+      const resetMessage = "Damaged Telegram runtime state was reset; previous runtime continuity was discarded.";
+      assert.equal(resetEvent.category, "lock");
+      assert.equal(resetEvent.message, resetMessage);
+      assert.deepEqual(resetEvent.details, { phase: "state-reset" });
+      // Reset precedes named-profile activation and discards every profile's envelope continuity.
+      assert.equal(resetEvent.profile, "default");
+      const beforeDebug = notices.length, methodsBeforeDebug = methods.slice();
+      await commands.get("telegram-status")!.handler("--debug", ctx);
+      const debug = notices.slice(beforeDebug).join("\n");
+      const resetLines = debug.split("\n").filter(line => line.includes(resetMessage));
+      assert.equal(resetLines.length, 1, "The same original reset event remains visible in debug");
+      assert.ok(resetLines[0]!.includes(new Date(resetEvent.at).toISOString()));
+      assert.ok(resetLines[0]!.includes("lock: " + resetMessage));
+      assert.match(resetLines[0]!, /phase="state-reset"/u);
+      assert.deepEqual(methods, methodsBeforeDebug, "Reading diagnostics cannot issue another Bot API request");
+      assert.equal(debug.includes(bot.botToken), false);
+      await commands.get("telegram-connect")!.handler(profile ?? "", ctx);
+      assert.deepEqual(await readResetEvents(), resetEvents, "Debug and a healthy reconnect cannot duplicate or renew the original reset evidence");
     } finally {
       await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
       restoreFetch();
