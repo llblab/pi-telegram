@@ -926,6 +926,103 @@ test("writeLocks writes private lock files", () => {
 });
 
 for (const artifact of ["source", "compiled"] as const)
+for (const succession of ["removed", "replacement", "logger"] as const)
+test(`Transaction guard recensus distinguishes a released directory from invalid layout (${artifact}/${succession})`, { skip: process.platform === "win32" }, async () => {
+  const moduleUrl = new URL(artifact === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+  const loggerUrl = new URL(artifact === "source" ? "../lib/logging.ts" : "../dist/lib/logging.js", import.meta.url).href;
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import fs from "node:fs";
+    import { spawn } from "node:child_process";
+    import { syncBuiltinESMExports } from "node:module";
+    import { mock } from "node:test";
+    import { tmpdir } from "node:os";
+    import { join } from "node:path";
+    import { setTimeout as delay } from "node:timers/promises";
+    const moduleUrl = ${JSON.stringify(moduleUrl)}, succession = ${JSON.stringify(succession)};
+    const Model = await import(moduleUrl);
+    let appendDone = false; const appendFailures = [];
+    mock.module(moduleUrl, { namedExports: { ...Model, withTelegramFileTransaction(...args) {
+      try { return Model.withTelegramFileTransaction(...args); }
+      catch (error) { appendFailures.push({ name: error.name, code: error.code, reason: error.reason, phase: error.phase }); throw error; }
+      finally { appendDone = true; }
+    } } });
+    const Logger = succession === "logger" ? await import(${JSON.stringify(loggerUrl)}) : undefined;
+    const dir = fs.mkdtempSync(join(tmpdir(), "pt-guard-enumeration-")), logPath = join(dir, "logs.jsonl"), guard = logPath + ".transaction";
+    const ready = join(dir, "ready"), release = join(dir, "release"), retired = join(dir, "retired");
+    const replacementReady = join(dir, "replacement-ready"), replacementRelease = join(dir, "replacement-release");
+    const source = [
+      "import fs from 'node:fs'; import { withTelegramFileTransaction } from " + JSON.stringify(moduleUrl) + ";",
+      "const guard = " + JSON.stringify(guard) + ";",
+      "const wait = path => { const deadline = Date.now() + 5000; while (!fs.existsSync(path)) { if (Date.now() >= deadline) throw new Error('Owner fixture wait expired'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2); } };",
+      "withTelegramFileTransaction(guard, () => { fs.writeFileSync(" + JSON.stringify(ready) + ", String(process.pid)); wait(" + JSON.stringify(release) + "); });",
+      "fs.writeFileSync(" + JSON.stringify(retired) + ", 'released');",
+      ...(succession === "replacement" ? ["withTelegramFileTransaction(guard, () => { fs.writeFileSync(" + JSON.stringify(replacementReady) + ", 'ready'); wait(" + JSON.stringify(replacementRelease) + "); });"] : []),
+    ].join("\n");
+    const owner = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module"], { stdio: ["pipe", "pipe", "pipe"] });
+    let stderr = "", ownerResult;
+    owner.stdout.resume(); owner.stderr.on("data", chunk => { stderr += chunk; });
+    const complete = new Promise((resolve, reject) => { owner.once("error", reject); owner.once("close", (code, signal) => resolve({ code, signal })); });
+    owner.stdin.end(source);
+    const readdir = fs.readdirSync;
+    let armed = true, observedEmpty = false, operations = 0;
+    try {
+      const startupDeadline = Date.now() + 5000;
+      while (!fs.existsSync(ready) && Date.now() < startupDeadline) await delay(5);
+      assert.equal(fs.readFileSync(ready, "utf8"), String(owner.pid));
+      console.log("guard-enumeration-checkpoint ready");
+      fs.readdirSync = function(path, ...args) {
+        if (path !== guard || !armed) return Reflect.apply(readdir, fs, [path, ...args]);
+        armed = false;
+        const originalDirectory = fs.opendirSync(guard);
+        try {
+          fs.writeFileSync(release, "release original");
+          const checkpoint = succession === "replacement" ? replacementReady : retired;
+          const deadline = Date.now() + 5000;
+          while (!fs.existsSync(checkpoint)) { if (Date.now() >= deadline) throw new Error("Original native owner did not release"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2); }
+          const entries = []; let entry;
+          while ((entry = originalDirectory.readSync()) !== null) entries.push(entry.name);
+          assert.deepEqual(entries, [], "The actual old directory descriptor enumerates no owner after native release");
+          observedEmpty = true; return entries;
+        } finally { originalDirectory.closeSync(); }
+      };
+      syncBuiltinESMExports();
+      if (Logger) {
+        const log = Logger.createTelegramRuntimeJsonlLog({ path: logPath, canReset: () => false });
+        for (let index = 0; index < 25; index++) log.record({ at: index, category: "actual-native-batch", message: String(index) });
+        const deadline = Date.now() + 2000;
+        while (!appendDone && Date.now() < deadline) await delay(5);
+        assert.equal(appendDone, true); assert.equal(observedEmpty, true);
+        const records = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
+        assert.equal(records.length, 25, JSON.stringify({ appendFailures, records: records.length }));
+        assert.deepEqual(appendFailures, []);
+        assert.deepEqual(records.map(row => row.message), Array.from({ length: 25 }, (_, index) => String(index)));
+      } else {
+        let failure;
+        try { Model.withTelegramFileTransaction(guard, () => { operations++; }, { attempts: 3, retryDelayMs: 1 }); }
+        catch (error) { failure = error; console.log(JSON.stringify({ name: error.name, code: error.code, reason: error.reason, phase: error.phase })); }
+        assert.equal(observedEmpty, true);
+        if (succession === "removed") { assert.equal(failure, undefined, "A consumed directory observation cannot become stable invalid-layout evidence"); assert.equal(operations, 1); }
+        else {
+          assert.equal(operations, 0, "A changed observation never grants entry past a live replacement");
+          assert.match(failure?.message ?? "", /Timed out acquiring Telegram lock transaction/);
+          const names = readdir(guard); assert.equal(names.length, 1);
+          assert.equal(JSON.parse(fs.readFileSync(join(guard, names[0]), "utf8")).pid, owner.pid);
+        }
+      }
+    } finally {
+      fs.readdirSync = readdir; syncBuiltinESMExports();
+      fs.writeFileSync(release, "release"); fs.writeFileSync(replacementRelease, "release");
+      ownerResult = await complete;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    assert.deepEqual(ownerResult, { code: 0, signal: null }, stderr);
+    assert.equal(owner.killed, false);
+  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 10000, readiness: { stdoutPrefix: "guard-enumeration-checkpoint ready", startupTimeoutMs: 10000 } });
+  assert.equal(result.signal, null); assert.equal(result.code, 0, result.stdout + result.stderr);
+});
+
+for (const artifact of ["source", "compiled"] as const)
 for (const format of ["directory", "legacy"] as const)
 for (const fault of ["empty", "truncated", "null", "array", "zero-pid", "negative-pid", "fractional-pid", "unsafe-pid", "out-of-range-pid", "bad-clock", "empty-generation", "invalid-generation", "oversized", "unreadable"] as const)
 test(`Unverifiable transaction owner refuses without contention sleeps (${artifact}/${format}/${fault})`, async t => {

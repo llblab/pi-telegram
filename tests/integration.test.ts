@@ -11588,6 +11588,8 @@ let productionRootFixtureSequence = 0;
 
 function launchProductionRootFixture<TStats extends { pid: number }>(role: string, source: string, executionMs = 20000) {
   const launchOrdinal = ++productionRootFixtureSequence;
+  const readClock = performance.now.bind(performance), launchedAt = readClock();
+  const checkpoints: Array<{ phase: string; elapsedMs: number }> = [];
   let readyOrdinal: number | undefined;
   const child = spawn(process.execPath, ["--experimental-strip-types", "--experimental-test-module-mocks", "--input-type=module"], { stdio: ["pipe", "pipe", "pipe", "ipc"] });
   assert.ok(child.stdin && child.stdout && child.stderr);
@@ -11606,7 +11608,12 @@ function launchProductionRootFixture<TStats extends { pid: number }>(role: strin
   child.stdout.on("data", chunk => { stdout += String(chunk); });
   child.on("message", raw => {
     const message = raw as { id: number; result: TStats; error?: string; fixtureCheckpoint?: string; pid?: number };
-    if (message.fixtureCheckpoint && message.pid === child.pid) { checkpoint = message.fixtureCheckpoint; return; }
+    if (message.fixtureCheckpoint && message.pid === child.pid) {
+      checkpoint = message.fixtureCheckpoint;
+      checkpoints.push({ phase: checkpoint, elapsedMs: Math.max(0, Math.round(readClock() - launchedAt)) });
+      if (checkpoints.length > 16) checkpoints.shift();
+      return;
+    }
     if (message.id === 0) {
       if (message.result?.pid === child.pid && readyOrdinal === undefined) readyOrdinal = ++productionRootFixtureSequence;
       clearTimeout(timer); timer = setTimeout(() => deadline("execution/drain timeout"), executionMs);
@@ -11631,7 +11638,7 @@ function launchProductionRootFixture<TStats extends { pid: number }>(role: strin
     const id = ++sequence; pending.set(id, { resolve, reject }); child.send({ id, command });
   });
   return { pid: child.pid, ready, request,
-    diagnostics: () => ({ role, pid: child.pid, launchOrdinal, readyOrdinal, checkpoint, closed, stdout, stderr, firstFailure: failure?.message }),
+    diagnostics: () => ({ role, pid: child.pid, launchOrdinal, readyOrdinal, checkpoint, checkpoints: checkpoints.map(row => ({ ...row })), closed, stdout, stderr, firstFailure: failure?.message }),
     async stop() { if (!closed) await request("stop"); await completion; } };
 }
 
@@ -11641,6 +11648,7 @@ test("OS-root fixture retains its first deadline failure through native close", 
     process.on("message", () => {});
     process.send?.({ id: 0, fixtureCheckpoint: "static-imports-complete", pid: process.pid });
     process.send?.({ id: 0, result: { pid: process.pid } });
+    for (let index = 0; index < 40; index++) process.send?.({ fixtureCheckpoint: "static-imports-complete", pid: process.pid });
     setInterval(() => process.send?.({ id: 0, fixtureCheckpoint: "static-imports-complete", pid: process.pid }), 5);
   `, 25);
   assert.equal((await fixture.ready).pid, fixture.pid, "A diagnostic checkpoint cannot acknowledge readiness");
@@ -11651,6 +11659,8 @@ test("OS-root fixture retains its first deadline failure through native close", 
   const retained = fixture.diagnostics();
   assert.match(retained.stdout, /fixture native stdout/u); assert.match(retained.stderr, /fixture native stderr/u);
   assert.equal(retained.firstFailure, first.message); assert.equal(retained.closed, true);
+  assert.equal(retained.checkpoints.length, 16, "Repeated diagnostics remain bounded and cannot renew execution/drain");
+  assert.ok(retained.checkpoints.every(row => row.phase === "static-imports-complete" && row.elapsedMs >= 0));
 }, 15000);
 
 test("OS-root diagnostic snapshot does not invent a first failure after healthy native close", async () => {
@@ -12278,8 +12288,11 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
         target: ThreadModel.parseTelegramWorkspaceStateSection(observed, name)?.workspaceBindings?.find(row => row.cwd === ctx.cwd)?.target,
         namespaceHash: createHash("sha256").update(JSON.stringify(observed ?? null)).digest("hex") };
     };
+    process.send?.({ fixtureCheckpoint: "root-construct", pid: process.pid });
     extension(harness.pi);
+    process.send?.({ fixtureCheckpoint: "session-start", pid: process.pid });
     await harness.handlers.get("session_start")?.({}, ctx);
+    process.send?.({ fixtureCheckpoint: "session-start-complete", pid: process.pid });
     const perform = async (command: string): Promise<unknown> => {
       if (command === "connect") { await harness.commands.get("telegram-connect")!.handler(profile ?? "", ctx); return stats(); }
       if (command === "stats") return stats();

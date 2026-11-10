@@ -493,10 +493,14 @@ function getLockTransactionOwnerFile(generation: string): string {
   return `owner.${generation}.json`;
 }
 
-function getLockTransactionOwnerPath(path: string): string {
-  const stat = lstatSync(path);
+function getLockTransactionOwnerPath(path: string): string | undefined {
+  const stat = lstatSync(path, { bigint: true });
   if (stat.isDirectory()) {
     const entries = readdirSync(path);
+    // Enumeration may hold the old directory while its owner renames/releases it and publishes a successor.
+    const current = lstatSync(path, { bigint: true });
+    if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino ||
+      current.mtimeNs !== stat.mtimeNs || current.ctimeNs !== stat.ctimeNs) return undefined;
     if (
       entries.length === 1 &&
       (TELEGRAM_TRANSACTION_OWNER_PATTERN.test(entries[0]) ||
@@ -515,6 +519,7 @@ function readLockTransactionOwner(
 ): TelegramLockTransactionOwner | undefined {
   try {
     const ownerPath = getLockTransactionOwnerPath(path);
+    if (ownerPath === undefined) return undefined;
     const source = readTelegramPrivateFile(ownerPath, TELEGRAM_TRANSACTION_OWNER_MAX_BYTES);
     if (source === undefined) return undefined;
     let value: unknown;
