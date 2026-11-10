@@ -11774,6 +11774,24 @@ test("OS-root fixture retains its first deadline failure through native close", 
   assert.ok(retained.checkpoints.every(row => row.phase === "static-imports-complete" && row.elapsedMs >= 0));
 }, 15000);
 
+test("OS-root startup checkpoints cannot acknowledge readiness or renew the original deadline", async () => {
+  const fixture = launchProductionRootFixture<{ pid: number }>("startup-progress-control", `
+    process.on("message", () => {});
+    setInterval(() => process.send?.({ id: 0, fixtureCheckpoint: "waiting-without-ready", pid: process.pid }), 5);
+  `, 25);
+  try {
+    const first = await fixture.ready.then(() => undefined, error => error);
+    assert.ok(first instanceof Error);
+    assert.match(first.message, /OS-root startup timeout \(startup-progress-control; checkpoint=waiting-without-ready\)/u);
+    await assert.rejects(fixture.waitForExit(), error => error === first, "Progress cannot replace the exact original startup failure at native close");
+    const retained = fixture.diagnostics();
+    assert.equal(retained.readyOrdinal, undefined); assert.equal(retained.closed, true);
+    assert.equal(retained.firstFailure, first.message);
+    assert.equal(retained.checkpoints.length, 16);
+    assert.ok(retained.checkpoints.every(row => row.phase === "waiting-without-ready" && row.elapsedMs >= 0));
+  } finally { await fixture.waitForExit().catch(() => undefined); }
+}, 15000);
+
 test("OS-root diagnostic snapshot does not invent a first failure after healthy native close", async () => {
   const fixture = launchProductionRootFixture<{ pid: number }>("healthy-control", `
     console.log("fixture healthy stdout");
@@ -11947,6 +11965,7 @@ for (const phase of ["early-threaded", "simultaneous-threaded", "early-classic",
 test(`Production separate OS startup converges through original admission (${artifact}/${profile ?? "default"}/${phase})`, async () => {
   const childRun = async (role: "first" | "second", agentDir: string) => {
     const { join } = await import("node:path");
+    const checkpoint = (stage: string) => process.send?.({ fixtureCheckpoint: stage, pid: process.pid });
     let registrationPending = false, registrationSocket: import("node:net").Socket | undefined, lostSockets = 0, registrationFailures = 0, nativeTimeouts = 0, replyTimeoutMs: number | undefined, replyElapsedMs: number | undefined;
     if (phase === "lost-ack-threaded") {
       const Net = await import("node:net");
@@ -11961,8 +11980,18 @@ test(`Production separate OS startup converges through original admission (${art
     const lockUrl = new URL(artifact === "source" ? "./lib/locks.ts" : "./dist/lib/locks.js", import.meta.url);
     const followerUrl = new URL(artifact === "source" ? "./lib/bus-follower.ts" : "./dist/lib/bus-follower.js", import.meta.url);
     const transportUrl = new URL(artifact === "source" ? "./lib/bus-transport.ts" : "./dist/lib/bus-transport.js", import.meta.url);
+    checkpoint("transport-import");
     const Transport: typeof import("../lib/bus-transport.ts") = await import(transportUrl.href);
-    const BusModel: typeof Bus = await import(busUrl.href), PollingModel: typeof import("../lib/polling.ts") = await import(pollingUrl.href), LockModel: typeof Locks = await import(lockUrl.href);
+    checkpoint("transport-import-complete");
+    checkpoint("bus-import");
+    const BusModel: typeof Bus = await import(busUrl.href);
+    checkpoint("bus-import-complete");
+    checkpoint("polling-import");
+    const PollingModel: typeof import("../lib/polling.ts") = await import(pollingUrl.href);
+    checkpoint("polling-import-complete");
+    checkpoint("locks-import");
+    const LockModel: typeof Locks = await import(lockUrl.href);
+    checkpoint("locks-import-complete");
     let pendingObservations = 0, registrationIssues = 0, registrationAcks = 0, cancelledStarts = 0, preparedAcks = 0, releasedAcks = 0, everRegistered = false, resets = 0;
     let localRegistration: ReturnType<typeof import("../lib/bus-follower.ts").createTelegramBusFollowerRegistrationState> | undefined;
     let releaseRegistrationAck!: () => void, releaseReceiver!: () => void;
@@ -12034,7 +12063,9 @@ test(`Production separate OS startup converges through original admission (${art
       },
     } });
     // Load the original follower only after installing the delegating Bus observer, so its lexical imports see that observer too.
+    checkpoint("follower-import");
     const FollowerModel: typeof import("../lib/bus-follower.ts") = await import(followerUrl.href);
+    checkpoint("follower-import-complete");
     mock.module(followerUrl.href, { namedExports: { ...FollowerModel, createTelegramBusFollowerRegistrationState(options: Parameters<typeof FollowerModel.createTelegramBusFollowerRegistrationState>[0]) {
       const state = FollowerModel.createTelegramBusFollowerRegistrationState({ ...options, onRegistrationChanged() {
         everRegistered ||= state.isRegistered();
@@ -12043,9 +12074,9 @@ test(`Production separate OS startup converges through original admission (${art
       localRegistration = state;
       return state;
     } } });
-    process.send?.({ fixtureCheckpoint: "root-import", pid: process.pid });
+    checkpoint("root-import");
     const extension = (await import(artifact === "source" ? "./index.ts" : "./dist/index.js")).default;
-    process.send?.({ fixtureCheckpoint: "root-import-complete", pid: process.pid });
+    checkpoint("root-import-complete");
     const harness = createRuntimePiHarness(), ctx = createRuntimeExtensionContext({ cwd: `/os-startup-${role}`, sessionManager: { getSessionId: () => `startup-session-${role}` } });
     const notices: string[] = [], publications: Array<{ text: string; target: { chatId: unknown; threadId: unknown } }> = [];
     let connectCalls = 0, connectHandlerEntries = 0, connectSettled = false, capabilityEntered = false, capabilityReturned = false;
@@ -12183,6 +12214,14 @@ test(`Production separate OS startup converges through original admission (${art
   try {
     const [a, b] = await Promise.all([first.ready, second.ready]);
     assert.equal(a.pid, first.pid); assert.equal(b.pid, second.pid); assert.notEqual(a.pid, b.pid); assert.notEqual(a.pid, process.pid); assert.notEqual(b.pid, process.pid);
+    const expectedPhases = ["static-imports-complete", ...["transport", "bus", "polling", "locks", "follower", "root"]
+      .flatMap(name => [`${name}-import`, `${name}-import-complete`])];
+    for (const root of [first, second]) {
+      const diagnostic = root.diagnostics();
+      assert.ok(diagnostic.readyOrdinal !== undefined);
+      assert.deepEqual(diagnostic.checkpoints.map(row => row.phase), expectedPhases, "Native startup progress must cover original import phases in order");
+      assert.ok(diagnostic.checkpoints.every((row, index, rows) => Number.isFinite(row.elapsedMs) && row.elapsedMs >= (rows[index - 1]?.elapsedMs ?? 0)), "Original parent observations are monotonic, not renewed startup clocks");
+    }
     connections.push(first.request("connect")); void connections[0]!.catch(() => undefined);
     if (!phase.startsWith("simultaneous-")) {
       await waitForAsyncCondition(async () => (await first.request("stats")).capabilityEntered);
