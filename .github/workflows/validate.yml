@@ -34,51 +34,83 @@ jobs:
           - os: ubuntu-latest
             suite: integration
             integrationShard: 0
+            integrationCount: 4
             shardName: ", integration 1/4"
           - os: ubuntu-latest
             suite: integration
             integrationShard: 1
+            integrationCount: 4
             shardName: ", integration 2/4"
           - os: ubuntu-latest
             suite: integration
             integrationShard: 2
+            integrationCount: 4
             shardName: ", integration 3/4"
           - os: ubuntu-latest
             suite: integration
             integrationShard: 3
+            integrationCount: 4
             shardName: ", integration 4/4"
           - os: windows-latest
             suite: integration
             integrationShard: 0
+            integrationCount: 4
             shardName: ", integration 1/4"
           - os: windows-latest
             suite: integration
             integrationShard: 1
+            integrationCount: 4
             shardName: ", integration 2/4"
           - os: windows-latest
             suite: integration
             integrationShard: 2
+            integrationCount: 4
             shardName: ", integration 3/4"
           - os: windows-latest
             suite: integration
             integrationShard: 3
+            integrationCount: 4
             shardName: ", integration 4/4"
           - os: macos-26-intel
             suite: integration
             integrationShard: 0
-            shardName: ", integration 1/4"
+            integrationCount: 8
+            shardName: ", integration 1/8"
           - os: macos-26-intel
             suite: integration
             integrationShard: 1
-            shardName: ", integration 2/4"
+            integrationCount: 8
+            shardName: ", integration 2/8"
           - os: macos-26-intel
             suite: integration
             integrationShard: 2
-            shardName: ", integration 3/4"
+            integrationCount: 8
+            shardName: ", integration 3/8"
           - os: macos-26-intel
             suite: integration
             integrationShard: 3
-            shardName: ", integration 4/4"
+            integrationCount: 8
+            shardName: ", integration 4/8"
+          - os: macos-26-intel
+            suite: integration
+            integrationShard: 4
+            integrationCount: 8
+            shardName: ", integration 5/8"
+          - os: macos-26-intel
+            suite: integration
+            integrationShard: 5
+            integrationCount: 8
+            shardName: ", integration 6/8"
+          - os: macos-26-intel
+            suite: integration
+            integrationShard: 6
+            integrationCount: 8
+            shardName: ", integration 7/8"
+          - os: macos-26-intel
+            suite: integration
+            integrationShard: 7
+            integrationCount: 8
+            shardName: ", integration 8/8"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -125,7 +157,7 @@ jobs:
         if: matrix.suite == 'integration'
         env:
           PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR: ${{ runner.temp }}/recovery-integration
-        run: node scripts/run-ci-tests.mjs integration ${{ matrix.integrationShard }}
+        run: node scripts/run-ci-tests.mjs integration ${{ matrix.integrationShard }}/${{ matrix.integrationCount }}
       - name: Preserve recovery integration evidence
         if: always() && matrix.suite == 'integration'
         uses: actions/upload-artifact@v4

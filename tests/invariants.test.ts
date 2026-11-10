@@ -5,7 +5,8 @@
  */
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -190,17 +191,46 @@ test("CI shards cover every domain file exactly once without widening deadlines"
   assert.deepEqual(Array.from(validateWorkflowSource.matchAll(/- os: macos-26-intel\s+suite: domains\s+shard: (\d+)/g),
     (match) => Number(match[1])), [0, 1]);
   for (const os of ["ubuntu-latest", "windows-latest", "macos-26-intel"]) {
-    const matrix = new RegExp(`- os: ${os}\\s+suite: integration\\s+integrationShard: (\\d+)`, "g");
-    assert.deepEqual(Array.from(validateWorkflowSource.matchAll(matrix), match => Number(match[1])), [0, 1, 2, 3]);
+    const count = os === "macos-26-intel" ? 8 : 4;
+    const matrix = new RegExp(`- os: ${os}\\s+suite: integration\\s+integrationShard: (\\d+)\\s+integrationCount: (\\d+)`, "g");
+    assert.deepEqual(Array.from(validateWorkflowSource.matchAll(matrix), match => [Number(match[1]), Number(match[2])]),
+      Array.from({ length: count }, (_, index) => [index, count]));
+    for (let index = 0; index < count; index++) assert.deepEqual(list(`${index}/${count}`, "integration"), ["tests/integration.test.ts"]);
   }
   assert.match(validateWorkflowSource, /timeout-minutes: 30/);
   assert.match(validateWorkflowSource, /matrix\.os == 'macos-26-intel' && matrix\.suite == 'domains' && matrix\.shard == 0/);
   assert.match(validateWorkflowSource, /run: node scripts\/run-ci-tests\.mjs process 0/);
   assert.match(validateWorkflowSource, /run: node scripts\/run-ci-tests\.mjs domains \$\{\{ matrix\.shard \}\}/);
-  assert.match(validateWorkflowSource, /run: node scripts\/run-ci-tests\.mjs integration \$\{\{ matrix\.integrationShard \}\}/);
+  assert.match(validateWorkflowSource, /run: node scripts\/run-ci-tests\.mjs integration \$\{\{ matrix\.integrationShard \}\}\/\$\{\{ matrix\.integrationCount \}\}/);
   assert.match(readFileSync(runner, "utf8"), /\? 4 : 1/);
-  for (const args of [["domains", "2"], ["unknown", "0"], ["process", "0", "extra"], ["integration", "4"]])
+  for (const args of [["domains", "2"], ["unknown", "0"], ["process", "0", "extra"], ["integration", "4"],
+    ["integration", "8/8"], ["integration", "4/4"], ["integration", "0/6"], ["integration", "00/8"]])
     assert.throws(() => execFileSync(process.execPath, [runner, ...args], { stdio: "pipe" }));
+});
+
+test("CI runner forwards the exact shard to its native child without inherited filters", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-ci-spec-"));
+  try {
+    await mkdir(join(root, "scripts")); await mkdir(join(root, "tests", "fixtures"), { recursive: true });
+    await writeFile(join(root, "scripts", "run-ci-tests.mjs"), readFileSync(join(PROJECT_ROOT, "scripts", "run-ci-tests.mjs")));
+    await writeFile(join(root, "tests", "fixtures", "canonical-tmpdir.ts"), "export {};\n");
+    await writeFile(join(root, "tests", "process-shutdown.test.ts"), "export {};\n");
+    for (const [argument, expected] of [["0", "0/4"], ["0/4", "0/4"], ["7/8", "7/8"]] as const) {
+      await writeFile(join(root, "tests", "integration.test.ts"), [
+        'import assert from "node:assert/strict";',
+        `assert.equal(process.env.PI_TELEGRAM_INTEGRATION_SHARD, ${JSON.stringify(expected)});`,
+        'assert.equal(process.env.PI_TELEGRAM_INTEGRATION_LIST, undefined);',
+        'console.log("native-shard-accepted");',
+      ].join("\n"));
+      const env: NodeJS.ProcessEnv = { ...process.env, PI_TELEGRAM_INTEGRATION_SHARD: "foreign", PI_TELEGRAM_INTEGRATION_LIST: "1" };
+      delete env.NODE_TEST_CONTEXT;
+      const result = spawnSync(process.execPath, [join(root, "scripts", "run-ci-tests.mjs"), "integration", argument],
+        { cwd: root, env, encoding: "utf8", timeout: 10000 });
+      assert.ifError(result.error); assert.equal(result.signal, null);
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.match(result.stdout, /native-shard-accepted/u); assert.match(result.stdout, /# pass 1\b/u);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("Integration CI name shards are exhaustive, disjoint and use actual registrations", t => {
@@ -215,20 +245,30 @@ test("Integration CI name shards are exhaustive, disjoint and use actual registr
     assert.equal(lines.length, 1); return JSON.parse(lines[0]!.slice("integration-inventory:".length)) as string[];
   };
   const all = list(); assert.ok(all.length > 0);
-  const shards = [0, 1, 2, 3].map(index => {
-    const spec = `${index}/4`, selected = list(spec), selector = createIntegrationShardSelector(spec);
-    assert.ok(selected.length > 0); assert.deepEqual(selected, all.filter(selector)); return selected;
-  });
-  assert.deepEqual(shards.flat().sort(), [...all].sort(), "Every registration must execute exactly once, including duplicate names");
-  for (const name of new Set(all)) assert.equal(shards.filter(shard => shard.includes(name)).length, 1, name);
-  for (const value of ["", "4/4", "-1/4", "01/4", "0/0", "0/5", "0/4x", " 0/4"]) {
+  const partitions = new Map<number, string[][]>();
+  for (const count of [4, 8]) {
+    const shards = Array.from({ length: count }, (_, index) => {
+      const spec = `${index}/${count}`, selected = list(spec), selector = createIntegrationShardSelector(spec);
+      assert.ok(selected.length > 0); assert.deepEqual(selected, all.filter(selector)); return selected;
+    });
+    assert.deepEqual(shards.flat().sort(), [...all].sort(), "Every registration must execute exactly once, including duplicate names");
+    for (const name of new Set(all)) assert.equal(shards.filter(shard => shard.includes(name)).length, 1, name);
+    partitions.set(count, shards);
+    t.diagnostic(`Integration registrations: ${all.length}; ${count}-way shard sizes: ${shards.map(shard => shard.length).join(", ")}`);
+  }
+  for (let index = 0; index < 4; index++) {
+    const original = all.filter(name => createHash("sha256").update(name).digest().readUInt32BE(0) % 4 === index);
+    assert.deepEqual(partitions.get(4)![index], original, "Linux/Windows retain the original four-way mapping");
+    assert.deepEqual([...partitions.get(8)![index]!, ...partitions.get(8)![index + 4]!].sort(), [...original].sort(),
+      "Each macOS pair refines one original bucket without omissions or duplicates");
+  }
+  for (const value of ["", "4/4", "8/8", "-1/4", "01/4", "00/8", "0/0", "0/5", "0/6", "0/16", "0/4x", " 0/4"]) {
     assert.throws(() => createIntegrationShardSelector(value), /Integration shard/);
   }
   assert.ok(all.every(createIntegrationShardSelector()));
   const source = readFileSync(join(PROJECT_ROOT, "tests/integration.test.ts"), "utf8");
   assert.equal([...source.matchAll(/\bnativeTest\(/gu)].length, 1, "Every registration must pass the selector");
   assert.match(source, /if \(!selectIntegrationTest\(name\)\) return/);
-  t.diagnostic(`Integration registrations: ${all.length}; shard sizes: ${shards.map(shard => shard.length).join(", ")}`);
 });
 
 test("Release CI validates exact tags and publishes through npm Trusted Publisher", () => {

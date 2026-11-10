@@ -5,9 +5,10 @@ import { createHash } from "node:crypto";
 /** CI-only partition of complete integration test names; absent configuration preserves local execution. */
 export function createIntegrationShardSelector(specification?: string): (name: string) => boolean {
   if (specification === undefined) return () => true;
-  if (!/^[0-3]\/4$/u.test(specification)) throw new Error("Integration shard must be 0/4, 1/4, 2/4 or 3/4");
-  const index = Number(specification[0]);
-  return name => createHash("sha256").update(name).digest().readUInt32BE(0) % 4 === index;
+  const match = /^([0-7])\/([48])$/u.exec(specification);
+  if (!match || Number(match[1]) >= Number(match[2])) throw new Error("Integration shard must be a valid index/4 or index/8");
+  const index = Number(match[1]), count = Number(match[2]);
+  return name => createHash("sha256").update(name).digest().readUInt32BE(0) % count === index;
 }
 
 /** Installs a fetch double and returns its restorer. */

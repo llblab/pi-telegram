@@ -9,11 +9,13 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const [phase, shard, mode, ...extra] = process.argv.slice(2);
+const integrationShard = /^[0-3]$/u.test(shard ?? "") ? `${shard}/4` : shard;
+const integrationMatch = /^([0-7])\/([48])$/u.exec(integrationShard ?? "");
 if (!(["domains"].includes(phase) && ["all", "0", "1"].includes(shard) ||
       phase === "process" && ["0", "1"].includes(shard) ||
-      phase === "integration" && ["0", "1", "2", "3"].includes(shard)) ||
+      phase === "integration" && integrationMatch && Number(integrationMatch[1]) < Number(integrationMatch[2])) ||
     (mode !== undefined && mode !== "--list") || extra.length) {
-  throw new Error("Usage: run-ci-tests.mjs <domains all|0|1 | process 0|1 | integration 0|1|2|3> [--list]");
+  throw new Error("Usage: run-ci-tests.mjs <domains all|0|1 | process 0|1 | integration 0|1|2|3|index/4|index/8> [--list]");
 }
 const root = fileURLToPath(new URL("..", import.meta.url));
 const entries = readdirSync(join(root, "tests"), { withFileTypes: true }).filter(entry => entry.name.endsWith(".test.ts"));
@@ -31,7 +33,7 @@ else if (files.length) {
   const env = { ...process.env, PATH: [join(root, "node_modules", ".bin"), process.env.PATH].filter(Boolean).join(delimiter) };
   // A domain child must not inherit an integration-only filter from its caller.
   delete env.PI_TELEGRAM_INTEGRATION_SHARD; delete env.PI_TELEGRAM_INTEGRATION_LIST;
-  if (phase === "integration") env.PI_TELEGRAM_INTEGRATION_SHARD = `${shard}/4`;
+  if (phase === "integration") env.PI_TELEGRAM_INTEGRATION_SHARD = integrationShard;
   console.log(`CI ${phase} ${shard}: ${files.length} test file(s)`);
   const result = spawnSync(process.execPath, [
     "--experimental-strip-types", "--import", "./tests/fixtures/canonical-tmpdir.ts",
