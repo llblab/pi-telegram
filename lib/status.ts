@@ -572,6 +572,12 @@ function getTelegramRecoveryErrorDetails(error: unknown): Record<string, Telegra
       details.guardReason = error.reason;
     if ("phase" in error && (error.phase === "acquire" || error.phase === "release")) details.guardPhase = error.phase;
   }
+  if (error instanceof Error && error.name === "TelegramRuntimeStateError" && "code" in error && error.code === "invalid" &&
+    "readCondition" in error && typeof error.readCondition === "string" &&
+    ["device-mismatch", "inode-mismatch", "opened-links", "opened-type", "opened-mode"].includes(error.readCondition)) {
+    details.errorCode = "invalid";
+    details.stateReadCondition = error.readCondition;
+  }
   if ("kind" in error && error.kind === "commit-unknown") details.outcome = "commit-unknown";
   if (error instanceof Error && (error.name === "TelegramApiAuthorityError" || error.name === "TelegramBusLocalAuthorityError") &&
     "requestIssued" in error && typeof error.requestIssued === "boolean") details.requestIssued = error.requestIssued;

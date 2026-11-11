@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import * as Queue from "../lib/queue.ts";
-import { createTelegramLockRuntime, mutateTelegramRuntimeStateSection, readTelegramRuntimeState } from "../lib/locks.ts";
+import { createTelegramLockRuntime, mutateTelegramRuntimeStateSection, readTelegramRuntimeState, TelegramRuntimeStateError } from "../lib/locks.ts";
 
 import {
   buildTelegramBridgeStatusLines,
@@ -316,6 +316,35 @@ test("Connection Restore causes survive incidental context while explicit transp
     [{ code: "ECONNREFUSED" }, "Telegram network unavailable. Retry /telegram-connect."],
     [{ code: "incompatible-protocol" }, "Telegram instances are incompatible. Update them together."],
   ] as const) assert.equal(formatTelegramConnectionFailure(Object.assign(new Error(detail), metadata)), notice);
+});
+
+for (const readCondition of ["device-mismatch", "inode-mismatch", "opened-links", "opened-type", "opened-mode"] as const)
+test(`Runtime read condition is finite producer evidence, not recovery authority (${readCondition})`, () => {
+  const cause = new Error("private-source-body-123:secret");
+  const original = new TelegramRuntimeStateError("invalid", "Telegram runtime state identity changed before reading.", { readCondition, cause });
+  const recorder = createTelegramRuntimeEventRecorder({ getBotToken: () => "123:secret" });
+  recorder.record("bus", original, { phase: "follower-readiness-refresh-refused", errorCode: "forged", stateReadCondition: "forged" });
+  assert.deepEqual(recorder.getEvents()[0]!.details, { phase: "follower-readiness-refresh-refused", errorCode: "invalid", stateReadCondition: readCondition });
+  assert.equal(original.cause, cause);
+  assert.equal(original.code, "invalid");
+  assert.equal(original.name, "TelegramRuntimeStateError");
+  assert.equal(original.message, "Telegram runtime state identity changed before reading.");
+  assert.equal(formatTelegramConnectionFailure(original), "Telegram connection failed. Check /telegram-status --debug.");
+  assert.equal(JSON.stringify(recorder.getEvents()).includes("private-source-body"), false, "No causes, physical identities or source bodies enter the finite projection");
+});
+
+test("Unknown runtime read fields do not become classified producer evidence", () => {
+  const recorder = createTelegramRuntimeEventRecorder({ getBotToken: () => undefined });
+  for (const error of [
+    new TelegramRuntimeStateError("invalid", "opaque"),
+    new TelegramRuntimeStateError("authority-changed", "opaque", { readCondition: "inode-mismatch" }),
+    Object.assign(new Error("opaque"), { name: "TelegramRuntimeStateError", code: "invalid", readCondition: "123:secret", dev: 1, ino: 2 }),
+    Object.assign(new Error("opaque"), { name: "OtherError", code: "invalid", readCondition: "inode-mismatch" }),
+    { name: "TelegramRuntimeStateError", code: "invalid", readCondition: "inode-mismatch" },
+  ]) {
+    recorder.record("bus", error);
+    assert.equal(recorder.getEvents().at(-1)!.details, undefined);
+  }
 });
 
 test("Recovery event evidence stays finite and cannot be downgraded by caller details", () => {

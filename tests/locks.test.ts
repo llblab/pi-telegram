@@ -171,6 +171,85 @@ function createTempLockPath(): { dir: string; path: string } {
   return { dir, path: join(dir, "owners.json") };
 }
 
+for (const artifact of ["source", "compiled"] as const)
+test(`Runtime opened-file refusal retains its first finite condition (${artifact})`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-state-read-condition-")), path = join(dir, "state.json");
+  const moduleUrl = new URL(artifact === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+  try {
+    const result = await runNodeEval(`
+      import assert from "node:assert/strict";
+      import * as fs from "node:fs";
+      import { mock } from "node:test";
+      const path = ${JSON.stringify(path)};
+      let fault, lastFd, publishing = false, contentReads = 0;
+      const { default: defaultFs, ...namedFs } = fs;
+      mock.module("node:fs", { defaultExport: defaultFs, namedExports: { ...namedFs,
+        lstatSync(...args) {
+          const actual = fs.lstatSync(...args);
+          if (args[0] === path && fault === "native-rename") {
+            fault = undefined; publishing = true;
+            try { Kernel.mutateTelegramRuntimeStateSection(path, "default", "runtime", () => ({ value: { boundary: "native-rename" }, result: true }), { isCurrent: () => true }); }
+            finally { publishing = false; }
+          }
+          return actual;
+        },
+        fstatSync(...args) {
+          lastFd = args[0];
+          const actual = fs.fstatSync(...args), selected = fault;
+          if (!selected) return actual;
+          fault = undefined;
+          return new Proxy(actual, { get(target, key) {
+            if (selected === "first" && key !== "dev") throw new Error("Later checks ran after the first refusal");
+            if ((selected === "device" || selected === "first") && key === "dev") return target.dev === 0 ? 1 : 0;
+            if (selected === "inode" && key === "ino") return target.ino === 0 ? 1 : 0;
+            if (selected === "links" && key === "nlink") return 0;
+            if (selected === "type" && key === "isFile") return () => false;
+            if (selected === "mode" && key === "mode") return target.mode | 0o040;
+            return Reflect.get(target, key);
+          } });
+        },
+        readFileSync(...args) {
+          if (!publishing && typeof args[0] === "number") contentReads++;
+          return fs.readFileSync(...args);
+        },
+      } });
+      const Kernel = await import(${JSON.stringify(moduleUrl)});
+      Kernel.mutateTelegramRuntimeStateSection(path, "default", "workspace", () => ({ value: { retained: true }, result: true }), { isCurrent: () => true });
+      const cases = [
+        ["device", "device-mismatch"], ["inode", "inode-mismatch"],
+        ["links", "opened-links"], ["type", "opened-type"],
+        ["mode", process.platform === "win32" ? undefined : "opened-mode"],
+        ["first", "device-mismatch"], ["native-rename", "inode-mismatch"],
+      ];
+      for (const [selected, expected] of cases) {
+        fault = selected; contentReads = 0; lastFd = undefined;
+        let original;
+        try { Kernel.readTelegramRuntimeState(path); } catch (error) { original = error; }
+        if (expected === undefined) assert.equal(original, undefined, "Windows retains its existing private-mode policy");
+        else {
+          assert.ok(original instanceof Kernel.TelegramRuntimeStateError);
+          assert.equal(original.name, "TelegramRuntimeStateError");
+          assert.equal(original.code, "invalid");
+          assert.equal(original.message, "Telegram runtime state identity changed before reading.");
+          assert.equal(original.readCondition, expected);
+          assert.equal(original.cause, undefined);
+        }
+        assert.equal(contentReads, expected === undefined ? 1 : 0, "The original reader never parses a rejected descriptor; publisher reads are separate");
+        assert.throws(() => fs.fstatSync(lastFd), { code: "EBADF" }, "The original descriptor closes on success or refusal");
+      }
+      const current = Kernel.readTelegramRuntimeState(path);
+      assert.deepEqual(current.profiles.default.workspace, { retained: true });
+      assert.deepEqual(current.profiles.default.runtime, { boundary: "native-rename" }, "The actual guarded atomic publication remains committed");
+      fs.writeFileSync(path, "{", { mode: 0o600 });
+      assert.throws(() => Kernel.readTelegramRuntimeState(path), error => error instanceof Kernel.TelegramRuntimeStateError && error.readCondition === undefined);
+      console.log(JSON.stringify({ descriptorPartitions: 6, nativeRename: true, malformedStillRefused: true }));
+    `, { nodeArgs: ["--experimental-test-module-mocks"] });
+    assert.equal(result.code, 0, result.stderr + result.stdout);
+    assert.equal(result.signal, null);
+    assert.deepEqual(JSON.parse(result.stdout), { descriptorPartitions: 6, nativeRename: true, malformedStillRefused: true });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("Consolidated runtime state publishes only the selected section and profile", () => {
   const temp = createTempLockPath(), path = join(temp.dir, "state.json");
   const publish = (profile: string, section: TelegramRuntimeStateSection, value: unknown) =>

@@ -11876,6 +11876,311 @@ test("OS-root diagnostic snapshot does not invent a first failure after healthy 
 }, 15000);
 
 for (const artifact of ["source", "compiled"] as const)
+test(`Production separate OS Restore follower separates original ACK from menu publication (${artifact})`, async () => {
+  const childRun = async (role: "leader" | "follower", agentDir: string) => {
+    const { readFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const base = artifact === "source" ? "./lib/" : "./dist/lib/";
+    const suffix = artifact === "source" ? ".ts" : ".js";
+    const moduleUrl = (name: string) => new URL(base + name + suffix, import.meta.url).href;
+    const LockModel: typeof Locks = await import(moduleUrl("locks"));
+    const ThreadModel: typeof Threads = await import(moduleUrl("threads"));
+    const JournalModel: typeof Journal = await import(moduleUrl("journal"));
+    const BusModel: typeof Bus = await import(moduleUrl("bus"));
+    const ActivityModel: typeof import("../lib/activity.ts") = await import(moduleUrl("activity"));
+    const PiModel: typeof import("../lib/pi.ts") = await import(moduleUrl("pi"));
+    let lockState: { kind: string; pid?: number } | undefined;
+    mock.module(moduleUrl("locks"), { namedExports: { ...LockModel, createTelegramLockRuntime(options: Parameters<typeof LockModel.createTelegramLockRuntime>[0]) {
+      const actual = LockModel.createTelegramLockRuntime(options), getState = actual.getState;
+      actual.getState = () => { const state = getState(); lockState = { kind: state.kind, ...("lock" in state ? { pid: state.lock.pid } : {}) }; return state; };
+      return actual;
+    } } });
+    let originalView: Threads.TelegramWorkspaceRestore | undefined;
+    mock.module(moduleUrl("threads"), { namedExports: { ...ThreadModel, createTelegramWorkspaceRestoreResolver(options: Parameters<typeof ThreadModel.createTelegramWorkspaceRestoreResolver>[0]) {
+      const resolve = ThreadModel.createTelegramWorkspaceRestoreResolver(options);
+      return () => { const view = resolve(); if (view) { if (originalView) assert.equal(view, originalView); originalView = view; } return view; };
+    } } });
+    let publication: ReturnType<typeof ActivityModel.createTelegramActivityPublicationRuntime> | undefined;
+    mock.module(moduleUrl("activity"), { namedExports: { ...ActivityModel, createTelegramActivityPublicationRuntime(options: Parameters<typeof ActivityModel.createTelegramActivityPublicationRuntime>[0]) {
+      publication = ActivityModel.createTelegramActivityPublicationRuntime(options); return publication;
+    } } });
+    let registry: ReturnType<typeof BusModel.createTelegramBusFollowerRegistry> | undefined;
+    const registrationPids: number[] = [], menuRequests: Array<{ instanceId: string; operationId: string }> = [];
+    const menuTrace: Array<Record<string, unknown>> = [], traceStartedAt = performance.now();
+    const traceMenu = (phase: string, requestId: string, details: Record<string, unknown> = {}) => {
+      // Evidence is capped without turning diagnostics into a transport veto.
+      if (menuTrace.length < 16) menuTrace.push({ phase, requestId, elapsedMs: Math.round(performance.now() - traceStartedAt), ...details });
+    };
+    const traceReply = (phase: string, requestId: string, reply: Bus.TelegramBusEnvelope | undefined) =>
+      traceMenu(phase, requestId, { kind: reply?.kind, ...(reply?.kind === "bus.ack" ? { replyRequestId: reply.requestId, ok: reply.ok, message: reply.message, errorCode: reply.error?.code } : {}) });
+    const traceError = (phase: string, requestId: string, error: unknown) => {
+      const causes: Array<{ name: string; message: string }> = [];
+      for (let depth = 0; depth < 4 && error instanceof Error; depth++) {
+        causes.push({ name: error.name, message: error.message.slice(0, 192) }); error = error.cause;
+      }
+      traceMenu(phase, requestId, { causes });
+    };
+    mock.module(moduleUrl("bus"), { namedExports: { ...BusModel,
+      sendTelegramBusLocalEnvelope(options: Parameters<typeof BusModel.sendTelegramBusLocalEnvelope>[0]) {
+        if (options.envelope.kind !== "follower.deliverSelectedMenu") return BusModel.sendTelegramBusLocalEnvelope(options);
+        const requestId = options.envelope.requestId;
+        traceMenu("client-call", requestId, { timeoutMs: options.timeoutMs });
+        return BusModel.sendTelegramBusLocalEnvelope(options).then(reply => {
+          traceReply("client-reply", requestId, reply); return reply;
+        }, error => { traceError("client-error", requestId, error); throw error; });
+      },
+      createTelegramBusFollowerRegistry() { registry = BusModel.createTelegramBusFollowerRegistry(); return registry; },
+      createTelegramBusLocalServer(options: Parameters<typeof BusModel.createTelegramBusLocalServer>[0]) {
+        return BusModel.createTelegramBusLocalServer({ ...options, handleEnvelope(request) {
+          if (role === "leader" && request.kind === "follower.register") registrationPids.push(request.registration.pid!);
+          if (role !== "leader" || request.kind !== "follower.deliverSelectedMenu") return options.handleEnvelope(request);
+          menuRequests.push({ instanceId: request.instanceId, operationId: request.operationId });
+          traceMenu("server-call", request.requestId);
+          try {
+            return Promise.resolve(options.handleEnvelope(request)).then(reply => {
+              traceReply("server-reply", request.requestId, reply); return reply;
+            }, error => { traceError("server-error", request.requestId, error); throw error; });
+          } catch (error) { traceError("server-error", request.requestId, error); throw error; }
+        } });
+      },
+    } });
+    let settingsCalls = 0;
+    mock.module(moduleUrl("pi"), { namedExports: { ...PiModel, async createSettingsManager(cwd: string) {
+      assert.equal(role, "follower"); assert.equal(cwd, "/native-restore-follower"); settingsCalls++;
+      return PiModel.normalizeSettingsManager({ flush() {}, getEnabledModels: () => undefined, setEnabledModels() { assert.fail("The native menu witness does not persist model settings"); } });
+    } } });
+    let binding: Journal.TelegramUpdateJournalRuntimeBinding | undefined;
+    let sourceBinding: string | undefined, sourceDigest: Journal.TelegramUpdateJournalEntryDigest | undefined, sourceRemovals = 0;
+    let durableCompletion: Journal.TelegramUpdateJournalSourceCompletion | undefined;
+    const seen = new WeakSet<object>();
+    mock.module(moduleUrl("journal"), { namedExports: { ...JournalModel, createTelegramUpdateJournalBindingRuntime(options: Parameters<typeof JournalModel.createTelegramUpdateJournalBindingRuntime>[0]) {
+      const runtime = JournalModel.createTelegramUpdateJournalBindingRuntime(options);
+      for (const method of ["resolveLeader", "resolveFollower"] as const) {
+        const resolve = runtime[method];
+        runtime[method] = () => {
+          const actual = resolve(); if (!actual) return actual;
+          if ((role === "leader" && method === "resolveLeader") || (role === "follower" && method === "resolveFollower")) binding = actual;
+          if (!seen.has(actual.journal)) {
+            seen.add(actual.journal);
+            const journal = actual.journal, remove = journal.removeCompletedExact;
+            journal.removeCompletedExact = (...args: Parameters<typeof remove>) => {
+              const original = args[0].includes(100) ? journal.read().entries.find(row => row.updateId === 100) : undefined;
+              const result = remove(...args);
+              if (original && result.removedUpdateIds.includes(100)) {
+                sourceBinding = actual.recoveryKey; sourceDigest = JournalModel.createTelegramUpdateJournalEntryDigest(original); sourceRemovals++;
+                durableCompletion = result.sourceCompletions?.find(row => row.updateId === 100);
+              }
+              return result;
+            };
+          }
+          return actual;
+        };
+      }
+      return runtime;
+    } } });
+    const BindingsModel: typeof Bindings = await import(moduleUrl("bindings"));
+    let originalPlan: import("../lib/commands.ts").TelegramPreparedHeldCommand | undefined;
+    mock.module(moduleUrl("bindings"), { namedExports: { ...BindingsModel,
+      createTelegramFollowerSelectedCommandBinding(options: Parameters<typeof BindingsModel.createTelegramFollowerSelectedCommandBinding>[0]) {
+        const owner = BindingsModel.createTelegramFollowerSelectedCommandBinding(options); if (!owner) return owner;
+        const prepare = owner.prepare;
+        owner.prepare = (...args: Parameters<typeof prepare>) => {
+          const plan = prepare(...args); if (plan) { assert.equal(originalPlan, undefined); originalPlan = plan; } return plan;
+        };
+        return owner;
+      },
+    } });
+    const extension = (await import(artifact === "source" ? "./index.ts" : "./dist/index.js")).default;
+    const dispatches: unknown[] = [], notices: string[] = [];
+    const harness = createRuntimePiHarness({ sendUserMessage(message) { dispatches.push(message); } });
+    const ctx = createRuntimeExtensionContext({ cwd: `/native-restore-${role}`,
+      sessionManager: { getSessionId: () => `native-restore-${role}`, getEntries: () => [] },
+      modelRegistry: { refresh() {}, getAvailable: () => [], isUsingOAuth: () => false }, getContextUsage: () => undefined });
+    Object.assign(ctx.ui, { notify(message: string) { notices.push(message); } });
+    const payloads: Array<{ method: string; payload: Record<string, unknown>; messageId: number }> = [];
+    const messageThreads = new Map<number, number>(), incoming: unknown[] = [], deletions: unknown[] = [];
+    let polls = 0, creations = 0, menus = 0, menuReturned = 0, nextMessage = 500, stopped = false;
+    let deliver: (() => void) | undefined, releaseMenu!: () => void;
+    const menuHold = new Promise<void>(resolve => { releaseMenu = resolve; });
+    const submit = (update: unknown) => { incoming.push(update); deliver?.(); };
+    const restoreFetch = setTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input), payload = parseJsonRequestBody(init) ?? {};
+      if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
+      assert.equal(role, "leader", `Follower cannot use direct Telegram transport for ${method}`);
+      if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: 100 + ++creations, name: "Fixture" });
+      if (method === "getUpdates") {
+        if (++polls === 1) return createRuntimeTelegramApiResponse([]);
+        return await new Promise<Response>((resolve, reject) => {
+          const abort = () => { deliver = undefined; reject(new DOMException("fixture stop", "AbortError")); };
+          deliver = () => { if (!incoming.length) return; const batch = incoming.splice(0); deliver = undefined; init?.signal?.removeEventListener("abort", abort); resolve(createRuntimeTelegramApiResponse(batch)); };
+          if (init?.signal?.aborted) abort(); else { init?.signal?.addEventListener("abort", abort, { once: true }); deliver(); }
+        });
+      }
+      if (["sendMessage", "sendRichMessage", "editMessageText", "editMessageReplyMarkup", "forwardMessage", "copyMessage"].includes(method ?? "")) {
+        const messageId = method!.startsWith("edit") && typeof payload.message_id === "number" ? payload.message_id : ++nextMessage;
+        if (typeof payload.message_thread_id === "number") messageThreads.set(messageId, payload.message_thread_id);
+        payloads.push({ method: method!, payload, messageId });
+        if (JSON.stringify(payload).includes("menu:model")) {
+          assert.equal(payload.message_thread_id, 103); assert.deepEqual(deletions, [102]);
+          assert.equal(menuRequests.length, 1, "The held HTTP comes from the actual selected-menu follower RPC");
+          menus++; await menuHold; menuReturned++;
+        }
+        return createRuntimeTelegramApiResponse({ message_id: messageId, chat: { id: 77, type: "private" }, message_thread_id: messageThreads.get(messageId) });
+      }
+      if (method === "deleteForumTopic") { deletions.push(payload.message_thread_id); return createRuntimeTelegramApiResponse(true); }
+      if (["deleteWebhook", "setMyCommands", "sendChatAction", "deleteMessage", "editForumTopic", "answerCallbackQuery"].includes(method ?? "")) return createRuntimeTelegramApiResponse(true);
+      throw new Error(`Unexpected native Restore method ${method}`);
+    });
+    const button = (prefix: string, selectedThread?: number) => {
+      for (const row of [...payloads].reverse()) {
+        const markup = row.payload.reply_markup as { inline_keyboard?: Array<Array<{ callback_data?: string }>> } | undefined;
+        const cell = markup?.inline_keyboard?.flat().find(value => value.callback_data?.startsWith(prefix) && (selectedThread === undefined || value.callback_data.endsWith(`:${selectedThread}`)));
+        if (cell?.callback_data) return { data: cell.callback_data, messageId: row.messageId, threadId: messageThreads.get(row.messageId) };
+      }
+      return undefined;
+    };
+    const stats = () => {
+      const acknowledgement = originalPlan?.inspectCompletion();
+      if (acknowledgement) {
+        assert.deepEqual(acknowledgement, originalPlan!.source);
+        assert.deepEqual(acknowledgement, { ...sourceDigest, journalBindingKey: sourceBinding });
+      }
+      return { pid: process.pid, lockState, polls, creations, menus, menuReturned, sourceRemovals, sourceBinding, sourceDigest,
+        durableCompletion, sourceAck: acknowledgement, preparedSource: originalPlan?.source, journalBindingKey: binding?.recoveryKey,
+        originalPending: binding?.journal.read().entries.some(row => row.updateId === 100),
+        publicationPending: publication?.hasPending(), publicationUnconfirmed: publication?.hasUnconfirmed(),
+        viewRows: originalView && LockModel.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction"), () => originalView!.listLiveRebindings()),
+        registrationPids, menuRequests, menuTrace, deletions, dispatches: dispatches.length, settingsCalls,
+        registered: registry?.list().map(value => ({ instanceId: value.instanceId, sessionId: value.sessionId, pid: value.pid, target: value.target, capabilities: value.protocol?.capabilities })),
+        restoreButton: !!button("rerouterestore:"), followerButton: !!button("reroutenew:", 102), notices };
+    };
+    const perform = async (command: string) => {
+      if (command === "connect") await harness.commands.get("telegram-connect")!.handler("", ctx);
+      else if (command === "admit") submit({ update_id: 100, message: { message_id: 100, date: Math.floor(Date.now() / 1000), chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false }, text: "/start" } });
+      else if (command === "restore" || command === "choose-follower") {
+        assert.equal(role, "leader");
+        const row = button(command === "restore" ? "rerouterestore:" : "reroutenew:", command === "restore" ? undefined : 102); assert.ok(row);
+        submit({ update_id: command === "restore" ? 101 : 102, callback_query: { id: command, from: { id: 77, is_bot: false }, data: row.data,
+          message: { message_id: row.messageId, date: 1, chat: { id: 77, type: "private" }, message_thread_id: row.threadId } } });
+      } else if (command === "release") releaseMenu();
+      else if (command === "diagnostics") return { ...stats(), logs: await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8").catch(() => "missing") };
+      else if (command === "stop") {
+        releaseMenu(); await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx); stopped = true;
+        assert.equal(originalPlan?.inspectCompletion(), undefined, "The native plan ACK ends with its actual follower lifetime");
+        restoreFetch(); mock.restoreAll(); return { pid: process.pid, stopped };
+      } else if (command !== "stats") throw new Error("Unknown native Restore fixture command");
+      return stats();
+    };
+    extension(harness.pi); await harness.handlers.get("session_start")?.({}, ctx);
+    process.on("message", raw => {
+      const { id, command } = raw as { id: number; command: string };
+      void perform(command).then(result => process.send?.({ id, result }, () => { if (command === "stop") process.disconnect?.(); }), async error => {
+        const logs = await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8").catch(() => "missing");
+        process.send?.({ id, error: `${command}: ${error instanceof Error ? error.stack : error}\n${logs}` }, () => {
+          if (command === "stop") { restoreFetch(); mock.restoreAll(); process.disconnect?.(); }
+        });
+      });
+    });
+    process.send?.({ id: 0, result: { pid: process.pid } });
+  };
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-native-restore-origin-")));
+  await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ botToken: "123:native-restore-origin", botId: 123, allowedUserId: 77,
+    threads: { automaticCleanup: false } }), { mode: 0o600 });
+  type Stats = { pid: number; lockState?: { kind: string; pid?: number }; polls?: number; creations?: number; menus?: number; menuReturned?: number;
+    sourceRemovals?: number; sourceBinding?: string; sourceDigest?: Journal.TelegramUpdateJournalEntryDigest; durableCompletion?: unknown;
+    sourceAck?: Updates.TelegramDeferredSourceEvidence; preparedSource?: Updates.TelegramDeferredSourceEvidence; journalBindingKey?: string; originalPending?: boolean; publicationPending?: boolean; publicationUnconfirmed?: boolean;
+    viewRows?: Threads.TelegramWorkspaceLiveRebindIntent[]; registrationPids?: number[]; menuRequests?: Array<{ instanceId: string; operationId: string }>;
+    menuTrace?: Array<{ phase: string; requestId: string; replyRequestId?: string; elapsedMs: number; ok?: boolean; errorCode?: string }>;
+    deletions?: unknown[]; dispatches?: number; settingsCalls?: number; registered?: Array<{ instanceId: string; sessionId: string; pid?: number; target: { chatId: number; threadId?: number }; capabilities?: readonly string[] }>;
+    restoreButton?: boolean; followerButton?: boolean; notices?: string[]; stopped?: boolean };
+  const launch = (role: "leader" | "follower") => launchProductionRootFixture<Stats>(`native-restore-${role}`, `
+    import assert from "node:assert/strict";
+    import { mock } from "node:test";
+    import * as Paths from "./lib/paths.ts";
+    const artifact = ${JSON.stringify(artifact)}, agentDir = ${JSON.stringify(agentDir)};
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const parseJsonRequestBody = ${parseJsonRequestBody.toString()};
+    const getRuntimeTelegramApiMethod = ${getRuntimeTelegramApiMethod.toString()};
+    const createRuntimeTelegramApiResponse = ${createRuntimeTelegramApiResponse.toString()};
+    const setTestFetch = ${setTestFetch.toString()};
+    await (${childRun.toString()})(${JSON.stringify(role)}, agentDir);
+  `);
+  const roots: Array<ReturnType<typeof launch>> = [];
+  let complete = false, leaderObserved: Stats | undefined, followerObserved: Stats | undefined;
+  try {
+    const leader = launch("leader"), follower = launch("follower"); roots.push(leader, follower);
+    assert.equal((await leader.ready).pid, leader.pid); assert.equal((await follower.ready).pid, follower.pid);
+    assert.notEqual(leader.pid, follower.pid);
+    await leader.request("connect"); await follower.request("connect");
+    const registered = (await leader.request("stats")).registered!;
+    assert.equal(registered.length, 1); assert.equal(registered[0]!.pid, follower.pid); assert.equal(registered[0]!.sessionId, "native-restore-follower");
+    for (const capability of [...Bus.TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES, Bus.TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES]) assert.ok(registered[0]!.capabilities?.includes(capability));
+    await leader.request("admit");
+    await waitForAsyncCondition(async () => (await leader.request("stats")).restoreButton === true, 5000);
+    await leader.request("restore");
+    await waitForAsyncCondition(async () => (await leader.request("stats")).followerButton === true, 5000);
+    await leader.request("choose-follower");
+    await waitForAsyncCondition(async () => {
+      leaderObserved = await leader.request("stats"); followerObserved = await follower.request("stats");
+      return leaderObserved.menus === 1 && leaderObserved.sourceRemovals === 1 && !!followerObserved.sourceAck && followerObserved.publicationPending === true;
+    }, 5000);
+    const before = leaderObserved!, recipient = followerObserved!;
+    assert.deepEqual(recipient.lockState, { kind: "active-elsewhere", pid: leader.pid });
+    assert.deepEqual(before.registrationPids, [follower.pid]); assert.equal(recipient.polls, 0);
+    assert.equal(before.creations, 3); assert.equal(before.menuReturned, 0); assert.equal(before.sourceRemovals, 1); assert.equal(before.originalPending, false);
+    assert.equal(before.durableCompletion, undefined); assert.ok(before.sourceBinding && recipient.journalBindingKey);
+    assert.notEqual(before.sourceBinding, recipient.journalBindingKey);
+    assert.deepEqual(before.viewRows?.[0]?.request.source, { journalBindingKey: before.sourceBinding, updateIds: [100] });
+    assert.equal(recipient.sourceRemovals, 1); assert.equal(recipient.originalPending, false); assert.equal(recipient.durableCompletion, undefined);
+    assert.deepEqual(recipient.sourceAck, recipient.preparedSource);
+    assert.deepEqual(recipient.sourceAck, { ...recipient.sourceDigest, journalBindingKey: recipient.journalBindingKey });
+    assert.notEqual(recipient.sourceDigest?.sourceSha256, before.sourceDigest?.sourceSha256, "The projected recipient source is not the donor original");
+    assert.equal(before.viewRows?.length, 1); assert.equal(before.viewRows![0]!.phase, "finished");
+    assert.equal(recipient.viewRows?.length, 1);
+    assert.deepEqual(recipient.viewRows![0]!.request, before.viewRows![0]!.request, "Both original Restore views retain the exact operation, source, binding and target");
+    assert.deepEqual(recipient.viewRows![0]!.recipient, before.viewRows![0]!.recipient, "Both original Restore views retain the exact recipient generation");
+    assert.deepEqual(before.viewRows![0]!.request.target, { chatId: 77, threadId: 103 });
+    assert.equal(before.viewRows![0]!.recipient.kind, "follower");
+    assert.equal(before.viewRows![0]!.recipient.instanceId, registered[0]!.instanceId);
+    assert.equal(before.viewRows![0]!.recipient.sessionId, registered[0]!.sessionId);
+    assert.equal(before.menuRequests?.[0]?.instanceId, registered[0]!.instanceId);
+    assert.equal(before.menuRequests?.[0]?.operationId, before.viewRows![0]!.request.operationId);
+    assert.equal(recipient.settingsCalls, 1); assert.deepEqual(before.deletions, [102]);
+    assert.deepEqual(before.menuTrace?.map(row => row.phase), ["server-call"]);
+    assert.deepEqual(recipient.menuTrace?.map(row => row.phase), ["client-call"]);
+    assert.equal(before.menuTrace![0]!.requestId, recipient.menuTrace![0]!.requestId);
+    assert.equal(before.dispatches, 0); assert.equal(recipient.dispatches, 0);
+    await leader.request("release");
+    await waitForAsyncCondition(async () => (await leader.request("stats")).menuReturned === 1 && (await follower.request("stats")).publicationPending === false, 5000);
+    const after = await leader.request("stats"), afterRecipient = await follower.request("stats");
+    assert.equal(after.sourceRemovals, 1); assert.equal(after.menus, 1); assert.equal(after.menuReturned, 1);
+    assert.deepEqual(afterRecipient.sourceAck, recipient.sourceAck); assert.deepEqual(after.deletions, [102]);
+    assert.equal(afterRecipient.publicationUnconfirmed, false);
+    for (const [observed, phases] of [[after, ["server-call", "server-reply"]], [afterRecipient, ["client-call", "client-reply"]]] as const) {
+      assert.deepEqual(observed.menuTrace?.map(row => row.phase), phases);
+      assert.ok(observed.menuTrace!.every(row => row.requestId === before.menuTrace![0]!.requestId && Number.isSafeInteger(row.elapsedMs) && row.elapsedMs >= 0));
+      assert.equal(observed.menuTrace![1]!.replyRequestId, observed.menuTrace![1]!.requestId);
+      assert.equal(observed.menuTrace![1]!.ok, true); assert.equal(observed.menuTrace![1]!.errorCode, undefined);
+    }
+    assert.equal((await follower.request("stop")).stopped, true); await follower.waitForExit();
+    assert.equal((await leader.request("stop")).stopped, true); await leader.waitForExit();
+    complete = true;
+  } catch (error) {
+    const observations = await Promise.allSettled(roots.map(root => root.request("diagnostics")));
+    console.error("native-restore-fixture:" + JSON.stringify(observations));
+    throw error;
+  } finally {
+    const outcomes = await Promise.allSettled(roots.map(root => root.stop()));
+    await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    if (complete) for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+  }
+}, 40000);
+
+
+for (const artifact of ["source", "compiled"] as const)
 for (const profile of [undefined, "work"] as const)
 test(`Production dead queue-owner cleanup retains native process and receipt proof (${artifact}/${profile ?? "default"})`, async (t) => {
   const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-native-dead-queue-")));

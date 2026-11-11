@@ -197,9 +197,13 @@ interface TelegramRuntimeStateFile {
     version: 2;
     profiles: Record<string, TelegramRuntimeStateProfile>;
 }
+type TelegramRuntimeStateReadCondition = "device-mismatch" | "inode-mismatch" | "opened-links" | "opened-type" | "opened-mode";
 export declare class TelegramRuntimeStateError extends Error {
     readonly code: "invalid" | "authority-changed" | "publication-unknown";
-    constructor(code: TelegramRuntimeStateError["code"], message: string, options?: ErrorOptions);
+    readonly readCondition: TelegramRuntimeStateReadCondition | undefined;
+    constructor(code: TelegramRuntimeStateError["code"], message: string, options?: ErrorOptions & {
+        readCondition?: TelegramRuntimeStateReadCondition;
+    });
 }
 /** Strict, observational envelope read; section owners validate their own payloads. Legacy state is never adopted here. */
 export declare function readTelegramRuntimeState(path: string): TelegramRuntimeStateFile;

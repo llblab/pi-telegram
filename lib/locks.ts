@@ -947,16 +947,24 @@ interface TelegramRuntimeStateFile {
   version: 2;
   profiles: Record<string, TelegramRuntimeStateProfile>;
 }
+type TelegramRuntimeStateReadCondition =
+  | "device-mismatch"
+  | "inode-mismatch"
+  | "opened-links"
+  | "opened-type"
+  | "opened-mode";
 export class TelegramRuntimeStateError extends Error {
   readonly code: "invalid" | "authority-changed" | "publication-unknown";
+  readonly readCondition: TelegramRuntimeStateReadCondition | undefined;
   constructor(
     code: TelegramRuntimeStateError["code"],
     message: string,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { readCondition?: TelegramRuntimeStateReadCondition },
   ) {
     super(message, options);
     this.name = "TelegramRuntimeStateError";
     this.code = code;
+    this.readCondition = options?.readCondition;
   }
 }
 const TELEGRAM_RUNTIME_STATE_SECTIONS: readonly TelegramRuntimeStateSection[] =
@@ -1006,16 +1014,17 @@ function readTelegramRuntimeSource(path: string): string | undefined {
     const fd = openSync(path, "r");
     try {
       const opened = fstatSync(fd);
-      if (
-        opened.dev !== stat.dev ||
-        opened.ino !== stat.ino ||
-        opened.nlink !== 1 ||
-        !opened.isFile() ||
-        (process.platform !== "win32" && (opened.mode & 0o077) !== 0)
-      )
+      const readCondition: TelegramRuntimeStateReadCondition | undefined =
+        opened.dev !== stat.dev ? "device-mismatch" :
+        opened.ino !== stat.ino ? "inode-mismatch" :
+        opened.nlink !== 1 ? "opened-links" :
+        !opened.isFile() ? "opened-type" :
+        process.platform !== "win32" && (opened.mode & 0o077) !== 0 ? "opened-mode" : undefined;
+      if (readCondition)
         throw new TelegramRuntimeStateError(
           "invalid",
           "Telegram runtime state identity changed before reading.",
+          { readCondition },
         );
       source = readFileSync(fd).toString("utf8");
     } finally {

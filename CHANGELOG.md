@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Diagnostics`: Opened runtime-state refusals report a finite first failing file condition without exposing physical identities or source bodies. Error class/code/message, descriptor closure, validation order and existing retry/reset policy remain unchanged; the new evidence is not a historical-cause or recovery-authority claim.
+
 ## 0.59.0-rc.2: Runtime Recovery And Lifetime Fences
 
 - `Admission lifetimes`: Same-process workers retain source-qualified execution exclusion across Root reconstruction until actual handler settlement. Waiter cancellation and DTO mutation cannot release or strand the original claim; profile/bot/journal namespaces remain independent. Root assembly now forwards existing source-reference admission to leader/follower lifecycles, so refused leases block before worker source I/O.
