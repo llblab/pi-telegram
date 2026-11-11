@@ -7395,9 +7395,13 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
     const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
     const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
     const base = ${JSON.stringify(source ? "./lib/" : "./dist/lib/")}, suffix = ${JSON.stringify(source ? ".ts" : ".js")}, foreign = ${foreign}, foreignBootstrap = ${foreignBootstrap}, replaceReceiver = ${replaceReceiver}, noArtifact = ${noArtifact}, carrier = ${JSON.stringify(carrier)}, rich = ${rich};
+    const now = performance.now.bind(performance), started = now(), resources = process.getActiveResourcesInfo.bind(process);
+    const phase = name => console.log("follower-carrier-phase:" + name + ":elapsedMs=" + Math.round(now() - started) + ":pid=" + process.pid);
+    phase("import-start");
     const dir = await realpath(await mkdtemp(join(tmpdir(), "pt-two-root-carrier-")));
     process.env.PI_CODING_AGENT_DIR = dir;
     const keepAlive = setInterval(() => {}, 60000);
+    phase("fixture-ready");
     let physicalId, agentMessageId, agentNativeBody, agentSends = 0, sends = 0, records = 0, refusedSends = 0, messageId = 100, threadId = 42;
     const failures = [], events = [], clients = [], states = [], registries = [], stores = [], lifecycles = [], apis = [];
     const refreshFlow = carrier.startsWith("app-mixed-refresh"), ordinaryRefresh = carrier.startsWith("app-mixed-refresh-ordinary"), refreshUsable = refreshFlow && !carrier.endsWith("sdk-loss") && !carrier.endsWith("app-loss"), refreshQualified = carrier === "app-mixed-refresh" || carrier === "app-mixed-refresh-worker" || carrier === "app-mixed-refresh-pure" || carrier === "app-mixed-refresh-ordinary" || carrier === "app-mixed-refresh-ordinary-pure" || carrier === "app-mixed-refresh-ordinary-worker" || carrier === "app-mixed-refresh-ordinary-later", retainedFlow = carrier.includes("-retained"), queueFlow = carrier.includes("-queued"), deferredFlow = queueFlow && carrier.includes("-editor"), pureChild = carrier.includes("-child-pure"), childFlow = carrier.startsWith("app-mixed-feedback-child-"), feedbackFlow = carrier.startsWith("app-mixed-feedback"), mixedApp = carrier.startsWith("app-mixed"), isMarkup = carrier.startsWith("markup-"), isPlainEdit = carrier.startsWith("edit-") || isMarkup,
@@ -7460,7 +7464,9 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
     }, createTelegramBusFollowerClientRuntime(...args) {
       const actual = followerModule.createTelegramBusFollowerClientRuntime(...args); clients.push(actual); return actual;
     } } });
+    phase("outbound-import-entered");
     const outboundUrl = new URL(base + "outbound" + suffix, import.meta.url), outbound = await import(outboundUrl.href);
+    phase("outbound-import-returned");
     mock.module(outboundUrl.href, { namedExports: { ...outbound, createTelegramButtonActionStore(...args) {
       const record = args[0].recordFailure, event = args[0].recordRuntimeEvent, sdkBirths = [], nativeSdkCapture = args[0].captureQuestionLifetimeOwner;
       const config = { ...args[0], recordFailure(error) { failures.push(String(error?.stack ?? error)); record?.(error); },
@@ -7624,7 +7630,9 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
       }
       return bindings.createTelegramGenerativeAppBoundButtonActionInvoker(options);
     } } });
+    phase("root-import-entered");
     const Delivery = await import(deliveryUrl.href), Api = await import(base + "telegram-api" + suffix), { default: extension } = await import(base + "extension" + suffix);
+    phase("import-complete");
     globalThis.fetch = async (input, init) => {
       const method = String(input).split("/").at(-1), body = init?.body ? JSON.parse(String(init.body)) : {};
       const response = result => new Response(JSON.stringify({ ok: true, result }), { status: 200, headers: { "content-type": "application/json" } });
@@ -7696,10 +7704,15 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
     try {
       await writeFile(join(dir, "telegram.json"), JSON.stringify({ botToken: "123:carrier-root", botId: 123, allowedUserId: 77, lastUpdateId: 0,
         threads: { automaticCleanup: false }, assistant: { activity: "quiet", rendering: rich ? "rich" : "html" } }), { mode: 0o600 });
+      phase("leader-connect-entered");
       extension(leader.pi); leaderStarted = true; await leader.handlers.get("session_start")({}, leaderCtx); await leader.commands.get("telegram-connect").handler("", leaderCtx);
+      phase("leader-connect-returned");
+      phase("follower-connect-entered");
       extension(follower.pi); followerStarted = true; await follower.handlers.get("session_start")({}, followerCtx);
       try { await follower.commands.get("telegram-connect").handler("", followerCtx); } catch (error) { if (!foreignBootstrap) throw error; }
+      phase("follower-connect-settled");
       assert.equal(threadId, 44, "Two actual Roots provision distinct leader/follower bindings through the real authenticated bus");
+      phase("registration-checked");
       if (foreignBootstrap) {
         assert.ok(bootstrapReplies > 0, "The native backend really handled and registered the follower before ACK correlation was lost");
         assert.equal(states[1].isRegistered(), false, "An unrelated bootstrap cannot publish ready authority");
@@ -7707,6 +7720,8 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
         const refused = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "Carrier root SDK",
           confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal });
         assert.equal(refused.ok, false); assert.equal(sends, 0); assert.equal(records, 0);
+        phase("bootstrap-refusal-checked");
+        phase("checks-complete");
         console.log("two-production-roots-native-carrier-checked");
       } else {
         birthAuthority = clients[1].captureApiAuthority(); assert.equal(typeof birthAuthority, "function", "Actual negotiated follower Root captures its native owner before a question"); birthAuthority();
@@ -7724,10 +7739,12 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
         if (foreign || replaceReceiver) assert.equal(opened.reason, "commit-unknown");
         if (replaceReceiver) assert.equal(receiverReplacements, 1, "An obsolete receiver origin cannot replay against its replacement");
         assert.equal(sends, replaceReceiver ? 0 : 1, "No reissue or adoption of a replacement receiver"); assert.equal(records, foreign || replaceReceiver ? 0 : 1);
+        phase("first-sdk-checked");
         if (!foreign && !replaceReceiver) {
           if (isApp) {
             ingress.resolve([{ update_id: 100, message: { message_id: 900, message_thread_id: 44, chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false }, text: "Native remote app input" } }]);
             await dispatched.promise; await follower.handlers.get("agent_start")({}, followerCtx);
+            phase("agent-started");
             const output = (ordinaryRefresh ? 'Remote coordinated question-free dashboard' : '<!-- telegram_confirm "Remote coordinated question app" --><!-- telegram_confirm "Remote coordinated question peer" -->') +
               (mixedApp ? feedbackFlow ? '<!-- telegram_button {Inspect|remote::inspect} -->' : '<!-- telegram_button {➕ Increment|remote::increment} -->' : '');
             const callbackOutput = 'Remote callback child <!-- telegram_confirm "Remote child one" --><!-- telegram_confirm "Remote child two" -->' + (pureChild ? '' : '<!-- telegram_button {Inspect|remote::inspect(2)} -->');
@@ -7762,6 +7779,7 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
             await follower.tools.get("telegram_bind").execute("native-app-change", { app: "remote", method: "increment", display: false }); agentRelease.resolve();
           }
           const published = await agent;
+          phase("first-carrier-returned");
           let row = stores[1].rows.slice(before).find(value => value.action.completionGroup);
           if (!ordinaryRefresh) assert.ok(row?.action.completionGroup?.deadline);
           const appSdkRebind = isApp && !isPlainEdit && carrier.endsWith("sdk-rebind");
@@ -7819,6 +7837,7 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
           if (!ordinaryRefresh) assert.ok(deadline > Date.now() + 23 * 60 * 60 * 1000);
           const successor = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "SDK successor",
             confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal }); assert.ok(successor.ok, JSON.stringify(successor));
+          phase("sdk-successor-returned");
           if (!ordinaryRefresh && (carrier === "complete" || carrier === "app" || carrier === "app-mixed" || feedbackFlow || refreshFlow || carrier === "edit-complete" || carrier === "markup-complete")) assert.ok(row.action.completionGroup.deadline.expiresAt <= Date.now() + 3600000, "Complete original native publication joins the SDK tail: " + JSON.stringify({ failures, events, deadline, actual: row.action.completionGroup.deadline.expiresAt }));
           else if (!ordinaryRefresh) assert.equal(row.action.completionGroup.deadline.expiresAt, deadline, "Legacy/foreign/ACK-time successor cannot mint membership or a new birth");
           if (!ordinaryRefresh && (carrier === "app" || carrier === "app-mixed" || feedbackFlow || refreshFlow)) {
@@ -7947,7 +7966,8 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
             callbackIngress.resolve([{ update_id: 101, callback_query: { id: "remote-feedback", from: { id: 77, is_bot: false }, data: methodRows[0].key,
               message: { message_id: originalMessageId, message_thread_id: 44, chat: { id: 77, type: "private" }, reply_markup: agentNativeBody.reply_markup } } }]);
             await Promise.race([nativeExit.promise, callbackDone.promise.then(status => { assert.fail("Callback ended before actual worker exit: " + status + JSON.stringify({ failures, events })); })]);
-            await workerExit.promise; await feedbackEntered.promise;
+            await workerExit.promise; phase("worker-exit-observed");
+            await feedbackEntered.promise; phase("feedback-entered");
             assert.ok(invocation); assert.equal(executionCaptures, 1); assert.equal(callbackPlans, 0); assert.equal(callbackResults, 0);
             if (queueFlow) {
               workerRelease.resolve();
@@ -7963,8 +7983,8 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
               }
             }
             if (carrier === "app-mixed-feedback-rebound") { Delivery.clearTelegramDeliveryRuntime(); await lifecycles[1].onSessionStart(); assert.ok(Delivery.captureTelegramQuestionLifetimeOwner()); }
-            feedbackRelease.resolve();
-            if (deferredFlow) await editorEntered.promise;
+            feedbackRelease.resolve(); phase("feedback-release-issued");
+            if (deferredFlow) { await editorEntered.promise; phase("editor-entered"); }
             else if (queueFlow && carrier.endsWith("parent-consumed")) await childEntered.promise;
             else await stores[1].store.waitForPublicationIdle();
             const observed = callbackObservations.find(value => !value.child); assert.ok(observed); assert.equal(observed.succeeded, carrier !== "app-mixed-feedback-rebound" && !(queueFlow && !deferredFlow && (carrier.endsWith("sdk-loss") || carrier.endsWith("app-loss") || carrier.endsWith("parent-loss") || carrier.endsWith("other-origin") || retainedFlow && (carrier.endsWith("partial") || carrier.endsWith("two")))));
@@ -7981,7 +8001,7 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
               if (carrier.endsWith("parent-consumed")) assert.ok(stores[1].store.resolve(appRows[0].key), "A captured original parent is consumed while the child edit is pending");
               childRelease.resolve();
             }
-            const status = await callbackDone.promise;
+            const status = await callbackDone.promise; phase("callback-toast-observed");
             const valid = carrier === "app-mixed-feedback" || childFlow;
             if (queueFlow) assert.ok(["Done", "Generative App action failed"].includes(status), JSON.stringify({ failures, events, callbackObservations }));
             else assert.equal(status, valid ? "Done" : "Generative App action failed", JSON.stringify({ failures, events, callbackObservations }));
@@ -7999,6 +8019,7 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
                 wantAdmissionClock = true; admissionController = new AbortController();
                 const later = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "After child ACK before original editor ACK", confirmLabel: "Yes", cancelLabel: "No", signal: admissionController.signal });
                 wantAdmissionClock = false; assert.equal(later.ok, !carrier.endsWith("cancelled")); assert.equal(typeof admissionCutoff, "number");
+                phase("conditional-admission-returned");
                 assert.deepEqual(pending.map(value => value.expiresAt), deferredOriginal, "An authentic admission records only a conditional ceiling, never a pending head or tail");
                 if (carrier.endsWith("second")) assert.ok((await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "Second pending admission", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal })).ok);
                 if (carrier.endsWith("sdk-loss")) { Delivery.clearTelegramDeliveryRuntime(); await lifecycles[1].onSessionStart(); assert.ok(Delivery.captureTelegramQuestionLifetimeOwner()); }
@@ -8007,7 +8028,7 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
                 await new Promise(resolve => setTimeout(resolve, 40));
                 assert.deepEqual(pending.map(value => value.expiresAt), deferredOriginal, "Neither a second event nor source changes can expose provisional child facts");
               }
-              editorRelease.resolve(); await stores[1].store.waitForPublicationIdle();
+              editorRelease.resolve(); await stores[1].store.waitForPublicationIdle(); phase("editor-queue-returned");
               if (carrier.endsWith("admission") || carrier.endsWith("cancelled") || carrier.endsWith("earlier")) assert.deepEqual(pending.map(value => value.expiresAt), deferredOriginal.map(value => Math.min(value, admissionCutoff)), "The original authenticated admission time, not editor settlement, fixes both ceilings");
             }
             if (valid) {
@@ -8065,19 +8086,43 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
             }
           }
         }
+        phase("checks-complete");
         console.log("two-production-roots-native-carrier-checked");
       }
     } finally {
       ingress.resolve([]); callbackIngress.resolve([]); secondCallbackIngress.resolve([]); feedbackRelease.resolve(); workerRelease.resolve(); childRelease.resolve(); editorRelease.resolve(); refreshRelease.resolve(); agentRelease.resolve(); editRelease.resolve();
       Worker.prototype.terminate = terminate;
-      if (followerStarted) await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, followerCtx);
-      if (leaderStarted) await leader.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, leaderCtx);
+      if (followerStarted) { phase("follower-shutdown-entered"); await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, followerCtx); phase("follower-shutdown-returned"); }
+      if (leaderStarted) { phase("leader-shutdown-entered"); await leader.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, leaderCtx); phase("leader-shutdown-returned"); }
+      phase("cleanup-entered");
       Delivery.clearTelegramDeliveryRuntime(); clearInterval(keepAlive); mock.restoreAll(); await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
       if (birthAuthority) assert.throws(birthAuthority, "Shutdown ends the original birth, not merely its future calls");
       if (registrationAuthority) assert.throws(registrationAuthority);
+      phase("cleanup-returned");
+      // A public resource-type census is evidence only; it neither closes descendants nor certifies settlement.
+      const counts = Object.fromEntries(["FSReqCallback", "FSReqPromise", "FileHandleCloseReq", "PipeWrap", "TCPServerWrap", "TCPSocketWrap", "Timeout", "MessagePort", "other"].map(key => [key, 0]));
+      for (const type of resources()) counts[Object.hasOwn(counts, type) ? type : "other"]++;
+      console.log("follower-carrier-resources:" + JSON.stringify({ pid: process.pid, elapsedMs: Math.round(now() - started), counts }));
     }
   `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 20000 });
   assert.equal(result.code, 0, result.stdout + result.stderr); assert.match(result.stdout, /two-production-roots-native-carrier-checked/u);
+  const phases = [...result.stdout.matchAll(/^follower-carrier-phase:([^:\r\n]+):elapsedMs=(\d+):pid=(\d+)$/gmu)];
+  const required = ["import-start", "fixture-ready", "outbound-import-entered", "outbound-import-returned", "root-import-entered", "import-complete",
+    "leader-connect-entered", "leader-connect-returned", "follower-connect-entered", "follower-connect-settled", "registration-checked", "checks-complete",
+    "follower-shutdown-entered", "follower-shutdown-returned", "leader-shutdown-entered", "leader-shutdown-returned", "cleanup-entered", "cleanup-returned"];
+  assert.deepEqual(phases.map(row => row[1]!).filter(name => required.includes(name)), required, "Original follower fixture phases must cover checks and actual cleanup in order");
+  const optional = ["bootstrap-refusal-checked", "first-sdk-checked", "agent-started", "first-carrier-returned", "sdk-successor-returned", "worker-exit-observed",
+    "feedback-entered", "feedback-release-issued", "editor-entered", "callback-toast-observed", "conditional-admission-returned", "editor-queue-returned"];
+  assert.ok(phases.every(row => required.includes(row[1]!) || optional.includes(row[1]!)), "Only finite body-free follower fixture phases may be emitted");
+  assert.equal(new Set(phases.map(row => row[1])).size, phases.length);
+  assert.equal(new Set(phases.map(row => row[3])).size, 1);
+  assert.ok(phases.every((row, index) => Number(row[3]) > 0 && (index === 0 || Number(row[2]) >= Number(phases[index - 1]![2]))));
+  const snapshots = [...result.stdout.matchAll(/^follower-carrier-resources:([^\r\n]+)$/gmu)]; assert.equal(snapshots.length, 1);
+  const snapshot = JSON.parse(snapshots[0]![1]!); assert.deepEqual(Object.keys(snapshot), ["pid", "elapsedMs", "counts"]); assert.equal(String(snapshot.pid), phases[0]![3]);
+  assert.ok(Number.isSafeInteger(snapshot.elapsedMs) && snapshot.elapsedMs >= Number(phases.at(-1)![2]));
+  assert.deepEqual(Object.keys(snapshot.counts), ["FSReqCallback", "FSReqPromise", "FileHandleCloseReq", "PipeWrap", "TCPServerWrap", "TCPSocketWrap", "Timeout", "MessagePort", "other"]);
+  assert.ok(Object.values(snapshot.counts).every(value => Number.isSafeInteger(value) && Number(value) >= 0));
+  assert.ok(phases.length + snapshots.length <= 40 && Buffer.byteLength([...phases, ...snapshots].map(row => row[0]).join("\n") + "\n") <= 6144, "Follower fixture evidence must remain finite and body-free");
 }, 25000);
 
 for (const source of [true, false]) for (const [artifact, rich, badAck] of [[false, false, false], [false, true, false], [true, false, false], [true, true, false], [true, false, true], [true, true, true]] as const)
