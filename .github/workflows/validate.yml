@@ -34,23 +34,43 @@ jobs:
           - os: ubuntu-latest
             suite: integration
             integrationShard: 0
-            integrationCount: 4
-            shardName: ", integration 1/4"
+            integrationCount: 8
+            shardName: ", integration 1/8"
           - os: ubuntu-latest
             suite: integration
             integrationShard: 1
-            integrationCount: 4
-            shardName: ", integration 2/4"
+            integrationCount: 8
+            shardName: ", integration 2/8"
           - os: ubuntu-latest
             suite: integration
             integrationShard: 2
-            integrationCount: 4
-            shardName: ", integration 3/4"
+            integrationCount: 8
+            shardName: ", integration 3/8"
           - os: ubuntu-latest
             suite: integration
             integrationShard: 3
-            integrationCount: 4
-            shardName: ", integration 4/4"
+            integrationCount: 8
+            shardName: ", integration 4/8"
+          - os: ubuntu-latest
+            suite: integration
+            integrationShard: 4
+            integrationCount: 8
+            shardName: ", integration 5/8"
+          - os: ubuntu-latest
+            suite: integration
+            integrationShard: 5
+            integrationCount: 8
+            shardName: ", integration 6/8"
+          - os: ubuntu-latest
+            suite: integration
+            integrationShard: 6
+            integrationCount: 8
+            shardName: ", integration 7/8"
+          - os: ubuntu-latest
+            suite: integration
+            integrationShard: 7
+            integrationCount: 8
+            shardName: ", integration 8/8"
           - os: windows-latest
             suite: integration
             integrationShard: 0

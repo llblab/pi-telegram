@@ -381,10 +381,11 @@ test("CI shards cover every domain file exactly once without widening deadlines"
   assert.deepEqual(Array.from(validateWorkflowSource.matchAll(/- os: macos-26-intel\s+suite: domains\s+shard: (\d+)/g),
     (match) => Number(match[1])), [0, 1]);
   for (const os of ["ubuntu-latest", "windows-latest", "macos-26-intel"]) {
-    const count = os === "macos-26-intel" ? 8 : 4;
-    const matrix = new RegExp(`- os: ${os}\\s+suite: integration\\s+integrationShard: (\\d+)\\s+integrationCount: (\\d+)`, "g");
-    assert.deepEqual(Array.from(validateWorkflowSource.matchAll(matrix), match => [Number(match[1]), Number(match[2])]),
-      Array.from({ length: count }, (_, index) => [index, count]));
+    const count = os === "windows-latest" ? 4 : 8;
+    const matrix = new RegExp(`- os: ${os}\\s+suite: integration\\s+integrationShard: (\\d+)\\s+integrationCount: (\\d+)\\s+shardName: ", integration (\\d+)/(\\d+)"`, "g");
+    assert.deepEqual(Array.from(validateWorkflowSource.matchAll(matrix), match => match.slice(1).map(Number)),
+      Array.from({ length: count }, (_, index) => [index, count, index + 1, count]),
+      `${os} integration matrix must cover each exact native bucket once with its matching label`);
     for (let index = 0; index < count; index++) assert.deepEqual(list(`${index}/${count}`, "integration"), ["tests/integration.test.ts"]);
   }
   assert.match(validateWorkflowSource, /timeout-minutes: 30/);
@@ -470,9 +471,9 @@ test("Integration CI name shards are exhaustive, disjoint and use actual registr
   }
   for (let index = 0; index < 4; index++) {
     const original = all.filter(name => createHash("sha256").update(name).digest().readUInt32BE(0) % 4 === index);
-    assert.deepEqual(partitions.get(4)![index], original, "Linux/Windows retain the original four-way mapping");
+    assert.deepEqual(partitions.get(4)![index], original, "The original four-way mapping remains unchanged for Windows and legacy selectors");
     assert.deepEqual([...partitions.get(8)![index]!, ...partitions.get(8)![index + 4]!].sort(), [...original].sort(),
-      "Each macOS pair refines one original bucket without omissions or duplicates");
+      "Each Linux/macOS eight-way pair refines one original bucket without omissions or duplicates");
   }
   for (const value of ["", "4/4", "8/8", "-1/4", "01/4", "00/8", "0/0", "0/5", "0/6", "0/16", "0/4x", " 0/4"]) {
     assert.throws(() => createIntegrationShardSelector(value), /Integration shard/);
