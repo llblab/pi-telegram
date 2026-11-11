@@ -6910,7 +6910,7 @@ test("Artifact settled native socket ledger retains neither wire bodies nor raw 
   assert.equal(result.code, 0, result.stdout + result.stderr); assert.match(result.stdout, /artifact-ledger-nonretention-pass:8-success:4-observer-failure/u);
 }, 25000);
 
-for (const source of [true, false]) for (const threaded of [false, true]) for (const [callbackKind, rich] of [["independent", false], ["read-only", false], ["read-only", true], ["state-written", false], ["pure", false], ["queued", true], ["deferred", false], ["conditional", true], ["lost-sdk", false], ["second-sdk", true], ["retained", true], ["partial-retained", true], ["retained-lost-sdk", true], ["retained-text", false], ["retained-text-mixed", false], ...(["timed-direct", "timed-direct-legacy", "timed-direct-proxy", "timed-direct-sdk-loss", "timed-direct-no-bot", "timed-direct-wrong-bot", "timed-direct-pure", "timed-direct-child-legacy", "timed-direct-child-bot", "timed-direct-child-thread", "timed-direct-parent-loss", "timed-direct-later"] as const).flatMap(kind => [[kind, false], [kind, true]] as const)] as const)
+for (const source of [true, false]) for (const threaded of [false, true]) for (const [callbackKind, rich] of [["independent", false], ["read-only", false], ["read-only", true], ["state-written", false], ["pure", false], ["queued", true], ["deferred", false], ["conditional", true], ["lost-sdk", false], ["second-sdk", true], ["retained", true], ["partial-retained", true], ["retained-lost-sdk", true], ["retained-text", false], ["retained-text-mixed", false], ...(["timed-direct", "timed-direct-legacy", "timed-direct-proxy", "timed-direct-sdk-loss", "timed-direct-no-bot", "timed-direct-wrong-bot", "timed-direct-pure", "timed-direct-child-legacy", "timed-direct-child-bot", "timed-direct-child-thread", "timed-direct-parent-loss", "timed-direct-later"] as const).flatMap(kind => [[kind, false], [kind, true]] as const), ["app-coheads", false], ["app-coheads", true]] as const)
 test(`Production question root uses original SDK binding at birth, not ACK (${source ? "source" : "compiled"}/${threaded}/${callbackKind}/rich=${rich})`, async () => {
   const result = await runNodeEval(`
     import assert from "node:assert/strict";
@@ -7132,6 +7132,8 @@ test(`Production question root uses original SDK binding at birth, not ACK (${so
       ingress.resolve([{ update_id: 100, message: { message_id: 100, chat: { id: 77, type: "private" },
         ...(threaded ? { message_thread_id: 43 } : {}), from: { id: 77, is_bot: false }, text: "Native app question fixture" } }]);
       await dispatched.promise; phase("dispatched"); await handlers.get("agent_start")({}, ctx); phase("agent-started");
+      // Co-head ownership has its own complete configuration controls, not extra setup inside every callback's clock.
+      if (callbackKind === "app-coheads") {
       const script = join(dir, "question.mjs");
       await writeFile(script, 'export function init(){return {state:{count:0},output:' + JSON.stringify('<!-- telegram_confirm "Native app birth" --><!-- telegram_confirm "Native app peer" -->') + '}} export function increment({state}){return {state:{count:state.count+1},output:"changed"}}');
       const appStart = rows.length;
@@ -7152,6 +7154,11 @@ test(`Production question root uses original SDK binding at birth, not ACK (${so
       await tools.get("telegram_bind").execute("root-app-change", { app: "question", method: "increment", display: false });
       phase("app-change-done");
       assert.equal(captured.store.resolve(peer.key), undefined, "Original app loss still refuses stale native selection");
+      } else {
+        await captured.lifecycle.onSessionStart();
+        phase("callback-sdk-context-ready");
+      }
+      if (callbackKind !== "app-coheads") {
       if (timedDirect) {
         assert.equal(captured.apiDeps.ownsDirect(), true);
         const originalApi = captured.api.captureQuestionAuthority(); assert.equal(typeof originalApi, "function"); originalApi();
@@ -7314,6 +7321,7 @@ test(`Production question root uses original SDK binding at birth, not ACK (${so
         }
       }
       }
+      }
       console.log("root-question-original-binding-pass");
     } finally {
       ingress.resolve([]); callbacks.resolve([]); refreshRelease.resolve(); feedbackRelease.resolve(); editorRelease.resolve(); workerRelease.resolve(); release.resolve(); await pending?.catch(() => {});
@@ -7333,6 +7341,9 @@ test(`Production question root uses original SDK binding at birth, not ACK (${so
     ["outbound", "delivery", "bindings", "bus-leader", "bus-api"].flatMap(module => ["mock-import-", "mock-install-", "mock-ready-"].map(prefix => prefix + module)));
   assert.match(result.stdout, /root-question-phase:import-complete:elapsedMs=\d+:pid=\d+/u);
   assert.match(result.stdout, /root-question-phase:shutdown-done:elapsedMs=\d+:pid=\d+/u);
+  for (const name of ["app-init-start", "app-init-done", "app-change-start", "app-change-done"])
+    assert.equal(phases.some(row => row[1] === name), callbackKind === "app-coheads", "Only the app co-head control may execute its separate app setup/mutation");
+  assert.equal(phases.some(row => row[1] === "callback-sdk-context-ready"), callbackKind !== "app-coheads", "Callbacks retain the same original SDK renewal without the unrelated app control");
 }, callbackKind.startsWith("timed-direct") ? 35000 : 25000);
 
 for (const source of [true, false]) for (const [foreign, foreignBootstrap, replaceReceiver, noArtifact, carrier, rich] of [

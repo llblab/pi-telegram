@@ -453,6 +453,10 @@ test("Integration CI name shards are exhaustive, disjoint and use actual registr
     assert.equal(lines.length, 1); return JSON.parse(lines[0]!.slice("integration-inventory:".length)) as string[];
   };
   const all = list(); assert.ok(all.length > 0);
+  assert.deepEqual(all.filter(name => name.startsWith("Production question root") && name.includes("/app-coheads/")),
+    ["source", "compiled"].flatMap(source => [false, true].flatMap(threaded => [false, true].map(rich =>
+      `Production question root uses original SDK binding at birth, not ACK (${source}/${threaded}/app-coheads/rich=${rich})`))),
+    "The independent app co-head control must retain every source, target-mode and rendering configuration");
   const partitions = new Map<number, string[][]>();
   for (const count of [4, 8]) {
     const shards = Array.from({ length: count }, (_, index) => {
