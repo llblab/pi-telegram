@@ -825,6 +825,17 @@ test("Node eval readiness bounds startup separately from execution and actual dr
     timeoutMs: 500, readiness: { stdoutPrefix: "fixture-ready", startupTimeoutMs: 3000 },
   }), /did not exit \(execution\/drain\)/u);
   assert.ok(performance.now() - started < 3000, "Extra startup allowance cannot conceal post-ready retained handles or marker renewal");
+  const integration = readFileSync(join(PROJECT_ROOT, "tests", "integration.test.ts"), "utf8");
+  const start = integration.indexOf('test(`Production follower SDK first-send refuses foreign native carrier before ownership');
+  const end = integration.indexOf('test(`Production follower question root keeps physical ACK', start);
+  assert.ok(start >= 0 && end > start);
+  const follower = integration.slice(start, end);
+  assert.match(follower, /timeoutMs: 20000,\s*readiness: \{ stdoutPrefix: "follower-carrier-phase:import-complete:", startupTimeoutMs: 20000 \}/u,
+    "Follower cold startup must be bounded separately from the original twenty-second work/drain guard");
+  assert.match(follower, /\}, 45000\);/u, "The outer guard must retain only five seconds beyond the fixed forty-second child total");
+  const imports = follower.indexOf('phase("import-complete");');
+  assert.ok(imports > follower.indexOf('await import(base + "extension" + suffix)'));
+  assert.ok(imports < follower.indexOf('extension(leader.pi)'), "Cold startup cannot hide a Root connection or semantic execution");
 });
 
 test("Node eval readiness refuses missing checkpoints within its startup bound", async () => {

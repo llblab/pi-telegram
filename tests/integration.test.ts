@@ -8104,7 +8104,9 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
       for (const type of resources()) counts[Object.hasOwn(counts, type) ? type : "other"]++;
       console.log("follower-carrier-resources:" + JSON.stringify({ pid: process.pid, elapsedMs: Math.round(now() - started), counts }));
     }
-  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 20000 });
+  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 20000,
+    readiness: { stdoutPrefix: "follower-carrier-phase:import-complete:", startupTimeoutMs: 20000 } });
+  assert.equal(result.signal, null);
   assert.equal(result.code, 0, result.stdout + result.stderr); assert.match(result.stdout, /two-production-roots-native-carrier-checked/u);
   const phases = [...result.stdout.matchAll(/^follower-carrier-phase:([^:\r\n]+):elapsedMs=(\d+):pid=(\d+)$/gmu)];
   const required = ["import-start", "fixture-ready", "outbound-import-entered", "outbound-import-returned", "root-import-entered", "import-complete",
@@ -8123,7 +8125,7 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
   assert.deepEqual(Object.keys(snapshot.counts), ["FSReqCallback", "FSReqPromise", "FileHandleCloseReq", "PipeWrap", "TCPServerWrap", "TCPSocketWrap", "Timeout", "MessagePort", "other"]);
   assert.ok(Object.values(snapshot.counts).every(value => Number.isSafeInteger(value) && Number(value) >= 0));
   assert.ok(phases.length + snapshots.length <= 40 && Buffer.byteLength([...phases, ...snapshots].map(row => row[0]).join("\n") + "\n") <= 6144, "Follower fixture evidence must remain finite and body-free");
-}, 25000);
+}, 45000);
 
 for (const source of [true, false]) for (const [artifact, rich, badAck] of [[false, false, false], [false, true, false], [true, false, false], [true, true, false], [true, false, true], [true, true, true]] as const)
 test(`Production follower question root keeps physical ACK and Artifact incarnation outside SDK membership (${source ? "source" : "compiled"}/artifact=${artifact}/rich=${rich}/badAck=${badAck})`, async () => {
