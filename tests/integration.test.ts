@@ -13656,6 +13656,26 @@ test(`Production original registration separates mode publication, IPC and ACK (
       }
       const phases = await events();
       assert.equal(phases.some(row => row.details?.phase === "follower-readiness-expired"), phase === "ipc-timeout" || phase === "connect-expired" || phase === "receiver-expired", "Only unissued connection waiting is governed by the original observation clock");
+    } catch (error) {
+      // Failure-only evidence reads the existing diagnostic log, never Workspace/Restore state or fresh authority.
+      try {
+        const failure = { version: 1, artifact, profile: profile ?? "default", phase, stage: "before-cleanup", pid: process.pid,
+          error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error),
+          counters: { entered, followerSettled, heldCompletions, registrationCalls, nativeConnects, nativeWrites, wireReceipts,
+            received, prepared, returned, leaderStarts, issued, polls, topics, sends, deletes, takeovers } };
+        console.log("registration-phases-failure", JSON.stringify(failure));
+        const logPath = Paths.resolveTelegramRuntimeLogPath(agentDir);
+        const runtimeLog = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : undefined;
+        const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
+        if (evidenceDir) {
+          fs.mkdirSync(evidenceDir, { recursive: true });
+          fs.writeFileSync(join(evidenceDir, `registration-${artifact}-${profile ?? "default"}-${phase}.json`),
+            JSON.stringify({ ...failure, runtimeLog }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+        } else console.log("registration-phases-runtime-log", JSON.stringify(runtimeLog));
+      } catch (captureError) {
+        try { console.log("registration-phases-capture-refused", String(captureError)); } catch { /* Preserve the original fixture Error. */ }
+      }
+      throw error;
     } finally {
       checkpoint("teardown-entered");
       release(); await connecting; await following;
