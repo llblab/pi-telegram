@@ -2259,7 +2259,10 @@ export function createTelegramTopicTargetStore(options) {
         const path = getPath(), profile = activeProfile();
         resetForPath(path);
         const revision = mutationRevision;
-        const rawFile = await readStoreSnapshot(path, !!workspaceRestore, true);
+        // Serialize this original load with envelope publishers, without recovering guards or locking retained/frame reads.
+        const rawFile = await (workspaceIO && !workspaceFrame
+            ? withTelegramFileTransaction(join(dirname(path), "runtime", `${basename(path)}.transaction`), () => readStoreSnapshot(path, !!workspaceRestore), { recoverAbandoned: false })
+            : readStoreSnapshot(path, !!workspaceRestore, true));
         // A read begun before a local mutation cannot replace the newly admitted projection.
         if (mutationRevision !== revision ||
             getPath() !== path ||

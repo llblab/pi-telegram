@@ -664,9 +664,13 @@ function acquireLockTransaction(path, options = {}) {
         catch (error) {
             if (!isLockTransactionContentionError(error))
                 throw error;
-            const recoveredOwner = recoverAbandonedLockTransaction(path, options);
-            if (recoveredOwner !== undefined)
-                return recoveredOwner;
+            if (options.recoverAbandoned === false)
+                readLockTransactionOwner(path);
+            else {
+                const recoveredOwner = recoverAbandonedLockTransaction(path, options);
+                if (recoveredOwner !== undefined)
+                    return recoveredOwner;
+            }
             if (attempt === attempts - 1) {
                 throw new Error(`Timed out acquiring Telegram lock transaction: ${path}`);
             }

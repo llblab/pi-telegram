@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
+import { runNodeEval } from "./fixtures/node-eval.ts";
 import { withTelegramFileTransaction, readTelegramRuntimeState, mutateTelegramRuntimeStateSection,
   createTelegramLockRuntime as createSessionGrantLock, createTelegramOwnedStateAuthorityCapture } from "../lib/locks.ts";
 import { createTelegramSessionContextStore } from "../lib/lifecycle.ts";
@@ -125,6 +126,167 @@ async function withConsolidatedWorkspaceFixture(run: (f: {
     await run({ rootPath, dir: dirname(rootPath), scope, owner, workspace, storage, consolidated });
   }, role);
 }
+
+
+for (const artifact of ["source", "compiled"] as const)
+for (const boundary of ["canonical", "unguarded", "wrong-guard"] as const)
+test(`Consolidated load serializes one original read against a native publisher (${artifact}/${boundary})`, async () => {
+  const kernelUrl = new URL(artifact === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+  const threadsUrl = new URL(artifact === "source" ? "../lib/threads.ts" : "../dist/lib/threads.js", import.meta.url).href;
+  async function publisher(url: string, dir: string) {
+    const { default: fs } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { syncBuiltinESMExports } = await import("node:module");
+    const exists = fs.existsSync, guard = join(dir, "runtime", "state.json.transaction");
+    let signalled = false;
+    fs.existsSync = candidate => {
+      const found = exists(candidate);
+      if (candidate === guard && found && !signalled) {
+        signalled = true;
+        fs.writeFileSync(join(dir, "contended"), String(process.pid), { flag: "wx" });
+      }
+      return found;
+    };
+    syncBuiltinESMExports();
+    const Kernel = await import(url);
+    fs.writeFileSync(join(dir, "ready"), String(process.pid), { flag: "wx" });
+    const started = Date.now();
+    while (!exists(join(dir, "start"))) {
+      if (Date.now() - started > 8000) throw new Error("Publisher start boundary expired");
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    Kernel.mutateTelegramRuntimeStateSection(join(dir, "state.json"), "work", "runtime",
+      () => ({ value: { publisherPid: process.pid }, result: true }), { isCurrent: () => true });
+    fs.writeFileSync(join(dir, "committed"), String(process.pid), { flag: "wx" });
+  }
+  async function reader(url: string, storeUrl: string, publisherSource: string, mode: string) {
+    const { default: fs } = await import("node:fs");
+    const { syncBuiltinESMExports } = await import("node:module");
+    const { mock } = await import("node:test");
+    const { spawn } = await import("node:child_process");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const assert: typeof import("node:assert/strict") = (await import("node:assert/strict")).default;
+    const original = { ...fs }, Kernel = await import(url);
+    const dir = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "pt-load-read-"))), path = join(dir, "state.json");
+    const guard = join(dir, "runtime", "state.json.transaction");
+    const workspace = { version: 1, source: "snapshot", writtenAtMs: 1, bot: { threadMode: "enabled" }, threads: [] };
+    Kernel.mutateTelegramRuntimeStateSection(path, "work", "workspace", () => ({ value: workspace, result: true }), { isCurrent: () => true });
+    let armed = false, calls = 0, guardCalls = 0, descriptorReads = 0, fd: number | undefined, reading = false;
+    let links: number | undefined, blocked: boolean | undefined;
+    mock.module(url, { namedExports: { ...Kernel,
+      readTelegramRuntimeState(candidate: string) { if (armed && candidate === path) calls++; return Kernel.readTelegramRuntimeState(candidate); },
+      withTelegramFileTransaction(candidate: string, operation: () => unknown, options: { recoverAbandoned?: boolean }) {
+        if (armed && candidate === guard) {
+          guardCalls++;
+          assert.equal(options.recoverAbandoned, false, "Load observation cannot acquire abandoned-owner recovery authority");
+          if (mode === "unguarded") return operation();
+          if (mode === "wrong-guard") candidate += ".wrong";
+        }
+        return Kernel.withTelegramFileTransaction(candidate, operation, options);
+      },
+    } });
+    const Threads = await import(storeUrl);
+    const store = Threads.createTelegramTopicTargetStore({ path: () => path, telegramProfile: () => "work",
+      consolidated: { captureAuthority: () => undefined, publishIfOwned: () => { throw new Error("No read-side publication"); } } });
+    await store.load();
+    const scope = store.captureReadScope();
+    console.log("consolidated-load-reader ready");
+    const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", "(" + publisherSource + ")(" + JSON.stringify(url) + "," + JSON.stringify(dir) + ")"],
+      { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", chunk => { stderr += chunk; }); child.stdout.resume();
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      child.once("error", reject); child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    const wait = (predicate: () => boolean) => {
+      const begin = Date.now();
+      while (!predicate()) {
+        if (Date.now() - begin > 8000) throw new Error("Native load fixture boundary expired");
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+    };
+    try {
+      wait(() => fs.existsSync(join(dir, "ready")));
+      assert.equal(Number(fs.readFileSync(join(dir, "ready"), "utf8")), child.pid);
+      assert.notEqual(child.pid, process.pid);
+      fs.openSync = ((...args: Parameters<typeof fs.openSync>) => {
+        const opened = original.openSync(...args);
+        if (armed && args[0] === path) { fd = opened; reading = true; }
+        return opened;
+      }) as typeof fs.openSync;
+      fs.fstatSync = ((...args: Parameters<typeof fs.fstatSync>) => {
+        if (armed && args[0] === fd && reading) {
+          armed = false;
+          fs.writeFileSync(join(dir, "start"), "", { flag: "wx" });
+          wait(() => fs.existsSync(join(dir, "contended")) || fs.existsSync(join(dir, "committed")));
+          blocked = !fs.existsSync(join(dir, "committed"));
+          const actual = original.fstatSync(...args);
+          links = Number(actual.nlink);
+          return actual;
+        }
+        return original.fstatSync(...args);
+      }) as typeof fs.fstatSync;
+      fs.readFileSync = ((...args: Parameters<typeof fs.readFileSync>) => {
+        if (reading && args[0] === fd) descriptorReads++;
+        return original.readFileSync(...args);
+      }) as typeof fs.readFileSync;
+      fs.closeSync = (...args) => { original.closeSync(...args); if (args[0] === fd) reading = false; };
+      syncBuiltinESMExports();
+      armed = true;
+      let failure: any;
+      try { await store.refresh(); } catch (error) { failure = error; }
+      if (mode === "canonical") {
+        assert.equal(failure, undefined); assert.equal(links, 1); assert.equal(descriptorReads, 1); assert.equal(blocked, true);
+      } else {
+        assert.ok(failure instanceof Kernel.TelegramRuntimeStateError);
+        // Windows may retain a link on an unlinked open descriptor; the replaced pathname must still refuse.
+        assert.ok(links === 0 || links === 1);
+        assert.equal(failure.readCondition, links === 0 ? "opened-links" : "post-read-inode-mismatch");
+        assert.equal(failure.code, "invalid"); assert.equal(descriptorReads, links === 0 ? 0 : 1); assert.equal(blocked, false);
+      }
+      assert.equal(guardCalls, 1); assert.equal(calls, 1);
+      assert.throws(() => original.fstatSync(fd!), { code: "EBADF" });
+      assert.deepEqual(await exited, { code: 0, signal: null }, stderr);
+      assert.equal(scope(), true); assert.equal(store.getBotState().threadMode, "enabled");
+      const state = Kernel.readTelegramRuntimeState(path);
+      assert.deepEqual(state.profiles.work.workspace, workspace);
+      assert.deepEqual(state.profiles.work.runtime, { publisherPid: child.pid });
+      if (mode === "canonical") {
+        const before = original.readFileSync(path, "utf8"), priorCalls = calls;
+        original.mkdirSync(guard); original.writeFileSync(join(guard, "owner.fixture.json"), "{", { mode: 0o600 });
+        armed = true;
+        await assert.rejects(store.refresh(), { name: "TelegramFileTransactionGuardError" });
+        armed = false;
+        assert.equal(calls, priorCalls, "Unverifiable guard refuses before the original snapshot callback");
+        assert.equal(original.readFileSync(path, "utf8"), before);
+        assert.equal(original.readFileSync(join(guard, "owner.fixture.json"), "utf8"), "{");
+        original.rmSync(guard, { recursive: true });
+        const alias = join(dir, "linked-state");
+        original.linkSync(path, alias);
+        await assert.rejects(store.refresh(), /private regular file/);
+        original.unlinkSync(alias);
+        const pending = store.refresh();
+        await Promise.resolve();
+        store.setBotState({ threadMode: "disabled" });
+        await pending;
+        assert.equal(store.getBotState().threadMode, "disabled", "The existing post-await revision fence retains local mutation");
+      }
+      console.log(JSON.stringify({ mode, oneOriginalRead: true, strictRefusal: mode !== "canonical", publisherExited: true }));
+    } finally {
+      for (const key of ["openSync", "fstatSync", "readFileSync", "closeSync"] as const) fs[key] = original[key] as never;
+      syncBuiltinESMExports();
+      // An earlier failure still releases the isolated publisher through its existing bounded start protocol.
+      if (!original.existsSync(join(dir, "start"))) original.writeFileSync(join(dir, "start"), "", { flag: "wx" });
+      await exited;
+      original.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const result = await runNodeEval("(" + reader.toString() + ")(" + [kernelUrl, threadsUrl, publisher.toString(), boundary].map(value => JSON.stringify(value)).join(",") + ")",
+    { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 12000,
+      readiness: { stdoutPrefix: "consolidated-load-reader ready", startupTimeoutMs: 8000 } });
+  assert.equal(result.signal, null); assert.equal(result.code, 0, result.stdout + result.stderr);
+});
 
 test("Provision recovery owner selector keeps exact legacy/consolidated layout and raw profile hashes", () => {
   const path = join("/agent", "state.json");
@@ -250,6 +412,31 @@ test("Consolidated Workspace refuses a publisher bound to another profile and au
     assert.throws(() => publish(() => { f.scope.generation++; return { value: f.workspace, result: true }; }), /authority changed/);
     assert.equal(await readFile(f.rootPath, "utf8"), before);
     assert.equal(readTelegramRuntimeState(f.rootPath).profiles.other, undefined);
+  });
+});
+
+for (const artifact of ["source", "compiled"] as const)
+test(`Consolidated load keeps the original nonempty Restore view and in-transaction observations (${artifact})`, async () => {
+  await withConsolidatedWorkspaceFixture(async f => {
+    f.owner.acquire({ cwd: "/repo" });
+    const publish = f.storage.capturePublication()!;
+    publish(() => ({ value: f.workspace, result: true }));
+    const Threads = artifact === "source" ? await import("../lib/threads.ts") : await import("../dist/lib/threads.js");
+    const store = Threads.createTelegramTopicTargetStore({ path: () => f.rootPath, consolidated: f.consolidated });
+    await store.load();
+    const view = store.workspaceRestore({ profileName: "default", tokenSha256: "a".repeat(64) });
+    const before = view.list();
+    assert.equal(before.length, 1); assert.equal(before[0]?.phase, "recipient-issued");
+    mutateTelegramRuntimeStateSection(f.rootPath, "default", "runtime", () => ({ value: { marker: "sibling" }, result: true }), { isCurrent: () => true });
+    await store.refresh!();
+    assert.deepEqual(view.list(), before, "Refresh keeps this original view, not a newly constructed reader");
+    const guard = join(f.dir, "runtime", "consolidated.json.transaction");
+    withTelegramFileTransaction(guard, () => assert.deepEqual(view.list(), before));
+    publish(current => {
+      assert.deepEqual(view.list(), before, "Existing protected observations never acquire a nested guard");
+      return { value: current, result: true };
+    });
+    assert.deepEqual(readTelegramRuntimeState(f.rootPath).profiles.default?.runtime, { marker: "sibling" });
   });
 });
 

@@ -650,6 +650,8 @@ type TelegramTransactionGlobal = typeof globalThis & {
 export interface TelegramFileTransactionOptions {
   recoveryRename?: typeof renameSync;
   publishRename?: typeof renameSync;
+  /** Observation leases may contend but must not acquire abandoned-owner recovery authority. */
+  recoverAbandoned?: boolean;
   attempts?: number;
   retryDelayMs?: number;
 }
@@ -910,8 +912,11 @@ function acquireLockTransaction(
       return createLockTransactionGuard(path, options);
     } catch (error) {
       if (!isLockTransactionContentionError(error)) throw error;
-      const recoveredOwner = recoverAbandonedLockTransaction(path, options);
-      if (recoveredOwner !== undefined) return recoveredOwner;
+      if (options.recoverAbandoned === false) readLockTransactionOwner(path);
+      else {
+        const recoveredOwner = recoverAbandonedLockTransaction(path, options);
+        if (recoveredOwner !== undefined) return recoveredOwner;
+      }
       if (attempt === attempts - 1) {
         throw new Error(
           `Timed out acquiring Telegram lock transaction: ${path}`,

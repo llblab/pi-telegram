@@ -187,6 +187,8 @@ export declare class TelegramFileTransactionGuardError extends Error {
 export interface TelegramFileTransactionOptions {
     recoveryRename?: typeof renameSync;
     publishRename?: typeof renameSync;
+    /** Observation leases may contend but must not acquire abandoned-owner recovery authority. */
+    recoverAbandoned?: boolean;
     attempts?: number;
     retryDelayMs?: number;
 }

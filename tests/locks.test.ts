@@ -1180,6 +1180,39 @@ test(`Transaction guard recensus distinguishes a released directory from invalid
 });
 
 for (const artifact of ["source", "compiled"] as const)
+test(`Non-recovering transaction admission preserves dead and unverifiable guards (${artifact})`, async () => {
+  const temp = createTempLockPath(), guard = `${temp.path}.transaction`;
+  const moduleUrl = new URL(artifact === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+  try {
+    const abandoned = await runNodeEval(`
+      const Kernel = await import(${JSON.stringify(moduleUrl)});
+      Kernel.withTelegramFileTransaction(${JSON.stringify(guard)}, () => process.exit(0));
+    `);
+    assert.equal(abandoned.code, 0, abandoned.stderr); assert.equal(abandoned.signal, null);
+    const locks = artifact === "source" ? await import("../lib/locks.ts") : await import("../dist/lib/locks.js");
+    const names = readdirSync(guard), marker = join(guard, names[0]!);
+    const before = readFileSync(marker, "utf8"), inode = statSync(marker).ino;
+    assert.notEqual(JSON.parse(before).pid, process.pid, "The abandoned guard belongs to the actual exited child");
+    let entered = 0;
+    assert.throws(() => locks.withTelegramFileTransaction(guard, () => { entered++; }, { recoverAbandoned: false, attempts: 1 }), /Timed out acquiring/);
+    assert.equal(entered, 0); assert.deepEqual(readdirSync(guard), names);
+    assert.equal(readFileSync(marker, "utf8"), before); assert.equal(statSync(marker).ino, inode);
+    writeFileSync(marker, "{", { mode: 0o600 });
+    assert.throws(() => locks.withTelegramFileTransaction(guard, () => { entered++; }, { recoverAbandoned: false, attempts: 1 }), error => {
+      assert.equal((error as Error).name, "TelegramFileTransactionGuardError"); return true;
+    });
+    assert.equal(readFileSync(marker, "utf8"), "{"); assert.equal(entered, 0);
+    writeFileSync(marker, before, { mode: 0o600 });
+    locks.withTelegramFileTransaction(guard, () => {
+      entered++;
+      assert.throws(() => locks.withTelegramFileTransaction(guard, () => { entered++; }, { recoverAbandoned: false, attempts: 1 }), /Timed out acquiring/);
+    });
+    assert.equal(entered, 1, "Existing default acquisition still recovers the dead guard; live read contention never enters");
+    assert.equal(existsSync(guard), false);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
 for (const format of ["directory", "legacy"] as const)
 for (const fault of ["empty", "truncated", "null", "array", "zero-pid", "negative-pid", "fractional-pid", "unsafe-pid", "out-of-range-pid", "bad-clock", "empty-generation", "invalid-generation", "oversized", "unreadable"] as const)
 test(`Unverifiable transaction owner refuses without contention sleeps (${artifact}/${format}/${fault})`, async t => {
