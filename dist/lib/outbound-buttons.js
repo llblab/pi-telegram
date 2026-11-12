@@ -2297,7 +2297,7 @@ function createTelegramChoiceSelection(questions, batched, register, view) {
             answers.length = 0;
         } });
     const selected = new Set(), answers = [];
-    let step = 0, ended = false, finishing = false, expired = false;
+    let step = 0, ended = false, finishing = false, expired = false, cancelled = false;
     let buttons = new Map(), renderedRows;
     const render = (terminal = false) => {
         expired ||= !ended && !finishing && nowMs() >= deadline.expiresAt;
@@ -2306,7 +2306,7 @@ function createTelegramChoiceSelection(questions, batched, register, view) {
         const cell = (index) => {
             const option = index < 0 ? undefined : cells[index], marked = selected.has(index);
             const text = option ? `${marked ? "✓ " : ""}${option.label || "\u00a0"}` : `${question.cancelLabel} · ${selected.size}/${count}`;
-            const style = marked ? option?.style ?? "primary" : undefined;
+            const style = index < 0 && cancelled ? "danger" : marked ? option?.style ?? "primary" : undefined;
             if (terminal || expired || option?.disabled)
                 return expired && !option?.disabled
                     ? { text: `Expired: ${text}`, callback_data: TELEGRAM_BUTTON_EXPIRED_CALLBACK }
@@ -2350,7 +2350,9 @@ function createTelegramChoiceSelection(questions, batched, register, view) {
         view.busy = true;
         view.revision++;
         const question = questions[step], cells = question.rows.flat(), count = question.select ?? 1;
-        if (index >= 0)
+        if (index < 0)
+            cancelled = true;
+        else
             selected.has(index) ? selected.delete(index) : selected.add(index);
         const complete = index < 0 || selected.size === count;
         const labels = cells.filter((_cell, i) => selected.has(i)).map(cell => cell.label);

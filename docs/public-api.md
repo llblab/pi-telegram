@@ -576,7 +576,7 @@ declare function sendTelegramArtifact(
 
 ### Agent Selection Markup
 
-Use strict JSON in `telegram_confirm` / `telegram_choice` Markdown fences or HTML comments. Both render escaped bold question text with neutral footer controls, even in Rich mode, allowing the existing post-click keyboard feedback. Choice `style` and Confirm `confirmStyle` select the pressed color only; default feedback is primary. Existing legacy in-body buttons remain unchanged.
+Use strict JSON in `telegram_confirm` / `telegram_choice` Markdown fences or HTML comments. Both render escaped bold question text with neutral footer controls, even in Rich mode, allowing the existing post-click keyboard feedback. Choice `style` and Confirm `confirmStyle` select the pressed color only; default option feedback is primary. A Choice collector's Cancel control stays neutral until cancellation, then uses danger (red). Existing legacy in-body buttons remain unchanged.
 
 For example, a comment body is `telegram_choice {"question":"Format?","choices":["JSON","CSV"]}` between `<!--` and `-->`. Or put the same JSON object in a `telegram_choice` fence. Comment delimiter rules match `telegram_button`, including activation inside code; escape the opener for literal examples.
 

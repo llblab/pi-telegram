@@ -1848,7 +1848,7 @@ function createTelegramChoiceSelection(
     ended = true; if (reason === "deadline") expired = true; else view.lost = true; selected.clear(); answers.length = 0;
   } });
   const selected = new Set<number>(), answers: { question: string; answer: string | string[] }[] = [];
-  let step = 0, ended = false, finishing = false, expired = false;
+  let step = 0, ended = false, finishing = false, expired = false, cancelled = false;
   let buttons = new Map<string, number>(), renderedRows: TelegramOutboundButtonMarkup["inline_keyboard"];
   const render = (terminal = false): TelegramOutboundButtonMarkup["inline_keyboard"] => {
     expired ||= !ended && !finishing && nowMs() >= deadline.expiresAt;
@@ -1857,7 +1857,7 @@ function createTelegramChoiceSelection(
     const cell = (index: number) => {
       const option = index < 0 ? undefined : cells[index], marked = selected.has(index);
       const text = option ? `${marked ? "✓ " : ""}${option.label || "\u00a0"}` : `${question.cancelLabel} · ${selected.size}/${count}`;
-      const style = marked ? option?.style ?? "primary" as const : undefined;
+      const style = index < 0 && cancelled ? "danger" as const : marked ? option?.style ?? "primary" as const : undefined;
       if (terminal || expired || option?.disabled) return expired && !option?.disabled
         ? { text: `Expired: ${text}`, callback_data: TELEGRAM_BUTTON_EXPIRED_CALLBACK }
         : { text, disabled: {}, ...(style ? { style } : {}) };
@@ -1897,7 +1897,8 @@ function createTelegramChoiceSelection(
     view.busy = true;
     view.revision++;
     const question = questions[step]!, cells = question.rows.flat(), count = question.select ?? 1;
-    if (index >= 0) selected.has(index) ? selected.delete(index) : selected.add(index);
+    if (index < 0) cancelled = true;
+    else selected.has(index) ? selected.delete(index) : selected.add(index);
     const complete = index < 0 || selected.size === count;
     const labels = cells.filter((_cell, i) => selected.has(i)).map(cell => cell.label);
     if (complete) answers.push({ question: question.question,

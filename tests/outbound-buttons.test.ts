@@ -538,11 +538,12 @@ test("A one-question wizard keeps aggregate shape and needs no message-update po
   assert.deepEqual(answer, [{ question: "Only?", answer: "A" }]);
 });
 
-for (const cancelAfterFirst of [false, true])
-test(`Wizard cancellation returns answered steps and the current cancel label only (after-first=${cancelAfterFirst})`, async () => {
+for (const rendering of ["rich", "html"] as const) for (const cancelAfterFirst of [false, true])
+test(`Wizard cancellation returns answered steps and pressed-only red Cancel (after-first=${cancelAfterFirst}/${rendering})`, async () => {
   const store = createTelegramButtonActionStore(), prompts: unknown[] = [];
   let markup = planTelegramButtonReply('<!-- telegram_choice [{"question":"First","choices":["A"]},{"question":"Second","choices":["X","Y","Z"],"select":2,"cancelLabel":"❌ Отмена"},{"question":"Unseen","choices":["No"]}] -->',
-    { registerAction: store.register }).replyMarkup!;
+    { registerAction: store.register, rendering }).replyMarkup!;
+  assert.ok(markup.inline_keyboard.flat().every(button => !button.style));
   const click = (label: string) => handleTelegramButtonCallbackQuery({ id: "q",
     data: markup.inline_keyboard.flat().find(button => button.text.startsWith(label))!.callback_data,
     message: { chat: { id: 7 }, message_id: 1, reply_markup: markup } }, undefined, {
@@ -551,9 +552,16 @@ test(`Wizard cancellation returns answered steps and the current cancel label on
     updateSelectionMessage: async (_query, _markdown, _mode, next) => { markup = next; },
     enqueueButtonPrompt: (_query, action) => { prompts.push(JSON.parse(action.prompt)); },
   });
-  if (cancelAfterFirst) { await click("A"); await click("X"); }
+  if (cancelAfterFirst) {
+    await click("A"); await click("X");
+    assert.equal(markup.inline_keyboard.flat().find(button => button.text === "✓ X")!.style, "primary");
+  }
+  const cancelLabel = cancelAfterFirst ? "❌ Отмена" : "❌ Cancel";
+  assert.equal(markup.inline_keyboard.flat().find(button => button.text.startsWith(cancelLabel))!.style, undefined);
   assert.equal(prompts.length, 0);
-  await click(cancelAfterFirst ? "❌ Отмена" : "❌ Cancel");
+  await click(cancelLabel);
+  assert.equal(markup.inline_keyboard.flat().find(button => button.text.startsWith(cancelLabel))!.style, "danger");
+  assert.ok(markup.inline_keyboard.flat().every(button => button.disabled));
   assert.deepEqual(prompts, [cancelAfterFirst ? [{ question: "First", answer: "A" }, { question: "Second", answer: "❌ Отмена" }] :
     [{ question: "First", answer: "❌ Cancel" }]]);
 });
@@ -945,9 +953,10 @@ test(`Multiselect completion is consumed before queue callbacks, without partial
       return false;
     } };
   const initial = structuredClone(markup);
-  if (disposition === "cancel")
+  if (disposition === "cancel") {
+    await handleTelegramButtonCallbackQuery(query(markup.inline_keyboard[0]![0]!.callback_data), undefined, deps);
     await handleTelegramButtonCallbackQuery(query(markup.inline_keyboard.at(-1)![0]!.callback_data), undefined, deps);
-  else {
+  } else {
     await handleTelegramButtonCallbackQuery(query(markup.inline_keyboard[0]![0]!.callback_data), undefined, deps);
     const pending = handleTelegramButtonCallbackQuery(query(markup.inline_keyboard[1]![0]!.callback_data), undefined, deps);
     if (disposition === "throwing-queue") await assert.rejects(pending, /Unknown admission/u); else await pending;
@@ -955,6 +964,7 @@ test(`Multiselect completion is consumed before queue callbacks, without partial
   for (const button of initial.inline_keyboard.flat()) await handleTelegramButtonCallbackQuery(query(button.callback_data), undefined, deps);
   assert.equal(attempts, 1);
   assert.deepEqual(answers, [{ question: "Two", answer: disposition === "cancel" ? "❌ Cancel" : ["A", "B"] }]);
+  assert.equal(markup.inline_keyboard.at(-1)![0]!.style, disposition === "cancel" ? "danger" : undefined);
 });
 
 test("Independent collectors share a bounded footer revision without overwriting each other", async () => {
