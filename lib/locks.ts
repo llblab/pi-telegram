@@ -952,7 +952,12 @@ type TelegramRuntimeStateReadCondition =
   | "inode-mismatch"
   | "opened-links"
   | "opened-type"
-  | "opened-mode";
+  | "opened-mode"
+  | "post-read-device-mismatch"
+  | "post-read-inode-mismatch"
+  | "post-read-size-mismatch"
+  | "post-read-mtime-mismatch"
+  | "post-read-ctime-mismatch";
 export class TelegramRuntimeStateError extends Error {
   readonly code: "invalid" | "authority-changed" | "publication-unknown";
   readonly readCondition: TelegramRuntimeStateReadCondition | undefined;
@@ -1031,16 +1036,17 @@ function readTelegramRuntimeSource(path: string): string | undefined {
       closeSync(fd);
     }
     const after = lstatSync(path);
-    if (
-      after.dev !== stat.dev ||
-      after.ino !== stat.ino ||
-      after.size !== stat.size ||
-      after.mtimeMs !== stat.mtimeMs ||
-      after.ctimeMs !== stat.ctimeMs
-    )
+    const readCondition: TelegramRuntimeStateReadCondition | undefined =
+      after.dev !== stat.dev ? "post-read-device-mismatch" :
+      after.ino !== stat.ino ? "post-read-inode-mismatch" :
+      after.size !== stat.size ? "post-read-size-mismatch" :
+      after.mtimeMs !== stat.mtimeMs ? "post-read-mtime-mismatch" :
+      after.ctimeMs !== stat.ctimeMs ? "post-read-ctime-mismatch" : undefined;
+    if (readCondition)
       throw new TelegramRuntimeStateError(
         "invalid",
         "Telegram runtime state changed during observation.",
+        { readCondition },
       );
   } catch (error) {
     if (!observed && (error as { code?: unknown }).code === "ENOENT")

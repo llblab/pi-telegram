@@ -318,18 +318,23 @@ test("Connection Restore causes survive incidental context while explicit transp
   ] as const) assert.equal(formatTelegramConnectionFailure(Object.assign(new Error(detail), metadata)), notice);
 });
 
-for (const readCondition of ["device-mismatch", "inode-mismatch", "opened-links", "opened-type", "opened-mode"] as const)
-test(`Runtime read condition is finite producer evidence, not recovery authority (${readCondition})`, () => {
+for (const artifact of ["source", "compiled"] as const)
+for (const readCondition of ["device-mismatch", "inode-mismatch", "opened-links", "opened-type", "opened-mode",
+  "post-read-device-mismatch", "post-read-inode-mismatch", "post-read-size-mismatch", "post-read-mtime-mismatch", "post-read-ctime-mismatch"] as const)
+test(`Runtime read condition is finite producer evidence, not recovery authority (${readCondition}/${artifact})`, async () => {
+  const Kernel = await import(new URL(artifact === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href);
+  const Status = await import(new URL(artifact === "source" ? "../lib/status.ts" : "../dist/lib/status.js", import.meta.url).href);
   const cause = new Error("private-source-body-123:secret");
-  const original = new TelegramRuntimeStateError("invalid", "Telegram runtime state identity changed before reading.", { readCondition, cause });
-  const recorder = createTelegramRuntimeEventRecorder({ getBotToken: () => "123:secret" });
+  const message = readCondition.startsWith("post-read-") ? "Telegram runtime state changed during observation." : "Telegram runtime state identity changed before reading.";
+  const original = new Kernel.TelegramRuntimeStateError("invalid", message, { readCondition, cause });
+  const recorder = Status.createTelegramRuntimeEventRecorder({ getBotToken: () => "123:secret" });
   recorder.record("bus", original, { phase: "follower-readiness-refresh-refused", errorCode: "forged", stateReadCondition: "forged" });
   assert.deepEqual(recorder.getEvents()[0]!.details, { phase: "follower-readiness-refresh-refused", errorCode: "invalid", stateReadCondition: readCondition });
   assert.equal(original.cause, cause);
   assert.equal(original.code, "invalid");
   assert.equal(original.name, "TelegramRuntimeStateError");
-  assert.equal(original.message, "Telegram runtime state identity changed before reading.");
-  assert.equal(formatTelegramConnectionFailure(original), "Telegram connection failed. Check /telegram-status --debug.");
+  assert.equal(original.message, message);
+  assert.equal(Status.formatTelegramConnectionFailure(original), "Telegram connection failed. Check /telegram-status --debug.");
   assert.equal(JSON.stringify(recorder.getEvents()).includes("private-source-body"), false, "No causes, physical identities or source bodies enter the finite projection");
 });
 
@@ -339,6 +344,7 @@ test("Unknown runtime read fields do not become classified producer evidence", (
     new TelegramRuntimeStateError("invalid", "opaque"),
     new TelegramRuntimeStateError("authority-changed", "opaque", { readCondition: "inode-mismatch" }),
     Object.assign(new Error("opaque"), { name: "TelegramRuntimeStateError", code: "invalid", readCondition: "123:secret", dev: 1, ino: 2 }),
+    Object.assign(new Error("opaque"), { name: "TelegramRuntimeStateError", code: "invalid", readCondition: "post-read-owner-changed" }),
     Object.assign(new Error("opaque"), { name: "OtherError", code: "invalid", readCondition: "inode-mismatch" }),
     { name: "TelegramRuntimeStateError", code: "invalid", readCondition: "inode-mismatch" },
   ]) {

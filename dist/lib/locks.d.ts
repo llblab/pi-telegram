@@ -197,7 +197,7 @@ interface TelegramRuntimeStateFile {
     version: 2;
     profiles: Record<string, TelegramRuntimeStateProfile>;
 }
-type TelegramRuntimeStateReadCondition = "device-mismatch" | "inode-mismatch" | "opened-links" | "opened-type" | "opened-mode";
+type TelegramRuntimeStateReadCondition = "device-mismatch" | "inode-mismatch" | "opened-links" | "opened-type" | "opened-mode" | "post-read-device-mismatch" | "post-read-inode-mismatch" | "post-read-size-mismatch" | "post-read-mtime-mismatch" | "post-read-ctime-mismatch";
 export declare class TelegramRuntimeStateError extends Error {
     readonly code: "invalid" | "authority-changed" | "publication-unknown";
     readonly readCondition: TelegramRuntimeStateReadCondition | undefined;

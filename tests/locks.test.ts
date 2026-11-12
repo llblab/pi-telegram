@@ -250,6 +250,84 @@ test(`Runtime opened-file refusal retains its first finite condition (${artifact
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+for (const artifact of ["source", "compiled"] as const)
+test(`Runtime post-read refusal retains its first finite condition (${artifact})`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-state-post-read-")), path = join(dir, "state.json");
+  const moduleUrl = new URL(artifact === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+  try {
+    const result = await runNodeEval(`
+      import assert from "node:assert/strict";
+      import * as fs from "node:fs";
+      import { mock } from "node:test";
+      const path = ${JSON.stringify(path)};
+      let fault, lastFd, publishing = false, contentReads = 0, observations = 0;
+      const { default: defaultFs, ...namedFs } = fs;
+      mock.module("node:fs", { defaultExport: defaultFs, namedExports: { ...namedFs,
+        lstatSync(...args) {
+          const actual = fs.lstatSync(...args);
+          if (args[0] !== path || publishing || ++observations !== 2 || !fault) return actual;
+          const selected = fault; fault = undefined;
+          const fields = ["dev", "ino", "size", "mtimeMs", "ctimeMs"];
+          const firstIndex = { device: 0, inode: 1, size: 2, mtime: 3, ctime: 4, first: 0 }[selected];
+          return new Proxy(actual, { get(target, key) {
+            if (fields.indexOf(key) > firstIndex) throw new Error("Later checks ran after the first refusal");
+            if ((selected === "device" || selected === "first") && key === "dev") return target.dev === 0 ? 1 : 0;
+            if (selected === "inode" && key === "ino") return target.ino === 0 ? 1 : 0;
+            if (selected === "size" && key === "size") return target.size + 1;
+            if (selected === "mtime" && key === "mtimeMs") return target.mtimeMs + 1;
+            if (selected === "ctime" && key === "ctimeMs") return target.ctimeMs + 1;
+            return Reflect.get(target, key);
+          } });
+        },
+        readFileSync(...args) {
+          if (!publishing && typeof args[0] === "number") { lastFd = args[0]; contentReads++; }
+          return fs.readFileSync(...args);
+        },
+        closeSync(fd) {
+          fs.closeSync(fd);
+          if (!publishing && fd === lastFd && fault === "native-rename") {
+            fault = undefined; publishing = true;
+            try { Kernel.mutateTelegramRuntimeStateSection(path, "default", "runtime", () => ({ value: { boundary: "post-read-publication" }, result: true }), { isCurrent: () => true }); }
+            finally { publishing = false; }
+          }
+        },
+      } });
+      const Kernel = await import(${JSON.stringify(moduleUrl)});
+      Kernel.mutateTelegramRuntimeStateSection(path, "default", "workspace", () => ({ value: { retained: true }, result: true }), { isCurrent: () => true });
+      const cases = [
+        ["device", "post-read-device-mismatch"], ["inode", "post-read-inode-mismatch"],
+        ["size", "post-read-size-mismatch"], ["mtime", "post-read-mtime-mismatch"],
+        ["ctime", "post-read-ctime-mismatch"], ["first", "post-read-device-mismatch"],
+        ["native-rename", "post-read-inode-mismatch"], [undefined, undefined],
+      ];
+      for (const [selected, expected] of cases) {
+        fault = selected; lastFd = undefined; contentReads = 0; observations = 0;
+        let original;
+        try { Kernel.readTelegramRuntimeState(path); } catch (error) { original = error; }
+        if (expected === undefined) assert.equal(original, undefined);
+        else {
+          assert.ok(original instanceof Kernel.TelegramRuntimeStateError);
+          assert.equal(original.name, "TelegramRuntimeStateError");
+          assert.equal(original.code, "invalid");
+          assert.equal(original.message, "Telegram runtime state changed during observation.");
+          assert.equal(original.readCondition, expected);
+          assert.equal(original.cause, undefined);
+        }
+        assert.equal(contentReads, 1, "The original reader never retries; guarded publisher reads are separate");
+        assert.equal(observations, 2, "Initial and final observations retain their original order and count");
+        assert.throws(() => fs.fstatSync(lastFd), { code: "EBADF" }, "The original descriptor is closed before the final refusal");
+      }
+      const current = Kernel.readTelegramRuntimeState(path);
+      assert.deepEqual(current.profiles.default.workspace, { retained: true });
+      assert.deepEqual(current.profiles.default.runtime, { boundary: "post-read-publication" }, "The guarded publication remains committed despite the original reader refusal");
+      console.log(JSON.stringify({ postReadPartitions: 6, nativePublication: true, healthyRead: true }));
+    `, { nodeArgs: ["--experimental-test-module-mocks"] });
+    assert.equal(result.code, 0, result.stderr + result.stdout);
+    assert.equal(result.signal, null);
+    assert.deepEqual(JSON.parse(result.stdout), { postReadPartitions: 6, nativePublication: true, healthyRead: true });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("Consolidated runtime state publishes only the selected section and profile", () => {
   const temp = createTempLockPath(), path = join(temp.dir, "state.json");
   const publish = (profile: string, section: TelegramRuntimeStateSection, value: unknown) =>

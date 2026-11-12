@@ -142,7 +142,8 @@ function getTelegramRecoveryErrorDetails(error) {
     }
     if (error instanceof Error && error.name === "TelegramRuntimeStateError" && "code" in error && error.code === "invalid" &&
         "readCondition" in error && typeof error.readCondition === "string" &&
-        ["device-mismatch", "inode-mismatch", "opened-links", "opened-type", "opened-mode"].includes(error.readCondition)) {
+        ["device-mismatch", "inode-mismatch", "opened-links", "opened-type", "opened-mode",
+            "post-read-device-mismatch", "post-read-inode-mismatch", "post-read-size-mismatch", "post-read-mtime-mismatch", "post-read-ctime-mismatch"].includes(error.readCondition)) {
         details.errorCode = "invalid";
         details.stateReadCondition = error.readCondition;
     }

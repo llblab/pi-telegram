@@ -737,12 +737,13 @@ function readTelegramRuntimeSource(path) {
             closeSync(fd);
         }
         const after = lstatSync(path);
-        if (after.dev !== stat.dev ||
-            after.ino !== stat.ino ||
-            after.size !== stat.size ||
-            after.mtimeMs !== stat.mtimeMs ||
-            after.ctimeMs !== stat.ctimeMs)
-            throw new TelegramRuntimeStateError("invalid", "Telegram runtime state changed during observation.");
+        const readCondition = after.dev !== stat.dev ? "post-read-device-mismatch" :
+            after.ino !== stat.ino ? "post-read-inode-mismatch" :
+                after.size !== stat.size ? "post-read-size-mismatch" :
+                    after.mtimeMs !== stat.mtimeMs ? "post-read-mtime-mismatch" :
+                        after.ctimeMs !== stat.ctimeMs ? "post-read-ctime-mismatch" : undefined;
+        if (readCondition)
+            throw new TelegramRuntimeStateError("invalid", "Telegram runtime state changed during observation.", { readCondition });
     }
     catch (error) {
         if (!observed && error.code === "ENOENT")
