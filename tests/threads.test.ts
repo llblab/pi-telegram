@@ -149,14 +149,16 @@ test(`Consolidated load serializes one original read against a native publisher 
     };
     syncBuiltinESMExports();
     const Kernel = await import(url);
-    fs.writeFileSync(join(dir, "ready"), String(process.pid), { flag: "wx" });
+    fs.writeFileSync(join(dir, "ready.prepared"), String(process.pid), { flag: "wx" });
+    fs.renameSync(join(dir, "ready.prepared"), join(dir, "ready"));
     const started = Date.now();
     while (!exists(join(dir, "start"))) {
       if (Date.now() - started > 8000) throw new Error("Publisher start boundary expired");
       await new Promise(resolve => setTimeout(resolve, 5));
     }
     Kernel.mutateTelegramRuntimeStateSection(join(dir, "state.json"), "work", "runtime",
-      () => ({ value: { publisherPid: process.pid }, result: true }), { isCurrent: () => true });
+      () => ({ value: { publisherPid: process.pid }, result: true }), { isCurrent: () => true,
+        onPublicationBoundary: (phase: string) => { if (phase === "before-write") fs.writeFileSync(join(dir, "admitted"), "", { flag: "wx" }); } });
     fs.writeFileSync(join(dir, "committed"), String(process.pid), { flag: "wx" });
   }
   async function reader(url: string, storeUrl: string, publisherSource: string, mode: string) {
@@ -173,9 +175,15 @@ test(`Consolidated load serializes one original read against a native publisher 
     const workspace = { version: 1, source: "snapshot", writtenAtMs: 1, bot: { threadMode: "enabled" }, threads: [] };
     Kernel.mutateTelegramRuntimeStateSection(path, "work", "workspace", () => ({ value: workspace, result: true }), { isCurrent: () => true });
     let armed = false, calls = 0, guardCalls = 0, descriptorReads = 0, fd: number | undefined, reading = false;
-    let links: number | undefined, blocked: boolean | undefined;
+    let links: number | undefined, blocked: boolean | undefined, observing = false, primaryFailed = false;
+    const observations: Array<import("node:fs").Stats> = [];
+    let openedStat: import("node:fs").Stats | undefined;
     mock.module(url, { namedExports: { ...Kernel,
-      readTelegramRuntimeState(candidate: string) { if (armed && candidate === path) calls++; return Kernel.readTelegramRuntimeState(candidate); },
+      readTelegramRuntimeState(candidate: string) {
+        if (!armed || candidate !== path) return Kernel.readTelegramRuntimeState(candidate);
+        calls++; observing = true;
+        try { return Kernel.readTelegramRuntimeState(candidate); } finally { observing = false; }
+      },
       withTelegramFileTransaction(candidate: string, operation: () => unknown, options: { recoverAbandoned?: boolean }) {
         if (armed && candidate === guard) {
           guardCalls++;
@@ -215,13 +223,27 @@ test(`Consolidated load serializes one original read against a native publisher 
         if (armed && args[0] === path) { fd = opened; reading = true; }
         return opened;
       }) as typeof fs.openSync;
+      fs.lstatSync = ((...args: Parameters<typeof fs.lstatSync>) => {
+        if (observing && args[0] === path) {
+          if (observations.length === 1 && mode !== "canonical") {
+            assert.equal(reading, false, "Commit gating begins only after the original descriptor closes");
+            wait(() => fs.existsSync(join(dir, "committed")));
+          }
+          const actual = original.lstatSync(...args);
+          observations.push(actual as import("node:fs").Stats);
+          return actual;
+        }
+        return original.lstatSync(...args);
+      }) as typeof fs.lstatSync;
       fs.fstatSync = ((...args: Parameters<typeof fs.fstatSync>) => {
         if (armed && args[0] === fd && reading) {
           armed = false;
           fs.writeFileSync(join(dir, "start"), "", { flag: "wx" });
-          wait(() => fs.existsSync(join(dir, "contended")) || fs.existsSync(join(dir, "committed")));
-          blocked = !fs.existsSync(join(dir, "committed"));
+          wait(() => fs.existsSync(join(dir, mode === "canonical" ? "contended" : "admitted")) || fs.existsSync(join(dir, "admitted")));
+          blocked = fs.existsSync(join(dir, "contended"));
+          if (mode === "canonical") assert.equal(fs.existsSync(join(dir, "admitted")), false, "A protected original read excludes publisher admission");
           const actual = original.fstatSync(...args);
+          openedStat = actual as import("node:fs").Stats;
           links = Number(actual.nlink);
           return actual;
         }
@@ -238,16 +260,34 @@ test(`Consolidated load serializes one original read against a native publisher 
       try { await store.refresh(); } catch (error) { failure = error; }
       if (mode === "canonical") {
         assert.equal(failure, undefined); assert.equal(links, 1); assert.equal(descriptorReads, 1); assert.equal(blocked, true);
+        assert.equal(observations.length, 2);
       } else {
-        assert.ok(failure instanceof Kernel.TelegramRuntimeStateError);
-        // Windows may retain a link on an unlinked open descriptor; the replaced pathname must still refuse.
-        assert.ok(links === 0 || links === 1);
-        assert.equal(failure.readCondition, links === 0 ? "opened-links" : "post-read-inode-mismatch");
-        assert.equal(failure.code, "invalid"); assert.equal(descriptorReads, links === 0 ? 0 : 1); assert.equal(blocked, false);
+        if (!(failure instanceof Kernel.TelegramRuntimeStateError)) {
+          if (failure !== undefined) throw failure;
+          assert.fail("A genuinely changed original observation must refuse");
+        }
+        const before = observations[0]!;
+        assert.ok(before && openedStat, "The original pathname and descriptor observations must exist");
+        const preRead = openedStat.dev !== before.dev ? "device-mismatch" :
+          openedStat.ino !== before.ino ? "inode-mismatch" : openedStat.nlink !== 1 ? "opened-links" :
+          !openedStat.isFile() ? "opened-type" : process.platform !== "win32" && (openedStat.mode & 0o077) !== 0 ? "opened-mode" : undefined;
+        let expected = preRead;
+        if (!preRead) {
+          assert.equal(observations.length, 2);
+          const fields = { dev: "device", ino: "inode", size: "size", mtimeMs: "mtime", ctimeMs: "ctime" } as const;
+          const after = observations[1]!;
+          const first = (Object.keys(fields) as Array<keyof typeof fields>).find(key => before[key] !== after[key]);
+          assert.ok(first, "Publication must change a field in the actual original final observation");
+          expected = `post-read-${fields[first]}-mismatch`;
+        } else assert.equal(observations.length, 1);
+        assert.equal(failure.readCondition, expected);
+        assert.equal(failure.code, "invalid"); assert.equal(descriptorReads, preRead ? 0 : 1); assert.equal(blocked, false);
       }
       assert.equal(guardCalls, 1); assert.equal(calls, 1);
       assert.throws(() => original.fstatSync(fd!), { code: "EBADF" });
       assert.deepEqual(await exited, { code: 0, signal: null }, stderr);
+      assert.equal(original.existsSync(join(dir, "admitted")), true);
+      assert.equal(original.existsSync(join(dir, "committed")), true);
       assert.equal(scope(), true); assert.equal(store.getBotState().threadMode, "enabled");
       const state = Kernel.readTelegramRuntimeState(path);
       assert.deepEqual(state.profiles.work.workspace, workspace);
@@ -273,13 +313,23 @@ test(`Consolidated load serializes one original read against a native publisher 
         assert.equal(store.getBotState().threadMode, "disabled", "The existing post-await revision fence retains local mutation");
       }
       console.log(JSON.stringify({ mode, oneOriginalRead: true, strictRefusal: mode !== "canonical", publisherExited: true }));
+    } catch (error) {
+      primaryFailed = true;
+      console.error("native-load-fixture:" + JSON.stringify({ mode, calls, guardCalls, descriptorReads, observations, openedStat, links, blocked, stderr,
+        error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error) }));
+      throw error;
     } finally {
-      for (const key of ["openSync", "fstatSync", "readFileSync", "closeSync"] as const) fs[key] = original[key] as never;
+      for (const key of ["openSync", "lstatSync", "fstatSync", "readFileSync", "closeSync"] as const) fs[key] = original[key] as never;
       syncBuiltinESMExports();
-      // An earlier failure still releases the isolated publisher through its existing bounded start protocol.
-      if (!original.existsSync(join(dir, "start"))) original.writeFileSync(join(dir, "start"), "", { flag: "wx" });
-      await exited;
-      original.rmSync(dir, { recursive: true, force: true });
+      try {
+        // An earlier failure still releases the isolated publisher through its existing bounded start protocol.
+        if (!original.existsSync(join(dir, "start"))) original.writeFileSync(join(dir, "start"), "", { flag: "wx" });
+        await exited;
+        original.rmSync(dir, { recursive: true, force: true });
+      } catch (error) {
+        if (!primaryFailed) throw error;
+        console.error("native-load-cleanup-refused", error);
+      }
     }
   }
   const result = await runNodeEval("(" + reader.toString() + ")(" + [kernelUrl, threadsUrl, publisher.toString(), boundary].map(value => JSON.stringify(value)).join(",") + ")",

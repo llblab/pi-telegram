@@ -12170,7 +12170,20 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     complete = true;
   } catch (error) {
     const observations = await Promise.allSettled(roots.map(root => root.request("diagnostics")));
-    console.error("native-restore-fixture:" + JSON.stringify(observations));
+    try {
+      const failure = { version: 1, artifact, stage: "before-cleanup", pid: process.pid,
+        error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error),
+        leaderObserved, followerObserved, observations: observations.map(row => row.status === "fulfilled" ? row :
+          { status: row.status, reason: row.reason instanceof Error ? { name: row.reason.name, message: row.reason.message, stack: row.reason.stack } : String(row.reason) }) };
+      console.error("native-restore-fixture:" + JSON.stringify(failure));
+      const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
+      if (evidenceDir) {
+        fs.mkdirSync(evidenceDir, { recursive: true });
+        fs.writeFileSync(join(evidenceDir, `restore-${artifact}.json`), JSON.stringify(failure, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+      }
+    } catch (captureError) {
+      try { console.error("native-restore-capture-refused", String(captureError)); } catch { /* Preserve the original fixture Error. */ }
+    }
     throw error;
   } finally {
     const outcomes = await Promise.allSettled(roots.map(root => root.stop()));

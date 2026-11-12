@@ -260,12 +260,16 @@ test(`Runtime post-read refusal retains its first finite condition (${artifact})
       import * as fs from "node:fs";
       import { mock } from "node:test";
       const path = ${JSON.stringify(path)};
-      let fault, lastFd, publishing = false, contentReads = 0, observations = 0;
+      let fault, lastFd, initial, final, publishing = false, contentReads = 0, observations = 0;
       const { default: defaultFs, ...namedFs } = fs;
       mock.module("node:fs", { defaultExport: defaultFs, namedExports: { ...namedFs,
         lstatSync(...args) {
           const actual = fs.lstatSync(...args);
-          if (args[0] !== path || publishing || ++observations !== 2 || !fault) return actual;
+          if (args[0] !== path || publishing) return actual;
+          observations++;
+          if (observations === 1) initial = actual;
+          if (observations === 2) final = actual;
+          if (observations !== 2 || !fault) return actual;
           const selected = fault; fault = undefined;
           const fields = ["dev", "ino", "size", "mtimeMs", "ctimeMs"];
           const firstIndex = { device: 0, inode: 1, size: 2, mtime: 3, ctime: 4, first: 0 }[selected];
@@ -296,21 +300,28 @@ test(`Runtime post-read refusal retains its first finite condition (${artifact})
       Kernel.mutateTelegramRuntimeStateSection(path, "default", "workspace", () => ({ value: { retained: true }, result: true }), { isCurrent: () => true });
       const cases = [
         ["device", "post-read-device-mismatch"], ["inode", "post-read-inode-mismatch"],
+        // Equal device/inode with changed size remains an independent first-refusal partition.
         ["size", "post-read-size-mismatch"], ["mtime", "post-read-mtime-mismatch"],
         ["ctime", "post-read-ctime-mismatch"], ["first", "post-read-device-mismatch"],
-        ["native-rename", "post-read-inode-mismatch"], [undefined, undefined],
+        ["native-rename", "observed-first-mismatch"], [undefined, undefined],
       ];
       for (const [selected, expected] of cases) {
-        fault = selected; lastFd = undefined; contentReads = 0; observations = 0;
-        let original;
+        fault = selected; lastFd = initial = final = undefined; contentReads = 0; observations = 0;
+        let original, expectedCondition = expected;
         try { Kernel.readTelegramRuntimeState(path); } catch (error) { original = error; }
+        if (selected === "native-rename") {
+          const fields = { dev: "device", ino: "inode", size: "size", mtimeMs: "mtime", ctimeMs: "ctime" };
+          const first = Object.keys(fields).find(key => initial[key] !== final[key]);
+          assert.ok(first, "Native publication must change an actually observed field");
+          expectedCondition = "post-read-" + fields[first] + "-mismatch";
+        }
         if (expected === undefined) assert.equal(original, undefined);
         else {
           assert.ok(original instanceof Kernel.TelegramRuntimeStateError);
           assert.equal(original.name, "TelegramRuntimeStateError");
           assert.equal(original.code, "invalid");
           assert.equal(original.message, "Telegram runtime state changed during observation.");
-          assert.equal(original.readCondition, expected);
+          assert.equal(original.readCondition, expectedCondition);
           assert.equal(original.cause, undefined);
         }
         assert.equal(contentReads, 1, "The original reader never retries; guarded publisher reads are separate");
