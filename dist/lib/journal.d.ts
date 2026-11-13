@@ -10,6 +10,7 @@ import { type TelegramWorkspaceAdmissionLedger, type TelegramWorkspaceAdmissionS
 export declare const TELEGRAM_UPDATE_JOURNAL_VERSION: 1;
 export declare const TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION: 2;
 export declare const TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION: 3;
+declare const TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION: 4;
 export declare const TELEGRAM_UPDATE_JOURNAL_QUEUE_OWNER_ID_MAX_LENGTH = 256;
 export declare const TELEGRAM_UPDATE_JOURNAL_FAILURE_CLASS_MAX_LENGTH = 128;
 export declare const TELEGRAM_UPDATE_JOURNAL_FAILURE_SUMMARY_MAX_LENGTH = 512;
@@ -177,11 +178,81 @@ export interface TelegramUpdateJournalEntry {
     queueHandoff?: TelegramUpdateJournalQueueHandoff;
     inputClaim?: TelegramUpdateJournalInputClaim;
     inputProvenance?: TelegramUpdateJournalInputProvenance;
+    privateTextReply?: TelegramJournalPrivateTextReply;
     failure?: TelegramUpdateJournalFailure;
     nextRetryAtMs?: number;
     terminalAtMs?: number;
     terminalReason?: string;
     terminalFailureId?: string;
+}
+/** Bounded persisted evidence only; callers own semantic original-receiver verification. */
+export interface TelegramJournalPrivateTextReplyDestination {
+    profile: string;
+    botIdentity: {
+        botId: number;
+        tokenSha256: string;
+    };
+    operatorUserId: number;
+    sourceTarget: {
+        chatId: number;
+        threadId?: number;
+    };
+    sourceMessageId: number;
+    publicationTarget: {
+        chatId: number;
+        threadId?: number;
+    };
+    publicationMessageId: number;
+    requestNonce: string;
+    receiver: {
+        instanceId: string;
+        profileKey: string;
+        bindingKey: string;
+        registrationGeneration: string;
+        sessionId: string;
+        sessionGeneration: number;
+        pid: number;
+        processBirthId: string;
+        cwd: string;
+        endpoint: string;
+        slot?: string;
+        target?: {
+            chatId: number;
+            threadId?: number;
+        };
+        protocol: {
+            protocolVersion: number;
+            runtimeBuild: string;
+            capabilities: string[];
+        };
+    };
+}
+/** Opt-in v5 candidate data only; neither receiver liveness nor a submission/disposition receipt. */
+export interface TelegramJournalTextInputAssociation {
+    source: TelegramInputJournalSourceReference;
+    expectedSource: TelegramUpdateJournalEntryDigest;
+    requestNonce: string;
+    operatorUserId: number;
+    target: {
+        chatId: number;
+        threadId?: number;
+    };
+    receiver: TelegramUpdateJournalQueueOwnerIdentity & {
+        sessionId: string;
+        bindingKey: string;
+        deliveryGeneration: string;
+    };
+}
+export interface TelegramTextInputSourceJournalCandidate extends Omit<TelegramUpdateJournalFile, "version" | "entries"> {
+    version: 5;
+    entries: (TelegramUpdateJournalEntry & {
+        privateTextInput?: TelegramJournalTextInputAssociation;
+    })[];
+}
+export interface TelegramJournalPrivateTextReply {
+    source: TelegramInputJournalSourceReference;
+    expectedSource: TelegramUpdateJournalEntryDigest;
+    destination: TelegramJournalPrivateTextReplyDestination;
 }
 /** Exact parsed journal entry identity, checked inside the source owner's mutation transaction. */
 export interface TelegramUpdateJournalEntryDigest {
@@ -194,7 +265,7 @@ export interface TelegramUpdateJournalSourceCompletion extends TelegramUpdateJou
 }
 export declare function createTelegramUpdateJournalEntryDigest(entry: TelegramUpdateJournalEntry): TelegramUpdateJournalEntryDigest;
 export interface TelegramUpdateJournalFile {
-    version: typeof TELEGRAM_UPDATE_JOURNAL_VERSION | typeof TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION | typeof TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION;
+    version: typeof TELEGRAM_UPDATE_JOURNAL_VERSION | typeof TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION | typeof TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION | typeof TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION;
     revision?: number;
     acceptedThroughUpdateId?: number;
     profile: string;
@@ -203,7 +274,8 @@ export interface TelegramUpdateJournalFile {
     operatorDispositions?: TelegramUpdateJournalOperatorDisposition[];
     sourceCompletions?: TelegramUpdateJournalSourceCompletion[];
 }
-export interface TelegramUpdateJournalSnapshot extends TelegramUpdateJournalFile {
+export interface TelegramUpdateJournalSnapshot<V extends TelegramUpdateJournalFile["version"] = 1 | 2 | 3> extends Omit<TelegramUpdateJournalFile, "version"> {
+    version: V;
     exists: boolean;
     serializedBytes: number;
 }
@@ -374,6 +446,13 @@ export interface TelegramUpdateJournalAbandonedPendingEvidence {
     updateId: number;
     retainedPath: string;
     operatorAuthorityId: string;
+    /** Read-only original bot-chat facts; never cancellation, execution or cleanup authority by themselves. */
+    originalTarget?: Readonly<{
+        chatId: number;
+        threadId: number;
+        messageId: number;
+        sourceSha256: string;
+    }>;
 }
 export interface TelegramRoutingInputAuthority {
     journalBindingKey: string;
@@ -383,7 +462,7 @@ export interface TelegramRoutingInputAuthority {
 }
 /** Expiry drops a donor attempt without retaining its body or claiming recipient execution/cancellation. */
 export type TelegramRoutingInputExpiryResult = Omit<TelegramUpdateJournalPendingAbandonmentResult, "retainedPath">;
-export type TelegramRoutingInputExpiryEvidence = Omit<TelegramUpdateJournalAbandonedPendingEvidence, "retainedPath">;
+export type TelegramRoutingInputExpiryEvidence = Omit<TelegramUpdateJournalAbandonedPendingEvidence, "retainedPath" | "originalTarget">;
 /** Package-private v1 capability; raw input custody does not expose it. */
 export interface TelegramRoutingInputJournal {
     arm(input: TelegramRoutingInputAuthority & {
@@ -400,9 +479,9 @@ export interface TelegramRoutingInputJournal {
     inspectExpiry(updateId: number): TelegramRoutingInputExpiryEvidence | undefined;
     inspectGroupExpiry(updateIds: readonly number[]): TelegramRoutingInputExpiryEvidence[] | undefined;
 }
-export interface TelegramUpdateJournalStore {
+export interface TelegramUpdateJournalStore<V extends TelegramUpdateJournalFile["version"] = 1 | 2 | 3> {
     routingInputs?: TelegramRoutingInputJournal;
-    read(): TelegramUpdateJournalSnapshot;
+    read(): TelegramUpdateJournalSnapshot<V>;
     /** Read-only: the committed abandonment tombstone plus its matching private retention, or undefined. */
     inspectAbandonedPending(updateId: number): TelegramUpdateJournalAbandonedPendingEvidence | undefined;
     /** Read-only protection evidence for this snapshot entry, never commit/execution authority. */
@@ -412,12 +491,14 @@ export interface TelegramUpdateJournalStore {
     markQueued(receipt: TelegramUpdateJournalQueueReceipt): TelegramUpdateJournalQueueResult;
     markExecutionFailure(input: TelegramUpdateJournalFailureInput): TelegramUpdateJournalFailureResult;
     applyOperatorDisposition(input: TelegramUpdateJournalOperatorDispositionInput): TelegramUpdateJournalOperatorDispositionResult;
+    /** Explicit operator-only exact v1 retry disposal; no execution, custody recovery or schema upgrade. */
+    discardRetryWait(input: TelegramUpdateJournalPendingAbandonmentInput): TelegramUpdateJournalOperatorDispositionResult;
     applyLegacyCustodyDisposition(authority: TelegramUpdateJournalLegacyCustodyDispositionAuthority): TelegramUpdateJournalLegacyCustodyDispositionResult;
     offerQueuedHandoff(input: TelegramUpdateJournalQueueHandoffInput): TelegramUpdateJournalQueueHandoffOfferResult;
     acceptQueuedHandoff(input: TelegramUpdateJournalQueueHandoffInput): TelegramUpdateJournalQueueHandoffAcceptResult;
     cancelQueuedHandoff(input: TelegramUpdateJournalQueueHandoffInput): TelegramUpdateJournalQueueHandoffCancelResult;
     completeQueued(receipts: readonly TelegramUpdateJournalQueuedCompletion[]): TelegramUpdateJournalRemoveResult;
-    /** Strict v1 whole-receipt disposal co-publishes caller-scoped ACKs; never a readiness grant. */
+    /** Strict legacy/v4 whole-receipt disposal co-publishes caller-scoped ACKs; never a readiness grant. */
     completeQueuedExact(receipts: readonly TelegramUpdateJournalQueuedCompletion[], completions: readonly TelegramUpdateJournalSourceCompletion[]): TelegramUpdateJournalRemoveResult;
     discardQueued(input: TelegramUpdateJournalQueueDiscardInput): TelegramUpdateJournalQueueDiscardResult;
     recoverDeadQueueOwner(input: TelegramUpdateJournalDeadQueueOwnerRecoveryInput): TelegramUpdateJournalDeadQueueOwnerRecoveryResult;
@@ -550,8 +631,19 @@ export interface TelegramInputJournalHandoffCancelResult {
     entryCount: number;
     serializedBytes: number;
 }
-export interface TelegramInputJournalStore {
-    read: TelegramUpdateJournalStore["read"];
+/** Native exact completion is exposed only by literal-v4 construction, never preparation/observation handles. */
+export type TelegramInputJournalStore<V extends TelegramUpdateJournalFile["version"] = 1 | 2 | 3> = TelegramInputJournalStoreBase<V> & (V extends 4 ? Pick<TelegramUpdateJournalStore<V>, "completeQueuedExact" | "inspectSourceCompletion"> : {});
+interface TelegramInputJournalStoreBase<V extends TelegramUpdateJournalFile["version"]> {
+    /** V4-only immutable source evidence; every success requires current ready authority. */
+    pinPrivateTextReplyDestination(input: {
+        receipt: TelegramInputJournalReceipt;
+        expectedSource: TelegramUpdateJournalEntryDigest;
+        destination: TelegramJournalPrivateTextReplyDestination;
+        assertAuthority: () => void;
+    }): {
+        pinned: boolean;
+    };
+    read: TelegramUpdateJournalStore<V>["read"];
     appendBatch: TelegramUpdateJournalStore["appendBatch"];
     listLegacyCustodyCandidates(): TelegramUpdateJournalLegacyCustodyCandidate[];
     applyLegacyCustodyDisposition: TelegramUpdateJournalStore["applyLegacyCustodyDisposition"];
@@ -597,6 +689,8 @@ export interface TelegramInputJournalContext {
     recipientBindingKey: string;
 }
 export type TelegramInputJournalStoreOptions = Omit<TelegramUpdateJournalStoreOptions, "withPairedAdmission"> & Required<Pick<TelegramUpdateJournalStoreOptions, "sourceAccess" | "withSourceSerialization" | "withPairingAdmission" | "queueRuntimeIdentity">> & {
+    /** Explicit storage selection only; never migrates an existing family. */
+    storageVersion?: 3;
     /** Bound originating profile/token/session/recipient context, not transport role; undefined revokes acquisition/start/transfer. */
     getInputContext: () => TelegramInputJournalContext | undefined;
 };
@@ -622,16 +716,30 @@ export declare function isTelegramUpdateJournalQueueOwnerProcess(owner: Telegram
 export declare function areTelegramUpdateJournalQueueOwnersEqual(left: TelegramUpdateJournalQueueOwner, right: TelegramUpdateJournalQueueOwner): boolean;
 /** Only legacy v1 carries routing-lifetime, scoped-ACK and pairing-free queue-receipt semantics. */
 export declare function isTelegramUpdateJournalLegacyFamilyVersion(version: unknown): boolean;
-/**
- * Isolated evidence only: caller must serialize/quiesce writers before inspection
- * and consumption. Metadata checks detect observable changes, not hostile same-user
- * swaps or whole-profile completeness. No locks, recovery, or publication occurs.
- * maxFiles counts snapshot + every enumerated segment entry (one overflow witness).
- * maxBytes aggregates all retained bytes. maxEntries bounds each raw collection and
- * reconstructed collection; maxWork charges each raw/revalidated collection element.
- * JSON allocation is bounded by maxBytes before decoding; collections before codecs.
- */
-export declare function inspectTelegramInputCustodySourceStatus(input: Parameters<typeof inspectTelegramUpdateJournalFamily>[0]): "absent" | "v3" | "legacy" | "unsupported" | "ambiguous";
+/** Explicit data codec only. Existing journal stores continue refusing v5, including recovery paths. */
+export declare function decodeTelegramTextInputSourceJournalCandidate(serialized: string, path: string): TelegramTextInputSourceJournalCandidate;
+/** Read-only warm publication data, never a source-use, SDK or removal receipt. */
+export interface TelegramTextInputSourceCustodyObservation {
+    readonly revision: number;
+    readonly frameUpdateIds: readonly number[];
+    readonly associations: readonly Readonly<Omit<TelegramJournalTextInputAssociation, "source" | "expectedSource" | "target" | "receiver"> & {
+        readonly source: Readonly<TelegramJournalTextInputAssociation["source"]>;
+        readonly expectedSource: Readonly<TelegramJournalTextInputAssociation["expectedSource"]>;
+        readonly target: Readonly<TelegramJournalTextInputAssociation["target"]>;
+        readonly receiver: Readonly<TelegramJournalTextInputAssociation["receiver"]>;
+    }>[];
+}
+/** Private native payload issued only inside the original frame's synchronous use scope. */
+export interface TelegramTextSourceUseInput {
+    readonly association: TelegramTextInputSourceCustodyObservation["associations"][number];
+    readonly profile: string;
+    readonly botId: number;
+    readonly revision: number;
+    readonly messageId: number;
+    readonly text: string;
+}
+/** Peek is immutable data only. Consume is one spent-before-probes native source barrier, never an SDK result. */
+export declare function readTelegramNativeTextSourceUse(value: unknown, consume?: boolean): Readonly<TelegramTextSourceUseInput>;
 export declare function inspectTelegramUpdateJournalFamily(input: {
     directory: string;
     path: string;
@@ -664,6 +772,7 @@ export interface TelegramUpdateJournalRetentionInspection {
         failureId: string;
         updateId: number;
         state: "committed" | "uncommitted";
+        originalTarget?: TelegramUpdateJournalAbandonedPendingEvidence["originalTarget"];
     }[];
 }
 /** Classifies private originals against exact discard tombstones; never replay or deletion authority. */
@@ -802,7 +911,7 @@ export interface TelegramUpdateJournalRuntimeBindingResolverDeps {
     strictSourceAccess?: boolean;
 }
 export declare function createTelegramUpdateJournalRuntimeBindingResolver(deps: TelegramUpdateJournalRuntimeBindingResolverDeps): () => TelegramUpdateJournalRuntimeBinding | undefined;
-export type TelegramUpdateJournalReferenceClass = "leader-lifecycle" | "follower-lifecycle" | "polling-cursor" | "polling-bootstrap" | "workspace-retirement" | "operator-disposition";
+export type TelegramUpdateJournalReferenceClass = "leader-lifecycle" | "follower-lifecycle" | "polling-cursor" | "polling-bootstrap" | "workspace-retirement" | "operator-disposition" | "private-source-observation";
 export declare function createTelegramUpdateJournalReferenceRegistry(input?: {
     maxActive?: number;
 }): {
@@ -825,6 +934,44 @@ export declare function withTelegramResolvedUpdateJournalReference<T>(input: {
     referenceClass: TelegramUpdateJournalReferenceClass;
     operation(binding: TelegramUpdateJournalRuntimeBinding): T;
 }): T | undefined;
+type PrivateReplyJournal = Pick<TelegramInputJournalStore<4>, "read" | "acquireInput" | "pinPrivateTextReplyDestination">;
+interface PrivateTextReplySelection {
+    purpose: "private-text-reply-first-ready";
+    source: TelegramInputJournalSourceReference;
+    expectedPendingSource: TelegramUpdateJournalEntryDigest;
+    destination: TelegramJournalPrivateTextReplyDestination;
+    assertOriginal: () => void;
+}
+interface PrivateTextReplyPreparationScope {
+    readonly journal: PrivateReplyJournal;
+    readonly sourceIdentity: Readonly<Omit<TelegramInputJournalSourceReference, "updateId">>;
+    assertCurrent(): void;
+    selectPrivateTextReplyContext(journal: PrivateReplyJournal, selection: PrivateTextReplySelection): {
+        readonly context: TelegramInputJournalContext;
+        assertCurrent(): void;
+    };
+}
+export interface TelegramPrivateTextReplyPreparationSource {
+    withScope<T>(updateId: number, operation: (scope: PrivateTextReplyPreparationScope) => T): T;
+}
+export interface TelegramPrivateTextReplyAcceptanceCandidate {
+    destination: TelegramJournalPrivateTextReplyDestination;
+    message: unknown;
+}
+export type TelegramPrivateTextReplyReceiverSelector = (candidate: TelegramPrivateTextReplyAcceptanceCandidate, assertSource: () => void) => Readonly<{
+    assertCurrent(): void;
+}> | undefined;
+export interface TelegramV4InputCandidate {
+    readonly profile: string;
+    readonly botIdentity: Readonly<TelegramUpdateJournalBotIdentity>;
+    readonly sessionId: string;
+    readonly owner: Readonly<TelegramUpdateJournalQueueOwnerIdentity>;
+    readonly source: Readonly<TelegramInputJournalSourceReference>;
+    readonly expectedSource: Readonly<TelegramUpdateJournalEntryDigest>;
+    readonly entry: TelegramUpdateJournalEntry;
+}
+export type TelegramOrdinaryV4InputCandidate = TelegramV4InputCandidate;
+export type TelegramOrdinaryV4SelectionGuard = (candidate: TelegramOrdinaryV4InputCandidate) => void;
 /** Operator-distinct authority: routing never treats it as an owner cancellation. */
 export declare const TELEGRAM_SESSION_ADOPTION_AUTHORITY_PREFIX = "session-successor:";
 export interface TelegramSessionPendingAdoptionInput {
@@ -876,5 +1023,4 @@ export declare function createTelegramUpdateJournalBindingRuntime(deps: {
  */
 export declare function createTelegramJournalSourceSerialization(getTransactionPath?: () => string): <T>(operation: () => T) => T;
 export declare function createTelegramUpdateJournalStore(options: TelegramUpdateJournalStoreOptions): TelegramUpdateJournalStore;
-/** Opt-in v3 only; does not migrate old files or expose legacy unowned mutation ports. */
-export declare function createTelegramInputJournalStore(options: TelegramInputJournalStoreOptions): TelegramInputJournalStore;
+export {};

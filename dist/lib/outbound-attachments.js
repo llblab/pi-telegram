@@ -3,13 +3,15 @@
  * Zones: telegram outbound, pi agent tool, filesystem
  * Owns telegram_attach registration, outbound attachment queueing, and delivery so Telegram file output stays in one domain module
  */
-import { stat } from "node:fs/promises";
-import { basename } from "node:path";
+import { open, realpath, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { basename, isAbsolute } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { isTelegramChannelPostValidationError, TelegramChannelPostValidationError, } from "./channel-posts.js";
 import { TELEGRAM_ATTACH_PROMPT_GUIDELINES, TELEGRAM_ATTACH_PROMPT_SNIPPET, TELEGRAM_MESSAGE_PROMPT_GUIDELINES, TELEGRAM_MESSAGE_PROMPT_SNIPPET, } from "./prompts.js";
 import { normalizeTelegramNativeMarkdown, withTelegramReplyParameters, } from "./replies.js";
 import { getTelegramTargetThreadParams, } from "./target.js";
+import { isTelegramArtifactFileName, TELEGRAM_ARTIFACT_MAX_BYTES } from "./wire.js";
 const MAX_ATTACHMENTS_PER_TURN = 10;
 export const TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
 // Deliberately local: outbound attachment delivery stays decoupled from Bot API helpers.
@@ -28,6 +30,60 @@ const TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES = getTelegramOutboundAttachmentByte
     "PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES",
     "TELEGRAM_MAX_ATTACHMENT_SIZE_BYTES",
 ]);
+export class TelegramArtifactSourceError extends Error {
+    reason;
+    constructor(reason, options) {
+        super("Telegram artifact source could not be captured.", options);
+        this.reason = reason;
+        this.name = "TelegramArtifactSourceError";
+    }
+}
+export function validateTelegramArtifactFile(path, name) {
+    if (typeof path !== "string" || !isAbsolute(path) || path.includes("\0") || !isTelegramArtifactFileName(name))
+        throw new TypeError("Telegram artifact requires an absolute source path and valid explicit basename.");
+}
+export function getTelegramArtifactByteLimit(maxBytes = TELEGRAM_ARTIFACT_MAX_BYTES) {
+    return Math.min(TELEGRAM_ARTIFACT_MAX_BYTES, TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES, maxBytes);
+}
+/** One regular descriptor, bounded actual read, and observational continuity; links are caller-authorized. */
+export async function captureTelegramArtifactSource(path, maxBytes = TELEGRAM_ARTIFACT_MAX_BYTES) {
+    const limit = getTelegramArtifactByteLimit(maxBytes);
+    const same = (a, b) => a.dev === b.dev && a.ino === b.ino &&
+        a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+    try {
+        const resolved = await realpath(path), before = await stat(resolved, { bigint: true });
+        if (!before.isFile() || before.size < 1n)
+            throw new TelegramArtifactSourceError("source-invalid");
+        if (before.size > BigInt(limit))
+            throw new TelegramArtifactSourceError("size-exceeded");
+        const fd = await open(resolved, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+        try {
+            const opened = await fd.stat({ bigint: true });
+            if (!opened.isFile() || !same(before, opened))
+                throw new TelegramArtifactSourceError("source-changed");
+            const bytes = Buffer.alloc(Number(opened.size) + 1);
+            let total = 0;
+            while (total < bytes.length) {
+                const { bytesRead } = await fd.read(bytes, total, bytes.length - total, total);
+                if (!bytesRead)
+                    break;
+                total += bytesRead;
+            }
+            const after = await fd.stat({ bigint: true }), selected = await stat(resolved, { bigint: true });
+            if (total !== Number(opened.size) || !same(opened, after) || !same(opened, selected) || await realpath(path) !== resolved)
+                throw new TelegramArtifactSourceError("source-changed");
+            return bytes.subarray(0, total);
+        }
+        finally {
+            await fd.close();
+        }
+    }
+    catch (cause) {
+        if (cause instanceof TelegramArtifactSourceError)
+            throw cause;
+        throw new TelegramArtifactSourceError("source-unavailable", { cause });
+    }
+}
 class TelegramRichAttachmentCommitUnknownError extends Error {
     kind = "commit-unknown";
     constructor(cause) {

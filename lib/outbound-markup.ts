@@ -1,9 +1,10 @@
 /**
  * Telegram outbound markup parsing helpers
  * Zones: telegram outbound, assistant markup
- * Owns delimiter-based assistant action comment extraction, attribute parsing, and markup stripping shared by voice and outbound delivery
+ * Owns assistant action comment/fence parsing, declarative UI wire validation, and markup stripping shared by voice and outbound delivery
  */
 
+import type { TelegramInlineKeyboardButtonStyle } from "./keyboard.ts";
 import { isWireRecord as isTelegramActionPayload } from "./wire.ts";
 
 export interface TelegramHtmlComment {
@@ -77,7 +78,8 @@ export function collectTelegramHtmlComments(markdown: string): {
 
 export function replaceTelegramButtonFences(
   markdown: string,
-  replace: (payload: string, closed: boolean) => string,
+  replace: (payload: string, closed: boolean, element: string) => string,
+  elements: readonly string[] = ["telegram_button"],
 ): string {
   let result = "";
   let copied = 0;
@@ -85,6 +87,7 @@ export function replaceTelegramButtonFences(
   let fence: TelegramTopLevelFenceState | undefined;
   let actionStart: number | undefined;
   let contentStart = 0;
+  let actionElement = "";
   while (offset < markdown.length) {
     const end = getMarkdownLineEnd(markdown, offset);
     const line = getMarkdownLineText(markdown, offset, end);
@@ -92,7 +95,7 @@ export function replaceTelegramButtonFences(
       if (isTopLevelClosingFence(line, fence)) {
         if (actionStart !== undefined) {
           result += markdown.slice(copied, actionStart);
-          result += replace(markdown.slice(contentStart, offset), true) + "\n";
+          result += replace(markdown.slice(contentStart, offset), true, actionElement) + "\n";
           copied = end;
           actionStart = undefined;
         }
@@ -105,7 +108,9 @@ export function replaceTelegramButtonFences(
       continue;
     } else {
       fence = getTopLevelOpeningFence(line);
-      if (fence && /^[ \t]*(?:`{3,}|~{3,})[ \t]*telegram_button[ \t]*$/.test(line)) {
+      const element = line.match(/^[ \t]*(?:`{3,}|~{3,})[ \t]*(telegram_[a-z_]+)[ \t]*$/)?.[1];
+      if (fence && element && elements.includes(element)) {
+        actionElement = element;
         actionStart = offset;
         contentStart = end;
       }
@@ -114,7 +119,7 @@ export function replaceTelegramButtonFences(
   }
   if (actionStart !== undefined) {
     result += markdown.slice(copied, actionStart);
-    return result + replace(markdown.slice(contentStart), false);
+    return result + replace(markdown.slice(contentStart), false, actionElement);
   }
   return result + markdown.slice(copied);
 }
@@ -586,6 +591,227 @@ export function parseTelegramActionPayloadRows(
   ];
 }
 
+// --- Declarative UI Wire Contract ---
+
+export interface TelegramUiQuestion {
+  readonly id?: string;
+  readonly question: string;
+  readonly timeoutMs: number;
+  readonly cancelLabel: string;
+}
+
+export interface TelegramUiChoiceCell {
+  readonly label: string;
+  readonly value: string;
+  readonly style?: TelegramInlineKeyboardButtonStyle;
+  readonly disabled: boolean;
+}
+
+export type TelegramUiChoiceRows = readonly (readonly TelegramUiChoiceCell[])[];
+
+export interface TelegramUiChoiceQuestion extends TelegramUiQuestion {
+  readonly rows: TelegramUiChoiceRows;
+  /** Exact number of choices required; omitted means one. */
+  readonly select?: number;
+}
+
+export type TelegramUiDeclaration =
+  | { readonly kind: "choice"; readonly batched: boolean; readonly questions: readonly TelegramUiChoiceQuestion[]; readonly timeoutMs: number }
+  | (TelegramUiQuestion & { readonly kind: "confirm"; readonly confirmLabel: string; readonly confirmStyle?: TelegramInlineKeyboardButtonStyle })
+  | (TelegramUiQuestion & { readonly kind: "text_input"; readonly maxLength: number; readonly multiline: boolean })
+  | (TelegramUiQuestion & { readonly kind: "attachment"; readonly accept: readonly string[]; readonly maxFiles: number; readonly maxBytes: number });
+
+export type TelegramUiDeclarationParseResult =
+  | { readonly ok: true; readonly declaration: TelegramUiDeclaration }
+  | { readonly ok: false; readonly reason: "unsupported-element" | "invalid-declaration"; readonly message: string };
+
+const TELEGRAM_UI_COMMON_KEYS = ["id", "question", "timeoutMs", "cancelLabel"];
+const TELEGRAM_UI_MAX_SOURCE_LENGTH = 65_536;
+const TELEGRAM_UI_MAX_TIMEOUT_MS = 3_600_000;
+const TELEGRAM_UI_DEFAULT_TIMEOUT_MS = 300_000;
+const TELEGRAM_UI_SELECTION_DEFAULT_TIMEOUT_MS = 60 * 60_000;
+const TELEGRAM_UI_SELECTION_HEAD_TIMEOUT_MS = 86_400_000;
+
+class TelegramUiDeclarationError extends Error {}
+
+function invalidTelegramUi(message: string): never {
+  throw new TelegramUiDeclarationError(message);
+}
+
+function telegramUiRecord(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  if (!isTelegramActionPayload(value) || Object.keys(value).some((key) => !keys.includes(key))) {
+    invalidTelegramUi("Unexpected declaration shape or property.");
+  }
+  return value;
+}
+
+function telegramUiText(value: unknown, maxLength: number, allowEmpty = false): string {
+  if (typeof value !== "string") invalidTelegramUi("Expected a string.");
+  const normalized = value.trim();
+  if ((!allowEmpty && !normalized) || normalized.length > maxLength ||
+      !normalized.isWellFormed() || /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(normalized)) {
+    invalidTelegramUi("Invalid single-line string or length.");
+  }
+  return normalized;
+}
+
+function telegramUiInteger(value: unknown, fallback: number, maximum: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > maximum) {
+    invalidTelegramUi("Invalid positive integer or bound.");
+  }
+  return value as number;
+}
+
+function telegramUiBoolean(value: unknown, fallback: boolean): boolean {
+  if (value === undefined) return fallback;
+  if (typeof value !== "boolean") invalidTelegramUi("Expected a boolean.");
+  return value;
+}
+
+function telegramUiStyle(value: unknown): TelegramUiChoiceCell["style"] {
+  if (value === undefined || value === "primary" || value === "success" || value === "danger") return value;
+  return invalidTelegramUi("Invalid button style.");
+}
+
+function telegramUiCommon(record: Record<string, unknown>, cancelLabel = "❌ Cancel", defaultTimeoutMs = TELEGRAM_UI_DEFAULT_TIMEOUT_MS): TelegramUiQuestion {
+  return {
+    ...(record.id !== undefined ? { id: telegramUiText(record.id, 128) } : {}),
+    question: telegramUiText(record.question, 1024),
+    timeoutMs: telegramUiInteger(record.timeoutMs, defaultTimeoutMs, TELEGRAM_UI_MAX_TIMEOUT_MS),
+    cancelLabel: record.cancelLabel === undefined ? cancelLabel : telegramUiText(record.cancelLabel, 128),
+  };
+}
+
+function parseTelegramUiChoiceCompactCell(atoms: readonly string[]): Record<string, unknown> | undefined {
+  const cell = parseTelegramButtonCompactActionPayload(atoms);
+  return cell ? {
+    label: cell.label ?? cell.value ?? cell.prompt ?? "",
+    value: cell.prompt ?? cell.value ?? cell.label ?? "",
+    ...(cell.selected_style !== undefined ? { style: cell.selected_style } : {}),
+    ...(cell.disabled !== undefined ? { disabled: cell.disabled } : {}),
+  } : undefined;
+}
+
+function normalizeTelegramUiChoiceRows(value: unknown): TelegramUiChoiceRows {
+  let rawRows: unknown[][];
+  if (typeof value === "string") {
+    if (value.length > TELEGRAM_UI_MAX_SOURCE_LENGTH) invalidTelegramUi("Choice payload is too large.");
+    const parsed = parseTelegramAdaptiveActionPayloadRows(value, parseTelegramUiChoiceCompactCell,
+      { maxCompactAtoms: 4, allowMatrixGroups: true });
+    if (!parsed) invalidTelegramUi("Invalid Choice matrix literal.");
+    rawRows = parsed.rows;
+  } else if (Array.isArray(value)) {
+    rawRows = value.map((item: unknown) => Array.isArray(item) ? item : [item]);
+  } else {
+    rawRows = [[value]];
+  }
+  if (rawRows.length < 1 || rawRows.length > 64) invalidTelegramUi("Invalid Choice row count.");
+  const values = new Set<string>();
+  let count = 0;
+  const rows = rawRows.map((row) => {
+    if (row.length < 1 || row.length > 8) invalidTelegramUi("Invalid Choice row width.");
+    return Object.freeze(row.map((item) => {
+      if (++count > 64) invalidTelegramUi("Too many Choice options.");
+      const cell = telegramUiRecord(typeof item === "string" ? { label: item } : item, ["label", "value", "style", "disabled"]);
+      const disabled = telegramUiBoolean(cell.disabled, false);
+      const labelSource = cell.label === undefined ? (cell.value === undefined ? (disabled ? "" : undefined) : cell.value) : cell.label;
+      const label = telegramUiText(labelSource, 128, disabled);
+      const semanticValue = telegramUiText(cell.value === undefined ? label : cell.value, 256, disabled);
+      const style = telegramUiStyle(cell.style);
+      if (!disabled) {
+        if (values.has(semanticValue)) invalidTelegramUi("Duplicate enabled Choice value.");
+        values.add(semanticValue);
+      }
+      return Object.freeze({ label, value: semanticValue, ...(style ? { style } : {}), disabled });
+    }));
+  });
+  if (values.size === 0) invalidTelegramUi("Choice needs an enabled option.");
+  return Object.freeze(rows);
+}
+
+/** Representation only. Private opt-in changes omitted Confirm/Choice defaults, not explicit bounds or runtime authority. */
+export function parseTelegramUiDeclaration(element: string, source: string, questionHeadTail?: true): TelegramUiDeclarationParseResult {
+  if (questionHeadTail !== undefined && questionHeadTail !== true)
+    throw new TypeError("Question head/tail policy must be true or omitted.");
+  const selectionTimeoutMs = questionHeadTail ? TELEGRAM_UI_SELECTION_HEAD_TIMEOUT_MS : TELEGRAM_UI_SELECTION_DEFAULT_TIMEOUT_MS;
+  if (!["telegram_confirm", "telegram_choice", "telegram_text_input", "telegram_attachment"].includes(element)) {
+    return { ok: false, reason: "unsupported-element", message: "Unknown UI element." };
+  }
+  if (source.length > TELEGRAM_UI_MAX_SOURCE_LENGTH) {
+    return { ok: false, reason: "invalid-declaration", message: "Declaration is too large." };
+  }
+  let value: unknown;
+  try { value = JSON.parse(source); }
+  catch { return { ok: false, reason: "invalid-declaration", message: "Invalid JSON configuration." }; }
+  try {
+    let declaration: TelegramUiDeclaration;
+    if (element === "telegram_choice") {
+      const rawQuestions: unknown[] = Array.isArray(value) ? value : [value];
+      if (rawQuestions.length < 1 || rawQuestions.length > 32) invalidTelegramUi("Invalid question count.");
+      const ids = new Set<string>();
+      const questions = rawQuestions.map((item) => {
+        const record = telegramUiRecord(item, [...TELEGRAM_UI_COMMON_KEYS, "choices", "select"]);
+        const common = telegramUiCommon(record, "❌ Cancel", selectionTimeoutMs);
+        if (common.id !== undefined) {
+          if (ids.has(common.id)) invalidTelegramUi("Duplicate question ID.");
+          ids.add(common.id);
+        }
+        const rows = normalizeTelegramUiChoiceRows(record.choices);
+        const select = telegramUiInteger(record.select, 1, 64);
+        if (select > rows.flat().filter(cell => !cell.disabled).length) invalidTelegramUi("Selection count exceeds enabled choices.");
+        return Object.freeze({ ...common, rows, ...(select > 1 ? { select } : {}) });
+      });
+      declaration = { kind: "choice", batched: Array.isArray(value), questions: Object.freeze(questions),
+        timeoutMs: Math.min(selectionTimeoutMs, questions.reduce((sum, question) => sum + question.timeoutMs, 0)) };
+    } else if (element === "telegram_confirm") {
+      const record = telegramUiRecord(typeof value === "string" ? { question: value } : value, [...TELEGRAM_UI_COMMON_KEYS, "confirmLabel", "confirmStyle"]);
+      const style = telegramUiStyle(record.confirmStyle);
+      declaration = { kind: "confirm", ...telegramUiCommon(record, "❌ No", selectionTimeoutMs),
+        confirmLabel: record.confirmLabel === undefined ? "✅ Yes" : telegramUiText(record.confirmLabel, 128),
+        ...(style ? { confirmStyle: style } : {}) };
+    } else if (element === "telegram_text_input") {
+      const record = telegramUiRecord(value, [...TELEGRAM_UI_COMMON_KEYS, "maxLength", "multiline"]);
+      declaration = { kind: "text_input", ...telegramUiCommon(record),
+        maxLength: telegramUiInteger(record.maxLength, 4096, 16_384), multiline: telegramUiBoolean(record.multiline, false) };
+    } else {
+      const record = telegramUiRecord(value, [...TELEGRAM_UI_COMMON_KEYS, "accept", "maxFiles", "maxBytes"]);
+      const accept = record.accept === undefined ? ["*/*"] : record.accept;
+      if (!Array.isArray(accept) || accept.length < 1 || accept.length > 16) invalidTelegramUi("Invalid MIME filter count.");
+      const filters = accept.map((filter: unknown) => {
+        const mime = telegramUiText(filter, 128).toLowerCase();
+        if (mime !== "*/*" && !/^[a-z0-9][a-z0-9!#$&^_.+-]*\/(?:[a-z0-9][a-z0-9!#$&^_.+-]*|\*)$/u.test(mime)) {
+          invalidTelegramUi("Invalid MIME filter.");
+        }
+        return mime;
+      });
+      if (new Set(filters).size !== filters.length) invalidTelegramUi("Duplicate MIME filter.");
+      declaration = { kind: "attachment", ...telegramUiCommon(record), accept: Object.freeze(filters),
+        maxFiles: telegramUiInteger(record.maxFiles, 1, 10), maxBytes: telegramUiInteger(record.maxBytes, 10_485_760, 20_971_520) };
+    }
+    return { ok: true, declaration: Object.freeze(declaration) };
+  } catch (error) {
+    if (!(error instanceof TelegramUiDeclarationError)) throw error;
+    return { ok: false, reason: "invalid-declaration", message: error.message };
+  }
+}
+
+/** Emit canonical matrix syntax; conversion preserves semantics, not original spelling. */
+export function formatTelegramUiChoiceRows(rows: TelegramUiChoiceRows, format: "json" | "cml"): string {
+  const normalized = normalizeTelegramUiChoiceRows(rows);
+  if (format === "json") return JSON.stringify(normalized);
+  const atom = (value: string): string => value.replace(/[\\|}]/gu, "\\$&");
+  const cell = (value: TelegramUiChoiceCell): string => {
+    // Compact fallback can reinterpret quoted labels or reveal the value of an explicitly blank label.
+    if (value.label.startsWith('"') || (value.label === "" && value.value !== "")) return JSON.stringify(value);
+    const label = atom(value.label), semanticValue = atom(value.value);
+    if (value.disabled) return `{${label}|${semanticValue}|${value.style ?? ""}|1}`;
+    if (value.style) return `{${label}|${semanticValue}|${value.style}}`;
+    return value.label === value.value ? `{${label}}` : `{${label}|${semanticValue}}`;
+  };
+  return `[${normalized.map((row) => row.length === 1 ? cell(row[0]!) : `[${row.map(cell).join("")}]`).join("")}]`;
+}
+
 function normalizeMarkdownAfterVoiceExtraction(markdown: string): string {
   return markdown.replace(/\n{3,}/g, "\n\n").trim();
 }
@@ -622,7 +848,7 @@ function stripTelegramHtmlCommentBlocks(markdown: string): string {
 
 export function stripTelegramCommentMarkupForPreview(markdown: string): string {
   const withoutClosedBlocks = stripTelegramHtmlCommentBlocks(
-    replaceTelegramButtonFences(markdown, () => ""),
+    replaceTelegramButtonFences(markdown, () => "", ["telegram_button", "telegram_confirm", "telegram_choice"]),
   );
   const openBlockIndex =
     findOpenOrPartialHtmlCommentIndex(withoutClosedBlocks);

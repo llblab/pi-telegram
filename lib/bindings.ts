@@ -22,6 +22,7 @@ import * as Menu from "./menu.ts";
 import * as Model from "./model.ts";
 import * as OutboundAttachments from "./outbound-attachments.ts";
 import * as OutboundHandlers from "./outbound.ts";
+import { captureTelegramOrdinaryCallbackDispatch, hasTelegramOrdinaryCallbackOrigin } from "./outbound-buttons.ts";
 import * as Pi from "./pi.ts";
 import * as Preview from "./preview.ts";
 import * as Prompts from "./prompts.ts";
@@ -255,6 +256,7 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
   hasPendingMessages: (ctx: TContext) => boolean;
   isContextCurrent?: (ctx: TContext) => boolean;
   isContextAborted?: (ctx: TContext) => boolean;
+  isShutdownRequested?: () => boolean;
   updateStatus: (ctx: TContext, error?: string) => void;
   sendTextReply: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendTextReply"];
   sendUserMessage: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendUserMessage"];
@@ -298,9 +300,9 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     hasDispatchPending: deps.lifecycle.hasDispatchPending,
     isIdle: deps.isIdle,
     hasPendingMessages: deps.hasPendingMessages,
-    hasDispatchContext: deps.deferredDispatch.isBound,
+    hasDispatchContext: () => !deps.isShutdownRequested?.() && deps.deferredDispatch.isBound(),
     getDispatchGeneration: deps.deferredDispatch.getGeneration,
-    isDispatchGenerationActive: deps.deferredDispatch.isGenerationActive,
+    isDispatchGenerationActive: generation => !deps.isShutdownRequested?.() && deps.deferredDispatch.isGenerationActive(generation),
     isQueueItemTransportActive(item) {
       return deps.transportStamp.isActive(item.transportStamp);
     },
@@ -321,8 +323,8 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     },
     steerDispatch: {
       commitPacket: settlePromptPacket,
-      isContextCurrent: (ctx: TContext) => deps.isContextCurrent?.(ctx) === true,
-      canSubmit: (ctx: TContext) => deps.isContextAborted?.(ctx) === false &&
+      isContextCurrent: (ctx: TContext) => !deps.isShutdownRequested?.() && deps.isContextCurrent?.(ctx) === true,
+      canSubmit: (ctx: TContext) => !deps.isShutdownRequested?.() && deps.isContextAborted?.(ctx) === false &&
         deps.isIdle(ctx) && !deps.hasPendingMessages(ctx) && !deps.lifecycle.isCompactionInProgress() &&
         !deps.activeTurn.has() && (deps.lifecycle.getActiveToolExecutions?.() ?? 0) === 0,
     },
@@ -343,9 +345,9 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
   const steer = Queue.createTelegramSteerBoundaryRuntime({
     ...deps.store,
     getGeneration: deps.deferredDispatch.getGeneration,
-    isContextCurrent: (ctx: TContext) => deps.isContextCurrent?.(ctx) === true,
+    isContextCurrent: (ctx: TContext) => !deps.isShutdownRequested?.() && deps.isContextCurrent?.(ctx) === true,
     isBlocked: (ctx: TContext) =>
-      deps.isContextAborted?.(ctx) !== false || !deps.deferredDispatch.isBound() ||
+      deps.isShutdownRequested?.() === true || deps.isContextAborted?.(ctx) !== false || !deps.deferredDispatch.isBound() ||
       deps.isIdle(ctx) || deps.hasPendingMessages(ctx) ||
       deps.lifecycle.isCompactionInProgress() || deps.lifecycle.hasDispatchPending() ||
       (deps.lifecycle.getActiveToolExecutions?.() ?? 0) > 0 ||
@@ -418,6 +420,13 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker<
   },
 >(deps: {
   agentDir: string;
+  /** @internal Native callback-worker ownership only; no disposition or successor permission. */
+  callbackWorkerDrain?: true;
+  /** @internal App-only predecessor; bound mode preserves legacy unbound prompts without fabricating lineage. */
+  callbackSuccessor?: true | "bound";
+  /** @internal Qualified mode joins issued native origins without requiring provenance for legacy execution. */
+  callbackDispatch?: true | "qualified";
+  onOwnerObserved?: GenerativeApps.GenerativeAppRuntimeOptions["onOwnerObserved"];
   assertExecutionCurrent: (query: TQuery) => void;
   getExecutionFence: (
     query: TQuery,
@@ -433,7 +442,7 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker<
     chatId: number,
     replyToMessageId: number,
     markdown: string,
-    options?: { replyMarkup?: OutboundHandlers.TelegramOutboundButtonMarkup },
+    options?: { replyMarkup?: OutboundHandlers.TelegramOutboundButtonMarkup; target?: TelegramTarget },
   ) => Promise<unknown>;
   editInteractiveMessage?: (
     chatId: number,
@@ -442,20 +451,51 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker<
     mode: "markdown",
     replyMarkup: OutboundHandlers.TelegramOutboundButtonMarkup,
   ) => Promise<void>;
+  /** App output uses its configured Markdown carrier; harness-owned interactive menus stay HTML. */
+  editMarkdownMessage?: (
+    chatId: number,
+    messageId: number,
+    markdown: string,
+    replyMarkup: OutboundHandlers.TelegramOutboundButtonMarkup,
+    options?: Parameters<typeof Replies.editTelegramSingleMarkdownMessage>[6],
+  ) => Promise<void>;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }): (
   action: OutboundHandlers.TelegramOutboundButtonAction,
   query: TQuery,
 ) => Promise<false | "new" | "edit"> {
+  const editMarkdownMessage = deps.editMarkdownMessage;
+  const callbackWorkerDrain = deps.callbackWorkerDrain;
+  if (callbackWorkerDrain !== undefined && callbackWorkerDrain !== true) throw new Error("Callback worker drain must be true or omitted.");
+  const callbackSuccessor = deps.callbackSuccessor;
+  if (callbackSuccessor !== undefined && callbackSuccessor !== true && callbackSuccessor !== "bound" || callbackSuccessor && !callbackWorkerDrain) throw new Error("Callback successor requires true or bound and original worker drain.");
+  const captureExecution = callbackWorkerDrain ? deps.getExecutionFence : undefined;
+  const callbackDispatch = deps.callbackDispatch;
+  if (callbackDispatch !== undefined && callbackDispatch !== true && callbackDispatch !== "qualified" || callbackDispatch && !callbackSuccessor) throw new Error("Callback dispatch requires true or qualified and original successor policy.");
+  if (callbackWorkerDrain && typeof captureExecution !== "function") throw new Error("Callback worker execution capture is unavailable.");
   return async (action, query) => {
     let boundAction: GenerativeApps.GenerativeAppBoundAction | undefined;
     let handedOff:
       | GenerativeApps.GenerativeAppLiveSurface<GenerativeApps.TelegramBindLiveHandle>
       | undefined;
     try {
+      const originalBinding = callbackSuccessor ? action.binding : undefined;
+      const getBinding = () => callbackSuccessor ? originalBinding : action.binding;
+      const successorEnabled = callbackSuccessor === true || callbackSuccessor === "bound" && originalBinding !== undefined;
+      if (callbackDispatch && action.promptKind === "selection" || callbackDispatch === true && !getBinding()) return false;
+      const dispatchRequired = callbackDispatch === true || callbackDispatch === "qualified" && hasTelegramOrdinaryCallbackOrigin(action);
+      const capturedExecution = dispatchRequired && captureExecution ? Reflect.apply(captureExecution, deps, [query]) : undefined;
+      const originalDispatchCheck = capturedExecution?.assertCurrent, originalDispatchSignal = capturedExecution?.signal;
+      const dispatchExecution = capturedExecution && typeof originalDispatchCheck === "function" && originalDispatchSignal instanceof AbortSignal ?
+        Object.freeze({ signal: originalDispatchSignal, assertCurrent: () => Reflect.apply(originalDispatchCheck, capturedExecution, []) }) : undefined;
+      const dispatch = dispatchRequired ? captureTelegramOrdinaryCallbackDispatch(action, query) : undefined;
+      if (dispatchRequired && !dispatch) throw new Error("Telegram ordinary callback dispatch is unavailable.");
+      if (dispatchRequired && (!dispatchExecution || typeof dispatchExecution.assertCurrent !== "function" || !(dispatchExecution.signal instanceof AbortSignal))) throw new Error("Callback dispatch execution is unavailable.");
+      const invocation = dispatch?.takeInvocation?.();
+      if (dispatchRequired && !invocation) throw new Error("Generative App callback invocation is unavailable.");
       // Only buttons emitted by a Generative App carry a binding. An unbound button is ordinary model text
       // (`std::map`, `a::b(c)`): malformed or uninstalled-app prompts fall through to the normal prompt plane.
-      if (!action.binding) {
+      if (!getBinding()) {
         try {
           boundAction = GenerativeApps.parseGenerativeAppBoundAction(
             action.prompt,
@@ -478,12 +518,14 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker<
         );
       }
       if (!boundAction) return false;
+      if (successorEnabled && (!getBinding() || getBinding()!.app !== boundAction.app)) throw new Error("Generative App callback origin is unavailable.");
       deps.assertExecutionCurrent(query);
       const chatId = query.message?.chat?.id;
-      const messageId = query.message?.message_id;
+      const messageId = query.message?.message_id, threadId = query.message?.message_thread_id;
       if (typeof chatId !== "number" || typeof messageId !== "number") {
         throw new Error("Generative App callback target is unavailable.");
       }
+      const target = Object.freeze({ chatId, ...(threadId !== undefined ? { threadId } : {}) });
       const liveSurfaces = deps.getLiveSurfaceRuntime?.();
       handedOff = liveSurfaces?.take(
         GenerativeApps.getTelegramBindLiveSurfaceKey(
@@ -491,36 +533,47 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker<
           deps.getActiveProfileName?.() ?? "default",
           {
             chatId,
-            ...(query.message?.message_thread_id !== undefined
-              ? { threadId: query.message.message_thread_id }
-              : {}),
+            ...(threadId !== undefined ? { threadId } : {}),
           },
         ),
       );
+      const execution = dispatchRequired ? dispatchExecution : captureExecution ? Reflect.apply(captureExecution, deps, [query]) : undefined;
+      const originalExecutionCheck = execution?.assertCurrent;
+      const assertResultExecutionCurrent = () => {
+        deps.assertExecutionCurrent(query);
+        if (originalExecutionCheck) Reflect.apply(originalExecutionCheck, execution, []);
+      };
       const result = await GenerativeApps.invokeGenerativeApp({
+        ...(invocation ? { callbackInvocation: invocation } : {}),
+        ...(callbackWorkerDrain ? { callbackWorkerDrain: true } : {}),
+        ...(successorEnabled ? { callbackBinding: originalBinding } : {}),
         agentDir: deps.agentDir,
-        ...(deps.getExecutionFence(query)
+        onOwnerObserved: deps.onOwnerObserved, recordRuntimeEvent: deps.recordRuntimeEvent,
+        ...(callbackWorkerDrain ? (execution ? { execution } : {}) : deps.getExecutionFence(query)
           ? { execution: deps.getExecutionFence(query) }
           : {}),
         ...(boundAction.argument !== undefined
           ? { argument: boundAction.argument }
           : {}),
-        ...(action.binding?.app === boundAction.app
+        ...(getBinding()?.app === boundAction.app
           ? {
-              expectedGeneration: action.binding.generation,
-              expectedRevision: action.binding.revision,
+              expectedGeneration: getBinding()!.generation,
+              expectedRevision: getBinding()!.revision,
+              assertCallbackOwner: getBinding()!.assertCurrent,
             }
           : {}),
         method: boundAction.method,
         app: boundAction.app,
       });
-      deps.assertExecutionCurrent(query);
+      assertResultExecutionCurrent();
+      const successor = GenerativeApps.getGenerativeAppCallbackBinding(result);
+      if (dispatch) {
+        if (callbackDispatch === "qualified" && GenerativeApps.getGenerativeAppCallbackInvocationKind(successor, invocation) === "state-written") {
+          if (!GenerativeApps.captureGenerativeAppCallbackOwner(successor)) throw new Error("Generative App callback result is unavailable.");
+        } else if (!dispatch.captureReadOnlySuccessor?.(successor, invocation)) throw new Error("Generative App callback invocation successor is unavailable.");
+      }
       const reply = deps.planOutput(result.output, {
-        binding: {
-          generation: result.generation,
-          app: result.app,
-          revision: result.revision,
-        },
+        binding: successor,
       });
       if (handedOff && liveSurfaces) {
         try {
@@ -535,16 +588,14 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker<
           });
         }
       }
-      if (result.viewMode === "edit" && deps.editInteractiveMessage) {
+      if (result.viewMode === "edit" && (editMarkdownMessage || deps.editInteractiveMessage)) {
         let editFailed = false;
         try {
-          await deps.editInteractiveMessage(
-            chatId,
-            messageId,
-            reply.markdown,
-            "markdown",
-            reply.replyMarkup ?? { inline_keyboard: [] },
-          );
+          const markup = reply.replyMarkup ?? { inline_keyboard: [] };
+          if (editMarkdownMessage) await Reflect.apply(editMarkdownMessage, deps, [chatId, messageId, reply.markdown, markup, {
+            assertLocalAuthority: assertResultExecutionCurrent,
+          }]);
+          else await deps.editInteractiveMessage!(chatId, messageId, reply.markdown, "markdown", markup);
         } catch (error) {
           editFailed = true;
           deps.recordRuntimeEvent("generative-app", error, {
@@ -553,14 +604,14 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker<
             method: boundAction.method,
           });
         }
-        deps.assertExecutionCurrent(query);
+        assertResultExecutionCurrent();
         if (!editFailed) return "edit";
       }
-      deps.assertExecutionCurrent(query);
+      assertResultExecutionCurrent();
       await deps.sendMarkdownReply(chatId, messageId, reply.markdown, {
-        replyMarkup: reply.replyMarkup,
+        replyMarkup: reply.replyMarkup, target,
       });
-      deps.assertExecutionCurrent(query);
+      assertResultExecutionCurrent();
       return "new";
     } catch (error) {
       if (handedOff) deps.getLiveSurfaceRuntime?.()?.open(handedOff);
@@ -880,6 +931,8 @@ interface TelegramCommandsAndToolsBindingDeps {
   stopPolling?: () => Promise<void | string>;
   getDisconnectThreadName?: () => string | undefined;
   onTransportChanged?: () => Promise<void> | void;
+  /** Read the selected profile's canonical projection only after this connect published an approved envelope reset. */
+  refreshProfileStateAfterReset?: () => Promise<void>;
   getStatusLines: (
     options?: Status.TelegramBridgeStatusLineOptions,
   ) => string[];
@@ -938,6 +991,7 @@ export function registerTelegramCommandsAndTools({
   stopPolling,
   getDisconnectThreadName,
   onTransportChanged,
+  refreshProfileStateAfterReset,
   getStatusLines,
   buttonActionStore,
   sendMarkdownReply,
@@ -960,6 +1014,8 @@ export function registerTelegramCommandsAndTools({
 }: TelegramCommandsAndToolsBindingDeps): void {
   GenerativeApps.registerTelegramBindTool(pi, {
     agentDir,
+    onOwnerObserved: buttonActionStore.observeAppOwner,
+    capturePublicationSource: buttonActionStore.capturePublicationSource,
     getActiveProfileName: configStore.getActiveProfileName,
     getActiveTurn: activeTurnRuntime.get,
     ...(setGenerativeAppLiveSurfaceRuntime
@@ -975,6 +1031,8 @@ export function registerTelegramCommandsAndTools({
       buttonActionStore,
       Config.createTelegramConfigControls(configStore)
         .getAssistantRenderingMode,
+      true,
+      true,
     ),
     sendMarkdownReply,
     sendView: (view, options) =>
@@ -1006,6 +1064,8 @@ export function registerTelegramCommandsAndTools({
       buttonActionStore,
       Config.createTelegramConfigControls(configStore)
         .getAssistantRenderingMode,
+      true,
+      true,
     ),
     sendMarkdownMessage: (chatId, markdown, options) =>
       sendMarkdownReply(chatId, undefined, markdown, options),
@@ -1123,31 +1183,67 @@ export function registerTelegramCommandsAndTools({
     connectionIntent,
     getProfileNames: () =>
       Config.getTelegramProfileNames(configStore.getStoredConfig()),
-    activateDefaultProfileConfig: async (_ctx, isCurrent) => {
+    activateDefaultProfileConfig: async (ctx, isCurrent) => {
       const previousProfileName = configStore.getActiveProfileName();
       await configStore.load();
       if (!isCurrent()) return;
+      const selectedConfig = configStore.getStoredConfig();
+      const selectedToken = configStore.getBotToken(Config.TELEGRAM_DEFAULT_PROFILE_NAME);
+      const isSelectionCurrent = (expectedProfile = previousProfileName) => {
+        if (!isCurrent()) return false;
+        if (configStore.getStoredConfig() !== selectedConfig ||
+          configStore.getActiveProfileName() !== (expectedProfile === Config.TELEGRAM_DEFAULT_PROFILE_NAME ? undefined : expectedProfile) ||
+          configStore.getBotToken(Config.TELEGRAM_DEFAULT_PROFILE_NAME) !== selectedToken)
+          throw new Error("Telegram connection profile selection changed.");
+        return true;
+      };
+      const reset = selectedToken ? lockedPollingRuntime.prepareConnection(ctx, isSelectionCurrent) : false;
+      if (!isSelectionCurrent()) return;
       if (previousProfileName) {
         await (stopPolling ?? lockedPollingRuntime.stop)();
-        if (!isCurrent()) return;
+        if (!isSelectionCurrent()) return;
       }
       configStore.activateProfile(undefined);
+      if (!isSelectionCurrent(Config.TELEGRAM_DEFAULT_PROFILE_NAME)) return;
+      if (reset) {
+        if (!refreshProfileStateAfterReset) throw new Error("Telegram profile refresh after state reset is unavailable.");
+        await refreshProfileStateAfterReset();
+        if (!isSelectionCurrent(Config.TELEGRAM_DEFAULT_PROFILE_NAME)) return;
+      }
       await onTransportChanged?.();
+      isSelectionCurrent(Config.TELEGRAM_DEFAULT_PROFILE_NAME);
     },
-    activateProfileConfig: async (_ctx, profileName, isCurrent) => {
+    activateProfileConfig: async (ctx, profileName, isCurrent) => {
       const previousProfileName = configStore.getActiveProfileName();
       await configStore.load();
       if (!isCurrent()) return false;
       if (!Config.isValidTelegramProfileName(profileName)) return false;
       const storedConfig = configStore.getStoredConfig();
       if (!storedConfig.profiles?.[profileName]) return false;
+      const selectedToken = configStore.getBotToken(profileName);
+      const isSelectionCurrent = (expectedProfile = previousProfileName) => {
+        if (!isCurrent()) return false;
+        if (configStore.getStoredConfig() !== storedConfig ||
+          configStore.getActiveProfileName() !== (expectedProfile === Config.TELEGRAM_DEFAULT_PROFILE_NAME ? undefined : expectedProfile) ||
+          configStore.getBotToken(profileName) !== selectedToken)
+          throw new Error("Telegram connection profile selection changed.");
+        return true;
+      };
+      const reset = selectedToken ? lockedPollingRuntime.prepareConnection(ctx, isSelectionCurrent) : false;
+      if (!isSelectionCurrent()) return false;
       if (previousProfileName !== profileName) {
         await (stopPolling ?? lockedPollingRuntime.stop)();
-        if (!isCurrent()) return false;
+        if (!isSelectionCurrent()) return false;
       }
       if (!configStore.activateProfile(profileName)) return false;
+      if (!isSelectionCurrent(profileName)) return false;
+      if (reset) {
+        if (!refreshProfileStateAfterReset) throw new Error("Telegram profile refresh after state reset is unavailable.");
+        await refreshProfileStateAfterReset();
+        if (!isSelectionCurrent(profileName)) return false;
+      }
       await onTransportChanged?.();
-      return true;
+      return isSelectionCurrent(profileName);
     },
   });
 }
@@ -1386,6 +1482,8 @@ export function registerTelegramLifecycleRuntimeHooks({
     OutboundHandlers.createTelegramOutboundReplyPlanner(
       buttonActionStore,
       getAssistantRenderingMode,
+      true,
+      true,
     );
   const voiceReplySenderDeps = {
     execCommand: CommandTemplates.execCommandTemplate,
@@ -1653,6 +1751,7 @@ export function registerTelegramLifecycleRuntimeHooks({
       activityRuntime.recordInputSource(event.source ?? "unknown");
     },
     async onSessionStart(event, ctx) {
+      buttonActionStore.clear?.();
       diagnostics?.onSessionStart();
       cancelPendingFinalPublication();
       previewRuntime.invalidate();
@@ -1664,7 +1763,11 @@ export function registerTelegramLifecycleRuntimeHooks({
       onSessionStarted?.(event, ctx);
     },
     async onSessionShutdown(event, ctx) {
-      if (!isSessionContextActive(ctx)) return;
+      const generation = getSessionGeneration?.();
+      const isCurrent = () => (!getSessionGeneration || Object.is(getSessionGeneration(), generation)) && isSessionContextActive(ctx);
+      if (!isCurrent()) return;
+      buttonActionStore.clear?.();
+      const buttonsStopped = buttonActionStore.waitForPublicationIdle?.();
       const diagnosticsStopped = diagnostics?.onSessionShutdown();
       shutdownGenerativeAppLiveSurfaces?.();
       agentLifecycleHooks.clearRetainedAgentEnd();
@@ -1676,12 +1779,14 @@ export function registerTelegramLifecycleRuntimeHooks({
       cancelPendingFinalPublication();
       uiPromptActive = false;
       compactionObserver.onSessionShutdown();
-      await diagnosticsStopped;
-      if (!isSessionContextActive(ctx)) return;
+      const stopped = await Promise.allSettled([diagnosticsStopped, buttonsStopped]);
+      for (const outcome of stopped) if (outcome.status === "rejected") throw outcome.reason;
+      if (!isCurrent()) return;
       if (event.reason === "quit" && disconnectOnQuit) {
         try {
           const automaticCleanupEnabled =
             (await resolveAutomaticThreadCleanupEnabled?.()) ?? true;
+          if (!isCurrent()) return;
           if (automaticCleanupEnabled) await disconnectOnQuit();
         } catch (error) {
           recordRuntimeEvent("session", error, {
@@ -1689,6 +1794,7 @@ export function registerTelegramLifecycleRuntimeHooks({
           });
         }
       }
+      if (!isCurrent()) return;
       await sessionLifecycleRuntime.onSessionShutdown(event, ctx);
     },
     async onSessionBeforeCompact(event, ctx) {

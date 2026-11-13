@@ -7,6 +7,32 @@ import { basename, dirname } from "node:path";
 import * as Machine from "./machine.js";
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
 const TELEGRAM_REPLY_CONTEXT_MAX_LENGTH = 1000;
+const ATTACHMENT_MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u;
+function attachmentString(value, max) {
+    return typeof value === "string" && value.length > 0 && value.length <= max && !!value.trim() && value.isWellFormed() &&
+        !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(value);
+}
+/** @internal Shared bounded producer metadata; never a receiver, actual-byte or file-use grant. */
+export function normalizeTelegramAttachmentRequestConstraints(constraints) {
+    const maxBytes = constraints?.maxBytes, accept = constraints?.accept;
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 20_971_520 ||
+        !Array.isArray(accept) || accept.length < 1 || accept.length > 16)
+        throw new TypeError("Invalid attachment preflight constraints.");
+    const filters = Array.from({ length: accept.length }, (_, index) => {
+        const descriptor = Object.getOwnPropertyDescriptor(accept, String(index));
+        const filter = descriptor && "value" in descriptor ? descriptor.value : undefined;
+        if (!attachmentString(filter, 128))
+            throw new TypeError("Invalid attachment MIME filter.");
+        const mime = filter.trim().toLowerCase();
+        if (mime !== "*/*" && !ATTACHMENT_MIME.test(mime) &&
+            !(mime.endsWith("/*") && ATTACHMENT_MIME.test(`${mime.slice(0, -1)}x`)))
+            throw new TypeError("Invalid attachment MIME filter.");
+        return mime;
+    });
+    if (new Set(filters).size !== filters.length)
+        throw new TypeError("Duplicate attachment MIME filter.");
+    return Object.freeze({ accept: Object.freeze(filters), maxBytes });
+}
 function guessExtensionFromMime(mimeType, fallback) {
     if (!mimeType)
         return fallback;

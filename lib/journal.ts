@@ -69,6 +69,7 @@ import {
 export const TELEGRAM_UPDATE_JOURNAL_VERSION = 1 as const;
 export const TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION = 2 as const;
 export const TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION = 3 as const;
+const TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION = 4 as const;
 // Receipt and binding identities survive storage-schema upgrades.
 const TELEGRAM_UPDATE_JOURNAL_IDENTITY_VERSION = 1 as const;
 const TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES = 10_000;
@@ -627,11 +628,64 @@ export interface TelegramUpdateJournalEntry {
   queueHandoff?: TelegramUpdateJournalQueueHandoff;
   inputClaim?: TelegramUpdateJournalInputClaim;
   inputProvenance?: TelegramUpdateJournalInputProvenance;
+  privateTextReply?: TelegramJournalPrivateTextReply;
   failure?: TelegramUpdateJournalFailure;
   nextRetryAtMs?: number;
   terminalAtMs?: number;
   terminalReason?: string;
   terminalFailureId?: string;
+}
+
+/** Bounded persisted evidence only; callers own semantic original-receiver verification. */
+export interface TelegramJournalPrivateTextReplyDestination {
+  profile: string;
+  botIdentity: { botId: number; tokenSha256: string };
+  operatorUserId: number;
+  sourceTarget: { chatId: number; threadId?: number };
+  sourceMessageId: number;
+  publicationTarget: { chatId: number; threadId?: number };
+  publicationMessageId: number;
+  requestNonce: string;
+  receiver: {
+    instanceId: string;
+    profileKey: string;
+    bindingKey: string;
+    registrationGeneration: string;
+    sessionId: string;
+    sessionGeneration: number;
+    pid: number;
+    processBirthId: string;
+    cwd: string;
+    endpoint: string;
+    slot?: string;
+    target?: { chatId: number; threadId?: number };
+    protocol: { protocolVersion: number; runtimeBuild: string; capabilities: string[] };
+  };
+}
+
+/** Opt-in v5 candidate data only; neither receiver liveness nor a submission/disposition receipt. */
+export interface TelegramJournalTextInputAssociation {
+  source: TelegramInputJournalSourceReference;
+  expectedSource: TelegramUpdateJournalEntryDigest;
+  requestNonce: string;
+  operatorUserId: number;
+  target: { chatId: number; threadId?: number };
+  receiver: TelegramUpdateJournalQueueOwnerIdentity & {
+    sessionId: string;
+    bindingKey: string;
+    deliveryGeneration: string;
+  };
+}
+
+export interface TelegramTextInputSourceJournalCandidate extends Omit<TelegramUpdateJournalFile, "version" | "entries"> {
+  version: 5;
+  entries: (TelegramUpdateJournalEntry & { privateTextInput?: TelegramJournalTextInputAssociation })[];
+}
+
+export interface TelegramJournalPrivateTextReply {
+  source: TelegramInputJournalSourceReference;
+  expectedSource: TelegramUpdateJournalEntryDigest;
+  destination: TelegramJournalPrivateTextReplyDestination;
 }
 
 /** Exact parsed journal entry identity, checked inside the source owner's mutation transaction. */
@@ -658,7 +712,8 @@ export interface TelegramUpdateJournalFile {
   version:
     | typeof TELEGRAM_UPDATE_JOURNAL_VERSION
     | typeof TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION
-    | typeof TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION;
+    | typeof TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION
+    | typeof TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION;
   revision?: number;
   acceptedThroughUpdateId?: number;
   profile: string;
@@ -668,7 +723,8 @@ export interface TelegramUpdateJournalFile {
   sourceCompletions?: TelegramUpdateJournalSourceCompletion[];
 }
 
-export interface TelegramUpdateJournalSnapshot extends TelegramUpdateJournalFile {
+export interface TelegramUpdateJournalSnapshot<V extends TelegramUpdateJournalFile["version"] = 1 | 2 | 3> extends Omit<TelegramUpdateJournalFile, "version"> {
+  version: V;
   exists: boolean;
   serializedBytes: number;
 }
@@ -865,6 +921,8 @@ export interface TelegramUpdateJournalAbandonedPendingEvidence {
   updateId: number;
   retainedPath: string;
   operatorAuthorityId: string;
+  /** Read-only original bot-chat facts; never cancellation, execution or cleanup authority by themselves. */
+  originalTarget?: Readonly<{ chatId: number; threadId: number; messageId: number; sourceSha256: string }>;
 }
 
 export interface TelegramRoutingInputAuthority {
@@ -881,7 +939,7 @@ export type TelegramRoutingInputExpiryResult = Omit<
 >;
 export type TelegramRoutingInputExpiryEvidence = Omit<
   TelegramUpdateJournalAbandonedPendingEvidence,
-  "retainedPath"
+  "retainedPath" | "originalTarget"
 >;
 
 function inspectRoutingInputExpiry(
@@ -972,9 +1030,9 @@ export interface TelegramRoutingInputJournal {
   ): TelegramRoutingInputExpiryEvidence[] | undefined;
 }
 
-export interface TelegramUpdateJournalStore {
+export interface TelegramUpdateJournalStore<V extends TelegramUpdateJournalFile["version"] = 1 | 2 | 3> {
   routingInputs?: TelegramRoutingInputJournal;
-  read(): TelegramUpdateJournalSnapshot;
+  read(): TelegramUpdateJournalSnapshot<V>;
   /** Read-only: the committed abandonment tombstone plus its matching private retention, or undefined. */
   inspectAbandonedPending(
     updateId: number,
@@ -999,6 +1057,10 @@ export interface TelegramUpdateJournalStore {
   applyOperatorDisposition(
     input: TelegramUpdateJournalOperatorDispositionInput,
   ): TelegramUpdateJournalOperatorDispositionResult;
+  /** Explicit operator-only exact v1 retry disposal; no execution, custody recovery or schema upgrade. */
+  discardRetryWait(
+    input: TelegramUpdateJournalPendingAbandonmentInput,
+  ): TelegramUpdateJournalOperatorDispositionResult;
   applyLegacyCustodyDisposition(
     authority: TelegramUpdateJournalLegacyCustodyDispositionAuthority,
   ): TelegramUpdateJournalLegacyCustodyDispositionResult;
@@ -1014,7 +1076,7 @@ export interface TelegramUpdateJournalStore {
   completeQueued(
     receipts: readonly TelegramUpdateJournalQueuedCompletion[],
   ): TelegramUpdateJournalRemoveResult;
-  /** Strict v1 whole-receipt disposal co-publishes caller-scoped ACKs; never a readiness grant. */
+  /** Strict legacy/v4 whole-receipt disposal co-publishes caller-scoped ACKs; never a readiness grant. */
   completeQueuedExact(
     receipts: readonly TelegramUpdateJournalQueuedCompletion[],
     completions: readonly TelegramUpdateJournalSourceCompletion[],
@@ -1195,8 +1257,21 @@ export interface TelegramInputJournalHandoffCancelResult {
   serializedBytes: number;
 }
 
-export interface TelegramInputJournalStore {
-  read: TelegramUpdateJournalStore["read"];
+/** Native exact completion is exposed only by literal-v4 construction, never preparation/observation handles. */
+export type TelegramInputJournalStore<V extends TelegramUpdateJournalFile["version"] = 1 | 2 | 3> =
+  TelegramInputJournalStoreBase<V> & (V extends 4
+    ? Pick<TelegramUpdateJournalStore<V>, "completeQueuedExact" | "inspectSourceCompletion">
+    : {});
+
+interface TelegramInputJournalStoreBase<V extends TelegramUpdateJournalFile["version"]> {
+  /** V4-only immutable source evidence; every success requires current ready authority. */
+  pinPrivateTextReplyDestination(input: {
+    receipt: TelegramInputJournalReceipt;
+    expectedSource: TelegramUpdateJournalEntryDigest;
+    destination: TelegramJournalPrivateTextReplyDestination;
+    assertAuthority: () => void;
+  }): { pinned: boolean };
+  read: TelegramUpdateJournalStore<V>["read"];
   appendBatch: TelegramUpdateJournalStore["appendBatch"];
   listLegacyCustodyCandidates(): TelegramUpdateJournalLegacyCustodyCandidate[];
   applyLegacyCustodyDisposition: TelegramUpdateJournalStore["applyLegacyCustodyDisposition"];
@@ -1266,6 +1341,8 @@ export type TelegramInputJournalStoreOptions = Omit<
       | "queueRuntimeIdentity"
     >
   > & {
+    /** Explicit storage selection only; never migrates an existing family. */
+    storageVersion?: 3;
     /** Bound originating profile/token/session/recipient context, not transport role; undefined revokes acquisition/start/transfer. */
     getInputContext: () => TelegramInputJournalContext | undefined;
   };
@@ -1278,6 +1355,7 @@ interface ReadTelegramUpdateJournalResult {
 }
 
 interface JournalSourceAcquisition {
+  assertCurrent(): void;
   evidence: ReturnType<typeof inspectTelegramUpdateJournalFamily>;
   snapshotRevision: number;
   segments: { name: string; bytes: number; work: number; botId?: number }[];
@@ -1766,7 +1844,8 @@ function journalRequiresExclusion(
 function journalHasCustodyFields(
   version: TelegramUpdateJournalFile["version"],
 ): boolean {
-  return version === TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION;
+  return version === TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION ||
+    version === TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION;
 }
 
 /** Only legacy v1 carries routing-lifetime, scoped-ACK and pairing-free queue-receipt semantics. */
@@ -1774,6 +1853,170 @@ export function isTelegramUpdateJournalLegacyFamilyVersion(
   version: unknown,
 ): boolean {
   return version === TELEGRAM_UPDATE_JOURNAL_VERSION;
+}
+
+function privateReplyRecord(value: unknown, required: readonly string[], optional: readonly string[] = []): value is Record<string, unknown> {
+  return isRecord(value) &&
+    (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null) &&
+    required.every(key => Object.hasOwn(value, key)) &&
+    Reflect.ownKeys(value).every(key => typeof key === "string" &&
+      (required.includes(key) || optional.includes(key)) &&
+      Object.getOwnPropertyDescriptor(value, key)?.enumerable === true &&
+      Object.hasOwn(Object.getOwnPropertyDescriptor(value, key)!, "value"));
+}
+
+function privateReplyString(value: unknown, units = 256, bytes = 1024): value is string {
+  return typeof value === "string" && value.trim().length > 0 &&
+    value.length <= units && Buffer.byteLength(value) <= bytes;
+}
+
+function privateReplyTarget(value: unknown): value is { chatId: number; threadId?: number } {
+  return privateReplyRecord(value, ["chatId"], ["threadId"]) &&
+    isSafePositiveInteger(value.chatId) &&
+    (!Object.hasOwn(value, "threadId") || isSafePositiveInteger(value.threadId));
+}
+
+function privateReplyCapabilities(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length > 64 || Object.getPrototypeOf(value) !== Array.prototype ||
+    Reflect.ownKeys(value).length !== value.length + 1) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor?.enumerable !== true || !Object.hasOwn(descriptor, "value") ||
+      !privateReplyString(descriptor.value, 128, 512)) return false;
+  }
+  return new Set(value).size === value.length;
+}
+
+function validatePrivateTextReply(value: unknown, path: string, updateId: number): TelegramJournalPrivateTextReply {
+  const invalid = (): never => { throw createJournalError("invalid", path, "contains invalid private Text Input evidence"); };
+  const hash = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
+  if (!privateReplyRecord(value, ["source", "expectedSource", "destination"])) return invalid();
+  const { source, expectedSource, destination: d } = value;
+  if (!privateReplyRecord(source, ["journalBindingKey", "tokenSha256", "updateId"]) ||
+    !privateReplyString(source.journalBindingKey) || !hash(source.tokenSha256) ||
+    !isSafeNonNegativeInteger(source.updateId) || source.updateId !== updateId ||
+    !privateReplyRecord(expectedSource, ["updateId", "sourceSha256"]) ||
+    expectedSource.updateId !== updateId || !hash(expectedSource.sourceSha256) ||
+    !privateReplyRecord(d, ["profile", "botIdentity", "operatorUserId", "sourceTarget", "sourceMessageId",
+      "publicationTarget", "publicationMessageId", "requestNonce", "receiver"]) ||
+    !privateReplyString(d.profile) || !privateReplyString(d.requestNonce) ||
+    !privateReplyRecord(d.botIdentity, ["botId", "tokenSha256"]) ||
+    !isSafePositiveInteger(d.botIdentity.botId) || !hash(d.botIdentity.tokenSha256) ||
+    d.botIdentity.tokenSha256 !== source.tokenSha256 ||
+    !isSafePositiveInteger(d.operatorUserId) || !isSafePositiveInteger(d.sourceMessageId) ||
+    !isSafePositiveInteger(d.publicationMessageId) || !privateReplyTarget(d.sourceTarget) ||
+    !privateReplyTarget(d.publicationTarget)) return invalid();
+  const r = d.receiver;
+  const strings = ["instanceId", "profileKey", "bindingKey", "registrationGeneration", "sessionId", "processBirthId"];
+  if (!privateReplyRecord(r, [...strings, "sessionGeneration", "pid", "cwd", "endpoint", "protocol"], ["slot", "target"]) ||
+    !strings.every(key => privateReplyString(r[key])) ||
+    !isSafeNonNegativeInteger(r.sessionGeneration) || !isSafePositiveInteger(r.pid) ||
+    !privateReplyString(r.cwd, 4096, 4096) || !privateReplyString(r.endpoint, 4096, 4096) ||
+    (Object.hasOwn(r, "slot") && (typeof r.slot !== "string" || !/^[A-Z]$/u.test(r.slot))) ||
+    (Object.hasOwn(r, "target") ? !privateReplyTarget(r.target) || !isDeepStrictEqual(r.target, d.publicationTarget)
+      : d.publicationTarget.threadId !== undefined) ||
+    !privateReplyRecord(r.protocol, ["protocolVersion", "runtimeBuild", "capabilities"]) ||
+    !isSafePositiveInteger(r.protocol.protocolVersion) || !privateReplyString(r.protocol.runtimeBuild) ||
+    !privateReplyCapabilities(r.protocol.capabilities)) return invalid();
+  const cloned = structuredClone(value) as unknown as TelegramJournalPrivateTextReply;
+  if (Buffer.byteLength(JSON.stringify(cloned)) > 16 * 1024) return invalid();
+  return cloned;
+}
+
+/** Explicit data codec only. Existing journal stores continue refusing v5, including recovery paths. */
+export function decodeTelegramTextInputSourceJournalCandidate(serialized: string, path: string): TelegramTextInputSourceJournalCandidate {
+  const invalid = (): never => { throw createJournalError("invalid", path, "contains invalid original Text Input association"); };
+  if (typeof serialized !== "string" || Buffer.byteLength(serialized) > TELEGRAM_UPDATE_JOURNAL_MAX_BYTES) return invalid();
+  let value: unknown;
+  try { value = JSON.parse(serialized); } catch { return invalid(); }
+  if (!isRecord(value)) return invalid();
+  if (value.version !== 5) throw createJournalError("unsupported-version", path, "requires explicit Text Input candidate version 5");
+  if (!Array.isArray(value.entries) || value.entries.length > TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES) return invalid();
+  const associations = value.entries.map(row => isRecord(row) && Object.hasOwn(row, "privateTextInput")
+    ? { present: true, value: row.privateTextInput } : { present: false, value: undefined });
+  // Reuse v4's common envelope/entry validation, never its store or execution surface.
+  const base = parseJournalFile({ ...value, version: 4, entries: value.entries.map(row => {
+    if (!isRecord(row)) return row;
+    const { privateTextInput: _association, ...entry } = row;
+    return entry;
+  }) }, path, 4);
+  const bindingKey = createTelegramUpdateJournalBindingKey({ path, profileName: base.profile, botIdentity: base.botIdentity });
+  const entries = base.entries.map((entry, index) => {
+    if (!associations[index]!.present) return entry;
+    const a = associations[index]!.value;
+    if (!privateReplyRecord(a, ["source", "expectedSource", "requestNonce", "operatorUserId", "target", "receiver"]) ||
+      !privateReplyRecord(a.source, ["journalBindingKey", "tokenSha256", "updateId"]) ||
+      a.source.journalBindingKey !== bindingKey || a.source.tokenSha256 !== base.botIdentity.tokenSha256 || a.source.updateId !== entry.updateId ||
+      !privateReplyRecord(a.expectedSource, ["updateId", "sourceSha256"]) ||
+      !isDeepStrictEqual(a.expectedSource, createTelegramUpdateJournalEntryDigest(entry)) ||
+      typeof a.requestNonce !== "string" || !/^[a-f0-9]{32}$/u.test(a.requestNonce) ||
+      !isSafePositiveInteger(a.operatorUserId) || !privateReplyTarget(a.target) || !isSafePositiveInteger(base.botIdentity.botId) ||
+      entry.state !== "pending" || entry.preApprovalExcluded !== false || entry.inputClaim || entry.inputProvenance || entry.privateTextReply ||
+      entry.queueOwner || entry.queueHandoff || entry.queueReceiptId || entry.queueKind) return invalid();
+    const receiver = a.receiver, message = entry.update.message;
+    if (!privateReplyRecord(receiver, ["instanceId", "processId", "processBirthId", "sessionGeneration", "sessionId", "bindingKey", "deliveryGeneration"]) ||
+      !["instanceId", "processBirthId", "sessionId", "bindingKey", "deliveryGeneration"].every(key => privateReplyString(receiver[key])) ||
+      !isSafePositiveInteger(receiver.processId) || !isSafeNonNegativeInteger(receiver.sessionGeneration) ||
+      entry.update.edited_message !== undefined || !isRecord(message) || !isRecord(message.from) || !isRecord(message.chat) ||
+      message.from.is_bot !== false || message.from.id !== a.operatorUserId || !isSafePositiveInteger(message.message_id) ||
+      message.chat.type !== "private" || !isDeepStrictEqual(a.target, { chatId: message.chat.id,
+        ...(message.message_thread_id === undefined ? {} : { threadId: message.message_thread_id }) })) return invalid();
+    if (Buffer.byteLength(JSON.stringify(a)) > 16 * 1024) return invalid();
+    return { ...entry, privateTextInput: structuredClone(a) as unknown as TelegramJournalTextInputAssociation };
+  });
+  return { ...base, version: 5, entries };
+}
+
+/** Read-only warm publication data, never a source-use, SDK or removal receipt. */
+export interface TelegramTextInputSourceCustodyObservation {
+  readonly revision: number;
+  readonly frameUpdateIds: readonly number[];
+  readonly associations: readonly Readonly<Omit<TelegramJournalTextInputAssociation, "source" | "expectedSource" | "target" | "receiver"> & {
+    readonly source: Readonly<TelegramJournalTextInputAssociation["source"]>;
+    readonly expectedSource: Readonly<TelegramJournalTextInputAssociation["expectedSource"]>;
+    readonly target: Readonly<TelegramJournalTextInputAssociation["target"]>;
+    readonly receiver: Readonly<TelegramJournalTextInputAssociation["receiver"]>;
+  }>[];
+}
+
+/** Private native payload issued only inside the original frame's synchronous use scope. */
+export interface TelegramTextSourceUseInput {
+  readonly association: TelegramTextInputSourceCustodyObservation["associations"][number];
+  readonly profile: string;
+  readonly botId: number;
+  readonly revision: number;
+  readonly messageId: number;
+  readonly text: string;
+}
+const TEXT_SOURCE_USE_KEY = Symbol("native original Text source use");
+class NativeTextSourceUse {
+  #input: Readonly<TelegramTextSourceUseInput>;
+  #assert: (() => void) | undefined;
+  #spent = false;
+  #lost = false;
+  constructor(key: symbol, input: Readonly<TelegramTextSourceUseInput>, guard: () => void) {
+    if (key !== TEXT_SOURCE_USE_KEY) throw new Error("Text source use is unavailable.");
+    this.#input = input; this.#assert = guard; Object.freeze(this);
+  }
+  static read(value: NativeTextSourceUse, consume: boolean): Readonly<TelegramTextSourceUseInput> {
+    if (!value.#assert || value.#spent || value.#lost) { value.#lost = true; throw new Error("Text source use is unavailable."); }
+    if (consume) {
+      value.#spent = true;
+      try { value.#assert(); if (value.#lost) throw new Error("Text source use is unavailable."); }
+      catch (error) { value.#lost = true; throw error; }
+    }
+    return value.#input;
+  }
+  static close(value: NativeTextSourceUse): boolean { value.#assert = undefined; return value.#spent && !value.#lost; }
+}
+const readNativeTextSourceUse = NativeTextSourceUse.read;
+/** Peek is immutable data only. Consume is one spent-before-probes native source barrier, never an SDK result. */
+export function readTelegramNativeTextSourceUse(value: unknown, consume = false): Readonly<TelegramTextSourceUseInput> {
+  return readNativeTextSourceUse(value as NativeTextSourceUse, consume);
+}
+function assertPrivateTextReplyContinuity(previous: TelegramUpdateJournalEntry | undefined, entry: TelegramUpdateJournalEntry, path: string): void {
+  if (previous?.privateTextReply && !isDeepStrictEqual(previous.privateTextReply, entry.privateTextReply))
+    throw createJournalError("conflict", path, "changes immutable private Text Input evidence");
 }
 
 function validateJournalInputClaim(
@@ -1934,6 +2177,7 @@ function validateJournalEntry(
       ...(journalHasCustodyFields(version)
         ? ["inputClaim", "inputProvenance"]
         : []),
+      ...(version === TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION ? ["privateTextReply"] : []),
     ]) ||
     !isSafeNonNegativeInteger(value.updateId) ||
     !isSafeNonNegativeInteger(value.admittedAtMs) ||
@@ -2045,7 +2289,7 @@ function validateJournalEntry(
   }
   if (
     value.preApprovalExcluded === true &&
-    (value.inputClaim !== undefined || value.inputProvenance !== undefined)
+    (value.inputClaim !== undefined || value.inputProvenance !== undefined || value.privateTextReply !== undefined)
   ) {
     throw createJournalError(
       "pairing-evidence",
@@ -2053,6 +2297,8 @@ function validateJournalEntry(
       "contains claimed exclusion evidence",
     );
   }
+  const privateTextReply = value.privateTextReply === undefined
+    ? undefined : validatePrivateTextReply(value.privateTextReply, path, value.updateId);
   const inputClaim =
     value.inputClaim === undefined
       ? undefined
@@ -2131,6 +2377,7 @@ function validateJournalEntry(
       : {}),
     ...(inputClaim ? { inputClaim } : {}),
     ...(inputProvenance ? { inputProvenance } : {}),
+    ...(privateTextReply ? { privateTextReply } : {}),
     admittedAtMs: value.admittedAtMs,
     ...(routingInput ? { routingInput } : {}),
     state: value.state,
@@ -2219,7 +2466,7 @@ function validateJournalSourceCompletions(
   allowEmpty = false,
 ): TelegramUpdateJournalSourceCompletion[] {
   if (
-    !isTelegramUpdateJournalLegacyFamilyVersion(version) ||
+    (!isTelegramUpdateJournalLegacyFamilyVersion(version) && version !== TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION) ||
     !Array.isArray(value) ||
     (!allowEmpty && !value.length)
   ) {
@@ -2541,12 +2788,17 @@ function assertJournalSourceCompletionContinuity(
     queueRemovals.set(receiptId, valid);
     return valid;
   };
+  if (file.version === TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION &&
+    segment.sourceCompletions.some(completion => !previous.has(completion.updateId)) &&
+    file.entries.some(entry => removed.has(entry.updateId) && entry.privateTextReply))
+    throw createJournalError("invalid", path, "ordinary source completion removes private Text Input evidence");
   for (const completion of segment.sourceCompletions) {
     if (previous.has(completion.updateId)) continue;
     const source = entries.get(completion.updateId);
     if (
       !removed.has(completion.updateId) ||
       !source ||
+      (file.version === TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION && source.state !== "queued") ||
       (source.state === "queued" && !queueWasRemoved(source)) ||
       source.state === "failed" ||
       createTelegramUpdateJournalEntryDigest(source).sourceSha256 !==
@@ -2668,30 +2920,6 @@ function parseJournalSegment(
   };
 }
 
-/**
- * Isolated evidence only: caller must serialize/quiesce writers before inspection
- * and consumption. Metadata checks detect observable changes, not hostile same-user
- * swaps or whole-profile completeness. No locks, recovery, or publication occurs.
- * maxFiles counts snapshot + every enumerated segment entry (one overflow witness).
- * maxBytes aggregates all retained bytes. maxEntries bounds each raw collection and
- * reconstructed collection; maxWork charges each raw/revalidated collection element.
- * JSON allocation is bounded by maxBytes before decoding; collections before codecs.
- */
-export function inspectTelegramInputCustodySourceStatus(
-  input: Parameters<typeof inspectTelegramUpdateJournalFamily>[0],
-): "absent" | "v3" | "legacy" | "unsupported" | "ambiguous" {
-  try {
-    const evidence = inspectTelegramUpdateJournalFamily(input);
-    if (evidence.kind === "absent") return "absent";
-    if (evidence.file.version === 3) return "v3";
-    if (evidence.file.version === 1 || evidence.file.version === 2)
-      return "legacy";
-    return "unsupported";
-  } catch {
-    return "ambiguous";
-  }
-}
-
 export function inspectTelegramUpdateJournalFamily(input: {
   directory: string;
   path: string;
@@ -2723,6 +2951,7 @@ export interface TelegramUpdateJournalRetentionInspection {
     failureId: string;
     updateId: number;
     state: "committed" | "uncommitted";
+    originalTarget?: TelegramUpdateJournalAbandonedPendingEvidence["originalTarget"];
   }[];
 }
 
@@ -2770,11 +2999,20 @@ export function readTelegramUpdateJournalSource(
   ).evidence;
 }
 
+interface TextInputCandidateAcquisition {
+  file: TelegramTextInputSourceJournalCandidate | undefined;
+  assertCurrent(): void;
+}
+
+function acquireTelegramUpdateJournalFamily(input: Parameters<typeof inspectTelegramUpdateJournalFamily>[0], selectedVersion: 5): TextInputCandidateAcquisition;
+function acquireTelegramUpdateJournalFamily(input: Parameters<typeof inspectTelegramUpdateJournalFamily>[0], selectedVersion?: TelegramUpdateJournalFile["version"], inspectRetention?: boolean, recountedAncestors?: boolean): JournalSourceAcquisition;
 function acquireTelegramUpdateJournalFamily(
   input: Parameters<typeof inspectTelegramUpdateJournalFamily>[0],
-  selectedVersion?: TelegramUpdateJournalFile["version"],
+  selectedVersion?: TelegramUpdateJournalFile["version"] | 5,
   inspectRetention = false,
-): JournalSourceAcquisition {
+  recountedAncestors = false,
+): JournalSourceAcquisition | TextInputCandidateAcquisition {
+  if (selectedVersion === 5) inspectRetention = true;
   const { path, limits } = input;
   const acquiredSegments: JournalSourceAcquisition["segments"] = [];
   let snapshotRevision = 0;
@@ -2951,6 +3189,7 @@ function acquireTelegramUpdateJournalFamily(
     files = snapshot ? 1 : 0;
     const names = segments ? enumerate() : [];
     let file: TelegramUpdateJournalFile | undefined;
+    let candidate: TelegramTextInputSourceJournalCandidate | undefined;
     let knownBotId = expected.botId;
     const identity = (value: {
       profile: string;
@@ -2971,11 +3210,17 @@ function acquireTelegramUpdateJournalFamily(
       }
       knownBotId ??= value.botIdentity.botId;
     };
-    if (snapshot) {
+    if (snapshot && selectedVersion === 5) {
+      if (names.length) fail("candidate source does not admit snapshot/segment mixing");
+      candidate = decodeTelegramTextInputSourceJournalCandidate(JSON.stringify(read(path, snapshot)), path);
+      identity(candidate);
+      snapshotRevision = candidate.revision ?? 0;
+    }
+    if (snapshot && selectedVersion !== 5) {
       const raw = read(path, snapshot);
       if (
         !isRecord(raw) ||
-        (raw.version !== 1 && raw.version !== 2 && raw.version !== 3)
+        (raw.version !== 1 && raw.version !== 2 && raw.version !== 3 && raw.version !== 4)
       ) {
         throw createJournalError(
           "unsupported-version",
@@ -2983,6 +3228,8 @@ function acquireTelegramUpdateJournalFamily(
           "has an unsupported snapshot version",
         );
       }
+      if (selectedVersion !== undefined)
+        assertSupportedJournalVersion(raw, path, selectedVersion);
       file = parseJournalFile(raw, path, raw.version);
       snapshotRevision = file.revision ?? 0;
       identity(file);
@@ -3036,6 +3283,7 @@ function acquireTelegramUpdateJournalFamily(
         for (const id of segment.removedUpdateIds) entries.delete(id);
         for (const entry of segment.upsertedEntries) {
           const previous = entries.get(entry.updateId);
+          assertPrivateTextReplyContinuity(previous, entry, target);
           if (
             journalRequiresExclusion(file.version) &&
             ((previous &&
@@ -3161,12 +3409,15 @@ function acquireTelegramUpdateJournalFamily(
             current.entries.some((value) => value.updateId === entry.updateId))
         )
           fail("private retention contradicts its journal disposition");
+        const originalTarget = committed && "dispositionKind" in disposition && disposition.dispositionKind === "legacy-custody"
+          ? projectCommittedAbandonmentTarget(entry, disposition.operatorAuthorityId) : undefined;
         retainedInputs.push({
           path: target,
           journalBindingKey: raw.journalBindingKey,
           failureId: disposition.failureId,
           updateId: entry.updateId,
           state: committed ? "committed" : "uncommitted",
+          ...(originalTarget ? { originalTarget } : {}),
         });
       }
     }
@@ -3187,27 +3438,32 @@ function acquireTelegramUpdateJournalFamily(
     )
       fail("committed abandonment lost its private original");
     // Re-enumeration has the same bound, rather than allocating an unbounded census.
-    files = snapshot ? 1 : 0;
-    if (segments && !isDeepStrictEqual(names, enumerate()))
-      fail("changed segment namespace");
-    files += names.length;
-    if (
-      retention &&
-      !isDeepStrictEqual(
-        retentionNames,
-        enumerate(retentionDirectory, retentionPattern),
-      )
-    )
-      fail("changed private retention namespace");
-    files += retentionNames.length;
-    for (const [target, before] of observed) {
-      const after = status(target);
-      const compare =
-        selectedVersion !== undefined && ancestors.has(target)
-          ? sameAncestor
-          : same;
-      if (before ? !after || !compare(before, after) : after !== undefined)
-        fail("changed observed namespace or file");
+    let observationLive = true, observing = false;
+    const assertObserved = () => {
+      if (!observationLive || observing) { observationLive = false; fail("source observation is no longer current"); }
+      observing = true;
+      try {
+        if (selectedVersion === 5 && realpathSync(anchor) !== anchor) fail("changed source namespace");
+        files = snapshot ? 1 : 0;
+        if (segments && !isDeepStrictEqual(names, enumerate())) fail("changed segment namespace");
+        files += names.length;
+        if (retention && !isDeepStrictEqual(retentionNames, enumerate(retentionDirectory, retentionPattern))) fail("changed private retention namespace");
+        files += retentionNames.length;
+        for (const [target, before] of observed) {
+          const after = status(target);
+          const compare = (selectedVersion !== undefined || recountedAncestors) && ancestors.has(target) ? sameAncestor : same;
+          if (before ? !after || !compare(before, after) : after !== undefined) fail("changed observed namespace or file");
+        }
+        if (!observationLive) fail("source observation reentered");
+      } catch (error) { observationLive = false; throw error; }
+      finally { observing = false; }
+    };
+    assertObserved();
+    if (selectedVersion === 5) {
+      if (candidate && createTelegramUpdateJournalReceiptScope({ profileName: input.profile, botIdentity: expected }) !==
+        createTelegramUpdateJournalReceiptScope({ profileName: candidate.profile, botIdentity: candidate.botIdentity }))
+        throw createJournalError("identity-mismatch", path, "does not retain the candidate receipt scope");
+      return { file: candidate, assertCurrent: assertObserved };
     }
     if (selectedVersion !== undefined) {
       if (realpathSync(anchor) !== anchor)
@@ -3239,6 +3495,7 @@ function acquireTelegramUpdateJournalFamily(
       }
     }
     return {
+      assertCurrent: assertObserved,
       evidence: file
         ? {
             kind: "present",
@@ -3347,16 +3604,21 @@ function inspectTelegramJournalNamespace(
   const expected = validateBotIdentity(input.botIdentity, directory);
   if (!isAbsolute(directory) || resolve(directory) !== directory)
     fail("requires a canonical directory anchor");
-  const metadata = (target: string) => {
+  const metadata = (target: string, runtimeKind?: "file" | "directory") => {
     const value = lstatSync(target, { bigint: true });
+    if (runtimeKind && (value.isSymbolicLink() || (runtimeKind === "file" ? !value.isFile() || value.nlink !== 1n : !value.isDirectory())))
+      fail("has a linked or unexpected runtime entry");
+    // Only known non-source runtime payloads may churn; directories retain their original physical identity.
     return {
       dev: value.dev,
-      ino: value.ino,
+      ino: runtimeKind === "file" ? undefined : value.ino,
       mode: value.mode,
-      nlink: value.nlink,
-      size: value.size,
-      mtimeNs: value.mtimeNs,
-      ctimeNs: value.ctimeNs,
+      uid: value.uid,
+      gid: value.gid,
+      nlink: runtimeKind ? undefined : value.nlink,
+      size: runtimeKind ? undefined : value.size,
+      mtimeNs: runtimeKind ? undefined : value.mtimeNs,
+      ctimeNs: runtimeKind ? undefined : value.ctimeNs,
     };
   };
   const suffix = profile === "default" ? "" : `.${profile}`;
@@ -3404,7 +3666,11 @@ function inspectTelegramJournalNamespace(
             const target = join(parent, entry.name);
             const key = relative(directory, target);
             if (entries.has(key)) fail("repeated an observed namespace entry");
-            entries.set(key, metadata(target));
+            const runtimeKind = includeSessions && parent === directory
+              ? entry.name === "state.json" || entry.name === "logs.jsonl" ? "file"
+                : entry.name === "runtime" || entry.name === "logs" ? "directory" : undefined
+              : undefined;
+            entries.set(key, metadata(target, runtimeKind));
             visit(entry.name, target);
           }
         } finally {
@@ -3536,6 +3802,7 @@ function inspectTelegramJournalNamespace(
           },
           undefined,
           includeSessions,
+          includeSessions,
         );
       const acquired = input.withSourceReference
         ? input.withSourceReference(path, acquire)
@@ -3565,13 +3832,17 @@ function inspectTelegramJournalNamespace(
         evidence.kind === "present" ? Math.max(1, evidence.accounting.work) : 1;
       sources.push({ role, path, evidence });
     }
+    const rootCurrent = (): boolean => {
+      const after = metadata(directory);
+      return includeSessions
+        ? realpathSync(directory) === directory && beforeRoot.dev === after.dev && beforeRoot.ino === after.ino &&
+          beforeRoot.mode === after.mode && beforeRoot.uid === after.uid && beforeRoot.gid === after.gid
+        : isDeepStrictEqual(beforeRoot, after);
+    };
     const namespaceCurrent = (): boolean => {
       try {
-        return (
-          isDeepStrictEqual(beforeRoot, metadata(directory)) &&
-          isDeepStrictEqual(before, census()) &&
-          isDeepStrictEqual(beforeRoot, metadata(directory))
-        );
+        // Every name and journal/evidence metadata is re-counted; root timestamps also reflect unrelated state writes.
+        return rootCurrent() && isDeepStrictEqual(before, census()) && rootCurrent();
       } catch {
         return false;
       }
@@ -3827,6 +4098,7 @@ function cloneEntry(
   return {
     ...entry,
     update: structuredClone(entry.update),
+    ...(entry.privateTextReply ? { privateTextReply: structuredClone(entry.privateTextReply) } : {}),
     ...(entry.inputClaim
       ? { inputClaim: structuredClone(entry.inputClaim) }
       : {}),
@@ -4092,6 +4364,26 @@ function createPendingRetentionReference(input: {
     };
   };
   return { evidenceSha256, failureId, retainedPath, read };
+}
+
+/** Projects body-free locator facts only after the caller has validated committed original retention. */
+function projectCommittedAbandonmentTarget(
+  entry: TelegramUpdateJournalEntry,
+  operatorAuthorityId: string,
+): TelegramUpdateJournalAbandonedPendingEvidence["originalTarget"] {
+  const update = entry.update, message = update.message;
+  // Only an original human bot-chat message supplies this locator. Other cancellation proofs remain useful,
+  // but callbacks, business/edited/ambiguous envelopes cannot lend their display target to orphan cleanup.
+  return Object.keys(update).length === 2 && "update_id" in update && "message" in update &&
+    isRecord(message) && isRecord(message.chat) && isRecord(message.from) &&
+    message.chat.type === "private" && isSafePositiveInteger(message.chat.id) &&
+    message.from.id === message.chat.id && message.from.is_bot === false &&
+    operatorAuthorityId === `telegram-owner:${message.chat.id}` &&
+    message.business_connection_id === undefined && message.sender_chat === undefined &&
+    isSafePositiveInteger(message.message_thread_id) && isSafePositiveInteger(message.message_id)
+    ? Object.freeze({ chatId: message.chat.id, threadId: message.message_thread_id, messageId: message.message_id,
+        sourceSha256: createTelegramUpdateJournalEntryDigest(entry).sourceSha256 })
+    : undefined;
 }
 
 function writeJournalFile(
@@ -4411,7 +4703,8 @@ export type TelegramUpdateJournalReferenceClass =
   | "polling-cursor"
   | "polling-bootstrap"
   | "workspace-retirement"
-  | "operator-disposition";
+  | "operator-disposition"
+  | "private-source-observation";
 
 export function createTelegramUpdateJournalReferenceRegistry(
   input: {
@@ -4480,6 +4773,57 @@ export function withTelegramResolvedUpdateJournalReference<T>(input: {
     { referenceClass: input.referenceClass, recoveryKey: binding.recoveryKey },
     () => input.operation(binding),
   );
+}
+
+type PrivateReplyJournal = Pick<TelegramInputJournalStore<4>, "read" | "acquireInput" | "pinPrivateTextReplyDestination">;
+
+interface PrivateTextReplySelection {
+  purpose: "private-text-reply-first-ready";
+  source: TelegramInputJournalSourceReference;
+  expectedPendingSource: TelegramUpdateJournalEntryDigest;
+  destination: TelegramJournalPrivateTextReplyDestination;
+  assertOriginal: () => void;
+}
+
+interface PrivateTextReplyPreparationScope {
+  readonly journal: PrivateReplyJournal;
+  readonly sourceIdentity: Readonly<Omit<TelegramInputJournalSourceReference, "updateId">>;
+  assertCurrent(): void;
+  selectPrivateTextReplyContext(journal: PrivateReplyJournal, selection: PrivateTextReplySelection): {
+    readonly context: TelegramInputJournalContext; assertCurrent(): void;
+  };
+}
+
+export interface TelegramPrivateTextReplyPreparationSource {
+  withScope<T>(updateId: number, operation: (scope: PrivateTextReplyPreparationScope) => T): T;
+}
+
+export interface TelegramPrivateTextReplyAcceptanceCandidate {
+  destination: TelegramJournalPrivateTextReplyDestination;
+  message: unknown;
+}
+
+export type TelegramPrivateTextReplyReceiverSelector = (
+  candidate: TelegramPrivateTextReplyAcceptanceCandidate, assertSource: () => void,
+) => Readonly<{ assertCurrent(): void }> | undefined;
+
+export interface TelegramV4InputCandidate {
+  readonly profile: string;
+  readonly botIdentity: Readonly<TelegramUpdateJournalBotIdentity>;
+  readonly sessionId: string;
+  readonly owner: Readonly<TelegramUpdateJournalQueueOwnerIdentity>;
+  readonly source: Readonly<TelegramInputJournalSourceReference>;
+  readonly expectedSource: Readonly<TelegramUpdateJournalEntryDigest>;
+  readonly entry: TelegramUpdateJournalEntry;
+}
+
+export type TelegramOrdinaryV4InputCandidate = TelegramV4InputCandidate;
+export type TelegramOrdinaryV4SelectionGuard = (candidate: TelegramOrdinaryV4InputCandidate) => void;
+
+function isPrivateFirstPreparationEntry(entry: TelegramUpdateJournalEntry): boolean {
+  return entry.state === "pending" && entry.preApprovalExcluded === false &&
+    !entry.inputClaim && !entry.inputProvenance && !entry.privateTextReply &&
+    !entry.queueOwner && !entry.queueHandoff && !entry.queueKind && !entry.queueReceiptId;
 }
 
 function validateQueuedReceiptObservation(
@@ -4560,11 +4904,11 @@ function inspectJournalSourceCompletion(
   completion: TelegramUpdateJournalSourceCompletion,
   path: string,
 ): TelegramUpdateJournalSourceCompletion | undefined {
-  if (!isTelegramUpdateJournalLegacyFamilyVersion(file.version))
+  if (!isTelegramUpdateJournalLegacyFamilyVersion(file.version) && file.version !== TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION)
     throw createJournalError(
       "invalid",
       path,
-      "source completion requires a legacy v1 source",
+      "source completion requires a legacy v1 or explicit v4 source",
     );
   const retained = file.sourceCompletions?.find(
     (value) => value.updateId === completion.updateId,
@@ -4855,6 +5199,7 @@ export function createTelegramUpdateJournalBindingRuntime(deps: {
           updateId,
           retainedPath: original.path,
           operatorAuthorityId: disposition.operatorAuthorityId,
+          ...(original.originalTarget ? { originalTarget: original.originalTarget } : {}),
         };
       });
     },
@@ -4988,31 +5333,8 @@ export function createTelegramJournalSourceSerialization(
 export function createTelegramUpdateJournalStore(
   options: TelegramUpdateJournalStoreOptions,
 ): TelegramUpdateJournalStore {
-  return createJournalStoreCore(options).journal;
-}
-
-/** Opt-in v3 only; does not migrate old files or expose legacy unowned mutation ports. */
-export function createTelegramInputJournalStore(
-  options: TelegramInputJournalStoreOptions,
-): TelegramInputJournalStore {
-  const captured = { ...options };
-  if (
-    !captured.sourceAccess ||
-    !captured.queueRuntimeIdentity ||
-    typeof captured.withSourceSerialization !== "function" ||
-    typeof captured.withPairingAdmission !== "function" ||
-    typeof captured.getInputContext !== "function" ||
-    ("withPairedAdmission" in captured &&
-      captured.withPairedAdmission !== undefined)
-  ) {
-    throw new Error(
-      "Telegram input custody requires strict serialized polling admission and runtime identity.",
-    );
-  }
-  return createJournalStoreCore(
-    { ...captured, queueRuntimeIdentity: { ...captured.queueRuntimeIdentity } },
-    captured.getInputContext,
-  ).input!;
+  // The core strictly validates the selected persisted version before every read.
+  return createJournalStoreCore(options).journal as TelegramUpdateJournalStore;
 }
 
 /** Exact unhanded queued receipt member: requested id, queue kind and owner identity. */
@@ -5032,10 +5354,32 @@ function isExactQueuedReceiptEntry(
   );
 }
 
+type OrdinaryAppendTicket = {
+  active: boolean;
+  poisoned: boolean;
+  captured?: ReadonlyMap<number, TelegramUpdateJournalEntryDigest>;
+  returned?: TelegramUpdateJournalAppendResult;
+};
+
+function ordinaryV4EntryDigest(entry: TelegramUpdateJournalEntry, path: string): TelegramUpdateJournalEntryDigest {
+  return createTelegramUpdateJournalEntryDigest(validateJournalEntry(entry, path, 4));
+}
+
 function createJournalStoreCore(
   options: TelegramUpdateJournalStoreOptions,
   getInputContext?: TelegramInputJournalStoreOptions["getInputContext"],
-): { journal: TelegramUpdateJournalStore; input?: TelegramInputJournalStore } {
+  storageVersion: 3 | 4 = TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION,
+  observationVersion?: 4,
+  privateFirstPreparation?: () => { updateId: number; expectedPendingSource: TelegramUpdateJournalEntryDigest },
+  ordinaryAppendScope?: <T>(operation: () => T) => T,
+  inputAdmission?: () => { phase: "acquire" | "start" | "complete" | "accept"; updateId: number; expectedSource: TelegramUpdateJournalEntryDigest },
+  ordinaryQueue?: () => readonly TelegramUpdateJournalEntryDigest[],
+): { journal: TelegramUpdateJournalStore<TelegramUpdateJournalFile["version"]>; input?: TelegramInputJournalStore<TelegramUpdateJournalFile["version"]>;
+  completeInputAcknowledged?: (receipt: TelegramInputJournalReceipt) => ReturnType<TelegramInputJournalStore<4>["completeInput"]>;
+  getInputCompletionPublication?: () => Readonly<{ receipt: Readonly<TelegramInputJournalReceipt>; source: Readonly<TelegramUpdateJournalEntryDigest>; assertPublished(): void }> | undefined;
+  appendAcknowledged?: (updates: readonly TelegramJournaledUpdate[], cursor: number) => {
+    result: TelegramUpdateJournalAppendResult; captured: ReadonlyMap<number, TelegramUpdateJournalEntryDigest>;
+  } } {
   const path = options.path;
   const profile = options.profileName ?? TELEGRAM_DEFAULT_PROFILE_NAME;
   if (!path) throw new Error("Telegram update journal path is required.");
@@ -5070,6 +5414,9 @@ function createJournalStoreCore(
   );
   const getNowMs = options.getNowMs ?? Date.now;
   const onPublicationBoundary = options.onPublicationBoundary;
+  type InputCompletionTicket = { active: boolean; poisoned: boolean; returned?: ReturnType<TelegramInputJournalStore<4>["completeInput"]>;
+    receipt?: Readonly<TelegramInputJournalReceipt>; source?: Readonly<TelegramUpdateJournalEntryDigest> };
+  let completionInFlight: InputCompletionTicket | undefined, lastCompletion: InputCompletionTicket | undefined;
   const workspaceAdmission = options.workspaceAdmission;
   const withSourceSerialization = options.withSourceSerialization;
   const sourceAccess = options.sourceAccess && {
@@ -5086,11 +5433,13 @@ function createJournalStoreCore(
   if (withPairingAdmission && withPairedAdmission) {
     throw new Error("Telegram journal admission modes are mutually exclusive.");
   }
-  const version = getInputContext
-    ? TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION
+  if (observationVersion && (!sourceAccess || !withSourceSerialization || getInputContext))
+    throw new Error("Private source observation requires strict read-only construction.");
+  const version = observationVersion ?? (getInputContext
+    ? storageVersion
     : withPairingAdmission
       ? TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION
-      : TELEGRAM_UPDATE_JOURNAL_VERSION;
+      : TELEGRAM_UPDATE_JOURNAL_VERSION);
   const notifyRecovery = (event: TelegramUpdateJournalRecoveryEvent): void => {
     try {
       options.onRecovery?.(event);
@@ -5420,6 +5769,7 @@ function createJournalStoreCore(
       }
       for (const entry of segment.upsertedEntries) {
         const previous = entriesById.get(entry.updateId);
+        assertPrivateTextReplyContinuity(previous, entry, segmentPath);
         if (
           withPairingAdmission &&
           ((previous &&
@@ -5721,9 +6071,11 @@ function createJournalStoreCore(
       const source = acquireSource();
       const readSource = (): ReadTelegramUpdateJournalResult =>
         source ? readAcquiredSource(source) : readCurrent();
-      return withTelegramFileTransaction(`${path}.transaction`, () =>
-        operation(readSource),
-      );
+      return withTelegramFileTransaction(`${path}.transaction`, () => {
+        // A different source serializer must not carry stale evidence through this family fence.
+        source?.assertCurrent();
+        return operation(readSource);
+      });
     } catch (error) {
       if (error instanceof TelegramUpdateJournalError) throw error;
       throw createJournalError("io", path, "mutation failed", error);
@@ -6438,6 +6790,13 @@ function createJournalStoreCore(
       ...(sourceCompletions?.length ? { sourceCompletions } : {}),
     };
     assertJournalRoutingInputContinuity(current.file, entries, path);
+    const previousEntries = new Map(
+      current.file.entries.map((entry) => [entry.updateId, entry]),
+    );
+    if (version === TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION) {
+      for (const entry of entries)
+        assertPrivateTextReplyContinuity(previousEntries.get(entry.updateId), entry, path);
+    }
     if (withPairingAdmission || current.source)
       parseJournalFile(file, path, version);
     const serialized = serializeJournalFile(file);
@@ -6472,9 +6831,6 @@ function createJournalStoreCore(
       writeJournalFile(path, serialized, publicationBoundary);
       return { file, serializedBytes };
     }
-    const previousEntries = new Map(
-      current.file.entries.map((entry) => [entry.updateId, entry]),
-    );
     if (
       withPairingAdmission &&
       entries.some((entry) => {
@@ -6791,6 +7147,13 @@ function createJournalStoreCore(
       const current = readCurrent();
       const receiptIds = new Set<string>(),
         requestedUpdateIds = new Set<number>();
+      const queueGroups = new Map<string, TelegramUpdateJournalEntry[]>();
+      for (const entry of current.file.entries) {
+        if (!entry.queueReceiptId) continue;
+        const group = queueGroups.get(entry.queueReceiptId) ?? [];
+        group.push(entry);
+        queueGroups.set(entry.queueReceiptId, group);
+      }
       for (const receipt of receipts) {
         if (
           (receipt.queueKind !== "prompt" && receipt.queueKind !== "control") ||
@@ -6835,9 +7198,7 @@ function createJournalStoreCore(
           sourceUpdateIds.add(updateId);
           requestedUpdateIds.add(updateId);
         }
-        const persistedReceiptEntries = current.file.entries.filter(
-          (entry) => entry.queueReceiptId === receipt.receiptId,
-        );
+        const persistedReceiptEntries = queueGroups.get(receipt.receiptId) ?? [];
         if (
           persistedReceiptEntries.length !== sourceUpdateIds.size ||
           persistedReceiptEntries.some(
@@ -6871,6 +7232,9 @@ function createJournalStoreCore(
           "queued completion did not resolve every source update",
         );
       if (completions) {
+        // Claims/provenance carry no purpose flag; the durable latch is structural private evidence.
+        if (version === TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION && removedEntries.some(entry => entry.privateTextReply))
+          throw createJournalError("conflict", path, "ordinary queued completion cannot remove private Text Input evidence");
         const sources = new Map(
           removedEntries.map((entry) => [
             entry.updateId,
@@ -7129,7 +7493,11 @@ function createJournalStoreCore(
     exists: current.exists,
     serializedBytes: current.serializedBytes,
   });
-  const journal: TelegramUpdateJournalStore = {
+  const tickets = new WeakSet<OrdinaryAppendTicket>();
+  let appendInFlight: OrdinaryAppendTicket | undefined;
+  const journal: Omit<TelegramUpdateJournalStore<TelegramUpdateJournalFile["version"]>, "appendBatch"> & {
+    appendBatch<TUpdate extends TelegramUpdateJournalInput>(updates: readonly TUpdate[], cursor?: number, ticket?: OrdinaryAppendTicket): TelegramUpdateJournalAppendResult;
+  } = {
     read() {
       // Atomic publication makes a repair-free read safe without serialization, so idle
       // status and polling cursor reads create no guards. Any read that needs reconciliation,
@@ -7149,7 +7517,9 @@ function createJournalStoreCore(
         ? projectRead(current)
         : runMutation((readCurrent) => projectRead(readCurrent()));
     },
-    appendBatch(updates, requestedAcceptedThroughUpdateId) {
+    appendBatch(updates, requestedAcceptedThroughUpdateId, ticket) {
+      if (ticket && (!tickets.has(ticket) || !ticket.active || ticket.poisoned))
+        throw new Error("Ordinary v4 append ticket is unavailable.");
       const canonicalUpdates = updates.map((update) =>
         normalizeIncomingJournaledUpdate(update, path),
       );
@@ -7175,7 +7545,7 @@ function createJournalStoreCore(
         }
         normalizedUpdates.push(normalized);
       }
-      const appendWithEvidence = (preApprovalExcluded?: boolean) =>
+      const transactionalAppendWithEvidence = (preApprovalExcluded?: boolean) =>
         runJournalTransaction((readCurrent) => {
           if (
             withPairingAdmission &&
@@ -7300,7 +7670,16 @@ function createJournalStoreCore(
             current.file.operatorDispositions,
             acceptedThroughUpdateId,
           );
-          return {
+          if (ticket) {
+            if (!ticket.active || ticket.poisoned || ticket.captured) {
+              ticket.poisoned = true;
+              throw new Error("Ordinary v4 append capture is conflicting or expired.");
+            }
+            const added = new Set(addedUpdateIds);
+            ticket.captured = new Map(published.file.entries.filter((entry) => added.has(entry.updateId))
+              .map((entry) => [entry.updateId, ordinaryV4EntryDigest(entry, path)]));
+          }
+          const result = {
             nonExcludedUpdateIds: normalizedUpdates.flatMap((update) => {
               const entry = entriesById.get(update.update_id);
               return entry && entry.preApprovalExcluded !== true
@@ -7312,7 +7691,16 @@ function createJournalStoreCore(
             entryCount: published.file.entries.length,
             serializedBytes: published.serializedBytes,
           };
+          if (ticket) ticket.returned = result;
+          return result;
         });
+      const appendWithEvidence = (preApprovalExcluded?: boolean) => {
+        if (ticket && (!tickets.has(ticket) || !ticket.active || ticket.poisoned || ticket.captured)) {
+          ticket.poisoned = true;
+          throw new Error("Ordinary v4 append capture is conflicting or expired.");
+        }
+        return transactionalAppendWithEvidence(preApprovalExcluded);
+      };
       // Sender admission is the outer config authority; journal serialization nests inside it.
       const serializedAppend = (preApprovalExcluded?: boolean) =>
         withSourceSerialization
@@ -7493,6 +7881,7 @@ function createJournalStoreCore(
             ...(entry.routingInput
               ? { routingInput: { ...entry.routingInput } }
               : {}),
+            ...(entry.privateTextReply ? { privateTextReply: structuredClone(entry.privateTextReply) } : {}),
             state: "queued",
             queueKind: receipt.queueKind,
             queueReceiptId: receipt.receiptId,
@@ -7622,6 +8011,7 @@ function createJournalStoreCore(
           ...(entry.preApprovalExcluded !== undefined
             ? { preApprovalExcluded: entry.preApprovalExcluded }
             : {}),
+          ...(entry.privateTextReply ? { privateTextReply: structuredClone(entry.privateTextReply) } : {}),
           state: input.disposition,
           failure,
           ...(input.disposition === "retry-wait"
@@ -7735,6 +8125,7 @@ function createJournalStoreCore(
                       ...(entry.preApprovalExcluded !== undefined
                         ? { preApprovalExcluded: entry.preApprovalExcluded }
                         : {}),
+                      ...(entry.privateTextReply ? { privateTextReply: structuredClone(entry.privateTextReply) } : {}),
                       state: "retry-wait" as const,
                       failure: entry.failure,
                       nextRetryAtMs: disposition.committedAtMs,
@@ -7754,6 +8145,52 @@ function createJournalStoreCore(
           entryCount: published.file.entries.length,
           serializedBytes: published.serializedBytes,
         };
+      });
+    },
+    discardRetryWait(input) {
+      return runMutation((readCurrent) => {
+        if (version !== TELEGRAM_UPDATE_JOURNAL_VERSION)
+          throw createJournalError("unsupported-version", path, "operator retry discard requires the legacy v1 source");
+        const journalBindingKey = createTelegramUpdateJournalBindingKey({ path, profileName: profile, botIdentity: expectedIdentity });
+        const operatorAuthorityId = input.operatorAuthorityId, isCurrent = input.isCurrent;
+        if (input.journalBindingKey !== journalBindingKey ||
+            !isBoundedString(operatorAuthorityId, TELEGRAM_UPDATE_JOURNAL_FAILURE_ID_MAX_LENGTH) || !operatorAuthorityId.trim() || typeof isCurrent !== "function")
+          throw createJournalError("conflict", path, "operator retry discard lacks exact source authority");
+        const expected = validateJournalEntry(input.entry, path, version);
+        if (expected.state !== "retry-wait" || !expected.failure || expected.inputClaim || expected.inputProvenance ||
+            expected.queueOwner || expected.queueHandoff || expected.queueReceiptId || expected.queueKind || expected.routingInput)
+          throw createJournalError("conflict", path, "operator retry discard requires an exact unclaimed failed input");
+        const assertCurrent = () => {
+          if (!isCurrent()) throw createJournalError("conflict", path, "operator retry discard lost authority");
+        };
+        assertCurrent();
+        // The existing terminal-discard audit is readable by v1 peers; do not invent a failed execution attempt.
+        const failureId = `operator-discard-${createHash("sha256").update(JSON.stringify({ journalBindingKey, entry: expected, operatorAuthorityId })).digest("hex")}`;
+        const current = sourceAccess ? readCurrent() : readCurrentStrict(false);
+        const existing = current.file.operatorDispositions?.find(value => value.failureId === failureId);
+        const entry = current.file.entries.find(value => value.updateId === expected.updateId);
+        if (existing) {
+          if (entry || "dispositionKind" in existing || existing.updateId !== expected.updateId || existing.action !== "discard" ||
+              existing.attemptCount !== expected.failure.attemptCount || existing.failureClass !== expected.failure.failureClass ||
+              existing.terminalReason !== `operator-discard:${operatorAuthorityId}`)
+            throw createJournalError("conflict", path, "operator retry discard has conflicting retained evidence");
+          assertCurrent();
+          return { disposition: { ...existing }, duplicate: true, entryCount: current.file.entries.length, serializedBytes: current.serializedBytes };
+        }
+        if (!entry || !isDeepStrictEqual(entry, expected) || current.file.operatorDispositions?.some(value => value.updateId === expected.updateId))
+          throw createJournalError("conflict", path, "operator retry source changed before discard");
+        const nowMs = getNowMs();
+        if (!isSafeNonNegativeInteger(nowMs)) throw createJournalError("invalid", path, "invalid operator discard timestamp");
+        const disposition: TelegramUpdateJournalTerminalOperatorDisposition = {
+          failureId, updateId: expected.updateId, action: "discard", committedAtMs: nowMs,
+          attemptCount: expected.failure.attemptCount, failureClass: expected.failure.failureClass,
+          terminalAtMs: nowMs, terminalReason: `operator-discard:${operatorAuthorityId}`,
+        };
+        assertCurrent();
+        const published = publishMutation(current, current.file.entries.filter(value => value.updateId !== expected.updateId), true,
+          [...(current.file.operatorDispositions ?? []), disposition], current.file.acceptedThroughUpdateId,
+          (boundary, target) => { onPublicationBoundary?.(boundary, target); assertCurrent(); });
+        return { disposition, duplicate: false, entryCount: published.file.entries.length, serializedBytes: published.serializedBytes };
       });
     },
     applyLegacyCustodyDisposition(authority) {
@@ -7891,6 +8328,7 @@ function createJournalStoreCore(
                       ...(entry.preApprovalExcluded === undefined
                         ? {}
                         : { preApprovalExcluded: entry.preApprovalExcluded }),
+                      ...(entry.privateTextReply ? { privateTextReply: structuredClone(entry.privateTextReply) } : {}),
                       state: "pending" as const,
                     }
                   : candidate,
@@ -8089,6 +8527,7 @@ function createJournalStoreCore(
                   ...(entry.preApprovalExcluded !== undefined
                     ? { preApprovalExcluded: entry.preApprovalExcluded }
                     : {}),
+                  ...(entry.privateTextReply ? { privateTextReply: structuredClone(entry.privateTextReply) } : {}),
                   state: "queued" as const,
                   queueKind: input.queueKind,
                   queueReceiptId: input.receiptId,
@@ -8463,11 +8902,13 @@ function createJournalStoreCore(
             "retained input does not match committed abandonment",
           );
         }
+        const originalTarget = projectCommittedAbandonmentTarget(entry, disposition.operatorAuthorityId);
         return {
           journalBindingKey,
           updateId,
           retainedPath,
           operatorAuthorityId: disposition.operatorAuthorityId,
+          ...(originalTarget ? { originalTarget } : {}),
         };
       });
     },
@@ -9039,8 +9480,10 @@ function createJournalStoreCore(
     entries: TelegramUpdateJournalEntry[],
     updateId: number | readonly number[],
     context: TelegramInputJournalContext,
-  ) =>
-    publishMutation(
+    assertAuthority?: () => void,
+  ) => {
+    assertAuthority?.();
+    const published = publishMutation(
       current,
       entries,
       true,
@@ -9055,9 +9498,21 @@ function createJournalStoreCore(
             "input execution context changed before publication",
           );
         }
+        assertAuthority?.();
+        if (assertAuthority && !isDeepStrictEqual(currentInputContext(), context))
+          throw createJournalError("conflict", path, "input execution context changed during authority assertion");
       },
       updateId,
     );
+    if (assertAuthority) {
+      if (!isDeepStrictEqual(currentInputContext(), context))
+        throw createJournalError("conflict", path, "input execution context changed after publication");
+      assertAuthority();
+      if (!isDeepStrictEqual(currentInputContext(), context))
+        throw createJournalError("conflict", path, "input execution context changed during post-publication assertion");
+    }
+    return published;
+  };
   const publishInputSettlement = (
     current: ReadTelegramUpdateJournalResult,
     entries: TelegramUpdateJournalEntry[],
@@ -9377,7 +9832,63 @@ function createJournalStoreCore(
       entry.updateId,
     );
   };
-  const input: TelegramInputJournalStore = {
+  const input: TelegramInputJournalStore<TelegramUpdateJournalFile["version"]> = {
+    pinPrivateTextReplyDestination(value) {
+      if (version !== TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION)
+        throw createJournalError("unsupported-version", path, "requires explicit private Text Input storage v4");
+      if (!privateReplyRecord(value, ["receipt", "expectedSource", "destination", "assertAuthority"]) ||
+        typeof value.assertAuthority !== "function" ||
+        !privateReplyRecord(value.receipt, ["journalBindingKey", "tokenSha256", "updateId", "owner"]) ||
+        !privateReplyRecord(value.receipt.owner, ["instanceId", "processId", "processBirthId", "sessionGeneration",
+          "acquisitionId", "acquiredAtMs"], ["handoffId"]))
+        throw createJournalError("invalid", path, "requires a synchronous private Text Input authority assertion and exact receipt");
+      const callerGuard = value.assertAuthority;
+      const receipt = normalizeInputReceipt(value.receipt);
+      const evidence = validatePrivateTextReply({
+        source: createInputSourceReference(receipt.updateId),
+        expectedSource: value.expectedSource,
+        destination: value.destination,
+      }, path, receipt.updateId);
+      if (evidence.destination.profile !== profile ||
+        evidence.destination.botIdentity.tokenSha256 !== expectedIdentity.tokenSha256 ||
+        (expectedIdentity.botId !== undefined && evidence.destination.botIdentity.botId !== expectedIdentity.botId) ||
+        evidence.destination.receiver.instanceId === queueRuntimeIdentity!.instanceId)
+        throw createJournalError("conflict", path, "private Text Input destination identity does not match its foreign source scope");
+      const assertAuthority = () => {
+        if (callerGuard() !== undefined)
+          throw createJournalError("invalid", path, "private Text Input authority assertion must be synchronous and return void");
+      };
+      return runInputMutation("pin-private-text-reply", read => {
+        assertAuthority();
+        const context = currentInputContext();
+        const current = read();
+        const ready = readReadyDonorInput(current, receipt);
+        if (!isDeepStrictEqual(context, ready.context) || ready.claim.handoff ||
+          ready.entry.preApprovalExcluded !== false || ready.entry.state !== "pending" ||
+          (current.file.botIdentity.botId !== undefined &&
+            current.file.botIdentity.botId !== evidence.destination.botIdentity.botId))
+          throw createJournalError("conflict", path, "private Text Input pin lost ready source authority");
+        assertAuthority();
+        if (ready.entry.privateTextReply) {
+          const beforePin = cloneEntry(ready.entry);
+          delete beforePin.privateTextReply;
+          if (!isDeepStrictEqual(ready.entry.privateTextReply, evidence) ||
+            !isDeepStrictEqual(createTelegramUpdateJournalEntryDigest(beforePin), evidence.expectedSource))
+            throw createJournalError("conflict", path, "private Text Input destination or original ready authority changed");
+          if (!isDeepStrictEqual(currentInputContext(), context))
+            throw createJournalError("conflict", path, "private Text Input pin context changed");
+          assertAuthority();
+          if (!isDeepStrictEqual(currentInputContext(), context))
+            throw createJournalError("conflict", path, "private Text Input pin context changed during authority assertion");
+          return { pinned: false };
+        }
+        if (!isDeepStrictEqual(createTelegramUpdateJournalEntryDigest(ready.entry), evidence.expectedSource))
+          throw createJournalError("conflict", path, "private Text Input source digest changed before pin");
+        publishInputMutation(current, current.file.entries.map(entry => entry.updateId === receipt.updateId
+          ? { ...entry, privateTextReply: evidence } : entry), receipt.updateId, context, assertAuthority);
+        return { pinned: true };
+      });
+    },
     read: journal.read,
     appendBatch: journal.appendBatch,
     listLegacyCustodyCandidates() {
@@ -9639,6 +10150,14 @@ function createJournalStoreCore(
           (candidate) => candidate.updateId === source.updateId,
         );
         const claim = entry?.inputClaim;
+        const acceptance = inputAdmission?.();
+        if (acceptance && (acceptance.phase !== "accept" || acceptance.updateId !== source.updateId || !entry ||
+          !isDeepStrictEqual(createTelegramUpdateJournalEntryDigest(entry), acceptance.expectedSource)))
+          throw createJournalError("conflict", path, "private input acceptance source changed under serialization");
+        const assertAcceptance = acceptance ? () => {
+          const observed = inputAdmission!();
+          if (!isDeepStrictEqual(observed, acceptance)) throw createJournalError("conflict", path, "private input acceptance authority changed");
+        } : undefined;
         if (
           !entry ||
           entry.state !== "pending" ||
@@ -9704,6 +10223,7 @@ function createJournalStoreCore(
           publishedEntries,
           source.updateId,
           context,
+          assertAcceptance,
         );
         return {
           handoffId,
@@ -9780,6 +10300,15 @@ function createJournalStoreCore(
           );
         }
         const current = read();
+        if (ordinaryQueue) {
+          const expected = ordinaryQueue();
+          if (expected.length !== receipts.length || receipts.some(receipt => {
+            const row = current.file.entries.find(entry => entry.updateId === receipt.updateId);
+            const source = expected.find(entry => entry.updateId === receipt.updateId);
+            return !row || !source || row.privateTextReply !== undefined || row.inputClaim?.executionUpdate !== undefined ||
+              !isDeepStrictEqual(ordinaryV4EntryDigest(row, path), source);
+          })) throw createJournalError("conflict", path, "ordinary queue serialized running source changed");
+        }
         const receiptsById = new Map(
           receipts.map((receipt) => [receipt.updateId, receipt]),
         );
@@ -9874,6 +10403,7 @@ function createJournalStoreCore(
             update: entry.update,
             admittedAtMs: entry.admittedAtMs,
             preApprovalExcluded: false,
+            ...(entry.privateTextReply ? { privateTextReply: structuredClone(entry.privateTextReply) } : {}),
             state: "queued" as const,
             queueKind,
             queueReceiptId: receiptId,
@@ -9953,6 +10483,20 @@ function createJournalStoreCore(
             "input is not eligible for acquisition",
           );
         }
+        if (privateFirstPreparation) {
+          const selected = privateFirstPreparation();
+          if (selected.updateId !== updateId || executionUpdate !== undefined ||
+            !isPrivateFirstPreparationEntry(entry) ||
+            !isDeepStrictEqual(createTelegramUpdateJournalEntryDigest(entry), selected.expectedPendingSource))
+            throw createJournalError("conflict", path, "private first preparation serialized source changed");
+        }
+        if (inputAdmission) {
+          const selected = inputAdmission();
+          if (selected.phase !== "acquire" || selected.updateId !== updateId || executionUpdate !== undefined ||
+            !isPrivateFirstPreparationEntry(entry) ||
+            !isDeepStrictEqual(ordinaryV4EntryDigest(entry, path), selected.expectedSource))
+            throw createJournalError("conflict", path, "ordinary admission serialized pending source changed");
+        }
         const projected = executionUpdate ?? entry.update;
         const existing = entry.inputClaim;
         if (existing) {
@@ -10019,7 +10563,8 @@ function createJournalStoreCore(
             "execution projection exceeds reserved input headroom",
           );
         }
-        publishInputMutation(current, claimedEntries, updateId, context);
+        publishInputMutation(current, claimedEntries, updateId, context,
+          privateFirstPreparation ? () => { privateFirstPreparation(); } : undefined);
         return {
           acquired: true,
           receipt: createInputReceipt(updateId, claim.owner),
@@ -10033,6 +10578,12 @@ function createJournalStoreCore(
         const current = read();
         const entry = ownedInput(current, receipt);
         const claim = entry.inputClaim!;
+        if (inputAdmission) {
+          const selected = inputAdmission();
+          if (selected.phase !== "start" || selected.updateId !== receipt.updateId || claim.phase !== "ready" ||
+            !isDeepStrictEqual(ordinaryV4EntryDigest(entry, path), selected.expectedSource))
+            throw createJournalError("conflict", path, "ordinary admission serialized READY source changed");
+        }
         if (
           context.owner.sessionGeneration !== receipt.owner.sessionGeneration ||
           context.recipientBindingKey !== claim.recipientBindingKey
@@ -10073,9 +10624,12 @@ function createJournalStoreCore(
       const receipt = normalizeInputReceipt(value);
       return runInputMutation("complete", (read) => {
         const current = read();
-        const exists = current.file.entries.some(
-          (entry) => entry.updateId === receipt.updateId,
-        );
+        const selected = inputAdmission?.();
+        const existing = current.file.entries.find(entry => entry.updateId === receipt.updateId);
+        if (selected && (selected.phase !== "complete" || selected.updateId !== receipt.updateId || !existing ||
+          !isDeepStrictEqual(ordinaryV4EntryDigest(existing, path), selected.expectedSource)))
+          throw createJournalError("conflict", path, "private completion serialized source changed");
+        const exists = existing !== undefined;
         if (
           !exists &&
           current.exists &&
@@ -10097,13 +10651,82 @@ function createJournalStoreCore(
           ),
           true,
         );
-        return {
+        const result = {
           removedUpdateIds: [receipt.updateId],
           entryCount: published.file.entries.length,
           serializedBytes: published.serializedBytes,
         };
+        if (completionInFlight?.active && selected?.phase === "complete") {
+          completionInFlight.receipt = Object.freeze({ ...receipt, owner: Object.freeze({ ...receipt.owner }) });
+          completionInFlight.source = Object.freeze({ ...selected.expectedSource });
+          completionInFlight.returned = result;
+        }
+        return result;
       });
     },
   };
-  return { journal, input };
+  if (version === TELEGRAM_UPDATE_JOURNAL_PRIVATE_TEXT_VERSION) {
+    const completionPorts: Pick<TelegramUpdateJournalStore<4>, "completeQueuedExact" | "inspectSourceCompletion"> = {
+      completeQueuedExact(receipts, completions) {
+        return runInputAdmission("complete-queued-exact", () => journal.completeQueuedExact(receipts, completions));
+      },
+      inspectSourceCompletion(expected) {
+        return runInputAdmission("inspect-source-completion", () => journal.inspectSourceCompletion(expected));
+      },
+    };
+    Object.assign(input, completionPorts);
+  }
+  const nativeAppend = journal.appendBatch.bind(journal);
+  const appendAcknowledged = (updates: readonly TelegramJournaledUpdate[], cursor: number) => {
+    if (appendInFlight) {
+      appendInFlight.poisoned = true;
+      throw new Error("Ordinary v4 append cannot reenter.");
+    }
+    if (version !== 4 || !getInputContext || !ordinaryAppendScope)
+      throw new Error("Ordinary v4 append requires its retained source scope.");
+    const ticket: OrdinaryAppendTicket = { active: true, poisoned: false };
+    tickets.add(ticket);
+    appendInFlight = ticket;
+    try {
+      const result = ordinaryAppendScope(() => {
+        try { return nativeAppend(updates, cursor, ticket); }
+        finally { ticket.active = false; }
+      });
+      // No synchronous capture authority survives inspection of a supplied return value.
+      ticket.active = false;
+      if (result !== null && (typeof result === "object" || typeof result === "function") &&
+        typeof (result as { then?: unknown }).then === "function")
+        throw new Error("Ordinary v4 append must return synchronously.");
+      if (ticket.poisoned || !ticket.captured || result !== ticket.returned)
+        throw new Error("Ordinary v4 append was not acknowledged.");
+      return { result, captured: ticket.captured };
+    } finally {
+      ticket.active = false;
+      tickets.delete(ticket);
+      appendInFlight = undefined;
+    }
+  };
+  const nativeComplete = input.completeInput.bind(input);
+  const completeInputAcknowledged = (receipt: TelegramInputJournalReceipt) => {
+    if (completionInFlight) { completionInFlight.poisoned = true; throw new Error("Private input completion cannot reenter."); }
+    if (version !== 4 || !inputAdmission) throw new Error("Private input completion requires a retained native scope.");
+    const ticket: InputCompletionTicket = { active: true, poisoned: false }; completionInFlight = lastCompletion = ticket;
+    try {
+      const result = nativeComplete(receipt); ticket.active = false;
+      if (result !== null && (typeof result === "object" || typeof result === "function") && typeof (result as { then?: unknown }).then === "function") {
+        ticket.poisoned = true; throw new Error("Private input completion must return synchronously.");
+      }
+      if (ticket.poisoned || !ticket.returned || result !== ticket.returned) throw new Error("Private input completion was not acknowledged.");
+      return result;
+    } finally { ticket.active = false; completionInFlight = undefined; }
+  };
+  const getInputCompletionPublication = () => {
+    const ticket = lastCompletion;
+    if (!ticket || ticket.active || ticket.poisoned || !ticket.returned || !ticket.receipt || !ticket.source ||
+      !isDeepStrictEqual(ticket.returned.removedUpdateIds, [ticket.receipt.updateId])) return undefined;
+    return Object.freeze({ receipt: ticket.receipt, source: ticket.source, assertPublished() {
+      if (ticket.active || ticket.poisoned || !ticket.returned) throw new Error("Private input publication history is unavailable.");
+    } });
+  };
+  return { journal, input, appendAcknowledged, completeInputAcknowledged, getInputCompletionPublication };
 }

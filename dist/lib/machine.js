@@ -1,7 +1,7 @@
 /**
  * Pure state-machine runner
  * Zones: shared utils
- * Owns committing a pure transition's next state, running the effects it returns and waking state waiters
+ * Owns committing a pure transition's next state, running the effects it returns and waking state waiters, plus the inert best-effort drain-observer capture shared by queue-like domains
  * Knows nothing about the machines it drives: their state, events, effects, timers and transports stay with each domain
  */
 export function createTelegramMachineRunner(options) {
@@ -34,4 +34,21 @@ export function createTelegramMachineRunner(options) {
             });
         },
     };
+}
+/** Optional drain hints are not transport/queue outcomes or request authority; observer failure is inert. */
+export function captureTelegramDrainObserver(capture) {
+    try {
+        const notify = capture?.();
+        return () => {
+            try {
+                const emitted = notify?.();
+                if (emitted)
+                    void Promise.resolve(emitted).catch(() => undefined);
+            }
+            catch { /* Observer failure is inert. */ }
+        };
+    }
+    catch {
+        return () => { };
+    }
 }

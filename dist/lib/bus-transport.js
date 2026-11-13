@@ -135,6 +135,10 @@ export function createTelegramBusTransportTimeoutError(message) {
     error.code = "ETIMEDOUT";
     return error;
 }
+/** Local pre-issuance budget exhaustion; not an ACK refusal or a remote no-effect certificate. */
+export class TelegramBusConnectionReadinessExpiredError extends Error {
+    constructor() { super("Telegram bus connection readiness expired."); this.name = "TelegramBusConnectionReadinessExpiredError"; }
+}
 export function delayTelegramBusTransportRetry(ms) {
     return new Promise((resolve) => {
         setTimeout(resolve, ms);

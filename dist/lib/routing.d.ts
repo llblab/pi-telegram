@@ -1,22 +1,26 @@
 /**
  * Telegram inbound routing composition
  * Zones: telegram inbound, orchestration, queue/menu/command composition
- * Wires authorized updates into menus, commands, media grouping, and prompt queueing, and owns exact assistant-output target/route authority capture
+ * Wires authorized updates into known private SDK collection, menus, commands, media grouping, and prompt queueing; owns exact assistant-output target/route authority capture
  */
 import * as Bus from "./bus.ts";
 import * as Commands from "./commands.ts";
-import type { TelegramConfigStore } from "./config.ts";
+import { type TelegramConfigStore } from "./config.ts";
+import * as Delivery from "./delivery.ts";
 import type { TelegramInboundHandlerRuntime } from "./inbound.ts";
-import type { TelegramUpdateJournalQueuedCompletion, TelegramUpdateJournalQueuedReceiptEvidence } from "./journal.ts";
+import type { TelegramUpdateJournalAbandonedPendingEvidence, TelegramUpdateJournalQueuedCompletion, TelegramUpdateJournalQueuedReceiptEvidence, TelegramOrdinaryV4InputCandidate, TelegramOrdinaryV4SelectionGuard } from "./journal.ts";
 import * as Media from "./media.ts";
 import * as Menu from "./menu.ts";
 import * as Model from "./model.ts";
 import * as OutboundHandlers from "./outbound.ts";
+import type { TelegramMessageOwnershipOrigin, TelegramOriginalForwardOwnership } from "./ownership.ts";
 import * as PromptTemplates from "./prompt-templates.ts";
 import * as Queue from "./queue.ts";
+import * as Replies from "./replies.ts";
 import type { TelegramBridgeRuntime } from "./runtime.ts";
 import type { TelegramSectionRegistry } from "./sections.ts";
 import type { TelegramApiCallOptions, TelegramInputRichMessage } from "./telegram-api.ts";
+import * as TelegramApi from "./telegram-api.ts";
 import * as TextGroups from "./text-groups.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import type { TelegramInstanceThreadIdentityCandidate, TelegramTopicTargetRecord } from "./threads.ts";
@@ -166,12 +170,23 @@ export declare function createTelegramInboundBusProjectionRuntime(deps: {
     getFollowerTarget(): Queue.TelegramQueueTarget | undefined;
     getCurrentIdentity(target?: Queue.TelegramQueueTarget): TelegramInstanceThreadIdentityCandidate;
 }): TelegramInboundBusProjectionRuntime;
+/** Known SDK sources only; unknown-reply/history and foreign custody remain publication gates. */
+export interface TelegramPrivateDeliveryReplyPorts {
+    getBotId: () => number | undefined;
+    getOriginalOwnership: (chatId: number, messageId: number) => TelegramMessageOwnershipOrigin | undefined;
+    captureOriginalOwnership: (chatId: number, messageId: number) => TelegramOriginalForwardOwnership | undefined;
+}
+/** Reject-only privacy fence. Attachment input cannot certify disposition through the Text/ordinary lanes. */
+export declare function createTelegramAttachmentReplyPrivacyGuard(ports: Pick<TelegramPrivateDeliveryReplyPorts, "getBotId">): (message: TelegramRoutedMessage) => void;
+export declare function createTelegramPrivateTextReplyClassifier(ports: TelegramPrivateDeliveryReplyPorts, getCurrentInstanceId: () => string | undefined): Updates.TelegramPrivateTextReplyClassifier;
+export declare function createTelegramLocalTextInputReplyHandler(ports: TelegramPrivateDeliveryReplyPorts, getCurrentInstanceId: () => string | undefined): (message: TelegramRoutedMessage, edited: boolean) => boolean;
 export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRoutedMessage, TCallbackQuery extends TelegramRoutedCallbackQuery, TContext, TModel extends Model.MenuModel> {
     configStore: Pick<TelegramConfigStore, "get" | "getAllowedUserId" | "persistAllowedUserId" | "persist"> & {
         set?: TelegramConfigStore["set"];
     };
     callApi?: <TResponse>(method: string, body: Record<string, unknown>, options?: TelegramApiCallOptions) => Promise<TResponse>;
     getCurrentInstanceId?: () => string | undefined;
+    privateDeliveryReplies?: TelegramPrivateDeliveryReplyPorts;
     getAdmissionScope?: () => string | undefined;
     getAdmissionJournalBinding?: () => string | undefined;
     getCommandReplyTarget?: Commands.TelegramCommandTargetRuntimeDeps<TContext>["getReplyTarget"];
@@ -193,9 +208,13 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     handleTelegramThreadTargetObserved?: (target: Threads.TelegramTopicTargetRecord["target"], ctx: TContext) => Promise<void> | void;
     foreignOwnedUpdateForwarder?: Updates.TelegramForeignOwnedUpdateForwarder<TContext, Updates.TelegramMessageReactionUpdated, TCallbackQuery, TMessage>;
     getWorkspaceRestoreStore?: () => Threads.TelegramWorkspaceRestore | undefined;
+    /** Original native whole-roster codec compatibility only; caller still needs live leader/Cancel/profile admission. */
+    captureOrphanIntentReaderCompatibility?: () => (() => boolean) | undefined;
+    /** V2 codec compatibility, freshly captured per admitted orphan cleanup attempt. */
+    captureOrphanCleanupReaderCompatibility?: () => (() => boolean) | undefined;
     captureWorkspaceExternalProtection?: ReturnType<typeof createTelegramWorkspaceExternalProtectionCapture>;
     /** Strict committed abandonment plus retained original; shared by Restore and temporary-input cancellation. */
-    inspectRestoreSourceAbandonment?: (updateId: number, journalBindingKey: string) => Threads.TelegramTemporaryThreadCancellationEvidence | undefined;
+    inspectRestoreSourceAbandonment?: (updateId: number, journalBindingKey: string) => (Threads.TelegramTemporaryThreadCancellationEvidence & Partial<Pick<TelegramUpdateJournalAbandonedPendingEvidence, "retainedPath" | "originalTarget">>) | undefined;
     inspectRoutingInputGroupExpiry?: (input: Threads.TelegramTemporaryThreadInput) => readonly Threads.TelegramTemporaryThreadCancellationEvidence[] | undefined;
     /** Strict active-journal observation only; a hint or missing source never substitutes for this ACK. */
     inspectRestoreSourceCompletion?: (expected: Updates.TelegramDeferredSourceEvidence & {
@@ -225,6 +244,8 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
         windowMs: number;
     };
     getSessionGeneration?: () => number;
+    /** Required only by unwired ordinary-v4 selection; absence cannot certify a session. */
+    getSessionId?: (ctx: TContext) => string | undefined;
     workspaceRestoreRecipient?: {
         getSessionId: (ctx: TContext) => string | undefined;
         getCwd: (ctx: TContext) => string | undefined;
@@ -285,18 +306,12 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
         };
     }) => void;
     stopTypingLoop?: () => void;
-    answerCallbackQuery: (callbackQueryId: string, text?: string, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
-    editInteractiveMessage?: (chatId: number, messageId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: Menu.TelegramReplyMarkup, options?: {
-        target?: Queue.TelegramQueueTarget;
-        assertAuthority?: TelegramApiCallOptions["assertAuthority"];
-    }) => Promise<void>;
-    editMessageReplyMarkup?: (chatId: number, messageId: number, replyMarkup: OutboundHandlers.TelegramOutboundButtonMarkup) => Promise<void>;
-    sendInteractiveMessage?: (chatId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: Menu.TelegramReplyMarkup, options?: {
-        target?: Queue.TelegramQueueTarget;
-        replyToMessageId?: number;
-        assertAuthority?: TelegramApiCallOptions["assertAuthority"];
-    }) => Promise<number | undefined>;
-    deleteMessage?: (chatId: number, messageId: number) => Promise<void>;
+    answerCallbackQuery: (callbackQueryId: string, text?: string, options?: TelegramApi.TelegramApiUiAuthorityOptions) => Promise<void>;
+    editInteractiveMessage?: (chatId: number, messageId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: Menu.TelegramReplyMarkup, options?: Replies.TelegramUiReplyTargetOptions) => Promise<void>;
+    editSelectionMessage?: (chatId: number, messageId: number, markdown: string, rendering: "rich" | "html", replyMarkup: OutboundHandlers.TelegramOutboundButtonMarkup, options: TelegramApi.TelegramApiUiAuthorityOptions) => Promise<void>;
+    editMessageReplyMarkup?: (chatId: number, messageId: number, replyMarkup: OutboundHandlers.TelegramOutboundButtonMarkup, options?: TelegramApi.TelegramApiUiAuthorityOptions) => Promise<void>;
+    sendInteractiveMessage?: (chatId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: Menu.TelegramReplyMarkup, options?: Replies.TelegramUiReplyTargetOptions) => Promise<number | undefined>;
+    deleteMessage?: (chatId: number, messageId: number, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
     answerGuestQuery: (guestQueryId: string, text?: string) => Promise<void>;
     /** Answers the guest query immediately and returns its inline message id. */
     answerGuestQueryForInlineMessage?: (guestQueryId: string, text: string, options?: {
@@ -326,6 +341,8 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     isIdle: (ctx: TContext) => boolean;
     hasPendingMessages: (ctx: TContext) => boolean;
     requestNewSession?: (source: unknown) => void;
+    requestQuit?: (source: unknown) => void;
+    confirmations?: Delivery.TelegramDeliveryConfirmationPort & Partial<Delivery.TelegramDeliveryChoicePort & Delivery.TelegramDeliveryTaskViewPort>;
     compact: (ctx: TContext, callbacks: {
         onComplete: () => void;
         onError: (error: unknown) => void;
@@ -340,11 +357,30 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
         };
     }) => Promise<number | undefined>;
 }
+export interface TelegramOrdinaryInputSelection {
+    readonly updateId: number;
+    assertCurrent: TelegramOrdinaryV4SelectionGuard;
+    /** Consumes Routing selection only; this does not grant native custody or execution. */
+    consume(): TelegramOrdinaryV4SelectionGuard;
+}
+export interface TelegramOrdinaryContinueSelection extends TelegramOrdinaryInputSelection {
+    execute(execution: Updates.TelegramOrdinaryV4Execution): Promise<void>;
+}
+export interface TelegramOrdinaryTextPromptPlan extends TelegramOrdinaryInputSelection {
+    readonly purpose: "text-prompt";
+    execute(execution: Updates.TelegramOrdinaryV4Execution): Promise<void>;
+}
 export declare function createTelegramInboundRouteRuntime<TUpdate extends Updates.TelegramUpdateFlow & {
     message?: TMessage;
     edited_message?: TMessage;
     callback_query?: TCallbackQuery;
 }, TMessage extends TelegramRoutedMessage, TCallbackQuery extends TelegramRoutedCallbackQuery, TContext, TModel extends Model.MenuModel>(deps: TelegramInboundRouteRuntimeDeps<TMessage, TCallbackQuery, TContext, TModel>): Updates.TelegramUpdateRuntimeController<TContext, TUpdate> & {
+    /** Unwired preclaim policy; execution requires the genuine started Updates owner association. */
+    selectOrdinaryContinue(candidate: TelegramOrdinaryV4InputCandidate, ctx: TContext): TelegramOrdinaryContinueSelection | undefined;
+    /** Positive plain-text preclaim only; grants no execution or ordinary fallback for replies. */
+    selectOrdinaryTextPrompt(candidate: TelegramOrdinaryV4InputCandidate, ctx: TContext): TelegramOrdinaryInputSelection | undefined;
+    /** Separate executable plan; requires the text-purpose Updates owner, never the preclaim alone. */
+    prepareOrdinaryTextPrompt(candidate: TelegramOrdinaryV4InputCandidate, ctx: TContext): TelegramOrdinaryTextPromptPlan | undefined;
     expireRoutingInput: NonNullable<Updates.TelegramUpdateWorkerRuntimeDeps<TContext>["expireRoutingInput"]>;
     shouldReviewHistoricalInput: NonNullable<Updates.TelegramUpdateWorkerRuntimeDeps<TContext>["shouldReviewHistoricalInput"]>;
     shouldHoldPendingInput: NonNullable<Updates.TelegramUpdateWorkerRuntimeDeps<TContext>["shouldHoldPendingInput"]>;

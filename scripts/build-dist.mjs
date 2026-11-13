@@ -6,6 +6,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   cpSync,
   existsSync,
@@ -16,14 +17,48 @@ import {
   renameSync,
   rmSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { join, relative } from "node:path";
 
 const DIST_DIR = "dist";
 const checkOnly = process.argv.includes("--check");
+const ciBuild = process.env.GITHUB_ACTIONS === "true";
+const buildId = ciBuild ? randomBytes(8).toString("hex") : null;
+let buildRecordCount = 0;
 
-function run(command, args) {
-  const result = spawnSync(command, args, { stdio: "inherit" });
+// Closed build phases only: at most six parent and two compiler records, including framing below 4 KiB.
+function reportBuild(phase, details = {}) {
+  if (!ciBuild || buildRecordCount >= 6) return;
+  buildRecordCount++;
+  try {
+    const record = { v: 1, build: buildId, phase, pid: process.pid, ppid: process.ppid, uptimeMs: Math.trunc(process.uptime() * 1000), ...details };
+    const line = "::notice title=CI native build::" + JSON.stringify(record) + "\n";
+    if (Buffer.byteLength(line) <= 384) writeSync(1, line);
+  } catch { /* Diagnostics cannot replace the compiler or filesystem outcome. */ }
+}
+
+// A public Node preload observes this actual child; entry/exit events are not parent settlement or publication.
+const compilerObserver = "data:text/javascript," + encodeURIComponent(`
+  import { writeSync } from "node:fs";
+  const ciBuild = true, buildId = ${JSON.stringify(buildId)};
+  let buildRecordCount = 0;
+  ${reportBuild.toString()}
+  reportBuild("compiler-node-entered");
+  process.once("exit", code => reportBuild("compiler-node-exiting", { code }));
+`);
+
+function run(command, args, phase) {
+  if (phase === "compiler") {
+    let detachedHead = null;
+    if (ciBuild) {
+      try { const head = readFileSync(".git/HEAD", "utf8").trim(); if (/^[a-f0-9]{40}$/.test(head)) detachedHead = head; } catch {}
+    }
+    reportBuild("compiler-invoking", { detachedHead });
+  }
+  const nodeArgs = phase === "compiler" && ciBuild ? ["--import", compilerObserver, ...args] : args;
+  const result = spawnSync(command, nodeArgs, { stdio: "inherit" });
+  if (phase === "compiler") reportBuild("compiler-returned", { childPid: result.pid || null, code: result.status, signal: result.signal, spawnError: !!result.error });
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error(`${command} exited with status ${result.status ?? "unknown"}.`);
@@ -79,6 +114,7 @@ function replaceDist(candidate) {
   }
 }
 
+reportBuild("build-entered", { check: checkOnly });
 const candidate = mkdtempSync(join(process.cwd(), ".dist-build-"));
 try {
   run(process.execPath, [
@@ -87,7 +123,7 @@ try {
     "tsconfig.build.json",
     "--outDir",
     candidate,
-  ]);
+  ], "compiler");
 
   mkdirSync(join(candidate, "pi-telegram"), { recursive: true });
   writeFileSync(
@@ -96,20 +132,24 @@ try {
     "utf8",
   );
   normalizeTextFiles(candidate);
-  cpSync("skills", join(candidate, "skills"), { recursive: true });
+  // Keep directory traversal in Node's JavaScript path, including Unicode Windows build roots.
+  cpSync("skills", join(candidate, "skills"), { recursive: true, filter: () => true });
   cpSync("package.json", join(candidate, "package.json"));
   cpSync(
     join("lib", "generative-app-worker.mjs"),
     join(candidate, "lib", "generative-app-worker.mjs"),
   );
+  reportBuild("assets-prepared");
   run(process.execPath, ["--check", join(candidate, "pi-telegram", "index.js")]);
 
+  reportBuild("publication-invoking", { check: checkOnly });
   if (checkOnly) {
     assertTreesEqual(DIST_DIR, candidate);
     console.log("pi-telegram: dist is current");
   } else {
     replaceDist(candidate);
   }
+  reportBuild("publication-complete", { check: checkOnly });
 } finally {
   rmSync(candidate, { recursive: true, force: true });
 }

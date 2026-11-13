@@ -31,8 +31,14 @@ import {
   resolveTelegramSessionPollingJournalPath,
   resolveTelegramUpdateJournalPathForProfile,
 } from "./paths.ts";
+import {
+  createTelegramEventLoopLagMonitor,
+  recordTelegramSyncBlock,
+} from "./loop-lag.ts";
 import { isProcessAlive } from "./process-identity.ts";
+import { TelegramFollowerRegistrationCancelledError, type TelegramFollowerRegistrationOptions, type TelegramFollowerRegistrationResult } from "./polling.ts";
 import { isWireRecord as runtimeStateRecord } from "./wire.ts";
+import { delayTelegramBusTransportRetry, TELEGRAM_BUS_REGISTRATION_RETRY } from "./bus-transport.ts";
 
 export const TELEGRAM_LOCK_KEY = "default";
 export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 8_000;
@@ -161,6 +167,10 @@ export interface TelegramLockRuntime<TContext extends TelegramLockContext> {
   ) => TelegramLockAcquireResult;
   release: () => TelegramLockState;
   getState: () => TelegramLockState;
+  /** Read-only original foreign owner/profile/endpoint scope; never polling acquisition or takeover authority. */
+  captureFollowerRegistrationScope: (owner: TelegramLockEntry) => () => boolean;
+  /** Selected consolidated storage coordinates; undefined for the independent legacy owners file. */
+  getStorageScope: () => { path: string; profile: string } | undefined;
   getStatusLabel: () => string;
   getOwnedLeaderEpoch: () => number | string | undefined;
   owns: (ctx?: TelegramLockContext) => boolean;
@@ -292,9 +302,12 @@ function isRetryableLockWriteError(error: unknown): boolean {
   return code === "EPERM" || code === "EBUSY" || code === "EACCES";
 }
 
-function sleepSync(ms: number): void {
+/** Blocks the whole event loop for `ms`; every wait is reported so a stall can be attributed to its cause. */
+function sleepSync(ms: number, label: string): void {
+  const startedAtMs = Date.now();
   const buffer = new SharedArrayBuffer(4);
   Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+  recordTelegramSyncBlock(label, Date.now() - startedAtMs);
 }
 
 interface TelegramRenameRetryOptions {
@@ -441,7 +454,7 @@ export function renameTelegramPathWithRetry(
       if (!isRetryableLockWriteError(error) || attempt === attempts - 1) {
         throw error;
       }
-      sleepSync(retryDelayMs * (attempt + 1));
+      sleepSync(retryDelayMs * (attempt + 1), "rename-retry-wait");
     }
   }
   return false;
@@ -454,15 +467,40 @@ interface TelegramLockTransactionOwner {
 }
 
 const TELEGRAM_TRANSACTION_OWNER_PATTERN = /^owner\.([A-Za-z0-9-]+)\.json$/u;
+const TELEGRAM_TRANSACTION_OWNER_MAX_BYTES = 4_096;
+
+/** A refusal of guard evidence, never permission to clear the guard or retry its protected operation. */
+export class TelegramFileTransactionGuardError extends Error {
+  readonly code = "guard-unverifiable";
+  readonly resource: string;
+  readonly reason: "invalid-layout" | "invalid-owner" | "unavailable-owner";
+  readonly phase: "acquire" | "release";
+  constructor(resource: string, reason: TelegramFileTransactionGuardError["reason"], options?: ErrorOptions & { phase?: "acquire" | "release" }) {
+    const phase = options?.phase ?? "acquire";
+    super(`Cannot verify Telegram lock transaction guard (${reason}) during ${phase}: ${resource}`, options);
+    this.name = "TelegramFileTransactionGuardError";
+    this.resource = resource;
+    this.reason = reason;
+    this.phase = phase;
+  }
+}
+
+function isLockTransactionPid(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 2_147_483_647;
+}
 
 function getLockTransactionOwnerFile(generation: string): string {
   return `owner.${generation}.json`;
 }
 
-function getLockTransactionOwnerPath(path: string): string {
-  const stat = lstatSync(path);
+function getLockTransactionOwnerPath(path: string): string | undefined {
+  const stat = lstatSync(path, { bigint: true });
   if (stat.isDirectory()) {
     const entries = readdirSync(path);
+    // Enumeration may hold the old directory while its owner renames/releases it and publishes a successor.
+    const current = lstatSync(path, { bigint: true });
+    if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino ||
+      current.mtimeNs !== stat.mtimeNs || current.ctimeNs !== stat.ctimeNs) return undefined;
     if (
       entries.length === 1 &&
       (TELEGRAM_TRANSACTION_OWNER_PATTERN.test(entries[0]) ||
@@ -470,37 +508,43 @@ function getLockTransactionOwnerPath(path: string): string {
     ) {
       return join(path, entries[0]);
     }
-    throw new Error(`Unverifiable Telegram lock transaction guard: ${path}`);
+    throw new TelegramFileTransactionGuardError(path, "invalid-layout");
   }
   if (stat.isFile()) return path;
-  throw new Error(`Unsupported Telegram lock transaction guard: ${path}`);
+  throw new TelegramFileTransactionGuardError(path, "invalid-layout");
 }
 
 function readLockTransactionOwner(
   path: string,
 ): TelegramLockTransactionOwner | undefined {
   try {
-    const value = JSON.parse(
-      readFileSync(getLockTransactionOwnerPath(path), "utf8"),
-    ) as Record<string, unknown>;
-    if (
-      typeof value.pid !== "number" ||
-      typeof value.acquiredAtMs !== "number" ||
-      typeof value.generation !== "string"
-    ) {
-      return undefined;
-    }
-    const ownerMatch = TELEGRAM_TRANSACTION_OWNER_PATTERN.exec(
-      basename(getLockTransactionOwnerPath(path)),
-    );
-    if (ownerMatch && ownerMatch[1] !== value.generation) return undefined;
-    return {
-      pid: value.pid,
-      acquiredAtMs: value.acquiredAtMs,
-      generation: value.generation,
-    };
-  } catch {
-    return undefined;
+    const ownerPath = getLockTransactionOwnerPath(path);
+    if (ownerPath === undefined) return undefined;
+    const source = readTelegramPrivateFile(ownerPath, TELEGRAM_TRANSACTION_OWNER_MAX_BYTES);
+    if (source === undefined) return undefined;
+    let value: unknown;
+    try { value = JSON.parse(source); }
+    catch (cause) { throw new TelegramFileTransactionGuardError(path, "invalid-owner", { cause }); }
+    if (!runtimeStateRecord(value) || !isLockTransactionPid(value.pid) || typeof value.acquiredAtMs !== "number" ||
+      !Number.isSafeInteger(value.acquiredAtMs) || value.acquiredAtMs < 0 ||
+      typeof value.generation !== "string" || !/^[A-Za-z0-9-]+$/u.test(value.generation))
+      throw new TelegramFileTransactionGuardError(path, "invalid-owner");
+    const ownerMatch = TELEGRAM_TRANSACTION_OWNER_PATTERN.exec(basename(ownerPath));
+    if (ownerMatch && ownerMatch[1] !== value.generation)
+      throw new TelegramFileTransactionGuardError(path, "invalid-owner");
+    const reclaim = TELEGRAM_TRANSACTION_RECLAIM_PATTERN.exec(basename(ownerPath));
+    if (reclaim && (!isLockTransactionPid(Number(reclaim[1])) || String(Number(reclaim[1])) !== reclaim[1]))
+      throw new TelegramFileTransactionGuardError(path, "invalid-owner");
+    if (getLockTransactionOwnerPath(path) !== ownerPath) return undefined;
+    return { pid: value.pid, acquiredAtMs: value.acquiredAtMs, generation: value.generation };
+  } catch (cause) {
+    if (cause instanceof TelegramFileTransactionGuardError) throw cause;
+    // A competing release/reclaim can consume the observed path; it never grants this attempt ownership.
+    if ((cause as { code?: unknown })?.code === "ENOENT" ||
+      cause instanceof TelegramPrivateFileError && cause.failure === "changed") return undefined;
+    const reason = cause instanceof TelegramPrivateFileError
+      ? cause.failure === "capacity" ? "invalid-owner" : "invalid-layout" : "unavailable-owner";
+    throw new TelegramFileTransactionGuardError(path, reason, { cause });
   }
 }
 
@@ -559,10 +603,16 @@ function releaseLockTransactionGuard(
   path: string,
   owner: TelegramLockTransactionOwner,
 ): void {
-  const current = readLockTransactionOwner(path);
+  let current: TelegramLockTransactionOwner | undefined;
+  try { current = readLockTransactionOwner(path); }
+  catch (cause) {
+    if (cause instanceof TelegramFileTransactionGuardError)
+      throw new TelegramFileTransactionGuardError(path, cause.reason, { phase: "release", cause: cause.cause ?? cause });
+    throw cause;
+  }
   if (!current) {
     if (!existsSync(path)) return;
-    throw new Error(`Cannot verify Telegram lock transaction guard: ${path}`);
+    throw new TelegramFileTransactionGuardError(path, "unavailable-owner", { phase: "release" });
   }
   if (
     current.pid !== owner.pid ||
@@ -600,6 +650,8 @@ type TelegramTransactionGlobal = typeof globalThis & {
 export interface TelegramFileTransactionOptions {
   recoveryRename?: typeof renameSync;
   publishRename?: typeof renameSync;
+  /** Observation leases may contend but must not acquire abandoned-owner recovery authority. */
+  recoverAbandoned?: boolean;
   attempts?: number;
   retryDelayMs?: number;
 }
@@ -629,14 +681,16 @@ function reclaimAbandonedDirectoryGuard(
   const entry = entries[0];
   let observedPid: number;
   let observedReclaimGeneration: string | undefined;
+  const owner = readLockTransactionOwner(path);
+  if (!owner) return false;
   if (TELEGRAM_TRANSACTION_OWNER_PATTERN.test(entry)) {
-    const owner = readLockTransactionOwner(path);
-    if (!owner) return false;
     observedPid = owner.pid;
   } else {
     const match = TELEGRAM_TRANSACTION_RECLAIM_PATTERN.exec(entry);
     if (!match) return false;
-    observedPid = Number.parseInt(match[1], 10);
+    observedPid = Number(match[1]);
+    if (!isLockTransactionPid(observedPid) || String(observedPid) !== match[1])
+      throw new TelegramFileTransactionGuardError(path, "invalid-owner");
     observedReclaimGeneration = match[2];
   }
   const activeReclaims = getActiveTransactionReclaims();
@@ -858,14 +912,17 @@ function acquireLockTransaction(
       return createLockTransactionGuard(path, options);
     } catch (error) {
       if (!isLockTransactionContentionError(error)) throw error;
-      const recoveredOwner = recoverAbandonedLockTransaction(path, options);
-      if (recoveredOwner !== undefined) return recoveredOwner;
+      if (options.recoverAbandoned === false) readLockTransactionOwner(path);
+      else {
+        const recoveredOwner = recoverAbandonedLockTransaction(path, options);
+        if (recoveredOwner !== undefined) return recoveredOwner;
+      }
       if (attempt === attempts - 1) {
         throw new Error(
           `Timed out acquiring Telegram lock transaction: ${path}`,
         );
       }
-      sleepSync(retryDelayMs);
+      sleepSync(retryDelayMs, "transaction-lock-wait");
     }
   }
   throw new Error(`Failed to acquire Telegram lock transaction: ${path}`);
@@ -877,10 +934,12 @@ export function withTelegramFileTransaction<T>(
   options: TelegramFileTransactionOptions = {},
 ): T {
   const owner = acquireLockTransaction(transactionPath, options);
+  const heldAtMs = Date.now();
   try {
     return operation();
   } finally {
     releaseLockTransactionGuard(transactionPath, owner);
+    recordTelegramSyncBlock("transaction-held", Date.now() - heldAtMs);
   }
 }
 
@@ -893,16 +952,29 @@ interface TelegramRuntimeStateFile {
   version: 2;
   profiles: Record<string, TelegramRuntimeStateProfile>;
 }
+type TelegramRuntimeStateReadCondition =
+  | "device-mismatch"
+  | "inode-mismatch"
+  | "opened-links"
+  | "opened-type"
+  | "opened-mode"
+  | "post-read-device-mismatch"
+  | "post-read-inode-mismatch"
+  | "post-read-size-mismatch"
+  | "post-read-mtime-mismatch"
+  | "post-read-ctime-mismatch";
 export class TelegramRuntimeStateError extends Error {
   readonly code: "invalid" | "authority-changed" | "publication-unknown";
+  readonly readCondition: TelegramRuntimeStateReadCondition | undefined;
   constructor(
     code: TelegramRuntimeStateError["code"],
     message: string,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { readCondition?: TelegramRuntimeStateReadCondition },
   ) {
     super(message, options);
     this.name = "TelegramRuntimeStateError";
     this.code = code;
+    this.readCondition = options?.readCondition;
   }
 }
 const TELEGRAM_RUNTIME_STATE_SECTIONS: readonly TelegramRuntimeStateSection[] =
@@ -952,32 +1024,34 @@ function readTelegramRuntimeSource(path: string): string | undefined {
     const fd = openSync(path, "r");
     try {
       const opened = fstatSync(fd);
-      if (
-        opened.dev !== stat.dev ||
-        opened.ino !== stat.ino ||
-        opened.nlink !== 1 ||
-        !opened.isFile() ||
-        (process.platform !== "win32" && (opened.mode & 0o077) !== 0)
-      )
+      const readCondition: TelegramRuntimeStateReadCondition | undefined =
+        opened.dev !== stat.dev ? "device-mismatch" :
+        opened.ino !== stat.ino ? "inode-mismatch" :
+        opened.nlink !== 1 ? "opened-links" :
+        !opened.isFile() ? "opened-type" :
+        process.platform !== "win32" && (opened.mode & 0o077) !== 0 ? "opened-mode" : undefined;
+      if (readCondition)
         throw new TelegramRuntimeStateError(
           "invalid",
           "Telegram runtime state identity changed before reading.",
+          { readCondition },
         );
       source = readFileSync(fd).toString("utf8");
     } finally {
       closeSync(fd);
     }
     const after = lstatSync(path);
-    if (
-      after.dev !== stat.dev ||
-      after.ino !== stat.ino ||
-      after.size !== stat.size ||
-      after.mtimeMs !== stat.mtimeMs ||
-      after.ctimeMs !== stat.ctimeMs
-    )
+    const readCondition: TelegramRuntimeStateReadCondition | undefined =
+      after.dev !== stat.dev ? "post-read-device-mismatch" :
+      after.ino !== stat.ino ? "post-read-inode-mismatch" :
+      after.size !== stat.size ? "post-read-size-mismatch" :
+      after.mtimeMs !== stat.mtimeMs ? "post-read-mtime-mismatch" :
+      after.ctimeMs !== stat.ctimeMs ? "post-read-ctime-mismatch" : undefined;
+    if (readCondition)
       throw new TelegramRuntimeStateError(
         "invalid",
         "Telegram runtime state changed during observation.",
+        { readCondition },
       );
   } catch (error) {
     if (!observed && (error as { code?: unknown }).code === "ENOENT")
@@ -1042,13 +1116,16 @@ export function resetDamagedTelegramRuntimeState(
     profile: string,
     sections: Readonly<TelegramRuntimeStateProfile>,
   ) => void,
+  assertCurrent?: () => void,
 ): boolean {
   requireRuntimeStatePath(path);
+  assertCurrent?.();
   const runtimeDir = join(dirname(path), "runtime");
   mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
   return withTelegramFileTransaction(
     join(runtimeDir, `${basename(path)}.transaction`),
     () => {
+      assertCurrent?.();
       let damaged = false;
       try {
         for (const [profile, sections] of Object.entries(
@@ -1065,6 +1142,7 @@ export function resetDamagedTelegramRuntimeState(
         if (!(error instanceof TelegramRuntimeStateError)) throw error;
         damaged = true;
       }
+      assertCurrent?.();
       if (!damaged) return false;
       const tempPath = join(
         runtimeDir,
@@ -1076,10 +1154,16 @@ export function resetDamagedTelegramRuntimeState(
           `${JSON.stringify({ version: 2, profiles: {} }, null, 2)}\n`,
           { encoding: "utf8", flag: "wx", mode: 0o600 },
         );
-        if (!renameTelegramPathWithRetry(tempPath, path))
+        if (!renameTelegramPathWithRetry(tempPath, path, {
+          rename(from, to) {
+            assertCurrent?.();
+            renameSync(from, to);
+          },
+        }))
           throw new Error(
             "Telegram runtime state reset publication disappeared.",
           );
+        assertCurrent?.();
       } finally {
         try {
           unlinkSync(tempPath);
@@ -1286,7 +1370,7 @@ export function writeLocks(path: string, locks: Record<string, unknown>): void {
       ) {
         throw error;
       }
-      sleepSync(TELEGRAM_LOCK_WRITE_RETRY_DELAY_MS * (attempt + 1));
+      sleepSync(TELEGRAM_LOCK_WRITE_RETRY_DELAY_MS * (attempt + 1), "write-retry-wait");
     }
   }
   throw lastError;
@@ -1758,6 +1842,27 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
       });
     },
     getState: () => getLockState(readLock(), pid, isAlive, stateOptions()),
+    getStorageScope: () => statePath ? { path: statePath, profile: resolveEffectiveKey() } : undefined,
+    captureFollowerRegistrationScope(owner) {
+      const expected = { ...owner }, profile = resolveEffectiveKey();
+      let lost = false, checking = false;
+      const current = () => {
+        if (lost || checking) { lost = true; return false; }
+        checking = true;
+        try {
+          if (resolveEffectiveKey() !== profile) lost = true;
+          if (!lost) {
+            const observed = parseTelegramLockEntry(readOwners()[profile]);
+            if (!hasSameLockOwner(observed, expected) || observed?.busSocketPath !== expected.busSocketPath ||
+              observed?.busSecret !== expected.busSecret || resolveEffectiveKey() !== profile) lost = true;
+          }
+        } catch { lost = true; }
+        finally { checking = false; }
+        return !lost;
+      };
+      current();
+      return current;
+    },
     getJournalPath: () =>
       readTelegramLockJournalPath(readOwners()[resolveEffectiveKey()]),
     getStatusLabel: () =>
@@ -1951,8 +2056,11 @@ export function createTelegramDirectDeliveryOwnershipChecker<
 }
 
 interface TelegramLockedPollingStartOptions {
+  assertAuthority?: () => void;
   force?: boolean;
   forceFreshLeaderThread?: boolean;
+  /** Automatic stale-owner recovery cannot provision an unremembered Thread. */
+  restoreWorkspaceOnly?: true;
   requestedThreadName?: string;
   election?: { expectedOwner?: TelegramLockEntry; unresponsive?: boolean };
   onAcquired?: () => Promise<void> | void;
@@ -1969,6 +2077,8 @@ export interface TelegramLockedPollingRuntime<
     ctx: TContext,
     options?: TelegramLockedPollingStartOptions,
   ) => Promise<TelegramLockedPollingStartResult>;
+  /** Explicit-connect preparation before profile teardown; does not acquire transport or grant cleanup authority. */
+  prepareConnection: (ctx: TContext, isCurrent: () => boolean) => boolean;
   stop: () => Promise<string>;
   /** Capture one disconnect attempt before cleanup awaits; a newer start revokes it. */
   captureStop: () => { isCurrent: () => boolean; stop: () => Promise<string> };
@@ -1976,13 +2086,15 @@ export interface TelegramLockedPollingRuntime<
   isSuspended: () => boolean;
   /** Fence one owned polling generation; suspension, restart, conflict or lock loss revokes it. */
   captureTransportAuthority: (ctx: TContext) => (() => boolean) | undefined;
+  /** Capture the owner's real startup context without lending it to a caller; observed loss is terminal. */
+  captureCurrentTransportAuthority: () => (() => boolean) | undefined;
   onPersistentConflict: (ctx: TContext, count: number) => Promise<void>;
   onSessionStart: (_event: unknown, ctx: TContext) => Promise<void>;
   registerFollowerWithOwner?: (
     ctx: TContext,
     owner: TelegramLockEntry,
-    options?: { recoverConnection?: boolean },
-  ) => boolean | undefined | Promise<boolean | undefined>;
+    options?: TelegramFollowerRegistrationOptions,
+  ) => TelegramFollowerRegistrationResult | Promise<TelegramFollowerRegistrationResult>;
   restoreFollowerWithOwner?: (
     ctx: TContext,
     owner: TelegramLockEntry,
@@ -1995,11 +2107,19 @@ interface TelegramLockedPollingRuntimeDeps<
 > {
   lock: TelegramLockRuntime<TContext>;
   /** Optimistically replaces a damaged shared runtime state before a non-election acquisition. */
-  resetDamagedState?: () => boolean;
+  resetDamagedState?: (assertCurrent: () => void) => boolean;
+  captureConfigScope?: (profile?: string) => () => boolean;
+  captureStorageScope?: (expected?: { path: string; profile: string }) => () => boolean;
+  /** Existing profile-derived locator for owners that do not publish an endpoint in their transport row. */
+  getLeaderEndpoint?: () => string;
   hasBotToken: () => boolean;
   getBotTokenDiagnostic?: () => string | undefined;
   canStartPolling?: (ctx: TContext) => boolean;
+  /** Read-only session eligibility before replacing stale transport continuity. */
+  canAutoStartSession?: (ctx: TContext) => Promise<boolean>;
   isContextCurrent?: (ctx: TContext) => boolean;
+  /** Actual session identity from the host owner; captured at polling startup, never synthesized by Delivery. */
+  getSessionId?: (ctx: TContext) => string | undefined;
   formatStartBlockedMessage?: (ctx: TContext) => string;
   startPolling: (
     ctx: TContext,
@@ -2009,8 +2129,8 @@ interface TelegramLockedPollingRuntimeDeps<
   registerFollowerWithOwner?: (
     ctx: TContext,
     owner: TelegramLockEntry,
-    options?: { recoverConnection?: boolean },
-  ) => boolean | undefined | Promise<boolean | undefined>;
+    options?: TelegramFollowerRegistrationOptions,
+  ) => TelegramFollowerRegistrationResult | Promise<TelegramFollowerRegistrationResult>;
   restoreFollowerWithOwner?: (
     ctx: TContext,
     owner: TelegramLockEntry,
@@ -2028,6 +2148,9 @@ interface TelegramLockedPollingRuntimeDeps<
   ) => void;
   ownershipCheckMs?: number;
   ownershipRefreshMs?: number;
+  /** Monotonic original-attempt readiness clock; native registration keeps its independent ACK timeout. */
+  readinessClock?: () => number;
+  waitForReadiness?: (ms: number) => Promise<void>;
 }
 
 function snapshotLockContext(ctx: TelegramLockContext): TelegramLockContext {
@@ -2042,7 +2165,17 @@ export function createTelegramLockedPollingRuntime<
   let ownershipCheckInterval: ReturnType<typeof setInterval> | undefined;
   let ownershipRefreshInterval: ReturnType<typeof setInterval> | undefined;
   let ownershipStop: Promise<void> | undefined;
+  const eventLoopLagMonitor = createTelegramEventLoopLagMonitor({
+    record: ({ lagMs, blocked, cpuMs }) =>
+      deps.recordRuntimeEvent?.(
+        "lock",
+        `Telegram event loop was blocked for ${lagMs} ms.`,
+        { phase: "event-loop-stall", lagMs, blocked, ...(cpuMs !== undefined ? { cpuMs } : {}) },
+      ),
+  });
   let activeContext: TContext | undefined;
+  let activeSessionId: string | undefined;
+  let artifactTransportRevoked = false;
   let ownershipCheckFailures = 0;
   let takeoverCandidate: TelegramLockEntry | undefined;
   let sessionAutoStartRun: Promise<void> | undefined;
@@ -2054,6 +2187,7 @@ export function createTelegramLockedPollingRuntime<
   const ownershipRefreshMs =
     deps.ownershipRefreshMs ?? TELEGRAM_OWNERSHIP_REFRESH_MS;
   const stopOwnershipWatcher = () => {
+    eventLoopLagMonitor.stop();
     if (ownershipCheckInterval) clearInterval(ownershipCheckInterval);
     if (ownershipRefreshInterval) clearInterval(ownershipRefreshInterval);
     ownershipCheckInterval = undefined;
@@ -2149,6 +2283,7 @@ export function createTelegramLockedPollingRuntime<
     }, ownershipRefreshMs);
     ownershipCheckInterval.unref?.();
     ownershipRefreshInterval.unref?.();
+    eventLoopLagMonitor.start();
   };
   const runOwnedPollingStart = async (
     ctx: TContext,
@@ -2156,6 +2291,10 @@ export function createTelegramLockedPollingRuntime<
     isCurrent: () => boolean,
   ): Promise<boolean> => {
     if (!isCurrent()) return false;
+    // Clear first: a throwing identity read must not leave the previous session ID attached to this context.
+    activeSessionId = undefined;
+    activeSessionId = deps.getSessionId?.(ctx);
+    artifactTransportRevoked = false;
     activeContext = ctx;
     startOwnershipWatcher(ctx);
     startupsInFlight += 1;
@@ -2203,6 +2342,43 @@ export function createTelegramLockedPollingRuntime<
   const formatStartBlockedMessage = (ctx: TContext): string =>
     deps.formatStartBlockedMessage?.(ctx) ??
     "Telegram polling is unavailable in this Pi run mode.";
+  const prepareConnection = (ctx: TContext, isCurrent: () => boolean): boolean => {
+    const generation = pollingGeneration;
+    const sessionId = deps.getSessionId?.(ctx);
+    let lost = false, checking = false;
+    const assertCurrent = () => {
+      if (lost || checking) {
+        lost = true;
+        throw new Error("Telegram connection preparation was cancelled or superseded.");
+      }
+      checking = true;
+      try {
+        const current = generation === pollingGeneration && isCurrent() &&
+          deps.isContextCurrent?.(ctx) !== false && deps.getSessionId?.(ctx) === sessionId;
+        if (lost || !current) throw new Error("Telegram connection preparation was cancelled or superseded.");
+      } catch (error) {
+        lost = true;
+        throw error;
+      } finally {
+        checking = false;
+      }
+    };
+    assertCurrent();
+    if (!canStartPolling(ctx)) throw new Error(formatStartBlockedMessage(ctx));
+    assertCurrent();
+    try {
+      const reset = deps.resetDamagedState?.(assertCurrent) ?? false;
+      if (reset)
+        deps.recordRuntimeEvent?.("lock", new Error(
+          "Damaged Telegram runtime state was reset; previous runtime continuity was discarded.",
+        ), { phase: "state-reset" });
+      assertCurrent();
+      return reset;
+    } catch (error) {
+      deps.recordRuntimeEvent?.("lock", error, { phase: "state-reset" });
+      throw error;
+    }
+  };
   const stop = async (): Promise<string> => {
     const generation = pollingGeneration + 1;
     await suspendPolling();
@@ -2222,6 +2398,20 @@ export function createTelegramLockedPollingRuntime<
   };
   return {
     start: async (ctx, options = {}) => {
+      const cancelled = {
+        ok: false as const, canTakeover: false as const,
+        message: "Telegram polling startup was cancelled or superseded.",
+      };
+      const assertCaller = options.assertAuthority;
+      const registerFollower = deps.registerFollowerWithOwner, clockProvider = deps.readinessClock, endpointProvider = deps.getLeaderEndpoint;
+      const readinessClock = clockProvider ?? (() => performance.now());
+      const waitProvider = deps.waitForReadiness, waitForReadiness = waitProvider ?? delayTelegramBusTransportRetry;
+      const readinessDelayMs = TELEGRAM_BUS_REGISTRATION_RETRY.delayMs;
+      const configCapture = deps.captureConfigScope, storageCapture = deps.captureStorageScope, scopeReader = deps.lock.getStorageScope;
+      try { assertCaller?.(); } catch { return cancelled; }
+      const coordinates = scopeReader();
+      const selectedScope = coordinates ? Object.freeze({ ...coordinates }) : undefined;
+      const configCurrent = configCapture?.(selectedScope?.profile), storageCurrent = storageCapture?.(selectedScope);
       if (!deps.hasBotToken()) {
         return {
           ok: false,
@@ -2232,32 +2422,47 @@ export function createTelegramLockedPollingRuntime<
       if (!canStartPolling(ctx)) {
         return { ok: false, message: formatStartBlockedMessage(ctx) };
       }
-      const cancelled = {
-        ok: false as const,
-        canTakeover: false as const,
-        message: "Telegram polling startup was cancelled or superseded.",
-      };
       if (deps.isContextCurrent?.(ctx) === false) return cancelled;
       const generation = ++pollingGeneration;
-      const isCurrent = () =>
-        generation === pollingGeneration &&
-        (deps.isContextCurrent?.(ctx) ?? true);
-      if (ownershipStop) await ownershipStop;
-      if (!isCurrent()) return cancelled;
-      if (!options.election && deps.resetDamagedState) {
+      const sessionReader = deps.getSessionId, contextReader = deps.isContextCurrent;
+      const sessionId = sessionReader?.(ctx);
+      let originalEndpoint: string | undefined;
+      try { originalEndpoint = endpointProvider?.(); } catch { return cancelled; }
+      let readinessStarted: number;
+      try { readinessStarted = readinessClock(); } catch { readinessStarted = NaN; }
+      let readinessLast = readinessStarted, readinessExpired = false;
+      let lost = false, checking = false;
+      const isCurrent = () => {
+        if (lost || checking) { lost = true; return false; }
+        checking = true;
         try {
-          if (deps.resetDamagedState())
-            deps.recordRuntimeEvent?.(
-              "lock",
-              new Error(
-                "Damaged Telegram runtime state was reset; previous runtime continuity was discarded.",
-              ),
-              { phase: "state-reset" },
-            );
-        } catch (error) {
-          deps.recordRuntimeEvent?.("lock", error, { phase: "state-reset" });
+          assertCaller?.();
+          if (generation !== pollingGeneration || deps.getSessionId !== sessionReader || deps.isContextCurrent !== contextReader ||
+            deps.captureConfigScope !== configCapture || deps.captureStorageScope !== storageCapture || deps.lock.getStorageScope !== scopeReader ||
+            deps.registerFollowerWithOwner !== registerFollower || deps.readinessClock !== clockProvider || deps.waitForReadiness !== waitProvider || deps.getLeaderEndpoint !== endpointProvider ||
+            endpointProvider?.() !== originalEndpoint ||
+            sessionReader?.(ctx) !== sessionId || contextReader?.(ctx) === false) lost = true;
+        } catch { lost = true; }
+        finally { checking = false; }
+        return !lost;
+      };
+      const selectedCurrent = () => {
+        if (!isCurrent()) return false;
+        try { if (configCurrent?.() === false || storageCurrent?.() === false) lost = true; } catch { lost = true; }
+        return isCurrent();
+      };
+      const draining = ownershipStop;
+      let priorOwner: TelegramLockEntry | undefined, priorOwnerCurrent: (() => boolean) | undefined;
+      if (draining) {
+        const state = deps.lock.getState();
+        if (state.kind === "active-elsewhere") {
+          priorOwner = Object.freeze({ ...state.lock });
+          priorOwnerCurrent = deps.lock.captureFollowerRegistrationScope(priorOwner);
         }
+        await draining;
       }
+      if (!selectedCurrent()) return cancelled;
+      if (!options.election) prepareConnection(ctx, isCurrent);
       let acquired = deps.lock.acquire(ctx, {
         force: options.force,
         expectedOwner:
@@ -2290,34 +2495,95 @@ export function createTelegramLockedPollingRuntime<
             message: "Telegram leadership election lost to another live owner.",
           };
         }
-        if (deps.registerFollowerWithOwner) {
+        if (registerFollower) {
+          const originalOwner = Object.freeze({ ...acquired.lock });
+          if (draining && (!priorOwner || !hasSameLockOwner(priorOwner, originalOwner) ||
+            priorOwner.busSocketPath !== originalOwner.busSocketPath || priorOwner.busSecret !== originalOwner.busSecret)) return cancelled;
+          const ownerCurrent = priorOwnerCurrent ?? deps.lock.captureFollowerRegistrationScope(originalOwner);
+          const registrationCurrent = () => {
+            if (!selectedCurrent()) return false;
+            try { if (!ownerCurrent()) lost = true; } catch { lost = true; }
+            return selectedCurrent();
+          };
+          const canWait = !!(assertCaller && selectedScope && configCurrent && storageCurrent && sessionId && sessionReader &&
+            originalOwner.instanceId && originalOwner.leaderEpoch !== undefined && (originalOwner.busSocketPath || originalEndpoint) && originalOwner.busSecret &&
+            Number.isSafeInteger(originalOwner.runtimeGeneration));
+          let readingReadiness = false;
+          const getReadinessRemainingMs = () => {
+            if (readingReadiness) { lost = true; throw new TelegramFollowerRegistrationCancelledError(); }
+            readingReadiness = true;
+            try {
+              if (!registrationCurrent()) throw new TelegramFollowerRegistrationCancelledError();
+              let now: number;
+              try { now = readinessClock(); } catch { now = NaN; }
+              if (!registrationCurrent()) throw new TelegramFollowerRegistrationCancelledError();
+              if (!Number.isFinite(readinessStarted) || readinessStarted < 0 || readinessStarted > Number.MAX_SAFE_INTEGER ||
+                !Number.isFinite(now) || now > Number.MAX_SAFE_INTEGER || now < readinessLast ||
+                now - readinessStarted >= TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS) readinessExpired = true;
+              readinessLast = now;
+              return readinessExpired ? 0 : TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS - (now - readinessStarted);
+            } finally { readingReadiness = false; }
+          };
+          let observationsLeft = Math.ceil(TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS / readinessDelayMs) + 1;
+          const readiness = {
+            remainingMs: getReadinessRemainingMs,
+            async wait() {
+              const remaining = getReadinessRemainingMs();
+              if (remaining <= 0) return false;
+              if (--observationsLeft <= 0) { readinessExpired = true; return false; }
+              await waitForReadiness(Math.min(readinessDelayMs, remaining));
+              return getReadinessRemainingMs() > 0;
+            },
+          };
           let failureMessage: string | undefined;
           try {
-            const registered = await deps.registerFollowerWithOwner(
+            if (!registrationCurrent()) return cancelled;
+            const registered = await registerFollower.call(deps,
               ctx,
-              acquired.lock,
-              options.forceFreshLeaderThread ? { recoverConnection: true } : undefined,
+              originalOwner,
+              { ...(options.forceFreshLeaderThread ? { recoverConnection: true } : {}),
+                ...(canWait ? { readiness } : {}), assertAuthority() {
+                if (!registrationCurrent()) throw new TelegramFollowerRegistrationCancelledError();
+              } },
             );
-            if (!isCurrent()) return cancelled;
-            if (registered) {
+            if (!registrationCurrent()) return cancelled;
+            if (registered === "readiness-expired") {
+              try { deps.recordRuntimeEvent?.("bus", "Original Telegram leader readiness deadline elapsed.", {
+                phase: "follower-readiness-expired", reason: "readiness-deadline",
+              }); } catch { /* A diagnostic failure is not registration or takeover evidence. */ }
+              if (!registrationCurrent()) return cancelled;
+              return { ok: false, canTakeover: false, message: "Timed out waiting for Telegram leader readiness." };
+            }
+            if (registered === "pending") {
+              deps.recordRuntimeEvent?.("bus", "Telegram leader Thread mode is not yet known.", {
+                phase: "follower-readiness-pending", reason: "thread-mode-unknown",
+              });
+              return {
+                ok: false, canTakeover: false,
+                message: "Telegram leader readiness is not yet established; Thread mode is still unknown.",
+              };
+            }
+            if (registered === true) {
               deps.updateStatus(ctx);
               return { ok: true, canTakeover: false };
             }
             if (registered === false) failureMessage = "not registered";
           } catch (error) {
+            if (error instanceof TelegramFollowerRegistrationCancelledError || !registrationCurrent()) return cancelled;
             failureMessage =
               error instanceof Error ? error.message : String(error);
             deps.recordRuntimeEvent?.("bus", error, {
               phase: "follower-register",
             });
           }
+          if (!registrationCurrent()) return cancelled;
           if (failureMessage) {
             const unresponsiveOwner = acquired.lock;
             if (
               deps.proveOwnerUnresponsive &&
               (await deps.proveOwnerUnresponsive(unresponsiveOwner))
             ) {
-              if (!isCurrent()) return cancelled;
+              if (!registrationCurrent()) return cancelled;
               acquired = deps.lock.acquire(ctx, { unresponsiveOwner });
             }
             if (!acquired.ok) {
@@ -2356,6 +2622,7 @@ export function createTelegramLockedPollingRuntime<
       const staleSuffix = acquired.replacedStale ? " Replaced stale lock." : "";
       return { ok: true, message: `Telegram bridge connected.${staleSuffix}` };
     },
+    prepareConnection,
     stop,
     captureStop() {
       const generation = pollingGeneration;
@@ -2380,6 +2647,28 @@ export function createTelegramLockedPollingRuntime<
         !ownershipStop &&
         (deps.isContextCurrent?.(ctx) ?? true) &&
         deps.lock.owns(snapshotLockContext(ctx));
+      return current() ? current : undefined;
+    },
+    captureCurrentTransportAuthority() {
+      const ctx = activeContext, generation = pollingGeneration, sessionId = activeSessionId;
+      let lost = false;
+      let epoch: number | string | undefined;
+      try { epoch = deps.lock.getOwnedLeaderEpoch(); }
+      catch { if (ctx !== undefined && generation === pollingGeneration) artifactTransportRevoked = true; return undefined; }
+      if (ctx !== undefined && epoch === undefined && startupsInFlight === 0) artifactTransportRevoked = true;
+      if (ctx === undefined || epoch === undefined || !deps.isContextCurrent || !deps.getSessionId || !sessionId ||
+          artifactTransportRevoked || ownershipStop || suspensionsInFlight !== 0 || startupsInFlight !== 0) return undefined;
+      const current = (): boolean => {
+        if (lost) return false;
+        try {
+          lost = artifactTransportRevoked || generation !== pollingGeneration || activeContext !== ctx ||
+            !!ownershipStop || suspensionsInFlight !== 0 || startupsInFlight !== 0 ||
+            !deps.isContextCurrent!(ctx) || deps.getSessionId!(ctx) !== sessionId ||
+            !deps.lock.owns(snapshotLockContext(ctx)) || deps.lock.getOwnedLeaderEpoch() !== epoch;
+        } catch { lost = true; }
+        if (lost && generation === pollingGeneration && activeContext === ctx) artifactTransportRevoked = true;
+        return !lost;
+      };
       return current() ? current : undefined;
     },
     isSuspended: () =>
@@ -2455,13 +2744,19 @@ export function createTelegramLockedPollingRuntime<
       }
       if (deps.isContextCurrent?.(ctx) === false) return;
       const generation = ++pollingGeneration;
-      const isCurrent = () =>
-        generation === pollingGeneration &&
-        (deps.isContextCurrent?.(ctx) ?? true);
+      const sessionId = deps.getSessionId?.(ctx);
+      let sessionLost = false;
+      const isCurrent = () => {
+        if (sessionLost) return false;
+        if (generation !== pollingGeneration || !(deps.isContextCurrent?.(ctx) ?? true) || deps.getSessionId?.(ctx) !== sessionId)
+          sessionLost = true;
+        return !sessionLost;
+      };
       const startedAtMs = Date.now();
       deps.recordRuntimeEvent?.("lock", "Telegram auto-start scheduled", {
         phase: "auto-start-scheduled",
-        mode: canRestoreRememberedFollower ? "follower-restore" : "leader",
+        mode: canRestoreRememberedFollower ? "follower-restore" : "leader", sessionId,
+        origin: canResumeStaleSameCwd ? "stale-same-cwd" : canHandoffSameProcess ? "same-process" : "owned",
       });
       const run = (async () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
@@ -2493,6 +2788,16 @@ export function createTelegramLockedPollingRuntime<
           );
           return;
         }
+        if (canResumeStaleSameCwd && deps.canAutoStartSession) {
+          const allowed = await deps.canAutoStartSession(ctx);
+          if (!isCurrent()) return;
+          if (allowed !== true) {
+            deps.recordRuntimeEvent?.("lock", "Telegram automatic startup skipped: no binding for this session.", {
+              phase: "auto-start-skip", reason: "session-binding-unavailable", sessionId,
+            });
+            return;
+          }
+        }
         if (canResumeStaleSameCwd || canHandoffSameProcess) {
           const acquired = deps.lock.acquire(
             ctx,
@@ -2503,12 +2808,12 @@ export function createTelegramLockedPollingRuntime<
           if (!acquired.ok) return;
         }
         if (!isCurrent()) return;
-        if (!(await runOwnedPollingStart(ctx, {}, isCurrent))) return;
+        if (!(await runOwnedPollingStart(ctx, canResumeStaleSameCwd ? { restoreWorkspaceOnly: true } : {}, isCurrent))) return;
         if (!isCurrent()) return;
         deps.onTransportAvailabilityChanged?.();
         deps.updateStatus(ctx);
         deps.recordRuntimeEvent?.("lock", "Telegram auto-start completed", {
-          phase: "auto-start-complete",
+          phase: "auto-start-complete", sessionId,
           durationMs: Date.now() - startedAtMs,
         });
       })()
@@ -2523,8 +2828,8 @@ export function createTelegramLockedPollingRuntime<
     registerFollowerWithOwner: deps.registerFollowerWithOwner
       ? async (ctx, owner, options) => {
           const registered = await deps.registerFollowerWithOwner?.(ctx, owner, options);
-          if (registered) deps.updateStatus(ctx);
-          return registered === true;
+          if (registered === true) deps.updateStatus(ctx);
+          return registered === "pending" ? "pending" : registered === true;
         }
       : undefined,
     restoreFollowerWithOwner: deps.restoreFollowerWithOwner

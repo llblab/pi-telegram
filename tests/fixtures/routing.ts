@@ -1,6 +1,7 @@
 /** Native routing composition shared by route regressions and cross-domain custody acceptance. Zones: telegram, pi agent, shared utils. */
 import * as Bindings from "../../lib/bindings.ts";
 import * as Commands from "../../lib/commands.ts";
+import * as Delivery from "../../lib/delivery.ts";
 import * as Media from "../../lib/media.ts";
 import * as Menu from "../../lib/menu.ts";
 import * as Model from "../../lib/model.ts";
@@ -41,6 +42,8 @@ export interface TestUpdate extends Updates.TelegramUpdateFlow {
 }
 
 export interface RouteHarnessOptions {
+  deliveryRuntime?: Delivery.TelegramDeliveryRuntime;
+  instanceTarget?: Delivery.TelegramDeliveryTarget;
   config?: unknown;
   configStore?: Routing.TelegramInboundRouteRuntimeDeps<
     TestMessage, TestCallbackQuery, TestContext, TestModel
@@ -92,6 +95,7 @@ export interface RouteHarnessOptions {
     TestContext,
     TestModel
   >["deleteMessage"];
+  editSelectionMessage?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["editSelectionMessage"];
   editMessageReplyMarkup?: Routing.TelegramInboundRouteRuntimeDeps<
     TestMessage,
     TestCallbackQuery,
@@ -100,6 +104,8 @@ export interface RouteHarnessOptions {
   >["editMessageReplyMarkup"];
   workspaceRestoreRecipient?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["workspaceRestoreRecipient"];
   getWorkspaceRestoreStore?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["getWorkspaceRestoreStore"];
+  captureOrphanIntentReaderCompatibility?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["captureOrphanIntentReaderCompatibility"];
+  captureOrphanCleanupReaderCompatibility?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["captureOrphanCleanupReaderCompatibility"];
   captureWorkspaceExternalProtection?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["captureWorkspaceExternalProtection"];
   inspectRestoreSourceAbandonment?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectRestoreSourceAbandonment"];
   inspectRoutingInputGroupExpiry?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectRoutingInputGroupExpiry"];
@@ -123,6 +129,7 @@ export interface RouteHarnessOptions {
     TestContext,
     TestModel
   >["foreignOwnedUpdateForwarder"];
+  privateDeliveryReplies?: Routing.TelegramPrivateDeliveryReplyPorts;
   getTargetOwnership?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["getTargetOwnership"];
   getMessageOwnership?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["getMessageOwnership"];
   getCurrentLeaderEpoch?: () => number | string | undefined;
@@ -248,6 +255,8 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     callApi: options.callApi,
     workspaceRestoreRecipient: options.workspaceRestoreRecipient,
     getWorkspaceRestoreStore: options.getWorkspaceRestoreStore,
+    captureOrphanIntentReaderCompatibility: options.captureOrphanIntentReaderCompatibility,
+    captureOrphanCleanupReaderCompatibility: options.captureOrphanCleanupReaderCompatibility,
     captureWorkspaceExternalProtection: options.captureWorkspaceExternalProtection,
     inspectRestoreSourceAbandonment: options.inspectRestoreSourceAbandonment,
     inspectRoutingInputGroupExpiry: options.inspectRoutingInputGroupExpiry,
@@ -263,6 +272,7 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     liveRebindCommandCompletionTimeoutMs: options.liveRebindCommandCompletionTimeoutMs,
     getSessionGeneration: options.getSessionGeneration,
     foreignOwnedUpdateForwarder: options.foreignOwnedUpdateForwarder,
+    privateDeliveryReplies: options.privateDeliveryReplies,
     getTargetOwnership: options.getTargetOwnership,
     getMessageOwnership: options.getMessageOwnership,
     getCurrentInstanceId: () => options.instanceId ?? "leader-a",
@@ -317,6 +327,7 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     answerGuestQueryForInlineMessage: options.answerGuestQueryForInlineMessage,
     startGuestPlaceholder: options.startGuestPlaceholder,
     editMessageReplyMarkup: options.editMessageReplyMarkup,
+    editSelectionMessage: options.editSelectionMessage,
     editInteractiveMessage: options.editInteractiveMessage,
     sendInteractiveMessage: options.sendInteractiveMessage ??  (async (_chatId, text, mode, replyMarkup, sendOptions) => {
       events.push(`interactive:${mode}:${text}`);
@@ -362,6 +373,25 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
       events.push(`event:${category}:${String(error)}`);
     }),
   };
+  const delivery = options.deliveryRuntime ?? Delivery.createTelegramDeliveryRuntime({
+    generation: `fixture:${options.instanceId ?? "route"}`,
+    getConfirmationAuthority: () => ({ profile: "default", operatorId: routingDeps.configStore.getAllowedUserId()! }),
+    getActiveTurnTarget: () => activeTurnRuntime.get()?.target,
+    getInstanceTarget: () => options.instanceTarget ?? ({ chatId: routingDeps.configStore.getAllowedUserId()! }),
+    getAggregateTarget: () => undefined,
+    isExplicitTargetAuthorized: target => target.chatId === routingDeps.configStore.getAllowedUserId(),
+    renderView: view => [{ text: view.text, parseMode: view.parseMode ?? "plain" }],
+    async sendChunk() { throw new Error("Native questions must use their captured publisher"); },
+    async editChunk() {},
+    async deleteMessage() {},
+    async sendChatAction() {},
+  });
+  routingDeps.confirmations = {
+    openChoice: request => delivery.openChoice!(request),
+    acceptChoice: (query, guard) => delivery.acceptChoice!(query, guard),
+    openConfirmation: (request, owned) => delivery.openConfirmation!(request, owned),
+    acceptConfirmation: (query, guard) => delivery.acceptConfirmation!(query, guard),
+  };
   const routeRuntime = Routing.createTelegramInboundRouteRuntime<TestUpdate, TestMessage, TestCallbackQuery, TestContext, TestModel>(routingDeps);
-  return { buttonActionStore, bridgeRuntime, events, routeRuntime, routingDeps, telegramQueueStore, activeTurnRuntime, queueBinding };
+  return { buttonActionStore, bridgeRuntime, events, routeRuntime, routingDeps, telegramQueueStore, activeTurnRuntime, queueBinding, deliveryRuntime: delivery };
 }

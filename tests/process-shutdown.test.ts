@@ -167,7 +167,12 @@ async function createPiPrintFixtureExtension(tempDir: string): Promise<string> {
     `import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";\n` +
       `import { join } from "node:path";\n` +
       `import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";\n\n` +
+      // Module evaluation follows static imports; absence of this probe does not identify which import stalled.
+      processProbePrelude("child") +
       `export default function (pi) {\n` +
+      `  traceProcessStage("fixture-entered");\n` +
+      `  pi.on("agent_end", () => { traceProcessStage("agent-end"); });\n` +
+      `  pi.on("session_shutdown", () => { traceProcessStage("session-shutdown"); });\n` +
       `  const agentDir = process.env.PI_CODING_AGENT_DIR;\n` +
       `  if (process.env.PI_TELEGRAM_TEST_LOCK_MODE === "owner" && agentDir) {\n` +
       `    const ownersDir = join(agentDir, "tmp", "pi-telegram");\n` +
@@ -175,6 +180,7 @@ async function createPiPrintFixtureExtension(tempDir: string): Promise<string> {
       `    writeFileSync(join(ownersDir, "state.json"), JSON.stringify({ version: 2, profiles: { default: { transport: { pid: process.pid } } } }) + "\\n", { mode: 0o600 });\n` +
       `  }\n` +
       `  pi.on("session_start", (_event, ctx) => {\n` +
+      `    traceProcessStage("session-start");\n` +
       `    const forcedMode = process.env.PI_TELEGRAM_TEST_CTX_MODE;\n` +
       `    if (forcedMode && ctx.mode === undefined) ctx.mode = forcedMode;\n` +
       `    const methodMarker = process.env.PI_TELEGRAM_TEST_METHOD_MARKER;\n` +
@@ -205,6 +211,7 @@ async function createPiPrintFixtureExtension(tempDir: string): Promise<string> {
       `    name: "Fixture Provider", baseUrl: "http://fixture.local", apiKey: "fixture", api: "fixture-stream",\n` +
       `    models: [{ id: "echo", name: "Echo", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8000, maxTokens: 1000 }],\n` +
       `    streamSimple(model) {\n` +
+      `      traceProcessStage("provider-entered");\n` +
       `      const stream = createAssistantMessageEventStream();\n` +
       `      queueMicrotask(() => {\n` +
       `        const output = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() };\n` +
@@ -217,10 +224,12 @@ async function createPiPrintFixtureExtension(tempDir: string): Promise<string> {
       `        stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });\n` +
       `        stream.push({ type: "done", reason: "stop", message: output });\n` +
       `        stream.end();\n` +
+      `        traceProcessStage("provider-ended");\n` +
       `      });\n` +
       `      return stream;\n` +
       `    },\n` +
       `  });\n` +
+      `  traceProcessStage("fixture-ready");\n` +
       `}\n`,
     "utf8",
   );
@@ -644,6 +653,9 @@ test(
       assert.equal(result.code, 0, result.stderr);
       assert.equal(result.signal, null, result.stderr);
       assert.match(result.stdout, /fixture ok/);
+      for (const stage of ["fixture-entered", "provider-entered", "exit"]) {
+        assert.ok(result.stderr.includes(`"stage":"${stage}"`), result.stderr);
+      }
     } finally {
       await rm(agentDir, { recursive: true, force: true });
       await rm(tempDir, { recursive: true, force: true });

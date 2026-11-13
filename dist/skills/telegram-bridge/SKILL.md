@@ -17,6 +17,7 @@ Use Telegram as a mobile companion to the current Pi session. Preserve the exact
 | Explicitly send to a different live Thread | `telegram_message(thread=...)` |
 | Add buttons | Hidden comment for footer; `telegram_button` fence for in-body rows |
 | Add explicit voice | Hidden action comment |
+| Structured choices | [Selection markup](./references/delivery-and-threads.md#selection-markup) |
 | Build a repeated deterministic interaction | Follow `generative-apps` |
 
 A connected Telegram session proves capability, not user intent. Use Telegram features on Telegram-originated turns or explicit Telegram delivery requests only. Never call `telegram_message` for the current active target.
@@ -114,7 +115,7 @@ When maintained capability guidance advertises an existing Generative App for th
 
 Read only when the current task needs the capability:
 
-- Explicit local, cross-target, or Thread delivery: [`references/delivery-and-threads.md`](./references/delivery-and-threads.md)
+- Delivery, Threads, selection markup: [`references/delivery-and-threads.md`](./references/delivery-and-threads.md)
 - Voice/media handler configuration or public extension APIs: [`references/configuration.md`](./references/configuration.md)
 - Bridge health or failure diagnosis: [`references/diagnosis.md`](./references/diagnosis.md)
 
@@ -122,7 +123,7 @@ Read only when the current task needs the capability:
 
 Before replying:
 
-- Use the ordinary path for the current target and direct tools only for explicit other delivery.
+- During turns, use ordinary replies; `telegram_message` requires explicit other-target delivery.
 - Attach requested files rather than only mentioning them.
 - Keep comments complete and button fences top-level and canonical: CML first, JSON when necessary; either syntax may coexist within one matrix.
 - Give every enabled button a self-contained prompt; preserve confirmation for dangerous actions.

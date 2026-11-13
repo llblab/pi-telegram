@@ -46,11 +46,16 @@ const TELEGRAM_SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
  * current-profile journal family; the folder disappears once no profile uses it.
  */
 export function createTelegramSessionFolderSweeper(deps) {
+    const preserveJournalFamilies = deps.preserveJournalFamilies;
+    if (preserveJournalFamilies !== undefined && preserveJournalFamilies !== true)
+        throw new Error("Telegram session journal preservation must be true or omitted.");
     const getNowMs = deps.getNowMs ?? Date.now;
     const intervalMs = deps.intervalMs ?? TELEGRAM_SESSION_SWEEP_INTERVAL_MS;
     let lastSweepAtMs;
     return {
         sweep() {
+            if (preserveJournalFamilies)
+                return [];
             const now = getNowMs();
             if (lastSweepAtMs !== undefined && now - lastSweepAtMs < intervalMs)
                 return [];

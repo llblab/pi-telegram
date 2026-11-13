@@ -19,6 +19,7 @@ test.beforeEach(() => {
 
 import {
   createTelegramButtonActionStore,
+  type TelegramOutboundButtonAction,
   createTelegramButtonPromptTurn,
   createTelegramOutboundReplyArtifactSender,
   createTelegramOutboundReplyPlanner,
@@ -40,6 +41,81 @@ import {
 const testReplyMarkup = {
   inline_keyboard: [[{ text: "Continue", callback_data: "btn:1" }]],
 };
+
+for (const kind of ["confirm", "choice", "set", "wizard"] as const) for (const rendering of ["html", "rich"] as const) for (const enabled of [false, true])
+test(`Private outbound question policy captures factory default without changing collectors (${kind}/${rendering}/${enabled})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const records: TelegramOutboundButtonAction[] = [], answers: unknown[] = [];
+  let live = true; const binding = { app: "counter", generation: "original", revision: 0, assertCurrent() { assert.ok(live); } };
+  const store = createTelegramButtonActionStore();
+  const planner = createTelegramOutboundReplyPlanner({ register(action) { records.push(action); return store.register(action); } }, () => rendering, enabled ? true : undefined);
+  const body = kind === "confirm" ? { question: "Q" } : kind === "wizard" ? [{ question: "First", choices: ["A"] }, { question: "Last", choices: ["B"] }] : { question: "Q", choices: ["A", "B"], ...(kind === "set" ? { select: 2 } : {}) };
+  const plan = planner(`<!-- ${kind === "confirm" ? "telegram_confirm" : "telegram_choice"} ${JSON.stringify(body)} -->`, { binding }); let markup = plan.replyMarkup!;
+  try { assert.ok(markup); const deadline = records[0]!.completionGroup!.deadline!; assert.equal(deadline.expiresAt, 1000 + (enabled ? 86_400_000 : 3_600_000));
+    assert.ok(records.every(a => a.binding === undefined && a.completionGroup!.deadline === deadline), "Structured selections remain ordinary answer data, not bound-method actions");
+    const click = async (label: string) => handleTelegramButtonCallbackQuery({ id: "policy", data: markup.inline_keyboard.flat().find(b => b.text === label)!.callback_data,
+      message: { chat: { id: 42 }, message_id: 201, reply_markup: markup } }, undefined, { resolveAction: store.resolve, answerCallbackQuery: async () => {},
+      updateSelectionKeyboard: async (_q, next, guard) => { guard(); markup = next; }, updateSelectionMessage: async (_q, _text, mode, next, guard) => { guard(); assert.equal(mode, rendering); markup = next; },
+      enqueueButtonPrompt: (_q, action) => { answers.push(JSON.parse(action.prompt)); } });
+    if (enabled) t.mock.timers.tick(3_600_001);
+    await click(kind === "confirm" ? "✅ Yes" : "A");
+    if (kind === "set" || kind === "wizard") { assert.deepEqual(answers, []); t.mock.timers.tick(100); await click("B"); }
+    assert.deepEqual(answers, [kind === "wizard" ? [{ question: "First", answer: "A" }, { question: "Last", answer: "B" }] : { question: "Q", answer: kind === "confirm" ? "✅ Yes" : kind === "set" ? ["A", "B"] : "A" }]);
+    assert.equal(deadline.expiresAt, 1000 + (enabled ? 86_400_000 : 3_600_000), "Steps/finish are not a renewal or another factory capture");
+  } finally { live = false; store.clear!(); }
+});
+
+for (const enabled of [false, true]) for (const timeoutMs of [1, 3_600_000, 3_600_001])
+test(`Private outbound question policy preserves explicit timeout limits (${enabled}/${timeoutMs})`, t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const actions: TelegramOutboundButtonAction[] = [];
+  const plan = createTelegramOutboundReplyPlanner({ register(action) { actions.push(action); return `callback:${actions.length}`; } }, () => "html", enabled ? true : undefined)(`<!-- telegram_choice ${JSON.stringify({ question: "Q", choices: ["A"], timeoutMs })} -->`);
+  if (timeoutMs > 3_600_000) { assert.equal(actions.length, 0); assert.equal(plan.replyMarkup, undefined); } else { assert.ok(actions.length); assert.ok(actions.every(a => a.expiresAt === 1000 + timeoutMs)); }
+});
+
+for (const invalid of [false, 0, null, {}])
+test(`Private outbound question policy validates before dependency access (${JSON.stringify(invalid)})`, () => {
+  let touched = 0; const store = { get register() { touched++; return () => "callback"; } };
+  assert.throws(() => createTelegramOutboundReplyPlanner(store, () => { touched++; return "html"; }, invalid as true), /head\/tail policy/u); assert.equal(touched, 0);
+});
+
+for (const enabled of [false, true])
+test(`Private outbound question policy stays constructor-only through rendering and bound values (${enabled})`, t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let flag: true | undefined = enabled ? true : undefined;
+  const actions: TelegramOutboundButtonAction[] = [], binding = { app: "counter", generation: "fixed", revision: 0 };
+  const planner = createTelegramOutboundReplyPlanner({ register(a) { actions.push(a); return `callback:${actions.length}`; } }, () => { flag = flag ? undefined : true; return "html"; }, flag);
+  const plan = planner('Visible.\n<!-- telegram_voice {Speak.|ru} -->\n<!-- telegram_choice {"question":"Q","choices":["counter::increment","/stop"]} -->\n<!-- telegram_button {Run|counter::increment} -->', { binding, questionHeadTail: !enabled } as { binding: typeof binding });
+  assert.deepEqual(plan.voiceReplies, [{ text: "Speak.", lang: "ru" }]); assert.match(plan.markdown, /Visible\./u);
+  const selections = actions.filter(a => a.promptKind === "selection"); assert.ok(selections.length);
+  assert.ok(selections.every(a => a.expiresAt === 1000 + (enabled ? 86_400_000 : 3_600_000) && a.binding === undefined));
+  assert.equal(actions.find(a => !a.promptKind)?.binding, binding, "Only ordinary app method controls keep the existing app binding");
+  assert.deepEqual(JSON.parse(actions[0]!.prompt), { question: "Q", answer: "counter::increment" });
+});
+
+for (const enabled of [false, true])
+test(`Private outbound question policy does not accept a declaration-level activation field (${enabled})`, () => {
+  let actions = 0; const planner = createTelegramOutboundReplyPlanner({ register() { actions++; return "callback"; } }, () => "html", enabled ? true : undefined);
+  const result = planner('<!-- telegram_confirm {"question":"Q","questionHeadTail":true} -->'); assert.equal(actions, 0); assert.equal(result.replyMarkup, undefined);
+});
+
+test("Finalized selection declarations use the normal outbound planner and ordinary callback queue", async () => {
+  const store = createTelegramButtonActionStore(), planner = createTelegramOutboundReplyPlanner(store);
+  const source = 'Before.\n```telegram_choice\n{"question":"Format?","choices":"[[{JSON|json|success}{CSV|csv}]]"}\n```\nAfter.';
+  assert.equal(stripTelegramCommentMarkupForPreview(source), "Before.\n\nAfter.");
+  const plan = planner(source); assert.match(plan.markdown, /\*\*Format\?\*\*/u);
+  assert.equal(plan.replyMarkup!.inline_keyboard[0]![0]!.style, undefined);
+  let turn: ReturnType<typeof createTelegramButtonPromptTurn> | undefined;
+  const data = plan.replyMarkup!.inline_keyboard[0]![0]!.callback_data;
+  await handleTelegramButtonCallbackQuery({ id: "click", data, message: { chat: { id: 7 }, message_id: 8, message_thread_id: 9, reply_markup: plan.replyMarkup } }, undefined, {
+    resolveAction: store.resolve, answerCallbackQuery: async () => {},
+    enqueueButtonPrompt: (_query, action) => { turn = createTelegramButtonPromptTurn({ chatId: 7, replyToMessageId: 8, queueOrder: 1, action, target: { chatId: 7, threadId: 9 } }); },
+  });
+  assert.ok(turn); assert.equal(turn.kind, "prompt"); assert.deepEqual(turn.target, { chatId: 7, threadId: 9 });
+  assert.deepEqual(JSON.parse(turn.historyText), { question: "Format?", answer: "JSON" });
+});
+
+for (const element of ["telegram_confirm", "telegram_choice"]) test(`Drafts suppress complete and partial ${element} bodies`, () => {
+  for (const body of ['{"question":"Sensitive unfinished declaration', '{"question":"Q"}\n```'])
+    assert.equal(stripTelegramCommentMarkupForPreview(`Before.\n\`\`\`${element}\n${body}`), "Before.");
+});
 
 test("Outbound text handler transforms text and markdown replies", async () => {
   const sent: string[] = [];
@@ -779,7 +855,7 @@ test("Button callback handler enqueues prompt actions", async () => {
   ]);
 });
 
-test("Button callback handler consumes expired button callbacks", async () => {
+test("Button callback handler refuses missing history without inventing a deadline", async () => {
   const events: unknown[] = [];
   assert.equal(
     await handleTelegramButtonCallbackQuery(
@@ -798,7 +874,7 @@ test("Button callback handler consumes expired button callbacks", async () => {
     true,
   );
   assert.deepEqual(events, [
-    { id: "callback-1", text: "Button action expired" },
+    { id: "callback-1", text: "Button action unavailable" },
   ]);
 });
 
@@ -1516,32 +1592,6 @@ test("Voice reply sender falls back to next handler when sendMultipart throws", 
   assert.equal((fields[0] as Record<string, unknown>).chat_id, "10");
   dispose1();
   dispose2();
-});
-
-test("Voice reply sender accepts provider returning an audio path", async () => {
-  const events: unknown[] = [];
-  const dispose = registerTelegramVoiceSynthesisProvider(
-    async () => "/tmp/response.ogg",
-  );
-  const sendVoiceReply = createTelegramVoiceReplySender({
-    execCommand: async () => ({
-      stdout: "",
-      stderr: "",
-      code: 0,
-      killed: false,
-    }),
-    sendMultipart: async (_method, _fields, _fileField, filePath, fileName) => {
-      events.push({ filePath, fileName });
-    },
-    recordRuntimeEvent: () => {},
-  });
-  await sendVoiceReply({ chatId: 10, replyToMessageId: 20 }, "hello");
-  const fileEvent = events.find(
-    (e) => (e as Record<string, unknown>).filePath !== undefined,
-  ) as Record<string, unknown>;
-  assert.equal(fileEvent.filePath, "/tmp/response.ogg");
-  assert.equal(fileEvent.fileName, "response.ogg");
-  dispose();
 });
 
 test("Outbound text handlers honour when guards on handlers and composition steps", async () => {

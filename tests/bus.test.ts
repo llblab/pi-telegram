@@ -1,6 +1,7 @@
 /**
  * Regression tests for Telegram multi-instance bus helpers
  * Covers the serializable leader/follower IPC contract and live follower registry behavior
+ * Zones: telegram, test infrastructure
  */
 
 import assert from "node:assert/strict";
@@ -10,6 +11,8 @@ import {
   mkdtempSync,
   rmSync,
   statSync,
+  lstatSync,
+  readlinkSync,
   linkSync,
   unlinkSync,
 } from "node:fs";
@@ -27,8 +30,70 @@ import {
   getTelegramBusTransportRetryPolicy,
   probeTelegramBusEndpoint,
 } from "../lib/bus-transport.ts";
+for (const artifact of ["source", "compiled"] as const) for (const mode of ["empty", "supported", "legacy", "local-legacy", "no-generation", "heartbeat", "replacement", "add-remove", "remove", "clear", "prune", "provider", "local-loss", "remove-absent"] as const)
+test(`Native orphan reader capture owns the whole original membership (${artifact}/${mode})`, async () => {
+  const createRegistry = (artifact === "source" ? createTelegramBusFollowerRegistry : (await import("../dist/lib/bus.js")).createTelegramBusFollowerRegistry) as typeof createTelegramBusFollowerRegistry;
+  const registry = createRegistry(), capability = TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER;
+  const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "same-build", capabilities: [capability] });
+  const local = createTelegramBusProtocolIdentity({ runtimeBuild: "same-build", capabilities: mode === "local-legacy" ? [] : [capability] });
+  const row = { instanceId: "reader", profileKey: "manual:reader", registrationGeneration: "g1", connectedAtMs: 1, protocol };
+  if (mode !== "empty") registry.register({ ...row, ...(mode === "no-generation" ? { registrationGeneration: undefined } : {}),
+    ...(mode === "legacy" ? { protocol: createTelegramBusProtocolIdentity({ runtimeBuild: "same-build", capabilities: [] }) } : {}) });
+  assert.equal(typeof registry.captureOrphanIntentReaderCompatibility, "function");
+  const current = registry.captureOrphanIntentReaderCompatibility!(local);
+  if (["legacy", "local-legacy", "no-generation"].includes(mode)) { assert.equal(current, undefined); return; }
+  assert.ok(current); assert.equal(current(), true);
+  if (mode === "heartbeat") registry.heartbeat("reader", 2000);
+  if (mode === "remove-absent") registry.remove("absent");
+  if (mode === "replacement") registry.register(row);
+  if (mode === "add-remove") { registry.register({ ...row, instanceId: "transient", profileKey: "manual:transient" }); registry.remove("transient"); }
+  if (mode === "remove") registry.remove("reader");
+  if (mode === "clear") registry.clear();
+  if (mode === "prune") registry.pruneStale(10000, 1);
+  if (mode === "provider") { const list = registry.list; registry.list = () => []; assert.equal(current(), false); registry.list = list; }
+  if (mode === "local-loss") { local.capabilities = []; assert.equal(current(), false); local.capabilities = [capability]; }
+  const live = ["empty", "supported", "heartbeat", "remove-absent"].includes(mode);
+  assert.equal(current(), live);
+  if (!live) { registry.clear(); registry.register(row); assert.equal(current(), false, "Equal restored roster/provider fields cannot revive a spent capture"); }
+});
+
+for (const artifact of ["source", "compiled"] as const) for (const localV2 of [false, true]) for (const remoteV2 of [false, true])
+test(`Orphan issued-state reader support is negotiated independently (${artifact}/${localV2}/${remoteV2})`, async () => {
+  const createRegistry = (artifact === "source" ? createTelegramBusFollowerRegistry : (await import("../dist/lib/bus.js")).createTelegramBusFollowerRegistry) as typeof createTelegramBusFollowerRegistry;
+  const protocol = (v2: boolean) => createTelegramBusProtocolIdentity({ runtimeBuild: "same-build", capabilities: [TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER,
+    ...(v2 ? [TELEGRAM_BUS_CAPABILITY_ORPHAN_CLEANUP_READER] : [])] });
+  const registry = createRegistry(), local = protocol(localV2);
+  registry.register({ instanceId: "reader", registrationGeneration: "g1", connectedAtMs: 1, protocol: protocol(remoteV2) });
+  assert.equal(registry.captureOrphanIntentReaderCompatibility!(local)?.(), true, "V1 still suffices for an unissued intent");
+  const cleanup = registry.captureOrphanIntentReaderCompatibility!(local, "cleanup");
+  assert.equal(cleanup?.() === true, localV2 && remoteV2, "Equal builds or V1 do not certify the issued codec");
+});
+
+test("Attachment publication receipt is bounded immutable evidence and never a default capability", () => {
+  const raw = { version: 1, requestId: "publication", nonce: "a".repeat(32), instanceId: "follower", registrationGeneration: "g1", registrationIncarnation: "b".repeat(48),
+    botId: 777, messageId: 501, target: { chatId: 7, threadId: 11 } };
+  const receipt = parseTelegramBusAttachmentPublicationReceipt(raw); assert.ok(receipt && Object.isFrozen(receipt) && Object.isFrozen(receipt.target));
+  raw.target.chatId = 99; assert.equal(receipt.target.chatId, 7);
+  for (const changed of [{ version: 2 }, { requestId: "" }, { requestId: "x".repeat(513) }, { nonce: "a".repeat(33) },
+    { instanceId: "bad\ninstance" }, { registrationGeneration: null }, { registrationIncarnation: "" }, { registrationIncarnation: "x".repeat(48) }, { botId: 0 }, { messageId: 1.5 }, { unknown: true },
+    { target: { chatId: 0 } }, { target: { chatId: 7, threadId: -1 } }, { target: { chatId: 7, extra: true } }])
+    assert.equal(parseTelegramBusAttachmentPublicationReceipt({ ...raw, ...changed }), undefined);
+  assert.equal(createTelegramCurrentBusProtocolIdentity().capabilities.includes(TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION), false);
+  const envelope = { kind: "follower.callApi", requestId: "publication", instanceId: "follower", registrationGeneration: "g1",
+    attachmentRegistrationIncarnation: "b".repeat(48), method: "call", args: ["sendMessage", {}], sentAtMs: 1 };
+  assert.deepEqual(parseTelegramBusEnvelope(JSON.stringify(envelope)), envelope);
+  for (const invalid of [null, "", "b".repeat(47), "x".repeat(48), 42])
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, attachmentRegistrationIncarnation: invalid })), undefined);
+});
+
 import {
   createCurrentTelegramBusProcessRuntime,
+  parseTelegramBusAttachmentPublicationReceipt,
+  createTelegramCurrentBusProtocolIdentity,
+  TELEGRAM_BUS_CAPABILITY_ATTACHMENT_PUBLICATION,
+  TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER,
+  TELEGRAM_BUS_CAPABILITY_ORPHAN_CLEANUP_READER,
+  parseTelegramBusArtifactDocument,
   canUseTelegramBusInputCustodyReference,
   createTelegramBusFollowerDeliveryIdentity,
   createTelegramBusForwardOwnershipValidator,
@@ -47,7 +112,6 @@ import {
   getTelegramBusEnvelopeTrafficClass,
   getTelegramBusFollowerSocketPath,
   getTelegramBusProtocolCompatibility,
-  getTelegramInputCustodyPeerReadiness,
   getTelegramBusSocketPath,
   getTelegramFollowerTargetOwnership,
   hasTelegramBusCapability,
@@ -465,19 +529,6 @@ test("Bus protocol compatibility ignores build skew and enforces capabilities", 
       ],
     },
   );
-});
-
-test("Bus custody peer readiness uses only live generation and protocol evidence", () => {
-  const ready = createTelegramBusProtocolIdentity({ runtimeBuild: "0.45.0",
-    capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
-      TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE] });
-  const legacy = createTelegramBusProtocolIdentity({ runtimeBuild: "0.44.0" });
-  assert.deepEqual(getTelegramInputCustodyPeerReadiness([
-    { registrationGeneration: "g1", protocol: ready },
-    { registrationGeneration: "g2", protocol: legacy },
-    { registrationGeneration: "g3" },
-    { protocol: ready },
-  ]), ["ready", "legacy", "unknown", "unknown"]);
 });
 
 test("Bus custody reference requires mutual capability and exact accepted handoff", () => {
@@ -1204,6 +1255,36 @@ test("Bus contract rejects malformed envelopes", () => {
   );
 });
 
+for (const kind of ["artifact", "ordinary"] as const)
+for (const change of ["heartbeat", "equal-register", "rename", "remove-readd", "overlap", "prune", "clear"] as const)
+test(`Native registry lifetime is owned and nonrenewing (${kind}/${change})`, () => {
+  const registry = createTelegramBusFollowerRegistry(), registration = { instanceId: "artifact", connectedAtMs: 1, registrationGeneration: "same", profileKey: "profile", target: { chatId: 7, threadId: 8 } };
+  const first = registry.register(registration), incarnation = first.registrationIncarnation!;
+  assert.match(incarnation, /^[a-f0-9]{48}$/u);
+  const capture = kind === "artifact" ? registry.captureArtifactRegistration!(registration.instanceId, incarnation)! : registry.captureRegistration!(registration.instanceId, "same")!;
+  assert.equal(registry.captureRegistration!(registration.instanceId, "foreign"), undefined);
+  assert.equal(capture(), true);
+  if (change === "heartbeat") registry.heartbeat(registration.instanceId, 5);
+  else if (change === "equal-register") registry.register(registration);
+  else if (change === "rename") registry.register({ ...registration, threadName: "new" });
+  else if (change === "remove-readd") { registry.remove(registration.instanceId); registry.register(registration); }
+  else if (change === "overlap") registry.register({ ...registration, instanceId: "other" });
+  else if (change === "prune") registry.pruneStale(100, 5);
+  else registry.clear();
+  assert.equal(capture(), change === "heartbeat");
+  if (change !== "heartbeat") { registry.register(registration); assert.equal(capture(), false); }
+  else assert.equal(registry.get(registration.instanceId)?.registrationIncarnation, incarnation);
+});
+
+test("Artifact wire rejects noncanonical base64, keys and mismatched declared size without payload allocation", () => {
+  const good = { version: 1, registrationIncarnation: "a".repeat(48), target: { chatId: 7, threadId: 8 }, fileName: "file", byteLength: 1, bytesBase64: "YQ==", expiresAt: Date.now() + 10000 };
+  assert.ok(parseTelegramBusArtifactDocument([good]));
+  for (const bad of [{ ...good, bytesBase64: "YR==" }, { ...good, bytesBase64: "YQ==\n" }, { ...good, bytesBase64: "AAAA" }, { ...good, byteLength: 2 }, { ...good, extra: true }, { ...good, fileName: "../path" }, { ...good, expiresAt: 1 }, { ...good, target: { chatId: 7, aggregate: true } }])
+    assert.equal(parseTelegramBusArtifactDocument([bad]), undefined);
+  const bytes = Buffer.alloc(1_048_576, 255);
+  assert.ok(parseTelegramBusArtifactDocument([{ ...good, byteLength: bytes.length, bytesBase64: bytes.toString("base64") }]));
+});
+
 test("Bus follower registry registers, heartbeats, and prunes live instances", () => {
   const registry = createTelegramBusFollowerRegistry();
 
@@ -1220,6 +1301,7 @@ test("Bus follower registry registers, heartbeats, and prunes live instances", (
       target: { chatId: 1 },
       connectedAtMs: 1000,
       lastHeartbeatMs: 1000,
+      registrationIncarnation: registry.get("inst-a")?.registrationIncarnation,
     },
   );
   registry.register({
@@ -1909,9 +1991,135 @@ test("Old bus server stop cannot invalidate a replacement endpoint generation", 
   }
 });
 
+for (const artifact of ["source", "compiled"] as const)
+for (const boundary of ["stop", "restart", "replacement", "join", "commit-stop", "commit-caught-loss", "provider"] as const)
+test(`Native server startup retains its original publication lifetime (${artifact}/${boundary})`, async () => {
+  const Model = artifact === "source" ? { createTelegramBusLocalServer, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope }
+    : await import("../dist/lib/bus.js");
+  const dir = mkdtempSync(join(tmpdir(), "pt-server-start-")), socketPath = join(dir, "bus.sock"), endpoint = Model.resolveTelegramBusSocketPath(socketPath);
+  let ready!: () => void, release!: () => void, armed = true, secondSettled = false, stopping: Promise<void> | undefined, locator = socketPath;
+  const gate = new Promise<void>(resolve => { release = resolve; }), entered = new Promise<void>(resolve => { ready = resolve; });
+  const server = Model.createTelegramBusLocalServer({ socketPath: () => locator,
+    async beforeEndpointPublication() { if (armed) { ready(); await gate; } },
+    ...(["commit-stop", "commit-caught-loss"].includes(boundary) ? { commitEndpointPublication(commit: () => void) {
+      if (armed) stopping = server.stop();
+      if (boundary === "commit-caught-loss") { try { commit(); } catch { /* The producer catches original authority loss. */ } } else commit();
+      return true;
+    } } : {}),
+    handleEnvelope: request => ({ kind: "bus.ack", requestId: request.requestId, ok: true, message: "original" }),
+  });
+  const replacement = Model.createTelegramBusLocalServer({ socketPath, handleEnvelope: request => ({ kind: "bus.ack", requestId: request.requestId, ok: true, message: "replacement" }) });
+  const pending = server.start().then(() => ({ ok: true as const }), error => ({ error }));
+  let second: Promise<void> | undefined, targetBefore: string | undefined;
+  try {
+    await entered;
+    if (boundary === "join") {
+      second = server.start().finally(() => { secondSettled = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(secondSettled, false, "A concurrent start must join actual endpoint publication, not the merely allocated server handle");
+    }
+    if (boundary === "stop" || boundary === "restart") await server.stop();
+    if (boundary === "provider") locator = join(dir, "replacement-source.sock");
+    if (boundary === "restart") { armed = false; await server.start(); }
+    if (boundary === "replacement") await replacement.start();
+    if (["restart", "replacement"].includes(boundary) && getTelegramBusTransportKind(endpoint) === "socket") targetBefore = readlinkSync(endpoint);
+    release();
+    const result = await pending;
+    await second; await stopping;
+    if (boundary === "join") assert.deepEqual(result, { ok: true });
+    else assert.ok("error" in result && result.error instanceof Error, "A stopped start cannot publish success after its original generation ended");
+    if (["stop", "commit-stop", "commit-caught-loss", "provider"].includes(boundary)) {
+      assert.equal((await probeTelegramBusEndpoint({ endpoint, timeoutMs: 50 })).reachable, false);
+      if (getTelegramBusTransportKind(endpoint) === "socket") assert.throws(() => lstatSync(endpoint), { code: "ENOENT" }, "No late dangling endpoint may be published by the stopped start");
+    } else {
+      if (targetBefore) assert.equal(readlinkSync(endpoint), targetBefore, "Late startup cannot replace a successor's exact endpoint generation");
+      const response = await Model.sendTelegramBusLocalEnvelope({ socketPath, envelope: { kind: "follower.heartbeat", requestId: "live-generation", instanceId: "fixture", sentAtMs: 0 } });
+      assert.equal(response?.kind === "bus.ack" && response.message, boundary === "replacement" ? "replacement" : "original");
+    }
+  } finally { release(); await pending; await second; await stopping; await server.stop(); await replacement.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+for (const outcome of ["loss", "ready", "join"] as const)
+test(`Original native startup guard does not become receiver lifetime (${artifact}/${outcome})`, async () => {
+  const Model = artifact === "source" ? { createTelegramBusLocalServer, sendTelegramBusLocalEnvelope } : await import("../dist/lib/bus.js");
+  const dir = mkdtempSync(join(tmpdir(), "pt-start-guard-")), socketPath = join(dir, "bus.sock");
+  let release!: () => void, entered!: () => void, current = true, calls = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; }), ready = new Promise<void>(resolve => { entered = resolve; });
+  const server = Model.createTelegramBusLocalServer({ socketPath, beforeEndpointPublication: async () => { entered(); await gate; },
+    handleEnvelope: request => ({ kind: "bus.ack", requestId: request.requestId, ok: true }) });
+  const guard = () => { calls++; if (!current) throw new Error("Original startup authority ended"); };
+  const pending = server.start(guard).then(() => undefined, error => error);
+  let joined: Promise<unknown> | undefined;
+  try {
+    await ready;
+    if (outcome === "join") joined = server.start(() => { throw new Error("Joining caller ended"); }).then(() => undefined, error => error);
+    if (outcome === "loss") current = false;
+    release();
+    const result = await pending;
+    if (outcome === "loss") { assert.match(result?.message ?? "", /Original startup authority ended/); return; }
+    assert.equal(result, undefined);
+    if (joined) { const result = await joined; assert.ok(result instanceof Error); assert.match(result.message, /Joining caller ended/); }
+    current = false;
+    await assert.rejects(server.start(guard), /Original startup authority ended/);
+    const beforeRequest = calls;
+    const response = await Model.sendTelegramBusLocalEnvelope({ socketPath, envelope: { kind: "follower.heartbeat", requestId: "independent-ready", instanceId: "fixture", sentAtMs: 0 } });
+    assert.ok(response?.kind === "bus.ack" && response.ok);
+    assert.equal(calls, beforeRequest, "Inbound receiver authority is independent of the ended startup caller");
+  } finally { release(); await pending; await joined; await server.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+for (const outcome of ["released", "stopped", "replacement", "revoked", "busy"] as const)
+test(`Bus startup waits for occupied native endpoint (${artifact}/${outcome})`, { timeout: 10000 }, async () => {
+  const Model = artifact === "source" ? { createTelegramBusLocalServer, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope } : await import("../dist/lib/bus.js");
+  const dir = mkdtempSync(join(tmpdir(), "pt-endpoint-drain-")), socketPath = join(dir, "bus.sock"), endpoint = Model.resolveTelegramBusSocketPath(socketPath);
+  let entered!: () => void, commits = 0, current = true, settled = false;
+  const probed = new Promise<void>(resolve => { entered = resolve; });
+  const original = createServer(socket => { entered(); socket.end(); });
+  await new Promise<void>((resolve, reject) => { original.once("error", reject); original.listen(endpoint, resolve); });
+  const server = Model.createTelegramBusLocalServer({ socketPath,
+    commitEndpointPublication(commit) { commits++; assert.equal(original.listening, false, "An occupied native listener cannot grant publication"); commit(); return true; },
+    handleEnvelope: request => ({ kind: "bus.ack", requestId: request.requestId, ok: true, message: "original-start" }),
+  });
+  const replacement = Model.createTelegramBusLocalServer({ socketPath,
+    handleEnvelope: request => ({ kind: "bus.ack", requestId: request.requestId, ok: true, message: "replacement" }),
+  });
+  const pending = server.start(() => { if (!current) throw new Error("Original occupied-endpoint caller ended"); })
+    .then(() => ({ ok: true as const }), error => ({ error })).finally(() => { settled = true; });
+  const retireOriginal = async () => { if (original.listening) await new Promise<void>(resolve => original.close(() => resolve())); };
+  try {
+    await Promise.race([probed, pending.then(result => {
+      if ("error" in result) throw result.error;
+      throw new Error("Startup settled before observing the live original endpoint");
+    })]);
+    await new Promise<void>(resolve => setTimeout(resolve, 60));
+    assert.equal(settled, false); assert.equal(commits, 0); assert.equal(original.listening, true);
+    if (outcome === "stopped" || outcome === "replacement") await server.stop();
+    if (outcome === "revoked") current = false;
+    if (outcome !== "busy") await retireOriginal();
+    if (outcome === "replacement") await replacement.start();
+    const result = await pending;
+    if (outcome === "released") { assert.deepEqual(result, { ok: true }); assert.equal(commits, 1); }
+    else {
+      assert.ok("error" in result && result.error instanceof Error);
+      assert.equal(commits, 0, "A canceled, revoked or still-occupied start cannot consult publication authority");
+      assert.match(result.error.message, outcome === "busy" ? /Timed out waiting for (legacy|previous) Telegram bus endpoint/ : outcome === "revoked" ? /Original occupied-endpoint caller ended/ : /cancelled or superseded/);
+    }
+    if (outcome === "released" || outcome === "replacement") {
+      const response = await Model.sendTelegramBusLocalEnvelope({ socketPath,
+        envelope: { kind: "follower.heartbeat", requestId: "after-actual-listener-close", instanceId: "fixture", sentAtMs: 0 } });
+      assert.ok(response?.kind === "bus.ack" && response.ok);
+      assert.equal(response.message, outcome === "replacement" ? "replacement" : "original-start");
+    }
+    if (outcome === "busy") assert.equal((await probeTelegramBusEndpoint({ endpoint, timeoutMs: 50 })).reachable, true, "Refusal cannot remove the original listener");
+  } finally { current = false; await server.stop(); await pending; await replacement.stop(); await retireOriginal(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("Stale bus server cannot publish over a replacement endpoint generation", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-publish-fence-"));
   const socketPath = join(dir, "bus.sock");
+  let commitCalls = 0;
   let releasePublication: (() => void) | undefined;
   let signalPublicationReady: (() => void) | undefined;
   const publicationReady = new Promise<void>((resolve) => {
@@ -1926,7 +2134,7 @@ test("Stale bus server cannot publish over a replacement endpoint generation", a
       signalPublicationReady?.();
       await publicationRelease;
     },
-    commitEndpointPublication: () => false,
+    commitEndpointPublication: () => { commitCalls++; return false; },
     handleEnvelope: () => undefined,
   });
   const replacement = createTelegramBusLocalServer({
@@ -1942,8 +2150,11 @@ test("Stale bus server cannot publish over a replacement endpoint generation", a
     const staleStart = stale.start();
     await publicationReady;
     await replacement.start();
+    // Unix has already registered its listener here; a pending Windows pipe has not entered the active-server map.
+    await stale.stop();
     releasePublication?.();
-    await assert.rejects(staleStart, /lost transport ownership/);
+    await assert.rejects(staleStart, /cancelled or superseded/);
+    assert.equal(commitCalls, 0, "A stopped startup cannot even consult a fresh publication grant");
 
     const response = await sendTelegramBusLocalEnvelope({
       socketPath,
@@ -2060,6 +2271,51 @@ test("Bus local client logs the first failure and the outcome, not every retry a
     await server.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+for (const outcome of ["connect", "deadline", "scope", "lost-ack", "negative", "long-ack", "before-write-expired", "forged-connect", "scope-marker", "logging"] as const)
+test(`Connection readiness consumes native pre-issuance proof only (${outcome})`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-connect-ready-")), socketPath = join(dir, "bus.sock");
+  let now = 0, waits = 0, issued = 0, received = 0, current = true;
+  const server = createTelegramBusLocalServer({ socketPath, async handleEnvelope(request) {
+    received++;
+    if (outcome === "lost-ack") return undefined;
+    if (outcome === "long-ack") { now = 2000; await new Promise(resolve => setTimeout(resolve, 20)); }
+    return { kind: "bus.ack", requestId: request.requestId, ok: outcome !== "negative" };
+  } });
+  try {
+    if (!["connect", "deadline", "scope", "forged-connect", "logging"].includes(outcome)) await server.start();
+    const pending = sendTelegramBusLocalEnvelope({ socketPath,
+      envelope: { kind: "follower.register", requestId: "original", registration: { instanceId: "fixture", connectedAtMs: 0 } },
+      timeoutMs: outcome === "lost-ack" ? 10 : 100,
+      retry: { attempts: 2, delayMs: 1 },
+      recordTransportEvent() { if (outcome === "logging") throw new Error("Fixture logger failed"); },
+      assertAuthority() { if (!current) throw new Error("Original scope lost"); },
+      onRequestIssued() { issued++; if (outcome === "before-write-expired") now = 1000; if (outcome === "scope-marker") current = false; },
+      connectionReadiness: {
+        remainingMs: () => { if (outcome === "forged-connect") throw Object.assign(new Error("Forged connection failure"), { code: "ENOENT", syscall: "connect" }); return 1000 - now; },
+        async wait() {
+          waits++; now += 10;
+          if (outcome === "forged-connect") assert.fail("A copied errno cannot certify native pre-issuance");
+          if (outcome === "deadline") return false;
+          if (outcome === "scope") { current = false; return true; }
+          if (waits === 3) await server.start();
+          return true;
+        },
+      },
+    });
+    if (["deadline", "scope", "lost-ack", "before-write-expired", "forged-connect", "scope-marker"].includes(outcome))
+      await assert.rejects(pending, error => error instanceof Error &&
+        (["scope", "scope-marker"].includes(outcome) ? /authority/.test(error.message) : outcome === "lost-ack" ? /Timed out/.test(error.message) : outcome === "forged-connect" ? /Forged/.test(error.message) : /readiness/.test(error.message)));
+    else {
+      const result = await pending;
+      assert.ok(result?.kind === "bus.ack"); assert.equal(result.ok, outcome !== "negative");
+    }
+    assert.equal(issued, ["deadline", "scope", "forged-connect"].includes(outcome) ? 0 : 1);
+    assert.equal(received, ["deadline", "scope", "before-write-expired", "forged-connect", "scope-marker"].includes(outcome) ? 0 : 1);
+    assert.equal(waits, outcome === "connect" || outcome === "logging" ? 3 : outcome === "deadline" || outcome === "scope" ? 1 : 0,
+      "Only proven unissued native connect failures may consume another observation");
+  } finally { await server.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("Bus local client classifies response timeouts as transport timeouts", async () => {
@@ -2584,7 +2840,7 @@ test("Bus foreign-owned update forwarder sends routed update envelopes", async (
 });
 
 for (const mode of ["current", "source-ended-initial", "source-ended-before-connect", "source-ended-before-write",
-  "recipient-ended-before-connect", "source-ended-after-write", "recipient-ended-after-write", "connection-refused"] as const) {
+  "recipient-ended-before-connect", "recipient-ended-before-write", "source-ended-after-write", "recipient-ended-after-write", "connection-refused"] as const) {
   test(`Guarded foreign forward fences native IPC issuance and ACK (${mode})`, async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-telegram-forward-guard-"));
     const socketPath = getTelegramBusFollowerSocketPath("guarded", dir);
@@ -2604,7 +2860,9 @@ for (const mode of ["current", "source-ended-initial", "source-ended-before-conn
         result: { deliveryId: envelope.delivery.deliveryId, sourceUpdateId: envelope.delivery.sourceUpdateId } };
     } });
     const message = { message_id: 1000, pi_telegram_source_update_id: 51,
-      get text() { if (mode === "source-ended-before-write") sourceCurrent = false; return "held source"; } };
+      get text() { if (mode === "source-ended-before-write") sourceCurrent = false;
+        if (mode === "recipient-ended-before-write") ownershipCurrent = false;
+        return "held source"; } };
     const forwarder = createTelegramBusForeignOwnedUpdateForwarder({ socketPath,
       createRequestId: () => "guarded:request", getAuthSecret: () => "guard-secret",
       validateForwardOwnership() { ownershipReads++; return ownershipCurrent; },

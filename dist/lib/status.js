@@ -22,9 +22,30 @@ export function formatTelegramConnectionFailure(error) {
         return "Telegram token rejected. Run /telegram-setup.";
     if (status === 403)
         return "Telegram access denied. Check /telegram-status --debug.";
-    if ((typeof code === "string" &&
-        ["ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND", "ECONNRESET"].includes(code)) ||
-        /network unavailable|fetch failed/i.test(message)) {
+    const recovery = getTelegramRecoveryErrorDetails(error);
+    if (recovery.errorCode === "guard-unverifiable")
+        return "Telegram state guard cannot be verified. Connection blocked. Check /telegram-status --debug.";
+    if (recovery.requestIssued === true || recovery.outcome === "commit-unknown")
+        return "Telegram request outcome is unconfirmed. Do not repeat it; check /telegram-status --debug.";
+    const networkCode = typeof code === "string" &&
+        ["ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND", "ECONNRESET"].includes(code);
+    // Both local Errors and correlated leader replies carry this canonical diagnostic; it is UI classification, not repair authority.
+    const restore = /Workspace Restore evidence (?:disappeared\b|moved backwards or changed without revision\b(?: \((missing-snapshot|profile-changed|token-changed|revision-regressed|same-revision-conflict)\))?)/u.exec(message);
+    if (!networkCode && code !== "incompatible-protocol" && (code === "workspace-restore-evidence-conflict" || restore)) {
+        const causes = {
+            "missing-snapshot": "history is missing",
+            "profile-changed": "profile changed",
+            "token-changed": "bot identity changed",
+            "revision-regressed": "revision moved backwards",
+            "same-revision-conflict": "history changed without a revision",
+        };
+        const cause = causes[restore?.[1] ?? ""] ?? (restore?.[0] === "Workspace Restore evidence disappeared"
+            ? "history is missing" : "history conflicts with current state");
+        return `Telegram Workspace Restore ${cause}. Connection blocked to protect prior work. Check /telegram-status --debug.`;
+    }
+    if (message === "Timed out waiting for Telegram leader readiness.")
+        return "Timed out waiting for Telegram leader readiness. Check /telegram-status --debug.";
+    if (networkCode || /network unavailable|fetch failed/i.test(message)) {
         return "Telegram network unavailable. Retry /telegram-connect.";
     }
     if (/Workspace slots?.*(?:unavailable|exhausted)|no free.*slot/i.test(message)) {
@@ -107,8 +128,34 @@ function getTelegramRuntimeEventMessage(input) {
         return input.error.message;
     return String(input.error);
 }
+/** Preserve finite producer diagnostics, not causes, payloads or any recovery authority. */
+function getTelegramRecoveryErrorDetails(error) {
+    if (!error || typeof error !== "object")
+        return {};
+    const details = {};
+    if ("code" in error && error.code === "guard-unverifiable") {
+        details.errorCode = "guard-unverifiable";
+        if ("reason" in error && (error.reason === "invalid-layout" || error.reason === "invalid-owner" || error.reason === "unavailable-owner"))
+            details.guardReason = error.reason;
+        if ("phase" in error && (error.phase === "acquire" || error.phase === "release"))
+            details.guardPhase = error.phase;
+    }
+    if (error instanceof Error && error.name === "TelegramRuntimeStateError" && "code" in error && error.code === "invalid" &&
+        "readCondition" in error && typeof error.readCondition === "string" &&
+        ["device-mismatch", "inode-mismatch", "opened-links", "opened-type", "opened-mode",
+            "post-read-device-mismatch", "post-read-inode-mismatch", "post-read-size-mismatch", "post-read-mtime-mismatch", "post-read-ctime-mismatch"].includes(error.readCondition)) {
+        details.errorCode = "invalid";
+        details.stateReadCondition = error.readCondition;
+    }
+    if ("kind" in error && error.kind === "commit-unknown")
+        details.outcome = "commit-unknown";
+    if (error instanceof Error && (error.name === "TelegramApiAuthorityError" || error.name === "TelegramBusLocalAuthorityError") &&
+        "requestIssued" in error && typeof error.requestIssued === "boolean")
+        details.requestIssued = error.requestIssued;
+    return details;
+}
 export function recordStructuredTelegramRuntimeEvent(events, input, options) {
-    const details = normalizeTelegramRuntimeEventDetails(input.details, options.botToken);
+    const details = normalizeTelegramRuntimeEventDetails({ ...input.details, ...getTelegramRecoveryErrorDetails(input.error) }, options.botToken);
     events.push({
         at: options.now ?? Date.now(),
         category: input.category,
@@ -1192,6 +1239,7 @@ function buildStatusHtml(ctx, activeModel, bridgeStatus) {
     }
     return lines.join("\n");
 }
+// Deliberately local: status is a structural leaf with no local imports.
 function escapeHtml(text) {
     return text
         .replace(/&/g, "&amp;")

@@ -4,28 +4,28 @@
  * Owns direct pi SDK imports and exposes narrow bridge-facing helpers/types for the extension composition layer
  */
 
+import { types } from "node:util";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
-import {
-  type AgentEndEvent,
-  type AgentSettledEvent,
-  type AgentStartEvent,
-  type BeforeAgentStartEvent,
-  type BeforeAgentStartEventResult,
-  type ExtensionAPI,
-  type ExtensionCommandContext,
-  type ExtensionContext,
-  type InputEvent,
-  type MessageEndEvent,
-  type SessionBeforeCompactEvent,
-  type SessionCompactEvent,
-  type SessionShutdownEvent,
-  type SessionStartEvent,
-  type SlashCommandInfo,
-  type TurnEndEvent,
-  type TurnEndEventResult,
-  type UIPromptEndEvent,
-  type UIPromptStartEvent,
-  SettingsManager,
+import type {
+  AgentEndEvent,
+  AgentSettledEvent,
+  AgentStartEvent,
+  BeforeAgentStartEvent,
+  BeforeAgentStartEventResult,
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+  InputEvent,
+  MessageEndEvent,
+  SessionBeforeCompactEvent,
+  SessionCompactEvent,
+  SessionShutdownEvent,
+  SessionStartEvent,
+  SlashCommandInfo,
+  TurnEndEvent,
+  TurnEndEventResult,
+  UIPromptEndEvent,
+  UIPromptStartEvent,
 } from "@earendil-works/pi-coding-agent";
 
 export type {
@@ -144,6 +144,67 @@ export function getSessionCompactionReason(
     : "unknown";
 }
 
+const COMMAND_PROVIDER_KEY = Symbol("original Pi command callable");
+const commandProviderIsProxy = types.isProxy;
+const commandProviderOwn = Object.getOwnPropertyDescriptor;
+const commandProviderApply = Reflect.apply;
+const commandProviderArray = Array.isArray;
+function commandProviderData(value: object, key: string) {
+  const descriptor = commandProviderOwn(value, key);
+  // A native accessor descriptor has no own value; do not consult its prototype.
+  return descriptor && commandProviderOwn(descriptor, "value")?.value;
+}
+const commandProviderUnavailable = () => new Error("Pi command provider callable is unavailable.");
+
+/** Original API callable only, not API activity, catalog/resource lifetime or source authority. */
+export interface PiCommandProviderCapture {
+  assertCallable(): void;
+  getCommands: ExtensionAPI["getCommands"];
+}
+
+class NativePiCommandProvider implements PiCommandProviderCapture {
+  #owner: { api: Pick<ExtensionAPI, "getCommands">; get: ExtensionAPI["getCommands"]; ports: PiExtensionApiRuntimePorts;
+    portGet: ExtensionAPI["getCommands"]; capture: NonNullable<PiExtensionApiRuntimePorts["captureCommandProvider"]>; lost: boolean; busy: boolean };
+  readonly assertCallable = () => {
+    if (this.#owner.busy) { this.#owner.lost = true; throw commandProviderUnavailable(); }
+    this.#assertFields();
+  };
+  readonly getCommands = (): ReturnType<ExtensionAPI["getCommands"]> => {
+    this.assertCallable(); const owner = this.#owner; owner.busy = true;
+    try {
+      const value = commandProviderApply(owner.get, owner.api, []);
+      this.#assertFields();
+      if (!commandProviderArray(value)) throw commandProviderUnavailable();
+      return value;
+    } catch (error) { owner.lost = true; throw error; }
+    finally { owner.busy = false; }
+  };
+  constructor(key: symbol, api: Pick<ExtensionAPI, "getCommands">, get: ExtensionAPI["getCommands"], ports: PiExtensionApiRuntimePorts,
+    portGet: ExtensionAPI["getCommands"], capture: NonNullable<PiExtensionApiRuntimePorts["captureCommandProvider"]>) {
+    if (key !== COMMAND_PROVIDER_KEY) throw commandProviderUnavailable();
+    this.#owner = { api, get, ports, portGet, capture, lost: false, busy: false };
+    Object.freeze(this);
+  }
+  #assertFields(): void {
+    const owner = this.#owner;
+    if (owner.lost || commandProviderData(owner.api, "getCommands") !== owner.get ||
+      commandProviderData(owner.ports, "getCommands") !== owner.portGet ||
+      commandProviderData(owner.ports, "captureCommandProvider") !== owner.capture) {
+      owner.lost = true; throw commandProviderUnavailable();
+    }
+  }
+  static read(value: unknown, ports: PiExtensionApiRuntimePorts): Readonly<PiCommandProviderCapture> | undefined {
+    if (!value || typeof value !== "object" || !(#owner in value) || value.#owner.ports !== ports) return undefined;
+    value.assertCallable(); return value;
+  }
+}
+const readNativePiCommandProvider = NativePiCommandProvider.read;
+
+/** Intrinsic non-match probes no supplied DTO/receiver fields and does not revoke the genuine owner. */
+export function readPiCommandProviderCapture(value: unknown, ports: PiExtensionApiRuntimePorts): Readonly<PiCommandProviderCapture> | undefined {
+  return readNativePiCommandProvider(value, ports);
+}
+
 export interface PiExtensionApiRuntimePorts {
   sendUserMessage: ExtensionAPI["sendUserMessage"];
   exec: ExtensionAPI["exec"];
@@ -154,6 +215,7 @@ export interface PiExtensionApiRuntimePorts {
   setActiveTools: ExtensionAPI["setActiveTools"];
   setModel: ExtensionAPI["setModel"];
   registerCommand: ExtensionAPI["registerCommand"];
+  captureCommandProvider?(): Readonly<PiCommandProviderCapture>;
 }
 
 export function createExtensionApiRuntimePorts(
@@ -169,8 +231,17 @@ export function createExtensionApiRuntimePorts(
     | "setModel"
     | "registerCommand"
   >,
+  commandProvider?: true,
 ): PiExtensionApiRuntimePorts {
-  return {
+  const refusal = () => new TypeError("Original Pi command provider requires true and an own-data callable.");
+  if (commandProvider !== undefined && commandProvider !== true) throw refusal();
+  let original: ExtensionAPI["getCommands"] | undefined;
+  if (commandProvider) {
+    if (!api || typeof api !== "object" || commandProviderIsProxy(api)) throw refusal();
+    original = commandProviderData(api, "getCommands");
+    if (typeof original !== "function" || commandProviderIsProxy(original)) throw refusal();
+  }
+  const ports: PiExtensionApiRuntimePorts = {
     sendUserMessage: (content, options) =>
       api.sendUserMessage(content, options),
     exec: (command, args, options) => api.exec(command, args, options),
@@ -182,6 +253,12 @@ export function createExtensionApiRuntimePorts(
     setModel: (model) => api.setModel(model),
     registerCommand: (name, options) => api.registerCommand(name, options),
   };
+  if (original) {
+    const capture: NonNullable<PiExtensionApiRuntimePorts["captureCommandProvider"]> = () => readNativePiCommandProvider(provider, ports)!;
+    const provider = new NativePiCommandProvider(COMMAND_PROVIDER_KEY, api, original, ports, ports.getCommands, capture);
+    ports.captureCommandProvider = capture;
+  }
+  return ports;
 }
 
 type PiSettingsManagerFactory = {
@@ -255,6 +332,8 @@ export async function createSettingsManager(
   // Pi returns its legacy settings surface synchronously. Compatible hosts may
   // resolve a generic settings service asynchronously; normalize both once at
   // the SDK boundary instead of leaking host distinctions into menu domains.
+  // Queue and transport helpers must not load the whole host SDK during cold Root imports.
+  const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
   const factory = SettingsManager as unknown as PiSettingsManagerFactory;
   return normalizeSettingsManager(await factory.create(cwd));
 }

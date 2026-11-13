@@ -4,6 +4,7 @@
  * Owns Generative App identity, installation, invocation, state history, and telegram_bind
  */
 import { createHash, randomUUID } from "node:crypto";
+import { lstatSync, readFileSync } from "node:fs";
 import { appendFile, copyFile, lstat, mkdir, readFile, rename, rm, stat, writeFile, } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
@@ -22,6 +23,158 @@ const GENERATIVE_APP_RUN_MAX_ARGS = 64;
 const GENERATIVE_APP_RUN_MAX_STREAM_BYTES = 64 * 1024;
 export const GENERATIVE_APP_MIN_REFRESH_AFTER_MS = 2_000;
 export const GENERATIVE_APP_MAX_REFRESH_AFTER_MS = 24 * 60 * 60 * 1_000;
+class NativeCallbackInvocation {
+    #facts;
+    #spent = false;
+    constructor(key, facts) {
+        if (key !== CALLBACK_OWNER_KEY)
+            throw new Error("Generative App callback invocation is unavailable.");
+        this.#facts = facts;
+        Object.freeze(this);
+    }
+    static claim(key, value, source) {
+        if (key !== CALLBACK_OWNER_KEY)
+            return undefined;
+        try {
+            const invocation = value;
+            if (invocation.#spent)
+                return undefined;
+            invocation.#spent = true;
+            return invocation.#facts.source.owner === source?.owner ? invocation.#facts : undefined;
+        }
+        catch {
+            return undefined;
+        }
+    }
+    static matches(key, value, origin, owner) {
+        if (key !== CALLBACK_OWNER_KEY || !origin)
+            return false;
+        try {
+            const invocation = value;
+            return invocation.#spent && invocation.#facts.source.owner === owner && Reflect.apply(readCallbackWeakRef, invocation.#facts.origin, []) === origin;
+        }
+        catch {
+            return false;
+        }
+    }
+}
+const claimNativeCallbackInvocation = NativeCallbackInvocation.claim, matchesNativeCallbackInvocation = NativeCallbackInvocation.matches;
+const NativeCallbackWeakRef = WeakRef, readCallbackWeakRef = WeakRef.prototype.deref;
+const CALLBACK_OWNER_KEY = Symbol("native Generative App callback owner");
+class NativeGenerativeAppCallbackBinding {
+    app;
+    generation;
+    revision;
+    assertCurrent;
+    #owner;
+    #appDir;
+    #predecessor;
+    #invocation;
+    constructor(key, fields, owner, appDir, predecessor, invocation, publicationSource) {
+        if (key !== CALLBACK_OWNER_KEY)
+            throw new Error("Generative App callback owner is unavailable.");
+        this.app = fields.app;
+        this.generation = fields.generation;
+        this.revision = fields.revision;
+        this.#appDir = appDir;
+        this.#predecessor = predecessor && new NativeCallbackWeakRef(predecessor);
+        this.#invocation = invocation && new NativeCallbackWeakRef(invocation);
+        const owned = { ...owner, createCallbackInvocation: (prompt, origin, authority) => {
+                const action = parseGenerativeAppBoundAction(prompt);
+                if (!origin || typeof origin !== "object" || !action || action.app !== this.app)
+                    throw new Error("Generative App callback invocation is unavailable.");
+                const current = authority?.assertCurrent, history = authority?.assertObservedCurrent;
+                if (authority && (typeof current !== "function" || typeof history !== "function"))
+                    throw new Error("Generative App callback invocation authority is unavailable.");
+                const pinned = authority && Object.freeze({ assertCurrent: () => Reflect.apply(current, authority, []), assertObservedCurrent: () => Reflect.apply(history, authority, []) });
+                this.#owner.assertCurrent();
+                this.#owner.assertObservedCurrent();
+                return new NativeCallbackInvocation(CALLBACK_OWNER_KEY, Object.freeze({ source: readNativeCallbackSource(CALLBACK_OWNER_KEY, this), method: action.method,
+                    ...(action.argument !== undefined ? { argument: action.argument } : {}), origin: new NativeCallbackWeakRef(origin), ...(pinned ? { authority: pinned } : {}) }));
+            }, captureReadOnlySuccessor: (binding, invocation, origin) => {
+                const next = readNativeCallbackSource(CALLBACK_OWNER_KEY, binding, true);
+                if (next?.predecessor !== this.#owner || invocation !== undefined && (next.invocation !== invocation || !matchesNativeCallbackInvocation(CALLBACK_OWNER_KEY, invocation, origin, this.#owner)))
+                    return undefined;
+                try {
+                    this.#owner.assertCurrent();
+                    next.owner.assertCurrent();
+                    this.#owner.assertObservedCurrent();
+                    next.owner.assertObservedCurrent();
+                    return next.owner;
+                }
+                catch {
+                    return undefined;
+                }
+            } };
+        if (predecessor && publicationSource !== undefined)
+            Object.defineProperty(owned, "originalPublicationSource", { value: publicationSource });
+        this.#owner = Object.freeze(owned);
+        this.assertCurrent = owner.assertCurrent;
+        Object.freeze(this);
+    }
+    static source(key, value, withPredecessor = false) {
+        if (key !== CALLBACK_OWNER_KEY)
+            return undefined;
+        try {
+            const binding = value;
+            return { appDir: binding.#appDir, app: binding.app, generation: binding.generation, revision: binding.revision, owner: binding.#owner,
+                predecessor: withPredecessor && binding.#predecessor ? Reflect.apply(readCallbackWeakRef, binding.#predecessor, []) : undefined,
+                invocation: withPredecessor && binding.#invocation ? Reflect.apply(readCallbackWeakRef, binding.#invocation, []) : undefined };
+        }
+        catch {
+            return undefined;
+        }
+    }
+    static read(key, value) {
+        if (key !== CALLBACK_OWNER_KEY)
+            return undefined;
+        try {
+            return value.#owner;
+        }
+        catch {
+            return undefined;
+        }
+    }
+}
+const readNativeCallbackOwner = NativeGenerativeAppCallbackBinding.read;
+const readNativeCallbackSource = NativeGenerativeAppCallbackBinding.source;
+/** @internal Capture only an existing original native owner; foreign/copy/unavailable bindings are never probed or adopted. */
+export function captureGenerativeAppCallbackOwner(binding) {
+    const owner = readNativeCallbackOwner(CALLBACK_OWNER_KEY, binding);
+    if (!owner)
+        return undefined;
+    try {
+        owner.assertCurrent();
+        owner.assertObservedCurrent();
+        return owner;
+    }
+    catch {
+        return undefined;
+    }
+}
+/** @internal Historical native outcome for this exact claimed invocation; not parent or effect-execution authority. */
+export function getGenerativeAppCallbackInvocationKind(binding, invocation) {
+    const source = readNativeCallbackSource(CALLBACK_OWNER_KEY, binding, true);
+    if (!invocation || !source || source.invocation !== invocation)
+        return undefined;
+    // The matching live invocation retains its original owner; absent predecessor here is not a GC observation.
+    return source.predecessor ? "read-only" : "state-written";
+}
+/** @internal Data-only exact native refresh association; the store must authenticate its opaque source. */
+export function getGenerativeAppRefreshPublicationSource(binding) {
+    const native = readNativeCallbackSource(CALLBACK_OWNER_KEY, binding, true);
+    if (!native?.predecessor || native.invocation !== undefined)
+        return undefined;
+    const source = Object.getOwnPropertyDescriptor(native.owner, "originalPublicationSource")?.value;
+    return source === undefined ? undefined : Object.freeze({ source, predecessor: native.predecessor });
+}
+const callbackOwnerProofs = new WeakMap();
+export function getGenerativeAppCallbackBinding(result) {
+    const binding = callbackOwnerProofs.get(result);
+    if (!binding)
+        throw new Error("Generative App callback result is not native-owned.");
+    return binding;
+}
 export function getTelegramBindLiveSurfaceKey(app, profile, target) {
     return `${app}/${profile}/${target.chatId}/${target.threadId ?? 0}`;
 }
@@ -314,6 +467,15 @@ async function reconcileCurrentState(appDir, timeline) {
 async function executeGenerativeAppWorker(options) {
     options.execution?.assertCurrent();
     await assertGenerativeAppModule(options.modulePath);
+    if (options.callbackWorkerDrain) {
+        options.execution?.assertCurrent();
+        if (options.execution?.signal.aborted)
+            throw new Error(`Generative App method ${options.method} was cancelled.`);
+        options.callbackInvocationAuthority?.assertCurrent();
+        options.callbackSource?.owner.assertCurrent();
+        options.callbackSource?.owner.assertObservedCurrent();
+        options.callbackInvocationAuthority?.assertObservedCurrent();
+    }
     return await new Promise((resolveResult, rejectResult) => {
         const worker = new Worker(new URL("./generative-app-worker.mjs", import.meta.url), {
             execArgv: [],
@@ -332,12 +494,38 @@ async function executeGenerativeAppWorker(options) {
                 statePresent: options.state !== undefined,
             },
         });
+        const terminate = options.callbackWorkerDrain ? worker.terminate : undefined;
         let settled = false;
         let terminationError;
-        let terminationStarted = false;
+        let terminationStarted = false, workerExited = false, terminationSettled = false;
+        let pending;
+        const completeDrain = () => {
+            if (pending && workerExited && terminationSettled)
+                finish(terminationError ?? pending.error, pending.result);
+        };
         const finish = (error, result) => {
             if (settled)
                 return;
+            if (options.callbackWorkerDrain && !(workerExited && terminationSettled)) {
+                if (pending) {
+                    pending.error ??= error;
+                    return;
+                }
+                pending = { error, result };
+                terminationStarted = true;
+                let termination;
+                try {
+                    termination = Reflect.apply(terminate, worker, []);
+                }
+                catch (failure) {
+                    pending.error ??= failure instanceof Error ? failure : new Error("Callback worker termination failed.", { cause: failure });
+                    terminationSettled = true;
+                    completeDrain();
+                    return;
+                }
+                void termination.then(() => { terminationSettled = true; completeDrain(); }, failure => { pending.error ??= failure instanceof Error ? failure : new Error("Callback worker termination failed.", { cause: failure }); terminationSettled = true; completeDrain(); });
+                return;
+            }
             settled = true;
             clearTimeout(timeout);
             options.execution?.signal.removeEventListener("abort", abort);
@@ -349,6 +537,10 @@ async function executeGenerativeAppWorker(options) {
         const terminateAndFinish = () => {
             if (terminationStarted || !terminationError)
                 return;
+            if (options.callbackWorkerDrain) {
+                finish(terminationError);
+                return;
+            }
             terminationStarted = true;
             void worker.terminate().then(() => finish(terminationError), () => finish(terminationError));
         };
@@ -356,6 +548,8 @@ async function executeGenerativeAppWorker(options) {
             if (settled || terminationError)
                 return;
             terminationError = error;
+            if (pending)
+                return;
             worker.postMessage({ type: "abort" });
             const forcedTermination = setTimeout(terminateAndFinish, 250);
             forcedTermination.unref?.();
@@ -375,15 +569,22 @@ async function executeGenerativeAppWorker(options) {
             }
             else if (message?.ok === true) {
                 finish(undefined, message.result);
-                void worker.terminate();
+                if (!options.callbackWorkerDrain)
+                    void worker.terminate();
             }
             else {
                 finish(new Error(message?.error || "Generative App worker failed."));
-                void worker.terminate();
+                if (!options.callbackWorkerDrain)
+                    void worker.terminate();
             }
         });
         worker.once("error", (error) => finish(terminationError ?? error));
         worker.once("exit", (code) => {
+            workerExited = true;
+            if (pending) {
+                completeDrain();
+                return;
+            }
             if (terminationError)
                 finish(terminationError);
             else if (!settled && code !== 0) {
@@ -404,11 +605,67 @@ function serializeInvocation(key, operation) {
     void current.then(cleanup, cleanup);
     return current;
 }
+function observeGenerativeAppOwner(options, owner) {
+    try {
+        options.onOwnerObserved?.(Object.freeze(owner));
+    }
+    catch (error) {
+        try {
+            options.recordRuntimeEvent?.("generative-app", error, { phase: "owner-observation", app: owner.app });
+        }
+        catch { }
+    }
+}
+async function recordGenerativeAppCallbackOwner(appDir, result, predecessor, invocation, publicationSource) {
+    const journal = join(appDir, "states.jsonl"), generationPath = join(appDir, "generation");
+    const original = await lstat(journal, { bigint: true });
+    const { app, generation, revision } = result;
+    let lost = !original.isFile(), checking = false;
+    const assertObservedCurrent = () => {
+        if (checking)
+            lost = true;
+        if (lost)
+            throw new Error("Generative App callback owner is unavailable.");
+    };
+    const assertCurrent = () => {
+        if (checking) {
+            lost = true;
+            throw new Error("Generative App callback owner is unavailable.");
+        }
+        checking = true;
+        try {
+            if (lost)
+                throw new Error("Generative App callback owner is unavailable.");
+            const current = lstatSync(journal, { bigint: true });
+            lost ||= !current.isFile() || current.dev !== original.dev || current.ino !== original.ino || current.size !== original.size ||
+                readFileSync(generationPath, "utf8").trim() !== generation;
+            if (lost)
+                throw new Error("Generative App callback owner is unavailable.");
+        }
+        catch {
+            lost = true;
+            throw new Error("Generative App callback owner is unavailable.");
+        }
+        finally {
+            checking = false;
+        }
+    };
+    callbackOwnerProofs.set(result, new NativeGenerativeAppCallbackBinding(CALLBACK_OWNER_KEY, { app, generation, revision }, { assertCurrent, assertObservedCurrent }, appDir, predecessor, invocation, publicationSource));
+}
 async function invokeMethod(options) {
+    const source = options.callbackSource;
+    if (source && (source.appDir !== options.appDir || source.app !== options.app ||
+        options.expectedGeneration !== undefined && options.expectedGeneration !== source.generation ||
+        options.expectedRevision !== undefined && options.expectedRevision !== source.revision))
+        throw new Error("Generative App callback origin is unavailable.");
+    options.assertCallbackOwner?.();
+    source?.owner.assertCurrent();
+    source?.owner.assertObservedCurrent();
     const generation = await readGenerativeAppGeneration(options.appDir);
-    if (options.expectedGeneration !== undefined &&
-        options.expectedGeneration !== generation) {
-        throw new Error(`Generative App action is stale: expected generation ${options.expectedGeneration}, current generation ${generation}.`);
+    observeGenerativeAppOwner(options, { app: options.app, generation });
+    if ((source?.generation ?? options.expectedGeneration) !== undefined &&
+        (source?.generation ?? options.expectedGeneration) !== generation) {
+        throw new Error(`Generative App action is stale: expected generation ${source?.generation ?? options.expectedGeneration}, current generation ${generation}.`);
     }
     const timeline = await readStateTimeline(options.appDir);
     const state = await reconcileCurrentState(options.appDir, timeline);
@@ -416,14 +673,20 @@ async function invokeMethod(options) {
         throw new Error(`Generative App ${options.app} is not initialized.`);
     }
     const revision = timeline.at(-1)?.revision ?? -1;
-    if (options.expectedRevision !== undefined &&
-        options.expectedRevision !== revision) {
-        throw new Error(`Generative App action is stale: expected revision ${options.expectedRevision}, current revision ${revision}.`);
+    observeGenerativeAppOwner(options, { app: options.app, generation, revision });
+    if ((source?.revision ?? options.expectedRevision) !== undefined &&
+        (source?.revision ?? options.expectedRevision) !== revision) {
+        throw new Error(`Generative App action is stale: expected revision ${source?.revision ?? options.expectedRevision}, current revision ${revision}.`);
     }
+    source?.owner.assertCurrent();
+    source?.owner.assertObservedCurrent();
     const result = normalizeMethodResult(await executeGenerativeAppWorker({
         ...(options.argument !== undefined ? { argument: options.argument } : {}),
         ...(options.execution ? { execution: options.execution } : {}),
         method: options.method,
+        ...(options.callbackWorkerDrain ? { callbackWorkerDrain: true } : {}),
+        ...(source ? { callbackSource: source } : {}),
+        ...(options.callbackInvocationAuthority ? { callbackInvocationAuthority: options.callbackInvocationAuthority } : {}),
         methodTimeoutMs: options.methodTimeoutMs,
         modulePath: options.modulePath,
         app: options.app,
@@ -436,9 +699,16 @@ async function invokeMethod(options) {
     if (options.method === "refresh" && result.state !== undefined) {
         throw new Error("Generative App refresh must be output-only.");
     }
+    options.assertCallbackOwner?.();
+    if (options.callbackWorkerDrain)
+        options.execution?.assertCurrent();
     let nextRevision = revision;
     if (result.state !== undefined) {
         options.execution?.assertCurrent();
+        options.callbackInvocationAuthority?.assertCurrent();
+        source?.owner.assertCurrent();
+        source?.owner.assertObservedCurrent();
+        options.callbackInvocationAuthority?.assertObservedCurrent();
         const envelope = {
             ...(options.argument !== undefined ? { argument: options.argument } : {}),
             method: options.method,
@@ -456,10 +726,11 @@ async function invokeMethod(options) {
                 mode: 0o600,
             });
         }
-        await writeFileAtomic(join(options.appDir, "state.json"), encodedState);
         nextRevision = envelope.revision;
+        observeGenerativeAppOwner(options, { app: options.app, generation, revision: nextRevision, ...(options.method === "init" ? { reset: true } : {}) });
+        await writeFileAtomic(join(options.appDir, "state.json"), encodedState);
     }
-    return {
+    const invoked = {
         generation,
         method: options.method,
         output: result.output,
@@ -471,33 +742,77 @@ async function invokeMethod(options) {
         stateChanged: result.state !== undefined,
         viewMode: result.viewMode ?? "new",
     };
+    if (!options.staging) {
+        const predecessor = result.state === undefined ? source?.owner : undefined;
+        await recordGenerativeAppCallbackOwner(options.appDir, invoked, predecessor, options.callbackInvocation, options.originalPublicationSource);
+        if (predecessor)
+            options.callbackInvocationAuthority?.assertCurrent();
+        predecessor?.assertCurrent();
+        predecessor?.assertObservedCurrent();
+        if (predecessor)
+            options.callbackInvocationAuthority?.assertObservedCurrent();
+    }
+    return invoked;
 }
 export async function invokeGenerativeApp(options) {
-    assertAppName(options.app);
-    assertMethod(options.method);
-    const argument = options.argument === undefined
-        ? undefined
-        : assertJsonValue(options.argument, "Generative App argument");
-    await ensureManagedAppsRoot(options.agentDir, false);
-    const appDir = resolveGenerativeAppDir(options.agentDir, options.app);
-    const modulePath = resolveGenerativeAppModulePath(options.agentDir, options.app);
+    const publicationField = Object.getOwnPropertyDescriptor(options, "originalPublicationSource"), publicationSource = publicationField?.value;
+    if (publicationField && !Object.hasOwn(publicationField, "value") || publicationSource !== undefined &&
+        (options.method !== "refresh" || options.callbackWorkerDrain !== true || options.callbackBinding === undefined || options.callbackInvocation !== undefined || readOpaquePublicationSource(publicationSource) !== publicationSource))
+        throw new Error("Generative App refresh publication source is unavailable.");
+    const callbackWorkerDrain = options.callbackWorkerDrain;
+    if (callbackWorkerDrain !== undefined && callbackWorkerDrain !== true)
+        throw new Error("Callback worker drain must be true or omitted.");
+    const originalFence = callbackWorkerDrain ? options.execution : undefined;
+    const originalCheck = originalFence?.assertCurrent, originalSignal = originalFence?.signal;
+    const execution = originalFence && Object.freeze({ signal: originalSignal, assertCurrent: () => Reflect.apply(originalCheck, originalFence, []) });
+    const assertCallbackOwner = callbackWorkerDrain ? options.assertCallbackOwner : undefined;
+    const callbackBinding = callbackWorkerDrain ? options.callbackBinding : undefined;
+    const callbackSource = callbackBinding === undefined ? undefined : readNativeCallbackSource(CALLBACK_OWNER_KEY, callbackBinding);
+    if (callbackBinding !== undefined && !callbackSource)
+        throw new Error("Generative App callback origin is unavailable.");
+    const invocationValue = callbackWorkerDrain ? options.callbackInvocation : undefined;
+    if (publicationSource !== undefined && invocationValue !== undefined)
+        throw new Error("Generative App refresh publication source is unavailable.");
+    const invocation = invocationValue === undefined ? undefined : claimNativeCallbackInvocation(CALLBACK_OWNER_KEY, invocationValue, callbackSource);
+    if (invocationValue !== undefined && !invocation)
+        throw new Error("Generative App callback invocation is unavailable.");
+    const scoped = !!invocation || publicationSource !== undefined;
+    const app = scoped ? options.app : undefined, method = scoped ? options.method : undefined, agentDir = scoped ? options.agentDir : undefined;
+    if (publicationSource !== undefined && method !== "refresh")
+        throw new Error("Generative App refresh publication source is unavailable.");
+    assertAppName(scoped ? app : options.app);
+    assertMethod(scoped ? method : options.method);
+    const argumentValue = scoped ? options.argument : undefined;
+    const argument = scoped ? (argumentValue === undefined ? undefined : assertJsonValue(argumentValue, "Generative App argument")) :
+        options.argument === undefined ? undefined : assertJsonValue(options.argument, "Generative App argument");
+    if (invocation && (app !== invocation.source.app || method !== invocation.method || JSON.stringify(argument) !== JSON.stringify(invocation.argument)))
+        throw new Error("Generative App callback invocation does not match its original prompt.");
+    await ensureManagedAppsRoot(scoped ? agentDir : options.agentDir, false);
+    const appDir = resolveGenerativeAppDir(scoped ? agentDir : options.agentDir, scoped ? app : options.app);
+    const modulePath = resolveGenerativeAppModulePath(scoped ? agentDir : options.agentDir, scoped ? app : options.app);
     return await serializeInvocation(appDir, async () => {
         const releaseLock = await acquireGenerativeAppTransitionLock(appDir);
         try {
             return await invokeMethod({
                 appDir,
+                onOwnerObserved: options.onOwnerObserved, recordRuntimeEvent: options.recordRuntimeEvent,
+                assertCallbackOwner: callbackWorkerDrain ? assertCallbackOwner : options.assertCallbackOwner,
+                ...(callbackWorkerDrain ? { callbackWorkerDrain: true } : {}),
+                ...(callbackSource ? { callbackSource } : {}),
+                ...(publicationSource !== undefined ? { originalPublicationSource: publicationSource } : {}),
+                ...(invocation ? { callbackInvocation: invocationValue, callbackInvocationAuthority: invocation.authority } : {}),
                 ...(argument !== undefined ? { argument } : {}),
-                ...(options.execution ? { execution: options.execution } : {}),
+                ...(callbackWorkerDrain ? (execution ? { execution } : {}) : options.execution ? { execution: options.execution } : {}),
                 ...(options.expectedGeneration !== undefined
                     ? { expectedGeneration: options.expectedGeneration }
                     : {}),
                 ...(options.expectedRevision !== undefined
                     ? { expectedRevision: options.expectedRevision }
                     : {}),
-                method: options.method,
+                method: scoped ? method : options.method,
                 methodTimeoutMs: options.methodTimeoutMs ?? GENERATIVE_APP_METHOD_TIMEOUT_MS,
                 modulePath,
-                app: options.app,
+                app: scoped ? app : options.app,
             });
         }
         finally {
@@ -558,7 +873,7 @@ export async function installGenerativeApp(options) {
                 ? undefined
                 : assertJsonValue(options.argument, "Generative App argument");
             const result = await invokeMethod({
-                appDir: stagingDir,
+                appDir: stagingDir, staging: true,
                 ...(argument !== undefined ? { argument } : {}),
                 ...(options.execution ? { execution: options.execution } : {}),
                 method: "init",
@@ -568,6 +883,8 @@ export async function installGenerativeApp(options) {
             });
             if (!installed) {
                 await rename(stagingDir, appDir);
+                observeGenerativeAppOwner(options, { app: result.app, generation: result.generation, revision: result.revision, reset: true });
+                await recordGenerativeAppCallbackOwner(appDir, result);
                 return result;
             }
             const backupDir = join(appsRoot, `.${options.app}.${process.pid}.${randomUUID()}.replaced`);
@@ -584,6 +901,8 @@ export async function installGenerativeApp(options) {
                 }
                 throw error;
             }
+            observeGenerativeAppOwner(options, { app: result.app, generation: result.generation, revision: result.revision, reset: true });
+            await recordGenerativeAppCallbackOwner(appDir, result);
             await rm(backupDir, { recursive: true, force: true });
             return result;
         }
@@ -637,6 +956,7 @@ export async function bindGenerativeApp(options) {
                 : {}),
             methodTimeoutMs: options.methodTimeoutMs,
             app: options.app,
+            onOwnerObserved: options.onOwnerObserved, recordRuntimeEvent: options.recordRuntimeEvent,
             replace: options.replace,
             script: options.script,
         })
@@ -646,12 +966,31 @@ export async function bindGenerativeApp(options) {
                 ? { argument: options.argument }
                 : {}),
             method: options.method,
+            assertCallbackOwner: options.assertCallbackOwner,
+            onOwnerObserved: options.onOwnerObserved, recordRuntimeEvent: options.recordRuntimeEvent,
             methodTimeoutMs: options.methodTimeoutMs,
             app: options.app,
         });
 }
+const observePublicationRejection = Promise.prototype.then;
+/** Opaque transport shape only: the publication owner must authenticate it before any membership use. */
+function readOpaquePublicationSource(value) {
+    try {
+        if (value && typeof value === "object" && Object.isFrozen(value) && typeof Object.getOwnPropertyDescriptor(value, "assertCurrent")?.value === "function")
+            return value;
+    }
+    catch { /* Foreign capture data never becomes an assertion or publication certificate. */ }
+    try {
+        Reflect.apply(observePublicationRejection, value, [undefined, () => { }]);
+    }
+    catch { /* Only genuine rejected Promises need draining; never call a foreign then/getter. */ }
+    return undefined;
+}
 export function createGenerativeAppLiveSurfaceRuntime(deps) {
     const records = new Map();
+    const capturePublication = deps.capturePublicationSource;
+    if (capturePublication !== undefined && typeof capturePublication !== "function")
+        throw new TypeError("Live publication source capture must be a function or omitted.");
     const setTimer = deps.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
     const clearTimer = deps.clearTimer ?? ((timer) => clearTimeout(timer));
     let active = true;
@@ -660,16 +999,20 @@ export function createGenerativeAppLiveSurfaceRuntime(deps) {
             clearTimer(record.timer);
         record.timer = undefined;
     };
+    const cancel = (key) => {
+        const record = records.get(key);
+        if (!record)
+            return;
+        // Drop only this record before clock callbacks; cancellation must not copy foreign surface getters.
+        records.delete(key);
+        clearRecordTimer(record);
+    };
     const take = (key) => {
         const record = records.get(key);
         if (!record)
             return undefined;
-        clearRecordTimer(record);
-        records.delete(key);
+        cancel(key);
         return { ...record.surface };
-    };
-    const cancel = (key) => {
-        take(key);
     };
     const ownsRecord = (key, record) => active && records.get(key) === record;
     const schedule = (record, delayMs) => {
@@ -680,32 +1023,107 @@ export function createGenerativeAppLiveSurfaceRuntime(deps) {
         record.timer = timer;
         timer.unref?.();
     };
+    const captureAppSource = (surface) => {
+        const field = Object.getOwnPropertyDescriptor(surface, "originalAppBinding"), binding = field?.value;
+        const native = binding === undefined ? undefined : readNativeCallbackSource(CALLBACK_OWNER_KEY, binding);
+        if (field && !Object.hasOwn(field, "value") || binding !== undefined && !native)
+            throw new Error("Generative App live source is unavailable.");
+        return native ? Object.freeze({ binding: binding, native }) : undefined;
+    };
+    const assertAppSourceData = (surface, source) => {
+        const data = (key) => Object.getOwnPropertyDescriptor(surface, key)?.value;
+        if (data("originalAppBinding") !== source.binding || data("app") !== source.native.app || data("appGeneration") !== source.native.generation || data("appRevision") !== source.native.revision)
+            throw new Error("Generative App live source is unavailable.");
+    };
+    const assertAppSource = (record) => {
+        const source = record.appSource;
+        if (!source)
+            return;
+        if (record.appSourceLost)
+            throw new Error("Generative App live source is unavailable.");
+        try {
+            assertAppSourceData(record.surface, source);
+            source.native.owner.assertCurrent();
+            source.native.owner.assertObservedCurrent();
+        }
+        catch (error) {
+            record.appSourceLost = true;
+            throw error;
+        }
+    };
     const refreshNow = async (key) => {
         const record = records.get(key);
         if (!active || !record || record.inFlight)
             return;
-        clearRecordTimer(record);
-        if (!deps.isCurrent(record.surface)) {
-            cancel(key);
-            return;
-        }
+        // Pin the existing native source and reserve this record before external clock/currentness callbacks.
+        const source = record.appSource;
         record.inFlight = true;
         try {
+            if (source) {
+                try {
+                    assertAppSourceData(record.surface, source);
+                }
+                catch (error) {
+                    record.appSourceLost = true;
+                    throw error;
+                }
+            }
+            if (!record.publicationCapture) {
+                // Eligibility is separate from independent app execution. Retain even an absent capture across
+                // retries; an issued snapshot stays opaque and cannot be replaced after worker/planning/I/O.
+                record.publicationCapture = Object.freeze({});
+                if (source && capturePublication) {
+                    try {
+                        const captured = readOpaquePublicationSource(Reflect.apply(capturePublication, deps, [record.surface.handle, source.binding]));
+                        record.publicationCapture = Object.freeze({ ...(captured ? { source: captured } : {}) });
+                    }
+                    catch (error) {
+                        try {
+                            deps.recordRuntimeEvent?.("generative-app", error, { phase: "live-surface-publication-source", app: record.surface.app });
+                        }
+                        catch { }
+                    }
+                }
+            }
+            if (!ownsRecord(key, record))
+                return;
+            clearRecordTimer(record);
+            if (!ownsRecord(key, record))
+                return;
+            const current = deps.isCurrent(record.surface);
+            if (!ownsRecord(key, record))
+                return;
+            if (!current) {
+                cancel(key);
+                return;
+            }
+            assertAppSource(record);
             let pending = record.pending;
             if (!pending) {
                 const result = await invokeGenerativeApp({
                     agentDir: deps.agentDir,
+                    onOwnerObserved: deps.onOwnerObserved, recordRuntimeEvent: deps.recordRuntimeEvent,
                     expectedGeneration: record.surface.appGeneration,
                     expectedRevision: record.surface.appRevision,
+                    ...(source ? { callbackWorkerDrain: true, callbackBinding: source.binding } : {}),
+                    ...(record.publicationCapture.source ? { originalPublicationSource: record.publicationCapture.source } : {}),
                     method: "refresh",
                     app: record.surface.app,
                 });
-                if (!ownsRecord(key, record) || !deps.isCurrent(record.surface)) {
-                    if (records.get(key) === record)
-                        cancel(key);
+                if (!ownsRecord(key, record))
+                    return;
+                const current = deps.isCurrent(record.surface);
+                if (!ownsRecord(key, record))
+                    return;
+                if (!current) {
+                    cancel(key);
                     return;
                 }
+                assertAppSource(record);
                 const frame = deps.plan(result, record.surface.handle);
+                if (!ownsRecord(key, record))
+                    return;
+                assertAppSource(record);
                 pending = { frame, result };
                 if (frame.digest !== record.digest)
                     record.pending = pending;
@@ -717,6 +1135,7 @@ export function createGenerativeAppLiveSurfaceRuntime(deps) {
                 record.surface.handle = await deps.edit(frame);
                 if (!ownsRecord(key, record))
                     return;
+                assertAppSource(record);
                 record.digest = frame.digest;
                 record.pending = undefined;
             }
@@ -724,6 +1143,7 @@ export function createGenerativeAppLiveSurfaceRuntime(deps) {
                 cancel(key);
                 return;
             }
+            record.publicationCapture = undefined;
             record.retryDelayMs = GENERATIVE_APP_MIN_REFRESH_AFTER_MS;
             record.surface.appRevision = result.revision;
             record.surface.refreshAfterMs = result.refreshAfterMs;
@@ -740,7 +1160,17 @@ export function createGenerativeAppLiveSurfaceRuntime(deps) {
                 app: record.surface.app,
                 outcome: classification.kind,
             });
-            if (classification.kind !== "retry" || !deps.isCurrent(record.surface)) {
+            const current = classification.kind === "retry" && deps.isCurrent(record.surface);
+            if (!ownsRecord(key, record))
+                return;
+            let sourceCurrent = true;
+            try {
+                assertAppSource(record);
+            }
+            catch {
+                sourceCurrent = false;
+            }
+            if (!current || !sourceCurrent) {
                 cancel(key);
                 return;
             }
@@ -755,36 +1185,69 @@ export function createGenerativeAppLiveSurfaceRuntime(deps) {
         }
     };
     const open = (surface) => {
-        cancel(surface.key);
-        if (!active)
+        const source = captureAppSource(surface);
+        const captured = { ...surface, ...(source ? { originalAppBinding: source.binding } : {}) };
+        cancel(captured.key);
+        if (!active || records.has(captured.key))
             return;
         const record = {
-            surface: { ...surface },
-            digest: surface.initialDigest,
+            surface: captured,
+            digest: captured.initialDigest,
             inFlight: false,
             retryDelayMs: GENERATIVE_APP_MIN_REFRESH_AFTER_MS,
+            ...(source ? { appSource: source } : {}),
         };
-        records.set(surface.key, record);
-        schedule(record, surface.refreshAfterMs);
+        records.set(captured.key, record);
+        schedule(record, captured.refreshAfterMs);
     };
     return {
         open,
         cancel,
         take,
         async resume(surface, result) {
-            if (!active || !deps.isCurrent(surface))
+            if (!active)
                 return;
+            const original = captureAppSource(surface), key = surface.key;
+            const available = () => active && !records.has(key);
+            if (!available())
+                return;
+            const binding = original ? getGenerativeAppCallbackBinding(result) : undefined;
+            const next = binding && readNativeCallbackSource(CALLBACK_OWNER_KEY, binding);
+            const assertResult = () => {
+                if (!original || !next)
+                    return;
+                assertAppSourceData(surface, original);
+                if (next.app !== original.native.app || next.generation !== original.native.generation ||
+                    Object.getOwnPropertyDescriptor(result, "app")?.value !== next.app || Object.getOwnPropertyDescriptor(result, "generation")?.value !== next.generation ||
+                    Object.getOwnPropertyDescriptor(result, "revision")?.value !== next.revision)
+                    throw new Error("Generative App live source is unavailable.");
+                next.owner.assertCurrent();
+                next.owner.assertObservedCurrent();
+            };
+            // A committed callback may replace the old app state; only its genuine current native result is reopened.
+            assertResult();
+            if (!available() || !deps.isCurrent(surface) || !available())
+                return;
+            assertResult();
             const frame = deps.plan(result, surface.handle);
+            if (!available())
+                return;
+            assertResult();
             const handle = frame.digest === surface.initialDigest
                 ? surface.handle
                 : await deps.edit(frame);
-            if (result.refreshAfterMs === undefined ||
-                !deps.isCurrent({ ...surface, handle }))
+            if (!available())
                 return;
+            assertResult();
+            if (result.refreshAfterMs === undefined ||
+                !deps.isCurrent({ ...surface, handle }) || !available())
+                return;
+            assertResult();
             open({
                 ...surface,
-                appGeneration: result.generation,
-                appRevision: result.revision,
+                appGeneration: next?.generation ?? result.generation,
+                appRevision: next?.revision ?? result.revision,
+                ...(binding ? { originalAppBinding: binding } : {}),
                 handle,
                 initialDigest: frame.digest,
                 refreshAfterMs: result.refreshAfterMs,
@@ -825,13 +1288,12 @@ function createTelegramBindJsonArgumentSchema(depth) {
     ]);
 }
 export function registerTelegramBindTool(pi, deps) {
+    const capturePublication = deps.capturePublicationSource;
+    if (capturePublication !== undefined && typeof capturePublication !== "function")
+        throw new TypeError("Live publication source capture must be a function or omitted.");
     const planFrame = (result, handle) => {
         const planned = deps.planOutput(result.output, {
-            binding: {
-                generation: result.generation,
-                app: result.app,
-                revision: result.revision,
-            },
+            binding: getGenerativeAppCallbackBinding(result),
         });
         const view = {
             text: planned.markdown,
@@ -848,6 +1310,7 @@ export function registerTelegramBindTool(pi, deps) {
     const liveSurfaces = deps.planOutput && deps.editView && deps.isDeliveryHandleCurrent
         ? createGenerativeAppLiveSurfaceRuntime({
             agentDir: deps.agentDir,
+            ...(capturePublication ? { capturePublicationSource: (handle, binding) => Reflect.apply(capturePublication, deps, [handle.delivery, binding]) } : {}),
             isCurrent: (surface) => deps.isDeliveryHandleCurrent(surface.handle.delivery),
             plan: planFrame,
             async edit(frame) {
@@ -882,6 +1345,7 @@ export function registerTelegramBindTool(pi, deps) {
                 };
             },
             recordRuntimeEvent: deps.recordRuntimeEvent,
+            onOwnerObserved: deps.onOwnerObserved,
             ...(deps.liveSurfaceSetTimer
                 ? { setTimer: deps.liveSurfaceSetTimer }
                 : {}),
@@ -922,6 +1386,7 @@ export function registerTelegramBindTool(pi, deps) {
                         ? { script: params.script }
                         : {}),
                     methodTimeoutMs: deps.methodTimeoutMs,
+                    onOwnerObserved: deps.onOwnerObserved, recordRuntimeEvent: deps.recordRuntimeEvent,
                 });
                 const activeTurn = params.display === false ? undefined : deps.getActiveTurn?.();
                 if (activeTurn &&
@@ -929,11 +1394,7 @@ export function registerTelegramBindTool(pi, deps) {
                     (deps.sendView || deps.sendMarkdownReply)) {
                     try {
                         const planned = deps.planOutput(result.output, {
-                            binding: {
-                                generation: result.generation,
-                                app: result.app,
-                                revision: result.revision,
-                            },
+                            binding: getGenerativeAppCallbackBinding(result),
                         });
                         let messageId;
                         if (deps.sendView) {
@@ -962,6 +1423,7 @@ export function registerTelegramBindTool(pi, deps) {
                                         app: result.app,
                                         appGeneration: result.generation,
                                         appRevision: result.revision,
+                                        originalAppBinding: getGenerativeAppCallbackBinding(result),
                                         handle,
                                         initialDigest: frame.digest,
                                         key,

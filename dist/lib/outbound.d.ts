@@ -137,7 +137,8 @@ export declare function createTelegramVoiceReplySender(deps: TelegramVoiceReplyS
     replyMarkup?: unknown;
 } | undefined) => Promise<void>;
 export { createTelegramButtonActionStore, createTelegramButtonPromptTurn, createTelegramButtonReplyPlanner, handleTelegramButtonCallbackQuery, markTelegramButtonSelected, planTelegramButtonReply, type TelegramButtonActionStore, type TelegramButtonCallbackHandlerDeps, type TelegramButtonCallbackQuery, type TelegramButtonReplyPlan, type TelegramOutboundButtonAction, type TelegramOutboundButtonBinding, type TelegramOutboundButtonMarkup, type TelegramOutboundButtonStoredAction, } from "./outbound-buttons.ts";
-export declare function createTelegramOutboundReplyPlanner(store: Pick<TelegramButtonActionStore, "register">, getRenderingMode?: () => "rich" | "html"): (markdown: string, options?: {
+/** @internal Private optional deadline normalization; not root/shared-lifetime activation. */
+export declare function createTelegramOutboundReplyPlanner(store: Pick<TelegramButtonActionStore, "register">, getRenderingMode?: () => "rich" | "html", questionHeadTail?: true, questionAppOrigin?: true): (markdown: string, options?: {
     binding?: TelegramOutboundButtonBinding;
 }) => TelegramOutboundReplyPlan<TelegramOutboundButtonMarkup>;
 /**

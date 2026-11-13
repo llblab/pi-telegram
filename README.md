@@ -59,6 +59,8 @@ Paste the bot token. If `~/.pi/agent/telegram.json` already contains a saved tok
 
 The connected Pi instance owns Telegram polling. Use `/telegram-connect <profile>` to activate a named profile. Each profile is a parallel bot runtime with isolated polling, diagnostics, Threaded Mode state, and local bus transport; the `default` profile keeps unsuffixed runtime paths. In classic mode each profile uses a singleton lock. When Telegram private-chat Threaded Mode is available, one live instance becomes the profile's leader and later visible Pi instances register as followers. Reopening or resuming the same Pi session restores its remembered Thread at session startup. If `/resume` immediately follows `/telegram-connect`, or the bridge is already connected, connection intent follows the switch: the destination restores its own Thread/slot or receives a new binding, never the source session's Thread. Otherwise, a distinct unbound session still requires explicit `/telegram-connect`.
 
+If a follower connects while its original leader's Thread mode or local IPC endpoint is still becoming ready, `/telegram-connect` uses one eight-second readiness budget without another command. Connection waiting is allowed only before native registration issuance; an issued request keeps its independent ACK timeout. Only acknowledged registration grants follower delivery; a timeout or changed session/profile/owner ends that attempt without takeover. Positive Classic mode keeps explicit takeover. See [Runtime Self-Healing](./docs/architecture.md#runtime-self-healing-high-priority-planned) for scope and acceptance limits.
+
 `/telegram-connect` keeps working when the shared runtime `state.json` is damaged. If it is malformed, foreign or contains invalid evidence, the connecting leader replaces it with a fresh empty state and continues. Every profile then forgets old Thread bindings, slots, unfinished Restore/temporary work and polling continuity; `telegram.json`, Pi history and the released `tmp/telegram` are untouched. Permission errors still stop connection. See [Damaged-State Reset](./docs/architecture.md#damaged-state-reset-operator-approved).
 
 If Thread creation was interrupted, an explicit `/telegram-connect` can reset that unfinished attempt and try a fresh connection without clearing queued prompts or taking over a live leader. A lost Telegram response may leave an extra tab behind; known tabs are reused rather than blindly recreated. Both peers need connection-recovery support. See [Connection Recovery](./docs/architecture.md#explicit-connection-recovery).
@@ -178,8 +180,13 @@ Use these in the bot DM.
 | `/continue` | Enqueue a priority continuation prompt |
 | `/abort` | Abort the active run while preserving the queue |
 | `/stop` | Abort the active run and clear waiting Telegram turns |
+| `/` | Send a lone slash to list every public command, including shortcuts, companion commands and prompt templates |
+
+Hidden emergency command `/quit` opens an owner-only confirmation to cancel active work and request orderly exit of this Pi instance when its terminal is unavailable. It is not listed in the bot menu; normal shutdown clears waiting queue work, but does not delete Pi history or force-kill other processes. See the [command contract](./docs/public-api.md#user-facing-api) for limits and on-quit behavior.
 
 Hidden compatibility shortcuts: `/help`, `/status`, `/model`, `/thinking`, `/queue`, and `/settings` jump into the same menu system.
+
+A slash command that nothing recognizes is answered with the same catalogue instead of reaching the model; names Pi knows and text that is not command-shaped, such as paths, `/skill:name` or hyphenated names, continue as ordinary prompts. The catalogue groups bot-menu commands first, other public commands alphabetically next, and prompt-template commands last, with blank lines between blocks.
 
 ## Pi Commands
 
@@ -193,6 +200,8 @@ Run these inside Pi.
 | `/telegram-connect <profile>` | Activate a named profile and acquire its transport ownership |
 | `/telegram-disconnect` | Confirm, then stop polling, release ownership, and delete this instance's Threaded Mode tab; graceful Pi quit always preserves restart ownership and independently deletes the tab only when automatic cleanup is enabled |
 | `/telegram-status` | Inspect connection, mode, separate polling/worker progress, journal depth, queue, transport, automatic retry state, and recent diagnostics |
+
+A validated connect can reset a damaged shared `state.json`, including before profile-switch teardown. This deliberately forgets every profile's runtime continuity; it does not repair unverifiable transaction guards or reset journals. See [damaged-state recovery](./docs/architecture.md#damaged-state-reset-operator-approved). Restore-history conflicts instead produce a protective connection warning: inspect `/telegram-status --debug` rather than infer network failure or permission to reset files.
 
 Named profile identifiers contain only lowercase ASCII letters and digits (maximum 32 characters); `default`, `main`, and `active` remain reserved. If graceful thread deletion was interrupted, a same-profile replacement reuses its still-active thread and cancels the superseded cleanup instead of deleting and recreating the tab during startup.
 
@@ -238,6 +247,8 @@ Answers use Telegram-native Rich Markdown, with clickable commands and links. In
 
 ### Files And Artifacts
 
+Agents can format questions with `telegram_confirm` and `telegram_choice` JSON fences or HTML comments. Buttons begin neutral; a completed answer sends ordinary question/answer JSON, without tags, versions or IDs. Exact-N Choice toggles/checks options locally and submits one label array at N; Choice arrays run a one-message sequential wizard and return one ordered answer array only at completion. No new agent tools or waiting SDK calls are needed. See [Agent Selection Markup](./docs/public-api.md#agent-selection-markup).
+
 Inbound files land under `<agent-dir>/tmp/pi-telegram` and default to a 50 MiB limit. `telegram_attach` is the canonical outbound file path. During Telegram-originated turns it attaches to the active reply; during explicit local/TUI delivery it can send to the paired/default chat or routed Threaded Mode target.
 
 ### Voice And Media
@@ -257,9 +268,11 @@ Classic private DM mode is the base product mode. When Telegram private-chat Thr
 - Each connected instance gets a Telegram thread target.
 - Queued work for a live follower transfers through authenticated exact-journal handoff rather than replaying under the transport owner.
 - Reopening, resuming, or replacing the process for the same Pi session restores its remembered Thread; distinct sessions in one directory keep independent bindings and letter slots.
-- Unknown threads are preserved and offered explicit reroute/restore choices. Retained temporary routing tabs stay protected while choices are pending. Cancel settles exact journal custody even if the Telegram view is unavailable; an unknown tab-deletion outcome never causes another deletion.
+- Unknown threads are preserved and offered explicit reroute/restore choices. Pending choices and accepted work protect routing tabs. Cancel settles exact journal custody even if the Telegram view is unavailable; deferred last-Cancel cleanup rechecks the original session and current protection. An unknown deletion outcome never causes another deletion.
 - When all `A`–`Z` slots are reserved, a new connection may reclaim the oldest inactive, unprotected Thread. **This deletes that Thread and all its messages**, not Pi session history or project files. When every slot is active or protected, nothing is deleted: the new connection takes the least recently used letter instead, and that Thread keeps its history and any accepted work. The leader immediately attempts to replace its old letter title with its retained name (manual titles stay); a failed edit is recorded for later display reconciliation, without undoing reuse or deleting anything. Restoring a remembered session never evicts another binding.
 - Telegram never launches hidden Pi processes.
+
+New installations preserve their Thread on graceful Pi quit: automatic cleanup starts **Off** and can be enabled in Settings → **🧹 Thread cleanup**. Existing configurations keep their chosen setting, including the legacy enabled behavior when the field is absent. Manual `/telegram-disconnect` still confirms Thread deletion independently.
 
 To remove retained inactive tabs, open Settings → **🧹 Thread cleanup** → **Review inactive tabs** on the leader instance. Review and Back delete nothing. The separate **Clean inactive tabs** action deletes eligible reviewed Telegram tabs **and all their messages**, not Pi session history or project files. Tabs without a letter are included when inactivity and clear protection are proven; live owners, accepted work and uncertain evidence remain protected. An unknown deletion outcome is retained without automatic retry.
 

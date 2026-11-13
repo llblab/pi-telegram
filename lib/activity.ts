@@ -16,6 +16,7 @@ import {
   type TelegramDeliveryTarget,
   type TelegramDeliveryView,
 } from "./delivery.ts";
+import { captureTelegramDrainObserver } from "./machine.ts";
 
 const TELEGRAM_ACTIVITY_REGISTRY_KEY = "__piTelegramActivityRegistry__";
 
@@ -288,19 +289,6 @@ function coalesceActivityEvents(
   return next;
 }
 
-/** Optional observation must not change queue/transport settlement. */
-function captureActivityDrainObserver(capture?: () => (() => void) | undefined): () => void {
-  try {
-    const notify = capture?.();
-    return () => {
-      try {
-        const emitted: unknown = notify?.();
-        if (emitted) void Promise.resolve(emitted).catch(() => undefined);
-      } catch { /* Observer failure is inert. */ }
-    };
-  } catch { return () => {}; }
-}
-
 /** @internal */
 export interface TelegramActivityDispatcher {
   hasPending?: () => boolean;
@@ -376,7 +364,7 @@ export function createTelegramActivityDispatcher(
           queues.set(registration.id, queue);
         }
         if (!queue.running && queue.events.length === 0)
-          queue.notifyDrained = captureActivityDrainObserver(deps.captureDrain);
+          queue.notifyDrained = captureTelegramDrainObserver(deps.captureDrain);
         const previous = queue.events.at(-1);
         if (previous && canCoalesceActivityEvents(previous, event)) {
           queue.events[queue.events.length - 1] = coalesceActivityEvents(
@@ -794,7 +782,7 @@ export function createTelegramActivityPublicationRuntime(deps: {
   const pending = new Set<() => void>();
   const reserve = (): TelegramActivityPublicationReservation => {
     const admittedGeneration = generation;
-    const notifyDrained = captureActivityDrainObserver(deps.captureDrain);
+    const notifyDrained = captureTelegramDrainObserver(deps.captureDrain);
     let state: "pending" | "published" | "cancelled" = "pending";
     let resolve!: (task: (() => Promise<void>) | undefined) => void;
     const ready = new Promise<(() => Promise<void>) | undefined>((accept) => {
@@ -840,7 +828,7 @@ export function createTelegramActivityPublicationRuntime(deps: {
     hasUnconfirmed: () => unconfirmed,
     beginWork() {
       const admittedGeneration = generation;
-      const notifyDrained = captureActivityDrainObserver(deps.captureDrain);
+      const notifyDrained = captureTelegramDrainObserver(deps.captureDrain);
       let settled = false;
       outstanding += 1;
       return {

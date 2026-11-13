@@ -51,6 +51,7 @@ import {
   TelegramApiAuthorityError,
   type TelegramApiCallOptions,
   type TelegramApiClient,
+  type TelegramApiUiAuthorityOptions,
   type TelegramInputRichMessage,
 } from "../lib/telegram-api.ts";
 import { isTelegramTopicTargetStaleError } from "../lib/threads.ts";
@@ -60,6 +61,211 @@ import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
 import { createGuestMarkdownReplyEditor } from "../lib/replies.ts";
 import { handleTelegramAgentEndRuntime, type PendingTelegramTurn } from "../lib/queue.ts";
 import { deliverTelegramGuestCachedAttachment } from "../lib/outbound-attachments.ts";
+import { setTestFetch } from "./fixtures/shared.ts";
+
+for (const markup of [false, true]) for (const phase of ["message", "boolean", "unchanged", "client-loss", "callback-loss", "observer-swap", "guard-swap", "observer-getter", "nonfunction", "callback-throw"] as const)
+test(`Original native edit response is captured before normalization (${markup}/${phase})`, async () => {
+  let current = true, calls = 0, observed = 0, replacements = 0, recoveries = 0, getterCalls = 0;
+  const message = { message_id: 55, chat: { id: 7 }, message_thread_id: 42, from: { id: 123, is_bot: true } };
+  let raw: unknown;
+  const guard = () => { if (!current) throw new Error("Original native owner ended"); };
+  const options: TelegramApiUiAuthorityOptions = { assertLocalAuthority: guard, onNativeEditResult(value) {
+    observed++; raw = value; if (phase === "callback-loss") current = false; if (phase === "callback-throw") throw new Error("Local data observer failed");
+  } };
+  if (phase === "observer-getter") Object.defineProperty(options, "onNativeEditResult", { get() { getterCalls++; return () => {}; } });
+  if (phase === "nonfunction") Object.defineProperty(options, "onNativeEditResult", { value: 7 });
+  const client = { async call(_method: string, _body: unknown, local?: TelegramApiCallOptions) {
+    calls++; assert.equal(local?.assertAuthority, guard); assert.equal(Object.hasOwn(local!, "onNativeEditResult"), false); local?.assertAuthority?.();
+    if (phase === "unchanged") throw new Error("Bad Request: message is not modified");
+    if (phase === "client-loss") current = false;
+    return phase === "boolean" ? true : message;
+  } } as unknown as TelegramApiClient;
+  const runtime = createTelegramBridgeApiRuntime({ client, tempDir: "/unused", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {}, captureRequestErrorHandler() {
+    if (phase === "observer-swap") options.onNativeEditResult = () => { replacements++; };
+    if (phase === "guard-swap") options.assertLocalAuthority = () => { replacements++; };
+    return async () => { recoveries++; };
+  } });
+  const pending = markup ? runtime.editMessageReplyMarkup(7, 55, { inline_keyboard: [] }, options) : runtime.editMessageText({ chat_id: 7, message_id: 55, text: "Edited" }, options);
+  if (["observer-getter", "nonfunction"].includes(phase)) { await assert.rejects(pending, /Native edit observer/u); assert.equal(calls, 0); assert.equal(observed, 0); }
+  else if (phase === "client-loss" || phase === "callback-loss") { await assert.rejects(pending, error => error instanceof TelegramApiAuthorityError && error.requestIssued); assert.equal(observed, phase === "callback-loss" ? 1 : 0); }
+  else if (phase === "callback-throw") { await assert.rejects(pending, /Local data observer failed/u); assert.equal(observed, 1); assert.equal(recoveries, 0, "An observation failure is not a second API recovery/issuance"); }
+  else if (phase === "unchanged") { if (markup) await assert.rejects(pending, isTelegramMessageNotModifiedError); else assert.equal(await pending, "unchanged"); assert.equal(observed, 0); }
+  else if (markup && phase === "boolean") { await assert.rejects(pending, /acknowledgement is unavailable/u); assert.equal(observed, 0); }
+  else { assert.equal(await pending, "edited"); assert.equal(observed, 1); assert.equal(raw, phase === "boolean" ? true : message, "Capture the actual native result, never synthesize a carrier from the public outcome"); }
+  assert.equal(getterCalls, 0); assert.equal(replacements, 0); assert.equal(calls, ["observer-getter", "nonfunction"].includes(phase) ? 0 : 1);
+});
+
+async function withNativeMarkupBody(capture: NonNullable<Parameters<typeof createTelegramBridgeApiRuntime>[0]["captureRequestErrorHandler"]>,
+  run: (runtime: ReturnType<typeof createTelegramBridgeApiRuntime>, requests: Record<string, unknown>[], setResponse: (value: Response) => void) => Promise<void>) {
+  const previous = globalThis.fetch, family = process.env.PI_TELEGRAM_NETWORK_FAMILY, requests: Record<string, unknown>[] = [];
+  let response: Response | undefined; process.env.PI_TELEGRAM_NETWORK_FAMILY = "ipv4";
+  globalThis.fetch = async (_url, options) => { requests.push(JSON.parse(options!.body as string)); return response ?? new Response(JSON.stringify({ ok: true, result: { message_id: 201, chat: { id: 42 } } })); };
+  const restore = setTelegramApiHttpsFetchForTesting(globalThis.fetch);
+  const runtime = createTelegramBridgeApiRuntime({ client: createTelegramApiClient(() => "123:markup-body"), tempDir: "/home/llb/pttmp", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1,
+    captureRequestErrorHandler: capture, recordRuntimeEvent() {} });
+  try { await run(runtime, requests, value => { response = value; }); }
+  finally { restore(); globalThis.fetch = previous; if (family === undefined) delete process.env.PI_TELEGRAM_NETWORK_FAMILY; else process.env.PI_TELEGRAM_NETWORK_FAMILY = family; }
+}
+
+for (const field of ["chat_id", "message_id", "message_thread_id", "inline_message_id", "business_connection_id", "direct_messages_topic_id"])
+test(`Native positional markup body keeps original route through recovery capture (${field})`, async () => {
+  const markup = { inline_keyboard: [[{ text: "Original", callback_data: "data" }]] };
+  await withNativeMarkupBody(body => {
+    assert.equal(Reflect.set(body, field, field.endsWith("_id") && field !== "inline_message_id" && field !== "business_connection_id" ? 99 : "alternate"), false,
+      "Native reconstruction must not lose the original carrier's routing fence");
+    assert.equal(body.reply_markup, markup); assert.equal(Object.isFrozen(markup), false); markup.inline_keyboard[0]![0]!.text = "Caller mutation";
+    return undefined;
+  }, async (runtime, requests) => {
+    assert.equal(await runtime.editMessageReplyMarkup(42, 201, markup), "edited");
+    assert.deepEqual(requests, [{ chat_id: 42, message_id: 201, reply_markup: { inline_keyboard: [[{ text: "Caller mutation", callback_data: "data" }]] } }]);
+  });
+});
+
+test("Native positional markup body excludes whole-body serialization replacement", async () => {
+  await withNativeMarkupBody(body => {
+    assert.equal(Reflect.set(body, "toJSON", () => ({ chat_id: 99, message_id: 909 })), false);
+    assert.equal(body.toJSON, undefined); assert.equal(Object.prototype.propertyIsEnumerable.call(body, "toJSON"), true, "Client snapshots must retain the undefined serializer sentinel"); return undefined;
+  }, async (runtime, requests) => { await runtime.editMessageReplyMarkup(42, 201, { inline_keyboard: [] }); assert.equal(requests[0]!.chat_id, 42); assert.equal(requests[0]!.message_id, 201); });
+});
+
+test("Native positional markup body excludes prototype serializer replacement", async () => {
+  await withNativeMarkupBody(body => {
+    assert.equal(Reflect.setPrototypeOf(body, { toJSON: () => ({ chat_id: 99, message_id: 909 }) }), false); return undefined;
+  }, async (runtime, requests) => { await runtime.editMessageReplyMarkup(42, 201, { inline_keyboard: [] }); assert.equal(requests[0]!.chat_id, 42); assert.equal(requests[0]!.message_id, 201); });
+});
+
+test("Native positional markup excludes inherited serializer on the existing prototype", async () => {
+  const previous = Object.getOwnPropertyDescriptor(Object.prototype, "toJSON");
+  try {
+    await withNativeMarkupBody(_body => {
+      Object.defineProperty(Object.prototype, "toJSON", { configurable: true, value(this: unknown) { return typeof this === "object" && this !== null && "chat_id" in this && "message_id" in this ? { chat_id: 99, message_id: 909 } : this; } });
+      return undefined;
+    }, async (runtime, requests) => { await runtime.editMessageReplyMarkup(42, 201, { inline_keyboard: [] }); assert.equal(requests[0]!.chat_id, 42); assert.equal(requests[0]!.message_id, 201); });
+  } finally { if (previous) Object.defineProperty(Object.prototype, "toJSON", previous); else Reflect.deleteProperty(Object.prototype, "toJSON"); }
+});
+
+test("Native positional markup strict recovery mutation refuses before actual issuance", async () => {
+  await withNativeMarkupBody(body => { body.chat_id = 99; return undefined; }, async (runtime, requests) => {
+    await assert.rejects(runtime.editMessageReplyMarkup(42, 201, { inline_keyboard: [] }), TypeError); assert.equal(requests.length, 0);
+  });
+});
+
+test("Native positional markup preserves method-bound not-modified rejection", async () => {
+  await withNativeMarkupBody(body => { assert.equal(Reflect.set(body, "inline_message_id", "alternate"), false); return undefined; }, async (runtime, requests, setResponse) => {
+    setResponse(new Response(JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message is not modified" }), { status: 400 }));
+    await assert.rejects(runtime.editMessageReplyMarkup(42, 201, { inline_keyboard: [] }), error => { assert.ok(isTelegramMessageNotModifiedError(error)); assert.ok(isTelegramApiRequestRejected(error, "editMessageReplyMarkup")); return true; });
+    assert.equal(requests.length, 1); assert.equal(requests[0]!.chat_id, 42); assert.equal(requests[0]!.message_id, 201);
+  });
+});
+
+for (const result of [true, false, null, {}, { message_id: 201 }, { message_id: 202, chat: { id: 42 } }, { message_id: 201, chat: { id: 99 } }, [{ message_id: 201, chat: { id: 42 } }]])
+test(`Native markup positive outcome refuses malformed or mismatched response (${JSON.stringify(result)})`, async () => {
+  await withNativeMarkupBody(() => undefined, async (runtime, requests, setResponse) => {
+    setResponse(new Response(JSON.stringify({ ok: true, result })));
+    await assert.rejects(runtime.editMessageReplyMarkup(42, 201, { inline_keyboard: [] }), error => {
+      assert.match(String(error), /acknowledgement is unavailable/u); assert.equal(isTelegramApiRequestRejected(error, "editMessageReplyMarkup"), false,
+        "An issued malformed success is unknown, not native non-use/rejection authority"); return true;
+    });
+    assert.equal(requests.length, 1); assert.equal(requests[0]!.chat_id, 42); assert.equal(requests[0]!.message_id, 201);
+  });
+});
+
+test("Native positional markup protection does not freeze unrelated caller-owned send bodies", async () => {
+  const original = { chat_id: 42, text: "Original" };
+  await withNativeMarkupBody(body => { assert.equal(body, original); assert.equal(Object.isFrozen(body), false); body.text = "Caller rendering"; return undefined; },
+    async (runtime, requests) => { await runtime.sendMessage(original); assert.deepEqual(requests, [{ chat_id: 42, text: "Caller rendering" }]); });
+});
+
+test("Artifact observer carrier preserves original and ordered secondary identities only in process", async () => {
+  const previous = globalThis.fetch, family = process.env.PI_TELEGRAM_NETWORK_FAMILY;
+  process.env.PI_TELEGRAM_NETWORK_FAMILY = "ipv4";
+  let requests = 0, issued = 0, original: unknown;
+  const recovery = new Error("private recovery"), diagnostics = [new Error("private recovery diagnostic"), new TelegramApiAuthorityError(false)];
+  globalThis.fetch = async () => { requests++; return new Response(JSON.stringify({ ok: false, error_code: 400, description: "private rejection" }), { status: 400 }); };
+  const restore = setTelegramApiHttpsFetchForTesting(globalThis.fetch);
+  const runtime = createTelegramBridgeApiRuntime({ client: createTelegramApiClient(() => "123:artifact"), tempDir: "/tmp", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1,
+    captureRequestErrorHandler: () => async error => { original = error; throw recovery; },
+    recordRuntimeEvent() { throw diagnostics.shift(); } });
+  const firstDiagnostic = diagnostics[0], secondDiagnostic = diagnostics[1];
+  try {
+    await assert.rejects(runtime.callArtifactBytes!({ chat_id: "7" }, Buffer.from("abc"), "file", { onRequestIssued() { issued++; } }), error => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.cause, original);
+      assert.deepEqual(error.errors, [original, recovery, firstDiagnostic, secondDiagnostic]);
+      for (const [index, cause] of [original, recovery, firstDiagnostic, secondDiagnostic].entries()) assert.equal(error.errors[index], cause);
+      assert.equal(isTelegramApiRequestRejected(error, "sendDocument"), true);
+      assert.equal(isTelegramApiRequestRejected(error, "sendMessage"), false);
+      assert.equal(isTelegramApiRequestRejected(new AggregateError([original], "metadata", { cause: original }), "sendDocument"), false);
+      return true;
+    });
+    assert.equal(requests, 1); assert.equal(issued, 1);
+    const fresh = runtime.reserveArtifact!(); assert.ok(fresh); fresh.release();
+  } finally { restore(); globalThis.fetch = previous; if (family === undefined) delete process.env.PI_TELEGRAM_NETWORK_FAMILY; else process.env.PI_TELEGRAM_NETWORK_FAMILY = family; }
+});
+
+test("Artifact native reservation is single-use, owner-matched and held through actual work despite early release", async () => {
+  const previous = globalThis.fetch, family = process.env.PI_TELEGRAM_NETWORK_FAMILY;
+  process.env.PI_TELEGRAM_NETWORK_FAMILY = "ipv4";
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let requests = 0;
+  globalThis.fetch = async () => { requests++; entered.resolve(); await release.promise; return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } })); };
+  const restore = setTelegramApiHttpsFetchForTesting(globalThis.fetch), client = createTelegramApiClient(() => "123:artifact"), other = createTelegramApiClient(() => "123:other");
+  const permit = client.reserveArtifact!()!;
+  let work: Promise<unknown> | undefined;
+  try {
+    const send = (artifactReservation = permit) => client.callArtifactBytes!({ chat_id: "7" }, Buffer.from("abc"), "file", { artifactReservation });
+    const foreign = other.reserveArtifact!()!;
+    await assert.rejects(send(foreign), TelegramApiAuthorityError); foreign.release();
+    work = send(); await entered.promise;
+    permit.release(); permit.release();
+    assert.equal(client.reserveArtifact!(), undefined);
+    await assert.rejects(send(), TelegramApiAuthorityError);
+    assert.equal(requests, 1); release.resolve(); await work;
+    const replacement = client.reserveArtifact!()!; assert.ok(replacement);
+    permit.release(); assert.equal(client.reserveArtifact!(), undefined, "Old cleanup cannot clear replacement lease");
+    replacement.release(); const fresh = client.reserveArtifact!(); assert.ok(fresh); fresh.release();
+  } finally { release.resolve(); await work; restore(); globalThis.fetch = previous; if (family === undefined) delete process.env.PI_TELEGRAM_NETWORK_FAMILY; else process.env.PI_TELEGRAM_NETWORK_FAMILY = family; }
+});
+
+for (const status of [200, 400, 429, 500]) test(`Artifact native byte upload uses activity, Workspace and one HTTP attempt (${status})`, async () => {
+  const activity = createTelegramApiTargetActivityRuntime(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const dir = await mkdtemp(join(tmpdir(), "pt-artifact-api-"));
+  const ledger = createTelegramWorkspaceAdmissionLedger({ path: join(dir, "admission.json"), profileKey: "artifact", owner: { processId: process.pid, processBirthId: `${process.pid}:artifact` }, getProcessLiveness: () => "alive" });
+  let requests = 0, admissions = 0, releases = 0, issued = 0;
+  const bytes = Buffer.from([0, 255, 13, 10, 1]);
+  const previous = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    requests++;
+    const form = init!.body as FormData;
+    assert.equal(form.get("chat_id"), "7"); assert.equal(form.get("message_thread_id"), "9");
+    const file = form.get("document") as File;
+    assert.equal(file.name, "résumé.bin"); assert.deepEqual(Buffer.from(await file.arrayBuffer()), bytes);
+    entered.resolve(); await release.promise;
+    return new Response(JSON.stringify(status === 200 ? { ok: true, result: { message_id: 51 } } : { ok: false, error_code: status, description: "rejected", parameters: { retry_after: 0 } }), { status });
+  };
+  const restore = setTelegramApiHttpsFetchForTesting(globalThis.fetch);
+  const admitted = createTelegramApiWorkspaceAdmissionClient(createTelegramApiClient(() => "123:artifact"), {
+    acquireAdmission(input) { admissions++; return ledger.acquireAdmission(input); },
+    releaseAdmission(lease) { releases++; return ledger.releaseAdmission(lease); },
+  });
+  const runtime = createTelegramBridgeApiRuntime({ client: createTelegramApiTargetTrackingClient(admitted, activity),
+    tempDir: "/tmp", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {} });
+  try {
+    const work = runtime.callArtifactBytes!<{ message_id: number }>({ chat_id: "7", message_thread_id: "9" }, bytes, "résumé.bin", {
+      maxAttempts: 12, retrySafety: "safe", onRequestIssued() { issued++; }, assertAuthority() {},
+    });
+    // Install rejection handling before releasing native work.
+    const result = work.then(value => value, error => error);
+    await entered.promise;
+    assert.equal(activity.hasPendingTarget({ chatId: 7, threadId: 9 }), true);
+    assert.equal(admissions, 1); assert.equal(releases, 0);
+    release.resolve();
+    const settled = await result;
+    if (status === 200) assert.equal(settled.message_id, 51); else assert.ok(settled instanceof Error);
+    assert.equal(requests, 1); assert.equal(issued, 1); assert.equal(releases, 1);
+    assert.equal(activity.hasPendingTarget({ chatId: 7, threadId: 9 }), false);
+  } finally { release.resolve(); restore(); globalThis.fetch = previous; await rm(dir, { recursive: true, force: true }); }
+});
 
 test("Target activity tracks exact JSON and multipart transport until settlement", async () => {
   const activity = createTelegramApiTargetActivityRuntime();
@@ -430,7 +636,7 @@ test("Message deletion accepts only typed exact HTTP 400 already-absent evidence
     [403, "Bad Request: message to delete not found", false],
     [400, "Bad Request: message can't be deleted", false],
   ] as const) {
-    const restoreFetch = setApiTestFetch(async () => createApiErrorResponse(status, description));
+    const restoreFetch = setTestFetch(async () => createApiErrorResponse(status, description));
     try {
       const runtime = createDefaultTelegramBridgeApiRuntime({
         getBotToken: () => "test-token",
@@ -480,14 +686,6 @@ test(`API drain observation follows per-target and chat counts without changing 
 
 function getApiTestFetchUrl(input: string | URL | Request): string {
   return typeof input === "string" ? input : input.toString();
-}
-
-function setApiTestFetch(fetchImpl: typeof fetch): () => void {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = fetchImpl;
-  return () => {
-    globalThis.fetch = originalFetch;
-  };
 }
 
 function setApiTestNetworkFamily(value: string | undefined): () => void {
@@ -542,7 +740,7 @@ for (const rich of [false, true]) {
       let sleeps = 0;
       let permanentRequests = 0;
       const drafts: string[] = [];
-      const restoreFetch = setApiTestFetch(async (input, init) => {
+      const restoreFetch = setTestFetch(async (input, init) => {
         const body = JSON.parse(String(init?.body));
         if (getApiTestFetchUrl(input).endsWith("/sendMessage")) {
           permanentRequests += 1;
@@ -606,7 +804,7 @@ for (const { status, retryAfter, delayMs } of [
     let now = 1000;
     let sleeps = 0;
     const drafts: string[] = [];
-    const restoreFetch = setApiTestFetch(async (input, init) => {
+    const restoreFetch = setTestFetch(async (input, init) => {
       if (getApiTestFetchUrl(input).endsWith("/sendMessage")) return createApiJsonResponse({ message_id: 100 });
       const body = JSON.parse(String(init?.body));
       drafts.push(body.rich_message.markdown);
@@ -648,7 +846,7 @@ test("Sealed preview drains its issued request but never waits for a 429 draft r
   let finalSent = false;
   let final: Promise<boolean> | undefined;
   let flush: Promise<void> | undefined;
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     requests += 1; entered(); await gate;
     return createApiErrorResponse(429, "Too Many Requests", new Headers({ "retry-after": "3" }));
   });
@@ -819,7 +1017,7 @@ for (const kind of ["http", "network"] as const) {
     const logged: unknown[] = [];
     let cancelled = false, calls = 0;
     const networkError = new TypeError("fetch failed");
-    const restoreFetch = setApiTestFetch(async () => {
+    const restoreFetch = setTestFetch(async () => {
       calls++; issued.resolve(); await response.promise;
       if (kind === "network") throw networkError;
       return createApiErrorResponse(500, "late failure fixture");
@@ -855,7 +1053,7 @@ test("Telegram bridge API runtime owns reply-markup edits", async () => {
         body: Record<string, unknown>,
       ) => {
         calls.push({ method, body });
-        return true as TResponse;
+        return { message_id: body.message_id, chat: { id: body.chat_id } } as TResponse;
       },
     }),
     tempDir: "/tmp",
@@ -870,7 +1068,7 @@ test("Telegram bridge API runtime owns reply-markup edits", async () => {
   assert.deepEqual(calls, [
     {
       method: "editMessageReplyMarkup",
-      body: { chat_id: 7, message_id: 42, reply_markup: replyMarkup },
+      body: { chat_id: 7, message_id: 42, reply_markup: replyMarkup, toJSON: undefined },
     },
   ]);
 });
@@ -923,7 +1121,7 @@ test("Concurrent Thread actions retain one shared 429 cooldown through peer comp
   let nowMs = 1000;
   const first = Promise.withResolvers<Response>(), second = Promise.withResolvers<Response>();
   const calls: number[] = [], events: Record<string, unknown>[] = [];
-  const restoreFetch = setApiTestFetch(async (_input, init) => {
+  const restoreFetch = setTestFetch(async (_input, init) => {
     const body = JSON.parse(String(init?.body)) as { message_thread_id: number };
     calls.push(body.message_thread_id);
     return body.message_thread_id === 41 ? first.promise
@@ -1005,7 +1203,7 @@ test("Telegram bridge API runtime shares retry-after suppression across one chat
   let nowMs = 1000;
   let calls = 0;
   const events: Array<Record<string, unknown>> = [];
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     calls += 1;
     return calls === 1
       ? createApiErrorResponse(
@@ -1078,7 +1276,7 @@ test("Telegram bridge API runtime shares retry-after suppression across one chat
 
 for (const action of ["typing", "record_voice"] as const) test(`Chat-action retry policy preserves voice but never replays typing (${action})`, async () => {
   let calls = 0;
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     calls += 1;
     return calls === 1
       ? createApiErrorResponse(500, "Server Error")
@@ -1201,7 +1399,7 @@ test("Telegram API helper fetches bot identity through getMe", async () => {
 test("Telegram API helper fetches bot identity through IPv4 fallback", async () => {
   const familySeen: boolean[] = [];
   const restoreEnv = setApiTestNetworkFamily("ipv4-fallback");
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     familySeen.push(false);
     throw createSyntheticFetchFailure();
   });
@@ -1300,7 +1498,7 @@ test("Telegram API helpers reject missing bot token for direct calls", async () 
 });
 
 test("Telegram API helpers include HTTP status details for failed responses", async () => {
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     return createApiErrorResponse(429, "Too Many Requests");
   });
   try {
@@ -1323,7 +1521,7 @@ for (const surface of ["helper", "client", "direct", "bus-direct", "default-dire
       const options: Pick<TelegramApiCallOptions, "assertAuthority"> = {
         assertAuthority() { if (!current) throw new Error("recipient replaced with secret fixture context"); },
       };
-      const restoreFetch = setApiTestFetch(async (_input, init) => {
+      const restoreFetch = setTestFetch(async (_input, init) => {
         calls++;
         bodies.push(JSON.parse(String(init?.body)));
         const response = createApiJsonResponse(true);
@@ -1375,7 +1573,7 @@ test("Typed callback authority captures its guard before the client token observ
     assertAuthority() { if (!current) throw new Error("Original recipient lost"); },
   };
   const client = createTelegramApiClient(() => { current = false; options.assertAuthority = () => {}; return "123:abc"; });
-  const restoreFetch = setApiTestFetch(async () => { calls++; return createApiJsonResponse(true); });
+  const restoreFetch = setTestFetch(async () => { calls++; return createApiJsonResponse(true); });
   try {
     await assert.rejects(client.answerCallbackQuery("captured-query", "Saved", options),
       { name: "TelegramApiAuthorityError", requestIssued: false });
@@ -1389,7 +1587,7 @@ for (const guarded of [false, true]) {
     const events: unknown[] = [];
     const runtime = createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:abc",
       recordRuntimeEvent(_kind, error) { events.push(error); } });
-    const restoreFetch = setApiTestFetch(async () => { calls++; return createApiErrorResponse(400, "Query expired"); });
+    const restoreFetch = setTestFetch(async () => { calls++; return createApiErrorResponse(400, "Query expired"); });
     try {
       await runtime.answerCallbackQuery("captured-query", "Saved", guarded ? { assertAuthority() {} } : undefined);
       assert.equal(calls, 1);
@@ -1403,7 +1601,7 @@ for (const guarded of [false, true]) {
 for (const boundary of ["entry", "encoding"] as const) {
   test(`Per-call API authority refuses JSON ${boundary} loss before issuance`, async () => {
     let current = boundary !== "entry", calls = 0;
-    const restoreFetch = setApiTestFetch(async () => { calls++; return createApiJsonResponse(true); });
+    const restoreFetch = setTestFetch(async () => { calls++; return createApiJsonResponse(true); });
     try {
       await assert.rejects(callTelegram("123:abc", "sendMessage", {
         chat_id: 7, message_thread_id: 42,
@@ -1418,7 +1616,7 @@ for (const boundary of ["entry", "encoding"] as const) {
 for (const boundary of ["transport", "parsing"] as const) {
   test(`Per-call API authority refuses acknowledged success after ${boundary} loss`, async () => {
     let current = true, calls = 0, sleeps = 0;
-    const restoreFetch = setApiTestFetch(async () => {
+    const restoreFetch = setTestFetch(async () => {
       calls++;
       const response = createApiJsonResponse(true);
       if (boundary === "transport") { await Promise.resolve(); current = false; }
@@ -1444,7 +1642,7 @@ for (const boundary of ["transport", "parsing"] as const) {
 test("Per-call API authority captures its guard before asynchronous response work", async () => {
   let current = true, calls = 0;
   const options: TelegramApiCallOptions = { assertAuthority() { if (!current) throw new Error("recipient replaced"); } };
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     calls++;
     await Promise.resolve();
     current = false;
@@ -1461,7 +1659,7 @@ test("Per-call API authority captures its guard before asynchronous response wor
 for (const status of [429, 503]) {
   test(`Per-call API authority loss during HTTP ${status} wait cannot reissue`, async () => {
     let current = true, calls = 0, sleeps = 0;
-    const restoreFetch = setApiTestFetch(async () => { calls++; return createApiErrorResponse(status, "rejected"); });
+    const restoreFetch = setTestFetch(async () => { calls++; return createApiErrorResponse(status, "rejected"); });
     try {
       await assert.rejects(callTelegram("123:abc", status === 429 ? "sendMessage" : "editMessageText", {}, {
         assertAuthority() { if (!current) throw new Error("recipient replaced"); },
@@ -1477,7 +1675,7 @@ for (const revoke of [false, true]) {
   test(`Per-call API authority ${revoke ? "refuses revoked" : "permits current"} IPv4 fallback`, async () => {
     let current = true, calls = 0, fallbackCalls = 0;
     const restoreEnv = setApiTestNetworkFamily("ipv4-fallback");
-    const restoreFetch = setApiTestFetch(async () => { calls++; current = !revoke; throw createSyntheticFetchFailure(); });
+    const restoreFetch = setTestFetch(async () => { calls++; current = !revoke; throw createSyntheticFetchFailure(); });
     const restoreHttpsFetch = setTelegramApiHttpsFetchForTesting(async () => { fallbackCalls++; return createApiJsonResponse(true); });
     try {
       const request = callTelegram("123:abc", "editMessageText", {}, {
@@ -1530,7 +1728,7 @@ for (const revoke of [false, true]) {
     const ledger = createTelegramWorkspaceAdmissionLedger({ path: join(dir, "admission.json"), profileKey: "profile:api-authority",
       owner: { processId: process.pid, processBirthId: `${process.pid}:api-authority` }, getProcessLiveness: () => "alive" });
     const activity = createTelegramApiTargetActivityRuntime();
-    const restoreFetch = setApiTestFetch(async () => {
+    const restoreFetch = setTestFetch(async () => {
       calls++;
       observedLease = ledger.read().leases.length === 1;
       assert.equal(activity.hasPendingTarget({ chatId: 7, threadId: 42 }), true);
@@ -1557,7 +1755,7 @@ for (const revoke of [false, true]) {
 test("Non-idempotent Telegram API calls retry explicit 429 but report 5xx commit unknown", async () => {
   const sleeps: number[] = [];
   let calls = 0;
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     calls += 1;
     if (calls === 1) {
       return createApiErrorResponse(
@@ -1593,7 +1791,7 @@ test("Non-idempotent Telegram API calls retry explicit 429 but report 5xx commit
 
 test("Retry-safe Telegram API methods replay 5xx responses", async () => {
   let calls = 0;
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     calls += 1;
     return calls === 1
       ? createApiErrorResponse(502, "Bad Gateway")
@@ -1622,7 +1820,7 @@ test("Rate-limit retry waits record the method and duration before the pause", a
     details?: Record<string, unknown>;
   }> = [];
   let calls = 0;
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     calls += 1;
     return calls === 1
       ? createApiErrorResponse(
@@ -1671,7 +1869,7 @@ test("Rate-limit retry waits record the method and duration before the pause", a
 test("5xx retry waits stay out of the rate-limit event stream", async () => {
   const events: unknown[] = [];
   let calls = 0;
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     calls += 1;
     return calls === 1
       ? createApiErrorResponse(500, "Server Error")
@@ -1701,7 +1899,7 @@ test("Telegram API retry waits settle immediately when their owner aborts", asyn
   const controller = new AbortController();
   const reason = { kind: "polling-request-expired" };
   let calls = 0;
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     calls += 1;
     if (calls === 1) {
       setTimeout(() => controller.abort(reason), 0);
@@ -1728,7 +1926,7 @@ test("Retry-safe Telegram API transport falls back to IPv4 once", async () => {
   const familySeen: boolean[] = [];
   let calls = 0;
   const restoreEnv = setApiTestNetworkFamily("ipv4-fallback");
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     calls += 1;
     familySeen.push(false);
     throw createSyntheticFetchFailure();
@@ -1762,7 +1960,7 @@ test("Retry-safe Telegram API transport falls back to IPv4 once", async () => {
 });
 
 test("Telegram API HTTP errors retain only the exact threaded request target", async () => {
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     return createApiErrorResponse(400, "Bad Request: message thread not found");
   });
   try {
@@ -1787,7 +1985,7 @@ test("Telegram API HTTP errors retain only the exact threaded request target", a
 });
 
 test("Telegram API stale-looking HTTP 500 errors remain transient", async () => {
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     return createApiErrorResponse(500, "message thread not found");
   });
   try {
@@ -1810,7 +2008,7 @@ test("Telegram API stale-looking HTTP 500 errors remain transient", async () => 
 test("Telegram API transport does not IPv4-fallback retry HTTP 400", async () => {
   const familySeen: boolean[] = [];
   const restoreEnv = setApiTestNetworkFamily("ipv4-fallback");
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     familySeen.push(false);
     return createApiErrorResponse(400, "Bad Request");
   });
@@ -1836,7 +2034,7 @@ test("Telegram multipart transport failure reports commit unknown without fallba
   const forms = new Set<FormData>();
   let calls = 0;
   const restoreEnv = setApiTestNetworkFamily("ipv4-fallback");
-  const restoreFetch = setApiTestFetch(async (_input, init) => {
+  const restoreFetch = setTestFetch(async (_input, init) => {
     calls += 1;
     const form = init?.body as FormData;
     forms.add(form);
@@ -1886,7 +2084,7 @@ test("Telegram file downloads use transport fallback for file content", async ()
   );
   const calls: string[] = [];
   const restoreEnv = setApiTestNetworkFamily("ipv4-fallback");
-  const restoreFetch = setApiTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const url = getApiTestFetchUrl(input);
     if (url.includes("/getFile")) {
       return createApiJsonResponse({ file_path: "files/demo" });
@@ -1967,7 +2165,7 @@ test("Telegram multipart 5xx reports commit unknown without replay", async () =>
   await writeFile(filePath, "hello", "utf8");
   const contentTypes: string[] = [];
   let calls = 0;
-  const restoreFetch = setApiTestFetch(async (_input, init) => {
+  const restoreFetch = setTestFetch(async (_input, init) => {
     calls += 1;
     contentTypes.push(
       (init?.body as FormData).get("document") instanceof Blob
@@ -2002,7 +2200,7 @@ test("Telegram multipart 5xx reports commit unknown without replay", async () =>
 
 test("Telegram file downloads use deterministic sanitized names published by rename", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-download-"));
-  const restoreFetch = setApiTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const url = getApiTestFetchUrl(input);
     if (url.includes("/getFile")) {
       return createApiJsonResponse({ file_path: "files/demo" });
@@ -2031,7 +2229,7 @@ test("Telegram file downloads use deterministic sanitized names published by ren
 test("Telegram file downloads reject files above configured limits", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-download-limit-"));
   let calls = 0;
-  const restoreFetch = setApiTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     calls += 1;
     const url = getApiTestFetchUrl(input);
     if (url.includes("/getFile")) {
@@ -2057,7 +2255,7 @@ test("Telegram file downloads reject files above configured limits", async () =>
 for (const method of ["sendMessage", "sendRichMessage", "sendPhoto", "sendVoice", "sendMediaGroup", "copyMessage", "copyMessages", "forwardMessage", "forwardMessages", "sendMessageDraft", "sendRichMessageDraft", "sendChatAction"]) {
   test(`Threaded Bot API refuses output to All before transport (${method})`, async () => {
     let calls = 0, threaded = true;
-    const restoreFetch = setApiTestFetch(async () => { calls++; return createApiJsonResponse({ message_id: 1 }); });
+    const restoreFetch = setTestFetch(async () => { calls++; return createApiJsonResponse({ message_id: 1 }); });
     const runtime = createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:fixture", isThreadedMode: () => threaded, recordRuntimeEvent() {} });
     try {
       for (const message_thread_id of [undefined, 0, "0", "", true, -1]) await assert.rejects(
@@ -2075,7 +2273,7 @@ for (const method of ["sendMessage", "sendRichMessage", "sendPhoto", "sendVoice"
 test("Threaded multipart refuses All before file access and fences mode change before upload", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-output-policy-")), path = join(dir, "voice.ogg");
   let calls = 0, threaded = true;
-  const restoreFetch = setApiTestFetch(async () => { calls++; return createApiJsonResponse(true); });
+  const restoreFetch = setTestFetch(async () => { calls++; return createApiJsonResponse(true); });
   const runtime = createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:fixture", isThreadedMode: () => threaded, recordRuntimeEvent() {} });
   try {
     await assert.rejects(runtime.callMultipart("sendVoice", { chat_id: "7" }, "voice", join(dir, "missing"), "voice.ogg"), /All is input-only/);
@@ -2091,7 +2289,7 @@ test("Threaded multipart refuses All before file access and fences mode change b
 
 test("Threaded policy preserves non-output operations and cannot be evaded by a reply anchor or caller guard", async () => {
   let calls = 0;
-  const restoreFetch = setApiTestFetch(async () => { calls++; return createApiJsonResponse(true); });
+  const restoreFetch = setTestFetch(async () => { calls++; return createApiJsonResponse(true); });
   const client = createTelegramApiClient(() => "123:fixture", { isThreadedMode: () => true });
   try {
     await assert.rejects(client.call("sendMessage", { chat_id: 7, text: "All", reply_parameters: { message_id: 1, message_thread_id: 42 } }, { assertAuthority() {} }), /All is input-only/);
@@ -2103,7 +2301,7 @@ test("Threaded policy preserves non-output operations and cannot be evaded by a 
 
 test("Threaded policy stops a classic output retry after mode changes", async () => {
   let threaded = false, calls = 0;
-  const restoreFetch = setApiTestFetch(async () => { calls++; threaded = true; return createApiJsonResponse(true); });
+  const restoreFetch = setTestFetch(async () => { calls++; threaded = true; return createApiJsonResponse(true); });
   const client = createTelegramApiClient(() => "123:fixture", { isThreadedMode: () => threaded });
   try {
     await assert.rejects(client.call("sendMessage", { chat_id: 7, text: "classic" }, { maxAttempts: 3 }), /authority/i);
@@ -2115,7 +2313,7 @@ test("Telegram streaming downloads remove partial files after limit failures", a
   const tempDir = await mkdtemp(
     join(tmpdir(), "pi-telegram-download-partial-"),
   );
-  const restoreFetch = setApiTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const url = getApiTestFetchUrl(input);
     if (url.includes("/getFile")) {
       return createApiJsonResponse({ file_path: "files/demo" });
@@ -2137,7 +2335,7 @@ test("Telegram streaming downloads remove partial files after limit failures", a
 });
 
 test("Telegram API helpers reject malformed successful responses", async () => {
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     return createMalformedApiTextResponse("not json");
   });
   try {
@@ -2150,7 +2348,7 @@ test("Telegram API helpers reject malformed successful responses", async () => {
 });
 
 test("Non-idempotent malformed success becomes commit-unknown", async () => {
-  const restoreFetch = setApiTestFetch(async () =>
+  const restoreFetch = setTestFetch(async () =>
     createMalformedApiTextResponse("not json"),
   );
   try {
@@ -2168,7 +2366,7 @@ test("Non-idempotent malformed success becomes commit-unknown", async () => {
 
 test("answerTelegramCallbackQuery records Telegram API failures without throwing", async () => {
   const events: Array<Record<string, unknown>> = [];
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     throw new Error("network down");
   });
   try {
@@ -2197,7 +2395,7 @@ test("answerTelegramCallbackQuery records Telegram API failures without throwing
 
 test("Default Telegram bridge API runtime binds lazy token client and defaults", async () => {
   const calls: string[] = [];
-  const restoreFetch = setApiTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     calls.push(getApiTestFetchUrl(input));
     return createApiJsonResponse(true);
   });
@@ -2218,7 +2416,7 @@ test("Workspace deletion requires executor authority and never retries transport
   let outcome: "success" | "false" | "absent" | "network" = "success";
   const previousFamily = process.env.PI_TELEGRAM_NETWORK_FAMILY;
   process.env.PI_TELEGRAM_NETWORK_FAMILY = "ipv4-fallback";
-  const restoreFetch = setApiTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     requests++;
     assert.match(getApiTestFetchUrl(input), /deleteForumTopic$/);
     if (outcome === "network") throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
@@ -2261,7 +2459,7 @@ test("Request rejection requires matching method and parsed Telegram no-effect r
     [500, 500, false, false], [429, 400, false, false], [429, "429", false, false],
     [429, 429, true, false], [429, undefined, false, false],
   ] as const) {
-    const restore = setApiTestFetch(async () => new Response(JSON.stringify({
+    const restore = setTestFetch(async () => new Response(JSON.stringify({
       ok, error_code: code, description: "fixture rejection",
     }), { status }));
     try {
@@ -2293,7 +2491,7 @@ test("Default Telegram bridge API runtime applies optional Workspace admission",
         acquiredAtMs: number;
       }
     | undefined;
-  const restoreFetch = setApiTestFetch(async () => {
+  const restoreFetch = setTestFetch(async () => {
     assert.equal(activeLease?.operationKind, "api.sendChatAction");
     assert.deepEqual(activeLease?.scope, { kind: "chat", chatId: 7 });
     return createApiJsonResponse(true);
@@ -2410,7 +2608,7 @@ test("Download publication bounds Windows sharing retries without refetching or 
     const failure = Object.assign(new Error("File publication denied"), { code: scenario.code });
     let renameCalls = 0;
     const requests: string[] = [];
-    const restoreFetch = setApiTestFetch(async (input) => {
+    const restoreFetch = setTestFetch(async (input) => {
       const url = getApiTestFetchUrl(input);
       requests.push(url.includes("/getFile") ? "metadata" : "content");
       if (url.includes("/getFile")) return createApiJsonResponse({ file_path: "files/demo" });
@@ -2452,7 +2650,7 @@ test("Download publication bounds Windows sharing retries without refetching or 
 
 test("Concurrent downloads of one message publish one complete file", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-download-race-"));
-  const restoreFetch = setApiTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const url = getApiTestFetchUrl(input);
     if (url.includes("/getFile")) return createApiJsonResponse({ file_path: "files/demo" });
     return new Response("complete payload", { status: 200 });
@@ -2537,7 +2735,7 @@ test("Telegram bridge API runtime records structured failures", async () => {
 for (const outcome of ["success", "rejected", "unknown"] as const) {
   test(`Guest ACK completion composes cached upload and inline edit (${outcome})`, async () => {
     const events: string[] = [];
-    const restore = setApiTestFetch(async (input, init) => {
+    const restore = setTestFetch(async (input, init) => {
       const method = String(input).split("/").at(-1);
       const body = JSON.parse(String(init?.body));
       assert.equal(body.inline_message_id, "inline");
@@ -2991,7 +3189,7 @@ test("Telegram bridge API runtime edits messages and tolerates unchanged text", 
 test("Telegram API client resolves bot tokens lazily for wrapped calls", async () => {
   const calls: string[] = [];
   let botToken = "123:abc";
-  const restoreFetch = setApiTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     calls.push(getApiTestFetchUrl(input));
     return createApiJsonResponse(true);
   });

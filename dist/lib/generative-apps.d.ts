@@ -34,8 +34,47 @@ export interface GenerativeAppExecutionFence {
     assertCurrent: () => void;
     signal: AbortSignal;
 }
+export interface GenerativeAppOwnerObservation {
+    app: string;
+    generation: string;
+    revision?: number;
+    reset?: boolean;
+}
+export interface GenerativeAppCallbackBinding {
+    app: string;
+    generation: string;
+    revision: number;
+    assertCurrent: () => void;
+}
+/** @internal Original filesystem guard and data-only observed history; neither is source-use or receiver authority. */
+export interface GenerativeAppCallbackOwner {
+    readonly assertCurrent: () => void;
+    readonly assertObservedCurrent: () => void;
+    /** @internal Opaque pre-worker snapshot on this exact native refresh result; not a membership certificate. */
+    readonly originalPublicationSource?: unknown;
+    /** @internal Exact native predecessor only; not a row disposition or business-effect receipt. */
+    readonly captureReadOnlySuccessor?: (binding: unknown, invocation?: unknown, origin?: object) => Readonly<GenerativeAppCallbackOwner> | undefined;
+    /** @internal One native app invocation, bound to a hidden original producer origin and exact decoded prompt. */
+    readonly createCallbackInvocation?: (prompt: string, origin: object, authority?: Readonly<{
+        assertCurrent: () => void;
+        assertObservedCurrent: () => void;
+    }>) => object;
+}
+/** @internal Capture only an existing original native owner; foreign/copy/unavailable bindings are never probed or adopted. */
+export declare function captureGenerativeAppCallbackOwner(binding: unknown): Readonly<GenerativeAppCallbackOwner> | undefined;
+/** @internal Historical native outcome for this exact claimed invocation; not parent or effect-execution authority. */
+export declare function getGenerativeAppCallbackInvocationKind(binding: unknown, invocation: unknown): "read-only" | "state-written" | undefined;
+/** @internal Data-only exact native refresh association; the store must authenticate its opaque source. */
+export declare function getGenerativeAppRefreshPublicationSource(binding: unknown): Readonly<{
+    source: unknown;
+    predecessor: Readonly<GenerativeAppCallbackOwner>;
+}> | undefined;
+export declare function getGenerativeAppCallbackBinding(result: GenerativeAppInvocationResult): GenerativeAppCallbackBinding;
 export interface GenerativeAppRuntimeOptions {
     agentDir: string;
+    onOwnerObserved?: (owner: GenerativeAppOwnerObservation) => void;
+    assertCallbackOwner?: () => void;
+    recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
     execution?: GenerativeAppExecutionFence;
     methodTimeoutMs?: number;
 }
@@ -51,6 +90,8 @@ export interface GenerativeAppLiveSurface<THandle> {
     initialDigest: string;
     key: string;
     refreshAfterMs: number;
+    /** @internal Original native app producer for this surface lifetime; not SDK/physical-parent or callback authority. */
+    originalAppBinding?: GenerativeAppCallbackBinding;
 }
 export interface GenerativeAppLiveSurfaceRuntime<THandle> {
     open: (surface: GenerativeAppLiveSurface<THandle>) => void;
@@ -62,6 +103,11 @@ export interface GenerativeAppLiveSurfaceRuntime<THandle> {
 }
 export interface GenerativeAppLiveSurfaceRuntimeDeps<THandle> {
     agentDir: string;
+    /** @internal Constructor-pinned, synchronous pre-worker capture; no execution or SDK membership grant. */
+    capturePublicationSource?: (handle: THandle, binding: GenerativeAppCallbackBinding) => Readonly<{
+        assertCurrent: () => void;
+    }> | undefined;
+    onOwnerObserved?: GenerativeAppRuntimeOptions["onOwnerObserved"];
     isCurrent: (surface: GenerativeAppLiveSurface<THandle>) => boolean;
     plan: (result: GenerativeAppInvocationResult, handle: THandle) => GenerativeAppLiveSurfaceFrame<THandle>;
     edit: (frame: GenerativeAppLiveSurfaceFrame<THandle>) => Promise<THandle>;
@@ -96,6 +142,8 @@ export declare function getTelegramBindLiveSurfaceKey(app: string, profile: stri
     threadId?: number;
 }): string;
 export interface TelegramBindToolRegistrationDeps extends GenerativeAppRuntimeOptions {
+    /** @internal Original store-owned snapshot, addressed by the existing SDK-managed handle. */
+    capturePublicationSource?: GenerativeAppLiveSurfaceRuntimeDeps<TelegramBindDeliveryHandle>["capturePublicationSource"];
     getActiveProfileName?: () => string | undefined;
     liveSurfaceSetTimer?: GenerativeAppLiveSurfaceRuntimeDeps<unknown>["setTimer"];
     liveSurfaceClearTimer?: GenerativeAppLiveSurfaceRuntimeDeps<unknown>["clearTimer"];
@@ -123,11 +171,7 @@ export interface TelegramBindToolRegistrationDeps extends GenerativeAppRuntimeOp
         };
     } | undefined;
     planOutput?: (markdown: string, options: {
-        binding: {
-            generation: string;
-            app: string;
-            revision: number;
-        };
+        binding: GenerativeAppCallbackBinding;
     }) => {
         markdown: string;
         replyMarkup?: unknown;
@@ -167,6 +211,14 @@ export declare function invokeGenerativeApp(options: GenerativeAppRuntimeOptions
     expectedRevision?: number;
     method: string;
     app: string;
+    /** @internal Keep callback work owned until native termination settles and the worker exits. */
+    callbackWorkerDrain?: true;
+    /** @internal Native original binding; only the drain opt-in can record read-only lineage. */
+    callbackBinding?: unknown;
+    /** @internal One native producer-bound invocation; never copied into worker data. */
+    callbackInvocation?: unknown;
+    /** @internal Opaque original snapshot stays main-side; only a drained native refresh may carry it. */
+    originalPublicationSource?: unknown;
 }): Promise<GenerativeAppInvocationResult>;
 export declare function installGenerativeApp(options: GenerativeAppRuntimeOptions & {
     argument?: unknown;

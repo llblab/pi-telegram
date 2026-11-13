@@ -65,4 +65,7 @@ export declare function createTelegramThreadDisplayReconciler(deps: TelegramThre
     reconcile(bindingKey?: string): Promise<{
         changed: number;
     }>;
+    reconcileLive(): Promise<{
+        changed: number;
+    }>;
 };

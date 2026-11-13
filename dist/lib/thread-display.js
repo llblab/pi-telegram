@@ -242,7 +242,7 @@ export function createTelegramThreadDisplaySettingsRuntime(deps) {
 /** Caller owns triggering and reporting; no timer or background retry is created. */
 export function createTelegramThreadDisplayReconciler(deps) {
     let tail = Promise.resolve();
-    const apply = async (bindingKey) => {
+    const apply = async (bindingKey, liveOnly = false) => {
         const epoch = deps.getLeaderEpoch();
         const profile = deps.getProfileKey();
         const mode = deps.getMode();
@@ -261,6 +261,8 @@ export function createTelegramThreadDisplayReconciler(deps) {
         let changed = 0;
         for (const binding of bindings) {
             if (bindingKey !== undefined && binding.bindingKey !== bindingKey)
+                continue;
+            if (liveOnly && !liveBindingKeys.has(binding.bindingKey))
                 continue;
             const isBindingCurrent = deps.captureBindingAuthority(binding);
             if (!isBindingCurrent)
@@ -302,11 +304,14 @@ export function createTelegramThreadDisplayReconciler(deps) {
         assertAuthority();
         return { changed };
     };
+    const enqueue = (bindingKey, liveOnly = false) => {
+        const run = tail.then(() => apply(bindingKey, liveOnly));
+        tail = run.catch(() => undefined);
+        return run;
+    };
     return {
-        reconcile(bindingKey) {
-            const run = tail.then(() => apply(bindingKey));
-            tail = run.catch(() => undefined);
-            return run;
-        },
+        reconcile: (bindingKey) => enqueue(bindingKey),
+        // Automatic roster/mode projection must not enter retained slotless repair.
+        reconcileLive: () => enqueue(undefined, true),
     };
 }

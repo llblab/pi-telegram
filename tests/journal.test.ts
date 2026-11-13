@@ -25,15 +25,7 @@ import { basename, dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import test from "node:test";
-
-import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusFollowerRegistry,
-  createTelegramBusForeignOwnedUpdateForwarder, createTelegramBusProtocolIdentity,
-  getTelegramInputCustodyPeerReadiness,
-  sendTelegramBusLocalEnvelope, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
-  TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE } from "../lib/bus.ts";
 import { getTelegramProcessBirthIdentity } from "../lib/process-identity.ts";
-import { createTelegramBusFollowerSourceReferenceAdmissionRuntime,
-  createTelegramBusForwardedUpdateReceiverRuntime } from "../lib/bus-follower.ts";
 import { createTelegramConfigStore } from "../lib/config.ts";
 import { withTelegramFileTransaction } from "../lib/locks.ts";
 import { resolveTelegramSessionJournalPath, resolveTelegramSessionPollingJournalPath } from "../lib/paths.ts";
@@ -51,7 +43,6 @@ import { createTelegramJournalSourceSerialization,
   discoverTelegramSessionJournalPaths,
   discoverTelegramRecipientJournalPaths,
   inspectTelegramUpdateJournalFamily,
-  inspectTelegramInputCustodySourceStatus,
   readTelegramUpdateJournalSource,
   inspectTelegramProfileJournalNamespace,
   inspectTelegramSessionJournalNamespace,
@@ -66,12 +57,12 @@ import { createTelegramJournalSourceSerialization,
   TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_BYTES,
   TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_COUNT,
   createTelegramUpdateJournalStore,
-  createTelegramInputJournalStore,
   type TelegramInputJournalStoreOptions,
   type TelegramUpdateJournalQueueOwnerIdentity,
   getTelegramUpdateJournalAdmissionScopes,
   TelegramUpdateJournalError,
   type TelegramJournaledUpdate,
+  type TelegramUpdateJournalAbandonedPendingEvidence,
   type TelegramUpdateJournalStoreOptions,
 } from "../lib/journal.ts";
 import {
@@ -79,31 +70,6 @@ import {
   TelegramWorkspaceAdmissionError,
   type TelegramWorkspaceAdmissionLedger,
 } from "../lib/workspace-admission.ts";
-import { createTelegramCustodiedExecutionSession,
-  createTelegramCustodiedUpdateAdmissionHandle,
-  createTelegramInputCustodyLifecycleBindingResolver,
-  createTelegramInputCustodyLegacyDispositionRuntime,
-  createTelegramInputCustodyBusBindingRuntime,
-  createTelegramInputCustodyForwardReferenceResolver,
-  createTelegramInputCustodyHandoffAcceptanceRuntime,
-  createTelegramInputCustodyHandoffClient,
-  createTelegramInputCustodySourceReferenceWakeRuntime,
-  createTelegramInputCustodyWorkerJournalPort,
-  evaluateTelegramInputCustodyActivationReadiness,
-  evaluateTelegramInputCustodyWriterExclusionEvidence,
-  executeTelegramInputCustodyWriterCutover,
-  executeTelegramInputCustodyMigrationCompletion,
-  normalizeTelegramInputCustodyStartupExclusionAuthority,
-  normalizeTelegramInputCustodyMigrationCompletionAuthority,
-  createTelegramInputCustodyActivationReadinessResolver,
-  createTelegramInputCustodyProvenReadinessResolver,
-  createTelegramInputCustodyReadinessEvidenceStore,
-  createTelegramUpdateAdmissionLifecycleAssembly,
-  createTelegramUpdateAdmissionLifecycleRuntime,
-  createTelegramUpdateAdmissionRuntimeBinding,
-  createTelegramUpdateAdmissionWorkerRuntime, executeTelegramCustodiedInput,
-  reportTelegramQueueAdmission, reportTelegramUpdateCompleted,
-  reportTelegramUpdateDeferred } from "../lib/updates.ts";
 
 const workerPath = fileURLToPath(
   new URL("./fixtures/journal-worker.ts", import.meta.url),
@@ -132,71 +98,6 @@ test("Legacy custody disposition authority binds immutable quarantined failure e
     target: { chatId: 1 } }, evidence), undefined);
   assert.equal(createTelegramUpdateJournalLegacyCustodyEvidence({ ...entry,
     inputClaim: { phase: "running" } } as never), undefined);
-});
-
-test("V3 legacy custody disposition atomically requeues or discards with audit", async () => {
-  await withInputCustodyFixture(async ({ path, options, setHook }) => {
-    const retryEntry = { updateId: 7, update: { update_id: 7 }, admittedAtMs: 100,
-      preApprovalExcluded: false, state: "retry-wait" as const,
-      failure: { attemptCount: 2, failedAtMs: 200, failureClass: "transport",
-        summary: "retry later" }, nextRetryAtMs: 300 };
-    const failedEntry = { updateId: 8, update: { update_id: 8 }, admittedAtMs: 110,
-      preApprovalExcluded: false, state: "failed" as const,
-      failure: { attemptCount: 3, failedAtMs: 210, failureClass: "handler",
-        summary: "terminal" }, terminalAtMs: 220, terminalReason: "attempt-limit",
-      terminalFailureId: "failure-terminal-8" };
-    writeFileSync(path, `${JSON.stringify({ version: 3,
-      acceptedThroughUpdateId: 8, profile: "work",
-      botIdentity: options.botIdentity, entries: [retryEntry, failedEntry] })}\n`);
-    let authorized = true;
-    const authorizationKeys: string[][] = [];
-    const store = createTelegramInputJournalStore({ ...options, getNowMs: () => 500,
-      authorizeLegacyCustodyDisposition: authority => {
-        authorizationKeys.push(Object.keys(authority).sort());
-        return authorized;
-      } });
-    const inspector = createTelegramInputJournalStore({ ...options,
-      withSourceSerialization() { throw new Error("candidate listing entered mutation serialization"); } });
-    const candidates = inspector.listLegacyCustodyCandidates();
-    assert.deepEqual(candidates.map(candidate => candidate.updateId), [7, 8]);
-    assert.deepEqual(Object.keys(candidates[0]!).sort(),
-      ["attemptCount", "evidenceSha256", "failureClass", "state", "updateId"]);
-    const retryEvidence = createTelegramUpdateJournalLegacyCustodyEvidence(retryEntry)!;
-    const retryAuthority = { version: 1 as const, dispositionId: "legacy:retry:7",
-      updateId: 7, evidenceSha256: retryEvidence.evidenceSha256, action: "requeue-v3" as const,
-      operatorAuthorityId: "operator:1", authorizedAtMs: 400 };
-    let boundaries = 0;
-    setHook(boundary => {
-      boundaries += 1;
-      if (boundaries === 3 && boundary === "before-write")
-        throw new Error("legacy disposition snapshot commit unknown");
-    });
-    assert.throws(() => store.applyLegacyCustodyDisposition(retryAuthority),
-      error => isJournalError(error, "io"));
-    setHook(undefined);
-    assert.equal(store.read().entries.find(entry => entry.updateId === 7)?.state, "pending");
-    assert.equal(store.applyLegacyCustodyDisposition(retryAuthority).duplicate, true);
-    assert.deepEqual(authorizationKeys[1], ["action", "authorizedAtMs", "dispositionId",
-      "evidenceSha256", "operatorAuthorityId", "updateId", "version"]);
-    const callsBeforeMalformedDuplicate = authorizationKeys.length;
-    assert.throws(() => store.applyLegacyCustodyDisposition({ ...retryAuthority,
-      extraAuthority: "must-not-reach-authorizer" } as never), /another authority/);
-    assert.equal(authorizationKeys.length, callsBeforeMalformedDuplicate);
-    assert.throws(() => store.applyLegacyCustodyDisposition({ ...retryAuthority,
-      dispositionId: "legacy:retry:7:again" }), /non-quarantined/);
-    const failedEvidence = createTelegramUpdateJournalLegacyCustodyEvidence(failedEntry)!;
-    const discardAuthority = { version: 1 as const, dispositionId: "legacy:discard:8",
-      updateId: 8, evidenceSha256: failedEvidence.evidenceSha256, action: "discard" as const,
-      operatorAuthorityId: "operator:1", authorizedAtMs: 410 };
-    authorized = false;
-    assert.throws(() => store.applyLegacyCustodyDisposition(discardAuthority), /unauthorized/);
-    authorized = true;
-    assert.equal(store.applyLegacyCustodyDisposition(discardAuthority).duplicate, false);
-    const snapshot = store.read();
-    assert.equal(snapshot.entries.some(entry => entry.updateId === 8), false);
-    assert.deepEqual(snapshot.operatorDispositions?.map(disposition => disposition.failureId),
-      ["legacy:retry:7", "legacy:discard:8"]);
-  });
 });
 
 test("Follower journal discovery is profile-exact, segment-aware, and fail-closed", async () => {
@@ -232,6 +133,7 @@ async function withInputCustodyFixture(
     setBinding: (binding: string) => void;
     setHook: (hook: TelegramUpdateJournalStoreOptions["onPublicationBoundary"]) => void;
     ledger: ReturnType<typeof createTelegramWorkspaceAdmissionLedger>;
+    config: ReturnType<typeof createTelegramConfigStore>;
   }) => Promise<void>,
 ): Promise<void> {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-input-custody-")));
@@ -275,101 +177,11 @@ async function withInputCustodyFixture(
         hook?.(boundary, target);
       },
     };
-    await run({ path, dir, options, ledger, setOwner: value => { owner = value; },
+    await run({ path, dir, options, ledger, config, setOwner: value => { owner = value; },
       setBinding: value => { recipientBindingKey = value; }, setHook: value => { hook = value; } });
     assert.deepEqual(ledger.read().leases, []);
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
-
-function inputSource(receipt: {
-  journalBindingKey: string;
-  tokenSha256: string;
-  updateId: number;
-}) {
-  return { journalBindingKey: receipt.journalBindingKey,
-    tokenSha256: receipt.tokenSha256, updateId: receipt.updateId };
-}
-
-test("Input custody acquires once, fences start and settlement, and preserves exact old receipts", async () => {
-  await withInputCustodyFixture(async ({ options, setOwner, setBinding, ledger }) => {
-    const store = createTelegramInputJournalStore(options);
-    assert.equal("removeCompleted" in store, false);
-    assert.equal("removeCompletedExact" in store, false);
-    assert.equal("inspectSourceCompletion" in store, false);
-    assert.equal("abandonPending" in store, false);
-    assert.equal("inspectPendingRetention" in store, false);
-    assert.equal("inspectAbandonedPending" in store, false);
-    assert.equal("markQueued" in store, false);
-    assert.equal("acquireInput" in createTelegramUpdateJournalStore(options), false);
-    store.appendBatch([{ update_id: 10 }, { update_id: 20, message: { text: "original" } }], 20);
-    const request = { updateId: 20, recipientBindingKey: "workspace:owner",
-      executionUpdate: { update_id: 20, message: { text: "routed", message_thread_id: 9 } } };
-    const first = store.acquireInput(request);
-    assert.equal(first.acquired, true);
-    assert.deepEqual(ledger.read().leases, []);
-    assert.throws(() => store.completeInput(first.receipt), (error) => isJournalError(error, "conflict"));
-    assert.deepEqual(createTelegramInputJournalStore(options).acquireInput(request), { acquired: false, receipt: first.receipt });
-    assert.throws(() => store.acquireInput({ ...request, recipientBindingKey: "another" }), (error) => isJournalError(error, "conflict"));
-    assert.throws(() => store.acquireInput({ ...request, executionUpdate: undefined }), (error) => isJournalError(error, "conflict"));
-    const second = store.acquireInput({ updateId: 10, recipientBindingKey: "workspace:owner" });
-    assert.notEqual(second.receipt.owner.acquisitionId, first.receipt.owner.acquisitionId);
-    const identity = { ...options.queueRuntimeIdentity, sessionGeneration: 1 };
-    setOwner({ ...identity, sessionGeneration: 2 });
-    assert.throws(() => store.startInput(first.receipt), (error) => isJournalError(error, "conflict"));
-    assert.throws(() => store.acquireInput(request), (error) => isJournalError(error, "conflict"));
-    setOwner(identity);
-    setBinding("workspace:replacement");
-    assert.throws(() => store.startInput(first.receipt), (error) => isJournalError(error, "conflict"));
-    setBinding("workspace:owner");
-    for (const changed of [
-      { ...first.receipt, journalBindingKey: first.receipt.journalBindingKey + "wrong" },
-      { ...first.receipt, updateId: 10 },
-      { ...first.receipt, owner: { ...first.receipt.owner, acquisitionId: "stale" } },
-      { ...first.receipt, owner: { ...first.receipt.owner, processBirthId: "foreign" } },
-    ]) assert.throws(() => store.startInput(changed), (error) => isJournalError(error, "conflict"));
-    const started = store.startInput(first.receipt);
-    assert.deepEqual(started, { started: true, update: request.executionUpdate });
-    if (started.started) (started.update.message as { text: string }).text = "caller mutation";
-    assert.deepEqual(createTelegramInputJournalStore(options).startInput(first.receipt), { started: false });
-    assert.equal((store.read().entries[1]!.inputClaim!.executionUpdate!.message as { text: string }).text, "routed");
-    const foreign = { instanceId: "foreign", processId: process.pid + 1, processBirthId: "foreign-birth" };
-    const other = createTelegramInputJournalStore({ ...options, queueRuntimeIdentity: foreign,
-      getInputContext: () => ({ owner: { ...foreign, sessionGeneration: 1 }, recipientBindingKey: "workspace:owner" }) });
-    assert.throws(() => other.acquireInput({ updateId: 10, recipientBindingKey: "workspace:owner" }), (error) => isJournalError(error, "conflict"));
-    assert.throws(() => other.completeInput(first.receipt), (error) => isJournalError(error, "conflict"));
-    // Settlement preserves its exact acquired authority after the originating session disappears.
-    setOwner(undefined);
-    assert.deepEqual(store.completeInput(first.receipt).removedUpdateIds, [20]);
-    assert.deepEqual(store.completeInput(first.receipt).removedUpdateIds, []);
-    assert.deepEqual(store.appendBatch([{ update_id: 20 }], 20).addedUpdateIds, []);
-    setOwner(identity);
-    assert.throws(() => store.acquireInput(request), (error) => isJournalError(error, "conflict"));
-    assert.equal(store.startInput(second.receipt).started, true);
-    assert.deepEqual(store.completeInput(second.receipt).removedUpdateIds, [10]);
-    assert.deepEqual(store.read().entries, []);
-  });
-});
-
-test("V3 activation readiness fails closed on mixed startup evidence", () => {
-  const ready = { requested: true, sourceStatus: "v3" as const,
-    legacyWritersExcluded: true, historicalMigrationComplete: true,
-    peerReadiness: ["ready"] as const };
-  assert.deepEqual(evaluateTelegramInputCustodyActivationReadiness(ready), { enabled: true });
-  assert.deepEqual(evaluateTelegramInputCustodyActivationReadiness({ ...ready,
-    sourceStatus: "absent" }), { enabled: true });
-  const cases = [
-    [{ ...ready, requested: false }, "disabled"],
-    [{ ...ready, legacyWritersExcluded: false }, "legacy-writers-present"],
-    [{ ...ready, historicalMigrationComplete: false }, "migration-incomplete"],
-    [{ ...ready, sourceStatus: "legacy" as const }, "source-unready"],
-    [{ ...ready, sourceStatus: "unsupported" as const }, "source-unready"],
-    [{ ...ready, sourceStatus: "ambiguous" as const }, "source-unready"],
-    [{ ...ready, peerReadiness: ["ready", "legacy"] as const }, "peer-capability-mismatch"],
-    [{ ...ready, peerReadiness: ["unknown"] as const }, "peer-capability-mismatch"],
-  ] as const;
-  for (const [input, blocker] of cases) assert.deepEqual(
-    evaluateTelegramInputCustodyActivationReadiness(input), { enabled: false, blocker });
-});
 
 test("Legacy journal mutations honor the optional outer writer admission fence", async () => {
   await withInputCustodyFixture(async ({ options, path }) => {
@@ -416,42 +228,6 @@ test("Legacy journal mutations honor the optional outer writer admission fence",
   });
 });
 
-test("V3 source readiness adapter observes absent then strict v3 family", async () => {
-  await withInputCustodyFixture(async ({ options, path }) => {
-    const inspection = { ...options.sourceAccess, path,
-      profile: options.profileName!, botIdentity: options.botIdentity };
-    const registry = createTelegramBusFollowerRegistry();
-    const readyProtocol = createTelegramBusProtocolIdentity({ runtimeBuild: "0.45.0",
-      capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
-        TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE] });
-    registry.register({ instanceId: "peer", registrationGeneration: "g1",
-      protocol: readyProtocol, connectedAtMs: 1 });
-    const resolve = createTelegramInputCustodyActivationReadinessResolver({
-      isRequested: () => true,
-      inspectSource: () => inspectTelegramInputCustodySourceStatus(inspection),
-      areLegacyWritersExcluded: () => true,
-      isHistoricalMigrationComplete: () => true,
-      listPeerReadiness: () => getTelegramInputCustodyPeerReadiness(registry.list()),
-    });
-    assert.equal(inspectTelegramInputCustodySourceStatus(inspection), "absent");
-    assert.deepEqual(resolve(), { enabled: true });
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 1 }], 1);
-    assert.equal(inspectTelegramInputCustodySourceStatus(inspection), "v3");
-    assert.deepEqual(resolve(), { enabled: true });
-    registry.register({ instanceId: "peer", registrationGeneration: "g1",
-      protocol: createTelegramBusProtocolIdentity({ runtimeBuild: "0.44.0",
-        capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] }), connectedAtMs: 2 });
-    assert.deepEqual(resolve(), { enabled: false, blocker: "peer-capability-mismatch" });
-    registry.register({ instanceId: "peer", registrationGeneration: "g2",
-      protocol: readyProtocol, connectedAtMs: 3 });
-    assert.deepEqual(resolve(), { enabled: true });
-    await writeFile(path, "{broken");
-    assert.equal(inspectTelegramInputCustodySourceStatus(inspection), "ambiguous");
-    assert.deepEqual(resolve(), { enabled: false, blocker: "source-unready" });
-  });
-});
-
 test("Journal reference registry bounds and exactly releases process-local leases", async () => {
   const registry = createTelegramUpdateJournalReferenceRegistry({ maxActive: 2 });
   const releaseLeader = registry.acquire({ referenceClass: "leader-lifecycle",
@@ -486,2013 +262,6 @@ test("Journal reference registry bounds and exactly releases process-local lease
   rejectOperation(new Error("operation failed"));
   await assert.rejects(pending, /operation failed/);
   assert.deepEqual(registry.list(), []);
-});
-
-test("V3 migration completion authority binds cutover and historical inventory", () => {
-  const expected = { profileKey: "profile:work", recoveryKey: "journal:work" };
-  const authority = { version: 1 as const, status: "authorized" as const,
-    authorityId: "migration:1", startupAuthorityId: "operator-cutover:1",
-    closureOperationId: "closure:1", ...expected,
-    migrationInventorySha256: "b".repeat(64), resultingSourceFamily: "v3" as const,
-    authorizedAtMs: 1_000 };
-  assert.deepEqual(normalizeTelegramInputCustodyMigrationCompletionAuthority(authority, expected),
-    authority);
-  assert.equal(normalizeTelegramInputCustodyMigrationCompletionAuthority({ ...authority,
-    recoveryKey: "journal:other" }, expected), undefined);
-  assert.equal(normalizeTelegramInputCustodyMigrationCompletionAuthority({ ...authority,
-    resultingSourceFamily: "legacy" }, expected), undefined);
-  assert.equal(normalizeTelegramInputCustodyMigrationCompletionAuthority({ ...authority,
-    migrationInventorySha256: "raw inventory" }, expected), undefined);
-  assert.equal(normalizeTelegramInputCustodyMigrationCompletionAuthority({ ...authority,
-    retryDisposition: "discard" }, expected), undefined);
-  assert.equal(normalizeTelegramInputCustodyMigrationCompletionAuthority({ ...authority,
-    status: "revoked" }, expected)?.status, "revoked");
-});
-
-test("V3 migration completion publication is exact and idempotent", () => {
-  const expected = { profileKey: "profile:work", recoveryKey: "journal:work" };
-  const digest = "b".repeat(64);
-  const authority = { version: 1 as const, status: "authorized" as const,
-    authorityId: "migration:1", startupAuthorityId: "operator-cutover:1",
-    closureOperationId: "closure:1", ...expected, migrationInventorySha256: digest,
-    resultingSourceFamily: "v3" as const, authorizedAtMs: 1_000 };
-  let retained: string | undefined;
-  const store = createTelegramInputCustodyReadinessEvidenceStore({
-    readRetained: () => retained, publishRetained(value) { retained = value; },
-    withSerialization: operation => operation(), authorizePublication: () => true });
-  store.publish({ expectedRevision: 0, kind: "migration-completion", evidence: authority });
-  let source: "absent" | "v3" = "v3";
-  const run = (migrationInventorySha256 = digest) =>
-    executeTelegramInputCustodyMigrationCompletion({ expected, authority,
-      migrationInventorySha256, inspectSource: () => source, evidenceStore: store });
-  assert.deepEqual(run("c".repeat(64)), { kind: "blocked", blocker: "inventory-drift" });
-  source = "absent";
-  assert.deepEqual(run(), { kind: "blocked", blocker: "source-drift" });
-  source = "v3";
-  const completed = run();
-  assert.equal(completed.kind, "completed");
-  if (completed.kind === "completed") assert.equal(completed.resumed, false);
-  const revision = store.read().revision;
-  const resumed = run();
-  assert.equal(resumed.kind, "completed");
-  if (resumed.kind === "completed") assert.equal(resumed.resumed, true);
-  assert.equal(store.read().revision, revision);
-  store.publish({ expectedRevision: revision, kind: "migration-completion",
-    evidence: { ...authority, status: "revoked" } });
-  assert.deepEqual(run(), { kind: "blocked", blocker: "migration-authority" });
-});
-
-test("V3 startup exclusion authority binds closure, inventory, identity, and protocol", () => {
-  const expected = { profileKey: "profile:work", recoveryKey: "journal:work" };
-  const authority = { version: 1 as const, status: "enforced" as const,
-    authorityId: "operator-cutover:1", closureOperationId: "closure:1", ...expected,
-    writerInventorySha256: "a".repeat(64), allowedWriterProtocol: "custody-v3" as const,
-    authorizedAtMs: 1_000 };
-  assert.deepEqual(normalizeTelegramInputCustodyStartupExclusionAuthority(authority, expected), authority);
-  assert.equal(normalizeTelegramInputCustodyStartupExclusionAuthority({ ...authority,
-    recoveryKey: "journal:other" }, expected), undefined);
-  assert.equal(normalizeTelegramInputCustodyStartupExclusionAuthority({ ...authority,
-    writerInventorySha256: "raw inventory" }, expected), undefined);
-  assert.equal(normalizeTelegramInputCustodyStartupExclusionAuthority({ ...authority,
-    allowedWriterProtocol: "legacy" }, expected), undefined);
-  assert.equal(normalizeTelegramInputCustodyStartupExclusionAuthority({ ...authority,
-    target: { chatId: 1 } }, expected), undefined);
-  assert.equal(normalizeTelegramInputCustodyStartupExclusionAuthority({ ...authority,
-    status: "revoked" }, expected)?.status, "revoked");
-});
-
-test("V3 writer exclusion requires complete inventory and proven process death", () => {
-  const expected = { profileKey: "profile:work", recoveryKey: "journal:work" };
-  const writers = [{ processId: 11, processBirthId: "11:start:a" },
-    { processId: 12, processBirthId: "12:start:b" }];
-  const digest = "a".repeat(64);
-  const startupAuthority = { version: 1 as const, status: "enforced" as const,
-    authorityId: "operator-cutover:1", closureOperationId: "closure:1", ...expected,
-    writerInventorySha256: digest, allowedWriterProtocol: "custody-v3" as const,
-    authorizedAtMs: 1_000 };
-  const evaluate = (complete: boolean, states: Record<number, "alive" | "dead" | "unverifiable">,
-    identity = expected,
-    authority: Parameters<typeof evaluateTelegramInputCustodyWriterExclusionEvidence>[0]["startupAuthority"] = startupAuthority) =>
-    evaluateTelegramInputCustodyWriterExclusionEvidence({ expected,
-      inventory: { ...identity, complete, writers, writerInventorySha256: digest },
-      startupAuthority: authority,
-      getProcessLiveness: writer => states[writer.processId] ?? "unverifiable" });
-  assert.equal(evaluate(false, { 11: "dead", 12: "dead" }).status, "unknown");
-  assert.equal(evaluate(true, { 11: "dead", 12: "dead" },
-    { ...expected, recoveryKey: "journal:other" }).status, "unknown");
-  assert.equal(evaluate(true, { 11: "dead", 12: "unverifiable" }).status, "unknown");
-  assert.equal(evaluate(true, { 11: "dead", 12: "alive" }).status, "present");
-  assert.equal(evaluate(true, { 11: "dead", 12: "dead" }, expected,
-    { ...startupAuthority, status: "revoked" }).status, "unknown");
-  assert.deepEqual(evaluate(true, { 11: "dead", 12: "dead" }), {
-    version: 1, status: "excluded", ...expected, startupAuthorityId: "operator-cutover:1",
-    closureOperationId: "closure:1", writerInventorySha256: digest });
-});
-
-test("V3 readiness evidence store serializes authorized exact-revision proofs", () => {
-  let retained: string | undefined;
-  let authorized = true;
-  const authorizedEvidenceKeys: string[][] = [];
-  const store = createTelegramInputCustodyReadinessEvidenceStore({
-    readRetained: () => retained,
-    publishRetained(value) { retained = value; },
-    withSerialization: operation => operation(),
-    authorizePublication: (_kind, evidence) => {
-      authorizedEvidenceKeys.push(Object.keys(evidence).sort());
-      return authorized;
-    },
-  });
-  assert.deepEqual(store.read(), { version: 1, revision: 0 });
-  const identity = { profileKey: "profile:work", recoveryKey: "journal:work" };
-  assert.equal(store.publish({ expectedRevision: 0, kind: "writer-exclusion",
-    evidence: { version: 1, status: "excluded", ...identity } }).revision, 1);
-  assert.equal(store.publish({ expectedRevision: 1, kind: "migration",
-    evidence: { version: 1, status: "complete", ...identity } }).revision, 2);
-  const startupExclusion = { version: 1 as const, status: "enforced" as const,
-    authorityId: "operator-cutover:1", closureOperationId: "closure:1", ...identity,
-    writerInventorySha256: "a".repeat(64), allowedWriterProtocol: "custody-v3" as const,
-    authorizedAtMs: 1_000 };
-  assert.equal(store.publish({ expectedRevision: 2, kind: "startup-exclusion",
-    evidence: startupExclusion }).revision, 3);
-  assert.deepEqual(store.read(), { version: 1, revision: 3,
-    writerExclusion: { version: 1, status: "excluded", ...identity },
-    migration: { version: 1, status: "complete", ...identity }, startupExclusion });
-  assert.throws(() => store.publish({ expectedRevision: 1, kind: "migration",
-    evidence: { version: 1, status: "complete", ...identity } }), /revision changed/);
-  const beforeInvalidKind = retained;
-  const callbacksBeforeInvalidKind = authorizedEvidenceKeys.length;
-  assert.throws(() => store.publish({ expectedRevision: 3, kind: "migration",
-    evidence: { version: 1, status: "excluded", ...identity } as unknown as
-      { version: 1; status: "complete"; profileKey: string; recoveryKey: string } }), /malformed/);
-  assert.equal(retained, beforeInvalidKind);
-  assert.equal(authorizedEvidenceKeys.length, callbacksBeforeInvalidKind);
-  assert.throws(() => store.publish({ expectedRevision: 3, kind: "migration",
-    evidence: { version: 1, status: "complete", profileKey: "profile:other",
-      recoveryKey: "journal:other" } }), /conflicting identities/);
-  assert.equal(retained, beforeInvalidKind);
-  assert.equal(authorizedEvidenceKeys.length, callbacksBeforeInvalidKind);
-  authorized = false;
-  assert.throws(() => store.publish({ expectedRevision: 3, kind: "startup-exclusion",
-    evidence: { ...startupExclusion, status: "revoked" } }), /unauthorized/);
-  authorized = true;
-  assert.equal(store.publish({ expectedRevision: 3, kind: "startup-exclusion",
-    evidence: { ...startupExclusion, status: "revoked" } }).revision, 4);
-  assert.equal(store.read().startupExclusion?.status, "revoked");
-  const beforeAuthorityConflict = retained;
-  assert.throws(() => store.publish({ expectedRevision: 4, kind: "writer-exclusion",
-    evidence: { version: 1, status: "excluded", ...identity, startupAuthorityId: "other",
-      closureOperationId: startupExclusion.closureOperationId,
-      writerInventorySha256: startupExclusion.writerInventorySha256 } }), /conflicting authorities/);
-  assert.equal(retained, beforeAuthorityConflict);
-  const migrationCompletion = { version: 1 as const, status: "authorized" as const,
-    authorityId: "migration:1", startupAuthorityId: startupExclusion.authorityId,
-    closureOperationId: startupExclusion.closureOperationId, ...identity,
-    migrationInventorySha256: "b".repeat(64), resultingSourceFamily: "v3" as const,
-    authorizedAtMs: 1_100 };
-  assert.equal(store.publish({ expectedRevision: 4, kind: "migration-completion",
-    evidence: migrationCompletion }).revision, 5);
-  assert.equal(store.publish({ expectedRevision: 5, kind: "migration", evidence: {
-    version: 1, status: "complete", ...identity,
-    migrationAuthorityId: migrationCompletion.authorityId,
-    startupAuthorityId: migrationCompletion.startupAuthorityId,
-    closureOperationId: migrationCompletion.closureOperationId,
-    migrationInventorySha256: migrationCompletion.migrationInventorySha256,
-    resultingSourceFamily: migrationCompletion.resultingSourceFamily } }).revision, 6);
-  assert.equal(store.read().migrationCompletion?.authorityId, "migration:1");
-  retained = "{broken";
-  assert.throws(() => store.read(), /malformed/);
-});
-
-test("V3 writer cutover installs mode before linked exclusion publication", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-writer-cutover-"));
-  try {
-    const expected = { profileKey: "profile:work", recoveryKey: "journal:work" };
-    const digest = "a".repeat(64);
-    const owner = { processId: 101, processBirthId: "101:start:cutover" };
-    const ledger = createTelegramWorkspaceAdmissionLedger({ path: join(dir, "admission.json"),
-      profileKey: expected.profileKey, owner, getNowMs: () => 1_000,
-      getProcessLiveness: () => "alive" });
-    const closure = ledger.acquireJournalWriterClosure({ operationId: "closure:cutover",
-      recoveryKey: expected.recoveryKey, requestedAtMs: 900 });
-    assert.equal(closure.kind, "acquired");
-    if (closure.kind !== "acquired") return;
-    let retained: string | undefined;
-    const store = createTelegramInputCustodyReadinessEvidenceStore({
-      readRetained: () => retained, publishRetained(value) { retained = value; },
-      withSerialization: operation => operation(), authorizePublication: () => true });
-    const authority = { version: 1 as const, status: "enforced" as const,
-      authorityId: "operator-cutover:1", closureOperationId: closure.fence.operationId,
-      ...expected, writerInventorySha256: digest, allowedWriterProtocol: "custody-v3" as const,
-      authorizedAtMs: 950 };
-    store.publish({ expectedRevision: 0, kind: "startup-exclusion", evidence: authority });
-    const run = () => executeTelegramInputCustodyWriterCutover({ expected,
-      closure: closure.fence, startupAuthority: authority,
-      inventory: { ...expected, complete: true, writerInventorySha256: digest, writers: [] },
-      getProcessLiveness: () => "dead",
-      installProtocolMode: (fence, evidence) => ledger.installJournalWriterProtocolMode(fence, evidence),
-      evidenceStore: store });
-    const completed = run();
-    assert.equal(completed.kind, "completed");
-    assert.equal(ledger.read().fence, undefined);
-    assert.equal(ledger.read().writerProtocolMode?.startupAuthorityId, authority.authorityId);
-    assert.equal(store.read().writerExclusion?.closureOperationId, closure.fence.operationId);
-    const resumed = run();
-    assert.equal(resumed.kind, "completed");
-    if (resumed.kind === "completed") assert.equal(resumed.resumed, true);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("V3 writer cutover keeps mode non-ready when authority changes after installation", () => {
-  const expected = { profileKey: "profile:work", recoveryKey: "journal:work" };
-  const digest = "a".repeat(64);
-  const authority = { version: 1 as const, status: "enforced" as const,
-    authorityId: "operator-cutover:1", closureOperationId: "closure:1", ...expected,
-    writerInventorySha256: digest, allowedWriterProtocol: "custody-v3" as const,
-    authorizedAtMs: 1_000 };
-  let reads = 0;
-  let publications = 0;
-  const result = executeTelegramInputCustodyWriterCutover({ expected,
-    closure: { operationId: "closure:1", ...expected }, startupAuthority: authority,
-    inventory: { ...expected, complete: true, writerInventorySha256: digest, writers: [] },
-    getProcessLiveness: () => "dead",
-    installProtocolMode: () => ({ resumed: false, mode: { protocol: "custody-v3", ...expected,
-      startupAuthorityId: authority.authorityId, closureOperationId: authority.closureOperationId,
-      writerInventorySha256: digest } }),
-    evidenceStore: {
-      read: () => ({ version: 1, revision: reads++, startupExclusion:
-        reads === 1 ? authority : { ...authority, status: "revoked" } }),
-      publish: () => { publications += 1; throw new Error("must not publish"); },
-    },
-  });
-  assert.equal(result.kind, "blocked");
-  if (result.kind === "blocked") assert.equal(result.blocker, "startup-authority");
-  assert.equal(publications, 0);
-});
-
-test("V3 proven readiness requires linked startup authority and installed protocol mode", () => {
-  const expected = { profileKey: "profile:work", recoveryKey: "journal:work" };
-  const digest = "a".repeat(64);
-  let writerEvidence: { version: 1; status: "excluded"; profileKey: string; recoveryKey: string;
-    startupAuthorityId?: string; closureOperationId?: string; writerInventorySha256?: string } =
-    { version: 1, status: "excluded", ...expected };
-  let startupAuthority = { version: 1 as const, status: "enforced" as "enforced" | "revoked",
-    authorityId: "operator-cutover:1", closureOperationId: "closure:1", ...expected,
-    writerInventorySha256: digest, allowedWriterProtocol: "custody-v3" as const,
-    authorizedAtMs: 1_000 };
-  let migrationEvidence: { version: 1; status: "complete"; profileKey: string; recoveryKey: string;
-    migrationAuthorityId?: string; startupAuthorityId?: string; closureOperationId?: string;
-    migrationInventorySha256?: string; resultingSourceFamily?: "absent" | "v3" } =
-    { version: 1, status: "complete", ...expected };
-  const migrationDigest = "b".repeat(64);
-  let migrationAuthority = { version: 1 as const, status: "authorized" as "authorized" | "revoked",
-    authorityId: "migration:1", startupAuthorityId: startupAuthority.authorityId,
-    closureOperationId: startupAuthority.closureOperationId, ...expected,
-    migrationInventorySha256: migrationDigest, resultingSourceFamily: "v3" as const,
-    authorizedAtMs: 1_100 };
-  let writerProtocolMode: { protocol: "custody-v3"; profileKey: string; recoveryKey: string;
-    startupAuthorityId: string; closureOperationId: string; writerInventorySha256: string } | undefined;
-  let sourceStatus: "absent" | "v3" = "v3";
-  const resolve = createTelegramInputCustodyProvenReadinessResolver({
-    isRequested: () => true, expectedIdentity: () => expected,
-    inspectSource: () => sourceStatus, listPeerReadiness: () => ["ready"],
-    readWriterExclusionEvidence: () => writerEvidence,
-    readStartupExclusionAuthority: () => startupAuthority,
-    readWriterProtocolMode: () => writerProtocolMode,
-    readMigrationCompletionAuthority: () => migrationAuthority,
-    readMigrationEvidence: () => migrationEvidence,
-  });
-  assert.deepEqual(resolve(), { enabled: false, blocker: "legacy-writers-present" });
-  writerEvidence = { ...writerEvidence, startupAuthorityId: startupAuthority.authorityId,
-    closureOperationId: startupAuthority.closureOperationId, writerInventorySha256: digest };
-  assert.deepEqual(resolve(), { enabled: false, blocker: "legacy-writers-present" });
-  writerProtocolMode = { protocol: "custody-v3", ...expected,
-    startupAuthorityId: startupAuthority.authorityId,
-    closureOperationId: startupAuthority.closureOperationId, writerInventorySha256: digest };
-  assert.deepEqual(resolve(), { enabled: false, blocker: "migration-incomplete" });
-  migrationEvidence = { ...migrationEvidence, migrationAuthorityId: migrationAuthority.authorityId,
-    startupAuthorityId: migrationAuthority.startupAuthorityId,
-    closureOperationId: migrationAuthority.closureOperationId,
-    migrationInventorySha256: migrationDigest, resultingSourceFamily: "v3" };
-  assert.deepEqual(resolve(), { enabled: true });
-  startupAuthority = { ...startupAuthority, status: "revoked" };
-  assert.deepEqual(resolve(), { enabled: false, blocker: "legacy-writers-present" });
-  startupAuthority = { ...startupAuthority, status: "enforced" };
-  writerProtocolMode = { ...writerProtocolMode, closureOperationId: "closure:other" };
-  assert.deepEqual(resolve(), { enabled: false, blocker: "legacy-writers-present" });
-  writerProtocolMode = { ...writerProtocolMode,
-    closureOperationId: startupAuthority.closureOperationId };
-  writerEvidence = { ...writerEvidence, writerInventorySha256: "b".repeat(64) };
-  assert.deepEqual(resolve(), { enabled: false, blocker: "legacy-writers-present" });
-  writerEvidence = { ...writerEvidence, writerInventorySha256: digest };
-  migrationEvidence = { ...migrationEvidence, profileKey: "profile:other" };
-  assert.deepEqual(resolve(), { enabled: false, blocker: "migration-incomplete" });
-  migrationEvidence = { ...migrationEvidence, profileKey: expected.profileKey };
-  sourceStatus = "absent";
-  assert.deepEqual(resolve(), { enabled: false, blocker: "migration-incomplete" });
-  sourceStatus = "v3";
-  migrationAuthority = { ...migrationAuthority, status: "revoked" };
-  assert.deepEqual(resolve(), { enabled: false, blocker: "migration-incomplete" });
-});
-
-test("V3 activation readiness resolver is lazy and fails closed on inspection loss", () => {
-  let requested = false;
-  let sourceReads = 0;
-  let peerReads = 0;
-  let writersExcluded = true;
-  let migrationComplete = true;
-  let sourceThrows = false;
-  let peersThrow = false;
-  const resolve = createTelegramInputCustodyActivationReadinessResolver({
-    isRequested: () => requested,
-    inspectSource() { sourceReads += 1; if (sourceThrows) throw new Error("lost source proof"); return "v3"; },
-    areLegacyWritersExcluded: () => writersExcluded,
-    isHistoricalMigrationComplete: () => migrationComplete,
-    listPeerReadiness() { peerReads += 1; if (peersThrow) throw new Error("lost peer proof"); return ["ready"]; },
-  });
-  assert.deepEqual(resolve(), { enabled: false, blocker: "disabled" });
-  assert.deepEqual([sourceReads, peerReads], [0, 0]);
-  requested = true;
-  writersExcluded = false;
-  assert.deepEqual(resolve(), { enabled: false, blocker: "legacy-writers-present" });
-  assert.deepEqual([sourceReads, peerReads], [0, 0]);
-  writersExcluded = true;
-  migrationComplete = false;
-  assert.deepEqual(resolve(), { enabled: false, blocker: "migration-incomplete" });
-  assert.deepEqual([sourceReads, peerReads], [0, 0]);
-  migrationComplete = true;
-  sourceThrows = true;
-  assert.deepEqual(resolve(), { enabled: false, blocker: "source-unready" });
-  assert.deepEqual([sourceReads, peerReads], [1, 0]);
-  sourceThrows = false;
-  peersThrow = true;
-  assert.deepEqual(resolve(), { enabled: false, blocker: "peer-capability-mismatch" });
-  peersThrow = false;
-  assert.deepEqual(resolve(), { enabled: true });
-});
-
-test("Legacy custody operator runtime resolves exact live binding without caching", () => {
-  const calls: string[] = [];
-  let bindingKey = "journal:g1";
-  const candidate = { updateId: 7, state: "retry-wait" as const, attemptCount: 2,
-    failureClass: "transport", evidenceSha256: "a".repeat(64) };
-  const runtime = createTelegramInputCustodyLegacyDispositionRuntime({
-    withBindingReference(recoveryKey, operation) {
-      if (recoveryKey !== bindingKey) throw new Error("binding is unavailable");
-      calls.push(`enter:${bindingKey}`);
-      try {
-        return operation({ recoveryKey: bindingKey, journal: {
-          listLegacyCustodyCandidates() { calls.push(`list:${bindingKey}`); return [candidate]; },
-          applyLegacyCustodyDisposition(authority) {
-            calls.push(`apply:${bindingKey}:${authority.dispositionId}`);
-            return { disposition: { dispositionKind: "legacy-custody" as const,
-              failureId: authority.dispositionId, updateId: authority.updateId,
-              action: authority.action, committedAtMs: authority.authorizedAtMs,
-              evidenceSha256: authority.evidenceSha256,
-              operatorAuthorityId: authority.operatorAuthorityId,
-              authorizedAtMs: authority.authorizedAtMs }, duplicate: false,
-              entryCount: 1, serializedBytes: 1 };
-          } } });
-      } finally { calls.push(`exit:${bindingKey}`); }
-    },
-  });
-  assert.deepEqual(runtime.list("journal:g1"), [candidate]);
-  bindingKey = "journal:g2";
-  assert.throws(() => runtime.list("journal:g1"), /binding is unavailable/);
-  const authority = { version: 1 as const, dispositionId: "legacy:7", updateId: 7,
-    evidenceSha256: candidate.evidenceSha256, action: "discard" as const,
-    operatorAuthorityId: "operator:1", authorizedAtMs: 500 };
-  assert.equal(runtime.apply("journal:g2", authority).disposition.failureId, "legacy:7");
-  assert.deepEqual(calls, ["enter:journal:g1", "list:journal:g1", "exit:journal:g1",
-    "enter:journal:g2", "apply:journal:g2:legacy:7", "exit:journal:g2"]);
-});
-
-test("V3 worker journal port exposes custody but cannot complete non-excluded input without receipts", async () => {
-  await withInputCustodyFixture(async ({ options, path }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 1 }], 1);
-    const port = createTelegramInputCustodyWorkerJournalPort(store);
-    assert.deepEqual(Object.keys(port.inputCustody).sort(),
-      ["acquireInput", "completeInput", "queueInputs", "startInput"]);
-    assert.equal("applyLegacyCustodyDisposition" in port.inputCustody, false);
-    assert.equal("listLegacyCustodyCandidates" in port.inputCustody, false);
-    assert.equal(port.read().version, 3);
-    const before = await readFile(path, "utf8");
-    const assertRawRemovalRefused = () => {
-      const snapshot = store.read();
-      assert.throws(() => port.removeCompleted([1]), error => isJournalError(error, "conflict"));
-      assert.deepEqual(store.read(), snapshot);
-    };
-    assertRawRemovalRefused();
-    assert.throws(() => port.markQueued({ queueKind: "prompt", receiptId: "legacy",
-      sourceUpdateIds: [1], owner: { ...options.queueRuntimeIdentity, sessionGeneration: 1 } }),
-    /forbids legacy raw worker settlement/);
-    assert.throws(() => port.markExecutionFailure({ updateId: 1, expectedAttemptCount: 0,
-      failedAtMs: 1, failureClass: "legacy", summary: "legacy", disposition: "failed" }),
-    /forbids legacy raw worker settlement/);
-    assert.equal(await readFile(path, "utf8"), before);
-    let enabled = false;
-    let sourceReads = 0;
-    let recipientReads = 0;
-    const resolve = createTelegramInputCustodyLifecycleBindingResolver({
-      isEnabled: () => enabled,
-      resolveInputJournal() { sourceReads += 1; return { runtimeKey: "runtime-v3",
-        recoveryKey: createTelegramUpdateJournalBindingKey(options), journal: store }; },
-      getRecipientBindingKey() { recipientReads += 1; return "workspace:owner"; },
-    });
-    assert.equal(resolve(), undefined);
-    assert.deepEqual([sourceReads, recipientReads], [0, 0]);
-    enabled = true;
-    const binding = resolve();
-    assert.equal(binding?.runtimeKey,
-      JSON.stringify({ source: "runtime-v3", recipientBindingKey: "workspace:owner" }));
-    assert.equal(binding?.recipientBindingKey, "workspace:owner");
-    assert.equal(binding?.journal.read().version, 3);
-    assert.deepEqual([sourceReads, recipientReads], [1, 1]);
-    const raw = store.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-    assertRawRemovalRefused();
-    assert.equal(store.startInput(raw.receipt).started, true);
-    assertRawRemovalRefused();
-    const queued = store.queueInputs({ queueKind: "prompt", receiptId: "v3-handoff",
-      receipts: [raw.receipt] }).queueReceipt;
-    assertRawRemovalRefused();
-    const recipientOwner = { instanceId: "recipient", processId: process.pid + 1,
-      processBirthId: `${process.pid + 1}:recipient`, sessionGeneration: 1 };
-    const handoff = { queueKind: queued.queueKind, receiptId: queued.receiptId,
-      sourceUpdateIds: queued.sourceUpdateIds, expectedOwner: queued.queueOwner, recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken() };
-    assert.deepEqual(binding?.journal.offerQueuedHandoff?.(handoff).offeredUpdateIds, [1]);
-    assertRawRemovalRefused();
-    assert.deepEqual(binding?.journal.cancelQueuedHandoff?.(handoff).cancelledUpdateIds, [1]);
-  });
-});
-
-test("Custodied execution adapter starts once and settles complete or single-input queue outcomes", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }], 3);
-    assert.deepEqual(await executeTelegramCustodiedInput({ journal: store,
-      update: { update_id: 1 }, recipientBindingKey: "workspace:owner",
-      async execute() { return { kind: "complete" }; } }), { status: "completed" });
-    let ambiguousExecutions = 0;
-    await assert.rejects(executeTelegramCustodiedInput({ journal: store,
-      update: { update_id: 2 }, recipientBindingKey: "workspace:owner",
-      async execute() { ambiguousExecutions += 1; throw new Error("execution outcome unknown"); } }));
-    assert.equal((await executeTelegramCustodiedInput({ journal: store,
-      update: { update_id: 2 }, recipientBindingKey: "workspace:owner",
-      async execute() { ambiguousExecutions += 1; return { kind: "complete" }; } })).status,
-    "outcome-unknown");
-    assert.equal(ambiguousExecutions, 1);
-    const queued = await executeTelegramCustodiedInput({ journal: store,
-      update: { update_id: 3 }, recipientBindingKey: "workspace:owner",
-      async execute() { return { kind: "queued", queueKind: "prompt",
-        receiptId: "queue-three", sourceUpdateIds: [3] }; } });
-    assert.equal(queued.status, "queued");
-    if (queued.status === "queued") assert.equal(queued.queueReceipt.receiptId, "queue-three");
-    assert.deepEqual(store.read().entries.map(entry => [entry.updateId, entry.state]),
-      [[2, "pending"], [3, "queued"]]);
-  });
-});
-
-test("Custodied execution session groups deferred and current receipts atomically", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 10 }, { update_id: 11 }, { update_id: 12 },
-      { update_id: 13 }], 13);
-    const session = createTelegramCustodiedExecutionSession({ journal: store,
-      recipientBindingKey: "workspace:owner" });
-    const deferred = await session.execute({ update_id: 10 },
-      async () => ({ kind: "deferred" }));
-    assert.equal(deferred.status, "deferred");
-    assert.equal((await session.execute({ update_id: 11 },
-      async () => ({ kind: "deferred" }))).status, "deferred");
-    const queued = await session.settle(11, { kind: "queued",
-      queueKind: "prompt", receiptId: "grouped-receipt", sourceUpdateIds: [10, 11] });
-    assert.equal(queued.status, "queued");
-    assert.equal((await session.settle(10, { kind: "queued", queueKind: "prompt",
-      receiptId: "grouped-receipt", sourceUpdateIds: [10, 11] })).status, "queued");
-    await assert.rejects(session.settle(10, { kind: "queued", queueKind: "prompt",
-      receiptId: "conflict", sourceUpdateIds: [10, 11] }), /no exact running receipt/);
-    assert.deepEqual(store.read().entries.map(entry => [entry.updateId, entry.state,
-      entry.queueReceiptId]), [[10, "queued", "grouped-receipt"],
-      [11, "queued", "grouped-receipt"], [12, "pending", undefined],
-      [13, "pending", undefined]]);
-    assert.equal((await session.execute({ update_id: 12 },
-      async () => ({ kind: "deferred" }))).status, "deferred");
-    assert.deepEqual(await session.settle(12, { kind: "complete" }), { status: "completed" });
-    await assert.rejects(session.settle(12, { kind: "complete" }), /no exact running receipt/);
-    await assert.rejects(session.execute({ update_id: 13 }, async () => {
-      throw new Error("ambiguous running execution");
-    }));
-    await assert.rejects(session.settle(13, { kind: "complete" }), /no exact running receipt/);
-    const replacement = createTelegramCustodiedExecutionSession({ journal: store,
-      recipientBindingKey: "workspace:owner" });
-    assert.equal((await replacement.execute({ update_id: 13 },
-      async () => ({ kind: "complete" }))).status, "outcome-unknown");
-    await assert.rejects(replacement.settle(13, { kind: "complete" }), /no exact running receipt/);
-    if (deferred.status === "deferred")
-      assert.throws(() => store.completeInput(deferred.receipt),
-        error => isJournalError(error, "conflict"));
-  });
-});
-
-test("Custodied admission handle settles a late report through its retained receipt", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 20, message: { chat: { type: "private" } } }], 20);
-    let deferredMessage: { chat: { type: string } } | undefined;
-    const lateErrors: unknown[] = [];
-    const lateSettlements: string[] = [];
-    const handle = createTelegramCustodiedUpdateAdmissionHandle({ journal: store,
-      recipientBindingKey: "workspace:owner",
-      async defaultHandle(update) {
-        deferredMessage = update.message;
-        assert.equal(reportTelegramUpdateDeferred(update.message), true);
-      },
-      onLateOutcomeError(error) { lateErrors.push(error); },
-      onCustodiedLateSettlement(result) { lateSettlements.push(result.status); },
-    });
-    const result = await handle({ update_id: 20, message: { chat: { type: "private" } } }, {},
-      new AbortController().signal);
-    assert.equal(result.status, "deferred");
-    assert.ok(deferredMessage);
-    assert.equal(reportTelegramUpdateCompleted(deferredMessage), true);
-    await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(lateErrors, []);
-    assert.deepEqual(lateSettlements, ["completed"]);
-    assert.deepEqual(store.read().entries, []);
-  });
-});
-
-test("Assembled custodied worker publishes one late grouped queue receipt", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 30, message: { chat: { type: "private" } } },
-      { update_id: 31, message: { chat: { type: "private" } } }], 31);
-    const port = createTelegramInputCustodyWorkerJournalPort(store);
-    const owner = { ...options.queueRuntimeIdentity, sessionGeneration: 1 };
-    const sources: unknown[] = [];
-    const published: string[] = [];
-    const worker = createTelegramUpdateAdmissionWorkerRuntime({ journal: port,
-      inputCustody: port.inputCustody,
-      getJournalBindingKey: () => createTelegramUpdateJournalBindingKey(options),
-      getRecipientBindingKey: () => "workspace:owner",
-      getQueueOwnerIdentity: () => owner, hasAuthority: () => true,
-      async defaultHandle(update) {
-        sources.push(update.message);
-        if (sources.length === 1) {
-          assert.equal(reportTelegramUpdateDeferred(update.message), true);
-          return;
-        }
-        assert.equal(reportTelegramQueueAdmission(sources, [{ queueKind: "prompt",
-          receiptId: "late-group", sourceUpdateIds: [30, 31],
-          journalBindingKey: createTelegramUpdateJournalBindingKey(options) }]), true);
-      },
-      onQueueReceiptCommitted(receipt) { published.push(receipt.receiptId); },
-    });
-    try {
-      worker.start({});
-      await worker.waitForDrain();
-      await new Promise(resolve => setImmediate(resolve));
-      assert.deepEqual(published, ["late-group"]);
-      assert.deepEqual(store.read().entries.map(entry => [entry.updateId, entry.state,
-        entry.queueReceiptId]), [[30, "queued", "late-group"], [31, "queued", "late-group"]]);
-      assert.equal(worker.getState().queuedClaimCount, 2);
-      assert.equal(worker.getState().blockedReason, undefined);
-    } finally { await worker.stop(); }
-  });
-});
-
-for (const mode of ["leader-restart", "follower-mutable-active"] as const) test(`V3 lifecycle refreshes expired source dependencies behind unchanged binding keys (${mode})`, async () => {
-  await withInputCustodyFixture(async ({ options, setOwner }) => {
-    const follower = mode === "follower-mutable-active";
-    let lifetime = 1;
-    const createSource = () => {
-      const capturedLifetime = lifetime;
-      return createTelegramInputJournalStore({ ...options, getInputContext() {
-        const current = options.getInputContext();
-        return capturedLifetime === lifetime ? current : undefined;
-      } });
-    };
-    let source = createSource();
-    const resolve = createTelegramInputCustodyLifecycleBindingResolver({
-      isEnabled: () => true,
-      resolveInputJournal: () => ({ runtimeKey: "same-source-runtime",
-        recoveryKey: createTelegramUpdateJournalBindingKey(options), journal: source }),
-      getRecipientBindingKey: () => "workspace:owner",
-    });
-    let descriptor: ReturnType<typeof resolve>;
-    const resolveBinding = () => {
-      const fresh = resolve()!;
-      if (!follower || !descriptor) descriptor = fresh;
-      else Object.assign(descriptor.journal, fresh.journal);
-      return descriptor;
-    };
-    const originalKeys = { runtime: resolveBinding().runtimeKey, recovery: resolveBinding().recoveryKey };
-    const handled: number[] = [];
-    const assembly = createTelegramUpdateAdmissionLifecycleAssembly({
-      runtimeBinding: createTelegramUpdateAdmissionRuntimeBinding({ isFollowerRegistered: () => follower }),
-      worker: {
-        getQueueOwnerIdentity: () => ({ ...options.queueRuntimeIdentity, sessionGeneration: lifetime }),
-        async defaultHandle(update) { handled.push(update.update_id); },
-      },
-      leader: { resolveBinding, hasAuthority: () => !follower },
-      follower: { resolveBinding, isRegistered: () => follower,
-        getGeneration: () => "stable-registration", prepareUpdateForExecution: update => update },
-    });
-    const lifecycle = follower ? assembly.follower : assembly.leader;
-    try {
-      source.appendBatch([{ update_id: 1 }], 1);
-      await lifecycle.onSessionStart({});
-      await new Promise<void>(done => setImmediate(done));
-      assert.deepEqual(handled, [1]);
-      await lifecycle.onSessionShutdown();
-      // Stable source handles may still reuse the worker and its compatible dependencies.
-      await lifecycle.onSessionStart({});
-      await new Promise<void>(done => setImmediate(done));
-      assert.equal(lifecycle.getState()?.generation, 2);
-      if (!follower) await lifecycle.onSessionShutdown();
-      lifetime += 1;
-      setOwner({ ...options.queueRuntimeIdentity, sessionGeneration: lifetime });
-      source = createSource();
-      source.appendBatch([{ update_id: 2 }], 2);
-      assert.deepEqual({ runtime: resolveBinding().runtimeKey, recovery: resolveBinding().recoveryKey }, originalKeys);
-      await lifecycle.onSessionStart({});
-      await new Promise<void>(done => setImmediate(done));
-      assert.deepEqual(handled, [1, 2], "Fresh maintenance reads must not restart expired execution ports");
-      assert.equal(lifecycle.getState()?.blockedReason, undefined);
-      assert.deepEqual(source.read().entries, []);
-    } finally { await lifecycle.onSessionShutdown(); }
-  });
-});
-
-test("V3 source refresh cannot replay an unsettled handler while independent input progresses", async () => {
-  await withInputCustodyFixture(async ({ options, setOwner }) => {
-    let lifetime = 1;
-    const createSource = () => {
-      const capturedLifetime = lifetime;
-      return createTelegramInputJournalStore({ ...options, getInputContext() {
-        const current = options.getInputContext();
-        return capturedLifetime === lifetime ? current : undefined;
-      } });
-    };
-    let source = createSource();
-    const resolveBinding = createTelegramInputCustodyLifecycleBindingResolver({
-      isEnabled: () => true,
-      resolveInputJournal: () => ({ runtimeKey: "held-source-runtime",
-        recoveryKey: createTelegramUpdateJournalBindingKey(options), journal: source }),
-      getRecipientBindingKey: () => "workspace:owner",
-    });
-    const release = Promise.withResolvers<void>();
-    const attempted: number[] = [];
-    const effects: number[] = [];
-    let oldFinished = false;
-    const assembly = createTelegramUpdateAdmissionLifecycleAssembly({
-      runtimeBinding: createTelegramUpdateAdmissionRuntimeBinding({ isFollowerRegistered: () => false }),
-      worker: {
-        getQueueOwnerIdentity: () => ({ ...options.queueRuntimeIdentity, sessionGeneration: lifetime }),
-        async defaultHandle(update, _ctx, execution) {
-          attempted.push(update.update_id);
-          if (update.update_id === 1) {
-            try { await release.promise; execution!.assertCurrent(); }
-            finally { oldFinished = true; }
-          }
-          effects.push(update.update_id);
-        },
-      },
-      leader: { resolveBinding, hasAuthority: () => true },
-      follower: { resolveBinding, isRegistered: () => false,
-        getGeneration: () => undefined, prepareUpdateForExecution: update => update },
-    });
-    try {
-      source.appendBatch([{ update_id: 1 }], 1);
-      await assembly.leader.onSessionStart({});
-      await new Promise<void>(done => setImmediate(done));
-      assert.deepEqual(attempted, [1]);
-      const running = source.read().entries[0]!.inputClaim;
-      assert.equal(running?.phase, "running");
-      lifetime += 1;
-      setOwner({ ...options.queueRuntimeIdentity, sessionGeneration: lifetime });
-      source = createSource();
-      source.appendBatch([{ update_id: 2 }], 2);
-      await assembly.leader.onSessionStart({});
-      await new Promise<void>(done => setImmediate(done));
-      assert.equal(oldFinished, false, "Stop is not settlement of the held handler");
-      assert.deepEqual(attempted, [1, 2]);
-      assert.deepEqual(effects, [2]);
-      assert.deepEqual(source.read().entries.map(entry => entry.updateId), [1]);
-      assert.deepEqual(source.read().entries[0]?.inputClaim, running);
-      release.resolve();
-      await new Promise<void>(done => setImmediate(done));
-      assert.equal(oldFinished, true);
-      assert.deepEqual(effects, [2], "The aborted origin cannot issue a late effect");
-      assert.deepEqual(source.read().entries[0]?.inputClaim, running);
-    } finally {
-      release.resolve();
-      await assembly.leader.onSessionShutdown();
-      await new Promise<void>(done => setImmediate(done));
-    }
-  });
-});
-
-test("V3 lifecycle replacement never replays retained running input", async () => {
-  await withInputCustodyFixture(async ({ options, setBinding }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 40 }], 40);
-    const acquired = store.acquireInput({ updateId: 40,
-      recipientBindingKey: "workspace:owner", executionUpdate: { update_id: 40 } });
-    assert.equal(store.startInput(acquired.receipt).started, true);
-    let recipientBindingKey = "workspace:owner";
-    const resolve = createTelegramInputCustodyLifecycleBindingResolver({
-      isEnabled: () => true,
-      resolveInputJournal: () => ({ runtimeKey: "runtime-v3",
-        recoveryKey: createTelegramUpdateJournalBindingKey(options), journal: store }),
-      getRecipientBindingKey: () => recipientBindingKey,
-    });
-    const owner = { ...options.queueRuntimeIdentity, sessionGeneration: 1 };
-    let handlerCalls = 0;
-    const lifecycle = createTelegramUpdateAdmissionLifecycleRuntime({ resolveBinding: resolve,
-      getQueueOwnerIdentity: () => owner,
-      createWorker(journal, binding) {
-        return createTelegramUpdateAdmissionWorkerRuntime({ journal,
-          inputCustody: binding.journal.inputCustody,
-          getJournalBindingKey: () => binding.recoveryKey,
-          getRecipientBindingKey: () => binding.recipientBindingKey,
-          getQueueOwnerIdentity: () => owner, hasAuthority: () => true,
-          async defaultHandle() { handlerCalls += 1; } });
-      },
-    });
-    try {
-      await lifecycle.onSessionStart({});
-      await new Promise(resolveImmediate => setImmediate(resolveImmediate));
-      assert.equal(handlerCalls, 0);
-      recipientBindingKey = "workspace:replacement";
-      setBinding(recipientBindingKey);
-      await lifecycle.onTransportChanged({});
-      await new Promise(resolveImmediate => setImmediate(resolveImmediate));
-      assert.equal(handlerCalls, 0);
-      assert.equal(store.read().entries[0]?.inputClaim?.phase, "running");
-    } finally { await lifecycle.onSessionShutdown(); }
-  });
-});
-
-test("Leader-follower custody assembly never replays running input across generation and role", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 50 }], 50);
-    const acquired = store.acquireInput({ updateId: 50,
-      recipientBindingKey: "workspace:owner", executionUpdate: { update_id: 50 } });
-    assert.equal(store.startInput(acquired.receipt).started, true);
-    const resolve = createTelegramInputCustodyLifecycleBindingResolver({
-      isEnabled: () => true,
-      resolveInputJournal: () => ({ runtimeKey: "role-v3",
-        recoveryKey: createTelegramUpdateJournalBindingKey(options), journal: store }),
-      getRecipientBindingKey: () => "workspace:owner",
-    });
-    const owner = { ...options.queueRuntimeIdentity, sessionGeneration: 1 };
-    let registered = true;
-    let generation = "g1";
-    let leader = false;
-    let handlerCalls = 0;
-    const assembly = createTelegramUpdateAdmissionLifecycleAssembly({
-      runtimeBinding: createTelegramUpdateAdmissionRuntimeBinding({
-        isFollowerRegistered: () => registered }),
-      worker: { getQueueOwnerIdentity: () => owner,
-        async defaultHandle() { handlerCalls += 1; } },
-      leader: { resolveBinding: resolve, hasAuthority: () => leader },
-      follower: { resolveBinding: resolve, isRegistered: () => registered,
-        getGeneration: () => generation, prepareUpdateForExecution: update => update },
-    });
-    try {
-      await assembly.follower.onSessionStart({});
-      await new Promise(resolveImmediate => setImmediate(resolveImmediate));
-      generation = "g2";
-      await assembly.follower.onTransportChanged({});
-      await new Promise(resolveImmediate => setImmediate(resolveImmediate));
-      registered = false;
-      await assembly.follower.onTransportChanged({});
-      leader = true;
-      await assembly.leader.onSessionStart({});
-      await new Promise(resolveImmediate => setImmediate(resolveImmediate));
-      assert.equal(handlerCalls, 0);
-      assert.equal(store.read().entries[0]?.inputClaim?.phase, "running");
-    } finally {
-      await assembly.follower.onSessionShutdown();
-      await assembly.leader.onSessionShutdown();
-    }
-  });
-});
-
-test("V3 worker drains independent tail behind retained running input", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 60 }, { update_id: 61 }, { update_id: 62 },
-      { update_id: 63 }, { update_id: 64 }, { update_id: 65 }], 65);
-    const running = store.acquireInput({ updateId: 60,
-      recipientBindingKey: "workspace:owner", executionUpdate: { update_id: 60 } });
-    assert.equal(store.startInput(running.receipt).started, true);
-    const port = createTelegramInputCustodyWorkerJournalPort(store);
-    const owner = { ...options.queueRuntimeIdentity, sessionGeneration: 1 };
-    const executed: number[] = [];
-    let yields = 0;
-    const worker = createTelegramUpdateAdmissionWorkerRuntime({ journal: port,
-      inputCustody: port.inputCustody,
-      getJournalBindingKey: () => createTelegramUpdateJournalBindingKey(options),
-      getRecipientBindingKey: () => "workspace:owner",
-      getQueueOwnerIdentity: () => owner, hasAuthority: () => true, batchSize: 2,
-      async yieldToEventLoop() { yields += 1; },
-      async defaultHandle(update) { executed.push(update.update_id); },
-    });
-    try {
-      worker.start({});
-      await worker.waitForDrain();
-      assert.deepEqual(executed, [61, 62, 63, 64, 65]);
-      assert.equal(yields, 5);
-      assert.deepEqual(store.read().entries.map(entry => entry.updateId), [60]);
-      assert.equal(store.read().entries[0]?.inputClaim?.phase, "running");
-      assert.equal(worker.getState().blockedReason, "execution");
-      assert.deepEqual(worker.getState().blockedInputCustody,
-        { updateId: 60, kind: "running-outcome-unknown" });
-      const diagnostic = JSON.stringify(worker.getState());
-      assert.doesNotMatch(diagnostic, /workspace:owner|fixture-birth|acquisitionId/);
-    } finally { await worker.stop(); }
-  });
-});
-
-test("V3 worker drains tail behind frozen ready handoff custody", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 70 }, { update_id: 71 }], 71);
-    const ready = store.acquireInput({ updateId: 70, recipientBindingKey: "workspace:owner" });
-    const recipientOwner = { instanceId: "recipient", processId: process.pid + 1,
-      processBirthId: `${process.pid + 1}:recipient`, sessionGeneration: 1 };
-    const offered = store.offerInputHandoff({ receipt: ready.receipt, recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken() });
-    const port = createTelegramInputCustodyWorkerJournalPort(store);
-    const owner = { ...options.queueRuntimeIdentity, sessionGeneration: 1 };
-    const executed: number[] = [];
-    const worker = createTelegramUpdateAdmissionWorkerRuntime({ journal: port,
-      inputCustody: port.inputCustody,
-      getJournalBindingKey: () => createTelegramUpdateJournalBindingKey(options),
-      getRecipientBindingKey: () => "workspace:owner", getQueueOwnerIdentity: () => owner,
-      hasAuthority: () => true, async defaultHandle(update) { executed.push(update.update_id); } });
-    try {
-      worker.start({});
-      await worker.waitForDrain();
-      assert.deepEqual(executed, [71]);
-      assert.deepEqual(store.read().entries.map(entry => entry.updateId), [70]);
-      assert.equal(store.read().entries[0]?.inputClaim?.phase, "ready");
-      assert.ok(store.read().entries[0]?.inputClaim?.handoff);
-      assert.equal(worker.getState().blockedReason, "input-custody");
-      assert.deepEqual(worker.getState().blockedInputCustody,
-        { updateId: 70, kind: "handoff-frozen" });
-      store.cancelInputHandoff({ receipt: ready.receipt, recipientOwner,
-        handoffId: offered.handoff.handoffId });
-      worker.signal();
-      await worker.waitForDrain();
-      assert.deepEqual(executed, [71, 70]);
-      assert.deepEqual(store.read().entries, []);
-      assert.equal(worker.getState().blockedInputCustody, undefined);
-    } finally { await worker.stop(); }
-  });
-});
-
-test("V3 worker drains tail behind foreign ready custody", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const donor = createTelegramInputJournalStore(options);
-    donor.appendBatch([{ update_id: 80 }, { update_id: 81 }], 81);
-    donor.acquireInput({ updateId: 80, recipientBindingKey: "workspace:owner" });
-    const runtime = { instanceId: "replacement", processId: process.pid + 2,
-      processBirthId: `${process.pid + 2}:replacement` };
-    const owner = { ...runtime, sessionGeneration: 1 };
-    const recipient = createTelegramInputJournalStore({ ...options,
-      queueRuntimeIdentity: runtime,
-      getInputContext: () => ({ owner, recipientBindingKey: "workspace:owner" }) });
-    const port = createTelegramInputCustodyWorkerJournalPort(recipient);
-    const executed: number[] = [];
-    const worker = createTelegramUpdateAdmissionWorkerRuntime({ journal: port,
-      inputCustody: port.inputCustody,
-      getJournalBindingKey: () => createTelegramUpdateJournalBindingKey(options),
-      getRecipientBindingKey: () => "workspace:owner", getQueueOwnerIdentity: () => owner,
-      hasAuthority: () => true, async defaultHandle(update) { executed.push(update.update_id); } });
-    try {
-      worker.start({});
-      await worker.waitForDrain();
-      assert.deepEqual(executed, [81]);
-      assert.deepEqual(recipient.read().entries.map(entry => entry.updateId), [80]);
-      assert.equal(recipient.read().entries[0]?.inputClaim?.phase, "ready");
-      assert.equal(worker.getState().blockedReason, "input-custody");
-      assert.deepEqual(worker.getState().blockedInputCustody,
-        { updateId: 80, kind: "foreign-ready" });
-    } finally { await worker.stop(); }
-  });
-});
-
-test("V3 blocked diagnostics prioritize running outcome unknown over foreign ready", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const donor = createTelegramInputJournalStore(options);
-    donor.appendBatch([{ update_id: 90 }, { update_id: 91 }], 91);
-    donor.acquireInput({ updateId: 90, recipientBindingKey: "workspace:owner" });
-    const running = donor.acquireInput({ updateId: 91,
-      recipientBindingKey: "workspace:owner", executionUpdate: { update_id: 91 } });
-    assert.equal(donor.startInput(running.receipt).started, true);
-    const runtime = { instanceId: "observer", processId: process.pid + 3,
-      processBirthId: `${process.pid + 3}:observer` };
-    const owner = { ...runtime, sessionGeneration: 1 };
-    const observer = createTelegramInputJournalStore({ ...options,
-      queueRuntimeIdentity: runtime,
-      getInputContext: () => ({ owner, recipientBindingKey: "workspace:owner" }) });
-    const port = createTelegramInputCustodyWorkerJournalPort(observer);
-    const worker = createTelegramUpdateAdmissionWorkerRuntime({ journal: port,
-      inputCustody: port.inputCustody,
-      getJournalBindingKey: () => createTelegramUpdateJournalBindingKey(options),
-      getRecipientBindingKey: () => "workspace:owner", getQueueOwnerIdentity: () => owner,
-      hasAuthority: () => true, async defaultHandle() { assert.fail("blocked input executed"); } });
-    try {
-      worker.start({});
-      await worker.waitForDrain();
-      assert.equal(worker.getState().blockedReason, "execution");
-      assert.deepEqual(worker.getState().blockedInputCustody,
-        { updateId: 91, kind: "running-outcome-unknown" });
-    } finally { await worker.stop(); }
-  });
-});
-
-test("V3 worker quarantines legacy retry state while draining pending tail", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 100 }, { update_id: 101 }], 101);
-    const strict = createTelegramInputCustodyWorkerJournalPort(store);
-    const journal = { ...strict, read() {
-      const snapshot = strict.read();
-      return { ...snapshot, entries: snapshot.entries.map(entry => entry.updateId === 100
-        ? { ...entry, state: "retry-wait" as const, nextRetryAtMs: 0 } : entry) };
-    } };
-    const owner = { ...options.queueRuntimeIdentity, sessionGeneration: 1 };
-    const executed: number[] = [];
-    const worker = createTelegramUpdateAdmissionWorkerRuntime({ journal,
-      inputCustody: strict.inputCustody,
-      getJournalBindingKey: () => createTelegramUpdateJournalBindingKey(options),
-      getRecipientBindingKey: () => "workspace:owner", getQueueOwnerIdentity: () => owner,
-      hasAuthority: () => true, async defaultHandle(update) { executed.push(update.update_id); } });
-    try {
-      worker.start({});
-      await worker.waitForDrain();
-      assert.deepEqual(executed, [101]);
-      assert.deepEqual(store.read().entries.map(entry => entry.updateId), [100]);
-      assert.equal(worker.getState().blockedReason, "input-custody");
-      assert.deepEqual(worker.getState().blockedInputCustody,
-        { updateId: 100, kind: "legacy-retry-state" });
-    } finally { await worker.stop(); }
-  });
-});
-
-test("V3 source-reference wake requires one exact accepted ready handoff", async () => {
-  await withInputCustodyFixture(async ({ options, dir }) => {
-    const donor = createTelegramInputJournalStore(options);
-    donor.appendBatch([{ update_id: 109 }], 109);
-    const claimed = donor.acquireInput({ updateId: 109, recipientBindingKey: "workspace:owner" });
-    const recipientRuntime = { instanceId: "recipient", processId: process.pid + 4,
-      processBirthId: `${process.pid + 4}:recipient` };
-    const recipientOwner = { ...recipientRuntime, sessionGeneration: 1 };
-    const offered = donor.offerInputHandoff({ receipt: claimed.receipt, recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken() });
-    const recipient = createTelegramInputJournalStore({ ...options,
-      queueRuntimeIdentity: recipientRuntime,
-      getInputContext: () => ({ owner: recipientOwner, recipientBindingKey: "workspace:owner" }) });
-    const recoveryKey = createTelegramUpdateJournalBindingKey(options);
-    const frozenResolver = createTelegramInputCustodyForwardReferenceResolver({
-      recoveryKey, recipientBindingKey: "workspace:owner", recipientOwner, journal: recipient });
-    assert.equal(frozenResolver({ sourceUpdateId: 109,
-      recipientBindingKey: "workspace:owner" }), undefined);
-    let wakes = 0;
-    const acceptance = createTelegramInputCustodyHandoffAcceptanceRuntime({
-      resolveBinding: key => key === recoveryKey ? { recoveryKey,
-        recipientBindingKey: "workspace:owner", recipientOwner, journal: recipient,
-        signalWorker() { wakes += 1; } } : undefined,
-    });
-    const accepted = acceptance.accept({ sourceRecoveryKey: recoveryKey,
-      recipientBindingKey: "workspace:owner", source: offered.source,
-      handoffId: offered.handoff.handoffId }, {});
-    assert.equal(accepted.duplicate, false);
-    assert.equal(wakes, 1);
-    const handoffSocketPath = join(dir, "input-handoff.sock");
-    const handoffReceiver = createTelegramBusForwardedUpdateReceiverRuntime({
-      socketPath: handoffSocketPath, instanceId: "recipient",
-      getAuthSecret: () => "shared-secret", getRegistrationGeneration: () => "g2",
-      getRecipientBindingKey: () => "workspace:owner",
-      durableAdmission: { async admit() { assert.fail("legacy copy admission invoked"); } },
-      isSourceReferenceAdmissionEnabled: () => true,
-      hasAuthenticatedSourceReferenceTransport: () => true, getContext: () => ({}),
-      handleInputCustodyHandoff: (envelope, ctx) => acceptance.accept({
-        sourceRecoveryKey: envelope.sourceRecoveryKey,
-        recipientBindingKey: envelope.recipientBindingKey,
-        source: envelope.source, handoffId: envelope.handoffId }, ctx),
-    });
-    try {
-      await handoffReceiver.start();
-      const handoffAck = await sendTelegramBusLocalEnvelope({ socketPath: handoffSocketPath,
-        envelope: { kind: "leader.offerInputCustodyHandoff", requestId: "leader:handoff",
-          recipientInstanceId: "recipient", recipientRegistrationGeneration: "g2",
-          recipientBindingKey: "workspace:owner", sourceRecoveryKey: recoveryKey,
-          source: offered.source, handoffId: offered.handoff.handoffId,
-          sentAtMs: 1_999, auth: "shared-secret" } });
-      assert.equal(handoffAck?.kind === "bus.ack" && handoffAck.ok, true);
-      assert.equal(handoffAck?.kind === "bus.ack" &&
-        (handoffAck.result as { duplicate?: boolean } | undefined)?.duplicate, true);
-      assert.equal(wakes, 2);
-      donor.appendBatch([{ update_id: 110 }], 110);
-      const networkClaim = donor.acquireInput({ updateId: 110,
-        recipientBindingKey: "workspace:owner" });
-      let networkSends = 0;
-      const networkClient = createTelegramInputCustodyHandoffClient({ journal: donor,
-        resolveAcceptedReference: createTelegramInputCustodyForwardReferenceResolver({
-          recoveryKey, recipientBindingKey: "workspace:owner", recipientOwner, journal: recipient }),
-        async sendEnvelope(envelope) {
-          networkSends += 1;
-          return sendTelegramBusLocalEnvelope({ socketPath: handoffSocketPath, envelope });
-        },
-      });
-      const networkInput = { requestId: "leader:handoff-110", receipt: networkClaim.receipt,
-        recipientInstanceId: "recipient", recipientRegistrationGeneration: "g2",
-        recipientBindingKey: "workspace:owner", recipientOwner,
-        handoffToken: createTelegramUpdateQueueHandoffToken(), sentAtMs: 2_000,
-        auth: "shared-secret" };
-      const networkAccepted = await networkClient.transfer(networkInput);
-      assert.equal(networkAccepted.duplicate, false);
-      assert.equal(networkAccepted.source.updateId, 110);
-      assert.equal(wakes, 3);
-      assert.equal(networkSends, 1);
-      assert.equal((await networkClient.transfer(networkInput)).duplicate, true);
-      assert.equal(networkSends, 1);
-      assert.equal(wakes, 3);
-    } finally { await handoffReceiver.stop(); }
-    const resolveReference = createTelegramInputCustodyForwardReferenceResolver({
-      recoveryKey, recipientBindingKey: "workspace:owner", recipientOwner, journal: recipient });
-    assert.deepEqual(resolveReference({ sourceUpdateId: 109,
-      recipientBindingKey: "workspace:owner" }), { sourceRecoveryKey: recoveryKey,
-      source: { updateId: 109, owner: { acquisitionId: accepted.source.owner.acquisitionId,
-        handoffId: accepted.source.owner.handoffId } } });
-    assert.equal(resolveReference({ sourceUpdateId: 109,
-      recipientBindingKey: "workspace:other" }), undefined);
-    let busBindingActive = true;
-    const busBinding = createTelegramInputCustodyBusBindingRuntime({
-      getForwardRecoveryKey: () => busBindingActive ? recoveryKey : undefined,
-      resolveBinding: key => busBindingActive && key === recoveryKey ? { recoveryKey,
-        recipientBindingKey: "workspace:owner", recipientOwner, journal: recipient,
-        signalWorker() { wakes += 1; } } : undefined,
-    });
-    assert.deepEqual(busBinding.resolveForwardReference({ sourceUpdateId: 109,
-      recipientBindingKey: "workspace:owner" }), resolveReference({ sourceUpdateId: 109,
-      recipientBindingKey: "workspace:owner" }));
-    const bindingWake = { deliveryId: "binding-wake", sourceUpdateId: 109,
-      recipientBindingKey: "workspace:owner", sourceRecoveryKey: recoveryKey,
-      sourceClaim: accepted.source.owner };
-    busBinding.wakeSource(bindingWake, {});
-    assert.equal(wakes, 4);
-    busBindingActive = false;
-    assert.equal(busBinding.resolveForwardReference({ sourceUpdateId: 109,
-      recipientBindingKey: "workspace:owner" }), undefined);
-    assert.throws(() => busBinding.wakeSource(bindingWake, {}),
-      /binding is unavailable or changed/);
-    assert.throws(() => busBinding.acceptHandoff({ sourceRecoveryKey: recoveryKey,
-      recipientBindingKey: "workspace:owner", source: offered.source,
-      handoffId: offered.handoff.handoffId }, {}), /binding is unavailable or changed/);
-    assert.equal(wakes, 4);
-    busBindingActive = true;
-    donor.appendBatch([{ update_id: 111 }], 111);
-    const secondClaim = donor.acquireInput({ updateId: 111,
-      recipientBindingKey: "workspace:owner" });
-    let handoffSends = 0;
-    const client = createTelegramInputCustodyHandoffClient({ journal: donor,
-      resolveAcceptedReference: resolveReference,
-      async sendEnvelope(envelope) {
-        handoffSends += 1;
-        acceptance.accept({ sourceRecoveryKey: envelope.sourceRecoveryKey,
-          recipientBindingKey: envelope.recipientBindingKey,
-          source: envelope.source, handoffId: envelope.handoffId }, {});
-        throw new Error("handoff acknowledgement lost");
-      },
-    });
-    const transferInput = { requestId: "leader:handoff-111", receipt: secondClaim.receipt,
-      recipientInstanceId: "recipient", recipientRegistrationGeneration: "g2",
-      recipientBindingKey: "workspace:owner", recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken(), sentAtMs: 1_998 };
-    await assert.rejects(client.transfer(transferInput), /handoff acknowledgement lost/);
-    assert.equal(handoffSends, 1);
-    const reconciled = await client.transfer(transferInput);
-    assert.equal(reconciled.duplicate, true);
-    assert.equal(reconciled.source.updateId, 111);
-    assert.equal(handoffSends, 1);
-    const runtime = createTelegramInputCustodySourceReferenceWakeRuntime({
-      resolveBinding: key => key === recoveryKey ? { recoveryKey,
-        recipientBindingKey: "workspace:owner", recipientOwner, journal: recipient,
-        signalWorker() { wakes += 1; } } : undefined,
-    });
-    const input = { deliveryId: "delivery-109", sourceUpdateId: 109,
-      recipientBindingKey: "workspace:owner", sourceRecoveryKey: recoveryKey,
-      sourceClaim: { acquisitionId: accepted.source.owner.acquisitionId,
-        handoffId: accepted.source.owner.handoffId } };
-    runtime.wakeSource(input, {});
-    assert.equal(wakes, 6);
-    assert.throws(() => runtime.wakeSource({ ...input,
-      sourceClaim: { ...input.sourceClaim, acquisitionId: "stale" } }, {}),
-    /claim is unavailable or changed/);
-    assert.throws(() => runtime.wakeSource({ ...input,
-      recipientBindingKey: "workspace:other" }, {}), /binding is unavailable or changed/);
-    assert.equal(wakes, 6);
-    const delivery = createTelegramBusFollowerDeliveryIdentity({ kind: "leader.wakeInputCustody",
-      recipientBindingKey: input.recipientBindingKey, sourceUpdateId: input.sourceUpdateId,
-      sourceRecoveryKey: input.sourceRecoveryKey, sourceClaim: input.sourceClaim });
-    const admission = createTelegramBusFollowerSourceReferenceAdmissionRuntime({
-      wakeSource: runtime.wakeSource });
-    const socketPath = join(dir, "source-reference.sock");
-    const receiver = createTelegramBusForwardedUpdateReceiverRuntime({ socketPath,
-      instanceId: "recipient", getAuthSecret: () => "shared-secret",
-      getRegistrationGeneration: () => "g2", getRecipientBindingKey: () => "workspace:owner",
-      durableAdmission: { async admit() { assert.fail("legacy copy admission invoked"); } },
-      sourceReferenceAdmission: admission, isSourceReferenceAdmissionEnabled: () => true,
-      hasAuthenticatedSourceReferenceTransport: () => true, getContext: () => ({}),
-    });
-    const send = (requestId: string, sourceDelivery = delivery, generation = "g2") =>
-      sendTelegramBusLocalEnvelope({ socketPath, envelope: { kind: "leader.wakeInputCustody",
-        requestId, recipientInstanceId: "recipient", recipientRegistrationGeneration: generation,
-        delivery: sourceDelivery, sentAtMs: 2_000, auth: "shared-secret" } });
-    try {
-      await receiver.start();
-      const capable = createTelegramBusProtocolIdentity({ runtimeBuild: "0.45.0",
-        capabilities: [TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE] });
-      const forwarder = createTelegramBusForeignOwnedUpdateForwarder({ socketPath,
-        createRequestId: () => "leader:resolved", getNowMs: () => 2_000,
-        getAuthSecret: () => "shared-secret",
-        localProtocolIdentity: capable, resolveInputCustodyReference: resolveReference });
-      const forwarded = await forwarder.forwardMessage({ message: {
-        message_id: 109, text: "must-not-cross", pi_telegram_source_update_id: 109 }, ownership: {
-        instanceId: "recipient", ownerGeneration: "g2", recipientBindingKey: "workspace:owner",
-        protocolIdentity: capable }, ctx: {} });
-      assert.equal(forwarded.status, "accepted");
-      const replayed = await forwarder.forwardMessage({ message: {
-        message_id: 109, text: "must-not-cross", pi_telegram_source_update_id: 109 }, ownership: {
-        instanceId: "recipient", ownerGeneration: "g2", recipientBindingKey: "workspace:owner",
-        protocolIdentity: capable }, ctx: {} });
-      assert.deepEqual(replayed, forwarded);
-      assert.equal(wakes, 7);
-      const first = await send("leader:accepted-1");
-      const duplicateWake = await send("leader:accepted-2");
-      assert.equal(first?.kind === "bus.ack" && first.ok, true);
-      assert.equal(duplicateWake?.kind === "bus.ack" && duplicateWake.ok, true);
-      assert.equal(wakes, 9);
-      const staleDelivery = { ...delivery,
-        sourceClaim: { ...delivery.sourceClaim!, acquisitionId: "stale" } };
-      const stale = await send("leader:stale-claim", staleDelivery);
-      assert.equal(stale?.kind === "bus.ack" && stale.ok, false);
-      const replaced = await send("leader:stale-generation", delivery, "g1");
-      assert.equal(replaced?.kind === "bus.ack" && replaced.ok, false);
-      assert.equal(wakes, 9);
-    } finally { await receiver.stop(); }
-  });
-});
-
-test("V3 lifecycle lookup accepts one exact queued handoff for recipient owner", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const donor = createTelegramInputJournalStore(options);
-    donor.appendBatch([{ update_id: 110 }], 110);
-    const raw = donor.acquireInput({ updateId: 110, recipientBindingKey: "workspace:owner" });
-    assert.equal(donor.startInput(raw.receipt).started, true);
-    const queued = donor.queueInputs({ queueKind: "prompt", receiptId: "lookup-handoff",
-      receipts: [raw.receipt] }).queueReceipt;
-    const recipientRuntime = { instanceId: "recipient", processId: process.pid + 4,
-      processBirthId: `${process.pid + 4}:recipient` };
-    const recipientOwner = { ...recipientRuntime, sessionGeneration: 1 };
-    const handoff = { queueKind: queued.queueKind, receiptId: queued.receiptId,
-      sourceUpdateIds: queued.sourceUpdateIds, expectedOwner: queued.queueOwner, recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken() };
-    donor.offerQueuedHandoff(handoff);
-    const recipient = createTelegramInputJournalStore({ ...options,
-      queueRuntimeIdentity: recipientRuntime,
-      getInputContext: () => ({ owner: recipientOwner, recipientBindingKey: "workspace:owner" }) });
-    const resolve = createTelegramInputCustodyLifecycleBindingResolver({ isEnabled: () => true,
-      resolveInputJournal: () => ({ runtimeKey: "recipient-v3",
-        recoveryKey: createTelegramUpdateJournalBindingKey(options), journal: recipient }),
-      getRecipientBindingKey: () => "workspace:owner" });
-    const runtimeBinding = createTelegramUpdateAdmissionRuntimeBinding({
-      isFollowerRegistered: () => true });
-    const lifecycleBus = createTelegramInputCustodyBusBindingRuntime({
-      getForwardRecoveryKey: () => undefined, resolveBinding: () => undefined });
-    const referenceEvents: string[] = [];
-    const assembly = createTelegramUpdateAdmissionLifecycleAssembly({ runtimeBinding,
-      inputCustodyBus: lifecycleBus,
-      acquireSourceReference(role, binding) {
-        referenceEvents.push(`acquire:${role}:${binding.recoveryKey}`);
-        let released = false;
-        return () => { assert.equal(released, false); released = true;
-          referenceEvents.push(`release:${role}:${binding.recoveryKey}`); };
-      },
-      worker: { getQueueOwnerIdentity: () => recipientOwner, async defaultHandle() {} },
-      leader: { resolveBinding: () => undefined, hasAuthority: () => false },
-      follower: { resolveBinding: resolve, isRegistered: () => true,
-        getGeneration: () => "g1", prepareUpdateForExecution: update => update },
-    });
-    try {
-      assert.equal(runtimeBinding.getInputCustodyBus(), lifecycleBus);
-      await assembly.follower.onSessionStart({});
-      const lifecycle = runtimeBinding.getLifecycleForJournalBinding(
-        createTelegramUpdateJournalBindingKey(options));
-      assert.ok(lifecycle);
-      const accepted = lifecycle.acceptQueueReceiptHandoff(handoff);
-      assert.deepEqual(accepted.acceptedUpdateIds, [110]);
-      assert.equal(accepted.queueOwner.instanceId, "recipient");
-      const duplicate = lifecycle.acceptQueueReceiptHandoff(handoff);
-      assert.equal(duplicate.duplicate, true);
-      assert.deepEqual(duplicate.queueOwner, accepted.queueOwner);
-      assert.deepEqual(recipient.read().entries[0]?.queueOwner, accepted.queueOwner);
-      await assembly.follower.onTransportChanged({});
-      assert.deepEqual(referenceEvents.map(event => event.split(":")[0]),
-        ["acquire", "release", "acquire"]);
-      const receipt = { queueKind: queued.queueKind, receiptId: queued.receiptId,
-        sourceUpdateIds: queued.sourceUpdateIds,
-        journalBindingKey: createTelegramUpdateJournalBindingKey(options) };
-      assert.deepEqual(runtimeBinding.getLifecycleForJournalBinding(receipt.journalBindingKey)
-        ?.getQueueReceiptOwner(receipt), accepted.queueOwner);
-
-    } finally { await assembly.follower.onSessionShutdown(); }
-    assert.deepEqual(referenceEvents.map(event => event.split(":")[0]),
-      ["acquire", "release", "acquire", "release"]);
-    await assembly.follower.onSessionStart({});
-    await assembly.follower.onSessionShutdown();
-    assert.deepEqual(referenceEvents.map(event => event.split(":")[0]),
-      ["acquire", "release", "acquire", "release", "acquire", "release"]);
-  });
-});
-
-test("Input custody refuses vetoes and revoked publication without losing a retryable acquisition", async () => {
-  await withInputCustodyFixture(async ({ options, path, setOwner, setBinding, setHook }) => {
-    const excluded = createTelegramInputJournalStore({ ...options,
-      withPairingAdmission: publish => withTelegramFileTransaction(join(dirname(path), "telegram.json.transaction"), () => publish(true)) });
-    excluded.appendBatch([{ update_id: 1 }], 1);
-    assert.throws(() => excluded.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" }),
-      (error) => isJournalError(error, "conflict"));
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 2 }], 2);
-    const identity = { ...options.queueRuntimeIdentity, sessionGeneration: 1 };
-    const before = store.read();
-    setHook(boundary => { if (boundary === "after-write-before-rename") setOwner(undefined); });
-    assert.throws(() => store.acquireInput({ updateId: 2, recipientBindingKey: "workspace:owner" }),
-      (error) => isJournalError(error, "conflict"));
-    assert.deepEqual(store.read(), before);
-    assert.equal(existsSync(`${path}.transaction`), false);
-    setHook(undefined); setOwner(identity);
-    const acquired = store.acquireInput({ updateId: 2, recipientBindingKey: "workspace:owner" });
-    const ready = store.read();
-    setHook(boundary => { if (boundary === "after-write-before-rename") setOwner({ ...identity, sessionGeneration: 2 }); });
-    assert.throws(() => store.startInput(acquired.receipt), (error) => isJournalError(error, "conflict"));
-    assert.deepEqual(store.read(), ready);
-    setOwner(identity);
-    setHook(boundary => { if (boundary === "after-write-before-rename") setBinding("workspace:replacement"); });
-    assert.throws(() => store.startInput(acquired.receipt), (error) => isJournalError(error, "conflict"));
-    assert.deepEqual(store.read(), ready);
-    setBinding("workspace:owner"); setHook(undefined);
-    assert.equal(store.startInput(acquired.receipt).started, true);
-    assert.deepEqual(store.completeInput(acquired.receipt).removedUpdateIds, [2]);
-  });
-});
-
-test("Input custody never regrants a start whose compaction failed after durable publication", async () => {
-  await withInputCustodyFixture(async ({ options, path, setHook }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 1 }], 1);
-    const { receipt } = store.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-    for (let cursor = 2; cursor <= 255; cursor++) store.appendBatch([], cursor);
-    setHook((boundary, target) => {
-      if (boundary === "before-write" && target === path) throw new Error("compaction publication failed");
-    });
-    assert.throws(() => store.startInput(receipt), (error) => isJournalError(error, "io"));
-    assert.equal(store.read().entries[0]!.inputClaim!.phase, "running");
-    assert.deepEqual(store.startInput(receipt), { started: false });
-    assert.equal(existsSync(`${path}.transaction`), false);
-    // This is commit-unknown, not evidence that a user handler actually ran.
-  });
-});
-
-test("Input custody serializes competing process acquisitions without dead-owner takeover", async () => {
-  await withInputCustodyFixture(async ({ options, path }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 42 }], 42);
-    await Promise.all([runJournalWorker(path, 1, 42, "input-custody"), runJournalWorker(path, 2, 42, "input-custody")]);
-    const results = await Promise.all([1, 2].map(async index => JSON.parse(await readFile(`${path}.claim-${index}.json`, "utf8"))));
-    assert.equal(results.filter(result => result.acquired).length, 1);
-    assert.equal(results.filter(result => result.refused === "conflict").length, 1);
-    const winner = results.find(result => result.acquired);
-    assert.equal(winner.started, true);
-    assert.deepEqual(store.read().entries[0]!.inputClaim!.owner, winner.receipt.owner);
-    assert.equal(store.read().entries[0]!.inputClaim!.phase, "running");
-    assert.throws(() => store.acquireInput({ updateId: 42, recipientBindingKey: "workspace:owner" }),
-      (error) => isJournalError(error, "conflict"));
-    assert.throws(() => store.completeInput(winner.receipt), (error) => isJournalError(error, "conflict"));
-  });
-});
-
-test("Input custody captures configuration, refuses capacity, and retains stored receipt scope", async () => {
-  await withInputCustodyFixture(async ({ options, path }) => {
-    for (const field of ["sourceAccess", "queueRuntimeIdentity", "withSourceSerialization", "withPairingAdmission", "getInputContext"]) {
-      assert.throws(() => createTelegramInputJournalStore({ ...options, [field]: undefined } as unknown as TelegramInputJournalStoreOptions),
-        /requires strict serialized polling admission/);
-    }
-    const captured = { ...options, queueRuntimeIdentity: { ...options.queueRuntimeIdentity } };
-    let getterReads = 0;
-    Object.defineProperty(captured, "getInputContext", { enumerable: true, get() { getterReads++; return options.getInputContext; } });
-    const store = createTelegramInputJournalStore(captured);
-    assert.equal(getterReads, 1);
-    captured.queueRuntimeIdentity.instanceId = "caller mutation";
-    store.appendBatch([{ update_id: 1 }], 1);
-    const bytes = await readFile(path, "utf8");
-    const tight = createTelegramInputJournalStore({ ...options, maxBytes: store.read().serializedBytes });
-    const request = { updateId: 1, recipientBindingKey: "workspace:owner" };
-    assert.throws(() => tight.acquireInput(request), (error) => isJournalError(error, "capacity"));
-    assert.equal(await readFile(path, "utf8"), bytes);
-    assert.equal(existsSync(`${path}.segments`), false);
-    assert.equal(existsSync(`${path}.transaction`), false);
-    const acquired = store.acquireInput(request);
-    const enriched = createTelegramInputJournalStore({ ...options, botIdentity: { ...options.botIdentity, botId: 77 } });
-    assert.throws(() => enriched.acquireInput(request), (error) => isJournalError(error, "identity-mismatch"));
-    assert.equal(store.read().botIdentity.botId, undefined);
-    assert.equal(acquired.receipt.journalBindingKey, createTelegramUpdateJournalBindingKey(options));
-    assert.throws(() => store.startInput({ ...acquired.receipt, tokenSha256: "f".repeat(64) }),
-      (error) => isJournalError(error, "conflict"));
-    assert.equal(store.startInput(acquired.receipt).started, true);
-    assert.deepEqual(store.completeInput(acquired.receipt).removedUpdateIds, [1]);
-    assert.throws(() => store.completeInput({ ...acquired.receipt, journalBindingKey: "other source" }),
-      (error) => isJournalError(error, "conflict"));
-  });
-});
-
-test("Input custody removes only immutable exclusions atomically and preserves the replay barrier", async () => {
-  await withInputCustodyFixture(async ({ options, path, dir, setOwner, ledger }) => {
-    const store = createTelegramInputJournalStore(options);
-    assert.throws(() => store.removeExcluded([1]), (error) => isJournalError(error, "conflict"));
-    assert.equal(existsSync(path), false);
-    const excluded = createTelegramInputJournalStore({ ...options,
-      withPairingAdmission: publish => withTelegramFileTransaction(join(dirname(path), "telegram.json.transaction"), () => publish(true)) });
-    excluded.appendBatch([{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }], 3);
-    store.appendBatch([{ update_id: 10 }, { update_id: 11 }, { update_id: 12 }], 12);
-    const ready = store.acquireInput({ updateId: 11, recipientBindingKey: "workspace:owner" });
-    const running = store.acquireInput({ updateId: 12, recipientBindingKey: "workspace:owner" });
-    assert.equal(store.startInput(running.receipt).started, true);
-    const before = store.read();
-    const names = await readdir(dir);
-    for (const ids of [[1, 10], [1, 11], [1, 12], [1, 13], [1, -1], [1, Number.NaN]]) {
-      assert.throws(() => store.removeExcluded(ids), TelegramUpdateJournalError);
-      assert.deepEqual(store.read(), before);
-      assert.deepEqual(await readdir(dir), names);
-      assert.deepEqual(ledger.read().leases, []);
-    }
-    // The immutable veto, not a live execution context or configured sender, permits removal.
-    setOwner(undefined);
-    await writeFile(join(dir, "telegram.json"), JSON.stringify({ profiles: { work: { botToken: "123:synthetic-input-custody" } } }));
-    const ids = [2, 1, 2, 4];
-    const captured = createTelegramInputJournalStore({ ...options,
-      withSourceSerialization(operation) {
-        assert.ok(ledger.read().leases.some(lease => lease.scope.kind === "profile"));
-        ids.push(10);
-        return options.withSourceSerialization(operation);
-      } });
-    assert.deepEqual(captured.removeExcluded(ids).removedUpdateIds, [1, 2]);
-    assert.deepEqual(store.removeExcluded([1, 2, 4]).removedUpdateIds, []);
-    assert.deepEqual(store.removeExcluded([]).removedUpdateIds, []);
-    assert.deepEqual(store.appendBatch([{ update_id: 1 }, { update_id: 2 }, { update_id: 4 }], 12).addedUpdateIds, []);
-    assert.deepEqual(createTelegramInputJournalStore(options).removeExcluded([3]).removedUpdateIds, [3]);
-    assert.deepEqual(store.read().entries, before.entries.filter(entry => entry.updateId >= 10));
-    assert.deepEqual(store.read().entries[1]!.inputClaim!.owner, ready.receipt.owner);
-    assert.equal(store.read().entries[2]!.inputClaim!.phase, "running");
-    assert.equal(store.read().acceptedThroughUpdateId, 12);
-    assert.deepEqual(ledger.read().leases, []);
-  });
-});
-
-test("Input custody exclusion removal preserves failure diagnostics outside the veto and retries publication safely", async () => {
-  await withInputCustodyFixture(async ({ options, path, dir, setHook, setOwner }) => {
-    const failure = { attemptCount: 1, failedAtMs: 101, failureClass: "fixture", summary: "fixture failure" };
-    const entries = [true, false].flatMap((preApprovalExcluded, group) =>
-      (["pending", "retry-wait", "failed"] as const).map((state, index) => {
-        const updateId = group * 10 + index + 1;
-        return { updateId, update: { update_id: updateId }, admittedAtMs: 100, preApprovalExcluded, state,
-          ...(state === "pending" ? {} : { failure }), ...(state === "retry-wait" ? { nextRetryAtMs: 102 } : {}),
-          ...(state === "failed" ? { terminalAtMs: 102, terminalReason: "fixture terminal" } : {}) };
-      }));
-    const queued = { updateId: 14, update: { update_id: 14 }, admittedAtMs: 100, preApprovalExcluded: false,
-      state: "queued", queueKind: "prompt", queueReceiptId: "fixture-receipt",
-      queueOwner: { ...options.queueRuntimeIdentity, sessionGeneration: 1, acquisitionId: "fixture-queue", acquiredAtMs: 101 } };
-    await writeFile(path, JSON.stringify({ version: 3, profile: "work", botIdentity: options.botIdentity,
-      entries: [...entries, queued], acceptedThroughUpdateId: 14 }));
-    const store = createTelegramInputJournalStore(options);
-    setOwner(undefined);
-    const before = store.read();
-    for (const id of [11, 12, 13, 14]) {
-      assert.throws(() => store.removeExcluded([1, id]), (error) => isJournalError(error, "conflict"));
-      assert.deepEqual(store.read(), before);
-    }
-    const bytes = await readFile(path, "utf8");
-    const malformed = JSON.parse(bytes);
-    delete malformed.entries.at(-1).preApprovalExcluded;
-    const malformedBytes = JSON.stringify(malformed);
-    await writeFile(path, malformedBytes);
-    assert.throws(() => store.removeExcluded([1]), (error) => isJournalError(error, "pairing-evidence"));
-    assert.equal(await readFile(path, "utf8"), malformedBytes);
-    assert.equal(existsSync(`${path}.transaction`), false);
-    await writeFile(path, bytes);
-    const tight = createTelegramInputJournalStore({ ...options,
-      sourceAccess: { ...options.sourceAccess, limits: { ...options.sourceAccess.limits, maxFiles: 1 } } });
-    assert.throws(() => tight.removeExcluded([1, 2, 3]), (error) => isJournalError(error, "capacity"));
-    assert.equal(await readFile(path, "utf8"), bytes);
-    assert.equal(existsSync(`${path}.segments`), false);
-    setHook(boundary => { if (boundary === "after-write-before-rename") throw new Error("fixture publication failure"); });
-    assert.throws(() => store.removeExcluded([1, 2, 3]), (error) => isJournalError(error, "io"));
-    assert.equal(await readFile(path, "utf8"), bytes);
-    assert.deepEqual(store.read(), before);
-    assert.equal(existsSync(`${path}.transaction`), false);
-    assert.deepEqual((await readdir(dir)).filter(name => name.startsWith("inbox.work.json")), ["inbox.work.json", "inbox.work.json.segments"]);
-    assert.deepEqual(await readdir(`${path}.segments`), []);
-    setHook(undefined);
-    assert.deepEqual(store.removeExcluded([3, 1, 2]).removedUpdateIds, [1, 2, 3]);
-    assert.deepEqual(store.read().entries, before.entries.filter(entry => !entry.preApprovalExcluded));
-    const after = store.read();
-    setHook(() => assert.fail("A repeated exclusion removal must not publish"));
-    assert.deepEqual(createTelegramInputJournalStore(options).removeExcluded([1, 2, 3]).removedUpdateIds, []);
-    assert.deepEqual(store.read(), after);
-  });
-});
-
-test("Input custody reserves one ready release and complete transition chain before durable admission", async () => {
-  await withInputCustodyFixture(async ({ options, dir, ledger }) => {
-    const calibrationPath = join(dir, "calibration.json");
-    const calibration = createTelegramInputJournalStore({ ...options, path: calibrationPath });
-    const rawBytes = calibration.appendBatch([{ update_id: 1 }], 1).serializedBytes;
-    for (const [name, override] of [
-      ["logical", { maxBytes: rawBytes }],
-      ["files", { sourceAccess: { ...options.sourceAccess,
-        limits: { ...options.sourceAccess.limits, maxFiles: 5 } } }],
-      ["physical-bytes", { sourceAccess: { ...options.sourceAccess,
-        limits: { ...options.sourceAccess.limits, maxBytes: rawBytes } } }],
-      ["work", { sourceAccess: { ...options.sourceAccess,
-        limits: { ...options.sourceAccess.limits, maxWork: 1 } } }],
-    ] as const) {
-      const path = join(dir, `bounded-${name}.json`);
-      const bounded = createTelegramInputJournalStore({ ...options, path, ...override });
-      assert.throws(() => bounded.appendBatch([{ update_id: 1 }], 1), (error) => isJournalError(error, "capacity"), name);
-      assert.equal(existsSync(path), false, name);
-      assert.equal(existsSync(`${path}.segments`), false, name);
-      assert.equal(existsSync(`${path}.transaction`), false, name);
-      assert.deepEqual(ledger.read().leases, [], name);
-    }
-    const path = join(dir, "six-files.json");
-    const store = createTelegramInputJournalStore({ ...options, path,
-      sourceAccess: { ...options.sourceAccess, limits: { ...options.sourceAccess.limits, maxFiles: 6 } } });
-    store.appendBatch([{ update_id: 2 }], 2);
-    const originalUnlink = fs.unlinkSync;
-    fs.unlinkSync = ((target: fs.PathLike) => {
-      if (String(target).startsWith(`${path}.segments${sep}`)) throw new Error("synthetic retained segment");
-      return originalUnlink(target);
-    }) as typeof fs.unlinkSync;
-    syncBuiltinESMExports();
-    try {
-      const first = store.acquireInput({ updateId: 2, recipientBindingKey: "workspace:owner" });
-      assert.equal(store.releaseInput(first.receipt).released, true);
-      const second = store.acquireInput({ updateId: 2, recipientBindingKey: "workspace:owner" });
-      assert.equal(store.startInput(second.receipt).started, true);
-      assert.deepEqual(store.completeInput(second.receipt).removedUpdateIds, [2]);
-    } finally { fs.unlinkSync = originalUnlink; syncBuiltinESMExports(); }
-    assert.deepEqual(store.read().entries, []);
-    assert.equal((await readdir(`${path}.segments`)).length, 5);
-    assert.deepEqual(ledger.read().leases, []);
-  });
-});
-
-test("Input custody reserves progress when append snapshot publication is commit-unknown", async () => {
-  await withInputCustodyFixture(async ({ options, dir, setHook }) => {
-    const path = join(dir, "commit-unknown-append.json");
-    const store = createTelegramInputJournalStore({ ...options, path,
-      sourceAccess: { ...options.sourceAccess, limits: { ...options.sourceAccess.limits, maxFiles: 7 } } });
-    store.appendBatch([{ update_id: 1 }], 1);
-    setHook((boundary, target) => {
-      if (boundary === "after-write-before-rename" && target === path) throw new Error("snapshot commit unknown");
-    });
-    assert.throws(() => store.appendBatch([{ update_id: 2 }], 2), (error) => isJournalError(error, "io"));
-    setHook(undefined);
-    assert.deepEqual(store.read().entries.map(entry => entry.updateId), [1, 2]);
-    assert.deepEqual(store.appendBatch([{ update_id: 2 }], 2).duplicateUpdateIds, [2]);
-    const claimed = store.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-    assert.equal(store.startInput(claimed.receipt).started, true);
-    assert.deepEqual(store.completeInput(claimed.receipt).removedUpdateIds, [1]);
-    const next = store.acquireInput({ updateId: 2, recipientBindingKey: "workspace:owner" });
-    assert.equal(store.startInput(next.receipt).started, true);
-    assert.deepEqual(store.completeInput(next.receipt).removedUpdateIds, [2]);
-    assert.deepEqual(store.read().entries, []);
-    const insufficientPath = join(dir, "commit-unknown-insufficient.json");
-    const insufficient = createTelegramInputJournalStore({ ...options, path: insufficientPath,
-      sourceAccess: { ...options.sourceAccess, limits: { ...options.sourceAccess.limits, maxFiles: 6 } } });
-    insufficient.appendBatch([{ update_id: 1 }], 1);
-    setHook(() => assert.fail("Insufficient commit-unknown headroom must refuse before publication"));
-    assert.throws(() => insufficient.appendBatch([{ update_id: 2 }], 2), (error) => isJournalError(error, "capacity"));
-    setHook(undefined);
-    assert.deepEqual(insufficient.read().entries.map(entry => entry.updateId), [1]);
-    assert.equal(existsSync(`${insufficientPath}.segments`), false);
-  });
-});
-
-test("Input custody bounds execution projection growth inside its admission reserve", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 1, message: { text: "original" } }], 1);
-    const before = store.read();
-    assert.throws(() => store.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner",
-      executionUpdate: { update_id: 1, message: { text: "x".repeat(16 * 1024) } } }),
-    (error) => isJournalError(error, "capacity"));
-    assert.deepEqual(store.read(), before);
-    assert.throws(() => store.acquireInput({ updateId: 1, recipientBindingKey: "x".repeat(257) }),
-      (error) => isJournalError(error, "invalid"));
-    assert.deepEqual(store.read(), before);
-    const acquired = store.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner",
-      executionUpdate: { update_id: 1, message: { text: "routed", message_thread_id: 9 } } });
-    assert.equal(acquired.acquired, true);
-    const bounded = createTelegramInputJournalStore({ ...options, path: join(dirname(options.path), "bounded-projection.json"),
-      maxBytes: 20_000 });
-    bounded.appendBatch([{ update_id: 10 }], 10);
-    const running = bounded.acquireInput({ updateId: 10, recipientBindingKey: "workspace:owner" });
-    assert.equal(bounded.startInput(running.receipt).started, true);
-    const boundedBefore = bounded.read();
-    assert.throws(() => bounded.appendBatch([{ update_id: 11, message: { text: "x".repeat(8_000) } }], 11),
-      (error) => isJournalError(error, "capacity"));
-    assert.deepEqual(bounded.read(), boundedBefore);
-    assert.deepEqual(bounded.completeInput(running.receipt).removedUpdateIds, [10]);
-  });
-});
-
-test("Input custody releases only an exact ready claim and retries commit-unknown publication", async () => {
-  await withInputCustodyFixture(async ({ options, path, setOwner, setHook }) => {
-    const identity = { ...options.queueRuntimeIdentity, sessionGeneration: 1 };
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 1, message: { text: "retained" } }], 1);
-    const first = store.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-    const ready = store.read();
-    const readyBytes = await readFile(path, "utf8");
-    const handedOff = JSON.parse(readyBytes);
-    handedOff.entries[0].inputClaim.handoff = { handoffId: `input-handoff-${"1".repeat(32)}`, offeredAtMs: 1,
-      recipientOwner: { instanceId: "recipient", processId: process.pid + 1,
-        processBirthId: `${process.pid + 1}:recipient`, sessionGeneration: 1 } };
-    await writeFile(path, JSON.stringify(handedOff));
-    assert.throws(() => store.releaseInput(first.receipt), (error) => isJournalError(error, "conflict"));
-    assert.equal(await readFile(path, "utf8"), JSON.stringify(handedOff));
-    await writeFile(path, readyBytes);
-    setOwner(undefined);
-    assert.throws(() => store.releaseInput({ ...first.receipt,
-      owner: { ...first.receipt.owner, acquisitionId: "stale" } }), (error) => isJournalError(error, "conflict"));
-    let interrupt = true;
-    setHook(boundary => { if (interrupt && boundary === "after-write-before-rename") throw new Error("pre-commit release failure"); });
-    assert.throws(() => store.releaseInput(first.receipt), (error) => isJournalError(error, "io"));
-    assert.deepEqual(store.read(), ready);
-    interrupt = false;
-    let boundaryCount = 0;
-    setHook(boundary => {
-      boundaryCount += 1;
-      if (boundaryCount === 3 && boundary === "before-write") throw new Error("release snapshot commit unknown");
-    });
-    assert.throws(() => store.releaseInput(first.receipt), (error) => isJournalError(error, "io"));
-    setHook(undefined);
-    assert.equal(store.read().entries[0]!.inputClaim, undefined);
-    assert.deepEqual(store.releaseInput(first.receipt), { released: false,
-      entryCount: 1, serializedBytes: store.read().serializedBytes });
-    assert.equal((store.read().entries[0]!.update.message as { text: string }).text, "retained");
-    setOwner(identity);
-    const second = store.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-    assert.throws(() => store.releaseInput(first.receipt), (error) => isJournalError(error, "conflict"));
-    assert.equal(store.startInput(second.receipt).started, true);
-    const running = store.read();
-    assert.throws(() => store.releaseInput(second.receipt), (error) => isJournalError(error, "conflict"));
-    assert.deepEqual(store.read(), running);
-    assert.deepEqual(store.completeInput(second.receipt).removedUpdateIds, [1]);
-    assert.equal(existsSync(`${path}.transaction`), false);
-  });
-});
-
-test("Input custody recovers ready ownership only after exact process-death proof", async () => {
-  await withInputCustodyFixture(async ({ options, path, ledger }) => {
-    const ownerStore = createTelegramInputJournalStore(options);
-    ownerStore.appendBatch([{ update_id: 1 }], 1);
-    const first = ownerStore.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-    const recoveryRuntime = { instanceId: "recovery", processId: process.pid + 1000,
-      processBirthId: `${process.pid + 1000}:recovery` };
-    const recoveryOwner = { ...recoveryRuntime, sessionGeneration: 2 };
-    let liveness: "alive" | "dead" | "unverifiable" = "alive";
-    let livenessCalls = 0;
-    let throwLiveness = false;
-    const recovery = createTelegramInputJournalStore({ ...options, queueRuntimeIdentity: recoveryRuntime,
-      getInputContext: () => ({ owner: recoveryOwner, recipientBindingKey: "workspace:owner" }),
-      getQueueProcessLiveness(observed) {
-        livenessCalls += 1;
-        assert.deepEqual(observed, { processId: first.receipt.owner.processId,
-          processBirthId: first.receipt.owner.processBirthId });
-        assert.ok(ledger.read().leases.some(lease => lease.scope.kind === "profile"));
-        if (throwLiveness) throw new Error("synthetic liveness failure");
-        return liveness;
-      } });
-    assert.throws(() => recovery.recoverReadyInput({ receipt: first.receipt,
-      recoveryOwner: { ...recoveryOwner, instanceId: "foreign" } }), (error) => isJournalError(error, "conflict"));
-    assert.equal(livenessCalls, 0);
-    for (const [value, status] of [["alive", "owner-alive"], ["unverifiable", "owner-unverifiable"]] as const) {
-      liveness = value;
-      assert.equal(recovery.recoverReadyInput({ receipt: first.receipt, recoveryOwner }).status, status);
-      assert.deepEqual(ownerStore.read().entries[0]!.inputClaim!.owner, first.receipt.owner);
-    }
-    throwLiveness = true;
-    assert.throws(() => recovery.recoverReadyInput({ receipt: first.receipt, recoveryOwner }),
-      (error) => isJournalError(error, "io"));
-    throwLiveness = false; liveness = "dead";
-    assert.equal(recovery.recoverReadyInput({ receipt: first.receipt, recoveryOwner }).status, "recovered");
-    assert.equal(ownerStore.read().entries[0]!.inputClaim, undefined);
-    const calls = livenessCalls;
-    assert.equal(recovery.recoverReadyInput({ receipt: first.receipt, recoveryOwner }).status, "unclaimed");
-    assert.equal(livenessCalls, calls);
-    const next = recovery.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-    assert.throws(() => ownerStore.releaseInput(next.receipt), (error) => isJournalError(error, "conflict"));
-    assert.equal(recovery.startInput(next.receipt).started, true);
-    const running = recovery.read();
-    assert.throws(() => recovery.recoverReadyInput({ receipt: next.receipt, recoveryOwner }),
-      (error) => isJournalError(error, "conflict"));
-    assert.equal(livenessCalls, calls);
-    assert.deepEqual(recovery.read(), running);
-    assert.deepEqual(recovery.completeInput(next.receipt).removedUpdateIds, [1]);
-    assert.equal(existsSync(`${path}.transaction`), false);
-    assert.deepEqual(ledger.read().leases, []);
-  });
-});
-
-test("Input custody offer freezes the donor and acceptance transfers one exact acquisition", async () => {
-  await withInputCustodyFixture(async ({ options, ledger }) => {
-    const donor = createTelegramInputJournalStore(options);
-    donor.appendBatch([{ update_id: 1, message: { text: "original" } }], 1);
-    const donorClaim = donor.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner",
-      executionUpdate: { update_id: 1, message: { text: "routed", message_thread_id: 9 } } });
-    const recipientRuntime = { instanceId: "recipient", processId: process.pid + 2000,
-      processBirthId: `${process.pid + 2000}:recipient` };
-    const recipientOwner = { ...recipientRuntime, sessionGeneration: 2 };
-    const handoff = { receipt: donorClaim.receipt, recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken() };
-    const readyBytes = await readFile(options.path, "utf8");
-    assert.throws(() => donor.offerInputHandoff({ ...handoff, handoffToken: "short" }),
-      (error) => isJournalError(error, "invalid"));
-    assert.throws(() => donor.offerInputHandoff({ ...handoff, recipientOwner: {
-      instanceId: donorClaim.receipt.owner.instanceId, processId: donorClaim.receipt.owner.processId,
-      processBirthId: donorClaim.receipt.owner.processBirthId, sessionGeneration: 2 } }),
-    (error) => isJournalError(error, "conflict"));
-    assert.equal(await readFile(options.path, "utf8"), readyBytes);
-    const offered = donor.offerInputHandoff(handoff);
-    assert.equal(offered.duplicate, false);
-    assert.deepEqual(offered.source, inputSource(donorClaim.receipt));
-    assert.match(offered.handoff.handoffId, /^input-handoff-[a-f0-9]{32}$/u);
-    assert.deepEqual(offered.previousOwner, donorClaim.receipt.owner);
-    const frozen = donor.read();
-    assert.deepEqual(frozen.entries[0]!.inputClaim!.handoff, offered.handoff);
-    assert.deepEqual(frozen.entries[0]!.inputClaim!.executionUpdate,
-      { update_id: 1, message: { text: "routed", message_thread_id: 9 } });
-    assert.equal(donor.offerInputHandoff(handoff).duplicate, true);
-    const reconstructedOffer = donor.offerInputHandoff({ ...handoff,
-      handoffToken: createTelegramUpdateQueueHandoffToken() });
-    assert.equal(reconstructedOffer.duplicate, true);
-    assert.deepEqual(reconstructedOffer.handoff, offered.handoff);
-    assert.throws(() => donor.offerInputHandoff({ ...handoff,
-      recipientOwner: { ...recipientOwner, sessionGeneration: 3 } }),
-    (error) => isJournalError(error, "conflict"));
-    const acceptance = { source: offered.source, recipientOwner,
-      handoffId: offered.handoff.handoffId };
-    const cancellation = { receipt: donorClaim.receipt, recipientOwner,
-      handoffId: offered.handoff.handoffId };
-    assert.throws(() => donor.startInput(donorClaim.receipt), (error) => isJournalError(error, "conflict"));
-    assert.throws(() => donor.releaseInput(donorClaim.receipt), (error) => isJournalError(error, "conflict"));
-    assert.deepEqual(donor.read(), frozen);
-    const wrongBinding = createTelegramInputJournalStore({ ...options, queueRuntimeIdentity: recipientRuntime,
-      getInputContext: () => ({ owner: recipientOwner, recipientBindingKey: "workspace:other" }) });
-    assert.throws(() => wrongBinding.acceptInputHandoff(acceptance), (error) => isJournalError(error, "conflict"));
-    assert.deepEqual(donor.read(), frozen);
-    const recipient = createTelegramInputJournalStore({ ...options, queueRuntimeIdentity: recipientRuntime,
-      getInputContext: () => ({ owner: recipientOwner, recipientBindingKey: "workspace:owner" }) });
-    assert.throws(() => recipient.acceptInputHandoff({ ...acceptance,
-      handoffId: `input-handoff-${"0".repeat(32)}` }), (error) => isJournalError(error, "conflict"));
-    const accepted = recipient.acceptInputHandoff(acceptance);
-    assert.equal(accepted.duplicate, false);
-    assert.notEqual(accepted.receipt.owner.acquisitionId, donorClaim.receipt.owner.acquisitionId);
-    assert.equal(accepted.receipt.owner.handoffId, offered.handoff.handoffId);
-    const acceptedSnapshot = recipient.read();
-    assert.equal(acceptedSnapshot.entries[0]!.inputClaim!.handoff, undefined);
-    assert.deepEqual(acceptedSnapshot.entries[0]!.inputClaim!.owner, accepted.receipt.owner);
-    assert.equal(recipient.acceptInputHandoff(acceptance).duplicate, true);
-    assert.deepEqual(recipient.acceptInputHandoff(acceptance).receipt, accepted.receipt);
-    assert.throws(() => donor.cancelInputHandoff(cancellation), (error) => isJournalError(error, "conflict"));
-    const started = recipient.startInput(accepted.receipt);
-    assert.deepEqual(started, { started: true,
-      update: { update_id: 1, message: { text: "routed", message_thread_id: 9 } } });
-    const lateDuplicate = recipient.acceptInputHandoff(acceptance);
-    assert.equal(lateDuplicate.duplicate, true);
-    assert.equal(lateDuplicate.handoffId, accepted.handoffId);
-    assert.deepEqual(lateDuplicate.receipt, accepted.receipt);
-    assert.equal(lateDuplicate.entryCount, 1);
-    assert.equal(lateDuplicate.serializedBytes, recipient.read().serializedBytes);
-    assert.equal(lateDuplicate.previousOwner, undefined);
-    assert.throws(() => donor.startInput(donorClaim.receipt), (error) => isJournalError(error, "conflict"));
-    assert.deepEqual(recipient.completeInput(accepted.receipt).removedUpdateIds, [1]);
-    assert.throws(() => recipient.acceptInputHandoff(acceptance), (error) => isJournalError(error, "conflict"));
-    assert.deepEqual(donor.appendBatch([{ update_id: 1 }], 1).addedUpdateIds, []);
-    assert.deepEqual(donor.read().entries, []);
-    assert.deepEqual(ledger.read().leases, []);
-  });
-});
-
-test("Input custody handoff cancellation, recovery, and commit-unknown acceptance never restore donor authority", async () => {
-  await withInputCustodyFixture(async ({ options, path, setHook, ledger }) => {
-    const donor = createTelegramInputJournalStore(options);
-    donor.appendBatch([{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }], 3);
-    const recipientRuntime = { instanceId: "recipient", processId: process.pid + 3000,
-      processBirthId: `${process.pid + 3000}:recipient` };
-    const recipientOwner = { ...recipientRuntime, sessionGeneration: 2 };
-    let liveness: "alive" | "unverifiable" | "dead" = "dead";
-    let livenessCalls = 0;
-    const recovery = createTelegramInputJournalStore({ ...options, queueRuntimeIdentity: recipientRuntime,
-      getInputContext: () => ({ owner: recipientOwner, recipientBindingKey: "workspace:owner" }),
-      getQueueProcessLiveness: () => { livenessCalls += 1; return liveness; } });
-
-    const first = donor.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-    const firstOffer = donor.offerInputHandoff({ receipt: first.receipt, recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken() });
-    const firstAcceptance = { source: firstOffer.source, recipientOwner,
-      handoffId: firstOffer.handoff.handoffId };
-    let boundaries = 0;
-    setHook(boundary => {
-      boundaries += 1;
-      if (boundaries === 3 && boundary === "before-write") throw new Error("accept snapshot commit unknown");
-    });
-    assert.throws(() => recovery.acceptInputHandoff(firstAcceptance), (error) => isJournalError(error, "io"));
-    setHook(undefined);
-    const accepted = recovery.acceptInputHandoff(firstAcceptance);
-    assert.equal(accepted.duplicate, true);
-    assert.throws(() => recovery.recoverReadyInput({ receipt: first.receipt, recoveryOwner: recipientOwner }),
-      (error) => isJournalError(error, "conflict"));
-    assert.equal(livenessCalls, 0);
-    assert.equal(recovery.startInput(accepted.receipt).started, true);
-    assert.throws(() => donor.cancelInputHandoff({ receipt: first.receipt, recipientOwner,
-      handoffId: firstOffer.handoff.handoffId }), (error) => isJournalError(error, "conflict"));
-    assert.deepEqual(recovery.completeInput(accepted.receipt).removedUpdateIds, [1]);
-
-    const second = donor.acquireInput({ updateId: 2, recipientBindingKey: "workspace:owner" });
-    const secondHandoff = { receipt: second.receipt, recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken() };
-    boundaries = 0;
-    setHook(boundary => {
-      boundaries += 1;
-      if (boundaries === 3 && boundary === "before-write") throw new Error("offer snapshot commit unknown");
-    });
-    assert.throws(() => donor.offerInputHandoff(secondHandoff), (error) => isJournalError(error, "io"));
-    setHook(undefined);
-    const offered = donor.offerInputHandoff({ ...secondHandoff,
-      handoffToken: createTelegramUpdateQueueHandoffToken() });
-    assert.equal(offered.duplicate, true);
-    const cancellation = { receipt: second.receipt, recipientOwner, handoffId: offered.handoff.handoffId };
-    const offeredBytes = await readFile(path, "utf8");
-    assert.throws(() => donor.cancelInputHandoff({ ...cancellation,
-      handoffId: `input-handoff-${"0".repeat(32)}` }), (error) => isJournalError(error, "conflict"));
-    assert.equal(await readFile(path, "utf8"), offeredBytes);
-    boundaries = 0;
-    setHook(boundary => {
-      boundaries += 1;
-      if (boundaries === 3 && boundary === "before-write") throw new Error("cancel snapshot commit unknown");
-    });
-    assert.throws(() => donor.cancelInputHandoff(cancellation), (error) => isJournalError(error, "io"));
-    setHook(undefined);
-    assert.equal(donor.cancelInputHandoff(cancellation).cancelled, false);
-    assert.equal(donor.read().entries.find(entry => entry.updateId === 2)!.inputClaim!.handoff, undefined);
-    assert.equal(donor.startInput(second.receipt).started, true);
-    assert.deepEqual(donor.completeInput(second.receipt).removedUpdateIds, [2]);
-
-    const third = donor.acquireInput({ updateId: 3, recipientBindingKey: "workspace:owner" });
-    const thirdOffer = donor.offerInputHandoff({ receipt: third.receipt, recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken() });
-    const recoveryRequest = { receipt: third.receipt, recoveryOwner: recipientOwner };
-    liveness = "alive";
-    assert.equal(recovery.recoverReadyInput(recoveryRequest).status, "owner-alive");
-    liveness = "unverifiable";
-    assert.equal(recovery.recoverReadyInput(recoveryRequest).status, "owner-unverifiable");
-    liveness = "dead";
-    assert.equal(recovery.recoverReadyInput(recoveryRequest).status, "recovered");
-    assert.equal(livenessCalls, 3);
-    assert.equal(donor.read().entries[0]!.inputClaim, undefined);
-    assert.throws(() => recovery.acceptInputHandoff({ source: thirdOffer.source, recipientOwner,
-      handoffId: thirdOffer.handoff.handoffId }), (error) => isJournalError(error, "conflict"));
-    const reacquired = donor.acquireInput({ updateId: 3, recipientBindingKey: "workspace:owner" });
-    assert.equal(donor.startInput(reacquired.receipt).started, true);
-    assert.deepEqual(donor.completeInput(reacquired.receipt).removedUpdateIds, [3]);
-    assert.deepEqual(ledger.read().leases, []);
-  });
-});
-
-test("Input custody serializes duplicate accept and accept/dead-recovery across processes", async () => {
-  await withInputCustodyFixture(async ({ options, dir, path, ledger }) => {
-    const donor = createTelegramInputJournalStore(options);
-    donor.appendBatch([{ update_id: 1 }, { update_id: 2 }], 2);
-    const recipientRuntime = { instanceId: "recipient-race", processId: process.pid + 5000,
-      processBirthId: `${process.pid + 5000}:recipient-race` };
-    const recipientOwner = { ...recipientRuntime, sessionGeneration: 2 };
-    const recoveryOwner = { instanceId: "recovery-race", processId: process.pid + 5001,
-      processBirthId: `${process.pid + 5001}:recovery-race`, sessionGeneration: 1 };
-    const recipient = createTelegramInputJournalStore({ ...options, queueRuntimeIdentity: recipientRuntime,
-      getInputContext: () => ({ owner: recipientOwner, recipientBindingKey: "workspace:owner" }) });
-    const requestPath = join(dir, "handoff-worker-request.json");
-    const output = async (worker: number) => JSON.parse(
-      await readFile(join(dir, `handoff-worker-${worker}.json`), "utf8"),
-    ) as { kind: string; duplicate?: boolean; status?: string;
-      receipt?: ReturnType<typeof donor.acquireInput>["receipt"] };
-
-    const first = donor.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-    const firstOffer = donor.offerInputHandoff({ receipt: first.receipt, recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken() });
-    const firstRequest = { acceptance: { source: firstOffer.source, recipientOwner,
-      handoffId: firstOffer.handoff.handoffId },
-    recovery: { receipt: first.receipt, recoveryOwner }, recipientBindingKey: "workspace:owner",
-    recipientOwner, recoveryOwner };
-    await writeFile(requestPath, JSON.stringify(firstRequest));
-    await Promise.all([runJournalWorker(path, 1, 1, "input-handoff-accept"),
-      runJournalWorker(path, 2, 1, "input-handoff-accept")]);
-    const duplicateResults = await Promise.all([output(1), output(2)]);
-    assert.deepEqual(duplicateResults.map(result => result.kind), ["accepted", "accepted"]);
-    assert.deepEqual(duplicateResults.map(result => result.duplicate).sort(), [false, true]);
-    assert.deepEqual(duplicateResults[0]!.receipt, duplicateResults[1]!.receipt);
-    const acceptedReceipt = duplicateResults[0]!.receipt!;
-    assert.equal(recipient.startInput(acceptedReceipt).started, true);
-    assert.deepEqual(recipient.completeInput(acceptedReceipt).removedUpdateIds, [1]);
-
-    const second = donor.acquireInput({ updateId: 2, recipientBindingKey: "workspace:owner" });
-    const secondOffer = donor.offerInputHandoff({ receipt: second.receipt, recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken() });
-    const secondRequest = { acceptance: { source: secondOffer.source, recipientOwner,
-      handoffId: secondOffer.handoff.handoffId },
-    recovery: { receipt: second.receipt, recoveryOwner }, recipientBindingKey: "workspace:owner",
-    recipientOwner, recoveryOwner };
-    await writeFile(requestPath, JSON.stringify(secondRequest));
-    await Promise.all([runJournalWorker(path, 3, 2, "input-handoff-accept"),
-      runJournalWorker(path, 4, 2, "input-handoff-recover")]);
-    const raced = await Promise.all([output(3), output(4)]);
-    const accepted = raced.find(result => result.kind === "accepted");
-    const recovered = raced.find(result => result.kind === "recovered" && result.status === "recovered");
-    assert.equal(Number(Boolean(accepted)) + Number(Boolean(recovered)), 1);
-    if (accepted?.receipt) {
-      assert.equal(recipient.startInput(accepted.receipt).started, true);
-      assert.deepEqual(recipient.completeInput(accepted.receipt).removedUpdateIds, [2]);
-    } else {
-      assert.equal(donor.read().entries[0]!.inputClaim, undefined);
-      const reacquired = donor.acquireInput({ updateId: 2, recipientBindingKey: "workspace:owner" });
-      assert.equal(donor.startInput(reacquired.receipt).started, true);
-      assert.deepEqual(donor.completeInput(reacquired.receipt).removedUpdateIds, [2]);
-    }
-    assert.deepEqual(donor.read().entries, []);
-    assert.deepEqual(ledger.read().leases, []);
-  });
-});
-
-test("Input custody offer reserves dead-donor recovery through complete cleanup refusal", async () => {
-  await withInputCustodyFixture(async ({ options, dir, ledger }) => {
-    const path = join(dir, "handoff-headroom.json");
-    const initial = createTelegramInputJournalStore({ ...options, path });
-    initial.appendBatch([{ update_id: 1 }], 1);
-    const donorClaim = initial.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-    const recipientRuntime = { instanceId: "recipient", processId: process.pid + 4000,
-      processBirthId: `${process.pid + 4000}:recipient` };
-    const recipientOwner = { ...recipientRuntime, sessionGeneration: 2 };
-    const handoff = { receipt: donorClaim.receipt, recipientOwner,
-      handoffToken: createTelegramUpdateQueueHandoffToken() };
-    const before = await readFile(path, "utf8");
-    const insufficient = createTelegramInputJournalStore({ ...options, path,
-      sourceAccess: { ...options.sourceAccess, limits: { ...options.sourceAccess.limits, maxFiles: 5 } } });
-    assert.throws(() => insufficient.offerInputHandoff(handoff), (error) => isJournalError(error, "capacity"));
-    assert.equal(await readFile(path, "utf8"), before);
-    assert.equal(existsSync(`${path}.segments`), false);
-    const donor = createTelegramInputJournalStore({ ...options, path,
-      sourceAccess: { ...options.sourceAccess, limits: { ...options.sourceAccess.limits, maxFiles: 6 } } });
-    const recipient = createTelegramInputJournalStore({ ...options, path, queueRuntimeIdentity: recipientRuntime,
-      sourceAccess: { ...options.sourceAccess, limits: { ...options.sourceAccess.limits, maxFiles: 6 } },
-      getInputContext: () => ({ owner: recipientOwner, recipientBindingKey: "workspace:owner" }),
-      getQueueProcessLiveness: () => "dead" });
-    const originalUnlink = fs.unlinkSync;
-    fs.unlinkSync = ((target: fs.PathLike) => {
-      if (String(target).startsWith(`${path}.segments${sep}`)) throw new Error("synthetic retained handoff segment");
-      return originalUnlink(target);
-    }) as typeof fs.unlinkSync;
-    syncBuiltinESMExports();
-    try {
-      donor.offerInputHandoff(handoff);
-      assert.equal(recipient.recoverReadyInput({ receipt: donorClaim.receipt,
-        recoveryOwner: recipientOwner }).status, "recovered");
-      const reacquired = recipient.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-      assert.equal(recipient.startInput(reacquired.receipt).started, true);
-      assert.deepEqual(recipient.completeInput(reacquired.receipt).removedUpdateIds, [1]);
-    } finally { fs.unlinkSync = originalUnlink; syncBuiltinESMExports(); }
-    assert.deepEqual(recipient.read().entries, []);
-    assert.equal((await readdir(`${path}.segments`)).length, 5);
-    assert.deepEqual(ledger.read().leases, []);
-  });
-});
-
-test("Input custody atomically replaces exact running claims with one grouped Pi queue receipt", async () => {
-  await withInputCustodyFixture(async ({ options, setOwner, ledger }) => {
-    const store = createTelegramInputJournalStore(options);
-    store.appendBatch([{ update_id: 1, message: { text: "one" } },
-      { update_id: 2, message: { text: "two" } }], 2);
-    const first = store.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner",
-      executionUpdate: { update_id: 1, message: { text: "routed one", message_thread_id: 9 } } });
-    const second = store.acquireInput({ updateId: 2, recipientBindingKey: "workspace:owner" });
-    assert.equal(store.startInput(first.receipt).started, true);
-    assert.equal(store.startInput(second.receipt).started, true);
-    const request = { queueKind: "prompt" as const, receiptId: "grouped-prompt",
-      receipts: [second.receipt, first.receipt] };
-    const queued = store.queueInputs(request);
-    assert.equal(queued.queued, true);
-    assert.deepEqual(queued.queueReceipt.sourceUpdateIds, [1, 2]);
-    assert.equal(queued.queueReceipt.queueOwner.instanceId, options.queueRuntimeIdentity.instanceId);
-    assert.notEqual(queued.queueReceipt.queueOwner.acquisitionId, first.receipt.owner.acquisitionId);
-    const snapshot = store.read();
-    assert.deepEqual(snapshot.entries.map(entry => entry.state), ["queued", "queued"]);
-    assert.deepEqual(snapshot.entries.map(entry => entry.inputClaim), [undefined, undefined]);
-    assert.deepEqual(snapshot.entries.map(entry => entry.queueOwner),
-      [queued.queueReceipt.queueOwner, queued.queueReceipt.queueOwner]);
-    assert.deepEqual(snapshot.entries[0]!.inputProvenance, {
-      owner: first.receipt.owner, recipientBindingKey: "workspace:owner",
-      executionUpdate: { update_id: 1, message: { text: "routed one", message_thread_id: 9 } },
-    });
-    assert.deepEqual(snapshot.entries[1]!.inputProvenance,
-      { owner: second.receipt.owner, recipientBindingKey: "workspace:owner" });
-    const duplicate = store.queueInputs(request);
-    assert.equal(duplicate.queued, false);
-    assert.deepEqual(duplicate.queueReceipt, queued.queueReceipt);
-    const retained = store.read();
-    for (const receipt of [first.receipt, second.receipt]) {
-      assert.throws(() => store.startInput(receipt), (error) => isJournalError(error, "conflict"));
-      assert.throws(() => store.completeInput(receipt), (error) => isJournalError(error, "conflict"));
-      assert.throws(() => store.releaseInput(receipt), (error) => isJournalError(error, "conflict"));
-    }
-    assert.throws(() => store.queueInputs({ ...request, queueKind: "control" }),
-      (error) => isJournalError(error, "conflict"));
-    assert.throws(() => store.queueInputs({ ...request, receipts: [first.receipt] }),
-      (error) => isJournalError(error, "conflict"));
-    assert.throws(() => store.queueInputs({ ...request, receipts: [first.receipt,
-      { ...second.receipt, owner: { ...second.receipt.owner, acquisitionId: "stale" } }] }),
-    (error) => isJournalError(error, "conflict"));
-    assert.deepEqual(store.read(), retained);
-    setOwner(undefined);
-    assert.deepEqual(store.completeQueued([queued.queueReceipt]).removedUpdateIds, [1, 2]);
-    assert.deepEqual(store.appendBatch([{ update_id: 1 }, { update_id: 2 }], 2).addedUpdateIds, []);
-    assert.deepEqual(store.read().entries, []);
-    assert.deepEqual(ledger.read().leases, []);
-  });
-});
-
-test("Input custody grouped queue transition reserves commit-unknown completion with cleanup residue", async () => {
-  await withInputCustodyFixture(async ({ options, dir, setHook, ledger }) => {
-    const path = join(dir, "queue-headroom.json");
-    const initial = createTelegramInputJournalStore({ ...options, path });
-    initial.appendBatch([{ update_id: 1 }, { update_id: 2 }], 2);
-    const first = initial.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
-    const second = initial.acquireInput({ updateId: 2, recipientBindingKey: "workspace:owner" });
-    assert.equal(initial.startInput(first.receipt).started, true);
-    assert.equal(initial.startInput(second.receipt).started, true);
-    const request = { queueKind: "prompt" as const, receiptId: "bounded-group",
-      receipts: [first.receipt, second.receipt] };
-    const before = await readFile(path, "utf8");
-    const insufficient = createTelegramInputJournalStore({ ...options, path,
-      sourceAccess: { ...options.sourceAccess, limits: { ...options.sourceAccess.limits, maxFiles: 2 } } });
-    assert.throws(() => insufficient.queueInputs(request), (error) => isJournalError(error, "capacity"));
-    assert.equal(await readFile(path, "utf8"), before);
-    assert.equal(existsSync(`${path}.segments`), false);
-    const bounded = createTelegramInputJournalStore({ ...options, path,
-      sourceAccess: { ...options.sourceAccess, limits: { ...options.sourceAccess.limits, maxFiles: 3 } } });
-    let boundaries = 0;
-    setHook(boundary => {
-      boundaries += 1;
-      if (boundaries === 3 && boundary === "before-write") throw new Error("queue snapshot commit unknown");
-    });
-    assert.throws(() => bounded.queueInputs(request), (error) => isJournalError(error, "io"));
-    setHook(undefined);
-    const duplicate = bounded.queueInputs(request);
-    assert.equal(duplicate.queued, false);
-    const originalUnlink = fs.unlinkSync;
-    fs.unlinkSync = ((target: fs.PathLike) => {
-      if (String(target).startsWith(`${path}.segments${sep}`)) throw new Error("synthetic retained queue segment");
-      return originalUnlink(target);
-    }) as typeof fs.unlinkSync;
-    syncBuiltinESMExports();
-    try {
-      assert.deepEqual(bounded.completeQueued([duplicate.queueReceipt]).removedUpdateIds, [1, 2]);
-    } finally { fs.unlinkSync = originalUnlink; syncBuiltinESMExports(); }
-    assert.deepEqual(bounded.read().entries, []);
-    assert.equal((await readdir(`${path}.segments`)).length, 2);
-    assert.deepEqual(ledger.read().leases, []);
-  });
 });
 
 test("Custody v3 decodes input claims without granting legacy consumers access", async () => {
@@ -2787,7 +556,7 @@ test("Strict family inspection preserves evidence and rejects uncertain families
 test("Strict readers work without no-follow, non-blocking or POSIX-uid support, as on Windows", () => {
   // Emulates Windows in a child: the shared read flags lose both bits and process.getuid disappears. Identity binding
   // must then carry the guarantee: a valid journal reads, and a link standing in for it is still refused.
-  const locks = new URL("../lib/locks.ts", import.meta.url).href;
+  const locks = import.meta.resolve("../lib/locks.ts");
   const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `
     import { registerHooks } from 'node:module';
     import assert from 'node:assert/strict';
@@ -3337,6 +1106,81 @@ for (const kind of ["alias", "unknown", "retained", "linked-session", "linked-sn
   });
 }
 
+test("Legacy profile namespace keeps its strict runtime metadata observation", async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-profile-metadata-")));
+  const path = join(directory, "inbox.json"), botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "fixture-profile-metadata" });
+  try {
+    await writeFile(path, JSON.stringify({ version: 1, revision: 1, profile: "default", botIdentity, entries: [] }));
+    await writeFile(join(directory, "logs.jsonl"), "initial\n");
+    assert.throws(() => inspectTelegramProfileJournalNamespace({ directory, profile: "default", botIdentity,
+      limits: { maxDirectoryEntries: 20, maxFiles: 20, maxBytes: 100000, maxEntries: 20, maxWork: 1000 },
+      withSourceReference(_path, operation) { fs.appendFileSync(join(directory, "logs.jsonl"), "changed\n"); return operation(); },
+    }), error => isJournalError(error, "invalid"));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+for (const sourceArtifact of [true, false]) for (const sessionPolling of [false, true]) for (const change of ["logs", "log-rotate", "state", "runtime", "native-state", "source", "replace-source", "new-session", "new-source", "root", "permissions", "linked-state", "replace-runtime", "linked-runtime", "hardlinked-state", "state-permissions", "other-root-file", "writer-lock"] as const)
+test(`Session census separates runtime churn from source changes (${sourceArtifact ? "source" : "compiled"}/${sessionPolling}/${change})`, { skip: process.platform === "win32" && ["permissions", "linked-state", "linked-runtime", "state-permissions"].includes(change) }, async () => {
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-runtime-census-")));
+  const directory = join(agentDir, "tmp", "pi-telegram"), runtime = join(directory, "runtime"), statePath = join(directory, "state.json");
+  const pollingPath = sessionPolling ? resolveTelegramSessionPollingJournalPath("leader", agentDir) : join(directory, "inbox.json");
+  const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "fixture-runtime-census" });
+  const compiled = sourceArtifact ? undefined : await import("../dist/lib/journal.js");
+  const inspectNamespace = sourceArtifact ? inspectTelegramSessionJournalNamespace : compiled!.inspectTelegramSessionJournalNamespace;
+  const NativeError = sourceArtifact ? TelegramUpdateJournalError : compiled!.TelegramUpdateJournalError;
+  const file = JSON.stringify({ version: 1, revision: 1, profile: "default", botIdentity, entries: [] });
+  const benign = ["logs", "log-rotate", "state", "runtime", "native-state"].includes(change);
+  const references = createTelegramUpdateJournalReferenceRegistry();
+  let changed = false;
+  try {
+    await mkdir(dirname(pollingPath), { recursive: true }); await mkdir(runtime, { recursive: true });
+    await mkdir(join(directory, "logs"));
+    if (change === "other-root-file") await writeFile(join(directory, "plugin-cache"), "original");
+    fs.chmodSync(directory, 0o700);
+    await writeFile(pollingPath, file); await writeFile(join(directory, "logs.jsonl"), "first\n");
+    await writeFile(statePath, JSON.stringify({ version: 2, profiles: { default: { runtime: { value: 1 } } } }), { mode: 0o600 });
+    const inspect = () => inspectNamespace({ directory, profile: "default", pollingPath, botIdentity,
+      limits: { maxDirectoryEntries: 100, maxFiles: 100, maxBytes: 1_000_000, maxEntries: 100, maxWork: 10000 },
+      withSourceReference(path, operation) {
+        return references.withReference({ referenceClass: "operator-disposition", recoveryKey: createTelegramUpdateJournalBindingKey({ path, botIdentity }) }, () => {
+          if (!changed) {
+            changed = true;
+            if (change === "logs") fs.appendFileSync(join(directory, "logs.jsonl"), "normal runtime event\n");
+            else if (change === "log-rotate") { fs.renameSync(join(directory, "logs.jsonl"), join(directory, "logs", "previous.jsonl")); fs.writeFileSync(join(directory, "logs.jsonl"), "new log\n"); }
+            else if (change === "state") { fs.writeFileSync(join(runtime, "candidate"), "different runtime state", { mode: 0o600 }); fs.renameSync(join(runtime, "candidate"), statePath); }
+            else if (change === "runtime") fs.writeFileSync(join(runtime, "state.json.transaction"), "unrelated native state transaction");
+            else if (change === "native-state") {
+              const url = new URL("../lib/locks.ts", import.meta.url).href;
+              const child = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e",
+                `import { mutateTelegramRuntimeStateSection } from ${JSON.stringify(url)}; mutateTelegramRuntimeStateSection(${JSON.stringify(statePath)}, 'default', 'runtime', () => ({ value: { value: 2 }, result: true }), { isCurrent: () => true });`],
+                { encoding: "utf8", timeout: 15000 });
+              assert.equal(child.status, 0, child.stderr);
+            } else if (change === "source") fs.appendFileSync(pollingPath, " ");
+            else if (change === "replace-source") { fs.writeFileSync(join(runtime, "candidate"), file); fs.renameSync(join(runtime, "candidate"), pollingPath); }
+            else if (change === "new-session") fs.mkdirSync(join(directory, "sessions", "new-session"), { recursive: true });
+            else if (change === "new-source") fs.writeFileSync(join(directory, "follower-inbox-aaaaaaaaaaaaaaaa.json"), file);
+            else if (change === "root") { fs.renameSync(directory, `${directory}.old`); fs.cpSync(`${directory}.old`, directory, { recursive: true }); }
+            else if (change === "permissions") fs.chmodSync(directory, 0o755);
+            else if (change === "linked-state") { fs.unlinkSync(statePath); fs.symlinkSync(pollingPath, statePath); }
+            else if (change === "replace-runtime") { fs.renameSync(runtime, join(agentDir, "old-runtime")); fs.mkdirSync(runtime); }
+            else if (change === "linked-runtime") { fs.renameSync(runtime, join(agentDir, "old-runtime")); fs.symlinkSync(join(agentDir, "old-runtime"), runtime, "dir"); }
+            else if (change === "hardlinked-state") fs.linkSync(statePath, join(agentDir, "state-alias"));
+            else if (change === "state-permissions") fs.chmodSync(statePath, 0o644);
+            else if (change === "other-root-file") fs.appendFileSync(join(directory, "plugin-cache"), " changed");
+            else if (change === "writer-lock") fs.writeFileSync(`${pollingPath}.transaction`, "uncoordinated journal writer");
+          }
+          return operation();
+        });
+      } });
+    if (benign) {
+      const result = inspect(); assert.equal(result.sources.length, 1);
+      assert.equal(result.sources[0]!.evidence.kind, "present");
+      assert.equal(await readFile(pollingPath, "utf8"), file, "Unrelated runtime churn must neither alter nor repair source bytes");
+    } else assert.throws(inspect, error => error instanceof NativeError && error.code === "invalid");
+    assert.equal(changed, true); assert.deepEqual(references.list(), []);
+  } finally { await rm(agentDir, { recursive: true, force: true }); }
+});
+
 for (const change of ["segment-body", "legacy-segment-body", "new-session", "foreign-body"] as const) {
   test(`Session namespace recensus refuses changes after the last family read (${change})`, async () => {
     const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-session-recensus-")));
@@ -3814,7 +1658,8 @@ for (const scenario of ["committed", "none", "pending", "other-disposition", "mi
       const snapshot = store.read();
       const bytes = retainedPath && scenario !== "missing-retention" ? await readFile(retainedPath, "utf8") : undefined;
       if (scenario === "committed") {
-        assert.deepEqual(store.inspectAbandonedPending(1), { journalBindingKey, updateId: 1, retainedPath, operatorAuthorityId: "telegram-owner:7" });
+        assert.deepEqual(store.inspectAbandonedPending(1), { journalBindingKey, updateId: 1, retainedPath, operatorAuthorityId: "telegram-owner:7",
+          originalTarget: { chatId: 7, threadId: 99, messageId: 11, sourceSha256: createTelegramUpdateJournalEntryDigest(entry).sourceSha256 } });
         assert.equal(store.inspectAbandonedPending(2), undefined, "another source has no abandonment");
       } else if (scenario === "invalid-id") {
         assert.throws(() => store.inspectAbandonedPending(-1), /invalid abandonment update id/);
@@ -3826,6 +1671,108 @@ for (const scenario of ["committed", "none", "pending", "other-disposition", "mi
     });
   });
 }
+
+for (const artifact of ["source", "compiled"] as const) for (const liveSource of [false, true])
+for (const scenario of ["committed", "none", "missing-retention", "tampered-retention", "business-envelope", "business-message", "ambiguous", "callback", "edited", "foreign-owner", "foreign-sender", "bot", "no-human-flag", "no-thread", "bad-message", "non-private", "sender-chat", "unknown-envelope"] as const)
+test(`Committed orphan origin remains a strict read-only source fact (${artifact}/${liveSource}/${scenario})`, async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
+    const M = artifact === "source" ? { createTelegramUpdateJournalStore } : await import("../dist/lib/journal.js");
+    const options = { path, profileName: "work", botIdentity: identity, getNowMs: () => 1000,
+      ...(liveSource ? { sourceAccess: { directory: dir, limits: sourceLimits },
+        withSourceSerialization: createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction")) } : {}),
+      onRecovery() { assert.fail("An origin observation cannot repair or rebind its source"); } };
+    const store = M.createTelegramUpdateJournalStore(options);
+    const message: Record<string, unknown> = { message_id: 11, message_thread_id: 99,
+      chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "Private source body" };
+    const original: TelegramJournaledUpdate = { update_id: 1, message };
+    if (scenario === "business-envelope") { delete original.message; original.business_message = { ...message, business_connection_id: "private-connection" }; }
+    if (scenario === "business-message") message.business_connection_id = "private-connection";
+    if (scenario === "callback" || scenario === "ambiguous") {
+      original.callback_query = { id: "private-callback", from: { id: 7, is_bot: false }, data: "private-token", message };
+      if (scenario === "callback") delete original.message;
+    }
+    if (scenario === "edited") { original.edited_message = message; delete original.message; }
+    if (scenario === "foreign-sender") message.from = { id: 8, is_bot: false };
+    if (scenario === "bot") message.from = { id: 7, is_bot: true };
+    if (scenario === "no-human-flag") message.from = { id: 7 };
+    if (scenario === "no-thread") delete message.message_thread_id;
+    if (scenario === "bad-message") message.message_id = 0;
+    if (scenario === "non-private") message.chat = { id: 7, type: "supergroup" };
+    if (scenario === "sender-chat") message.sender_chat = { id: 7, type: "private" };
+    if (scenario === "unknown-envelope") original.unrecognized = true;
+    store.appendBatch([original]);
+    const entry = store.read().entries[0]!, journalBindingKey = createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity });
+    if (scenario !== "none") {
+      const result = store.abandonPending({ journalBindingKey, entry, operatorAuthorityId: scenario === "foreign-owner" ? "telegram-owner:8" : "telegram-owner:7", isCurrent: () => true });
+      if (scenario === "missing-retention") await rm(result.retainedPath);
+      if (scenario === "tampered-retention") { const altered = JSON.parse(await readFile(result.retainedPath, "utf8")); altered.entry.update.message.message_thread_id = 100; await writeFile(result.retainedPath, JSON.stringify(altered)); }
+    }
+    const before = await readJournalFixtureTree(dir);
+    if (scenario === "missing-retention" || scenario === "tampered-retention") assert.throws(() => store.inspectAbandonedPending(1), /retained input/u);
+    else {
+      const observed: TelegramUpdateJournalAbandonedPendingEvidence | undefined = store.inspectAbandonedPending(1);
+      if (scenario === "committed") {
+        const expected = { chatId: 7, threadId: 99, messageId: 11, sourceSha256: createTelegramUpdateJournalEntryDigest(entry).sourceSha256 };
+        assert.deepEqual(observed?.originalTarget, expected); assert.ok(Object.isFrozen(observed!.originalTarget));
+        assert.doesNotMatch(JSON.stringify(observed), /Private source body|private-token|private-connection/u);
+        observed!.originalTarget = { ...expected, threadId: 100 };
+        const cold = M.createTelegramUpdateJournalStore(options);
+        const again: TelegramUpdateJournalAbandonedPendingEvidence | undefined = cold.inspectAbandonedPending(1);
+        assert.deepEqual(again?.originalTarget, expected, "Returned/copied locator data cannot alter retained origin or renew authority");
+      } else {
+        assert.equal(observed?.originalTarget, undefined, "A cancellation ID or display locator alone cannot certify a human bot-chat orphan");
+        if (scenario === "none") assert.equal(observed, undefined); else assert.ok(observed, "Unsupported origin does not destroy otherwise valid cancellation evidence");
+      }
+    }
+    assert.deepEqual(await readJournalFixtureTree(dir), before, "Both successful and refused origin reads preserve every source/retention byte");
+  });
+});
+
+for (const liveSource of [false, true]) for (const scenario of ["discard", "repeat", "payload-changed", "failure-changed", "foreign-source", "lost-authority", "pending", "queued", "publication-loss", "foreign-repeat"] as const)
+test(`Exact operator retry discard preserves native authority (${liveSource}/${scenario})`, async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
+    let current = true, armed = false;
+    const store = createStore(path, {
+      ...(liveSource ? { sourceAccess: { directory: dir, limits: sourceLimits },
+        withSourceSerialization: createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction")) } : {}),
+      onPublicationBoundary(boundary) { if (armed && scenario === "publication-loss" && boundary === "before-write") current = false; },
+      onRecovery() { assert.fail("Operator disposal must never repair a source"); },
+    });
+    store.appendBatch([{ update_id: 1, message: { message_id: 10, message_thread_id: 99, text: "Original private command" } }]);
+    if (scenario === "queued") store.markQueued({ queueKind: "prompt", receiptId: "receipt", sourceUpdateIds: [1], owner: queueOwnerIdentity });
+    else if (scenario !== "pending") store.markExecutionFailure({ updateId: 1, expectedAttemptCount: 0, failedAtMs: 10,
+      failureClass: "execution-Error", summary: "Unknown prior effects", disposition: "retry-wait", nextRetryAtMs: 20 });
+    const before = store.read(), entry = structuredClone(before.entries[0]!);
+    if (scenario === "payload-changed") (entry.update.message as { text: string }).text = "Equal failure, foreign source body";
+    if (scenario === "failure-changed") entry.failure!.attemptCount++;
+    const input = { journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }) + (scenario === "foreign-source" ? "foreign" : ""),
+      entry, operatorAuthorityId: "fixture-explicit-owner-consent", isCurrent: () => current };
+    if (scenario === "lost-authority") current = false;
+    armed = true;
+    const success = scenario === "discard" || scenario === "repeat" || scenario === "foreign-repeat";
+    if (!success) {
+      assert.throws(() => store.discardRetryWait(input));
+      assert.deepEqual(store.read(), before, "Refusal cannot change source, failure, custody or audit");
+      return;
+    }
+    const result = store.discardRetryWait(input);
+    assert.equal(result.duplicate, false); assert.equal(result.entryCount, 0);
+    assert.equal(result.disposition.attemptCount, entry.failure!.attemptCount, "Operator action is not a synthetic execution attempt");
+    assert.equal(result.disposition.failureClass, entry.failure!.failureClass);
+    assert.equal(result.disposition.action, "discard"); assert.match(result.disposition.terminalReason, /fixture-explicit-owner-consent/);
+    assert.deepEqual(store.read().entries, []);
+    assert.deepEqual(store.read().operatorDispositions, [result.disposition]);
+    const compiled = await import("../dist/lib/journal.js");
+    const reader = compiled.createTelegramUpdateJournalStore({ path, profileName: "work", botIdentity: identity,
+      onRecovery() { assert.fail("Existing compiled v1 reader must not repair an operator audit"); } });
+    assert.deepEqual(reader.read().entries, []);
+    assert.deepEqual(reader.read().operatorDispositions, [result.disposition], "The existing v1 audit format needs no schema activation");
+    if (scenario === "repeat") {
+      const after = store.read(); assert.equal(store.discardRetryWait(input).duplicate, true); assert.deepEqual(store.read(), after);
+    }
+    if (scenario === "foreign-repeat") assert.throws(() => store.discardRetryWait({ ...input, operatorAuthorityId: "another-consent" }));
+  });
+});
 
 for (const scenario of ["foreign-source", "foreign-profile", "foreign-bot", "changed-entry", "queued", "retry-wait", "failed", "absent", "lost-authority"] as const) {
   test(`Pending abandonment refuses ${scenario} without writing retention or changing authority`, async () => {
@@ -4594,7 +2541,7 @@ for (const liveSource of [false, true]) test(`Real journal namespace contention 
       assert.equal(child.status, 0, child.stderr);
       const result = JSON.parse(child.stdout);
       assert.ok(result.contentions > 0, "Actual failed acquisitions, not a pre-attempt marker");
-      assert.deepEqual(result.methods.sort(), ["read", "appendBatch", "abandonPending", "inspectAbandonedPending", "inspectPendingRetention", "markQueued", "markExecutionFailure", "applyOperatorDisposition",
+      assert.deepEqual(result.methods.sort(), ["read", "appendBatch", "abandonPending", "inspectAbandonedPending", "inspectPendingRetention", "markQueued", "markExecutionFailure", "applyOperatorDisposition", "discardRetryWait",
         "applyLegacyCustodyDisposition", "offerQueuedHandoff", "acceptQueuedHandoff", "cancelQueuedHandoff", "completeQueued", "completeQueuedExact", "discardQueued", "recoverDeadQueueOwner", "removeCompleted", "removeCompletedExact", "inspectSourceCompletion", "inspectQueuedReceipt", "routingInputs.arm", "routingInputs.select", "routingInputs.expire", "routingInputs.inspectExpiry", "routingInputs.inspectGroupExpiry"].sort());
       assert.equal(fs.readFileSync(path, "utf8"), evidence);
       assert.equal(existsSync(`${path}.transaction`), false);
@@ -5143,14 +3090,16 @@ test("Active follower succession records the first session and advances only aft
   });
 });
 
+for (const artifact of ["source", "compiled"] as const) for (const withOrigin of [false, true])
 for (const state of ["committed", "bot-id-discovery", "uncommitted", "damaged", "linked-ancestor", "lost-snapshot", "unprepared", "profile-drift", "release-drift"] as const) {
-  test(`Historical abandonment lookup is exact, read-only and never prepares a successor (${state})`, async () => {
+  test(`Historical abandonment lookup is exact, read-only and never prepares a successor (${artifact}/${withOrigin}/${state})`, async () => {
+    const M = artifact === "source" ? { createTelegramUpdateJournalBindingRuntime, TelegramUpdateJournalError } : await import("../dist/lib/journal.js");
     await withJournalTempDir(async ({ dir }) => {
       let sessionId: string | undefined = "session-a", profile = "work";
       let botId: number | undefined = state === "bot-id-discovery" ? undefined : 7;
       let drift: "before" | "after" | undefined;
       let serializations = 0, recoveries = 0;
-      const runtime = createTelegramUpdateJournalBindingRuntime({
+      const runtime = M.createTelegramUpdateJournalBindingRuntime({
         base: { getProfileName: () => profile, getBotToken: () => "historical-proof-token", getBotId: () => botId,
           withSourceSerialization(operation) {
             serializations++;
@@ -5167,10 +3116,13 @@ for (const state of ["committed", "bot-id-discovery", "uncommitted", "damaged", 
       });
       const original = runtime.resolveActive()!, path = getTelegramUpdateJournalBindingPath(original.recoveryKey)!;
       const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "historical-proof-token", botId: 7 });
-      original.journal.appendBatch([{ update_id: 1, message: { text: "old-session" } }]);
+      original.journal.appendBatch([{ update_id: 1, message: { text: "old-session", ...(withOrigin ? {
+        message_id: 11, message_thread_id: 99, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+      } : {}) } }]);
       const { exists: _exists, serializedBytes: _bytes, ...beforeCancel } = original.journal.read();
+      const operatorAuthorityId = withOrigin ? "telegram-owner:7" : "owner:7";
       const cancellation = original.journal.abandonPending({ journalBindingKey: original.recoveryKey, entry: beforeCancel.entries[0]!,
-        operatorAuthorityId: "owner:7", isCurrent: () => true });
+        operatorAuthorityId, isCurrent: () => true });
       sessionId = "session-b"; botId = 7;
       const successor = runtime.resolveActive()!;
       successor.journal.appendBatch([{ update_id: 1, message: { text: "new-session-same-ID" } }]);
@@ -5191,12 +3143,15 @@ for (const state of ["committed", "bot-id-discovery", "uncommitted", "damaged", 
       const before = await readJournalFixtureTree(dir);
       serializations = 0;
       if (state === "damaged" || state === "lost-snapshot" || state === "linked-ancestor")
-        assert.throws(() => runtime.inspectSourceAbandonment(lookupKey, 1), error => isJournalError(error, state === "damaged" ? "io" : "invalid"));
+        assert.throws(() => runtime.inspectSourceAbandonment(lookupKey, 1), error => error instanceof M.TelegramUpdateJournalError && error.code === (state === "damaged" ? "io" : "invalid"));
       else {
         const proof = runtime.inspectSourceAbandonment(original.recoveryKey, 1);
         assert.deepEqual(proof, state === "committed" || state === "bot-id-discovery" || state === "unprepared" ? {
-          journalBindingKey: original.recoveryKey, updateId: 1, retainedPath: cancellation.retainedPath, operatorAuthorityId: "owner:7",
+          journalBindingKey: original.recoveryKey, updateId: 1, retainedPath: cancellation.retainedPath, operatorAuthorityId,
+          ...(withOrigin ? { originalTarget: { chatId: 7, threadId: 99, messageId: 11,
+            sourceSha256: createTelegramUpdateJournalEntryDigest(beforeCancel.entries[0]!).sourceSha256 } } : {}),
         } : undefined);
+        if (proof?.originalTarget) assert.ok(Object.isFrozen(proof.originalTarget));
       }
       assert.equal(serializations, 1);
       assert.equal(recoveries, 0);
@@ -5215,6 +3170,57 @@ for (const state of ["committed", "bot-id-discovery", "uncommitted", "damaged", 
     });
   });
 }
+
+for (const artifact of ["source", "compiled"] as const)
+test(`Historical orphan origin comes only from the bounded native family snapshot (${artifact})`, async () => {
+  const M = artifact === "source" ? { createTelegramUpdateJournalBindingRuntime } : await import("../dist/lib/journal.js");
+  await withJournalTempDir(async ({ dir, path }) => {
+    const serialize = createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
+    let serialDepth = 0;
+    const runtime = M.createTelegramUpdateJournalBindingRuntime({ base: {
+      getProfileName: () => "work", getBotToken: () => "123:journal-secret", getBotId: () => 42,
+      withSourceSerialization(operation) { return serialize(() => { serialDepth++; try { return operation(); } finally { serialDepth--; } }); },
+      onRecovery() { assert.fail("Historical origin observation must never repair its source"); },
+    }, getRuntimeDir: () => dir, getLeaderJournalPath: () => path, getFollowerJournalPath: () => path,
+      getActiveFollowerBindingKey: () => "unused", isFollowerRegistered: () => false });
+    const binding = runtime.resolveLeader()!;
+    binding.journal.appendBatch([{ update_id: 1, message: { message_id: 11, message_thread_id: 99,
+      chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "Private original" } }]);
+    const entry = binding.journal.read().entries[0]!;
+    const cancellation = binding.journal.abandonPending({ journalBindingKey: binding.recoveryKey,
+      entry, operatorAuthorityId: "telegram-owner:7", isCurrent: () => true });
+    const before = await readJournalFixtureTree(dir), bytes = await readFile(cancellation.retainedPath, "utf8");
+    const originalStat = fs.statSync(cancellation.retainedPath, { bigint: true });
+    const references = createTelegramUpdateJournalReferenceRegistry();
+    const nativeRead = fs.readFileSync, nativeReadSync = fs.readSync;
+    let originalBytesRead = 0;
+    fs.readSync = ((fd: number, ...args: unknown[]) => {
+      const observed = fs.fstatSync(fd, { bigint: true });
+      const result = Reflect.apply(nativeReadSync, fs, [fd, ...args]);
+      if (result > 0 && observed.dev === originalStat.dev && observed.ino === originalStat.ino) {
+        assert.ok(serialDepth > 0, "The actual family read still holds its source serializer");
+        assert.equal(references.list().length, 1, "The caller holds the actual source reference during the bounded read");
+        originalBytesRead += result;
+      }
+      return result;
+    }) as typeof fs.readSync;
+    fs.readFileSync = ((target: Parameters<typeof fs.readFileSync>[0], ...args: unknown[]) => {
+      assert.notEqual(target, cancellation.retainedPath, "Locator projection must not open a second, unbounded or separately observed archive");
+      return Reflect.apply(nativeRead, fs, [target, ...args]);
+    }) as typeof fs.readFileSync;
+    syncBuiltinESMExports();
+    let proof: TelegramUpdateJournalAbandonedPendingEvidence | undefined;
+    try {
+      proof = references.withReference({ referenceClass: "operator-disposition", recoveryKey: binding.recoveryKey },
+        () => runtime.inspectSourceAbandonment(binding.recoveryKey, 1));
+    } finally { fs.readFileSync = nativeRead; fs.readSync = nativeReadSync; syncBuiltinESMExports(); }
+    assert.deepEqual(proof?.originalTarget, { chatId: 7, threadId: 99, messageId: 11,
+      sourceSha256: createTelegramUpdateJournalEntryDigest(entry).sourceSha256 });
+    assert.equal(originalBytesRead, Buffer.byteLength(bytes), "The original archive is acquired once through its bounded descriptor, not reopened for the locator");
+    assert.deepEqual(references.list(), []); assert.equal(serialDepth, 0);
+    assert.deepEqual(await readJournalFixtureTree(dir), before, "Observation does not publish, repair or mutate journal/retention bytes");
+  });
+});
 
 test("Historical chooser expiry proof is body-free, exact-scope and read-only", async () => {
   await withJournalTempDir(async ({ dir }) => {
@@ -6104,14 +4110,6 @@ test("Source completion survives ordinary publishers and compaction without repl
       { profileName: "work", botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "changed", botId: identity.botId }) },
     ]) assert.throws(() => createTelegramUpdateJournalStore({ path, ...foreign }).read(), error => isJournalError(error, "identity-mismatch"));
     assert.equal(await readFile(path, "utf8"), before, "empty entries do not make retained source proof disposable");
-  });
-});
-
-test("Scoped queued completion is absent from the raw input custody surface", async () => {
-  await withInputCustodyFixture(async ({ options }) => {
-    const raw = createTelegramInputJournalStore(options);
-    assert.equal("completeQueuedExact" in raw, false);
-    assert.equal("routingInputs" in raw, false);
   });
 });
 

@@ -4,8 +4,9 @@
  * Owns telegram_attach registration, outbound attachment queueing, and delivery so Telegram file output stays in one domain module
  */
 
-import { stat } from "node:fs/promises";
-import { basename } from "node:path";
+import { open, realpath, stat } from "node:fs/promises";
+import { constants, type BigIntStats } from "node:fs";
+import { basename, isAbsolute } from "node:path";
 
 import { Type } from "@sinclair/typebox";
 
@@ -32,6 +33,7 @@ import {
   getTelegramTargetThreadParams,
   type TelegramTarget,
 } from "./target.ts";
+import { isTelegramArtifactFileName, TELEGRAM_ARTIFACT_MAX_BYTES } from "./wire.ts";
 
 const MAX_ATTACHMENTS_PER_TURN = 10;
 
@@ -57,6 +59,55 @@ const TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES =
     "PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES",
     "TELEGRAM_MAX_ATTACHMENT_SIZE_BYTES",
   ]);
+
+export class TelegramArtifactSourceError extends Error {
+  readonly reason: "source-unavailable" | "source-invalid" | "source-changed" | "size-exceeded";
+  constructor(reason: TelegramArtifactSourceError["reason"], options?: ErrorOptions) {
+    super("Telegram artifact source could not be captured.", options);
+    this.reason = reason;
+    this.name = "TelegramArtifactSourceError";
+  }
+}
+
+export function validateTelegramArtifactFile(path: string, name: string): void {
+  if (typeof path !== "string" || !isAbsolute(path) || path.includes("\0") || !isTelegramArtifactFileName(name))
+    throw new TypeError("Telegram artifact requires an absolute source path and valid explicit basename.");
+}
+
+export function getTelegramArtifactByteLimit(maxBytes = TELEGRAM_ARTIFACT_MAX_BYTES): number {
+  return Math.min(TELEGRAM_ARTIFACT_MAX_BYTES, TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES, maxBytes);
+}
+
+/** One regular descriptor, bounded actual read, and observational continuity; links are caller-authorized. */
+export async function captureTelegramArtifactSource(path: string, maxBytes = TELEGRAM_ARTIFACT_MAX_BYTES): Promise<Buffer> {
+  const limit = getTelegramArtifactByteLimit(maxBytes);
+  const same = (a: BigIntStats, b: BigIntStats) => a.dev === b.dev && a.ino === b.ino &&
+    a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+  try {
+    const resolved = await realpath(path), before = await stat(resolved, { bigint: true });
+    if (!before.isFile() || before.size < 1n) throw new TelegramArtifactSourceError("source-invalid");
+    if (before.size > BigInt(limit)) throw new TelegramArtifactSourceError("size-exceeded");
+    const fd = await open(resolved, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    try {
+      const opened = await fd.stat({ bigint: true });
+      if (!opened.isFile() || !same(before, opened)) throw new TelegramArtifactSourceError("source-changed");
+      const bytes = Buffer.alloc(Number(opened.size) + 1);
+      let total = 0;
+      while (total < bytes.length) {
+        const { bytesRead } = await fd.read(bytes, total, bytes.length - total, total);
+        if (!bytesRead) break;
+        total += bytesRead;
+      }
+      const after = await fd.stat({ bigint: true }), selected = await stat(resolved, { bigint: true });
+      if (total !== Number(opened.size) || !same(opened, after) || !same(opened, selected) || await realpath(path) !== resolved)
+        throw new TelegramArtifactSourceError("source-changed");
+      return bytes.subarray(0, total);
+    } finally { await fd.close(); }
+  } catch (cause) {
+    if (cause instanceof TelegramArtifactSourceError) throw cause;
+    throw new TelegramArtifactSourceError("source-unavailable", { cause });
+  }
+}
 
 export interface TelegramOutboundAttachmentToolResult {
   content: Array<{ type: "text"; text: string }>;

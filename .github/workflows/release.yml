@@ -133,7 +133,7 @@ jobs:
           fi
       - name: Publish npm package through Trusted Publisher
         if: steps.npm-state.outputs.publish == 'true'
-        run: npm publish --access public --provenance
+        run: npm publish --access public --provenance --tag ${{ contains(github.ref_name, '-') && 'next' || 'latest' }}
       - name: Verify public npm package and packed manifest
         env:
           PACKAGE_NAME: "@llblab/pi-telegram"
@@ -185,10 +185,14 @@ jobs:
             echo "Release $TAG_NAME already exists; updating title and notes."
             gh release edit "$TAG_NAME" \
               --title "$(cat release-title.txt)" \
-              --notes-file release-notes.md
+              --notes-file release-notes.md \
+              --prerelease=${{ contains(github.ref_name, '-') }} \
+              --latest=${{ !contains(github.ref_name, '-') }}
           else
             gh release create "$TAG_NAME" \
               --title "$(cat release-title.txt)" \
               --notes-file release-notes.md \
-              --verify-tag
+              --verify-tag \
+              --prerelease=${{ contains(github.ref_name, '-') }} \
+              --latest=${{ !contains(github.ref_name, '-') }}
           fi

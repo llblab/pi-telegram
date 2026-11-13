@@ -4,7 +4,7 @@
  * Owns direct pi SDK imports and exposes narrow bridge-facing helpers/types for the extension composition layer
  */
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
-import { type AgentEndEvent, type AgentSettledEvent, type AgentStartEvent, type BeforeAgentStartEvent, type BeforeAgentStartEventResult, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type InputEvent, type MessageEndEvent, type SessionBeforeCompactEvent, type SessionCompactEvent, type SessionShutdownEvent, type SessionStartEvent, type SlashCommandInfo, type TurnEndEvent, type TurnEndEventResult, type UIPromptEndEvent, type UIPromptStartEvent } from "@earendil-works/pi-coding-agent";
+import type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, BeforeAgentStartEvent, BeforeAgentStartEventResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionShutdownEvent, SessionStartEvent, SlashCommandInfo, TurnEndEvent, TurnEndEventResult, UIPromptEndEvent, UIPromptStartEvent } from "@earendil-works/pi-coding-agent";
 export type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, BeforeAgentStartEventResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionShutdownEvent, SessionStartEvent, SlashCommandInfo, TurnEndEvent, TurnEndEventResult, UIPromptEndEvent, UIPromptStartEvent, };
 export interface SessionCompactFailedEvent {
     type: "session_compact_failed";
@@ -49,6 +49,13 @@ export declare function isExtensionContextPassiveRunMode(ctx: unknown): boolean;
 export declare function canStartPollingInExtensionContext(ctx: unknown): boolean;
 export declare function formatPollingStartBlockedByRunMode(ctx: unknown): string;
 export declare function getSessionCompactionReason(event: unknown): "manual" | "threshold" | "overflow" | "unknown";
+/** Original API callable only, not API activity, catalog/resource lifetime or source authority. */
+export interface PiCommandProviderCapture {
+    assertCallable(): void;
+    getCommands: ExtensionAPI["getCommands"];
+}
+/** Intrinsic non-match probes no supplied DTO/receiver fields and does not revoke the genuine owner. */
+export declare function readPiCommandProviderCapture(value: unknown, ports: PiExtensionApiRuntimePorts): Readonly<PiCommandProviderCapture> | undefined;
 export interface PiExtensionApiRuntimePorts {
     sendUserMessage: ExtensionAPI["sendUserMessage"];
     exec: ExtensionAPI["exec"];
@@ -59,8 +66,9 @@ export interface PiExtensionApiRuntimePorts {
     setActiveTools: ExtensionAPI["setActiveTools"];
     setModel: ExtensionAPI["setModel"];
     registerCommand: ExtensionAPI["registerCommand"];
+    captureCommandProvider?(): Readonly<PiCommandProviderCapture>;
 }
-export declare function createExtensionApiRuntimePorts(api: Pick<ExtensionAPI, "sendUserMessage" | "exec" | "getCommands" | "getThinkingLevel" | "setThinkingLevel" | "getActiveTools" | "setActiveTools" | "setModel" | "registerCommand">): PiExtensionApiRuntimePorts;
+export declare function createExtensionApiRuntimePorts(api: Pick<ExtensionAPI, "sendUserMessage" | "exec" | "getCommands" | "getThinkingLevel" | "setThinkingLevel" | "getActiveTools" | "setActiveTools" | "setModel" | "registerCommand">, commandProvider?: true): PiExtensionApiRuntimePorts;
 export declare function normalizeSettingsManager(manager: unknown): PiSettingsManager;
 export declare function createSettingsManager(cwd: string): Promise<PiSettingsManager>;
 export declare function createScopedModelPatternPersister(deps: {

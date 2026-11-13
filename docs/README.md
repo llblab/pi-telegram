@@ -8,8 +8,8 @@ Living index of project documentation in `/docs`.
 
 ## Documents
 
-- [architecture.md](./architecture.md) — Overview of the Telegram bridge runtime, optional profile isolation, queueing model and Normal/Priority/Steer plus Keep/Skip reaction policy, native Rich Markdown delivery, UI/compat rendering, and interactive controls
-- [public-api.md](./public-api.md) — Stable public API map: package entrypoints, commands, config, assistant markup, extension APIs, smoke examples, and compatibility boundaries
+- [architecture.md](./architecture.md) — Overview of the Telegram bridge runtime, optional profile isolation, queueing model and Normal/Priority/Steer plus Keep/Skip reaction policy, native Rich Markdown delivery, UI/compat rendering, interactive controls, [composable interaction-surface target contract](./architecture.md#composable-interaction-surfaces-planned), and [planned runtime self-healing](./architecture.md#runtime-self-healing-high-priority-planned)
+- [public-api.md](./public-api.md) — Stable public API map: package entrypoints, commands, config, assistant markup, extension APIs, smoke examples, compatibility boundaries, the unreleased Confirm/Choice/Task View and Artifact contracts, and [planned declarative UI markup](./public-api.md#declarative-ui-markup-planned)
 - [delivery.md](./delivery.md) — Target-aware companion delivery contract for operational views, logical message handles, target scopes, lifecycle fencing, and leader/follower transport
 - [activity.md](./activity.md) — Normalized Pi lifecycle API for extension-owned reasoning, intermediate prose, tool activity, source identity, delivery contexts, and consumer policy examples
 - [../.agents/skills/telegram-bot/SKILL.md](../.agents/skills/telegram-bot/SKILL.md) — Agent-facing Telegram Bot API lookup skill backed by a local full Bot API reference

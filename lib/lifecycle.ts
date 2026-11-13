@@ -417,6 +417,23 @@ export function createTelegramSessionContextStore<TContext>(
   };
 }
 
+/** Artifact disclosure stays bound to the captured session generation and ID, even with reused managers. */
+export function createTelegramArtifactSessionCapture<TContext>(deps: {
+  context: Pick<TelegramSessionContextStore<TContext>, "get" | "getGeneration" | "isCurrent">;
+  getSessionId(ctx: TContext | undefined): string | undefined;
+}): () => (() => boolean) | undefined {
+  return () => {
+    const ctx = deps.context.get(), generation = deps.context.getGeneration(), sessionId = deps.getSessionId(ctx);
+    if (ctx === undefined || !sessionId) return undefined;
+    let lost = false;
+    return () => {
+      try { lost ||= !deps.context.isCurrent(ctx, generation) || deps.getSessionId(deps.context.get()) !== sessionId; }
+      catch { lost = true; }
+      return !lost;
+    };
+  };
+}
+
 /** Capture drain hints at work admission; late completion never borrows a replacement session or transport. */
 export function createTelegramSessionDrainObserver<TContext, TAuthority>(deps: {
   context: Pick<TelegramSessionContextStore<TContext>, "get" | "getGeneration" | "isCurrent">;

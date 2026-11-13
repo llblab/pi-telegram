@@ -1,9 +1,13 @@
 /**
  * Regression tests for the Telegram polling runtime domain
  * Covers polling request helpers, stop conditions, and the long-poll loop runtime in one suite
+ * Zones: telegram transport, polling runtime
  */
 
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -25,6 +29,8 @@ import {
   createTelegramThreadCapabilityOrchestration,
   createTelegramThreadCapabilityStateRuntime,
   type TelegramThreadCapabilityState,
+  type TelegramPollingFirstObservation,
+  type TelegramPollLoopDeps,
   createTelegramThreadTargetObservationBinding,
   cutOverTelegramPollingCursor,
   getLatestTelegramUpdateId,
@@ -66,6 +72,222 @@ async function waitForPollingCondition(
   }
   assert.fail(message);
 }
+
+type ObservedUpdate = { update_id: number; message: { text: string } };
+function firstObservationHarness() {
+  const controller = new AbortController(), events: string[] = [], errors: unknown[] = [];
+  const raw: ObservedUpdate[] = [{ update_id: 2, message: { text: "original" } }];
+  let captured: Readonly<TelegramPollingFirstObservation<ObservedUpdate>> | undefined;
+  const deps: TelegramPollLoopDeps<ObservedUpdate, string> = {
+    ctx: "original-context", signal: controller.signal, config: { botToken: "123:offline-polling-observation" },
+    async deleteWebhook() {}, async getUpdates() { events.push("fetch"); return raw; },
+    getAcceptedThroughUpdateId() { events.push("cursor"); return 1; }, getJournalEntryCount: () => 0,
+    onFirstUpdateBatch(scope) { events.push("first"); captured = scope; scope.assertCurrent(scope.updates[0]); },
+    onSuccessfulResponse() { events.push("response"); }, onPhaseChange(phase) { events.push(phase); },
+    appendUpdateBatch() { events.push("append"); }, signalUpdateWorker() { events.push("signal"); controller.abort(); },
+    async persistConfig() { assert.fail("No config write expected"); }, onErrorStatus() { events.push("error"); }, onStatusReset() {},
+    async sleep() { events.push("retry"); controller.abort(); }, recordRuntimeEvent(_owner, error) { errors.push(error); },
+  };
+  return { deps, controller, events, errors, raw, get scope() { return captured; }, run: () => runTelegramPollLoop(deps) };
+}
+
+for (const artifact of ["source", "compiled"] as const)
+test(`Native polling retains journal authority across an unverifiable source guard (${artifact})`, async () => {
+  const journalModule = artifact === "source" ? await import("../lib/journal.ts") : await import("../dist/lib/journal.js");
+  const polling = artifact === "source" ? { runTelegramPollLoop } : await import("../dist/lib/polling.js");
+  const lag = artifact === "source" ? await import("../lib/loop-lag.ts") : await import("../dist/lib/loop-lag.js");
+  const dir = fs.mkdtempSync(join(tmpdir(), "pt-poll-guard-")), path = join(dir, "journal.json"), guard = join(dir, "runtime", "journals.transaction");
+  const serialize = journalModule.createTelegramJournalSourceSerialization(() => guard);
+  const journal = journalModule.createTelegramUpdateJournalStore({ path, withSourceSerialization: serialize,
+    botIdentity: journalModule.createTelegramUpdateJournalBotIdentity({ botToken: "123:offline-polling-observation", botId: 77 }) });
+  const h = firstObservationHarness(); let retries = 0, signals = 0;
+  try {
+    journal.appendBatch([{ update_id: 1, message: { text: "already accepted" } }], 1);
+    const original = journal.read(), originalBytes = fs.readFileSync(path, "utf8");
+    fs.mkdirSync(guard, { mode: 0o700 }); fs.writeFileSync(join(guard, "owner.fixture.json"), "", { mode: 0o600 });
+    const waits = lag.readTelegramSyncBlockTotals()["transaction-lock-wait"]?.count ?? 0;
+    h.deps.getAcceptedThroughUpdateId = () => journal.read().acceptedThroughUpdateId;
+    h.deps.getJournalEntryCount = () => journal.read().entries.length;
+    h.deps.appendUpdateBatch = (updates, cursor) => { journal.appendBatch(updates, cursor); };
+    h.deps.signalUpdateWorker = () => { signals++; h.controller.abort(); };
+    h.deps.sleep = async delay => {
+      retries++; assert.equal(retries, 1); assert.equal(delay, 1000);
+      assert.equal(signals, 0); assert.equal(h.errors.length, 1);
+      assert.ok(h.errors[0] instanceof Error); assert.equal(h.errors[0].name, "TelegramFileTransactionGuardError");
+      assert.deepEqual(journal.read(), original); assert.equal(fs.readFileSync(path, "utf8"), originalBytes);
+      assert.equal(fs.readFileSync(join(guard, "owner.fixture.json"), "utf8"), "");
+      assert.equal(lag.readTelegramSyncBlockTotals()["transaction-lock-wait"]?.count ?? 0, waits);
+      // This fixture is the sole writer: simulate a separately authorized repair, never automatic cleanup.
+      fs.rmSync(guard, { recursive: true });
+    };
+    await polling.runTelegramPollLoop(h.deps);
+    assert.equal(retries, 1); assert.equal(signals, 1);
+    assert.equal(journal.read().acceptedThroughUpdateId, 2);
+    assert.deepEqual(journal.read().entries.map(entry => entry.updateId), [1, 2]);
+    assert.deepEqual(journal.read().entries[0], original.entries[0]); assert.equal(fs.existsSync(guard), false);
+  } finally { h.controller.abort(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("Polling first observation precedes response, cursor, phase, append and signal callbacks", async () => {
+  const h = firstObservationHarness(); await h.run();
+  const seen = h.events.slice(h.events.indexOf("fetch"));
+  assert.deepEqual(seen, ["fetch", "first", "response", "cursor", "persisting-journal", "append", "signal"]);
+  assert.deepEqual(h.errors, []); assert.ok(h.scope); assert.ok(Object.isFrozen(h.scope) && Object.isFrozen(h.scope.updates));
+  assert.ok(Object.isFrozen(h.scope.updates[0])); assert.notEqual(h.scope.updates[0], h.raw[0]);
+  assert.equal(h.scope.requestedAfterUpdateId, 1); assert.throws(h.scope.assertCurrent);
+});
+
+for (const owner of ["runner", "controller"] as const)
+test(`Polling first observation reaches the native ${owner} without a new polling owner`, async () => {
+  const h = firstObservationHarness();
+  if (owner === "runner") {
+    const run = createTelegramPollLoopRunner({ ...h.deps, getConfig: () => h.deps.config, updateStatus() {} });
+    await run(h.deps.ctx, h.controller.signal);
+  } else {
+    const controller = createTelegramPollingControllerRuntime({ ...h.deps, getConfig: () => h.deps.config,
+      hasBotToken: () => true, stopTypingLoop() {}, updateStatus() {}, createAbortController: () => h.controller });
+    try {
+      controller.start(h.deps.ctx);
+      await waitForPollingCondition(() => h.events.includes("signal"), "Native controller did not forward the first-observation port");
+    } finally { await controller.stop(); }
+  }
+  assert.ok(h.scope); assert.throws(h.scope.assertCurrent); assert.deepEqual(h.errors, []);
+});
+
+test("Polling first observation is closed before ordinary response and append callbacks", async () => {
+  const h = firstObservationHarness();
+  h.deps.onSuccessfulResponse = () => { assert.ok(h.scope); assert.throws(h.scope.assertCurrent); h.events.push("response"); };
+  h.deps.appendUpdateBatch = () => { assert.ok(h.scope); assert.throws(h.scope.assertCurrent); h.events.push("append"); };
+  await h.run(); assert.deepEqual(h.errors, []); assert.ok(h.events.includes("append"));
+});
+
+test("Polling first observation binds exact scoped records, not equal DTOs or restored failed attempts", async () => {
+  const h = firstObservationHarness(); let original: (() => void) | undefined, refusedCopy = false, refusedRestoration = false;
+  h.deps.onFirstUpdateBatch = scope => {
+    original = scope.assertCurrent;
+    try { scope.assertCurrent(structuredClone(scope.updates[0]!)); } catch { refusedCopy = true; }
+    try { scope.assertCurrent(scope.updates[0]); } catch { refusedRestoration = true; }
+  };
+  await h.run(); assert.ok(original); assert.throws(original); assert.equal(refusedCopy, true); assert.equal(refusedRestoration, true);
+  assert.ok(h.events.includes("retry")); assert.equal(h.events.includes("response"), false); assert.equal(h.events.includes("append"), false);
+});
+
+for (const side of ["raw", "snapshot"] as const)
+test(`Polling first observation refuses ${side} mutation without ordinary fallback`, async () => {
+  const h = firstObservationHarness(); let refusedMutation = false, refusedRestoration = false;
+  h.deps.onFirstUpdateBatch = scope => {
+    const data = side === "raw" ? h.raw[0]! : scope.updates[0]!;
+    data.message.text = "changed"; try { scope.assertCurrent(); } catch { refusedMutation = true; } data.message.text = "original";
+    try { scope.assertCurrent(); } catch { refusedRestoration = true; }
+  };
+  await h.run(); assert.equal(refusedMutation, true); assert.equal(refusedRestoration, true);
+  assert.equal(h.events.includes("append"), false); assert.equal(h.events.includes("signal"), false);
+});
+
+test("Polling first observation refuses Promise continuations and never spans an await", async () => {
+  const h = firstObservationHarness(); let later: Promise<void> | undefined;
+  h.deps.onFirstUpdateBatch = async scope => {
+    later = Promise.resolve().then(() => { assert.throws(scope.assertCurrent); }); await later;
+  };
+  await h.run(); await later; assert.ok(h.events.includes("retry")); assert.equal(h.events.includes("append"), false);
+});
+
+test("Polling first observation callback refusal is not swallowed as diagnostic success", async () => {
+  const h = firstObservationHarness(); h.deps.onFirstUpdateBatch = () => { throw new Error("Controlled private refusal"); };
+  await h.run(); assert.ok(h.events.includes("retry")); assert.equal(h.events.includes("response"), false);
+  assert.equal(h.events.includes("append"), false); assert.equal(h.events.includes("signal"), false);
+  assert.ok(h.errors.length > 0); assert.equal(h.errors.some(error => error instanceof Error && error.message.includes("Controlled private refusal")), false);
+});
+
+for (const port of ["ctx", "config", "token", "getUpdates", "getUpdatesRequestBudgetMs", "appendUpdateBatch", "getAcceptedThroughUpdateId", "signalUpdateWorker", "onFirstUpdateBatch"] as const)
+test(`Polling first observation refuses in-flight ${port} renewal before granting a scope`, async () => {
+  const h = firstObservationHarness(); let observations = 0;
+  h.deps.onFirstUpdateBatch = () => { observations++; };
+  const read = h.deps.getUpdates;
+  h.deps.getUpdates = async (...args) => {
+    const updates = await read(...args);
+    if (port === "ctx") h.deps.ctx = "other-context";
+    else if (port === "config") h.deps.config = { ...h.deps.config };
+    else if (port === "token") h.deps.config.botToken = "123:changed";
+    else if (port === "getUpdates") h.deps.getUpdates = h.deps.getUpdates.bind(h.deps);
+    else if (port === "getUpdatesRequestBudgetMs") h.deps.getUpdatesRequestBudgetMs = () => 10_000;
+    else if (port === "appendUpdateBatch") h.deps.appendUpdateBatch = () => {};
+    else if (port === "getAcceptedThroughUpdateId") h.deps.getAcceptedThroughUpdateId = () => 1;
+    else if (port === "signalUpdateWorker") h.deps.signalUpdateWorker = () => {};
+    else h.deps.onFirstUpdateBatch = () => {};
+    return updates;
+  };
+  await h.run(); assert.equal(observations, 0); assert.ok(h.events.includes("retry")); assert.equal(h.events.includes("append"), false);
+});
+
+test("Polling first observation pins the actual request callable before deferred issue, not only after restoration", async () => {
+  const h = firstObservationHarness(); let wrongTransportCalls = 0, observations = 0;
+  const original = h.deps.getUpdates;
+  h.deps.onFirstUpdateBatch = () => { observations++; };
+  h.deps.getUpdatesRequestBudgetMs = () => {
+    h.deps.getUpdates = async () => { wrongTransportCalls++; h.deps.getUpdates = original; return h.raw; };
+    return 10_000;
+  };
+  await h.run(); assert.equal(wrongTransportCalls, 0); assert.equal(observations, 0);
+  assert.ok(h.events.includes("retry")); assert.equal(h.events.includes("append"), false);
+});
+
+test("Polling first observation refuses source-owner descriptor substitution without executing its getter", async () => {
+  const h = firstObservationHarness(); let getterCalls = 0;
+  h.deps.onFirstUpdateBatch = scope => {
+    const signal = h.deps.signalUpdateWorker;
+    Object.defineProperty(h.deps, "signalUpdateWorker", { configurable: true, get() { getterCalls++; return signal; } });
+    assert.throws(scope.assertCurrent);
+  };
+  await h.run(); assert.equal(getterCalls, 0); assert.equal(h.events.includes("append"), false);
+});
+
+test("Polling first observation poisons caught data-observation reentry", async () => {
+  const h = firstObservationHarness(); let nested = false, refusedOuter = false, refusedRestoration = false;
+  h.deps.onFirstUpdateBatch = scope => {
+    Object.assign(h.raw[0]!.message, { toJSON() {
+      try { scope.assertCurrent(); } catch { nested = true; }
+      return { text: "original" };
+    } });
+    try { scope.assertCurrent(); } catch { refusedOuter = true; }
+    try { scope.assertCurrent(); } catch { refusedRestoration = true; }
+  };
+  await h.run(); assert.equal(nested, true); assert.equal(refusedOuter, true); assert.equal(refusedRestoration, true);
+  assert.equal(h.events.includes("append"), false);
+});
+
+test("Polling first observation rejects non-monotonic and oversized incoming packets before callbacks", async () => {
+  for (const raw of [[{ update_id: 1, message: { text: "old" } }],
+    Array.from({ length: 11 }, (_, i) => ({ update_id: i + 2, message: { text: "over limit" } }))]) {
+    const h = firstObservationHarness(); h.deps.getUpdates = async () => raw;
+    await h.run(); assert.equal(h.events.includes("first"), false); assert.equal(h.events.includes("response"), false);
+    assert.equal(h.events.includes("append"), false);
+  }
+});
+
+test("Polling first observation is not minted for empty responses or historical cursor bootstrap", async () => {
+  const h = firstObservationHarness(); let cursor: number | undefined, fetches = 0, observations = 0;
+  h.deps.getAcceptedThroughUpdateId = () => cursor;
+  h.deps.getUpdates = async () => ++fetches === 1 ? [{ update_id: 10, message: { text: "history" } }] : [{ update_id: 11, message: { text: "new" } }];
+  h.deps.appendUpdateBatch = (updates, accepted) => { if (!updates.length) cursor = accepted; else { assert.equal(updates[0]!.update_id, 11); h.events.push("append"); } };
+  h.deps.onFirstUpdateBatch = scope => { observations++; assert.equal(scope.requestedAfterUpdateId, 10); assert.equal(scope.updates[0]!.update_id, 11); };
+  await h.run(); assert.equal(observations, 1); assert.equal(fetches, 2); assert.ok(h.events.includes("append"));
+  const empty = firstObservationHarness(); empty.deps.getUpdates = async () => [];
+  empty.deps.onSuccessfulResponse = () => { empty.controller.abort(); };
+  await empty.run(); assert.equal(empty.scope, undefined); assert.deepEqual(empty.errors, []);
+});
+
+test("Polling first observation cannot treat a failed cursor bootstrap as incoming-source authority", async () => {
+  const h = firstObservationHarness(); let fetches = 0;
+  h.deps.getAcceptedThroughUpdateId = () => undefined;
+  h.deps.getUpdates = async () => { if (++fetches === 1) throw new Error("bootstrap unavailable"); return h.raw; };
+  await h.run(); assert.equal(fetches, 2); assert.equal(h.scope, undefined); assert.equal(h.events.includes("append"), false);
+});
+
+test("Polling first observation observes owner abort without source publication or fallback", async () => {
+  const h = firstObservationHarness(); h.deps.onFirstUpdateBatch = scope => { h.controller.abort(); assert.throws(scope.assertCurrent); };
+  await h.run(); assert.equal(h.events.includes("response"), false); assert.equal(h.events.includes("append"), false);
+});
 
 test("Polling helpers build the initial sync request", () => {
   assert.deepEqual(buildTelegramInitialSyncRequest(), {
@@ -426,6 +648,32 @@ test("Thread capability monitor stays passive before transport authorization", a
   await new Promise((resolve) => setTimeout(resolve, 10));
   monitor.stop();
   assert.equal(calls, 0);
+});
+
+for (const scenario of ["relayed", "leader-probes", "stale-relay"] as const)
+test(`Thread capability monitor uses the leader relay only for a follower with a fresh value (${scenario})`, async () => {
+  let apiCalls = 0;
+  const monitor = createTelegramThreadCapabilityMonitor({
+    failureLog: createPassthroughFailureLog(),
+    getAllowedUserId: () => 7,
+    callApi: async <TResponse>() => { apiCalls += 1; return { has_topics_enabled: true } as TResponse; },
+    topicTargetStore: { load: async () => {}, persist: async () => {},
+      getBotState: () => ({ threadMode: "enabled" as const }), setBotState: () => {} },
+    ownsLock: () => scenario === "leader-probes",
+    isFollowerRegistered: () => scenario !== "leader-probes",
+    getRelayedThreadCapability: () => (scenario === "stale-relay" ? undefined : true),
+    getPollingStartedWithTelegramBus: () => false,
+    setPollingStartedWithTelegramBus: () => {}, setTopicModeUnavailable: () => {},
+    stopFollowerRegistration: () => {}, startClassicPolling: () => {},
+    stopClassicPolling: () => {}, startBusPolling: () => {}, stopBusPolling: () => {},
+    startLeaderHealth: () => {}, stopLeaderHealth: () => {}, updateStatus: () => {}, recordEvent: () => {},
+    intervalMs: 1,
+  });
+  monitor.start(TEST_CONTEXT);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  monitor.stop();
+  if (scenario === "relayed") assert.equal(apiCalls, 0, "A follower with a fresh relayed capability makes no getMe call");
+  else assert.ok(apiCalls > 0, "The leader and a follower without a fresh relay still probe Telegram");
 });
 
 test("Thread capability monitor stops after synchronous stale-context preflight", async () => {
@@ -817,13 +1065,15 @@ test("Stopped capability transitions cannot restart health, fall back, or mutate
   }
 });
 
-test("Thread-aware polling returns disabled mode to classic takeover despite retained thread history", async () => {
+for (const mode of ["disabled", "unknown", "enabled", undefined] as const)
+test(`Thread-aware polling distinguishes pending mode from classic takeover (${mode ?? "missing"})`, async () => {
+  let registrations = 0;
   const callApi = async <TResponse,>(): Promise<TResponse> => ({}) as TResponse;
   const store = {
     async load() {},
     async persist() {},
     getBotState() {
-      return { threadMode: "disabled" as const };
+      return { threadMode: mode };
     },
     setBotState() {},
     list() {
@@ -851,15 +1101,126 @@ test("Thread-aware polling returns disabled mode to classic takeover despite ret
     async stopBusLeaderPolling() {},
     startLeaderHealth() {},
     stopLeaderHealth() {},
-    registerFollowerWithLeader: async () => true,
+    registerFollowerWithLeader: async () => { registrations++; return true; },
     stopFollowerRegistration() {},
     recordEvent() {},
   });
 
   assert.equal(
     await ports.registerFollowerWithOwner?.(TEST_CONTEXT, { pid: 1 }),
-    undefined,
+    mode === "disabled" ? undefined : mode === "enabled" ? true : "pending",
   );
+  assert.equal(registrations, mode === "enabled" ? 1 : 0, "Unknown capability cannot authorize registration from retained history");
+});
+
+for (const fault of ["none", "caller-loss", "stop", "superseded", "delegate-replaced", "lifecycle-loss", "reentry", "callback-replaced"] as const)
+test(`Follower refresh carries its original attempt to delegation (${fault})`, async () => {
+  let release!: () => void, entered!: () => void, refreshes = 0, registrations = 0, effects = 0, current = true, lifecycleCurrent = true;
+  let forwarded: (() => void) | undefined, reenter = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const deps = {
+    getAllowedUserId: () => 42, callApi: async <TResponse,>() => ({}) as TResponse,
+    topicTargetStore: { async load() {}, async refresh() { if (++refreshes === 1) { entered(); await gate; } },
+      async persist() {}, getBotState: () => ({ threadMode: "enabled" as const }), setBotState() {} },
+    lifecycle: { capture: () => () => lifecycleCurrent, invalidate() { lifecycleCurrent = false; } },
+    isBusRuntimeEnabled: () => false, isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false, setPollingStartedWithTelegramBus() {}, setForceFreshLeaderThreadOnNextStart() {}, setTopicModeUnavailable() {},
+    startClassicPolling() {}, async stopClassicPolling() {}, async startBusLeaderPolling() {}, async stopBusLeaderPolling() {}, startLeaderHealth() {}, stopLeaderHealth() {},
+    registerFollowerWithLeader: async (_ctx: typeof TEST_CONTEXT, _owner: { pid: number }, options?: { assertAuthority?: () => void }) => {
+      registrations++;
+      assert.ok(options?.assertAuthority, "Native registration must receive the original process-local guard");
+      if (fault === "reentry") { forwarded = options.assertAuthority; reenter = true; }
+      options.assertAuthority(); effects++; return true;
+    }, stopFollowerRegistration() {}, recordEvent() {},
+  };
+  const ports = createTelegramThreadAwarePollingPorts(deps);
+  const options = { recoverConnection: true, assertAuthority() {
+    if (reenter) { reenter = false; try { forwarded!(); } catch { /* Producer catches the original reentry refusal. */ } }
+    if (!current) throw new Error("Fixture original caller ended");
+  } };
+  const pending = ports.registerFollowerWithOwner(TEST_CONTEXT, { pid: 1 }, options).then(value => ({ value }), error => ({ error }));
+  try {
+    await waiting;
+    if (fault === "caller-loss") current = false;
+    if (fault === "callback-replaced") { current = false; options.assertAuthority = () => {}; }
+    if (fault === "stop") ports.stopFollowerRegistration();
+    if (fault === "lifecycle-loss") lifecycleCurrent = false;
+    if (fault === "delegate-replaced") deps.registerFollowerWithLeader = async () => { registrations++; return true; };
+    if (fault === "superseded") assert.equal(await ports.registerFollowerWithOwner(TEST_CONTEXT, { pid: 1 }), true);
+    release();
+    const outcome = await pending;
+    if (fault === "none") assert.deepEqual(outcome, { value: true });
+    else assert.ok("error" in outcome && outcome.error instanceof Error, "A stale refresh cannot delegate after its original scope ends");
+    assert.equal(registrations, fault === "none" || fault === "superseded" || fault === "reentry" ? 1 : 0);
+    assert.equal(effects, fault === "none" || fault === "superseded" ? 1 : 0, "Caught reentry cannot restore the original authority");
+  } finally { release(); await pending; }
+});
+
+for (const outcome of ["enabled", "classic", "timeout", "late-refresh", "long-ack", "rejected", "negative", "restore", "cancelled", "getter-replaced", "constant-clock", "logging"] as const)
+test(`Original readiness observation ends before one native registration (${outcome})`, async () => {
+  let now = 0, mode: "unknown" | "enabled" | "disabled" = "unknown", waits = 0, refreshes = 0, issues = 0, current = true;
+  const original = new Error("Fixture protected refusal");
+  const records: unknown[] = [];
+  const store = { async load() {}, async refresh() {
+    refreshes++;
+    if (waits && outcome === "restore") throw original;
+    if (waits && outcome === "late-refresh") { await Promise.resolve(); now = 600; mode = "enabled"; }
+  }, async persist() {}, getBotState: () => ({ threadMode: mode }), setBotState() {} };
+  const ports = createTelegramThreadAwarePollingPorts({
+    getAllowedUserId: () => 42, callApi: async <T,>() => ({}) as T, topicTargetStore: store,
+    isBusRuntimeEnabled: () => false, isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false, setPollingStartedWithTelegramBus() {}, setForceFreshLeaderThreadOnNextStart() {}, setTopicModeUnavailable() {},
+    startClassicPolling() { assert.fail("Readiness cannot poll"); }, async stopClassicPolling() {}, async startBusLeaderPolling() { assert.fail("Readiness cannot lead"); },
+    async stopBusLeaderPolling() {}, startLeaderHealth() {}, stopLeaderHealth() {}, stopFollowerRegistration() {},
+    registerFollowerWithLeader: async (_ctx, _owner, options) => {
+      assert.equal(Object.hasOwn(options!, "readiness"), false, "The local readiness budget never enters native registration");
+      options?.assertAuthority?.(); issues++;
+      if (outcome === "long-ack") { now = 60_000; await Promise.resolve(); options?.assertAuthority?.(); }
+      if (outcome === "rejected") throw original;
+      return outcome !== "negative";
+    }, recordEvent(_category, _error, details) { records.push(details?.phase); if (outcome === "logging") throw original; },
+  });
+  const pending = ports.registerFollowerWithOwner(TEST_CONTEXT, { pid: 1 }, {
+    readiness: {
+      remainingMs: () => outcome === "constant-clock" ? 600 : 600 - now,
+      async wait() {
+        waits++; now += 150;
+        if (outcome === "cancelled") current = false;
+        if (outcome === "getter-replaced") store.getBotState = () => ({ threadMode: "enabled" });
+        if (!["timeout", "late-refresh", "restore", "constant-clock"].includes(outcome)) mode = outcome === "classic" ? "disabled" : "enabled";
+        return waits < 4;
+      },
+    },
+    assertAuthority() { if (!current) throw original; },
+  });
+  if (["rejected", "restore", "cancelled", "getter-replaced"].includes(outcome))
+    await assert.rejects(pending, error => outcome === "getter-replaced" ? error instanceof Error : error === original);
+  else assert.equal(await pending, ["timeout", "late-refresh", "constant-clock"].includes(outcome) ? "readiness-expired" : outcome === "classic" ? undefined : outcome !== "negative");
+  assert.equal(issues, ["enabled", "long-ack", "rejected", "negative", "logging"].includes(outcome) ? 1 : 0);
+  assert.equal(records.filter(phase => phase === "follower-readiness-wait").length, 1);
+  assert.ok(waits <= 4 && refreshes <= 5, "A frozen clock cannot extend the original observation count");
+});
+
+for (const loggingFails of [false, true])
+test(`Follower refresh refusal is local and preserves the original error (${loggingFails})`, async () => {
+  const original = new Error("Workspace Restore evidence fixture refusal");
+  const records: Array<{ error: unknown; details?: Record<string, unknown> }> = [];
+  let registrations = 0;
+  const ports = createTelegramThreadAwarePollingPorts({
+    getAllowedUserId: () => 42, callApi: async <TResponse,>() => ({}) as TResponse,
+    topicTargetStore: { async load() { throw original; }, async refresh() { throw original; }, async persist() {}, getBotState: () => ({ threadMode: "enabled" }), setBotState() {} },
+    isBusRuntimeEnabled: () => false, isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false, setPollingStartedWithTelegramBus() {}, setForceFreshLeaderThreadOnNextStart() {}, setTopicModeUnavailable() {},
+    startClassicPolling() {}, async stopClassicPolling() {}, async startBusLeaderPolling() {}, async stopBusLeaderPolling() {}, startLeaderHealth() {}, stopLeaderHealth() {},
+    registerFollowerWithLeader: async () => { registrations++; return true; }, stopFollowerRegistration() {},
+    recordEvent(_category, error, details) { records.push({ error, details }); if (loggingFails) throw new Error("Fixture diagnostics failed"); },
+  });
+  await assert.rejects(ports.registerFollowerWithOwner(TEST_CONTEXT, { pid: 1 }), error => error === original);
+  assert.equal(registrations, 0, "Local view refusal cannot send a registration request");
+  assert.equal(records.length, 1);
+  assert.equal(records[0]?.error, original);
+  assert.deepEqual(records[0]?.details, { phase: "follower-readiness-refresh-refused", source: "local" });
 });
 
 test("Thread-aware polling refreshes owner-published enabled mode over stale local classic state", async () => {
@@ -908,6 +1269,41 @@ test("Thread-aware polling refreshes owner-published enabled mode over stale loc
     true,
   );
   assert.equal(followerRegistrations, 1);
+});
+
+for (const mode of ["enabled", "disabled", "unknown"] as const) for (const remembered of [false, true])
+for (const classicOmitted of mode === "disabled" ? [false, true] : [false])
+test(`Automatic leader eligibility requires remembered Thread continuity (${mode}, remembered=${remembered}, classicOmitted=${classicOmitted})`, async () => {
+  let bus = false, unavailable = false, starts = 0, classic = 0, binding = remembered, loseDuringProbe = false;
+  const ports = createTelegramThreadAwarePollingPorts({
+    getAllowedUserId: () => 7, callApi: async <T,>() => {
+      if (loseDuringProbe) binding = false;
+      return { has_topics_enabled: mode === "unknown" || classicOmitted ? undefined : mode === "enabled" } as T;
+    },
+    topicTargetStore: { async load() {}, async persist() {}, getBotState: () => ({ threadMode: mode }), setBotState() {} },
+    isBusRuntimeEnabled: () => !unavailable, isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => bus, setPollingStartedWithTelegramBus: value => { bus = value; },
+    setForceFreshLeaderThreadOnNextStart() {}, setTopicModeUnavailable: value => { unavailable = value; },
+    startClassicPolling() { classic++; }, async stopClassicPolling() {}, async startBusLeaderPolling() { starts++; }, async stopBusLeaderPolling() {},
+    startLeaderHealth() {}, stopLeaderHealth() {}, registerFollowerWithLeader: async () => true,
+    hasRememberedWorkspaceBinding: () => binding, stopFollowerRegistration() {}, recordEvent() {},
+  });
+  assert.equal(await ports.canAutoStartSession(TEST_CONTEXT), remembered || mode === "disabled");
+  if (!remembered && mode !== "disabled") {
+    await assert.rejects(ports.startPolling(TEST_CONTEXT, { restoreWorkspaceOnly: true }), /remembered session binding/u);
+    assert.equal(starts, 0); assert.equal(classic, 0);
+  } else {
+    await ports.startPolling(TEST_CONTEXT, { restoreWorkspaceOnly: true });
+    assert.equal(starts + classic, 1);
+    await ports.stopPolling();
+  }
+  if (remembered && mode === "enabled") {
+    assert.equal(await ports.canAutoStartSession(TEST_CONTEXT), true);
+    loseDuringProbe = true;
+    await assert.rejects(ports.startPolling(TEST_CONTEXT, { restoreWorkspaceOnly: true }), /remembered session binding/u);
+    assert.equal(starts, 1, "Preflight cannot lend a later missing binding to provisioning");
+  }
+  await ports.stopPolling();
 });
 
 test("Thread-aware polling auto-restores followers only for remembered Workspaces", async () => {

@@ -4,6 +4,7 @@
  * Owns filesystem authority, atomic runtime-section publication and Telegram bridge ownership semantics
  */
 import { renameSync } from "node:fs";
+import { type TelegramFollowerRegistrationOptions, type TelegramFollowerRegistrationResult } from "./polling.ts";
 export declare const TELEGRAM_LOCK_KEY = "default";
 export declare const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 8000;
 export declare const TELEGRAM_OWNERSHIP_CHECK_MS = 1000;
@@ -83,6 +84,13 @@ export interface TelegramLockRuntime<TContext extends TelegramLockContext> {
     acquire: (ctx: TContext, options?: TelegramLockAcquireOptions) => TelegramLockAcquireResult;
     release: () => TelegramLockState;
     getState: () => TelegramLockState;
+    /** Read-only original foreign owner/profile/endpoint scope; never polling acquisition or takeover authority. */
+    captureFollowerRegistrationScope: (owner: TelegramLockEntry) => () => boolean;
+    /** Selected consolidated storage coordinates; undefined for the independent legacy owners file. */
+    getStorageScope: () => {
+        path: string;
+        profile: string;
+    } | undefined;
     getStatusLabel: () => string;
     getOwnedLeaderEpoch: () => number | string | undefined;
     owns: (ctx?: TelegramLockContext) => boolean;
@@ -166,9 +174,21 @@ export declare function readTelegramPrivateFile(path: string, maxBytes: number):
 export declare function publishTelegramPrivateFile(path: string, temporaryBasePath: string, contents: string, label: string, onBoundary?: (boundary: "after-write-before-rename" | "after-rename") => void): void;
 /** Rename one Telegram runtime artifact with bounded Windows sharing retries. */
 export declare function renameTelegramPathWithRetry(sourcePath: string, destinationPath: string, options?: TelegramRenameRetryOptions): boolean;
+/** A refusal of guard evidence, never permission to clear the guard or retry its protected operation. */
+export declare class TelegramFileTransactionGuardError extends Error {
+    readonly code = "guard-unverifiable";
+    readonly resource: string;
+    readonly reason: "invalid-layout" | "invalid-owner" | "unavailable-owner";
+    readonly phase: "acquire" | "release";
+    constructor(resource: string, reason: TelegramFileTransactionGuardError["reason"], options?: ErrorOptions & {
+        phase?: "acquire" | "release";
+    });
+}
 export interface TelegramFileTransactionOptions {
     recoveryRename?: typeof renameSync;
     publishRename?: typeof renameSync;
+    /** Observation leases may contend but must not acquire abandoned-owner recovery authority. */
+    recoverAbandoned?: boolean;
     attempts?: number;
     retryDelayMs?: number;
 }
@@ -179,9 +199,13 @@ interface TelegramRuntimeStateFile {
     version: 2;
     profiles: Record<string, TelegramRuntimeStateProfile>;
 }
+type TelegramRuntimeStateReadCondition = "device-mismatch" | "inode-mismatch" | "opened-links" | "opened-type" | "opened-mode" | "post-read-device-mismatch" | "post-read-inode-mismatch" | "post-read-size-mismatch" | "post-read-mtime-mismatch" | "post-read-ctime-mismatch";
 export declare class TelegramRuntimeStateError extends Error {
     readonly code: "invalid" | "authority-changed" | "publication-unknown";
-    constructor(code: TelegramRuntimeStateError["code"], message: string, options?: ErrorOptions);
+    readonly readCondition: TelegramRuntimeStateReadCondition | undefined;
+    constructor(code: TelegramRuntimeStateError["code"], message: string, options?: ErrorOptions & {
+        readCondition?: TelegramRuntimeStateReadCondition;
+    });
 }
 /** Strict, observational envelope read; section owners validate their own payloads. Legacy state is never adopted here. */
 export declare function readTelegramRuntimeState(path: string): TelegramRuntimeStateFile;
@@ -190,7 +214,7 @@ export declare function readTelegramRuntimeState(path: string): TelegramRuntimeS
  * caller-validated section is damaged, publish a fresh empty envelope instead of refusing. All profiles lose runtime
  * continuity. Filesystem access errors are not damage and still throw. Returns whether a reset was published.
  */
-export declare function resetDamagedTelegramRuntimeState(path: string, validateProfile?: (profile: string, sections: Readonly<TelegramRuntimeStateProfile>) => void): boolean;
+export declare function resetDamagedTelegramRuntimeState(path: string, validateProfile?: (profile: string, sections: Readonly<TelegramRuntimeStateProfile>) => void, assertCurrent?: () => void): boolean;
 /** Pure section reducer: receives the stored section and its profile, returns the next section and result. */
 export type TelegramRuntimeStateSectionReducer<T> = (current: unknown, observed: Readonly<TelegramRuntimeStateProfile>) => TelegramRuntimeStateMutation<T>;
 export interface TelegramRuntimeStateMutation<T> {
@@ -226,8 +250,11 @@ export declare function createTelegramDirectDeliveryOwnershipChecker<TContext ex
     contextStore: TelegramLockContextStore<TContext>;
 }): () => boolean;
 interface TelegramLockedPollingStartOptions {
+    assertAuthority?: () => void;
     force?: boolean;
     forceFreshLeaderThread?: boolean;
+    /** Automatic stale-owner recovery cannot provision an unremembered Thread. */
+    restoreWorkspaceOnly?: true;
     requestedThreadName?: string;
     election?: {
         expectedOwner?: TelegramLockEntry;
@@ -247,6 +274,8 @@ type TelegramLockedPollingStartResult = {
 };
 export interface TelegramLockedPollingRuntime<TContext extends TelegramLockContext> {
     start: (ctx: TContext, options?: TelegramLockedPollingStartOptions) => Promise<TelegramLockedPollingStartResult>;
+    /** Explicit-connect preparation before profile teardown; does not acquire transport or grant cleanup authority. */
+    prepareConnection: (ctx: TContext, isCurrent: () => boolean) => boolean;
     stop: () => Promise<string>;
     /** Capture one disconnect attempt before cleanup awaits; a newer start revokes it. */
     captureStop: () => {
@@ -257,28 +286,37 @@ export interface TelegramLockedPollingRuntime<TContext extends TelegramLockConte
     isSuspended: () => boolean;
     /** Fence one owned polling generation; suspension, restart, conflict or lock loss revokes it. */
     captureTransportAuthority: (ctx: TContext) => (() => boolean) | undefined;
+    /** Capture the owner's real startup context without lending it to a caller; observed loss is terminal. */
+    captureCurrentTransportAuthority: () => (() => boolean) | undefined;
     onPersistentConflict: (ctx: TContext, count: number) => Promise<void>;
     onSessionStart: (_event: unknown, ctx: TContext) => Promise<void>;
-    registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry, options?: {
-        recoverConnection?: boolean;
-    }) => boolean | undefined | Promise<boolean | undefined>;
+    registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry, options?: TelegramFollowerRegistrationOptions) => TelegramFollowerRegistrationResult | Promise<TelegramFollowerRegistrationResult>;
     restoreFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;
     stopFollowerRegistration?: () => void;
 }
 interface TelegramLockedPollingRuntimeDeps<TContext extends TelegramLockContext> {
     lock: TelegramLockRuntime<TContext>;
     /** Optimistically replaces a damaged shared runtime state before a non-election acquisition. */
-    resetDamagedState?: () => boolean;
+    resetDamagedState?: (assertCurrent: () => void) => boolean;
+    captureConfigScope?: (profile?: string) => () => boolean;
+    captureStorageScope?: (expected?: {
+        path: string;
+        profile: string;
+    }) => () => boolean;
+    /** Existing profile-derived locator for owners that do not publish an endpoint in their transport row. */
+    getLeaderEndpoint?: () => string;
     hasBotToken: () => boolean;
     getBotTokenDiagnostic?: () => string | undefined;
     canStartPolling?: (ctx: TContext) => boolean;
+    /** Read-only session eligibility before replacing stale transport continuity. */
+    canAutoStartSession?: (ctx: TContext) => Promise<boolean>;
     isContextCurrent?: (ctx: TContext) => boolean;
+    /** Actual session identity from the host owner; captured at polling startup, never synthesized by Delivery. */
+    getSessionId?: (ctx: TContext) => string | undefined;
     formatStartBlockedMessage?: (ctx: TContext) => string;
     startPolling: (ctx: TContext, options?: TelegramLockedPollingStartOptions) => void | Promise<void>;
     stopPolling: () => Promise<void>;
-    registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry, options?: {
-        recoverConnection?: boolean;
-    }) => boolean | undefined | Promise<boolean | undefined>;
+    registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry, options?: TelegramFollowerRegistrationOptions) => TelegramFollowerRegistrationResult | Promise<TelegramFollowerRegistrationResult>;
     restoreFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;
     stopFollowerRegistration?: () => void;
     /** Threaded Mode takeover evidence after failed follower registration; replaces the retired file heartbeat. */
@@ -292,6 +330,9 @@ interface TelegramLockedPollingRuntimeDeps<TContext extends TelegramLockContext>
     recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
     ownershipCheckMs?: number;
     ownershipRefreshMs?: number;
+    /** Monotonic original-attempt readiness clock; native registration keeps its independent ACK timeout. */
+    readinessClock?: () => number;
+    waitForReadiness?: (ms: number) => Promise<void>;
 }
 export declare function createTelegramLockedPollingRuntime<TContext extends TelegramLockContext>(deps: TelegramLockedPollingRuntimeDeps<TContext>): TelegramLockedPollingRuntime<TContext>;
 export {};

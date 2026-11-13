@@ -6,6 +6,10 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { Worker } from "node:worker_threads";
+import { syncBuiltinESMExports } from "node:module";
+import { setTimeout as nativeSetTimeout } from "node:timers";
 import fs from "node:fs";
 import {
   chmod,
@@ -20,14 +24,16 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
-import testRoot, { after, mock, type TestContext } from "node:test";
+import nativeTest, { after, mock, type TestContext, type TestOptions } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
 import { runNodeEval } from "./fixtures/node-eval.ts";
+import { createIntegrationShardSelector } from "./fixtures/shared.ts";
 import * as RoutingFixture from "./fixtures/routing.ts";
+import { withWorkspaceRestoreFixture } from "./fixtures/workspace.ts";
 import { createTelegramActivityVerbosityRuntime } from "../lib/activity-verbosity.ts";
 import * as AgentMessages from "../lib/agent-messages.ts";
 import * as Bindings from "../lib/bindings.ts";
@@ -36,12 +42,13 @@ import * as BusFollower from "../lib/bus-follower.ts";
 import * as BusLeader from "../lib/bus-leader.ts";
 import * as Bus from "../lib/bus.ts";
 import * as BusTransport from "../lib/bus-transport.ts";
-import * as Media from "../lib/media.ts";
-import * as Config from "../lib/config.ts";
 import * as Commands from "../lib/commands.ts";
 import * as ProcessIdentity from "../lib/process-identity.ts";
 import * as WorkspaceAdmission from "../lib/workspace-admission.ts";
 import * as Delivery from "../lib/delivery.ts";
+import * as GenerativeApps from "../lib/generative-apps.ts";
+import * as OutboundButtons from "../lib/outbound-buttons.ts";
+import * as Outbound from "../lib/outbound.ts";
 import * as Routing from "../lib/routing.ts";
 import * as Threads from "../lib/threads.ts";
 import * as ThreadCleanupManager from "../lib/thread-cleanup-manager.ts";
@@ -60,19 +67,30 @@ import * as Updates from "../lib/updates.ts";
 import {
   createTelegramBridgeApiRuntime,
   createTelegramApiClient,
+  TelegramApiAuthorityError,
   type TelegramApiClient,
   type TelegramBridgeApiRuntime,
 } from "../lib/telegram-api.ts";
 import { createPassthroughFailureLog } from "./fixtures/failure-log.ts";
 import { createTelegramFailureRunLog } from "../lib/logging.ts";
+import { setTestFetch } from "./fixtures/shared.ts";
 
 // Production timers are unref'd so they never hold Pi open; a live Pi process keeps the loop alive. Mirror that so
 // Node 22's runner does not abort runtime tests that await those timers.
+const inventoryOnly = process.env.PI_TELEGRAM_INTEGRATION_LIST === "1";
+const selectIntegrationTest = createIntegrationShardSelector(process.env.PI_TELEGRAM_INTEGRATION_SHARD);
+const selectedTestNames: string[] = [];
 const eventLoopKeepAlive = setInterval(() => {}, 60_000);
-after(() => { clearInterval(eventLoopKeepAlive); });
+if (!inventoryOnly) after(() => { clearInterval(eventLoopKeepAlive); });
 
 type RuntimeTestHandler = (context: TestContext) => void | Promise<void>;
 type RuntimeTelegramExtension = (typeof import("../index.ts"))["default"];
+
+function testRoot(name: string, options: TestOptions, fn: RuntimeTestHandler): void {
+  if (!selectIntegrationTest(name)) return;
+  if (inventoryOnly) selectedTestNames.push(name);
+  else void nativeTest(name, options, fn);
+}
 
 function test(
   name: string,
@@ -85,6 +103,4342 @@ function test(
 function strictFileTest(name: string, fn: RuntimeTestHandler): void {
   void testRoot(name, { concurrency: false, skip: process.platform === "win32", timeout: 5_000 }, fn);
 }
+
+function createLifetimeSdk(target: Delivery.TelegramDeliveryTarget, overrides: Partial<Delivery.TelegramDeliveryRuntimeDeps> = {}) {
+  let messageId = 1000;
+  return Delivery.createTelegramDeliveryRuntime({ questionHeadTail: true, generation: "sdk-lifetime-original",
+    getConfirmationAuthority: () => ({ profile: "default", operatorId: 42 }), getInstanceTarget: () => target,
+    getActiveTurnTarget: () => target, getAggregateTarget: () => ({ chatId: 42 }), isExplicitTargetAuthorized: candidate => candidate.chatId === 42,
+    renderView: view => [{ text: view.text, parseMode: "html" }], sendChunk: async () => ++messageId,
+    async editChunk() {}, async deleteMessage() {}, async sendChatAction() {}, ...overrides });
+}
+function openLifetimeSdkHead(sdk: Delivery.TelegramDeliveryRuntime) {
+  return sdk.openConfirmation!({ owner: "@test/lifetime", scope: { kind: "instance" }, question: "SDK question",
+    confirmLabel: "Yes", cancelLabel: "Cancel", signal: new AbortController().signal });
+}
+const lifetimeAgentDeclaration = '<!-- telegram_confirm {"question":"Agent question"} -->';
+
+async function liveOrdinaryHarness(options: { threaded?: boolean; rich?: boolean; count?: number; ttlMs?: number; ordinaryPrompt?: string; ordinaryDisabled?: true; ordinaryCallbackDispatch?: true | "qualified"; ordinaryReadOnlyParent?: true; ordinaryFeedbackParent?: true; ordinaryRichFeedbackParent?: true; ordinaryQueuedFeedbackParent?: true; ordinaryDeferredFeedbackParent?: true; ordinaryDeferredSdkTail?: true; questionAppOrigin?: true | "independent"; ordinaryQuestionParent?: true; ordinaryRetainedQuestionParent?: true; initialQuestionBinding?: true | "peer"; ordinaryCount?: number; assertProducer?: () => void; sdk?: Partial<Delivery.TelegramDeliveryRuntimeDeps>;
+  captureSdk?: (sdk: Delivery.TelegramDeliveryRuntime) => Readonly<Delivery.TelegramQuestionLifetimeOwner> | undefined;
+  afterConstruct?: (config: object) => void; ordinaryExpiresAt?: number; captureApp?: typeof GenerativeApps.captureGenerativeAppCallbackOwner; binding?: (binding: GenerativeApps.GenerativeAppCallbackBinding) => GenerativeApps.GenerativeAppCallbackBinding } = {}) {
+  const folder = await mkdtemp(join(tmpdir(), "pi-telegram-live-ordinary-")), agentDir = join(folder, "agent"), script = join(folder, "counter.mjs");
+  await writeFile(script, 'export function init(){return {state:{count:0},output:"ready"}} export function inspect({state}){return {output:String(state.count)}} export function increment({state}){return {state:{count:state.count+1},output:"changed"}} export function refresh(){return {output:"fresh"}}');
+  const result = await GenerativeApps.installGenerativeApp({ agentDir, app: "counter", script }), nativeBinding = GenerativeApps.getGenerativeAppCallbackBinding(result)!;
+  const initialBinding = options.initialQuestionBinding === "peer" ? GenerativeApps.getGenerativeAppCallbackBinding(await GenerativeApps.invokeGenerativeApp({ agentDir, app: "counter", method: "inspect" }))! : nativeBinding;
+  const target = { chatId: 42, ...(options.threaded ? { threadId: 7 } : {}) };
+  let store: OutboundButtons.TelegramButtonActionStore, captures = 0, appCaptures = 0;
+  const sdk = createLifetimeSdk(target, { ...options.sdk, onQuestionAdmission: admission => store?.onQuestionAdmission!(admission) });
+  const config = { ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}), ...(options.ordinaryCallbackDispatch ? { ordinaryCallbackDispatch: options.ordinaryCallbackDispatch } : {}), ...(options.ordinaryReadOnlyParent ? { ordinaryReadOnlyParent: true as const } : {}), ...(options.ordinaryFeedbackParent ? { ordinaryFeedbackParent: true as const } : {}), ...(options.ordinaryRichFeedbackParent ? { ordinaryRichFeedbackParent: true as const } : {}), ...(options.ordinaryQueuedFeedbackParent ? { ordinaryQueuedFeedbackParent: true as const } : {}), ...(options.ordinaryDeferredFeedbackParent ? { ordinaryDeferredFeedbackParent: true as const } : {}), ...(options.ordinaryDeferredSdkTail ? { ordinaryDeferredSdkTail: true as const } : {}), ...(options.questionAppOrigin ? { questionAppOrigin: options.questionAppOrigin } : {}), ...(options.ordinaryQuestionParent ? { ordinaryQuestionParent: true as const } : {}), ...(options.ordinaryRetainedQuestionParent ? { ordinaryRetainedQuestionParent: true as const } : {}), captureSelectionAuthority: () => options.assertProducer ?? (() => {}), captureQuestionLifetimeOwner() { assert.equal(this, config); captures++; return options.captureSdk ? options.captureSdk(sdk) : sdk.captureQuestionLifetimeOwner!(); },
+    captureOrdinaryBindingOwner(binding: unknown) { assert.equal(this, config); appCaptures++; return (options.captureApp ?? GenerativeApps.captureGenerativeAppCallbackOwner)(binding); } };
+  store = OutboundButtons.createTelegramButtonActionStore(config); options.afterConstruct?.(config);
+  const rows: { key: string; action: OutboundButtons.TelegramOutboundButtonAction }[] = [];
+  const question = (label = "A") => `<!-- telegram_confirm "${label}" -->`;
+  const declaration = Array.from({ length: options.count ?? 2 }, (_, index) => question(String(index))).join("\n") +
+    Array.from({ length: options.ordinaryCount ?? 1 }, () => `\n<!-- telegram_button {Run|${options.ordinaryPrompt ?? "counter::increment"}} -->`).join("");
+  const plan = OutboundButtons.planTelegramButtonReply(declaration, { questionHeadTail: true, rendering: options.rich ? "rich" : "html",
+    binding: options.binding ? options.binding(nativeBinding) : nativeBinding, registerAction(action) { if (action.binding && options.ordinaryDisabled) action = { ...action, disabled: true }; if (action.binding && options.ordinaryExpiresAt !== undefined) action = { ...action, expiresAt: options.ordinaryExpiresAt }; const key = store.register(action, options.initialQuestionBinding ? initialBinding : undefined); rows.push({ key, action }); return key; } });
+  const groups = [...new Set(rows.flatMap(({ action }) => action.completionGroup ? [action.completionGroup] : []))];
+  const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { sendMessage: async () => ({ message_id: 201 }), sendRichMessage: async () => ({ message_id: 201 }) } as unknown as TelegramBridgeApiRuntime,
+    ownsDirect: () => true, callFollowerApi: async () => assert.fail("No follower fallback"), beginButtonPublication: store.beginPublication });
+  const body = { chat_id: 42, ...(options.threaded ? { message_thread_id: 7 } : {}), ...(options.rich ? { rich_message: { markdown: plan.markdown } } : { text: plan.markdown }), reply_markup: plan.replyMarkup };
+  return { folder, agentDir, sdk, store, rows, groups, plan, body, config, nativeBinding, target, captures: () => captures, appCaptures: () => appCaptures,
+    publish: () => "rich_message" in body ? api.sendRichMessage(body) : api.sendMessage(body),
+    async close() { store.clear!(); sdk.shutdown(); await store.waitForPublicationIdle!(); await rm(folder, { recursive: true, force: true }); } };
+}
+
+
+
+
+for (const rich of [false, true]) for (const scenario of ["current", "source-loss", "sdk-loss", "app-loss", "frame-change", "namespace-change", "spent-parent", "foreign-binding", "accessor", "reentry"] as const)
+test(`Original publication source captures native first-parent without renewal (${rich}/${scenario})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let producerCurrent = true, reenter: (() => void) | undefined;
+  const h = await liveOrdinaryHarness({ rich, threaded: true, questionAppOrigin: "independent", initialQuestionBinding: true,
+    ordinaryCallbackDispatch: "qualified", ordinaryReadOnlyParent: true, assertProducer() { if (reenter) reenter(); if (!producerCurrent) throw new Error("Original publisher lost"); } });
+  try {
+    const handle = { target: h.target, messageIds: [201] }, capture = h.store.capturePublicationSource!;
+    assert.equal(capture(handle, h.nativeBinding), undefined, "Planning alone cannot supply physical publication evidence");
+    await h.publish(); await h.store.waitForPublicationIdle!();
+    const deadlines = h.groups.map(group => group.deadline!.expiresAt), captures = h.captures();
+    const source = capture(handle, h.nativeBinding); assert.ok(source); assert.equal(Object.isFrozen(source), true);
+    source.assertCurrent(); source.assertCurrent();
+    assert.equal(h.captures(), captures, "Source capture uses original native SDK owners, never a current owner lookup");
+    assert.deepEqual(h.groups.map(group => group.deadline!.expiresAt), deadlines);
+    if (scenario === "foreign-binding" || scenario === "accessor") {
+      let reads = 0;
+      const bad = scenario === "accessor" ? { ...handle, target: { chatId: 42, get threadId() { reads++; return 7; } } } : handle;
+      assert.equal(capture(bad, scenario === "foreign-binding" ? { ...h.nativeBinding } : h.nativeBinding), undefined); assert.equal(reads, 0);
+      source.assertCurrent();
+    } else if (scenario === "source-loss") {
+      producerCurrent = false; assert.throws(source.assertCurrent); producerCurrent = true; assert.throws(source.assertCurrent, "Restoring fields cannot revive an observed source loss");
+    } else if (scenario === "sdk-loss") {
+      h.sdk.shutdown(); assert.throws(source.assertCurrent); assert.equal(capture(handle, h.nativeBinding), undefined);
+    } else if (scenario === "app-loss") {
+      await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment" }); assert.throws(source.assertCurrent);
+    } else if (scenario === "namespace-change") {
+      assert.equal(capture({ target: { chatId: 42, threadId: 8 }, messageIds: [201] }, h.nativeBinding), undefined);
+      assert.equal(capture({ target: h.target, messageIds: [202] }, h.nativeBinding), undefined);
+      assert.equal(capture({ ...handle, messageIds: [201, 202] }, h.nativeBinding), undefined); source.assertCurrent();
+    } else if (scenario === "spent-parent") {
+      assert.ok(h.store.resolve(h.rows[0]!.key)); assert.throws(source.assertCurrent); assert.equal(capture(handle, h.nativeBinding), undefined);
+    } else if (scenario === "frame-change") {
+      const markup = structuredClone(h.plan.replyMarkup!); markup.inline_keyboard[0]![0]!.text += " changed";
+      const edit = async (reply_markup: typeof markup) => {
+        const finish = h.store.beginPublication!("editMessageReplyMarkup", { chat_id: 42, message_id: 201, reply_markup }); assert.ok(finish);
+        await finish.ready; finish(undefined, true); await h.store.waitForPublicationIdle!();
+      };
+      await edit(markup); assert.throws(source.assertCurrent);
+      await edit(h.plan.replyMarkup!); assert.throws(source.assertCurrent, "Equal fields in another native frame cannot restore the original captured frame");
+    } else if (scenario === "reentry") {
+      reenter = () => { reenter = undefined; assert.throws(source.assertCurrent); };
+      assert.throws(source.assertCurrent); assert.throws(source.assertCurrent);
+    } else {
+      t.mock.timers.tick(1000); source.assertCurrent();
+      assert.deepEqual(h.groups.map(group => group.deadline!.expiresAt), deadlines);
+      assert.ok(h.store.resolve(h.rows[0]!.key), "A read-only source snapshot never spends a question or ordinary callback");
+      assert.ok(h.store.resolve(h.rows.find(row => !row.action.completionGroup)!.key));
+    }
+  } finally { await h.close(); }
+});
+
+async function questionAppOriginFixture(options: Parameters<typeof liveOrdinaryHarness>[0] & { plannerOrigin?: boolean; omitFirstOrigin?: boolean } = {}) {
+  const h = await liveOrdinaryHarness({ count: 0, ordinaryCount: 0, questionAppOrigin: true, ...options });
+  const rows: { key: string; action: OutboundButtons.TelegramOutboundButtonAction; binding: unknown }[] = [];
+  let firstGroup: object | undefined;
+  const planner = Outbound.createTelegramOutboundReplyPlanner({ register(action, binding) { firstGroup ??= action.completionGroup; const origin = options.omitFirstOrigin && action.completionGroup === firstGroup ? undefined : binding; const key = h.store.register(action, origin); rows.push({ key, action, binding: origin }); return key; } }, () => options.rich ? "rich" : "html", true, options.plannerOrigin === false ? undefined : true);
+  const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { sendMessage: async () => ({ message_id: 201 }), sendRichMessage: async () => ({ message_id: 201 }), editMessageText: async () => "edited", editMessageReplyMarkup: async () => "edited" } as unknown as TelegramBridgeApiRuntime,
+    ownsDirect: () => true, callFollowerApi: async () => assert.fail("No follower fallback"), beginButtonPublication: h.store.beginPublication });
+  const plan = (text = lifetimeAgentDeclaration, binding: unknown = h.nativeBinding) => planner(text, { binding: binding as GenerativeApps.GenerativeAppCallbackBinding });
+  const publish = (p: ReturnType<typeof planner>) => {
+    const body = { chat_id: 42, ...(options.threaded ? { message_thread_id: 7 } : {}), ...(options.rich ? { rich_message: { markdown: p.markdown } } : { text: p.markdown }), reply_markup: p.replyMarkup };
+    return "rich_message" in body ? api.sendRichMessage(body) : api.sendMessage(body);
+  };
+  return { ...h, rows, planner, plan, publish, api };
+}
+for (const directTransport of [false, true]) for (const rich of [false, true]) for (const threaded of [false, true]) for (const scenario of ["current", "legacy", "bot", "thread", "sdk-io", "app-io", "publisher-io", "expiry-io", "consumed-io", "refused-retry", "unknown-retry", "multiple", "duplicate", "late-born", "source-loss", "frame-change", "reentrant-frame"] as const)
+test(`Ordinary first-wire source certifies original birth without a question head (${rich}/${threaded}/${scenario}/direct=${directTransport})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let publisherCurrent = true, reenter: (() => void) | undefined;
+  const h = await questionAppOriginFixture({ rich, threaded, questionAppOrigin: "independent", ordinaryCallbackDispatch: "qualified", ordinaryReadOnlyParent: true,
+    ...(scenario === "expiry-io" ? { ttlMs: 2000 } : {}), assertProducer() { const callback = reenter; reenter = undefined; callback?.(); if (!publisherCurrent) throw new Error("Original publisher lost"); } });
+  try {
+    const head = await openLifetimeSdkHead(h.sdk); assert.ok(head.ok);
+    let headEnded = false; void head.handle.result.then(() => { headEnded = true; });
+    const declaration = '<!-- telegram_button {Inspect|counter::inspect} -->';
+    const plan = h.plan(scenario === "multiple" ? declaration + declaration : declaration);
+    assert.equal(h.rows.some(row => row.action.completionGroup), false);
+    const body: Record<string, unknown> = { chat_id: 42, ...(threaded ? { message_thread_id: 7 } : {}),
+      ...(rich ? { rich_message: { markdown: plan.markdown } } : { text: plan.markdown }), reply_markup: plan.replyMarkup };
+    if (scenario === "duplicate") {
+      if (plan.replyMarkup) body.reply_markup = { inline_keyboard: [...plan.replyMarkup.inline_keyboard, ...plan.replyMarkup.inline_keyboard] };
+      else body.rich_message = { markdown: plan.markdown + plan.markdown };
+    }
+    if (scenario === "late-born") {
+      let late: ReturnType<typeof h.plan> | undefined;
+      const footer = !!plan.replyMarkup;
+      Object.defineProperty(body, footer ? "reply_markup" : "rich_message", { enumerable: true, get() {
+        late ??= h.plan(declaration);
+        return footer ? late.replyMarkup : { markdown: late.markdown };
+      } });
+    }
+    const handle = { target: h.target, messageIds: [201] }, capture = h.store.capturePublicationSource!;
+    assert.equal(capture(handle, h.nativeBinding), undefined);
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(); let calls = 0;
+    const guard = () => { if (!publisherCurrent) throw new Error("Original transport lost"); };
+    const nativeWire = async (wire: Record<string, unknown>) => {
+        calls++; entered.resolve(); await release.promise;
+        if (calls === 1 && scenario === "refused-retry") throw new TelegramApiAuthorityError(false);
+        if (calls === 1 && scenario === "unknown-retry") throw new Error("Issued outcome unknown");
+        if (scenario === "reentrant-frame") reenter = () => {
+          const markup = structuredClone(plan.replyMarkup!); markup.inline_keyboard[0]![0]!.text += " changed";
+          const edit = h.store.beginPublication!("editMessageReplyMarkup", { chat_id: 42, message_id: 201, reply_markup: markup }); assert.ok(edit);
+          edit(undefined, true);
+        };
+        return scenario === "legacy" ? { message_id: 201 } : { message_id: 201, chat: { id: wire.chat_id },
+          from: { id: scenario === "bot" ? 124 : 123, is_bot: true },
+          ...(threaded || scenario === "thread" ? { message_thread_id: scenario === "thread" ? 8 : 7 } : {}) };
+    };
+    const native = createTelegramBridgeApiRuntime({ client: { async call(_method: string, wire: Record<string, unknown>, options?: import("../lib/telegram-api.ts").TelegramApiCallOptions) {
+      options?.assertAuthority?.(); const value = await nativeWire(wire); options?.assertAuthority?.(); return value;
+    } } as unknown as TelegramApiClient, tempDir: "/unused", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {} });
+    const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: native, ownsDirect: () => directTransport,
+      captureQuestionAuthority: () => guard, captureFollowerApiRegistration: () => guard, getQuestionBotId: () => 123, beginButtonPublication: h.store.beginPublication,
+      callFollowerApi: async (_method, args) => { assert.equal(directTransport, false); return nativeWire(args[1] as Record<string, unknown>); } });
+    const send = () => rich ? api.sendRichMessage(body as Parameters<typeof api.sendRichMessage>[0]) : api.sendMessage(body as Parameters<typeof api.sendMessage>[0]);
+    const pending = send(); await entered.promise;
+    assert.equal(capture(handle, h.nativeBinding), undefined, "Pending I/O cannot certify a physical source");
+    if (scenario === "sdk-io") h.sdk.shutdown();
+    if (scenario === "app-io") await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment" });
+    if (scenario === "publisher-io") publisherCurrent = false;
+    if (scenario === "expiry-io") t.mock.timers.tick(2001);
+    if (scenario === "consumed-io") assert.ok(h.store.resolve(h.rows[0]!.key));
+    release.resolve();
+    if (scenario === "refused-retry" || scenario === "unknown-retry") { await assert.rejects(pending); await send(); }
+    else if (scenario === "publisher-io") await assert.rejects(pending);
+    else await pending;
+    await h.store.waitForPublicationIdle!();
+    const births = h.captures(), source = capture(handle, h.nativeBinding);
+    assert.equal(h.captures(), births);
+    if (!["current", "source-loss", "frame-change"].includes(scenario)) { assert.equal(source, undefined); return; }
+    assert.ok(source); source.assertCurrent();
+    if (scenario === "source-loss") {
+      publisherCurrent = false; assert.throws(source.assertCurrent); publisherCurrent = true; assert.throws(source.assertCurrent); return;
+    }
+    if (scenario === "frame-change") {
+      const finish = h.store.beginPublication!("editMessageReplyMarkup", { chat_id: 42, message_id: 201, reply_markup: plan.replyMarkup }); assert.ok(finish);
+      await finish.ready; finish(undefined, true); await h.store.waitForPublicationIdle!();
+      assert.throws(source.assertCurrent); assert.equal(capture(handle, h.nativeBinding), undefined); return;
+    }
+    t.mock.timers.tick(3600001); await Promise.resolve();
+    assert.equal(headEnded, false, "Certifying an ordinary row never admits a question head or shortens the existing SDK question");
+    source.assertCurrent();
+    assert.ok(h.store.resolve(h.rows[0]!.key), "The ordinary button keeps its original 24-hour TTL");
+    assert.throws(source.assertCurrent, "Original row consumption spends its physical source, not a successor namespace");
+  } finally { await h.close(); }
+});
+
+for (const questionFree of [false, true]) for (const rich of [false, true]) for (const threaded of [false, true]) for (const scenario of ["current", "copied-source", "constructor", "foreign-store", "rejected-once", "peer-predecessor", "partial-child", "pure-child"] as const)
+test(`Native timed publication joins only one original store source (${rich}/${threaded}/${scenario}/questionFree=${questionFree})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const options = { rich, threaded, questionAppOrigin: "independent" as const, ordinaryCallbackDispatch: "qualified" as const, ordinaryReadOnlyParent: true as const, ordinaryQuestionParent: true as const };
+  const h = await questionAppOriginFixture(options);
+  let foreign: Awaited<ReturnType<typeof questionAppOriginFixture>> | undefined;
+  const declaration = (prefix: string) => `<!-- telegram_confirm "${prefix} one" --><!-- telegram_confirm "${prefix} two" --><!-- telegram_button {Inspect|counter::inspect} -->`;
+  const publishParent = async (owner: typeof h) => {
+    const p = owner.plan(questionFree ? '<!-- telegram_button {Inspect|counter::inspect} -->' : declaration("Parent"), h.nativeBinding);
+    if (!questionFree) return owner.publish(p);
+    const guard = () => {}, body = { chat_id: 42, ...(threaded ? { message_thread_id: 7 } : {}),
+      ...(rich ? { rich_message: { markdown: p.markdown } } : { text: p.markdown }), reply_markup: p.replyMarkup };
+    const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: {} as TelegramBridgeApiRuntime, ownsDirect: () => false,
+      captureQuestionAuthority: () => guard, captureFollowerApiRegistration: () => guard, getQuestionBotId: () => 123, beginButtonPublication: owner.store.beginPublication,
+      callFollowerApi: async () => ({ message_id: 201, chat: { id: 42 }, from: { id: 123, is_bot: true }, ...(threaded ? { message_thread_id: 7 } : {}) }) });
+    return "rich_message" in body ? api.sendRichMessage(body) : api.sendMessage(body);
+  };
+  try {
+    const prior = questionFree ? await openLifetimeSdkHead(h.sdk) : undefined;
+    if (prior) assert.ok(prior.ok);
+    let sdkEnded = false; if (prior?.ok) void prior.handle.result.then(() => { sdkEnded = true; });
+    await publishParent(h); await h.store.waitForPublicationIdle!();
+    const handle = { target: h.target, messageIds: [201] }, source = h.store.capturePublicationSource!(handle, h.nativeBinding); assert.ok(source);
+    let used = source;
+    if (scenario === "copied-source") used = Object.freeze({ assertCurrent: source.assertCurrent });
+    if (scenario === "constructor") {
+      const constructor = source.constructor as new (key: symbol, facts: unknown) => unknown;
+      assert.throws(() => new constructor(Symbol("foreign"), {}), /source is unavailable/u); source.assertCurrent();
+    }
+    if (scenario === "foreign-store") {
+      foreign = await questionAppOriginFixture({ ...options, captureSdk: () => h.sdk.captureQuestionLifetimeOwner!() });
+      await publishParent(foreign); await foreign.store.waitForPublicationIdle!();
+      used = foreign.store.capturePublicationSource!(handle, h.nativeBinding)!; assert.ok(used); used.assertCurrent();
+    }
+    const original = scenario === "peer-predecessor" ? GenerativeApps.getGenerativeAppCallbackBinding(await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect" })) : h.nativeBinding;
+    const publishChild = async (reject = false) => {
+      const result = await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "refresh", callbackWorkerDrain: true, callbackBinding: original, originalPublicationSource: used });
+      const binding = GenerativeApps.getGenerativeAppCallbackBinding(result), start = h.rows.length;
+      const p = h.plan(scenario === "pure-child" ? '<!-- telegram_confirm "Child one" --><!-- telegram_confirm "Child two" -->' : declaration("Child"), binding), children = h.rows.slice(start).filter(row => row.action.completionGroup), groups = [...new Set(children.map(row => row.action.completionGroup!))];
+      assert.equal(groups.length, 2);
+      const body: Record<string, unknown> = { chat_id: 42, message_id: 201, ...(rich ? { rich_message: { markdown: p.markdown } } : { text: p.markdown }), reply_markup: p.replyMarkup };
+      if (scenario === "partial-child") {
+        const key = children.find(row => row.action.completionGroup === groups[1])!.key;
+        if (p.replyMarkup) body.reply_markup = { inline_keyboard: p.replyMarkup.inline_keyboard.map(row => row.filter(button => button.callback_data !== key)) };
+        if (rich) body.rich_message = { markdown: p.markdown.replace(new RegExp('<tg-button type="callback_data" data="' + key + '">[^<]*</tg-button>'), "") };
+      }
+      const finish = h.store.beginPublication!("editMessageText", body); assert.ok(finish); await finish.ready;
+      finish.restrictQuestionMembership!("known-parent-edit");
+      if (finish.prepareReplyMarkup) body.reply_markup = finish.prepareReplyMarkup();
+      if (finish.prepareRichMessage && rich) body.rich_message = finish.prepareRichMessage();
+      finish.assertPublicationBody!(body);
+      finish("edited", !reject, reject, { message_id: 201, chat: { id: 42 }, ...(threaded ? { message_thread_id: 7 } : {}) });
+      await h.store.waitForPublicationIdle!(); return groups.map(group => group.deadline!);
+    };
+    if (scenario === "rejected-once") await publishChild(true);
+    const deadlines = await publishChild(), saved = deadlines.map(value => value.expiresAt);
+    const qualified = scenario === "current" || scenario === "constructor" || scenario === "pure-child";
+    if (questionFree) {
+      t.mock.timers.tick(3600001); await Promise.resolve();
+      if (qualified && prior?.ok) assert.equal((await prior.handle.result).status, "expired", "The native child ACK, not its ordinary parent, demotes the original SDK question");
+      else assert.equal(sdkEnded, false, "Refused ancestry cannot demote any SDK question through a qualifying prefix");
+    }
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    if (qualified) assert.deepEqual(deadlines.map(value => value.expiresAt), [Date.now() + 3600000, Date.now() + 3600000]);
+    else assert.deepEqual(deadlines.map(value => value.expiresAt), saved, "A forged/foreign/spent/wrong-predecessor/partial source cannot authorize a qualifying prefix");
+  } finally { await foreign?.close(); await h.close(); }
+});
+
+for (const [questionFree, directOrdinary] of [[false, false], [true, false], [true, true]] as const) for (const source of [true, false]) for (const pure of [false, true]) for (const retirement of ["selection", "expiry-pending", "result-root"] as const)
+test(`Timed source native retention follows control result and I/O roots (${source ? "source" : "compiled"}/${pure}/${retirement}/questionFree=${questionFree}/directOrdinary=${directOrdinary})`, async () => {
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+    import { join } from "node:path";
+    import { tmpdir } from "node:os";
+    const base = ${JSON.stringify(source ? "./lib/" : "./dist/lib/")}, suffix = ${JSON.stringify(source ? ".ts" : ".js")};
+    const Delivery = await import(base + "delivery" + suffix), Apps = await import(base + "generative-apps" + suffix);
+    const Outbound = await import(base + "outbound" + suffix), BusApi = await import(base + "bus-api" + suffix);
+    const pure = ${pure}, questionFree = ${questionFree}, directOrdinary = ${directOrdinary}, retirement = ${JSON.stringify(retirement)}, target = Object.freeze({ chatId: 42, threadId: 7 });
+    const dir = await mkdtemp(join(tmpdir(), "pi-timed-source-gc-")), agentDir = join(dir, "agent"), marker = join(dir, "refresh-count.txt");
+    const keepAlive = setInterval(() => {}, 60000), realNow = Date.now;
+    let clock = 1000; Date.now = () => clock;
+    let store, runtime, pending, heldResult, currentProducer = { available: true }, phase = "parent";
+    const refs = { producer: new WeakRef(currentProducer), parentGroups: [], childGroups: [] }, seen = new WeakSet(), parentKeys = [], childKeys = [], childAnswers = [], ordinaryKeys = [], timers = new Map();
+    const entered = Promise.withResolvers(), release = Promise.withResolvers();
+    let planned = 0, edits = 0, captures = 0, nextMessage = 1000;
+    const sdk = Delivery.createTelegramDeliveryRuntime({ questionHeadTail: true, generation: "gc-original",
+      getConfirmationAuthority: () => ({ profile: "default", operatorId: 42 }), getInstanceTarget: () => target,
+      getActiveTurnTarget: () => target, getAggregateTarget: () => ({ chatId: 42 }), isExplicitTargetAuthorized: candidate => candidate.chatId === 42,
+      onQuestionAdmission: value => store.onQuestionAdmission(value), renderView: view => [{ text: view.text, parseMode: "html" }],
+      sendChunk: async () => ++nextMessage, async editChunk() {}, async deleteMessage() {}, async sendChatAction() {} });
+    const unbind = Delivery.bindTelegramDeliveryRuntime(sdk);
+    const query = key => ({ id: "native:" + key, data: key, from: { id: 42, is_bot: false }, message: { message_id: 201, message_thread_id: 7, chat: { id: 42 } } });
+    async function collect() { for (let i = 0; i < 12; i++) { await new Promise(resolve => setImmediate(resolve)); globalThis.gc(); } }
+    function live(name) { assert.ok(refs[name].deref(), name + " must retain its native owner while an actual root remains"); }
+    function collected() { for (const name of ["source", "original", "binding", "producer", "result"]) assert.equal(refs[name].deref(), undefined, name + " must collect after all actual roots end"); }
+    try {
+      const script = join(dir, "counter.mjs");
+      await writeFile(script, 'import {readFile,writeFile} from "node:fs/promises"; export function init(){return {state:{count:0},output:"initial"}} export function inspect(){return {output:"inspect"}} export async function refresh(){let n=0;try{n=Number(await readFile(' + JSON.stringify(marker) + ',"utf8"))}catch(e){if(e.code!=="ENOENT")throw e}await writeFile(' + JSON.stringify(marker) + ',String(n+1));return {output:' + JSON.stringify('Fresh source questions <!-- telegram_confirm "Fresh one" --><!-- telegram_confirm "Fresh two" -->' + (pure ? '' : '<!-- telegram_button {Inspect|counter::inspect} -->')) + '}}');
+      let initial = await Apps.installGenerativeApp({ agentDir, app: "counter", script }), original = Apps.getGenerativeAppCallbackBinding(initial);
+      refs.original = new WeakRef(original);
+      store = Outbound.createTelegramButtonActionStore({ questionAppOrigin: "independent", ordinaryCallbackDispatch: "qualified", ordinaryReadOnlyParent: true, ordinaryQuestionParent: true,
+        captureQuestionLifetimeOwner: Delivery.captureTelegramQuestionLifetimeOwner, captureOrdinaryBindingOwner: Apps.captureGenerativeAppCallbackOwner,
+        captureSelectionAuthority() { const pinned = currentProducer; return pinned ? () => { if (!pinned.available) throw Error("Original publisher unavailable"); } : undefined; } });
+      const register = store.register;
+      store.register = (action, binding) => {
+        const key = register(action, binding); (phase === "parent" ? parentKeys : childKeys).push(key);
+        if (action.completionGroup && !seen.has(action.completionGroup)) {
+          seen.add(action.completionGroup); refs[phase === "parent" ? "parentGroups" : "childGroups"].push(new WeakRef(action.completionGroup));
+          if (phase === "child") childAnswers.push(key);
+        } else if (!action.completionGroup && phase === "child") ordinaryKeys.push(key);
+        return key;
+      };
+      const nativeAck = () => ({ message_id: 201, chat: { id: 42 }, message_thread_id: 7, from: { id: 123, is_bot: true } });
+      const edit = async body => {
+        if (body.text.includes("Fresh source questions")) { edits++; entered.resolve(); await release.promise; }
+        return nativeAck();
+      };
+      const originalApiGuard = () => {};
+      const NativeApi = await import(base + "telegram-api" + suffix);
+      const native = directOrdinary ? NativeApi.createTelegramBridgeApiRuntime({ client: { async call(method, body, options) {
+        options?.assertAuthority?.(); const value = method === "editMessageText" ? await edit(body) : nativeAck(); options?.assertAuthority?.(); return value;
+      } }, tempDir: dir, maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {} }) :
+        { sendMessage: async () => nativeAck(), editMessageText: async body => { await edit(body); return "edited"; }, editMessageReplyMarkup: async () => {} };
+      const api = BusApi.createTelegramBusAwareApiRuntime({ ownsDirect: () => !questionFree || directOrdinary, beginButtonPublication: store.beginPublication,
+        ...(questionFree ? { captureQuestionAuthority: () => originalApiGuard, captureFollowerApiRegistration: () => originalApiGuard, getQuestionBotId: () => 123 } : {}),
+        callFollowerApi: async (method, args) => { assert.equal(questionFree && !directOrdinary, true); assert.equal(method, "call"); return args[0] === "editMessageText" ? edit(args[1]) : nativeAck(); },
+        directRuntime: native });
+      store.bindPublicationEditor(BusApi.createTelegramButtonPublicationEditor(api));
+      const planner = Outbound.createTelegramOutboundReplyPlanner(store, () => "html", true, true);
+      let parent = planner((questionFree ? 'Parent source control ' : 'Parent source questions <!-- telegram_confirm "Parent one" --><!-- telegram_confirm "Parent two" -->') + '<!-- telegram_button {Inspect|counter::inspect} -->', { binding: original });
+      await api.sendMessage({ chat_id: 42, message_thread_id: 7, text: parent.markdown, reply_markup: parent.replyMarkup }); await store.waitForPublicationIdle();
+      assert.equal(refs.parentGroups.length, questionFree ? 0 : 2, "Count actual native question groups, never invent a parent head");
+      const handle = Object.freeze({ target, messageIds: Object.freeze([201]) });
+      runtime = Apps.createGenerativeAppLiveSurfaceRuntime({ agentDir,
+        capturePublicationSource(value, binding) { captures++; const source = store.capturePublicationSource(value, binding); assert.ok(source); refs.source = new WeakRef(source); return source; },
+        isCurrent: () => true,
+        plan(value, previous) {
+          planned++; refs.result = new WeakRef(value); if (retirement === "result-root") heldResult = value;
+          const binding = Apps.getGenerativeAppCallbackBinding(value); refs.binding = new WeakRef(binding); phase = "child";
+          const next = planner(value.output, { binding }); return { digest: next.markdown, handle: { ...previous, view: next } };
+        },
+        edit: async frame => { await api.editMessageText({ chat_id: 42, message_id: 201, text: frame.handle.view.markdown, reply_markup: frame.handle.view.replyMarkup }); return handle; },
+        setTimer(callback) { const token = { unref() {} }; timers.set(token, callback); return token; }, clearTimer: token => timers.delete(token),
+      });
+      runtime.open({ app: "counter", appGeneration: initial.generation, appRevision: initial.revision, handle, initialDigest: "initial", key: "surface", refreshAfterMs: 60000, originalAppBinding: original });
+      initial = undefined; original = undefined; parent = undefined;
+      pending = runtime.refreshNow("surface"); await entered.promise;
+      currentProducer = undefined;
+      assert.equal(captures, 1); assert.equal(planned, 1); assert.equal(edits, 1); assert.equal(await readFile(marker, "utf8"), "1");
+      if (retirement === "expiry-pending") {
+        clock += 86400001;
+        for (const key of [...parentKeys, ...childKeys]) assert.equal(store.resolve(key, query(key)), undefined);
+      }
+      await collect(); for (const name of ["source", "original", "binding", "producer", "result"]) live(name);
+      refs.original.deref().assertCurrent();
+      release.resolve(); await pending; pending = undefined; await store.waitForPublicationIdle();
+      assert.equal(timers.size, 0); assert.equal(captures, 1); assert.equal(edits, 1);
+      if (retirement !== "expiry-pending") {
+        for (const key of parentKeys) assert.equal(store.resolve(key, query(key)), undefined, "The old physical questions really ended");
+        await collect(); for (const name of ["source", "original", "binding", "producer"]) live(name);
+        assert.equal(refs.result.deref() !== undefined, retirement === "result-root", "A settled unheld result is not retained by its native WeakMap association");
+        refs.original.deref().assertCurrent();
+        assert.ok((await sdk.openConfirmation({ owner: "@test/gc", scope: { kind: "instance" }, question: "Next SDK head", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal })).ok);
+        assert.equal(refs.childGroups.length, 2); assert.ok(refs.childGroups.every(ref => ref.deref().deadline.expiresAt === clock + 3600000));
+        for (const key of childAnswers) assert.ok(store.resolve(key, query(key)), "Original answer authority is usable after GC and parent retirement");
+        await store.waitForPublicationIdle(); await collect();
+        if (!pure) {
+          for (const name of ["source", "original", "binding", "producer"]) live(name);
+          refs.original.deref().assertCurrent();
+          assert.equal(ordinaryKeys.length, 1); assert.ok(store.resolve(ordinaryKeys[0], query(ordinaryKeys[0])));
+          await store.waitForPublicationIdle();
+        }
+        if (retirement === "result-root") {
+          await collect(); for (const name of ["source", "original", "binding", "producer", "result"]) live(name);
+          assert.equal(refs.result.deref(), heldResult, "The producer's exact native result is the remaining intentional root");
+          heldResult = undefined;
+        }
+      }
+      await collect(); collected();
+      assert.equal(await readFile(marker, "utf8"), "1", "Collection/retirement cannot rerun the native refresh worker");
+      assert.ok(refs.parentGroups.every(ref => ref.deref() === undefined)); assert.ok(refs.childGroups.every(ref => ref.deref() === undefined));
+      assert.equal(runtime.take("surface"), undefined); assert.ok(Delivery.captureTelegramQuestionLifetimeOwner(), "Collection cannot require retiring the still-live SDK namespace");
+      console.log("timed-source-native-gc-pass");
+    } finally {
+      release.resolve(); await pending; runtime?.shutdown(); store?.clear(); sdk.shutdown(); unbind(); Date.now = realNow;
+      if (store) await store.waitForPublicationIdle(); clearInterval(keepAlive); await rm(dir, { recursive: true, force: true });
+    }
+  `, { nodeArgs: ["--expose-gc"], timeoutMs: 20000 });
+  assert.equal(result.code, 0, result.stdout + result.stderr); assert.match(result.stdout, /timed-source-native-gc-pass/u);
+}, 25000);
+
+for (const sdkAvailable of [false, true]) for (const bound of [false, true])
+test(`Independent question selection separates original app authority from SDK membership (${sdkAvailable}/${bound})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await questionAppOriginFixture({ questionAppOrigin: "independent", captureSdk: sdk => sdkAvailable ? sdk.captureQuestionLifetimeOwner!() : undefined });
+  try {
+    const old = await openLifetimeSdkHead(h.sdk); assert.ok(old.ok); let ended = false; void old.handle.result.then(() => { ended = true; });
+    const p = bound ? h.plan() : h.planner(lifetimeAgentDeclaration); await h.publish(p);
+    const deadline = h.rows[0]!.action.completionGroup!.deadline!;
+    assert.equal(h.captures(), 1); assert.equal(h.appCaptures(), bound ? 1 : 0);
+    t.mock.timers.tick(3_600_001); await Promise.resolve(); assert.equal(ended, sdkAvailable);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.equal(deadline.expiresAt, sdkAvailable ? Date.now() + 3_600_000 : 86_401_000);
+    assert.ok(h.store.resolve(h.rows[0]!.key), "Missing SDK provenance must not disable independently authorized selection");
+    assert.equal(h.rows[0]!.action.binding, undefined, "Question answers never acquire method dispatch");
+    assert.equal(h.captures(), 1, "A future SDK admission never recaptures an absent original birth");
+  } finally { await h.close(); }
+});
+for (const phase of ["before-ack", "after-ack"] as const)
+test(`Independent app selection survives SDK-only loss without renewing coordinated membership (${phase})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await questionAppOriginFixture({ questionAppOrigin: "independent" });
+  try {
+    const p = h.plan();
+    if (phase === "before-ack") h.sdk.shutdown();
+    await h.publish(p); if (phase === "after-ack") h.sdk.shutdown();
+    assert.ok(h.store.resolve(h.rows[0]!.key)); assert.equal(h.captures(), 1); assert.equal(h.appCaptures(), 1);
+  } finally { await h.close(); }
+});
+test("Independent app collector keeps its original capture through SDK loss and regenerated rows", async () => {
+  const h = await questionAppOriginFixture({ questionAppOrigin: "independent" });
+  try {
+    const p = h.plan('<!-- telegram_choice {"question":"Pick two","select":2,"choices":["A","B","C"]} -->');
+    await h.publish(p); h.sdk.shutdown();
+    const key = h.rows[0]!.key, query = { id: "independent-collector", data: key, message: { chat: { id: 42 }, message_id: 201, reply_markup: p.replyMarkup } };
+    const action = h.store.resolve(key, query); assert.ok(action?.selection);
+    const update = action.selection.prepare(query); assert.ok(update);
+    await h.api.editMessageReplyMarkup(42, 201, update.replyMarkup); update.commit();
+    assert.ok(h.rows.length > 3); assert.equal(h.captures(), 1); assert.equal(h.appCaptures(), 1);
+    assert.ok(h.rows.every(row => row.action.binding === undefined && row.binding === h.nativeBinding));
+  } finally { await h.close(); }
+});
+
+for (const sdkAvailable of [false, true]) for (const loss of ["event", "fs"] as const)
+test(`Independent app selection still processes original owner retirement (${sdkAvailable}/${loss})`, async () => {
+  const h = await questionAppOriginFixture({ questionAppOrigin: "independent", captureSdk: sdk => sdkAvailable ? sdk.captureQuestionLifetimeOwner!() : undefined });
+  try {
+    const p = h.plan(); await h.publish(p); const binding = h.nativeBinding;
+    if (loss === "fs") await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment" });
+    else {
+      h.store.observeAppOwner!({ app: binding.app, generation: binding.generation, revision: binding.revision + 1 });
+      h.store.observeAppOwner!({ app: binding.app, generation: binding.generation, revision: binding.revision });
+    }
+    assert.equal(h.store.resolve(h.rows[0]!.key), undefined); assert.equal(h.captures(), 1); assert.equal(h.appCaptures(), 1);
+  } finally { await h.close(); }
+});
+
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const kind of ["confirm", "set", "wizard"] as const)
+test(`Question app origin captures one native birth without method routing (${threaded}/${rich}/${kind})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await questionAppOriginFixture({ threaded, rich });
+  try {
+    const old = await openLifetimeSdkHead(h.sdk); assert.equal(old.ok, true);
+    const declaration = kind === "confirm" ? lifetimeAgentDeclaration : `<!-- telegram_choice ${JSON.stringify(kind === "set" ? { question: "Set", select: 2, choices: ["counter::increment", "/quit"] } : [{ question: "First", choices: ["counter::increment", "No"] }, { question: "Last", choices: ["/quit", "No"] }])} -->`;
+    t.mock.timers.setTime(5000); const p = h.plan(declaration);
+    assert.equal(h.captures(), 1); assert.equal(h.appCaptures(), 1); assert.ok(h.rows.every(row => row.binding === h.nativeBinding && row.action.binding === undefined));
+    t.mock.timers.setTime(10000); await h.publish(p);
+    t.mock.timers.tick(3605000); assert.equal((await old.handle!.result).status, "expired");
+  } finally { await h.close(); }
+});
+for (const phase of ["before-plan", "before-ack", "after-ack"] as const)
+test(`Question app origin refuses original app loss (${phase})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await questionAppOriginFixture();
+  try {
+    const old = await openLifetimeSdkHead(h.sdk); assert.equal(old.ok, true);
+    const lose = () => GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment" });
+    if (phase === "before-plan") await lose();
+    const p = h.plan();
+    if (phase === "before-ack") await lose();
+    await h.publish(p).catch(() => {});
+    if (phase === "after-ack") { await lose(); assert.equal(h.store.resolve(h.rows[0]!.key, { id: "q", data: h.rows[0]!.key, message: { chat: { id: 42 }, message_id: 201 } }), undefined); }
+    if (phase !== "after-ack") { t.mock.timers.tick(3605000); h.sdk.shutdown(); assert.notEqual((await old.handle!.result).status, "expired"); }
+    assert.equal(h.captures(), 1); assert.equal(h.appCaptures(), 1);
+  } finally { await h.close(); }
+});
+for (const kind of ["copy", "proxy", "missing"] as const) for (const mode of [true, "independent"] as const)
+test(`Question app origin refuses nonnative binding without renewal (${kind}/${mode})`, async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1000 }); let reads = 0;
+  const h = await questionAppOriginFixture({ questionAppOrigin: mode, ...(mode === "independent" ? { captureSdk: () => undefined } : {}) });
+  try {
+    const bad = kind === "copy" ? Object.freeze({ ...h.nativeBinding }) : kind === "proxy" ? new Proxy(h.nativeBinding, { get() { reads++; throw Error("No proxy probes"); } }) : Object.freeze({ app: "counter", generation: h.nativeBinding.generation, revision: h.nativeBinding.revision });
+    const p = h.plan(lifetimeAgentDeclaration, bad); await h.publish(p).catch(() => {});
+    assert.equal(h.store.resolve(h.rows[0]!.key), undefined); assert.equal(reads, 0); assert.equal(h.captures(), 1); assert.equal(h.appCaptures(), 1);
+  } finally { await h.close(); }
+});
+test("Question app origin captures SDK before app and original producer callbacks", async () => {
+  const order: string[] = []; const h = await questionAppOriginFixture({ captureSdk(sdk) { order.push("sdk"); return sdk.captureQuestionLifetimeOwner!(); }, captureApp(binding) { order.push("app"); return GenerativeApps.captureGenerativeAppCallbackOwner(binding); }, assertProducer() { order.push("producer-use"); } });
+  try { h.plan(); assert.equal(order[0], "sdk"); assert.equal(order[1], "app"); assert.ok(order.indexOf("producer-use") > 1); assert.equal(h.captures(), 1); } finally { await h.close(); }
+});
+for (const mode of ["store-omitted", "planner-omitted"] as const)
+test(`Question app origin preserves omitted opt-in (${mode})`, async () => {
+  const h = await questionAppOriginFixture({ ...(mode === "store-omitted" ? { questionAppOrigin: undefined } : {}), plannerOrigin: mode !== "planner-omitted" });
+  try { const p = h.plan(); await h.publish(p); assert.equal(h.appCaptures(), 0); assert.ok(h.rows.every(row => row.action.binding === undefined)); } finally { await h.close(); }
+});
+for (const label of ["initial", "late"] as const)
+test(`A labeled app question stays independent without original app capture (${label})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await questionAppOriginFixture({ questionAppOrigin: undefined, plannerOrigin: label === "initial" });
+  try {
+    const old = await openLifetimeSdkHead(h.sdk); assert.ok(old.ok); let ended = false;
+    void old.handle.result.then(() => { ended = true; });
+    const p = h.plan();
+    if (label === "late") h.store.register(h.rows[0]!.action, h.nativeBinding);
+    await h.publish(p); assert.equal(h.appCaptures(), 0);
+    const deadline = h.rows[0]!.action.completionGroup!.deadline!;
+    assert.equal(deadline.expiresAt, 86_401_000);
+    t.mock.timers.tick(3_600_001); await Promise.resolve(); assert.equal(ended, false, "An app declaration without original app provenance cannot demote the SDK head");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.equal(deadline.expiresAt, 86_401_000, "Missing app provenance cannot participate in the SDK/agent cohort");
+    assert.ok(h.store.resolve(h.rows[0]!.key), "Ordinary selection remains independently usable");
+  } finally { await h.close(); }
+});
+
+test("Question app origin pins constructor and planner policies", async () => {
+  const h = await questionAppOriginFixture({ afterConstruct(config) { Object.assign(config, { questionAppOrigin: undefined, captureOrdinaryBindingOwner: () => assert.fail("No replacement app capture") }); } });
+  try { h.plan(); assert.equal(h.appCaptures(), 1); } finally { await h.close(); }
+});
+for (const bad of [false, {}, 1]) test(`Question app origin rejects invalid policy (${String(bad)})`, () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ questionAppOrigin: bad } as never), /Question app origin requires/u);
+  assert.throws(() => Outbound.createTelegramOutboundReplyPlanner({ register: () => "k" }, () => "rich", true, bad as never), /Question app origin planner requires/u);
+});
+test("Question app origin requires original capture ports and planner question policy", () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ questionAppOrigin: true }), /Question app origin requires/u);
+  assert.throws(() => Outbound.createTelegramOutboundReplyPlanner({ register: () => "k" }, () => "rich", undefined, true), /Question app origin planner requires/u);
+});
+
+
+for (const port of ["sdk", "app"] as const)
+test(`Question app origin never recaptures a missing original birth (${port})`, async () => {
+  let available = false; const h = await questionAppOriginFixture({ ...(port === "sdk" ? { captureSdk: (sdk: Delivery.TelegramDeliveryRuntime) => available ? sdk.captureQuestionLifetimeOwner!() : undefined } : { captureApp: (binding: unknown) => available ? GenerativeApps.captureGenerativeAppCallbackOwner(binding) : undefined }) });
+  try {
+    h.plan(); available = true; const row = h.rows[0]!; h.store.register(row.action, h.nativeBinding);
+    assert.equal(h.captures(), 1); assert.equal(h.appCaptures(), port === "app" ? 1 : 0); assert.equal(h.store.resolve(row.key), undefined);
+  } finally { await h.close(); }
+});
+test("Question app origin refuses a peer native binding with equal app fields", async () => {
+  const h = await questionAppOriginFixture();
+  try {
+    h.plan(); const row = h.rows[0]!, peer = GenerativeApps.getGenerativeAppCallbackBinding(await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect" }))!;
+    assert.notEqual(peer, h.nativeBinding); assert.equal(peer.app, h.nativeBinding.app); assert.equal(peer.generation, h.nativeBinding.generation); assert.equal(peer.revision, h.nativeBinding.revision);
+    const key = h.store.register(row.action, peer); assert.equal(h.store.resolve(key), undefined); assert.equal(h.store.resolve(row.key), undefined); assert.equal(h.appCaptures(), 1);
+  } finally { await h.close(); }
+});
+test("Question app origin cannot be enabled after store construction", async () => {
+  const h = await questionAppOriginFixture({ questionAppOrigin: undefined, afterConstruct(config) { Object.assign(config, { questionAppOrigin: true }); } });
+  try { h.plan(); assert.equal(h.appCaptures(), 0); } finally { await h.close(); }
+});
+test("Question app origin spends SDK birth before caught store reentry", async () => {
+  let h: Awaited<ReturnType<typeof questionAppOriginFixture>> | undefined;
+  h = await questionAppOriginFixture({ captureSdk(sdk) { assert.throws(() => h!.store.register({ text: "Nested", prompt: "data" }), /reentered/u); return sdk.captureQuestionLifetimeOwner!(); } });
+  try { assert.throws(() => h!.plan(), /admission is unavailable/u); assert.equal(h.captures(), 1); assert.equal(h.appCaptures(), 0); } finally { await h.close(); }
+});
+test("Question app origin rechecks native app FS inside the SDK final-use gate", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let h: Awaited<ReturnType<typeof questionAppOriginFixture>>, armed = false;
+  h = await questionAppOriginFixture({ captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; return Object.freeze({ ...owner, captureTail(cohort: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) { const apply = owner.captureTail(cohort); return () => { if (armed) { armed = false; fs.appendFileSync(join(h.agentDir, "genapps", "counter", "states.jsonl"), "\n"); } apply(); }; } }); } });
+  try {
+    const journal = join(h.agentDir, "genapps", "counter", "states.jsonl"), bytes = await readFile(journal), old = await openLifetimeSdkHead(h.sdk); assert.ok(old.ok);
+    t.mock.timers.setTime(5000); const p = h.plan(), group = h.rows[0]!.action.completionGroup!; armed = true;
+    t.mock.timers.setTime(10000); await h.publish(p); assert.equal(armed, false); await writeFile(journal, bytes);
+    t.mock.timers.setTime(20000); await openLifetimeSdkHead(h.sdk); assert.equal(group.deadline!.expiresAt, 86405000, "Observed original app loss cannot be restored into a consumable head");
+    t.mock.timers.tick(3592000); h.sdk.shutdown(); assert.notEqual((await old.handle.result).status, "expired", "Unqualified app output cannot apply the earlier SDK cutoff");
+    assert.equal(h.store.resolve(h.rows[0]!.key), undefined);
+  } finally { await h.close(); }
+});
+test("Question app origin guards the collector independently of a plain physical publisher", async () => {
+  const h = await questionAppOriginFixture({ omitFirstOrigin: true });
+  try {
+    const p = h.plan('<!-- telegram_confirm "Plain" --><!-- telegram_choice [{"question":"First","choices":["A","B"]},{"question":"Last","choices":["C","D"]}] -->'); await h.publish(p);
+    assert.equal(h.appCaptures(), 1); const row = h.rows.find(row => row.action.selection)!;
+    const query = { id: "collector", data: row.key, message: { chat: { id: 42 }, message_id: 201, reply_markup: p.replyMarkup } };
+    const action = h.store.resolve(row.key, query)!; assert.ok(action); const update = action.selection!.prepare(query)!; assert.ok(update);
+    await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment" });
+    assert.throws(update.commit); update.fail(); assert.equal(h.captures(), 2);
+  } finally { await h.close(); }
+});
+
+
+for (const kind of ["reset", "generation", "revision", "current"] as const)
+test(`Question app origin observes native owner events without resurrection (${kind})`, async () => {
+  const h = await questionAppOriginFixture();
+  try {
+    const p = h.plan(); await h.publish(p); const b = h.nativeBinding, row = h.rows[0]!;
+    h.store.observeAppOwner!({ app: b.app, generation: kind === "generation" ? "replacement" : b.generation, revision: kind === "revision" ? b.revision + 1 : b.revision, ...(kind === "reset" ? { reset: true } : {}) });
+    h.store.observeAppOwner!({ app: b.app, generation: b.generation, revision: b.revision });
+    const action = h.store.resolve(row.key, { id: "owner-event", data: row.key, message: { chat: { id: 42 }, message_id: 201 } });
+    assert.equal(!!action, kind === "current"); assert.equal(h.captures(), 1); assert.equal(h.appCaptures(), 1); assert.equal(row.action.binding, undefined);
+  } finally { await h.close(); }
+});
+
+
+for (const kind of ["confirm", "wizard"] as const)
+test(`Question app origin pins producer TTL before SDK callbacks (${kind})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await questionAppOriginFixture({ ttlMs: 1000, captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!(); t.mock.timers.setTime(10000); return owner; } });
+  try {
+    t.mock.timers.setTime(5000); assert.throws(() => h.plan(kind === "confirm" ? lifetimeAgentDeclaration : '<!-- telegram_choice [{"question":"First","choices":["A"]},{"question":"Last","choices":["B"]}] -->'), /callback group is retired/u);
+    assert.equal(h.rows[0]!.action.completionGroup!.deadline!.expiresAt, 6000, "A collector footer cannot renew the original group birth after a provider callback");
+    assert.equal(h.captures(), 1); assert.equal(h.store.resolve(h.rows[0]!.key), undefined);
+  } finally { await h.close(); }
+});
+
+
+test("Question app origin pins SDK history before app capture callbacks", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let last: Record<string, unknown> | undefined, replacements = 0;
+  const h = await questionAppOriginFixture({ captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; last = { ...owner }; return last as unknown as Readonly<Delivery.TelegramQuestionLifetimeOwner>; },
+    captureApp(binding) { if (last) last.assertObservedCurrent = () => { replacements++; throw Error("No replacement SDK history"); }; return GenerativeApps.captureGenerativeAppCallbackOwner(binding); } });
+  try {
+    const before = await openLifetimeSdkHead(h.sdk); assert.ok(before.ok); t.mock.timers.setTime(5000);
+    const p = h.plan(lifetimeAgentDeclaration + '\n<!-- telegram_button {Run|counter::increment} -->'); t.mock.timers.setTime(10000); await h.publish(p);
+    assert.equal(replacements, 0); t.mock.timers.tick(3605000); assert.equal((await before.handle.result).status, "expired");
+  } finally { await h.close(); }
+});
+
+
+for (const rich of [false, true])
+test(`Question app origin withdraws the complete failed co-head batch (${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let h: Awaited<ReturnType<typeof questionAppOriginFixture>>, armed = false;
+  h = await questionAppOriginFixture({ rich, omitFirstOrigin: true, captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; return Object.freeze({ ...owner, captureTail(cohort: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) { const apply = owner.captureTail(cohort); return () => { if (armed) { armed = false; fs.appendFileSync(join(h.agentDir, "genapps", "counter", "states.jsonl"), "\n"); } apply(); }; } }); } });
+  try {
+    const journal = join(h.agentDir, "genapps", "counter", "states.jsonl"), bytes = await readFile(journal);
+    t.mock.timers.setTime(5000); const p = h.plan('<!-- telegram_confirm "Plain" --><!-- telegram_confirm "App" -->'), groups = [...new Set(h.rows.map(row => row.action.completionGroup!))];
+    armed = true; t.mock.timers.setTime(10000); await h.publish(p); assert.equal(armed, false); await writeFile(journal, bytes);
+    t.mock.timers.setTime(20000); await openLifetimeSdkHead(h.sdk);
+    assert.deepEqual(groups.map(group => group.deadline!.expiresAt), [86405000, 86405000], "A failed app peer cannot leave a consumable plain-head prefix");
+  } finally { await h.close(); }
+});
+
+async function invocationJoinFixture(options: Parameters<typeof liveOrdinaryHarness>[0] = {}) {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, ordinaryPrompt: "counter::inspect", ...options });
+  await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+  const dispatch = OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query)!; assert.ok(dispatch);
+  assert.equal(typeof dispatch.takeInvocation, "function");
+  const invocation = dispatch.takeInvocation!(); assert.ok(invocation); assert.ok(Object.isFrozen(invocation));
+  return { ...h, query, action, dispatch, invocation, run: () => GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: invocation }) };
+}
+
+async function pureQuestionParentFixture(options: Parameters<typeof liveOrdinaryHarness>[0] & { plannerOrigin?: boolean; changing?: boolean; bindingMode?: "peer" | "self" | "copy" | "proxy"; originMode?: "mixed" | "unbound" } = {}) {
+  const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true, questionAppOrigin: true, ordinaryQuestionParent: true, ...(options.changing ? { ordinaryPrompt: "counter::increment" } : {}), ...options });
+  const result = options.changing ? await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: h.invocation }) : await h.run();
+  const binding = GenerativeApps.getGenerativeAppCallbackBinding(result)!;
+  const peer = options.bindingMode === "peer" || options.originMode === "mixed" ? GenerativeApps.getGenerativeAppCallbackBinding(await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding }))! : undefined;
+  const selected = options.bindingMode === "peer" ? peer! : options.bindingMode === "self" ? h.nativeBinding : options.bindingMode === "copy" ? Object.freeze({ ...binding }) : options.bindingMode === "proxy" ? new Proxy(binding, {}) : binding;
+  const rows: { key: string; action: OutboundButtons.TelegramOutboundButtonAction }[] = [], declared: object[] = [];
+  const planner = Outbound.createTelegramOutboundReplyPlanner({ register(action, origin) {
+    const group = action.completionGroup!; if (!declared.includes(group)) declared.push(group);
+    const next = declared.indexOf(group) > 0 ? options.originMode === "mixed" ? peer : options.originMode === "unbound" ? undefined : origin : origin;
+    const key = h.store.register(action, next); rows.push({ key, action }); return key;
+  } }, () => options.rich ? "rich" : "html", true, options.plannerOrigin === false ? undefined : true);
+  const plan = (kind: "confirm" | "set" | "wizard" = "confirm", count = 2) => {
+    const declaration = kind === "confirm" ? Array.from({ length: count }, (_, i) => `<!-- telegram_confirm "Pure ${i}" -->`).join("\n") : `<!-- telegram_choice ${JSON.stringify(kind === "set" ? { question: "Pure set", select: 2, choices: ["counter::increment", "/quit"] } : [{ question: "First", choices: ["counter::increment", "No"] }, { question: "Last", choices: ["/quit", "No"] }])} -->`;
+    const start = rows.length, value = planner(declaration, { binding: selected });
+    const fresh = rows.slice(start), groups = [...new Set(fresh.map(row => row.action.completionGroup!))];
+    const body = { chat_id: 42, message_id: 201, ...(options.rich ? { rich_message: { markdown: value.markdown } } : { text: value.markdown }), reply_markup: value.replyMarkup };
+    return { ...value, rows: fresh, groups, body };
+  };
+  return { ...h, result, binding, peer, freshRows: rows, planner, replacement: plan };
+}
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const kind of ["confirm", "set", "wizard"] as const) for (const count of [1, 2])
+test(`Pure question parent certifies exact native successor without ordinary carrier (${threaded}/${rich}/${kind}/${count})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await pureQuestionParentFixture({ threaded, rich, count, ordinaryCount: 3 });
+  try {
+    const old = await openLifetimeSdkHead(h.sdk); assert.ok(old.ok); let ended = false; void old.handle.result.then(() => { ended = true; });
+    t.mock.timers.setTime(5000); const next = h.replacement(kind, count); t.mock.timers.setTime(10000); await ordinaryParentTransport(h).editMessageText(next.body);
+    assert.ok(next.rows.every(row => row.action.binding === undefined && row.action.promptKind === "selection"));
+    t.mock.timers.setTime(20000); await openLifetimeSdkHead(h.sdk); assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), Array(next.groups.length).fill(3620000));
+    t.mock.timers.tick(3595000); await Promise.resolve(); assert.equal(ended, true, "The exact native pure result must cut the original SDK tail at its ACK");
+    assert.equal((await old.handle.result).status, "expired"); assert.ok(h.rows.every(row => h.store.resolve(row.key) === undefined));
+  } finally { await h.close(); }
+});
+for (const mode of ["peer", "self", "copy", "proxy", "mixed", "unbound", "planner-omitted", "store-omitted", "changing", "query-loss", "partial", "duplicate", "legacy-ack", "clear"] as const)
+test(`Pure question parent holds non-original or incomplete transition (${mode})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await pureQuestionParentFixture({ ...(mode === "store-omitted" ? { ordinaryQuestionParent: undefined } : {}), ...(mode === "planner-omitted" ? { plannerOrigin: false } : {}), ...(mode === "changing" ? { changing: true } : {}), ...(["peer", "self", "copy", "proxy"].includes(mode) ? { bindingMode: mode as "peer" | "self" | "copy" | "proxy" } : {}), ...(mode === "mixed" || mode === "unbound" ? { originMode: mode } : {}) });
+  try {
+    t.mock.timers.setTime(5000); const next = h.replacement();
+    if (mode === "query-loss") { const id = h.query.id; h.query.id = "observed-loss"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
+    if (mode === "partial") next.body.reply_markup!.inline_keyboard[0]!.pop();
+    if (mode === "duplicate") next.body.reply_markup!.inline_keyboard.push(next.body.reply_markup!.inline_keyboard[0]!);
+    const api = ordinaryParentTransport(h, async () => { if (mode === "clear") h.store.clear!(); return mode === "legacy-ack" ? true : "edited"; });
+    t.mock.timers.setTime(10000); await api.editMessageText(next.body).catch(() => {});
+    t.mock.timers.setTime(20000); await openLifetimeSdkHead(h.sdk);
+    assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), [86405000, 86405000], "Unqualified native identity/ACK cannot leave a consumable pure head");
+  } finally { await h.close(); }
+});
+
+for (const rich of [false, true]) test(`Pure question parent snapshots original origins before a body getter (${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await pureQuestionParentFixture({ rich });
+  try {
+    t.mock.timers.setTime(10000); let next: ReturnType<typeof h.replacement> | undefined;
+    const body = { chat_id: 42, message_id: 201, text: "Getter result", get reply_markup() { return (next ??= h.replacement()).replyMarkup; } };
+    const finish = h.store.beginPublication!("editMessageText", body)!; assert.ok(next); await finish.ready;
+    finish.assertPublicationBody!({ chat_id: 42, message_id: 201, text: "Getter result", reply_markup: finish.prepareReplyMarkup!() }); finish("edited", true);
+    t.mock.timers.setTime(20000); const later = await openLifetimeSdkHead(h.sdk); assert.ok(later.ok);
+    assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), [86410000, 86410000], "The descriptor cannot select question origins registered by its own getter");
+  } finally { await h.close(); }
+});
+for (const rich of [false, true]) for (const loss of ["source-query", "app-file", "sdk-owner", "publisher"] as const)
+test(`Pure question parent rechecks original final authority after native IO (${rich}/${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let sdkLost = false, publisher = true;
+  const h = await pureQuestionParentFixture({ rich, assertProducer() { if (!publisher) throw Error("Original publisher lost"); }, captureSdk(sdk) {
+    const owner = sdk.captureQuestionLifetimeOwner!()!, resultQuestion = Date.now() === 5000;
+    return Object.freeze({ ...owner, assertCurrent() { if (resultQuestion && sdkLost) throw Error("Original result SDK owner lost"); owner.assertCurrent(); }, assertObservedCurrent() { if (resultQuestion && sdkLost) throw Error("Original result SDK history lost"); owner.assertObservedCurrent!(); } });
+  } });
+  try {
+    const journal = join(h.agentDir, "genapps", "counter", "states.jsonl"), bytes = await readFile(journal);
+    t.mock.timers.setTime(5000); const next = h.replacement();
+    const api = ordinaryParentTransport(h, async () => {
+      if (loss === "source-query") { const id = h.query.id; h.query.id = "lost-at-ACK"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
+      if (loss === "app-file") fs.appendFileSync(journal, "\n");
+      if (loss === "sdk-owner") sdkLost = true;
+      if (loss === "publisher") publisher = false;
+      return "edited";
+    });
+    t.mock.timers.setTime(10000); await api.editMessageText(next.body).catch(() => {});
+    sdkLost = false; publisher = true; if (loss === "app-file") await writeFile(journal, bytes);
+    t.mock.timers.setTime(20000); const later = await openLifetimeSdkHead(h.sdk); assert.ok(later.ok);
+    assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), [86405000, 86405000], "Restoration after observed authority loss cannot renew membership");
+  } finally { await h.close(); }
+});
+for (const rich of [false, true]) test(`Pure question parent retains a shorter original producer deadline (${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await pureQuestionParentFixture({ rich });
+  try {
+    t.mock.timers.setTime(5000); const next = h.replacement(); next.groups[0]!.deadline!.shorten(2000000);
+    t.mock.timers.setTime(10000); await ordinaryParentTransport(h).editMessageText(next.body);
+    t.mock.timers.setTime(20000); await openLifetimeSdkHead(h.sdk); assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), [2000000, 3620000]);
+  } finally { await h.close(); }
+});
+
+
+for (const rich of [false, true]) test(`Pure question parent performs native app FS after SDK apply callbacks (${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let armed = false, changed = false, journal: string | undefined;
+  const h = await pureQuestionParentFixture({ rich, sdk: { getConfirmationAuthority() { if (armed && journal) { armed = false; changed = true; fs.appendFileSync(journal, "\n"); } return { profile: "default", operatorId: 42 }; } }, captureSdk(sdk) {
+    const owner = sdk.captureQuestionLifetimeOwner!()!;
+    return Object.freeze({ ...owner, captureTail(cohort: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) { const apply = owner.captureTail(cohort); return () => { if (Date.now() === 10000) armed = true; apply(); }; } });
+  } });
+  try {
+    journal = join(h.agentDir, "genapps", "counter", "states.jsonl"); const bytes = await readFile(journal), old = await openLifetimeSdkHead(h.sdk); assert.ok(old.ok);
+    t.mock.timers.setTime(5000); const next = h.replacement(); t.mock.timers.setTime(10000); await ordinaryParentTransport(h).editMessageText(next.body);
+    assert.equal(changed, true, "An actual SDK apply provider must mutate the original native app file"); await writeFile(journal, bytes);
+    t.mock.timers.setTime(20000); await openLifetimeSdkHead(h.sdk); assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), [86405000, 86405000]);
+  } finally { await h.close(); }
+});
+
+for (const value of [false, {}, 1]) test(`Pure question parent validates private policy (${String(value)})`, () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: true, questionAppOrigin: true, ordinaryQuestionParent: value } as never), /Question ordinary parent requires/u);
+});
+test("Pure question parent requires original readonly and question-origin policies", () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryQuestionParent: true } as never), /Question ordinary parent requires/u);
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: true, ordinaryQuestionParent: true } as never), /Question ordinary parent requires/u);
+});
+for (const enabled of [false, true]) test(`Pure question parent pins original constructor policy (${enabled})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await pureQuestionParentFixture({ ordinaryQuestionParent: enabled ? true : undefined, afterConstruct(config) { Object.assign(config, { ordinaryQuestionParent: enabled ? undefined : true }); } });
+  try {
+    t.mock.timers.setTime(5000); const next = h.replacement(); await ordinaryParentTransport(h).editMessageText(next.body);
+    t.mock.timers.setTime(20000); await openLifetimeSdkHead(h.sdk); assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), Array(2).fill(enabled ? 3620000 : 86405000));
+  } finally { await h.close(); }
+});
+
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const count of [1, 2])
+test(`Native invocation join binds exact row/call/read-only successor (Thread=${threaded}/Rich=${rich}/heads=${count})`, async () => {
+  const h = await invocationJoinFixture({ threaded, rich, count });
+  try {
+    assert.equal(h.dispatch.takeInvocation!(), undefined);
+    const result = await h.run(), binding = GenerativeApps.getGenerativeAppCallbackBinding(result);
+    assert.equal(h.dispatch.captureReadOnlySuccessor!(binding, h.invocation), GenerativeApps.captureGenerativeAppCallbackOwner(binding));
+    assert.equal(h.dispatch.captureReadOnlySuccessor!(binding, {}), undefined);
+    assert.equal(h.dispatch.captureReadOnlySuccessor!(binding, undefined), undefined);
+    assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt > Date.now() + 3_600_001), Array(count).fill(true));
+    await assert.rejects(h.run(), /invocation is unavailable/u);
+    assert.equal(Object.keys(h.invocation).length, 0);
+  } finally { await h.close(); }
+});
+test("Native invocation join rejects unrelated completion with the same binding and prompt", async () => {
+  const h = await invocationJoinFixture();
+  try {
+    const peer = await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding });
+    const peerBinding = GenerativeApps.getGenerativeAppCallbackBinding(peer);
+    assert.ok(GenerativeApps.captureGenerativeAppCallbackOwner(h.nativeBinding)!.captureReadOnlySuccessor!(peerBinding));
+    assert.equal(h.dispatch.captureReadOnlySuccessor!(peerBinding, h.invocation), undefined);
+    const actual = GenerativeApps.getGenerativeAppCallbackBinding(await h.run());
+    assert.ok(h.dispatch.captureReadOnlySuccessor!(actual, h.invocation));
+  } finally { await h.close(); }
+});
+test("Native invocation join refuses a caller-owned memo origin and cannot reassign its cell", async () => {
+  const h = await invocationJoinFixture(), owner = GenerativeApps.captureGenerativeAppCallbackOwner(h.nativeBinding)!;
+  try {
+    const memo = {}, cell = owner.createCallbackInvocation!("counter::inspect", memo);
+    const result = await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: cell });
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(result);
+    assert.ok(owner.captureReadOnlySuccessor!(binding, cell, memo)); assert.equal(h.dispatch.captureReadOnlySuccessor!(binding, cell), undefined);
+    assert.equal(h.dispatch.captureReadOnlySuccessor!(binding, h.invocation), undefined);
+  } finally { await h.close(); }
+});
+for (const kind of ["copy", "proxy", "prototype", "foreign"] as const)
+test(`Native invocation join refuses nonnative cells without input probes (${kind})`, async () => {
+  const h = await invocationJoinFixture(); let reads = 0;
+  try {
+    const fake = kind === "copy" ? { ...h.invocation } : kind === "proxy" ? new Proxy(h.invocation, {}) : kind === "prototype" ? Object.create(h.invocation) : Object.defineProperty({}, "method", { get() { reads++; return "inspect"; } });
+    await assert.rejects(GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: fake, get argument() { reads++; return undefined; } }), /invocation is unavailable/u);
+    assert.equal(reads, 0); assert.ok(await h.run());
+  } finally { await h.close(); }
+});
+for (const mismatch of ["method", "argument", "owner"] as const)
+test(`Native invocation join spends mismatched original input without peer renewal (${mismatch})`, async () => {
+  const h = await invocationJoinFixture(); let peer = h.nativeBinding;
+  try {
+    if (mismatch === "owner") peer = GenerativeApps.getGenerativeAppCallbackBinding(await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect" }));
+    await assert.rejects(GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: mismatch === "method" ? "increment" : "inspect", ...(mismatch === "argument" ? { argument: 1 } : {}),
+      callbackWorkerDrain: true, callbackBinding: peer, callbackInvocation: h.invocation }), /callback invocation/u);
+    await assert.rejects(h.run(), /invocation is unavailable/u);
+    assert.equal((await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect" })).output, "0");
+  } finally { await h.close(); }
+});
+test("Native invocation join pins exact method before argument getters", async () => {
+  const h = await invocationJoinFixture(); let reads = 0;
+  const options = { agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true as const, callbackBinding: h.nativeBinding, callbackInvocation: h.invocation,
+    get argument() { reads++; options.method = "increment"; return undefined; } };
+  try {
+    const result = await GenerativeApps.invokeGenerativeApp(options);
+    assert.equal(reads, 1); assert.equal(result.method, "inspect"); assert.equal(result.stateChanged, false);
+    assert.ok(h.dispatch.captureReadOnlySuccessor!(GenerativeApps.getGenerativeAppCallbackBinding(result), h.invocation));
+  } finally { await h.close(); }
+});
+for (const loss of ["clear", "query", "sdk", "app"] as const)
+test(`Native invocation join cannot lend late lost store authority to its result (${loss})`, async () => {
+  let allowed = true; const h = await invocationJoinFixture({ sdk: { isExplicitTargetAuthorized: () => allowed } });
+  const journal = join(h.agentDir, "genapps", "counter", "states.jsonl"), bytes = await readFile(journal);
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run());
+    if (loss === "clear") h.store.clear!(); else if (loss === "query") h.query.id = "foreign"; else if (loss === "sdk") allowed = false; else fs.appendFileSync(journal, "\n");
+    assert.equal(h.dispatch.captureReadOnlySuccessor!(binding, h.invocation), undefined);
+    allowed = true; h.query.id = "original-dispatch"; fs.writeFileSync(journal, bytes);
+    assert.equal(h.dispatch.captureReadOnlySuccessor!(binding, h.invocation), undefined);
+  } finally { await h.close(); }
+});
+test("Native invocation join state write has no read-only completion relation", async () => {
+  const h = await invocationJoinFixture({ ordinaryPrompt: "counter::increment" });
+  try {
+    const result = await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: h.invocation });
+    assert.equal(result.stateChanged, true);
+    assert.equal(h.dispatch.captureReadOnlySuccessor!(GenerativeApps.getGenerativeAppCallbackBinding(result), h.invocation), undefined);
+  } finally { await h.close(); }
+});
+test("Native invocation join cannot borrow originals through its input getter", async () => {
+  const h = await invocationJoinFixture(); let lost = false, adopted = 0;
+  const options = { agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true as const, callbackBinding: h.nativeBinding,
+    execution: { signal: new AbortController().signal, assertCurrent() { if (lost) throw Error("Original execution lost"); } },
+    assertCallbackOwner() { if (lost) throw Error("Original callback lost"); },
+    get callbackInvocation() { lost = true; options.execution = { signal: new AbortController().signal, assertCurrent() { adopted++; } }; options.assertCallbackOwner = () => { adopted++; }; return h.invocation; } };
+  try { await assert.rejects(GenerativeApps.invokeGenerativeApp(options), /Original (execution|callback) lost/u); assert.equal(adopted, 0); }
+  finally { await h.close(); }
+});
+
+test("Native invocation join retains original store authority through the last pre-worker callback", async t => {
+  const h = await invocationJoinFixture(); let checks = 0, workers = 0; const terminate = Worker.prototype.terminate;
+  t.mock.method(Worker.prototype, "terminate", function(this: Worker) { workers++; return Reflect.apply(terminate, this, []); });
+  try {
+    await assert.rejects(GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: h.invocation,
+      execution: { signal: new AbortController().signal, assertCurrent() { if (++checks === 2) h.query.id = "late-source-loss"; } } }), /dispatch is unavailable/u);
+    assert.equal(workers, 0);
+  } finally { t.mock.restoreAll(); await h.close(); }
+});
+test("Native invocation join refuses an issued cell after original store clear", async () => {
+  const h = await invocationJoinFixture();
+  try { h.store.clear!(); await assert.rejects(h.run(), /dispatch is unavailable/u); }
+  finally { await h.close(); }
+});
+test("Native invocation join fences the original store after the last state-write callback", async () => {
+  const h = await invocationJoinFixture({ ordinaryPrompt: "counter::increment" }); let checks = 0;
+  const journal = join(h.agentDir, "genapps", "counter", "states.jsonl"), bytes = await readFile(journal);
+  try {
+    await assert.rejects(GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: h.invocation,
+      execution: { signal: new AbortController().signal, assertCurrent() { if (++checks === 4) h.query.id = "late-state-loss"; } } }), /dispatch is unavailable/u);
+    assert.equal((await readFile(journal)).equals(bytes), true);
+  } finally { await h.close(); }
+});
+for (const kind of ["native", "copy", "missing-execution"] as const)
+test(`Native invocation join binding uses one original dispatch and exact cell (${kind})`, async () => {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, ordinaryPrompt: "counter::inspect" }); let plans = 0, captures = 0;
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), native = h.store.resolve(query.data, query)!;
+    const invoke = Bindings.createTelegramGenerativeAppBoundButtonActionInvoker({ agentDir: h.agentDir, callbackWorkerDrain: true, callbackSuccessor: true, callbackDispatch: true,
+      assertExecutionCurrent() {}, getExecutionFence() { captures++; return kind === "missing-execution" ? undefined : { signal: new AbortController().signal, assertCurrent() {} }; },
+      planOutput(text) { plans++; return { markdown: text }; }, async editInteractiveMessage() {}, async sendMarkdownReply() {}, recordRuntimeEvent() {} });
+    const work = invoke(kind === "copy" ? { ...native } : native, query);
+    if (kind !== "native") { await assert.rejects(work, /dispatch.*unavailable/u); assert.equal(plans, 0); }
+    else { const result = await work.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error })); assert.equal(result.ok, true); if (result.ok) assert.equal(result.value, "new"); assert.equal(plans, 1); }
+    assert.equal(captures, 1);
+    if (kind === "copy") assert.ok(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(native, query));
+    else assert.equal(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(native, query), undefined);
+  } finally { await h.close(); }
+});
+test("Native invocation join binding pins execution callable before store-provider callbacks", async () => {
+  let enter: (() => void) | undefined, lost = false, adopted = 0;
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, ordinaryPrompt: "counter::inspect", sdk: { getConfirmationAuthority() { enter?.(); return { profile: "default", operatorId: 42 }; } } });
+  const fence = { signal: new AbortController().signal, assertCurrent() { if (lost) throw Error("Original bound execution lost"); } };
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    enter = () => { lost = true; fence.assertCurrent = () => { adopted++; }; };
+    const invoke = Bindings.createTelegramGenerativeAppBoundButtonActionInvoker({ agentDir: h.agentDir, callbackWorkerDrain: true, callbackSuccessor: true, callbackDispatch: true, assertExecutionCurrent() {}, getExecutionFence() { return fence; },
+      planOutput() { assert.fail("No result from a borrowed guard"); }, async sendMarkdownReply() {}, recordRuntimeEvent() {} });
+    await assert.rejects(invoke(action, query), /Original bound execution lost/u); assert.equal(adopted, 0);
+  } finally { enter = undefined; await h.close(); }
+});
+
+
+for (const kind of ["ordinary", "selection"] as const)
+test(`Native invocation join leaves non-method data out of dispatch (${kind})`, async () => {
+  const invoke = Bindings.createTelegramGenerativeAppBoundButtonActionInvoker({ agentDir: "", callbackWorkerDrain: true, callbackSuccessor: true, callbackDispatch: true,
+    assertExecutionCurrent() { assert.fail("No method execution for answer data"); }, getExecutionFence() { assert.fail("No source capture for answer data"); },
+    planOutput() { assert.fail("No app planning"); }, async sendMarkdownReply() {}, recordRuntimeEvent() {} });
+  assert.equal(await invoke({ text: "Data", prompt: "counter::inspect", ...(kind === "selection" ? { promptKind: "selection" as const } : {}) }, {}), false);
+});
+test("Native invocation join binds the exact normalized prompt argument", async () => {
+  const h = await invocationJoinFixture({ ordinaryPrompt: "counter::inspect(1)" });
+  try {
+    const result = await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", argument: 1, callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: h.invocation });
+    assert.ok(h.dispatch.captureReadOnlySuccessor!(GenerativeApps.getGenerativeAppCallbackBinding(result), h.invocation));
+  } finally { await h.close(); }
+});
+test("Native invocation join failed native method cannot acquire another result", async () => {
+  const h = await invocationJoinFixture({ ordinaryPrompt: "counter::missing" });
+  try {
+    await assert.rejects(GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "missing", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: h.invocation }));
+    const other = await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding });
+    assert.equal(h.dispatch.captureReadOnlySuccessor!(GenerativeApps.getGenerativeAppCallbackBinding(other), h.invocation), undefined);
+  } finally { await h.close(); }
+});
+
+
+test("Native invocation join rejects a different hidden producer origin after completion", async () => {
+  const h = await invocationJoinFixture();
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run()), owner = GenerativeApps.captureGenerativeAppCallbackOwner(h.nativeBinding)!;
+    assert.equal(owner.captureReadOnlySuccessor!(binding, h.invocation, {}), undefined);
+    assert.ok(h.dispatch.captureReadOnlySuccessor!(binding, h.invocation));
+  } finally { await h.close(); }
+});
+test("Native invocation join cannot substitute a later same-binding result after its own completion", async () => {
+  const h = await invocationJoinFixture();
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run());
+    const peer = GenerativeApps.getGenerativeAppCallbackBinding(await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding }));
+    assert.equal(h.dispatch.captureReadOnlySuccessor!(peer, h.invocation), undefined);
+    assert.ok(h.dispatch.captureReadOnlySuccessor!(binding, h.invocation));
+  } finally { await h.close(); }
+});
+test("Native invocation join checks original provider before creating actual work", async t => {
+  let allowed = true; const h = await invocationJoinFixture({ sdk: { isExplicitTargetAuthorized: () => allowed } }); let workers = 0; const terminate = Worker.prototype.terminate;
+  t.mock.method(Worker.prototype, "terminate", function(this: Worker) { workers++; return Reflect.apply(terminate, this, []); });
+  try { allowed = false; await assert.rejects(h.run(), /dispatch is unavailable/u); assert.equal(workers, 0); }
+  finally { t.mock.restoreAll(); allowed = true; await h.close(); }
+});
+test("Native invocation join data barrier retains physical loss inside the last native app check", async t => {
+  let allowed = true, armed = false, reads = 0, workers = 0; const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await invocationJoinFixture({ sdk: { isExplicitTargetAuthorized: () => allowed }, captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return owner; } });
+  const stat = fs.lstatSync, terminate = Worker.prototype.terminate; let checks = 0;
+  t.mock.method(Worker.prototype, "terminate", function(this: Worker) { workers++; return Reflect.apply(terminate, this, []); });
+  t.mock.method(fs, "lstatSync", (...args: unknown[]) => { const result = Reflect.apply(stat, fs, args); if (armed && ++reads === 2) { allowed = false; assert.throws(owners[0]!.assertCurrent); allowed = true; } return result; }); syncBuiltinESMExports();
+  try {
+    await assert.rejects(GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: h.invocation,
+      execution: { signal: new AbortController().signal, assertCurrent() { if (++checks === 2) armed = true; } } }), /dispatch is unavailable/u);
+    assert.equal(reads >= 2, true); assert.equal(workers, 0);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await h.close(); }
+});
+test("Native invocation join checks provider again after the last state-write callback", async () => {
+  let allowed = true, checks = 0; const h = await invocationJoinFixture({ ordinaryPrompt: "counter::increment", sdk: { isExplicitTargetAuthorized: () => allowed } });
+  const journal = join(h.agentDir, "genapps", "counter", "states.jsonl"), bytes = await readFile(journal);
+  try {
+    await assert.rejects(GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: h.invocation,
+      execution: { signal: new AbortController().signal, assertCurrent() { if (++checks === 4) allowed = false; } } }), /dispatch is unavailable/u);
+    assert.equal((await readFile(journal)).equals(bytes), true);
+  } finally { allowed = true; await h.close(); }
+});
+test("Native invocation join retains original store after native result recording I/O", async t => {
+  const h = await invocationJoinFixture(), stat = fs.promises.lstat; let observed = false;
+  try {
+    t.mock.method(fs.promises, "lstat", async (...args: unknown[]) => { const result = await Reflect.apply(stat, fs.promises, args); if (String(args[0]).endsWith("states.jsonl")) { observed = true; h.store.clear!(); } return result; }); syncBuiltinESMExports();
+    await assert.rejects(h.run(), /dispatch is unavailable/u); assert.equal(observed, true);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await h.close(); }
+});
+test("Native invocation join binding refuses late loss before result planning", async () => {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, ordinaryPrompt: "counter::inspect" }); let checks = 0, plans = 0;
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    const invoke = Bindings.createTelegramGenerativeAppBoundButtonActionInvoker({ agentDir: h.agentDir, callbackWorkerDrain: true, callbackSuccessor: true, callbackDispatch: true,
+      assertExecutionCurrent() { if (++checks === 2) h.store.clear!(); }, getExecutionFence() { return { signal: new AbortController().signal, assertCurrent() {} }; },
+      planOutput(text) { plans++; return { markdown: text }; }, async sendMarkdownReply() {}, recordRuntimeEvent() {} });
+    await assert.rejects(invoke(action, query), /invocation successor is unavailable/u); assert.equal(plans, 0);
+  } finally { await h.close(); }
+});
+
+
+test("Native invocation join pins native issuer readers and rejects caller construction", async t => {
+  const h = await invocationJoinFixture(), ctor = Object.getPrototypeOf(h.invocation).constructor;
+  try {
+    assert.throws(() => new ctor(Symbol("caller"), {}), /invocation is unavailable/u);
+    t.mock.method(ctor, "claim", () => undefined); t.mock.method(ctor, "matches", () => true);
+    const result = await h.run().then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
+    assert.equal(result.ok, true); if (!result.ok) return;
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(result.value), owner = GenerativeApps.captureGenerativeAppCallbackOwner(h.nativeBinding)!;
+    assert.equal(owner.captureReadOnlySuccessor!(binding, h.invocation, {}), undefined);
+    assert.ok(h.dispatch.captureReadOnlySuccessor!(binding, h.invocation));
+  } finally { t.mock.restoreAll(); await h.close(); }
+});
+test("Native invocation join pins original authority receiver and callable", async () => {
+  const h = await invocationJoinFixture(), owner = GenerativeApps.captureGenerativeAppCallbackOwner(h.nativeBinding)!; let lost = false, adopted = 0;
+  const authority = { assertCurrent() { assert.equal(this, authority); if (lost) throw Error("Original invocation authority lost"); }, assertObservedCurrent() {} };
+  try {
+    const cell = owner.createCallbackInvocation!("counter::inspect", {}, authority); lost = true; authority.assertCurrent = () => { adopted++; };
+    await assert.rejects(GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: cell }), /Original invocation authority lost/u);
+    assert.equal(adopted, 0);
+  } finally { await h.close(); }
+});
+
+for (const phase of ["absent", "before-issue", "after-issue", "spent", "query-copy"] as const)
+test(`Qualified dispatch distinguishes absent origin from refused native origin (${phase})`, async () => {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: "qualified", questionAppOrigin: "independent", ordinaryPrompt: "counter::increment",
+    ...(phase === "absent" ? { captureSdk: () => undefined } : {}) });
+  let plans = 0;
+  try {
+    await h.publish(); if (phase === "before-issue") h.sdk.shutdown();
+    const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!; assert.ok(action);
+    const issued = phase !== "absent" && phase !== "before-issue";
+    assert.equal(OutboundButtons.hasTelegramOrdinaryCallbackOrigin(action), issued);
+    if (phase === "after-issue") h.sdk.shutdown();
+    if (phase === "spent") assert.ok(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query));
+    const invoke = Bindings.createTelegramGenerativeAppBoundButtonActionInvoker({ agentDir: h.agentDir, callbackWorkerDrain: true, callbackSuccessor: "bound", callbackDispatch: "qualified",
+      assertExecutionCurrent() {}, getExecutionFence() { return { signal: new AbortController().signal, assertCurrent() {} }; },
+      planOutput(text) { plans++; return { markdown: text }; }, async sendMarkdownReply() {}, recordRuntimeEvent() {} });
+    const work = invoke(action, phase === "query-copy" ? { ...query } : query);
+    if (issued) {
+      await assert.rejects(work, /dispatch.*unavailable/u); assert.equal(plans, 0);
+      assert.equal(OutboundButtons.hasTelegramOrdinaryCallbackOrigin(action), true, "Spent/refused native origin cannot become legacy eligibility");
+    } else { assert.equal(await work, "new"); assert.equal(plans, 1); }
+    const state = await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect" });
+    assert.equal(state.output, issued ? "0" : "1", "No refused-origin retry through the weaker executor");
+  } finally { await h.close(); }
+});
+for (const changing of [false, true])
+test(`Native callback result classifies its exact invocation without trusting mutable DTO state (${changing})`, async () => {
+  const h = await invocationJoinFixture(changing ? { ordinaryPrompt: "counter::increment" } : {});
+  try {
+    const result = changing ? await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: h.invocation }) : await h.run();
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(result); result.stateChanged = !changing;
+    assert.equal(GenerativeApps.getGenerativeAppCallbackInvocationKind(binding, h.invocation), changing ? "state-written" : "read-only");
+    assert.equal(GenerativeApps.getGenerativeAppCallbackInvocationKind(binding, {}), undefined);
+    assert.equal(GenerativeApps.getGenerativeAppCallbackInvocationKind({ ...binding }, h.invocation), undefined);
+    assert.equal(GenerativeApps.getGenerativeAppCallbackInvocationKind(new Proxy(binding, { get() { assert.fail("No foreign getter probing"); } }), h.invocation), undefined);
+    assert.equal(!!h.dispatch.captureReadOnlySuccessor!(binding, h.invocation), !changing, "A native state write is not read-only parent authority");
+  } finally { await h.close(); }
+});
+test("Qualified dispatch refuses a lost read-only result instead of reclassifying it as a mutation", async () => {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: "qualified", ordinaryPrompt: "counter::inspect" }); let checks = 0, plans = 0;
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    const invoke = Bindings.createTelegramGenerativeAppBoundButtonActionInvoker({ agentDir: h.agentDir, callbackWorkerDrain: true, callbackSuccessor: "bound", callbackDispatch: "qualified",
+      assertExecutionCurrent() { if (++checks === 2) h.sdk.shutdown(); }, getExecutionFence() { return { signal: new AbortController().signal, assertCurrent() {} }; },
+      planOutput(text) { plans++; return { markdown: text }; }, async sendMarkdownReply() {}, recordRuntimeEvent() {} });
+    await assert.rejects(invoke(action, query), /invocation successor is unavailable/u); assert.equal(checks, 2); assert.equal(plans, 0);
+  } finally { await h.close(); }
+});
+
+for (const value of [false, null, 1, {}])
+test(`Native invocation join validates private binding policy (${JSON.stringify(value)})`, () => {
+  assert.throws(() => Bindings.createTelegramGenerativeAppBoundButtonActionInvoker({ callbackWorkerDrain: true, callbackSuccessor: true, callbackDispatch: value } as never), /Callback dispatch requires true or qualified and original successor policy/u);
+});
+test("Native invocation join requires successor and drain binding policy", () => {
+  assert.throws(() => Bindings.createTelegramGenerativeAppBoundButtonActionInvoker({ callbackDispatch: true } as never), /Callback dispatch requires true or qualified and original successor policy/u);
+});
+
+function ordinaryDispatchQuery(h: Awaited<ReturnType<typeof liveOrdinaryHarness>>) {
+  const key = h.rows.find(row => row.action.binding)!.key;
+  return { id: "original-dispatch", data: key, message: { message_id: 201, chat: { id: 42 }, ...(h.target.threadId !== undefined ? { message_thread_id: h.target.threadId } : {}) } };
+}
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const count of [1, 2])
+test(`Native ordinary dispatch captures one exact consumed origin (Thread=${threaded}/Rich=${rich}/heads=${count})`, async () => {
+  assert.equal(typeof OutboundButtons.captureTelegramOrdinaryCallbackDispatch, "function");
+  const h = await liveOrdinaryHarness({ threaded, rich, count, ordinaryCallbackDispatch: true });
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    const dispatch = OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query);
+    assert.ok(dispatch); assert.equal(dispatch.binding, h.nativeBinding); assert.equal(dispatch.prompt, action.prompt); assert.ok(Object.isFrozen(action)); assert.ok(Object.isFrozen(dispatch));
+    dispatch.assertCurrent(); dispatch.assertObservedCurrent();
+    assert.equal(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query), undefined); assert.doesNotThrow(dispatch.assertCurrent);
+    assert.equal(h.store.resolve(query.data, query), undefined);
+    assert.equal(Object.keys(dispatch).sort().join(","), "assertCurrent,assertObservedCurrent,binding,prompt");
+  } finally { await h.close(); }
+});
+
+for (const when of ["before", "after"] as const)
+test(`Native ordinary dispatch refuses optional query accessors without probing (${when})`, async () => {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true }); let reads = 0;
+  const mutate = (message: object) => Object.defineProperty(message, "message_thread_id", { configurable: true, get() { reads++; return 7; } });
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h); if (when === "before") mutate(query.message);
+    const action = h.store.resolve(query.data, query)!, dispatch = OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query);
+    if (when === "before") assert.equal(dispatch, undefined);
+    else { assert.ok(dispatch); mutate(query.message); assert.throws(dispatch.assertObservedCurrent); delete query.message.message_thread_id; assert.throws(dispatch.assertCurrent); }
+    assert.equal(reads, 0);
+  } finally { await h.close(); }
+});
+
+for (const kind of ["copy", "proxy", "prototype", "foreign"] as const)
+test(`Native ordinary dispatch rejects nonnative action without lending the original (${kind})`, async () => {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true }); let reads = 0;
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    const fake = kind === "copy" ? { ...action } : kind === "proxy" ? new Proxy(action, {}) : kind === "prototype" ? Object.create(action) : Object.defineProperty({}, "prompt", { get() { reads++; throw Error("Foreign getter"); } });
+    assert.equal(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(fake, query), undefined); assert.equal(reads, 0);
+    assert.ok(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query));
+  } finally { await h.close(); }
+});
+test("Native ordinary dispatch spends a wrong original-query capture without equal-field renewal", async () => {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true });
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    assert.equal(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, { ...query }), undefined);
+    assert.equal(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query), undefined);
+  } finally { await h.close(); }
+});
+for (const field of ["id", "data", "message", "chat", "message_id", "message_thread_id"] as const)
+test(`Native ordinary dispatch never renews original query history (${field})`, async () => {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, threaded: true });
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    const dispatch = OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query)!; assert.ok(dispatch);
+    const target = field === "id" || field === "data" || field === "message" ? query : query.message;
+    const original = Object.getOwnPropertyDescriptor(target, field)!;
+    Object.defineProperty(target, field, { ...original, value: field === "message" ? { ...query.message } : field === "chat" ? { id: 42 } : "changed" });
+    assert.throws(dispatch.assertCurrent, /dispatch is unavailable/u);
+    Object.defineProperty(target, field, original); assert.throws(dispatch.assertObservedCurrent); assert.throws(dispatch.assertCurrent);
+  } finally { await h.close(); }
+});
+for (const loss of ["producer", "app", "sdk", "clear", "deadline"] as const)
+test(`Native ordinary dispatch keeps original owner loss sticky (${loss})`, async t => {
+  let producer = true, sdk = true;
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, ordinaryExpiresAt: Date.now() + 20_000, assertProducer() { if (!producer) throw Error("Lost producer"); },
+    sdk: { isExplicitTargetAuthorized: () => sdk } });
+  const journal = join(h.agentDir, "genapps", "counter", "states.jsonl"), bytes = await readFile(journal);
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    const dispatch = OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query)!; assert.ok(dispatch);
+    if (loss === "producer") producer = false;
+    else if (loss === "sdk") sdk = false;
+    else if (loss === "app") fs.appendFileSync(journal, "\n");
+    else if (loss === "clear") h.store.clear!();
+    else t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 30_000 });
+    assert.throws(dispatch.assertCurrent); producer = true; sdk = true; fs.writeFileSync(journal, bytes); t.mock.timers.reset();
+    assert.throws(dispatch.assertObservedCurrent); assert.throws(dispatch.assertCurrent);
+  } finally { t.mock.timers.reset(); await h.close(); }
+});
+for (const kind of ["omitted", "unpublished", "no-query", "bad-locator", "expired", "disabled"] as const)
+test(`Native ordinary dispatch needs native indexed consumption and original physical history (${kind})`, async t => {
+  const h = await liveOrdinaryHarness({ ...(kind === "omitted" ? {} : { ordinaryCallbackDispatch: true as const }), ...(kind === "disabled" ? { ordinaryDisabled: true as const } : {}), ordinaryExpiresAt: Date.now() + 20_000 });
+  try {
+    if (kind !== "unpublished") await h.publish();
+    const query = ordinaryDispatchQuery(h); if (kind === "bad-locator") query.message.message_id++;
+    if (kind === "expired") t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 30_000 });
+    const action = h.store.resolve(query.data, kind === "no-query" ? undefined : query);
+    assert.equal(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query), undefined);
+  } finally { t.mock.timers.reset(); await h.close(); }
+});
+test("Native ordinary dispatch poisons caught own capture reentry", async () => {
+  let enter: (() => void) | undefined;
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, sdk: { getConfirmationAuthority() { enter?.(); return { profile: "default", operatorId: 42 }; } } });
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!; let nested = false;
+    enter = () => { nested = true; assert.equal(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query), undefined); };
+    assert.equal(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query), undefined); assert.equal(nested, true);
+    enter = undefined; assert.equal(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query), undefined);
+  } finally { await h.close(); }
+});
+test("Native ordinary dispatch preserves physical SDK loss during original app I/O", async t => {
+  let allowed = true, armed = false; const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, sdk: { isExplicitTargetAuthorized: () => allowed },
+    captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return owner; } }), stat = fs.lstatSync;
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    const dispatch = OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query)!; assert.ok(dispatch);
+    t.mock.method(fs, "lstatSync", (...args: unknown[]) => { const result = Reflect.apply(stat, fs, args); if (armed) { armed = false; allowed = false; assert.throws(owners[0]!.assertCurrent); allowed = true; } return result; });
+    syncBuiltinESMExports(); armed = true; assert.throws(dispatch.assertCurrent); assert.equal(armed, false); assert.throws(dispatch.assertObservedCurrent);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await h.close(); }
+});
+
+test("Native ordinary dispatch retains original factories and constructor policy", async () => {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, afterConstruct(config) { Object.assign(config, { ordinaryCallbackDispatch: false, captureQuestionLifetimeOwner() { assert.fail("No late SDK capture"); }, captureOrdinaryBindingOwner() { assert.fail("No late app capture"); } }); } });
+  try {
+    await h.publish(); const before = [h.captures(), h.appCaptures()], query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    const dispatch = OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query); assert.ok(dispatch); dispatch.assertCurrent();
+    assert.deepEqual([h.captures(), h.appCaptures()], before);
+  } finally { await h.close(); }
+});
+test("Native ordinary dispatch rejects caller construction without the native issuer", async () => {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true });
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    const ctor = Object.getPrototypeOf(action).constructor;
+    assert.throws(() => new ctor(Symbol("foreign"), { ...action }, () => Object.freeze({ binding: h.nativeBinding, prompt: action.prompt, assertCurrent() {}, assertObservedCurrent() {} })), /dispatch is unavailable/u);
+    assert.ok(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query));
+  } finally { await h.close(); }
+});
+test("Native ordinary dispatch pins its native reader despite mutable constructor slots", async t => {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true });
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    t.mock.method(Object.getPrototypeOf(action).constructor, "take", () => { assert.fail("Mutable native reader"); });
+    assert.ok(OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query));
+  } finally { t.mock.restoreAll(); await h.close(); }
+});
+test("Native ordinary dispatch data history observes original query loss after the last provider", async () => {
+  let change: (() => void) | undefined;
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, sdk: { getConfirmationAuthority() { change?.(); return { profile: "default", operatorId: 42 }; } } });
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    const dispatch = OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query)!; assert.ok(dispatch);
+    change = () => { query.id = "changed-after-provider"; };
+    assert.throws(dispatch.assertCurrent); change = undefined; query.id = "original-dispatch"; assert.throws(dispatch.assertObservedCurrent);
+  } finally { await h.close(); }
+});
+test("Native ordinary dispatch poisons caught own history reentry during providers", async () => {
+  let enter: (() => void) | undefined;
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, sdk: { getConfirmationAuthority() { enter?.(); return { profile: "default", operatorId: 42 }; } } });
+  try {
+    await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!;
+    const dispatch = OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query)!; assert.ok(dispatch);
+    enter = () => assert.throws(dispatch.assertObservedCurrent);
+    assert.throws(dispatch.assertCurrent); enter = undefined; assert.throws(dispatch.assertObservedCurrent);
+  } finally { await h.close(); }
+});
+
+for (const value of [false, null, 1, "true", {}])
+test(`Native ordinary dispatch validates only its constructor opt-in (${JSON.stringify(value)})`, () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: value } as never), /Ordinary callback dispatch must be true, qualified or omitted/u);
+});
+
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const count of [1, 2])
+test(`Live ordinary roster proves native original mixed first-send reciprocity (Thread=${threaded}/Rich=${rich}/heads=${count})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness({ threaded, rich, count });
+  try {
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    assert.equal(h.captures(), count + 1); assert.equal(h.appCaptures(), 1);
+    h.config.captureQuestionLifetimeOwner = () => { throw new Error("No successor lookup"); };
+    h.config.captureOrdinaryBindingOwner = () => { throw new Error("No recapture"); };
+    await h.publish(); assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), Array(count).fill(86_401_000));
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), Array(count).fill(7_201_000));
+    assert.equal(h.captures(), count + 1); assert.equal(h.appCaptures(), 1);
+    assert.ok(h.rows.filter(row => row.action.completionGroup).every(row => row.action.binding === undefined));
+    assert.equal((await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect" })).output, "0");
+  } finally { await h.close(); }
+});
+
+for (const loss of ["revision", "generation", "observed-restored", "sdk-owner", "ordinary-consumed"] as const)
+test(`Live ordinary roster never lends late lost original history to a published question (${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let ordinaryOwner: Readonly<Delivery.TelegramQuestionLifetimeOwner> | undefined, captures = 0, authorized = true;
+  const h = await liveOrdinaryHarness({ sdk: { isExplicitTargetAuthorized: () => authorized }, captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; if (++captures === 3) ordinaryOwner = owner; return owner; } });
+  try {
+    await h.publish(); assert.ok(ordinaryOwner);
+    const journal = join(h.agentDir, "genapps", "counter", "states.jsonl"), before = await readFile(journal);
+    if (loss === "revision") await GenerativeApps.bindGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment" });
+    if (loss === "generation") await writeFile(join(h.agentDir, "genapps", "counter", "generation"), "changed");
+    if (loss === "observed-restored") { fs.appendFileSync(journal, "\n"); assert.throws(h.nativeBinding.assertCurrent!, /unavailable/u); await writeFile(journal, before); }
+    if (loss === "sdk-owner") { authorized = false; assert.throws(ordinaryOwner.assertCurrent, /unavailable/u); authorized = true; }
+    if (loss === "ordinary-consumed") assert.ok(h.store.resolve(h.rows.find(row => row.action.binding)!.key));
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { await h.close(); }
+});
+
+for (const boundary of ["copy", "proxy", "missing-app", "missing-sdk-history", "foreign-sdk"] as const)
+test(`Live ordinary roster refuses nonoriginal or incomplete birth authority (${boundary})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const foreign = createLifetimeSdk({ chatId: 42 }); let captures = 0;
+  const h = await liveOrdinaryHarness({ binding: boundary === "copy" ? binding => ({ ...binding }) : boundary === "proxy" ? binding => new Proxy(binding, {}) : undefined,
+    captureApp: boundary === "missing-app" ? () => undefined : undefined,
+    captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; if (++captures !== 3) return owner;
+      if (boundary === "foreign-sdk") return foreign.captureQuestionLifetimeOwner!();
+      if (boundary === "missing-sdk-history") { const { assertObservedCurrent: _history, ...legacy } = owner; return legacy; } return owner;
+    } });
+  try {
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await h.publish(); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { foreign.shutdown(); await h.close(); }
+});
+
+for (const loss of ["app", "ordinary-row", "sdk-scope"] as const)
+test(`Live ordinary roster rechecks native app authority after the last SDK provider (${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onFinal: (() => void) | undefined, remaining = 0;
+  const h = await liveOrdinaryHarness({ sdk: { captureQuestionAuthority: () => () => { if (onFinal && --remaining === 0) { const fn = onFinal; onFinal = undefined; fn(); } } },
+    captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; return Object.freeze({ ...owner, captureTail(cohort?: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) {
+      const apply = owner.captureTail(cohort); return () => { remaining = 2; onFinal = lose; apply(); };
+    } }); } });
+  const lose = () => { if (loss === "app") fs.appendFileSync(join(h.agentDir, "genapps", "counter", "states.jsonl"), "\n");
+    else if (loss === "ordinary-row") assert.ok(h.store.resolve(h.rows.find(row => row.action.binding)!.key)); else h.sdk.shutdown(); };
+  try {
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await h.publish(); assert.equal(onFinal, undefined); t.mock.timers.tick(3_600_000); await Promise.resolve(); if (loss !== "sdk-scope") assert.equal(ended, false);
+    if (loss === "app") assert.throws(h.nativeBinding.assertCurrent!, /unavailable/u);
+  } finally { await h.close(); }
+});
+
+for (const loss of ["local-scope", "original-binding"] as const)
+test(`Live ordinary roster final tail barrier retains SDK loss observed inside native app I/O (${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let authorized = true, captures = 0, ordinaryOwner: Readonly<Delivery.TelegramQuestionLifetimeOwner> | undefined, unbind: (() => void) | undefined;
+  const h = await liveOrdinaryHarness({ sdk: { isExplicitTargetAuthorized: () => authorized }, captureSdk(sdk) {
+    if (loss === "original-binding" && !unbind) unbind = Delivery.bindTelegramDeliveryRuntime(sdk);
+    const owner = loss === "original-binding" ? Delivery.captureTelegramQuestionLifetimeOwner()! : sdk.captureQuestionLifetimeOwner!()!;
+    if (++captures === 3) ordinaryOwner = owner; return owner;
+  } });
+  const stat = fs.lstatSync; let armed = false, observed = false;
+  try {
+    await h.publish(); assert.ok(ordinaryOwner); armed = true;
+    t.mock.method(fs, "lstatSync", (...args: unknown[]) => {
+      if (armed) { armed = false; observed = true;
+        if (loss === "local-scope") { authorized = false; assert.throws(ordinaryOwner!.assertCurrent, /unavailable/u); authorized = true; }
+        else unbind!();
+      }
+      return Reflect.apply(stat, fs, args);
+    }); syncBuiltinESMExports();
+    const next = await openLifetimeSdkHead(h.sdk); if (loss === "local-scope") assert.ok(next.ok);
+    assert.equal(observed, true); assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { t.mock.restoreAll(); t.mock.timers.reset(); syncBuiltinESMExports(); unbind?.(); Delivery.clearTelegramDeliveryRuntime(); await h.close(); }
+});
+
+test("Live ordinary roster revalidates a new physical head after SDK shortening before earlier-agent cut", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let armed = false, onRead: (() => void) | undefined;
+  const h = await liveOrdinaryHarness({ sdk: { getConfirmationAuthority() { const fn = onRead; onRead = undefined; fn?.(); return { profile: "default", operatorId: 42 }; } },
+    captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; return Object.freeze({ ...owner, captureTail(cohort?: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) {
+      const apply = owner.captureTail(cohort); return () => { apply(); if (armed) { armed = false; onRead = () => fs.appendFileSync(join(h.agentDir, "genapps", "counter", "states.jsonl"), "\n"); } };
+    } }); } });
+  try {
+    const deadline = OutboundButtons.createTelegramButtonQuestionDeadline(86_401_000), group = Object.freeze({ deadline });
+    const key = h.store.register({ text: "Earlier", prompt: "Earlier", promptKind: "selection", completionGroup: group });
+    const finish = h.store.beginPublication!("sendMessage", { chat_id: 42, text: "Earlier", reply_markup: { inline_keyboard: [[{ text: "Earlier", callback_data: key }]] } }); assert.ok(finish); finish({ message_id: 199 }, true);
+    armed = true; await h.publish(); assert.equal(onRead, undefined);
+    assert.equal(deadline.expiresAt, 86_401_000, "An earlier SDK cut does not make original app authority current at a later agent cut");
+    assert.throws(h.nativeBinding.assertCurrent!, /unavailable/u);
+  } finally { await h.close(); }
+});
+
+test("Live ordinary roster omitted SDK composition does not inspect native app capture getters", () => {
+  let reads = 0; const store = OutboundButtons.createTelegramButtonActionStore({ get captureOrdinaryBindingOwner(): typeof GenerativeApps.captureGenerativeAppCallbackOwner { reads++; throw new Error("Unrelated app provider"); } });
+  try { store.register({ text: "Ordinary", prompt: "Data" }); assert.equal(reads, 0); } finally { store.clear!(); }
+});
+
+for (const value of [false, null, 3, {}])
+test(`Live ordinary roster validates only a constructor native app reader (${JSON.stringify(value)})`, () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ captureQuestionLifetimeOwner: () => undefined,
+    captureOrdinaryBindingOwner: value as unknown as typeof GenerativeApps.captureGenerativeAppCallbackOwner }), /must be a function/u);
+});
+
+for (const boundary of ["missing-sdk", "throwing-sdk", "throwing-app", "rejected-app", "pending-app"] as const)
+test(`Live ordinary roster keeps failed original capture unavailable without awaiting (${boundary})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let captures = 0;
+  const h = await liveOrdinaryHarness({ captureSdk(sdk) { if (++captures === 3) {
+    if (boundary === "missing-sdk") return undefined; if (boundary === "throwing-sdk") throw new Error("Original SDK capture failed");
+  } return sdk.captureQuestionLifetimeOwner!(); }, captureApp: boundary.endsWith("app") ? (() => {
+    if (boundary === "throwing-app") throw new Error("Original app capture failed");
+    return boundary === "rejected-app" ? Promise.reject(new Error("Original app capture rejected")) : new Promise(() => {});
+  }) as unknown as typeof GenerativeApps.captureGenerativeAppCallbackOwner : undefined });
+  try {
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await h.publish(); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+    assert.equal(h.captures(), 3); assert.equal(h.rows.filter(row => row.action.binding).length, 1);
+  } finally { await h.close(); }
+});
+
+for (const mutation of ["property", "call-slot"] as const)
+test(`Live ordinary roster invokes only original constructor functions and receiver (${mutation})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let probes = 0;
+  const h = await liveOrdinaryHarness({ afterConstruct(config) {
+    for (const name of ["captureQuestionLifetimeOwner", "captureOrdinaryBindingOwner"]) {
+      if (mutation === "property") Object.defineProperty(config, name, { get() { probes++; throw new Error("Replacement factory"); } });
+      else { const original = Object.getOwnPropertyDescriptor(config, name)!.value as object;
+        Object.defineProperty(original, "call", { get() { probes++; throw new Error("Replaced callable member"); } }); }
+    }
+  } });
+  try {
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await h.publish(); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true); assert.equal(probes, 0);
+  } finally { await h.close(); }
+});
+
+test("Live ordinary roster does not import caller-shaped private lifetime fields", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness({ captureApp: () => undefined });
+  try {
+    const owner = h.sdk.captureQuestionLifetimeOwner!()!, app = GenerativeApps.captureGenerativeAppCallbackOwner(h.nativeBinding)!;
+    const injected = h.store.register(Object.assign({ text: "Injected", prompt: "counter::increment", binding: h.nativeBinding }, {
+      ordinary: { binding: h.nativeBinding, owner, assertApp: app.assertCurrent, assertAppHistory: app.assertObservedCurrent, assertSdkHistory: owner.assertObservedCurrent! },
+    }));
+    const old = h.rows.find(row => row.action.binding)!.key;
+    for (const row of h.plan.replyMarkup!.inline_keyboard) for (const button of row) if (button.callback_data === old) button.callback_data = injected;
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await h.publish(); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { await h.close(); }
+});
+
+test("Live ordinary roster restores named native timers for later runtime fixtures", () => {
+  assert.equal(nativeSetTimeout, globalThis.setTimeout);
+});
+
+
+
+
+async function richFeedbackFixture(options: Parameters<typeof liveOrdinaryHarness>[0] & { carrier?: "mixed" | "rich-only" | "keyboard-source"; literal?: "fenced" | "inline" } = {}) {
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true, ordinaryRichFeedbackParent: true, ordinaryPrompt: "counter::inspect", ...options, rich: true });
+  const body = h.body as { rich_message: { markdown: string }; reply_markup: OutboundButtons.TelegramOutboundButtonMarkup | undefined };
+  const richRow = (row: OutboundButtons.TelegramOutboundButtonMarkup["inline_keyboard"][number]) => "\n<tg-button-row>" + row.map(button => `<tg-button type="callback_data" data="${button.callback_data}">${button.text}</tg-button>`).join("") + "</tg-button-row>\n";
+  if (options.carrier === "rich-only") { for (const row of body.reply_markup!.inline_keyboard) body.rich_message.markdown += richRow(row); body.reply_markup = undefined; }
+  else if (options.carrier === "keyboard-source") body.rich_message.markdown += richRow(body.reply_markup!.inline_keyboard.shift()!);
+  else {
+    const ordinaryKeys = new Set(h.rows.filter(row => row.action.binding).map(row => row.key));
+    const inline = body.reply_markup!.inline_keyboard.filter(row => row.some(button => ordinaryKeys.has(button.callback_data!)));
+    body.reply_markup!.inline_keyboard = body.reply_markup!.inline_keyboard.filter(row => !inline.includes(row));
+    for (const row of inline) body.rich_message.markdown += richRow(row);
+  }
+  if (options.literal) {
+    const example = richRow([{ text: "Literal", callback_data: h.rows.find(row => row.action.binding)!.key }]).trim();
+    body.rich_message.markdown += options.literal === "fenced" ? "\n```text\n" + example + "\n```\n" : "\n`" + example + "`\n";
+  }
+  await h.publish(); const query = ordinaryDispatchQuery(h), action = h.store.resolve(query.data, query)!, dispatch = OutboundButtons.captureTelegramOrdinaryCallbackDispatch(action, query)!;
+  assert.ok(dispatch); const invocation = dispatch.takeInvocation!(); assert.ok(invocation);
+  return { ...h, query, action, dispatch, invocation, run: () => GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: invocation }) };
+}
+for (const threaded of [false, true]) for (const carrier of ["mixed", "rich-only", "keyboard-source"] as const) for (const count of [1, 2])
+test(`Native Rich feedback joins a whole original text/keyboard projection (Thread=${threaded}/carrier=${carrier}/heads=${count})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await richFeedbackFixture({ threaded, carrier, count });
+  try {
+    Object.defineProperty(h.config, "ordinaryRichFeedbackParent", { value: false });
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, api = ordinaryParentTransport(h);
+    h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(api)); await h.store.waitForPublicationIdle!();
+    const next = ordinaryParentReplacement(h, { binding, count }), prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true, "The complete original Rich projection must qualify this native parent");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), Array(count).fill(7_201_000));
+  } finally { await h.close(); }
+});
+for (const literal of ["fenced", "inline"] as const)
+test(`Native Rich feedback keeps literal callback examples inert (${literal})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await richFeedbackFixture({ literal });
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, api = ordinaryParentTransport(h);
+    h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(api)); await h.store.waitForPublicationIdle!();
+    const next = ordinaryParentReplacement(h, { binding }), prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true);
+  } finally { await h.close(); }
+});
+for (const boundary of ["omitted", "markup-only", "missing-keyboard", "clone-rich", "clone-keyboard", "changed-rich-content", "drop-rich-callback", "duplicate-cross-carrier", "legacy-ack", "void", "query-loss", "clear", "intervening-view"] as const)
+test(`Native Rich feedback refuses an incomplete or renewed carrier (${boundary})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await richFeedbackFixture({ ordinaryCount: 2, ordinaryRichFeedbackParent: boundary === "omitted" ? undefined : true });
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false, calls = 0; void prior.handle.result.then(() => { ended = true; });
+    const api = ordinaryParentTransport(h, async () => boundary === "legacy-ack" && ++calls === 1 ? true : "edited"), native = BusApi.createTelegramButtonPublicationEditor(api);
+    h.store.bindPublicationEditor!(async (view, guard) => {
+      if (boundary === "void") return;
+      if (boundary === "markup-only") return api.editMessageReplyMarkup(42, 201, view.replyMarkup!);
+      if (boundary === "missing-keyboard") return native({ ...view, replyMarkup: undefined }, guard);
+      if (boundary === "clone-rich") return native({ ...view, richMessage: structuredClone(view.richMessage) }, guard);
+      if (boundary === "clone-keyboard") return native({ ...view, replyMarkup: structuredClone(view.replyMarkup) }, guard);
+      if (boundary === "changed-rich-content") (view.richMessage as { markdown: string }).markdown = "Unowned replacement context\n" + view.richMessage!.markdown;
+      if (boundary === "drop-rich-callback") (view.richMessage as { markdown: string }).markdown = view.richMessage!.markdown.replace(/<tg-button-row>[\s\S]*?<\/tg-button-row>/g, "");
+      if (boundary === "duplicate-cross-carrier") (view.richMessage as { markdown: string }).markdown += `\n<tg-button-row><tg-button type="callback_data" data="${view.replyMarkup!.inline_keyboard[0]![0]!.callback_data}">Duplicate</tg-button></tg-button-row>\n`;
+      await native(view, guard);
+    }); await h.store.waitForPublicationIdle!();
+    if (boundary === "query-loss") { const id = h.query.id; h.query.id = "lost"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
+    if (boundary === "clear") h.store.clear!();
+    if (boundary === "intervening-view") await api.editMessageText({ chat_id: 42, message_id: 201, rich_message: { markdown: h.plan.markdown }, reply_markup: h.plan.replyMarkup });
+    const next = ordinaryParentReplacement(h, { binding }); await api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { await h.close(); }
+});
+test("Native Rich feedback seals even a projected Rich carrier with zero remaining inline callbacks", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await richFeedbackFixture();
+  try {
+    await h.run(); let sealed = false;
+    const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { editMessageText: async (body: { rich_message: { markdown: string }; reply_markup: OutboundButtons.TelegramOutboundButtonMarkup }) => {
+      sealed = !body.rich_message.markdown.includes('type="callback_data"') && Object.getOwnPropertyDescriptor(body.rich_message, "markdown")?.writable === false && body.reply_markup.inline_keyboard.every(row => Object.isFrozen(row));
+      return "edited";
+    } } as unknown as TelegramBridgeApiRuntime, ownsDirect: () => true, callFollowerApi: async () => assert.fail("No follower"), beginButtonPublication: h.store.beginPublication });
+    h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(api)); await h.store.waitForPublicationIdle!(); assert.equal(sealed, true);
+  } finally { await h.close(); }
+});
+for (const value of [false, null, 1, "yes"])
+test(`Native Rich feedback validates private policy (${String(value)})`, () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true, ordinaryRichFeedbackParent: value } as unknown as Parameters<typeof OutboundButtons.createTelegramButtonActionStore>[0]), /Rich feedback ordinary parent/u);
+});
+test("Native Rich feedback requires original feedback ownership policy", () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: true, ordinaryRichFeedbackParent: true } as Parameters<typeof OutboundButtons.createTelegramButtonActionStore>[0]), /Rich feedback ordinary parent/u);
+});
+
+
+
+
+async function conditionalTailFixture(t: import("node:test").TestContext, options: Parameters<typeof liveOrdinaryHarness>[0] & { pure?: boolean; retain?: "whole" | "half" | "two"; noPrior?: true; stage?: "native-pending" | "editor-pending"; beforeAck?: (sdk: Delivery.TelegramDeliveryRuntime) => Promise<void> } = {}) {
+  const config = { ordinaryReadOnlyParent: true as const, ordinaryFeedbackParent: true as const,
+    ordinaryRichFeedbackParent: options.rich ? true as const : undefined, ordinaryQueuedFeedbackParent: true as const,
+    ordinaryDeferredFeedbackParent: true as const, ordinaryDeferredSdkTail: true as const, ...options };
+  const pure = options.pure ? await pureQuestionParentFixture(config) : undefined;
+  const h = pure ?? (options.rich ? await richFeedbackFixture(config) : await invocationJoinFixture(config));
+  const nativeEntered = Promise.withResolvers<void>(), nativeRelease = Promise.withResolvers<void>(), editorNative = Promise.withResolvers<void>(),
+    editorGate = Promise.withResolvers<void>(), resultEntered = Promise.withResolvers<void>(), resultRelease = Promise.withResolvers<void>(), resultView = Promise.withResolvers<void>();
+  let editorFulfilled = false, calls = 0;
+  const api = ordinaryParentTransport(h, async () => { if (++calls === 1) { nativeEntered.resolve(); await nativeRelease.promise; } else { resultEntered.resolve(); await resultRelease.promise; } return "edited"; });
+  const native = BusApi.createTelegramButtonPublicationEditor(api);
+  try {
+    const binding = pure ? pure.binding : GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!;
+    t.mock.timers.setTime(5000); const prior = options.noPrior ? undefined : await openLifetimeSdkHead(h.sdk); if (prior) assert.ok(prior.ok);
+    h.store.bindPublicationEditor!((view, guard) => (async () => {
+      await native(view, guard); editorNative.resolve(); await resultView.promise; await editorGate.promise; editorFulfilled = true;
+    })());
+    await nativeEntered.promise;
+    if (options.stage === "editor-pending") { nativeRelease.resolve(); await editorNative.promise; }
+    const next = pure ? pure.replacement("confirm", options.count ?? 2) : ordinaryParentReplacement(h, { binding, count: options.count ?? 2 });
+    const retainedGroups = options.retain === "two" ? h.groups.slice(0, 2) : options.retain ? h.groups.slice(0, 1) : [];
+    const retainedRows = h.rows.filter(row => row.action.completionGroup && retainedGroups.includes(row.action.completionGroup)).slice(0, options.retain === "half" ? 1 : undefined);
+    if (retainedRows.length) {
+      const wanted = new Set(retainedRows.map(row => row.key));
+      next.body.reply_markup!.inline_keyboard.unshift(...h.plan.replyMarkup!.inline_keyboard.map(row => row.filter(button => wanted.has(button.callback_data!))).filter(row => row.length));
+    }
+    const work = api.editMessageText(next.body).then(() => { resultView.resolve(); }, error => { resultView.resolve(); throw error; });
+    nativeRelease.resolve(); await Promise.race([resultEntered.promise, work.then(() => { throw Error("Original result native gate was not entered"); })]);
+    await options.beforeAck?.(h.sdk); t.mock.timers.setTime(10000); resultRelease.resolve(); await work;
+    assert.equal(editorFulfilled, false);
+    return { ...h, api, next, prior, retainedGroups, retainedRows, editorFulfilled: () => editorFulfilled,
+      async admit(when = 20000, terminate?: "before" | "after", sdk = h.sdk) {
+        t.mock.timers.setTime(when); const controller = new AbortController(), original = h.store.onQuestionAdmission!;
+        h.store.onQuestionAdmission = admission => { if (terminate === "before") controller.abort(); original(admission); if (terminate === "after") controller.abort(); };
+        try { return await sdk.openConfirmation!({ owner: "@test/conditional", scope: { kind: "instance" }, question: "Later SDK",
+          confirmLabel: "Yes", cancelLabel: "Cancel", signal: controller.signal }); }
+        finally { h.store.onQuestionAdmission = original; }
+      },
+      async settle(at = 30000) { t.mock.timers.setTime(at); editorGate.resolve(); await h.store.waitForPublicationIdle!(); },
+      async close() { nativeRelease.resolve(); resultRelease.resolve(); resultView.resolve(); editorGate.resolve(); await h.close(); }
+    };
+  } catch (error) { nativeRelease.resolve(); resultRelease.resolve(); resultView.resolve(); editorGate.resolve(); await h.close(); throw error; }
+}
+
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const pure of [false, true]) for (const count of [1, 2])
+test(`Conditional SDK tail qualifies one original late editor without exposing a pending head (${threaded}/${rich}/${pure}/${count})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await conditionalTailFixture(t, { threaded, rich, pure, count });
+  try {
+    const sdk = await h.admit(); assert.ok(sdk.ok); let laterEnded = false; void sdk.handle.result.then(() => { laterEnded = true; });
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), Array(count).fill(86405000));
+    assert.equal(h.editorFulfilled(), false); await h.settle();
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), Array(count).fill(3620000));
+    if (pure) assert.ok(h.next.rows.every(row => row.action.binding === undefined));
+    let priorEnded = false; void h.prior!.handle.result.then(() => { priorEnded = true; });
+    t.mock.timers.tick(3585001); await Promise.resolve(); assert.equal(priorEnded, true); assert.equal(laterEnded, false);
+    t.mock.timers.tick(20000); await Promise.resolve(); assert.equal(laterEnded, false, "Original ACK captures cannot include the intervening SDK head");
+  } finally { await h.close(); }
+});
+
+for (const rich of [false, true]) for (const pure of [false, true]) for (const stage of ["before", "after"] as const)
+test(`Conditional SDK tail retains an admitted cutoff across SDK cancellation (${rich}/${pure}/${stage})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await conditionalTailFixture(t, { rich, pure });
+  try {
+    assert.equal((await h.admit(20000, stage)).ok, false);
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000]);
+    await h.settle(); assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [3620000, 3620000]);
+  } finally { await h.close(); }
+});
+
+
+for (const rich of [false, true]) for (const pure of [false, true]) for (const loss of ["second-sdk", "source-before", "source-after", "file-before", "file-after", "producer", "sdk-owner", "elapsed", "agent", "omitted"] as const)
+test(`Conditional SDK tail holds uncertainty without rollback or a replacement cohort (${rich}/${pure}/${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let producer = true, sdkCurrent = true;
+  const h = await conditionalTailFixture(t, { rich, pure, ...(loss === "omitted" ? { ordinaryDeferredSdkTail: undefined } : {}),
+    assertProducer() { if (!producer) throw Error("Original producer lost"); }, captureSdk(sdk) {
+      const owner = sdk.captureQuestionLifetimeOwner!()!;
+      return Object.freeze({ ...owner, assertCurrent() { if (!sdkCurrent) throw Error("Original SDK owner lost"); owner.assertCurrent(); } });
+    } });
+  const path = join(h.agentDir, "genapps", "counter", "states.jsonl"), bytes = await readFile(path);
+  const loseSource = () => { const id = h.query.id; h.query.id = "conditional-source-lost"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; };
+  try {
+    if (loss === "source-before") loseSource();
+    if (loss === "file-before") fs.appendFileSync(path, "\n");
+    if (loss === "producer") producer = false;
+    if (loss === "sdk-owner") sdkCurrent = false;
+    const sdk = await h.admit(); assert.ok(sdk.ok);
+    if (loss === "second-sdk") { const second = await h.admit(21000); assert.ok(second.ok); }
+    if (loss === "source-after") loseSource();
+    if (loss === "file-after") { fs.appendFileSync(path, "\n"); assert.throws(() => GenerativeApps.captureGenerativeAppCallbackOwner(h.nativeBinding)!.assertCurrent()); }
+    if (loss.startsWith("file")) await writeFile(path, bytes);
+    producer = true; sdkCurrent = true;
+    if (loss === "agent") {
+      t.mock.timers.setTime(21000); const other = ordinaryParentReplacement(h, { ordinary: false });
+      const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { async sendMessage() { return { message_id: 301 }; } } as unknown as TelegramBridgeApiRuntime,
+        ownsDirect: () => true, callFollowerApi: async () => assert.fail("No follower substitute"), beginButtonPublication: h.store.beginPublication });
+      await api.sendMessage({ chat_id: 42, text: "Independent agent head", reply_markup: other.body.reply_markup });
+    }
+    await h.settle(loss === "elapsed" ? 3620000 : 30000);
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000]);
+    t.mock.timers.setTime(40000); await openLifetimeSdkHead(h.sdk);
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000], "A later head cannot adopt or retry held membership");
+  } finally { producer = true; sdkCurrent = true; await writeFile(path, bytes); await h.close(); }
+});
+
+for (const rich of [false, true]) for (const pure of [false, true])
+test(`Conditional SDK tail excludes a foreign native event without making it freshness (${rich}/${pure})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await conditionalTailFixture(t, { rich, pure });
+  const foreign = createLifetimeSdk(h.target, { onQuestionAdmission: a => h.store.onQuestionAdmission!(a) });
+  try {
+    await h.admit(20000, undefined, foreign); await h.settle();
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000]);
+    await h.admit(40000); assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [3640000, 3640000]);
+  } finally { foreign.shutdown(); await h.close(); }
+});
+
+for (const rich of [false, true]) for (const pure of [false, true])
+test(`Conditional SDK tail retains its original matcher and earlier producer deadline (${rich}/${pure})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const owners: Delivery.TelegramQuestionLifetimeOwner[] = [];
+  const h = await conditionalTailFixture(t, { rich, pure, captureSdk(sdk) { const owner = { ...sdk.captureQuestionLifetimeOwner!()! }; owners.push(owner); return owner; } });
+  try {
+    h.next.groups[0]!.deadline!.shorten(2000000);
+    for (const owner of owners) Object.defineProperty(owner, "matchAdmissionEvent", { value() { assert.fail("No matcher renewal after birth"); } });
+    await h.admit(); await h.settle(); assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [2000000, 3620000]);
+  } finally { await h.close(); }
+});
+
+for (const mode of ["missing", "throw", "nonfinite", "reentry", "replay"] as const)
+test(`Conditional SDK tail refuses absent or uncertain original event matching (${mode})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let armed = false, nested = false, onEvent: ((a: unknown) => void) | undefined, token: unknown;
+  const h = await conditionalTailFixture(t, { pure: true, captureSdk(sdk) {
+    const owner = sdk.captureQuestionLifetimeOwner!()!;
+    return Object.freeze({ ...owner, matchAdmissionEvent: mode === "missing" ? undefined : (...args: Parameters<NonNullable<Delivery.TelegramQuestionLifetimeOwner["matchAdmissionEvent"]>>) => {
+      if (armed) {
+        if (mode === "throw") throw Error("Matching SDK authority is uncertain");
+        if (mode === "nonfinite") return NaN;
+        if (mode === "reentry" && !nested) { nested = true; onEvent!(args[0]); }
+      }
+      return owner.matchAdmissionEvent!(...args);
+    } });
+  } });
+  try {
+    onEvent = h.store.onQuestionAdmission!; armed = true;
+    const original = h.store.onQuestionAdmission!;
+    h.store.onQuestionAdmission = admission => { token = admission; original(admission); };
+    await h.admit();
+    if (mode === "replay") { assert.ok(token); original(token); token = undefined; }
+    await h.settle(); assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000]);
+    await h.admit(40000); assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000]);
+  } finally { await h.close(); }
+});
+
+for (const value of [false, 1, {}, "true", true])
+test(`Conditional SDK tail constructor rejects malformed or unowned opt-in (${String(value)})`, () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryDeferredSdkTail: value } as never), /Deferred SDK tail requires/);
+});
+
+
+for (const rich of [false, true]) for (const stage of ["native-pending", "editor-pending"] as const)
+test(`Conditional SDK tail cannot adopt an SDK event before the original result ACK (${rich}/${stage})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await conditionalTailFixture(t, { rich, pure: true, stage, async beforeAck(sdk) { t.mock.timers.setTime(9000); assert.ok((await openLifetimeSdkHead(sdk)).ok); } });
+  try {
+    await h.settle(); assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000]);
+    await h.admit(40000); assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000]);
+  } finally { await h.close(); }
+});
+
+for (const rich of [false, true]) for (const pure of [false, true]) for (const loss of ["file", "clock"] as const)
+test(`Conditional SDK tail requalifies final native app and future ceiling after retained cuts (${rich}/${pure}/${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let armed = false, path = "";
+  const h = await conditionalTailFixture(t, { rich, pure, captureSdk(sdk) {
+    const owner = sdk.captureQuestionLifetimeOwner!()!;
+    return Object.freeze({ ...owner, captureTail(...args: Parameters<typeof owner.captureTail>) {
+      const apply = owner.captureTail(...args);
+      return () => { apply(); if (armed && Date.now() === 30000) { if (loss === "file") fs.appendFileSync(path, "\n"); else t.mock.timers.setTime(3620000); } };
+    } });
+  } });
+  path = join(h.agentDir, "genapps", "counter", "states.jsonl"); const bytes = await readFile(path);
+  try {
+    await h.admit(); armed = true; await h.settle();
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000]);
+    await writeFile(path, bytes); t.mock.timers.setTime(40000); await openLifetimeSdkHead(h.sdk);
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000]);
+  } finally { armed = false; await writeFile(path, bytes); await h.close(); }
+});
+
+
+for (const rich of [false, true]) for (const pure of [false, true])
+test(`Conditional SDK tail never lends provisional result facts to a second SDK event (${rich}/${pure})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let armed = false, entered = false, work: ReturnType<typeof openLifetimeSdkHead> | undefined;
+  const h = await conditionalTailFixture(t, { rich, pure, captureSdk(sdk) {
+    const owner = sdk.captureQuestionLifetimeOwner!()!;
+    return Object.freeze({ ...owner, captureTail(...args: Parameters<typeof owner.captureTail>) {
+      const apply = owner.captureTail(...args);
+      return () => { apply(); if (armed && !entered) { entered = true; work = openLifetimeSdkHead(sdk); } };
+    } });
+  } });
+  try {
+    await h.admit(); armed = true; await h.settle(); assert.equal(entered, true); assert.ok((await work!)!.ok);
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000]);
+  } finally { armed = false; await work?.catch(() => {}); await h.close(); }
+});
+for (const rich of [false, true])
+test(`Conditional SDK tail does not spend the one-event limit on a later foreign SDK event (${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await conditionalTailFixture(t, { rich, pure: true });
+  const foreign = createLifetimeSdk(h.target, { onQuestionAdmission: a => h.store.onQuestionAdmission!(a) });
+  try { await h.admit(); await h.admit(21000, undefined, foreign); await h.settle(); assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [3620000, 3620000]); }
+  finally { foreign.shutdown(); await h.close(); }
+});
+
+
+for (const rich of [false, true])
+test(`Conditional SDK tail uses the original admission clock despite later provider time (${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let armed = false;
+  const h = await conditionalTailFixture(t, { rich, pure: true, captureSdk(sdk) {
+    const owner = sdk.captureQuestionLifetimeOwner!()!;
+    return Object.freeze({ ...owner, matchAdmissionEvent(...args: Parameters<NonNullable<typeof owner.matchAdmissionEvent>>) {
+      if (armed) t.mock.timers.setTime(27000);
+      return owner.matchAdmissionEvent!(...args);
+    } });
+  } });
+  try {
+    armed = true; await h.admit(); assert.equal(Date.now(), 27000); await h.settle(); assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [3620000, 3620000]);
+  } finally { armed = false; await h.close(); }
+});
+
+
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const pure of [false, true]) for (const noPrior of [false, true]) for (const sdkEvent of [false, true])
+test(`Retained question parent preserves one original lifetime beside fresh heads (${threaded}/${rich}/${pure}/${noPrior}/${sdkEvent})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await conditionalTailFixture(t, { threaded, rich, pure, noPrior: noPrior ? true : undefined, retain: "whole",
+    questionAppOrigin: true, ordinaryQuestionParent: true, ordinaryRetainedQuestionParent: true, initialQuestionBinding: true });
+  try {
+    const group = h.retainedGroups[0]!, initial = group.deadline!.expiresAt;
+    assert.equal(initial, 86401000, "The unit fixture admits its SDK predecessor after source consumption; it is not an earlier agent cut");
+    if (sdkEvent) await h.admit();
+    assert.equal(group.deadline!.expiresAt, initial, "A pending result cannot demote or rebind a retained group");
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), [86405000, 86405000]);
+    await h.settle();
+    assert.equal(group.deadline!.expiresAt, Math.min(initial, 3610000));
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), Array(2).fill(sdkEvent ? 3620000 : 86405000));
+    await h.admit(40000);
+    assert.equal(group.deadline!.expiresAt, Math.min(initial, 3610000));
+    assert.deepEqual(h.next.groups.map(g => g.deadline!.expiresAt), Array(2).fill(sdkEvent ? 3620000 : 3640000));
+    const answer = h.store.resolve(h.retainedRows[0]!.key, { id: "retained-answer", data: h.retainedRows[0]!.key,
+      message: { chat: { id: 42 }, message_id: 201, ...(threaded ? { message_thread_id: 7 } : {}) } });
+    assert.ok(answer); assert.equal(answer.binding, undefined); assert.equal(answer.promptKind, "selection");
+    assert.deepEqual(JSON.parse(answer.prompt), { question: "0", answer: "✅ Yes" });
+    assert.equal(group.deadline!.expiresAt, Math.min(initial, 3610000));
+  } finally { await h.close(); }
+});
+
+for (const rich of [false, true]) for (const pure of [false, true]) for (const loss of ["half", "two", "omitted", "missing-origin", "peer-origin"] as const)
+test(`Retained question parent refuses partial multiple unbound and omitted histories (${rich}/${pure}/${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  await assert.rejects(() => conditionalTailFixture(t, { rich, pure, retain: loss === "half" ? "half" : loss === "two" ? "two" : "whole",
+    questionAppOrigin: true, ordinaryQuestionParent: true, ordinaryRetainedQuestionParent: loss === "omitted" ? undefined : true,
+    initialQuestionBinding: loss === "missing-origin" ? undefined : loss === "peer-origin" ? "peer" : true }), /queued feedback projection is unavailable/);
+});
+
+for (const value of [false, 1, "true", {}, true])
+test(`Retained question parent validates its original constructor dependencies (${typeof value}/${String(value)})`, () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryRetainedQuestionParent: value } as never), /Retained question parent requires/);
+});
+
+
+for (const rich of [false, true]) for (const loss of ["source", "file", "publisher", "sdk", "second-sdk", "second-view", "elapsed", "deadline"] as const)
+test(`Retained question parent keeps original authority and interference sticky (${rich}/${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let producer = true, sdkCurrent = true;
+  const h = await conditionalTailFixture(t, { rich, pure: true, retain: "whole", questionAppOrigin: true, ordinaryQuestionParent: true,
+    ordinaryRetainedQuestionParent: true, initialQuestionBinding: true,
+    assertProducer() { if (!producer) throw Error("Original retained producer lost"); }, captureSdk(sdk) {
+      const owner = sdk.captureQuestionLifetimeOwner!()!;
+      return Object.freeze({ ...owner, assertCurrent() { if (!sdkCurrent) throw Error("Original retained SDK lost"); owner.assertCurrent(); } });
+    } });
+  const path = join(h.agentDir, "genapps", "counter", "states.jsonl"), bytes = await readFile(path);
+  try {
+    if (loss === "source") { const id = h.query.id; h.query.id = "retained-source-lost"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
+    if (loss === "file") fs.appendFileSync(path, "\n");
+    if (loss === "publisher") producer = false;
+    if (loss === "sdk") sdkCurrent = false;
+    if (loss === "deadline") h.retainedGroups[0]!.deadline!.shorten(25000);
+    await h.admit();
+    if (loss === "second-sdk") await h.admit(21000);
+    if (loss === "second-view") await h.api.editMessageText({ ...h.next.body, text: "Second view is not the original editor" }).catch(() => {});
+    await writeFile(path, bytes); producer = true; sdkCurrent = true;
+    await h.settle(loss === "elapsed" ? 3620000 : 30000);
+    assert.deepEqual(h.next.groups.map(group => group.deadline!.expiresAt), [86405000, 86405000]);
+    await h.admit(40000); assert.deepEqual(h.next.groups.map(group => group.deadline!.expiresAt), [86405000, 86405000]);
+  } finally { producer = true; sdkCurrent = true; await writeFile(path, bytes); await h.close(); }
+});
+
+for (const rich of [false, true]) for (const pure of [false, true])
+test(`Retained question parent keeps an earlier original cutoff and constructor snapshot (${rich}/${pure})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await conditionalTailFixture(t, { rich, pure, retain: "whole", questionAppOrigin: true, ordinaryQuestionParent: true,
+    ordinaryRetainedQuestionParent: true, initialQuestionBinding: true, afterConstruct(config) {
+      Object.defineProperty(config, "ordinaryRetainedQuestionParent", { get() { assert.fail("No option reread"); } });
+    } });
+  try {
+    h.retainedGroups[0]!.deadline!.shorten(2000000); await h.admit(); await h.settle();
+    assert.equal(h.retainedGroups[0]!.deadline!.expiresAt, 2000000);
+    assert.deepEqual(h.next.groups.map(group => group.deadline!.expiresAt), [3620000, 3620000]);
+  } finally { await h.close(); }
+});
+
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const count of [1, 2]) for (const stage of ["native-pending", "editor-pending"] as const)
+test(`Deferred feedback join keeps semantic progress and original ACK cutoff (Thread=${threaded}/Rich=${rich}/heads=${count}/${stage})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const options = { threaded, count, ordinaryQueuedFeedbackParent: true as const, ordinaryDeferredFeedbackParent: true as const, ordinaryReadOnlyParent: true as const, ordinaryFeedbackParent: true as const };
+  const h = rich ? await richFeedbackFixture(options) : await invocationJoinFixture(options);
+  const nativeEntered = Promise.withResolvers<void>(), nativeRelease = Promise.withResolvers<void>(), editorNative = Promise.withResolvers<void>(), editorGate = Promise.withResolvers<void>(), resultEntered = Promise.withResolvers<void>(), resultRelease = Promise.withResolvers<void>(), resultView = Promise.withResolvers<void>();
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!; t.mock.timers.setTime(5000);
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false, editorFulfilled = false; void prior.handle.result.then(() => { ended = true; });
+    let calls = 0; const api = ordinaryParentTransport(h, async () => { if (++calls === 1) { nativeEntered.resolve(); await nativeRelease.promise; } else { resultEntered.resolve(); await resultRelease.promise; } return "edited"; });
+    const native = BusApi.createTelegramButtonPublicationEditor(api);
+    h.store.bindPublicationEditor!((view, guard) => { const work = (async () => { await native(view, guard); editorNative.resolve(); await resultView.promise; await editorGate.promise; })(); void work.then(() => { editorFulfilled = true; }, () => {}); return work; });
+    await nativeEntered.promise;if (stage === "editor-pending") { nativeRelease.resolve(); await editorNative.promise; }
+    const next = ordinaryParentReplacement(h, { binding, count }), work = api.editMessageText(next.body).then(() => { resultView.resolve(); }, error => { resultView.resolve(); throw error; });
+    nativeRelease.resolve(); await resultEntered.promise; t.mock.timers.setTime(10000); resultRelease.resolve(); await work;
+    let idle = false; const idleWork = h.store.waitForPublicationIdle!().then(() => { idle = true; }); await Promise.resolve(); assert.equal(idle, false); assert.equal(editorFulfilled, false);
+    Object.defineProperty(h.config, "ordinaryDeferredFeedbackParent", { value: false });
+    t.mock.timers.setTime(30000); editorGate.resolve(); await idleWork; assert.equal(editorFulfilled, true);
+    t.mock.timers.tick(3_585_001); await Promise.resolve(); assert.equal(ended, true, "A late original editor must apply the original ACK-time cut, not become a new head at settlement");
+    const cutoff = Date.now() + 3_600_000; assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), Array(count).fill(cutoff), "Only the qualified deferred result can join later native SDK tails");
+  } finally { nativeRelease.resolve(); resultRelease.resolve(); resultView.resolve(); editorGate.resolve(); await h.close(); }
+});
+
+for (const rich of [false, true]) for (const boundary of ["omitted", "editor-reject", "legacy-feedback", "legacy-result", "query-loss", "producer-loss", "sdk-loss", "app-loss", "clear", "sdk-before-ack", "sdk-after-ack", "agent-after-ack", "view-after-ack", "retained-view", "partial", "duplicate", "second-retirement", "fresh-retirement", "fresh-expiry"] as const)
+test(`Deferred feedback join refuses uncertified late ownership (Rich=${rich}/${boundary})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let producer = true, sdk = true;
+  const options = { ordinaryQueuedFeedbackParent: true as const, ordinaryDeferredFeedbackParent: boundary === "omitted" ? undefined : true as const, ordinaryReadOnlyParent: true as const, ordinaryFeedbackParent: true as const,
+    ordinaryCount: boundary === "second-retirement" ? 2 : 1, assertProducer: () => { if (!producer) throw Error("Original producer lost"); }, sdk: { isExplicitTargetAuthorized: () => sdk } };
+  const h = rich ? await richFeedbackFixture(options) : await invocationJoinFixture(options);
+  const nativeEntered = Promise.withResolvers<void>(), nativeRelease = Promise.withResolvers<void>(), editorGate = Promise.withResolvers<void>(), resultEntered = Promise.withResolvers<void>(), resultRelease = Promise.withResolvers<void>(), resultView = Promise.withResolvers<void>();
+  const journal = join(h.agentDir, "genapps", "counter", "states.jsonl"), bytes = await readFile(journal);
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!; t.mock.timers.setTime(5000); let challenge = await openLifetimeSdkHead(h.sdk); assert.ok(challenge.ok);
+    let calls = 0; const api = ordinaryParentTransport(h, async () => { if (++calls === 1) { nativeEntered.resolve(); await nativeRelease.promise; return boundary === "legacy-feedback" ? true : "edited"; } resultEntered.resolve(); await resultRelease.promise; return boundary === "legacy-result" ? true : "edited"; });
+    const native = BusApi.createTelegramButtonPublicationEditor(api);
+    h.store.bindPublicationEditor!((view, guard) => (async () => { await native(view, guard); await resultView.promise; await editorGate.promise; if (boundary === "editor-reject") throw Error("Original editor rejected"); })());
+    await nativeEntered.promise;
+    const next = ordinaryParentReplacement(h, { binding });
+    if (boundary === "partial") next.body.reply_markup!.inline_keyboard[0]!.pop();
+    if (boundary === "duplicate") next.body.reply_markup!.inline_keyboard.push(next.body.reply_markup!.inline_keyboard.at(-1)!);
+    const work = api.editMessageText(next.body).then(() => { resultView.resolve(); return true; }, () => { resultView.resolve(); return false; });
+    nativeRelease.resolve(); await Promise.race([resultEntered.promise, work]);
+    if (boundary === "sdk-before-ack") challenge = await openLifetimeSdkHead(h.sdk);
+    if (boundary === "second-retirement") { const row = h.rows.filter(r => r.action.binding)[1]!; h.store.resolve(row.key, { ...h.query, id: "second", data: row.key }); }
+    t.mock.timers.setTime(10000); resultRelease.resolve(); await work; t.mock.timers.setTime(20000);
+    let independent: ReturnType<typeof ordinaryParentReplacement> | undefined;
+    if (boundary === "agent-after-ack") {
+      independent = ordinaryParentReplacement(h, { count: 1, ordinary: false }); const { message_id: _message, ...body } = independent.body;
+      const send = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { sendMessage: async () => ({ message_id: 301 }), sendRichMessage: async () => ({ message_id: 301 }) } as unknown as TelegramBridgeApiRuntime,
+        ownsDirect: () => true, callFollowerApi: async () => assert.fail("No follower"), beginButtonPublication: h.store.beginPublication });
+      if ("rich_message" in body) await send.sendRichMessage(body); else await send.sendMessage(body);
+    }
+    if (boundary === "sdk-after-ack") challenge = await openLifetimeSdkHead(h.sdk);
+    if (boundary === "view-after-ack") await api.editMessageText({ chat_id: 42, message_id: 201, ...("rich_message" in h.body ? { rich_message: { markdown: "Another view" } } : { text: "Another view" }) });
+    if (boundary === "retained-view") await api.editMessageText({ ...next.body, ...("rich_message" in next.body ? { rich_message: { markdown: next.plan.markdown + "\nAnother view" } } : { text: next.plan.markdown + "\nAnother view" }) });
+    if (boundary === "query-loss") { const id = h.query.id; h.query.id = "lost"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
+    if (boundary === "producer-loss") producer = false;
+    if (boundary === "sdk-loss") sdk = false;
+    if (boundary === "app-loss") await writeFile(journal, Buffer.concat([bytes, Buffer.from("\n")]));
+    if (boundary === "clear") h.store.clear!();
+    if (boundary === "fresh-retirement") { const row = next.rows.find(r => r.action.completionGroup)!; h.store.resolve(row.key, { ...h.query, id: "fresh", data: row.key }); }
+    if (boundary === "fresh-expiry") { next.groups[0]!.deadline!.shorten(Date.now() + 1); t.mock.timers.tick(2); }
+    assert.ok(challenge.ok); let status: string | undefined; void challenge.handle.result.then(value => { status = value.status; });
+    let idle = false; const wait = h.store.waitForPublicationIdle!().then(() => { idle = true; }); await Promise.resolve();
+    if (!["partial", "duplicate", "legacy-feedback"].includes(boundary)) assert.equal(idle, false, "Native result completion never drains a still-running original editor");
+    t.mock.timers.setTime(30000); editorGate.resolve(); await wait;
+    assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), boundary === "fresh-expiry" ? [20_001, 86_405_000] : [86_405_000, 86_405_000], "Failed final ownership cannot publish deferred head facts");
+    if (independent) assert.deepEqual(independent.groups.map(group => group.deadline!.expiresAt), [86_420_000], "An earlier result never cuts a later independent agent head");
+    else if (boundary !== "sdk-loss") { t.mock.timers.tick(3_605_001); await Promise.resolve(); assert.notEqual(status, "expired"); }
+    producer = true; sdk = true; await writeFile(journal, bytes); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), boundary === "fresh-expiry" ? [20_001, 86_405_000] : [86_405_000, 86_405_000], "Refused late ownership must leave no fresh weak facts for a later SDK head");
+  } finally { producer = true; sdk = true; nativeRelease.resolve(); resultRelease.resolve(); resultView.resolve(); editorGate.resolve(); await writeFile(journal, bytes); await h.close(); }
+});
+
+for (const rich of [false, true])
+test(`Deferred feedback join holds while a second native view is still uncertain (Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let failures = 0;
+  const options = { ordinaryReadOnlyParent: true as const, ordinaryFeedbackParent: true as const, ordinaryQueuedFeedbackParent: true as const, ordinaryDeferredFeedbackParent: true as const,
+    afterConstruct(config: object) { Object.assign(config, { recordFailure() { failures++; } }); } };
+  const h = rich ? await richFeedbackFixture(options) : await invocationJoinFixture(options);
+  const ready = Promise.withResolvers<void>(), gate = Promise.withResolvers<void>(), view = Promise.withResolvers<void>(), editorDone = Promise.withResolvers<void>(), secondEntered = Promise.withResolvers<void>(), secondRelease = Promise.withResolvers<void>();
+  let second: Promise<unknown> | undefined;
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    let calls = 0; const api = ordinaryParentTransport(h, async () => { if (++calls === 3) { secondEntered.resolve(); await secondRelease.promise; } return "edited"; }), native = BusApi.createTelegramButtonPublicationEditor(api);
+    h.store.bindPublicationEditor!((target, guard) => { const work = (async () => { await native(target, guard); ready.resolve(); await view.promise; await gate.promise; })(); void work.then(() => editorDone.resolve(), () => editorDone.resolve()); return work; });
+    await ready.promise; const next = ordinaryParentReplacement(h, { binding }); t.mock.timers.setTime(10000); await api.editMessageText(next.body); view.resolve();
+    second = api.editMessageText({ ...next.body, ...("rich_message" in next.body ? { rich_message: { markdown: next.plan.markdown + "\nUncertain view" } } : { text: next.plan.markdown + "\nUncertain view" }) }).then(() => true, () => false); await secondEntered.promise;
+    t.mock.timers.setTime(30000); gate.resolve(); await editorDone.promise;
+    let idle = false; const idleWork = h.store.waitForPublicationIdle!().then(() => { idle = true; }); await Promise.resolve(); assert.equal(idle, false, "The second actual I/O owner retains its lane after the original editor drains");
+    assert.equal(failures, 1, "An observed second native attempt must refuse deferred membership before its uncertain ACK");
+    t.mock.timers.tick(3_585_001); await Promise.resolve(); assert.equal(ended, false);
+    secondRelease.resolve(); await second; await idleWork;
+  } finally { secondRelease.resolve(); view.resolve(); gate.resolve(); if (second) await second; await h.close(); }
+});
+
+for (const rich of [false, true])
+test(`Deferred feedback join keeps ACK-time earlier-agent snapshot (Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const options = { ordinaryReadOnlyParent: true as const, ordinaryFeedbackParent: true as const, ordinaryQueuedFeedbackParent: true as const, ordinaryDeferredFeedbackParent: true as const };
+  const h = rich ? await richFeedbackFixture(options) : await invocationJoinFixture(options), gate = Promise.withResolvers<void>(), view = Promise.withResolvers<void>();
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!;
+    const api = ordinaryParentTransport(h), native = BusApi.createTelegramButtonPublicationEditor(api), ready = Promise.withResolvers<void>();
+    h.store.bindPublicationEditor!((target, guard) => (async () => { await native(target, guard); ready.resolve(); await view.promise; await gate.promise; })()); await ready.promise;
+    t.mock.timers.setTime(7000); const independent = ordinaryParentReplacement(h, { count: 1, ordinary: false });
+    const send = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { sendMessage: async () => ({ message_id: 301 }), sendRichMessage: async () => ({ message_id: 301 }) } as unknown as TelegramBridgeApiRuntime,
+      ownsDirect: () => true, callFollowerApi: async () => assert.fail("No follower"), beginButtonPublication: h.store.beginPublication });
+    const { message_id: _message, ...body } = independent.body;if ("rich_message" in body) await send.sendRichMessage(body); else await send.sendMessage(body);
+    const next = ordinaryParentReplacement(h, { binding }); next.groups[0]!.deadline!.shorten(3_620_000);
+    t.mock.timers.setTime(10000); await api.editMessageText(next.body); view.resolve();
+    t.mock.timers.setTime(30000); gate.resolve(); await h.store.waitForPublicationIdle!();
+    assert.deepEqual(independent.groups.map(group => group.deadline!.expiresAt), [3_610_000], "Earlier agent candidates and demotion time are pinned at the original result ACK");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), [3_620_000, 3_630_000], "A shorter producer deadline never renews during deferred membership");
+  } finally { view.resolve(); gate.resolve(); await h.close(); }
+});
+
+for (const rich of [false, true])
+test(`Deferred feedback join rechecks source after original native app FS (Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const options = { ordinaryReadOnlyParent: true as const, ordinaryFeedbackParent: true as const, ordinaryQueuedFeedbackParent: true as const, ordinaryDeferredFeedbackParent: true as const };
+  const h = rich ? await richFeedbackFixture(options) : await invocationJoinFixture(options), gate = Promise.withResolvers<void>(), ready = Promise.withResolvers<void>(), view = Promise.withResolvers<void>();
+  let armed = false, observed = false; const stat = fs.lstatSync, originalQueryId = h.query.id;
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, api = ordinaryParentTransport(h), native = BusApi.createTelegramButtonPublicationEditor(api);
+    h.store.bindPublicationEditor!((target, guard) => (async () => { await native(target, guard); ready.resolve(); await view.promise; await gate.promise; })()); await ready.promise;
+    const next = ordinaryParentReplacement(h, { binding }); await api.editMessageText(next.body); view.resolve();
+    t.mock.method(fs, "lstatSync", function(...args: Parameters<typeof fs.lstatSync>) { const result = Reflect.apply(stat, fs, args); if (armed && String(args[0]).endsWith("states.jsonl")) { armed = false; observed = true; h.query.id = "lost-in-original-app-fs"; } return result; }); syncBuiltinESMExports();
+    armed = true; gate.resolve(); await h.store.waitForPublicationIdle!(); assert.equal(observed, true); h.query.id = originalQueryId;
+    assert.throws(h.dispatch.assertObservedCurrent); assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { armed = false; view.resolve(); gate.resolve(); t.mock.restoreAll(); t.mock.timers.reset(); syncBuiltinESMExports(); await h.close(); }
+});
+
+for (const phase of ["capture", "commit"] as const) for (const rich of [false, true])
+test(`Deferred feedback join fences callback-admitted newer SDK head (Rich=${rich}/${phase})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let armed = false, injected = false, later: ReturnType<typeof openLifetimeSdkHead> | undefined;
+  const options = { ordinaryReadOnlyParent: true as const, ordinaryFeedbackParent: true as const, ordinaryQueuedFeedbackParent: true as const, ordinaryDeferredFeedbackParent: true as const,
+    captureSdk(sdk: Delivery.TelegramDeliveryRuntime) { const raw = sdk.captureQuestionLifetimeOwner!()!; return Object.freeze({ ...raw,
+      captureTail(...args: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>) { const apply = Reflect.apply(raw.captureTail, raw, args); if (phase === "capture" && armed && !injected) { injected = true; later = openLifetimeSdkHead(sdk); } return apply; },
+      assertScope(value: unknown) { if (phase === "commit" && armed && !injected) { injected = true; later = openLifetimeSdkHead(sdk); } return raw.assertScope(value); }
+    }); } };
+  const h = rich ? await richFeedbackFixture(options) : await invocationJoinFixture(options), gate = Promise.withResolvers<void>(), ready = Promise.withResolvers<void>(), view = Promise.withResolvers<void>();
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const api = ordinaryParentTransport(h), native = BusApi.createTelegramButtonPublicationEditor(api);
+    h.store.bindPublicationEditor!((target, guard) => (async () => { await native(target, guard); ready.resolve(); await view.promise; await gate.promise; })()); await ready.promise;
+    const next = ordinaryParentReplacement(h, { binding }); const result = api.editMessageText(next.body); armed = phase === "capture"; await result; view.resolve(); armed = true;
+    t.mock.timers.setTime(30000); gate.resolve(); await h.store.waitForPublicationIdle!(); assert.equal(injected, true); const newest = await later!; assert.ok(newest.ok);
+    let newerEnded = false; void newest.handle.result.then(() => { newerEnded = true; }); t.mock.timers.tick(3_585_001); await Promise.resolve();
+    assert.equal(newerEnded, false, "An earlier result cannot cut the head admitted by its own callback");
+    if (phase === "commit") assert.equal(ended, false, "Only the newer SDK admission, not the earlier held ACK, may cut its predecessor");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(next.groups.map(group => group.deadline!.expiresAt), [86_401_000, 86_401_000], "Reentrant loss cannot leave deferred physical membership behind");
+  } finally { armed = false; view.resolve(); gate.resolve(); await h.close(); }
+});
+
+for (const value of [false, null, 1, "yes"])
+test(`Deferred feedback join validates private policy (${String(value)})`, () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true, ordinaryQueuedFeedbackParent: true, ordinaryDeferredFeedbackParent: value } as unknown as Parameters<typeof OutboundButtons.createTelegramButtonActionStore>[0]), /Deferred feedback ordinary parent/u);
+});
+test("Deferred feedback join requires original queued projection ownership", () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true, ordinaryDeferredFeedbackParent: true } as Parameters<typeof OutboundButtons.createTelegramButtonActionStore>[0]), /Deferred feedback ordinary parent/u);
+});
+
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const count of [1, 2]) for (const stage of ["native-pending", "editor-pending"] as const)
+test(`Queued feedback join pins one original projection before callbacks (Thread=${threaded}/Rich=${rich}/heads=${count}/stage=${stage})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const options = { threaded, count, ordinaryQueuedFeedbackParent: true as const, ordinaryReadOnlyParent: true as const, ordinaryFeedbackParent: true as const };
+  const h = rich ? await richFeedbackFixture(options) : await invocationJoinFixture(options);
+  const feedbackEntered = Promise.withResolvers<void>(), nativeRelease = Promise.withResolvers<void>(), editorGate = Promise.withResolvers<void>(), editorReady = Promise.withResolvers<void>(), editorDone = Promise.withResolvers<void>(), resultEntered = Promise.withResolvers<void>(), resultRelease = Promise.withResolvers<void>();
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    let calls = 0; const api = ordinaryParentTransport(h, async () => { if (++calls === 1) { feedbackEntered.resolve(); await nativeRelease.promise; } else { resultEntered.resolve(); await resultRelease.promise; } return "edited"; });
+    const native = BusApi.createTelegramButtonPublicationEditor(api);
+    h.store.bindPublicationEditor!((view, guard) => { const work = (async () => { await native(view, guard); editorReady.resolve(); await editorGate.promise; })(); void work.then(() => editorDone.resolve()); return work; });
+    await feedbackEntered.promise;
+    if (stage === "editor-pending") { nativeRelease.resolve(); await editorReady.promise; }
+    const next = ordinaryParentReplacement(h, { binding, count }), work = api.editMessageText(next.body);
+    nativeRelease.resolve(); await resultEntered.promise; editorGate.resolve(); await editorDone.promise;
+    Object.defineProperty(h.config, "ordinaryQueuedFeedbackParent", { value: false });
+    resultRelease.resolve(); await work; await h.store.waitForPublicationIdle!();
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true, "The original queued projection, not a current-view lookup, must authorize this drained-by-result-ACK subset");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), Array(count).fill(7_201_000));
+  } finally { nativeRelease.resolve(); editorGate.resolve(); resultRelease.resolve(); await h.close(); }
+});
+
+
+for (const rich of [false, true]) for (const boundary of ["omitted", "late-editor", "legacy-feedback", "legacy-result", "query-loss", "clear", "sdk-native-pending", "sdk-result-pending", "agent-head", "partial", "duplicate", "second-retirement"] as const)
+test(`Queued feedback join refuses uncertainty or an intervening original head (Rich=${rich}/${boundary})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const options = { ordinaryQueuedFeedbackParent: boundary === "omitted" ? undefined : true as const, ordinaryReadOnlyParent: true as const, ordinaryFeedbackParent: true as const, ordinaryCount: boundary === "second-retirement" ? 2 : 1 };
+  const h = rich ? await richFeedbackFixture(options) : await invocationJoinFixture(options);
+  const feedbackEntered = Promise.withResolvers<void>(), nativeRelease = Promise.withResolvers<void>(), editorGate = Promise.withResolvers<void>(), editorDone = Promise.withResolvers<void>(), resultEntered = Promise.withResolvers<void>(), resultRelease = Promise.withResolvers<void>();
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!; let prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false;
+    let calls = 0; const api = ordinaryParentTransport(h, async () => { if (++calls === 1) { feedbackEntered.resolve(); await nativeRelease.promise; return boundary === "legacy-feedback" ? true : "edited"; } resultEntered.resolve(); await resultRelease.promise; return boundary === "legacy-result" ? true : "edited"; });
+    const native = BusApi.createTelegramButtonPublicationEditor(api);
+    h.store.bindPublicationEditor!((view, guard) => { const work = (async () => { await native(view, guard); await editorGate.promise; })(); void work.then(() => editorDone.resolve(), () => editorDone.resolve()); return work; });
+    await feedbackEntered.promise;
+    const next = ordinaryParentReplacement(h, { binding });
+    if (boundary === "partial") next.body.reply_markup!.inline_keyboard[0]!.pop();
+    if (boundary === "duplicate") next.body.reply_markup!.inline_keyboard.push(next.body.reply_markup!.inline_keyboard.at(-1)!);
+    const work = api.editMessageText(next.body).then(() => true, () => false);
+    if (boundary === "sdk-native-pending") prior = await openLifetimeSdkHead(h.sdk);
+    if (boundary === "second-retirement") { const row = h.rows.filter(r => r.action.binding)[1]!; h.store.resolve(row.key, { ...h.query, id: "second", data: row.key }); }
+    nativeRelease.resolve(); await Promise.race([resultEntered.promise, work]);
+    if (boundary === "sdk-result-pending") prior = await openLifetimeSdkHead(h.sdk);
+    let independent: ReturnType<typeof ordinaryParentReplacement> | undefined;
+    if (boundary === "agent-head") {
+      independent = ordinaryParentReplacement(h, { binding });
+      const send = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { sendMessage: async () => ({ message_id: 301 }), sendRichMessage: async () => ({ message_id: 301 }) } as unknown as TelegramBridgeApiRuntime,
+        ownsDirect: () => true, callFollowerApi: async () => assert.fail("No follower"), beginButtonPublication: h.store.beginPublication });
+      const { message_id: _message, ...body } = independent.body;
+      if ("rich_message" in body) await send.sendRichMessage(body); else await send.sendMessage(body);
+    }
+    if (boundary === "query-loss") { const id = h.query.id; h.query.id = "lost"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
+    if (boundary === "clear") h.store.clear!();
+    assert.ok(prior.ok); void prior.handle.result.then(() => { ended = true; });
+    if (boundary !== "late-editor") { editorGate.resolve(); await editorDone.promise; }
+    resultRelease.resolve(); await work; editorGate.resolve(); await h.store.waitForPublicationIdle!();
+    if (independent) assert.deepEqual(independent.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000], "An earlier queued publication must not cut a newer independent agent head");
+    else { t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false); }
+  } finally { nativeRelease.resolve(); editorGate.resolve(); resultRelease.resolve(); await h.close(); }
+});
+
+for (const kind of ["sdk", "agent"] as const)
+test(`Queued feedback join snapshots earlier heads before fence callbacks (${kind})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let armed = false, injected = false, inject: (() => void) | undefined;
+  const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true, ordinaryQueuedFeedbackParent: true,
+    captureSdk(sdk) { const raw = sdk.captureQuestionLifetimeOwner!(); if (!raw) return raw;
+      return Object.freeze({ ...raw,
+        assertAdmission(value: unknown) { if (kind === "sdk" && armed && !injected) { injected = true; inject!(); } return raw.assertAdmission!(value); },
+        assertScope(value: unknown) { if (kind === "agent" && armed && !injected) { injected = true; inject!(); } return raw.assertScope(value); }
+      }); }
+  });
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!;
+    const api = ordinaryParentTransport(h, async () => { entered.resolve(); await release.promise; return "edited"; });
+    h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(api)); await entered.promise;
+    const next = ordinaryParentReplacement(h, { binding }), work = api.editMessageText(next.body).then(() => true, () => false);
+    const independent = ordinaryParentReplacement(h, { count: 1, ordinary: false });
+    const { message_id: _message, ...body } = independent.body;
+    const finish = h.store.beginPublication!("sendMessage", body)!; assert.ok(finish);
+    finish.assertPublicationBody!({ ...body, reply_markup: finish.prepareReplyMarkup!() });
+    let later: ReturnType<typeof openLifetimeSdkHead> | undefined;
+    if (kind === "sdk") { inject = () => { finish({ message_id: 301 }, true); }; armed = true; const incoming = await openLifetimeSdkHead(h.sdk); assert.ok(incoming.ok); }
+    else { inject = () => { later = openLifetimeSdkHead(h.sdk); }; armed = true; finish({ message_id: 301 }, true); }
+    assert.equal(injected, true);
+    if (kind === "sdk") assert.deepEqual(independent.groups.map(g => g.deadline!.expiresAt), [86_401_000], "An older SDK admission must not cut the agent head created inside its fence callback");
+    else { const latest = await later!; assert.ok(latest.ok); let ended = false; void latest.handle.result.then(() => { ended = true; }); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "An earlier agent ACK must not recapture the SDK head created by its fence callback"); }
+    release.resolve(); await work; await h.store.waitForPublicationIdle!();
+  } finally { release.resolve(); await h.close(); }
+});
+
+for (const value of [false, null, 1, "yes"])
+test(`Queued feedback join validates private policy (${String(value)})`, () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true, ordinaryQueuedFeedbackParent: value } as unknown as Parameters<typeof OutboundButtons.createTelegramButtonActionStore>[0]), /Queued feedback ordinary parent/u);
+});
+test("Queued feedback join requires original projection ownership", () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: true, ordinaryQueuedFeedbackParent: true } as Parameters<typeof OutboundButtons.createTelegramButtonActionStore>[0]), /Queued feedback ordinary parent/u);
+});
+
+for (const threaded of [false, true]) for (const ordinaryCount of [1, 2])
+test(`Native feedback parent adopts only an owned drained HTML projection (Thread=${threaded}/ordinary=${ordinaryCount})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await invocationJoinFixture({ threaded, ordinaryCount, ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true });
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, api = ordinaryParentTransport(h);
+    Object.defineProperty(h.config, "ordinaryFeedbackParent", { value: false });
+    h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(api)); await h.store.waitForPublicationIdle!();
+    const next = ordinaryParentReplacement(h, { binding }), prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true, "Owned native feedback ACK must preserve exact original semantic/physical parent identity");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [7_201_000, 7_201_000]);
+  } finally { await h.close(); }
+});
+for (const terminal of ["question", "unused-deadline"] as const)
+test(`Native feedback parent preserves existing finite non-app cleanup (${terminal})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await liveOrdinaryHarness({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true, ...(terminal === "unused-deadline" ? { ordinaryExpiresAt: 1500 } : {}) });
+  try {
+    await h.publish(); h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(ordinaryParentTransport(h)));
+    if (terminal === "question") { const selected = h.rows.find(row => row.action.completionGroup)!; assert.ok(h.store.resolve(selected.key, { ...ordinaryDispatchQuery(h), data: selected.key })); }
+    else t.mock.timers.tick(500);
+    await h.store.waitForPublicationIdle!(); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(h.groups.slice(terminal === "question" ? 1 : 0).map(g => g.deadline!.expiresAt), Array(terminal === "question" ? 1 : 2).fill(Date.now() + 3_600_000));
+  } finally { await h.close(); }
+});
+for (const boundary of ["omitted", "legacy-ack", "void-editor", "cloned-carrier", "wrong-roster", "rich", "query-loss", "clear"] as const)
+test(`Native feedback parent holds unsupported projection (${boundary})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await invocationJoinFixture({ rich: boundary === "rich", ordinaryReadOnlyParent: true, ordinaryFeedbackParent: boundary === "omitted" ? undefined : true });
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false;
+    void prior.handle.result.then(() => { ended = true; }); let edits = 0;
+    const api = ordinaryParentTransport(h, async () => boundary === "legacy-ack" && ++edits === 1 ? true : "edited");
+    const native = BusApi.createTelegramButtonPublicationEditor(api);
+    h.store.bindPublicationEditor!(async (view, guard) => {
+      if (boundary === "void-editor") return;
+      if (boundary === "cloned-carrier") return native({ ...view, replyMarkup: structuredClone(view.replyMarkup) }, guard);
+      if (boundary === "wrong-roster") view.replyMarkup!.inline_keyboard[0]!.pop();
+      await native(view, guard);
+    }); await h.store.waitForPublicationIdle!();
+    if (boundary === "query-loss") { const id = h.query.id; h.query.id = "lost"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
+    if (boundary === "clear") h.store.clear!();
+    const next = ordinaryParentReplacement(h, { binding }); await api.editMessageText(next.body);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { await h.close(); }
+});
+test("Native feedback parent cannot rebase its proof after another native edit", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true });
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, api = ordinaryParentTransport(h);
+    h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(api)); await h.store.waitForPublicationIdle!();
+    await api.editMessageReplyMarkup(42, 201, h.plan.replyMarkup!);
+    const next = ordinaryParentReplacement(h, { binding }), prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { await h.close(); }
+});
+test("Native feedback parent seals the actual prepared callback carrier", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true });
+  try {
+    await h.run(); let sealed = false;
+    const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { editMessageReplyMarkup: async (_chatId: number, _messageId: number, markup: OutboundButtons.TelegramOutboundButtonMarkup) => {
+      sealed = Object.getOwnPropertyDescriptor(markup, "toJSON")?.value === undefined && markup.inline_keyboard.every(row => Object.isFrozen(row) && row.every(button => Object.getOwnPropertyDescriptor(button, "callback_data")?.writable === false));
+      return "edited";
+    } } as unknown as TelegramBridgeApiRuntime, ownsDirect: () => true, callFollowerApi: async () => assert.fail("No follower fallback"), beginButtonPublication: h.store.beginPublication });
+    h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(api)); await h.store.waitForPublicationIdle!(); assert.equal(sealed, true);
+  } finally { await h.close(); }
+});
+test("Native feedback parent observes original app loss through native FS before recording", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true });
+  try {
+    await h.run(); await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment" });
+    h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(ordinaryParentTransport(h))); await h.store.waitForPublicationIdle!();
+    assert.throws(h.dispatch.assertObservedCurrent);
+  } finally { await h.close(); }
+});
+test("Native feedback parent retains editor work after its native ACK and refuses early adoption", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true }), acknowledged = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, api = ordinaryParentTransport(h), native = BusApi.createTelegramButtonPublicationEditor(api);
+    h.store.bindPublicationEditor!(async (view, guard) => { await native(view, guard); acknowledged.resolve(); await release.promise; });
+    await acknowledged.promise; let idle = false; void h.store.waitForPublicationIdle!().then(() => { idle = true; }); await Promise.resolve(); assert.equal(idle, false);
+    const next = ordinaryParentReplacement(h, { binding }), prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await api.editMessageText(next.body); release.resolve(); await h.store.waitForPublicationIdle!(); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { release.resolve(); await h.close(); }
+});
+test("Native feedback parent keeps a begin-before-feedback result held after the preimage changes", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true, ordinaryFeedbackParent: true }), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!; let calls = 0;
+    const api = ordinaryParentTransport(h, async () => { if (++calls === 1) { entered.resolve(); await release.promise; } return "edited"; });
+    h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(api)); await entered.promise;
+    const next = ordinaryParentReplacement(h, { binding }), prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const result = api.editMessageText(next.body); release.resolve(); await result; await h.store.waitForPublicationIdle!(); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { release.resolve(); await h.close(); }
+});
+for (const value of [false, null, 1, "yes"])
+test(`Native feedback parent validates policy (${String(value)})`, () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: true, ordinaryFeedbackParent: value } as unknown as Parameters<typeof OutboundButtons.createTelegramButtonActionStore>[0]), /Feedback ordinary parent/u);
+});
+test("Native feedback parent requires the closed native read-only parent policy", () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: true, ordinaryFeedbackParent: true } as Parameters<typeof OutboundButtons.createTelegramButtonActionStore>[0]), /Feedback ordinary parent/u);
+});
+
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const count of [1, 2])
+test(`Read-only consumed parent qualifies one exact untouched native footer (Thread=${threaded}/Rich=${rich}/heads=${count})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await invocationJoinFixture({ threaded, rich, count, ordinaryReadOnlyParent: true });
+  try {
+    Object.defineProperty(h.config, "ordinaryReadOnlyParent", { value: false });
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, next = ordinaryParentReplacement(h, { count, binding });
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await ordinaryParentTransport(h).editMessageText(next.body);
+    assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), Array(count).fill(86_401_000));
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true, "Exact completed original row must qualify this unchanged whole-parent transition");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), Array(count).fill(7_201_000), "Fresh heads retain original physical ancestry without retaining a consumed semantic row");
+    assert.equal(h.dispatch.takeInvocation!(), undefined);
+    assert.equal(h.store.resolve(h.query.data), undefined);
+  } finally { await h.close(); }
+});
+test("Read-only consumed parent distinguishes consumed source from live ordinary siblings", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true, ordinaryCount: 2 });
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, next = ordinaryParentReplacement(h, { binding }), prior = await openLifetimeSdkHead(h.sdk);
+    assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await ordinaryParentTransport(h).editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true);
+    assert.ok(h.rows.every(row => h.store.resolve(row.key) === undefined));
+  } finally { await h.close(); }
+});
+test("Read-only consumed parent refuses a second retired ordinary peer", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true, ordinaryCount: 2 });
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, sibling = h.rows.filter(row => row.action.binding)[1]!;
+    assert.ok(h.store.resolve(sibling.key, { ...h.query, id: "sibling", data: sibling.key }));
+    const next = ordinaryParentReplacement(h, { binding }), prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    await ordinaryParentTransport(h).editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { await h.close(); }
+});
+for (const boundary of ["omitted", "unrelated-result", "same-binding", "mixed-fresh-binding", "no-ordinary", "source-query", "clear", "partial", "duplicate", "unknown-ack", "expired-parent", "state-write"] as const)
+test(`Read-only consumed parent holds unsupported proof (${boundary})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await invocationJoinFixture({ ordinaryReadOnlyParent: boundary === "omitted" ? undefined : true, ...(boundary === "state-write" ? { ordinaryPrompt: "counter::increment" } : {}) });
+  try {
+    const result = boundary === "state-write"
+      ? await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment", callbackWorkerDrain: true, callbackBinding: h.nativeBinding, callbackInvocation: h.invocation })
+      : await h.run();
+    let binding = GenerativeApps.getGenerativeAppCallbackBinding(result)!;
+    if (boundary === "unrelated-result") binding = GenerativeApps.getGenerativeAppCallbackBinding(await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding }))!;
+    if (boundary === "same-binding") binding = h.nativeBinding;
+    const next = ordinaryParentReplacement(h, { binding, ordinary: boundary !== "no-ordinary" }), prior = await openLifetimeSdkHead(h.sdk);
+    assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    if (boundary === "clear") h.store.clear!();
+    if (boundary === "partial") next.body.reply_markup!.inline_keyboard[0]!.pop();
+    if (boundary === "duplicate") next.body.reply_markup!.inline_keyboard.push(next.body.reply_markup!.inline_keyboard.at(-1)!);
+    if (boundary === "mixed-fresh-binding") {
+      const other = GenerativeApps.getGenerativeAppCallbackBinding(await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect", callbackWorkerDrain: true, callbackBinding: h.nativeBinding }))!;
+      const key = h.store.register({ text: "Foreign peer", prompt: "counter::inspect", binding: other }); next.body.reply_markup!.inline_keyboard.push([{ text: "Other", callback_data: key }]);
+    }
+    const api = ordinaryParentTransport(h, async () => {
+      if (boundary === "source-query") { const id = h.query.id; h.query.id = "lost"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
+      if (boundary === "expired-parent") t.mock.timers.tick(86_400_000);
+      return boundary === "unknown-ack" ? true : "edited";
+    });
+    await api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve();
+    if (boundary !== "expired-parent") assert.equal(ended, false);
+    if (boundary !== "clear" && boundary !== "expired-parent") {
+      assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+      assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+    }
+  } finally { await h.close(); }
+});
+test("Read-only consumed parent refuses a preimage changed while waiting behind native feedback", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true }), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, next = ordinaryParentReplacement(h, { binding }), prior = await openLifetimeSdkHead(h.sdk);
+    assert.ok(prior.ok); let ended = false, calls = 0; void prior.handle.result.then(() => { ended = true; });
+    const api = ordinaryParentTransport(h, async () => { if (++calls === 1) { entered.resolve(); await release.promise; } return "edited"; });
+    const feedback = api.editMessageReplyMarkup(42, 201, h.plan.replyMarkup!); await entered.promise;
+    const replacement = api.editMessageText(next.body); await Promise.resolve(); assert.equal(calls, 1);
+    release.resolve(); await Promise.all([feedback, replacement]); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { release.resolve(); await h.close(); }
+});
+for (const loss of ["query", "old-ordinary", "physical", "new-ordinary", "clear"] as const)
+test(`Read-only consumed parent retains late SDK-provider loss (${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onMetadata: (() => void) | undefined, allowed = true;
+  const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true, sdk: { getConfirmationAuthority() { onMetadata?.(); return { profile: "default", operatorId: 42 }; }, isExplicitTargetAuthorized: () => allowed },
+    captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return owner; } });
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, next = ordinaryParentReplacement(h, { binding }), prior = await openLifetimeSdkHead(h.sdk);
+    assert.ok(prior.ok); let ended = false, observed = false, clearRefused = true; void prior.handle.result.then(() => { ended = true; });
+    const api = ordinaryParentTransport(h, async () => { onMetadata = () => {
+      onMetadata = undefined; observed = true;
+      if (loss === "clear") { h.store.clear!(); try { h.dispatch.assertObservedCurrent(); clearRefused = false; } catch { /* Original transition row must already be revoked. */ } }
+      else if (loss === "query") { const id = h.query.id; h.query.id = "lost"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
+      else { allowed = false; assert.throws(owners[loss === "physical" ? 0 : loss === "old-ordinary" ? 2 : 5]!.assertCurrent); allowed = true; }
+    }; return "edited"; });
+    await api.editMessageText(next.body); assert.equal(observed, true); assert.equal(clearRefused, true); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { await h.close(); }
+});
+test("Read-only consumed parent source history follows original native app I/O before the final data barrier", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await invocationJoinFixture({ ordinaryReadOnlyParent: true });
+  let armed = false, observed = false; const stat = fs.lstatSync;
+  try {
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, next = ordinaryParentReplacement(h, { binding }), prior = await openLifetimeSdkHead(h.sdk);
+    assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    t.mock.method(fs, "lstatSync", function (...args: Parameters<typeof fs.lstatSync>) {
+      const result = Reflect.apply(stat, fs, args);
+      if (armed && String(args[0]).endsWith("states.jsonl")) { armed = false; observed = true; const id = h.query.id; h.query.id = "lost-after-fs"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
+      return result;
+    }); syncBuiltinESMExports();
+    await ordinaryParentTransport(h, async () => { armed = true; return "edited"; }).editMessageText(next.body);
+    assert.equal(observed, true); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { t.mock.restoreAll(); t.mock.timers.reset(); syncBuiltinESMExports(); await h.close(); }
+});
+for (const value of [false, null, 1, "yes"])
+test(`Read-only consumed parent validates private policy (${String(value)})`, () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryCallbackDispatch: true, ordinaryReadOnlyParent: value } as unknown as Parameters<typeof OutboundButtons.createTelegramButtonActionStore>[0]), /Read-only ordinary parent/u);
+});
+test("Read-only consumed parent requires original native dispatch policy", () => {
+  assert.throws(() => OutboundButtons.createTelegramButtonActionStore({ ordinaryReadOnlyParent: true } as Parameters<typeof OutboundButtons.createTelegramButtonActionStore>[0]), /Read-only ordinary parent/u);
+});
+
+function ordinaryParentReplacement(h: Awaited<ReturnType<typeof liveOrdinaryHarness>>, options: { count?: number; binding?: GenerativeApps.GenerativeAppCallbackBinding; ordinary?: boolean } = {}) {
+  const rows: { key: string; action: OutboundButtons.TelegramOutboundButtonAction }[] = [];
+  const text = Array.from({ length: options.count ?? 2 }, (_, i) => `<!-- telegram_confirm "Replacement ${i}" -->`).join("\n") +
+    (options.ordinary === false ? "" : '\n<!-- telegram_button {Run|counter::increment} -->');
+  const plan = OutboundButtons.planTelegramButtonReply(text, { questionHeadTail: true, rendering: "rich_message" in h.body ? "rich" : "html", binding: options.binding ?? h.nativeBinding,
+    registerAction(action) { const key = h.store.register(action); rows.push({ key, action }); return key; } });
+  const groups = [...new Set(rows.flatMap(row => row.action.completionGroup ? [row.action.completionGroup] : []))];
+  const body = { chat_id: 42, message_id: 201, ...("rich_message" in h.body ? { rich_message: { markdown: plan.markdown } } : { text: plan.markdown }), reply_markup: plan.replyMarkup };
+  return { plan, rows, groups, body };
+}
+function ordinaryParentTransport(h: Awaited<ReturnType<typeof liveOrdinaryHarness>>, edit: () => Promise<boolean | "edited" | "unchanged"> = async () => "edited") {
+  return BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { editMessageText: edit, editMessageReplyMarkup: edit } as unknown as TelegramBridgeApiRuntime,
+    ownsDirect: () => true, callFollowerApi: async () => assert.fail("No follower fallback"), beginButtonPublication: h.store.beginPublication });
+}
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const count of [1, 2])
+test(`Live ordinary parent edits retain original whole-roster reciprocity (Thread=${threaded}/Rich=${rich}/heads=${count})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness({ threaded, rich, count });
+  try {
+    await h.publish(); const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const next = ordinaryParentReplacement(h, { count }), api = ordinaryParentTransport(h); await api.editMessageText(next.body);
+    assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), Array(count).fill(86_401_000));
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), Array(count).fill(7_201_000));
+    assert.equal(h.captures(), 2 * (count + 1)); assert.equal(h.appCaptures(), 2);
+    assert.ok(h.rows.every(row => h.store.resolve(row.key) === undefined)); assert.ok(next.rows.filter(row => row.action.completionGroup).every(row => row.action.binding === undefined));
+  } finally { await h.close(); }
+});
+for (const loss of ["parent-ordinary", "parent-question", "physical", "new-ordinary"] as const)
+test(`Live ordinary parent final SDK metadata cannot leave replacement weak facts (${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onMetadata: (() => void) | undefined, allowed = true;
+  const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await liveOrdinaryHarness({ sdk: { getConfirmationAuthority() { onMetadata?.(); return { profile: "default", operatorId: 42 }; }, isExplicitTargetAuthorized: () => allowed },
+    captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return owner; } });
+  try {
+    await h.publish(); const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const next = ordinaryParentReplacement(h), index = loss === "parent-ordinary" ? 2 : loss === "parent-question" ? 1 : loss === "physical" ? 0 : 5;
+    const api = ordinaryParentTransport(h, async () => { onMetadata = () => { onMetadata = undefined; allowed = false; assert.throws(owners[index]!.assertCurrent); allowed = true; }; return "edited"; });
+    await api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { await h.close(); }
+});
+
+for (const boundary of ["consumed", "deadline", "owner-revision", "unknown-ack", "untracked-parent", "partial-new", "duplicate-new", "foreign-new-sdk"] as const)
+test(`Live ordinary parent keeps unsupported original transitions held (${boundary})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const foreign = createLifetimeSdk({ chatId: 42 }); let captures = 0, replacing = false;
+  const h = await liveOrdinaryHarness({ captureSdk(sdk) { captures++; return boundary === "foreign-new-sdk" && replacing && captures === 6 ? foreign.captureQuestionLifetimeOwner!() : sdk.captureQuestionLifetimeOwner!(); } });
+  try {
+    await h.publish(); const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    if (boundary === "consumed") assert.ok(h.store.resolve(h.rows.find(row => row.action.binding)!.key));
+    if (boundary === "deadline") t.mock.timers.setTime(86_401_001);
+    let binding = h.nativeBinding;
+    if (boundary === "owner-revision") { const result = await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment", onOwnerObserved: h.store.observeAppOwner }); binding = GenerativeApps.getGenerativeAppCallbackBinding(result); }
+    replacing = true; const next = ordinaryParentReplacement(h, { binding });
+    if (boundary === "untracked-parent") {
+      const fresh = ordinaryParentTransport(h); await fresh.editMessageText({ chat_id: 42, message_id: 201, text: "Unknown", reply_markup: { inline_keyboard: [[{ text: "Unknown", callback_data: "tgbtn:unknown" }]] } });
+    }
+    if (boundary === "partial-new") next.body.reply_markup!.inline_keyboard[0]!.splice(0, 1);
+    if (boundary === "duplicate-new") next.body.reply_markup!.inline_keyboard.push([...next.body.reply_markup!.inline_keyboard[0]!]);
+    await ordinaryParentTransport(h, async () => boundary === "unknown-ack" ? true : "edited").editMessageText(next.body);
+    if (boundary !== "deadline") { t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false); }
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.ok(next.groups.every(g => g.deadline!.expiresAt > Date.now() + 3_600_000));
+  } finally { foreign.shutdown(); await h.close(); }
+});
+for (const index of [0, 1, 2])
+test(`Live ordinary parent final app I/O retains original parent SDK loss (${index})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let allowed = true, armed = false, observed = false;
+  const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await liveOrdinaryHarness({ sdk: { isExplicitTargetAuthorized: () => allowed }, captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return owner; } });
+  const stat = fs.lstatSync;
+  try {
+    await h.publish(); const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const next = ordinaryParentReplacement(h); t.mock.method(fs, "lstatSync", (...args: unknown[]) => {
+      const result = Reflect.apply(stat, fs, args); if (armed && !observed && String(args[0]).endsWith("states.jsonl")) { observed = true; allowed = false; assert.throws(owners[index]!.assertCurrent); allowed = true; } return result;
+    }); syncBuiltinESMExports();
+    await ordinaryParentTransport(h, async () => { armed = true; return "edited"; }).editMessageText(next.body); assert.equal(observed, true);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { t.mock.restoreAll(); t.mock.timers.reset(); syncBuiltinESMExports(); await h.close(); }
+});
+test("Live ordinary parent tail keeps the first physical SDK history after app I/O", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let allowed = true, armed = false, observed = false;
+  const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await liveOrdinaryHarness({ sdk: { isExplicitTargetAuthorized: () => allowed }, captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return owner; } }), stat = fs.lstatSync;
+  try {
+    await h.publish(); const next = ordinaryParentReplacement(h); await ordinaryParentTransport(h).editMessageText(next.body);
+    t.mock.method(fs, "lstatSync", (...args: unknown[]) => { const result = Reflect.apply(stat, fs, args); if (armed && !observed && String(args[0]).endsWith("states.jsonl")) { observed = true; allowed = false; assert.throws(owners[0]!.assertCurrent); allowed = true; } return result; }); syncBuiltinESMExports();
+    armed = true; assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(observed, true);
+    assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]); assert.ok(owners.slice(3).every(owner => { owner.assertCurrent(); return true; }));
+  } finally { t.mock.restoreAll(); t.mock.timers.reset(); syncBuiltinESMExports(); await h.close(); }
+});
+test("Live ordinary parent rechecks an old app removed by a different native app after SDK metadata", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onMetadata: (() => void) | undefined;
+  const h = await liveOrdinaryHarness({ sdk: { getConfirmationAuthority() { onMetadata?.(); return { profile: "default", operatorId: 42 }; } } });
+  try {
+    await h.publish(); const script = join(h.folder, "other.mjs"); await writeFile(script, await readFile(join(h.folder, "counter.mjs")));
+    const result = await GenerativeApps.installGenerativeApp({ agentDir: h.agentDir, app: "other", script });
+    const binding = GenerativeApps.getGenerativeAppCallbackBinding(result), prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const next = ordinaryParentReplacement(h, { binding });
+    await ordinaryParentTransport(h, async () => { onMetadata = () => { onMetadata = undefined; fs.appendFileSync(join(h.agentDir, "genapps", "counter", "states.jsonl"), "\n"); }; return "edited"; }).editMessageText(next.body);
+    binding.assertCurrent!(); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { await h.close(); }
+});
+for (const ordinary of [false, true])
+test(`Live ordinary parent can move a native live footer between mixed and pure (${ordinary})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness();
+  try {
+    await h.publish(); const api = ordinaryParentTransport(h), pure = ordinaryParentReplacement(h, { ordinary: false }); await api.editMessageText(pure.body);
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const next = ordinaryParentReplacement(h, { ordinary }); await api.editMessageText(next.body);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [7_201_000, 7_201_000]);
+  } finally { await h.close(); }
+});
+test("Live ordinary parent logical clear retains actual native edit drain", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  try {
+    await h.publish(); const next = ordinaryParentReplacement(h), editing = ordinaryParentTransport(h, async () => { entered.resolve(); await release.promise; return "edited"; }).editMessageText(next.body);
+    await entered.promise; h.store.clear!(); let idle = false; void h.store.waitForPublicationIdle!().then(() => { idle = true; }); await Promise.resolve(); assert.equal(idle, false);
+    release.resolve(); await editing; await h.store.waitForPublicationIdle!(); await Promise.resolve(); assert.equal(idle, true);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { release.resolve(); await h.close(); }
+});
+
+test("Live ordinary parent repeated edits do not renew the first physical SDK owner", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let allowed = true;
+  const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await liveOrdinaryHarness({ sdk: { isExplicitTargetAuthorized: () => allowed }, captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return owner; } });
+  try {
+    await h.publish(); const api = ordinaryParentTransport(h), one = ordinaryParentReplacement(h); await api.editMessageText(one.body);
+    const two = ordinaryParentReplacement(h); await api.editMessageText(two.body); allowed = false; assert.throws(owners[0]!.assertCurrent); allowed = true;
+    assert.ok(owners.slice(3).every(owner => { owner.assertCurrent(); return true; })); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(two.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { await h.close(); }
+});
+test("Live ordinary parent holds original app loss between ACK and final native authority with equal-field replacement", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let armed = false, observed = false, poisonOld = false;
+  const h = await liveOrdinaryHarness(), stat = fs.lstatSync;
+  try {
+    await h.publish(); const result = await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect" }), binding = GenerativeApps.getGenerativeAppCallbackBinding(result);
+    const old = GenerativeApps.captureGenerativeAppCallbackOwner(h.nativeBinding)!; assert.notEqual(binding, h.nativeBinding);
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const next = ordinaryParentReplacement(h, { binding });
+    t.mock.method(fs, "lstatSync", (...args: unknown[]) => { const result = Reflect.apply(stat, fs, args);
+      if (poisonOld) assert.throws(old.assertCurrent);
+      else if (armed && !observed && String(args[0]).endsWith("states.jsonl")) { observed = true; poisonOld = true; try { assert.throws(old.assertCurrent); } finally { poisonOld = false; } } return result; }); syncBuiltinESMExports();
+    await ordinaryParentTransport(h, async () => { armed = true; return "edited"; }).editMessageText(next.body); assert.equal(observed, true); binding.assertCurrent!();
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { t.mock.restoreAll(); t.mock.timers.reset(); syncBuiltinESMExports(); await h.close(); }
+});
+
+test("Live ordinary parent pending SDK transition guards reentrant agent cuts after app I/O", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onMetadata: (() => void) | undefined, allowed = true, armed = false, observed = false;
+  const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await liveOrdinaryHarness({ sdk: { getConfirmationAuthority() { onMetadata?.(); return { profile: "default", operatorId: 42 }; }, isExplicitTargetAuthorized: () => allowed },
+    captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return owner; } }), stat = fs.lstatSync;
+  try {
+    await h.publish(); const next = ordinaryParentReplacement(h);
+    t.mock.method(fs, "lstatSync", (...args: unknown[]) => { const result = Reflect.apply(stat, fs, args);
+      if (armed && !observed && String(args[0]).endsWith("states.jsonl")) { observed = true; allowed = false; assert.throws(owners[2]!.assertCurrent); allowed = true; } return result; }); syncBuiltinESMExports();
+    await ordinaryParentTransport(h, async () => { onMetadata = () => {
+      onMetadata = undefined; const newer = ordinaryParentReplacement(h, { ordinary: false }), { message_id: _id, ...body } = newer.body;
+      const finish = h.store.beginPublication!("sendMessage", body)!; const actual = { ...body, reply_markup: finish.prepareReplyMarkup!() }; finish.assertPublicationBody!(actual);
+      armed = true; finish({ message_id: 202 }, true);
+    }; return "edited"; }).editMessageText(next.body);
+    assert.equal(observed, true); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { t.mock.restoreAll(); t.mock.timers.reset(); syncBuiltinESMExports(); await h.close(); }
+});
+
+test("Live ordinary parent revalidates old SDK history before a later agent-tail cut", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let allowed = true, afterSdk = false, observed = false, armAfterSdk = false;
+  const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await liveOrdinaryHarness({ sdk: { isExplicitTargetAuthorized: () => allowed }, captureSdk(sdk) {
+    const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return Object.freeze({ ...owner, captureTail(cohort: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) {
+      const apply = owner.captureTail(cohort); return () => { apply(); if (armAfterSdk) afterSdk = true; };
+    } });
+  } }), stat = fs.lstatSync;
+  try {
+    await h.publish(); const older = ordinaryParentReplacement(h, { ordinary: false }), { message_id: _id, ...body } = older.body;
+    const finish = h.store.beginPublication!("sendMessage", body)!; finish.assertPublicationBody!({ ...body, reply_markup: finish.prepareReplyMarkup!() }); finish({ message_id: 202 }, true);
+    const next = ordinaryParentReplacement(h); t.mock.method(fs, "lstatSync", (...args: unknown[]) => { const result = Reflect.apply(stat, fs, args);
+      if (afterSdk && !observed && String(args[0]).endsWith("states.jsonl")) { observed = true; allowed = false; assert.throws(owners[2]!.assertCurrent); allowed = true; } return result; }); syncBuiltinESMExports();
+    armAfterSdk = true; await ordinaryParentTransport(h).editMessageText(next.body); assert.equal(observed, true);
+    assert.deepEqual(older.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { t.mock.restoreAll(); t.mock.timers.reset(); syncBuiltinESMExports(); await h.close(); }
+});
+
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const sole of [false, true])
+test(`Native ordinary deadline non-use preserves original published heads (Thread=${threaded}/Rich=${rich}/Sole=${sole})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness({ threaded, rich, count: sole ? 1 : 2, ordinaryExpiresAt: 2000 });
+  try {
+    await h.publish(); t.mock.timers.tick(1000); assert.equal(h.store.resolve(h.rows.find(row => row.action.binding)!.key), undefined);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), h.groups.map(() => 3_602_000));
+    assert.equal((await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "inspect" })).output, "0");
+  } finally { await h.close(); }
+});
+for (const loseSdk of [false, true])
+test(`Native ordinary deadline non-use supports agent tails with original SDK history (loss=${loseSdk})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let allowed = true, armed = false, observed = false;
+  const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await liveOrdinaryHarness({ ordinaryExpiresAt: 2000, sdk: { isExplicitTargetAuthorized: () => allowed, getConfirmationAuthority() {
+    if (armed && loseSdk && !observed) { observed = true; allowed = false; assert.throws(owners[2]!.assertCurrent); allowed = true; } return { profile: "default", operatorId: 42 };
+  } }, captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return owner; } });
+  try {
+    await h.publish(); t.mock.timers.tick(1000); const next = ordinaryParentReplacement(h), { message_id: _messageId, ...body } = next.body;
+    armed = true; const finish = h.store.beginPublication!("sendMessage", body)!; assert.ok(finish); const prepared = { ...body, reply_markup: finish.prepareReplyMarkup!() };
+    finish.assertPublicationBody!(prepared); finish({ message_id: 202 }, true);
+    assert.equal(observed, loseSdk); assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), h.groups.map(() => loseSdk ? 86_401_000 : 3_602_000));
+    assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_402_000, 86_402_000]);
+  } finally { await h.close(); }
+});
+test("Native ordinary deadline non-use requires native indexed expiry rather than a clock observation", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness({ ordinaryExpiresAt: 2000 });
+  try {
+    await h.publish(); t.mock.timers.setTime(2000); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+    h.store.resolve("tgbtn:unknown"); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), [3_602_000, 3_602_000]);
+  } finally { await h.close(); }
+});
+test("Native ordinary deadline non-use is sticky across clock restoration without renewing a row", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness({ ordinaryExpiresAt: 2000 });
+  try {
+    await h.publish(); t.mock.timers.tick(1000); t.mock.timers.setTime(1000); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), [3_601_000, 3_601_000]); assert.equal(h.store.resolve(h.rows.find(row => row.action.binding)!.key), undefined);
+  } finally { await h.close(); }
+});
+for (const loss of ["consumed", "clear", "revision", "generation", "sdk", "physical"] as const)
+test(`Native ordinary deadline non-use never upgrades another terminal or lost owner (${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let allowed = true; const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await liveOrdinaryHarness({ ordinaryExpiresAt: 2000, sdk: { isExplicitTargetAuthorized: () => allowed }, captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return owner; } });
+  try {
+    await h.publish(); if (loss === "consumed") assert.ok(h.store.resolve(h.rows.find(row => row.action.binding)!.key));
+    if (loss === "clear") h.store.clear!(); t.mock.timers.tick(1000);
+    if (loss === "revision") await GenerativeApps.invokeGenerativeApp({ agentDir: h.agentDir, app: "counter", method: "increment" });
+    if (loss === "generation") await writeFile(join(h.agentDir, "genapps", "counter", "generation"), "changed");
+    if (loss === "sdk" || loss === "physical") { allowed = false; assert.throws(owners[loss === "sdk" ? 2 : 0]!.assertCurrent); allowed = true; }
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { await h.close(); }
+});
+test("Native ordinary deadline non-use cannot create first-send membership after expiry", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness({ ordinaryExpiresAt: 2000 });
+  try {
+    t.mock.timers.tick(1000); await h.publish(); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { await h.close(); }
+});
+test("Native ordinary deadline non-use does not admit an expired ordinary parent edit", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness({ ordinaryExpiresAt: 2000 });
+  try {
+    await h.publish(); t.mock.timers.tick(1000); const next = ordinaryParentReplacement(h); await ordinaryParentTransport(h).editMessageText(next.body);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(next.groups.map(g => g.deadline!.expiresAt), [86_402_000, 86_402_000]);
+  } finally { await h.close(); }
+});
+test("Native ordinary deadline non-use keeps actual cleanup I/O owned after a logical question cut", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness({ ordinaryExpiresAt: 2000 }), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  h.store.bindPublicationEditor!(async (_target, guard) => { entered.resolve(); await release.promise; guard(); });
+  try {
+    await h.publish(); t.mock.timers.tick(1000); await entered.promise; let idle = false; void h.store.waitForPublicationIdle!().then(() => { idle = true; }); await Promise.resolve(); assert.equal(idle, false);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), [3_602_000, 3_602_000]);
+    assert.equal(idle, false); release.resolve(); await h.store.waitForPublicationIdle!(); await Promise.resolve(); assert.equal(idle, true);
+  } finally { release.resolve(); await h.close(); }
+});
+test("Native ordinary deadline non-use refuses unknown cleanup history after actual failure", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await liveOrdinaryHarness({ ordinaryExpiresAt: 2000 });
+  h.store.bindPublicationEditor!(async () => { throw new Error("Unknown cleanup outcome"); });
+  try {
+    await h.publish(); t.mock.timers.tick(1000); await h.store.waitForPublicationIdle!(); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { await h.close(); }
+});
+test("Native ordinary deadline non-use retains SDK history lost during original app I/O", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let allowed = true, armed = false, observed = false;
+  const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  const h = await liveOrdinaryHarness({ ordinaryExpiresAt: 2000, sdk: { isExplicitTargetAuthorized: () => allowed }, captureSdk(sdk) { const owner = sdk.captureQuestionLifetimeOwner!()!; owners.push(owner); return owner; } }), stat = fs.lstatSync;
+  try {
+    await h.publish(); t.mock.timers.tick(1000); t.mock.method(fs, "lstatSync", (...args: unknown[]) => { const result = Reflect.apply(stat, fs, args);
+      if (armed && !observed && String(args[0]).endsWith("states.jsonl")) { observed = true; allowed = false; assert.throws(owners[2]!.assertCurrent); allowed = true; } return result; }); syncBuiltinESMExports();
+    armed = true; assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(observed, true);
+    assert.deepEqual(h.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { t.mock.restoreAll(); t.mock.timers.reset(); syncBuiltinESMExports(); await h.close(); }
+});
+
+function questionMembershipHarness(options: { threaded?: boolean; capture?: () => (() => void) | undefined;
+  captureSdk?: () => Readonly<Delivery.TelegramQuestionLifetimeOwner> | undefined;
+  retirement?: (reason: unknown) => void;
+  sdk?: Partial<Delivery.TelegramDeliveryRuntimeDeps>; send?: () => Promise<{ message_id: number }>; edit?: () => Promise<boolean | "edited" | "unchanged"> } = {}) {
+  const target = { chatId: 42, ...(options.threaded === false ? {} : { threadId: 7 }) }; let messageId = 200, validations = 0, captures = 0;
+  const owners: Readonly<Delivery.TelegramQuestionLifetimeOwner>[] = [];
+  let store: OutboundButtons.TelegramButtonActionStore;
+  let observer = (admission: Readonly<Delivery.TelegramQuestionAdmission>) => store.onQuestionAdmission!(admission);
+  const sdk = createLifetimeSdk(target, { ...options.sdk, onQuestionAdmission: admission => observer(admission) });
+  store = OutboundButtons.createTelegramButtonActionStore({ recordRuntimeEvent: (_category, _message, details) => options.retirement?.(details?.reason), captureSelectionAuthority: options.capture ?? (() => () => {}), captureQuestionLifetimeOwner: () => {
+    captures++; const owner = options.captureSdk ? options.captureSdk() : sdk.captureQuestionLifetimeOwner!(); if (owner) owners.push(owner);
+    return owner && Object.freeze({ ...owner, assertAdmission(admission: unknown) {
+      validations++; return owner.assertAdmission(admission);
+    } });
+  } });
+  const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: {
+    sendMessage: options.send ?? (async () => ({ message_id: ++messageId })), sendRichMessage: options.send ?? (async () => ({ message_id: ++messageId })),
+    editMessageText: options.edit ?? (async () => true), editMessageReplyMarkup: options.edit ?? (async () => true),
+  } as unknown as TelegramBridgeApiRuntime, ownsDirect: () => true, callFollowerApi: async () => undefined, beginButtonPublication: store.beginPublication });
+  const question = () => {
+    // A private native producer with its own long deadline, not a widened agent-markup default or fabricated SDK result.
+    const deadline = OutboundButtons.createTelegramButtonQuestionDeadline(Date.now() + 86_400_000), group = Object.freeze({ deadline });
+    const keys = ["Yes", "No"].map(text => store.register({ text, prompt: JSON.stringify({ question: "Native question", answer: text }),
+      promptKind: "selection", expiresAt: deadline.expiresAt, completionGroup: group }));
+    return { deadline, group, keys, markup: { inline_keyboard: [keys.map((callback_data, i) => ({ text: i ? "No" : "Yes", callback_data }))] } };
+  };
+  const body = (q: ReturnType<typeof question>) => ({ chat_id: target.chatId, ...(target.threadId === undefined ? {} : { message_thread_id: target.threadId }),
+    text: "Native question", reply_markup: q.markup });
+  return { sdk, store, api, target, question, body, owners, validations: () => validations, captures: () => captures,
+    observe(next: typeof observer) { observer = next; },
+    async close() { store.clear!(); sdk.shutdown(); await store.waitForPublicationIdle!(); } };
+}
+
+test("Sole final-use tail history refuses independent producer loss after the last native admission callback", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let producer = 1, current = true, tail = false, fired = false, onRead: (() => void) | undefined, observeLoss: () => void;
+  const h = questionMembershipHarness({ capture: () => { const captured = producer; return () => {
+    if (captured === 2 && !current) throw new Error("Original producer is unavailable");
+    if (captured === 2 && tail && !fired) onRead = () => { fired = true; current = false; observeLoss(); current = true; };
+  }; }, sdk: { getConfirmationAuthority() { const fn = onRead; onRead = undefined; fn?.(); return { profile: "default", operatorId: 42 }; } } });
+  try {
+    producer = 2; const owner = {}, selection = { owner, revision: 0, prepare: () => ({ replyMarkup: { inline_keyboard: [] }, assertCurrent() {}, commit() {}, fail() {} }) };
+    const probe = h.store.register({ text: "Probe", prompt: "", promptKind: "selection", selection });
+    const update = h.store.resolve(probe)!.selection!.prepare({ id: "probe" }); assert.ok(update); observeLoss = () => assert.throws(update.assertCurrent, /unavailable/u);
+    producer = 1; const publisher = h.question();
+    const deadline = OutboundButtons.createTelegramButtonQuestionDeadline(86_401_000), group = Object.freeze({ deadline });
+    const keys = ["Yes", "No"].map(text => h.store.register({ text, prompt: text, promptKind: "selection", selection, completionGroup: group }));
+    publisher.markup.inline_keyboard.push(keys.map(callback_data => ({ text: "Answer", callback_data })));
+    await h.api.sendMessage(h.body(publisher)); tail = true;
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(fired, true); assert.equal(current, true);
+    assert.equal(publisher.deadline.expiresAt, 3_601_000, "Already authoritative earlier cuts are not rolled back by a later observation");
+    assert.equal(deadline.expiresAt, 86_401_000, "A healthy physical publisher cannot substitute for a different lost semantic producer");
+  } finally { await h.close(); }
+});
+
+for (const mutation of ["reference", "codec", "array", "serializer", "inherited", "caller", "rich-inline"] as const)
+test(`Sole final-use seals its original native callback carrier (${mutation})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let caller: OutboundButtons.TelegramOutboundButtonMarkup, expected: string[];
+  const h = questionMembershipHarness({ send: async (...args: unknown[]) => {
+    const body = args[0] as Record<string, unknown>, markup = body.reply_markup as OutboundButtons.TelegramOutboundButtonMarkup | undefined;
+    if (mutation === "rich-inline") {
+      assert.equal(Reflect.set(body, "rich_message", { markdown: "Wrong" }), false);
+      assert.equal(Reflect.set(body.rich_message as object, "markdown", "Wrong"), false);
+    } else {
+      assert.ok(markup); assert.notEqual(markup, caller);
+      if (mutation === "reference") assert.equal(Reflect.set(body, "reply_markup", { inline_keyboard: [] }), false);
+      if (mutation === "codec") assert.equal(Reflect.set(markup.inline_keyboard[0]![0]!, "callback_data", "tgbtn:bad00000"), false);
+      if (mutation === "array") assert.equal(Reflect.set(markup.inline_keyboard, "length", 0), false);
+      if (mutation === "serializer") assert.equal(Reflect.set(markup, "toJSON", () => ({ inline_keyboard: [] })), false);
+      if (mutation === "caller") assert.equal(Reflect.set(caller.inline_keyboard[0]![0]!, "callback_data", "tgbtn:bad00000"), true);
+      assert.equal(Reflect.set(markup.inline_keyboard[0]![0]!, "text", "Mutable label"), true);
+    }
+    const prototype = Object.getPrototypeOf(body), previous = Object.getOwnPropertyDescriptor(prototype, "toJSON");
+    try {
+      if (mutation === "inherited") Object.defineProperty(prototype, "toJSON", { configurable: true, value: () => ({ chat_id: 99 }) });
+      const wire = JSON.parse(JSON.stringify({ ...body })) as { chat_id: number; reply_markup?: OutboundButtons.TelegramOutboundButtonMarkup; rich_message?: { markdown: string } };
+      assert.equal(wire.chat_id, 42);
+      assert.ok(Array.isArray(wire.reply_markup?.inline_keyboard) || typeof wire.rich_message?.markdown === "string", "Native wire must retain its complete callback carrier");
+      const codes = wire.reply_markup?.inline_keyboard.flat().map(button => button.callback_data!) ?? [...wire.rich_message!.markdown.matchAll(/data="(tgbtn:[a-f0-9]+)"/g)].map(match => match[1]!);
+      assert.deepEqual(codes, expected);
+    } finally { if (previous) Object.defineProperty(prototype, "toJSON", previous); else Reflect.deleteProperty(prototype, "toJSON"); }
+    return { message_id: 201 };
+  } });
+  try {
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const q = h.question(); caller = q.markup; expected = q.keys;
+    if (mutation === "rich-inline") await h.api.sendRichMessage({ chat_id: 42, message_thread_id: 7, rich_message: {
+      markdown: '<tg-button-row>' + caller.inline_keyboard.flat().map(button => '<tg-button type="callback_data" data="' + button.callback_data + '">' + button.text + '</tg-button>').join("") + '</tg-button-row>' } });
+    else await h.api.sendMessage(h.body(q));
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true);
+  } finally { await h.close(); }
+});
+
+for (const phase of ["capture", "apply"] as const) for (const loss of ["clear", "consume", "expire"] as const)
+test(`Sole final-use refuses row loss from the last SDK provider (${phase}/${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let remaining = 0, onFinal: (() => void) | undefined;
+  const h = questionMembershipHarness({ sdk: { captureQuestionAuthority: () => () => {
+    if (onFinal && --remaining === 0) { const fn = onFinal; onFinal = undefined; fn(); }
+  } }, captureSdk: () => {
+    const owner = h.sdk.captureQuestionLifetimeOwner!()!;
+    return Object.freeze({ ...owner, captureTail(cohort?: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) {
+      const arm = () => { remaining = 2; onFinal = lose; };
+      if (phase === "capture") arm(); const apply = owner.captureTail(cohort);
+      return () => { if (phase === "apply") arm(); apply(); };
+    } });
+  } });
+  let q: ReturnType<typeof h.question>;
+  const lose = () => { if (loss === "clear") h.store.clear!(); else if (loss === "consume") assert.ok(h.store.resolve(q.keys[0])); else t.mock.timers.tick(500); };
+  try {
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    q = h.question(); if (loss === "expire") q.deadline.shorten(1500);
+    await h.api.sendMessage(h.body(q)); assert.equal(onFinal, undefined);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "Final native metadata cannot remove the sole head then shorten the old SDK question");
+  } finally { await h.close(); }
+});
+
+for (const phase of ["capture", "apply"] as const) for (const count of [1, 2])
+test(`Sole final-use preserves observed original producer loss without row notification (${phase}/heads=${count})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let current = true, remaining = 0, onFinal: (() => void) | undefined, observeLoss: () => void;
+  const h = questionMembershipHarness({ capture: () => () => { if (!current) throw new Error("Original producer is unavailable"); },
+    sdk: { captureQuestionAuthority: () => () => { if (onFinal && --remaining === 0) { const fn = onFinal; onFinal = undefined; fn(); } } },
+    captureSdk: () => {
+      const owner = h.sdk.captureQuestionLifetimeOwner!()!;
+      return Object.freeze({ ...owner, captureTail(cohort?: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) {
+        const arm = () => { remaining = 2; onFinal = () => { current = false; observeLoss(); current = true; }; };
+        if (phase === "capture") arm(); const apply = owner.captureTail(cohort);
+        return () => { if (phase === "apply") arm(); apply(); };
+      } });
+    } });
+  try {
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const producer = {}, selection = { owner: producer, revision: 0, prepare: () => ({ replyMarkup: { inline_keyboard: [] }, assertCurrent() {}, commit() {}, fail() {} }) };
+    const probe = h.store.register({ text: "Probe", prompt: "", promptKind: "selection", selection });
+    const action = h.store.resolve(probe)!; const update = action.selection!.prepare({ id: "probe" }); assert.ok(update);
+    observeLoss = () => { assert.throws(update.assertCurrent, /unavailable/u); };
+    const deadline = OutboundButtons.createTelegramButtonQuestionDeadline(86_401_000), group = Object.freeze({ deadline });
+    const keys = ["Yes", "No"].map(text => h.store.register({ text, prompt: text, promptKind: "selection", selection, completionGroup: group }));
+    const q = { deadline, group, keys, markup: { inline_keyboard: [keys.map(callback_data => ({ text: "Answer", callback_data }))] } };
+    if (count === 2) q.markup.inline_keyboard.unshift(...h.question().markup.inline_keyboard);
+    await h.api.sendMessage(h.body(q)); assert.equal(onFinal, undefined); assert.equal(current, true);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "Independent observed producer loss survives exact restoration and unchanged rows");
+    assert.equal(deadline.expiresAt, 86_401_000);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+for (const phase of ["capture", "apply"] as const)
+test(`Sole final-use preserves original edited publisher history after semantic supersession (${phase})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let enabled = false, current = true, remaining = 0, onFinal: (() => void) | undefined, observeLoss: () => void;
+  const h = questionMembershipHarness({ edit: async () => "edited", capture: () => () => { if (!current) throw new Error("Original producer is unavailable"); },
+    sdk: { captureQuestionAuthority: () => () => { if (onFinal && --remaining === 0) { const fn = onFinal; onFinal = undefined; fn(); } } },
+    captureSdk: () => {
+      const owner = h.sdk.captureQuestionLifetimeOwner!()!;
+      return Object.freeze({ ...owner, captureTail(cohort?: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) {
+        const arm = () => { if (!enabled) return; remaining = 2; onFinal = () => { current = false; observeLoss(); current = true; }; };
+        if (phase === "capture") arm(); const apply = owner.captureTail(cohort);
+        return () => { if (phase === "apply") arm(); apply(); };
+      } });
+    } });
+  try {
+    const producer = {}, selection = { owner: producer, revision: 0, prepare: () => ({ replyMarkup: { inline_keyboard: [] }, assertCurrent() {}, commit() {}, fail() {} }) };
+    const probe = h.store.register({ text: "Probe", prompt: "", promptKind: "selection", selection });
+    const action = h.store.resolve(probe)!; const update = action.selection!.prepare({ id: "probe" }); assert.ok(update);
+    observeLoss = () => { assert.throws(update.assertCurrent, /unavailable/u); };
+    const deadline = OutboundButtons.createTelegramButtonQuestionDeadline(86_401_000), group = Object.freeze({ deadline });
+    const keys = ["Yes", "No"].map(text => h.store.register({ text, prompt: text, promptKind: "selection", selection, completionGroup: group }));
+    const q = { deadline, group, keys, markup: { inline_keyboard: [keys.map(callback_data => ({ text: "Answer", callback_data }))] } };
+    await h.api.sendMessage(h.body(q));
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const fresh = h.question(); enabled = true;
+    await h.api.editMessageText({ ...h.body(fresh), message_id: 201 }); assert.equal(onFinal, undefined); assert.equal(current, true);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "Independent observed producer loss survives exact restoration and unchanged rows");
+    assert.equal(fresh.deadline.expiresAt, 86_401_000);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(fresh.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+for (const field of ["business_connection_id", "direct_messages_topic_id", "inline_message_id", "caption", "reply_markup_extra", "message_id"])
+test(`Sole final-use does not authorize an unsupported native body (${field})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = questionMembershipHarness();
+  try {
+    const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false; void prior.handle.result.then(() => { ended = true; });
+    const q = h.question(), body = { ...h.body(q), [field]: field === "message_id" ? 99 : "foreign" };
+    await h.api.sendMessage(body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(q.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+for (const threaded of [false, true]) for (const rich of [false, true]) for (const boundary of ["pure", "ordinary", "unknown", "duplicate"] as const)
+test(`Single question roster refuses an unsupported callback prefix (Thread=${threaded}/Rich=${rich}/${boundary})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = questionMembershipHarness({ threaded });
+  try {
+    const previous = await openLifetimeSdkHead(h.sdk); assert.ok(previous.ok);
+    let ended = false; void previous.handle.result.then(() => { ended = true; });
+    const question = h.question();
+    if (boundary !== "pure") {
+      const key = boundary === "duplicate" ? question.keys[0]! : boundary === "unknown" ? "foreign:untracked" :
+        h.store.register({ text: "Run", prompt: "counter::increment", binding: { app: "counter", generation: "original", revision: 0, assertCurrent() {} } });
+      question.markup.inline_keyboard.push([{ text: "Sibling", callback_data: key }]);
+    }
+    const body = h.body(question);
+    if (rich) { const { text: _text, ...richBody } = body; await h.api.sendRichMessage({ ...richBody, rich_message: { markdown: "Native question" } }); }
+    else await h.api.sendMessage(body);
+    t.mock.timers.tick(3_600_000); await Promise.resolve();
+    assert.equal(ended, boundary === "pure", "One known question cannot lend whole-footer authority to unsupported callbacks");
+    assert.equal(question.deadline.expiresAt, 86_401_000);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.equal(question.deadline.expiresAt, boundary === "pure" ? 7_201_000 : 86_401_000, "Held attempts expose no positive question publication");
+  } finally { await h.close(); }
+});
+
+for (const headKind of ["sdk", "agent"] as const) for (const threaded of [false, true]) for (const rich of [false, true])
+test(`Private agent default real markup retains a 24h head then takes a native tail (${headKind}/Thread=${threaded}/Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ threaded });
+  const question = (label: string) => {
+    const actions: OutboundButtons.TelegramOutboundButtonAction[] = [];
+    const plan = OutboundButtons.planTelegramButtonReply(`<!-- telegram_choice ${JSON.stringify({ question: label, choices: ["A", "B"] })} -->`, {
+      questionHeadTail: true, rendering: rich ? "rich" : "html", registerAction(action) { actions.push(action); return h.store.register(action); },
+    });
+    return { plan, deadline: actions[0]!.completionGroup!.deadline! };
+  };
+  const publish = async (plan: OutboundButtons.TelegramButtonReplyPlan) => {
+    const common = { chat_id: 42, ...(threaded ? { message_thread_id: 7 } : {}), reply_markup: plan.replyMarkup };
+    if (rich) await h.api.sendRichMessage({ ...common, rich_message: { markdown: plan.markdown } });
+    else await h.api.sendMessage({ ...common, text: plan.markdown });
+  };
+  try {
+    const original = question("Original"); await publish(original.plan);
+    assert.equal(original.deadline.expiresAt, 86_401_000); t.mock.timers.tick(3_600_001);
+    assert.equal(original.deadline.expiresAt, 86_401_000, "A real markup head stays live past the released one-hour default");
+    if (headKind === "sdk") assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    else { const next = question("Next"); await publish(next.plan); assert.equal(next.deadline.expiresAt, Date.now() + 86_400_000); }
+    assert.equal(original.deadline.expiresAt, 7_201_001, "Only native same-runtime SDK admission/agent ACK demotes the original real markup");
+    t.mock.timers.tick(3_600_000);
+    assert.equal(h.store.resolve(original.plan.replyMarkup!.inline_keyboard[0]![0]!.callback_data), undefined);
+  } finally { await h.close(); }
+});
+
+for (const rich of [false, true]) for (const outcome of ["live-neighbor", "expiring-update", "unknown-cleanup"] as const)
+test(`Question-local expiry preserves native lanes and footer-wide uncertainty (Rich=${rich}/${outcome})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(); let edits = 0;
+  const h = questionMembershipHarness({ edit: async () => { if (++edits === 1) { entered.resolve(); await release.promise;
+    if (outcome === "unknown-cleanup") throw new Error("Unknown native edit outcome"); } return true; } });
+  h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(h.api));
+  const records: { key: string; action: OutboundButtons.TelegramOutboundButtonAction }[] = [], answers: unknown[] = [];
+  const plan = OutboundButtons.planTelegramButtonReply('<!-- telegram_choice {"question":"Short","choices":["A","B"],"select":2,"timeoutMs":100} -->\n<!-- telegram_choice {"question":"Long","choices":["C","D"],"select":2} -->', {
+    questionHeadTail: true, rendering: rich ? "rich" : "html", registerAction(action) { const key = h.store.register(action); records.push({ key, action }); return key; },
+  });
+  let markup = plan.replyMarkup!, active: Promise<unknown> | undefined;
+  const click = (label: string) => OutboundButtons.handleTelegramButtonCallbackQuery({ id: "q",
+    data: markup.inline_keyboard.flat().find(button => button.text === label)!.callback_data,
+    message: { chat: { id: 42 }, message_id: 201, message_thread_id: 7, reply_markup: markup } }, undefined, {
+    resolveAction: h.store.resolve, answerCallbackQuery: async () => {},
+    updateSelectionKeyboard: async (_query, next, guard) => { guard(); await h.api.editMessageReplyMarkup(42, 201, next, { assertLocalAuthority: guard }); guard(); markup = next; },
+    enqueueButtonPrompt: (_query, action) => { answers.push(JSON.parse(action.prompt)); },
+  });
+  const longGroup = records.find(record => record.action.text === "C")!.action.completionGroup!;
+  try {
+    const body = { chat_id: 42, message_thread_id: 7, reply_markup: markup };
+    if (rich) await h.api.sendRichMessage({ ...body, rich_message: { markdown: plan.markdown } }); else await h.api.sendMessage({ ...body, text: plan.markdown });
+    if (outcome === "expiring-update") { active = click("A"); void active.catch(() => {}); await entered.promise; t.mock.timers.tick(100); }
+    else { t.mock.timers.tick(100); await entered.promise; }
+    let drained = false; const idle = h.store.waitForPublicationIdle!().then(() => { drained = true; }); await Promise.resolve();
+    assert.equal(drained, false, "Logical expiry does not release issued native edit work");
+    assert.equal(longGroup.deadline!.expiresAt, 86_401_000);
+    if (outcome === "live-neighbor") { active = click("C"); await Promise.resolve(); assert.equal(edits, 1, "A newer selection cannot overtake held native cleanup"); }
+    release.resolve();
+    if (outcome === "expiring-update") await assert.rejects(active!, /unavailable/u);
+    else if (active) await active;
+    await idle; assert.equal(drained, true);
+    if (outcome === "live-neighbor") { await click("D"); await h.store.waitForPublicationIdle!();
+      assert.deepEqual(answers, [{ question: "Long", answer: ["C", "D"] }]); assert.equal(h.captures(), 2, "Same two original SDK owner captures survive regeneration");
+      assert.ok(markup.inline_keyboard.flat().some(button => button.text === "Expired: A" && button.callback_data === "tgbtn:expired"));
+    } else { assert.deepEqual(answers, []); for (const record of records) assert.equal(h.store.resolve(record.key), undefined, "Unknown/stale footer publication stays held"); }
+  } finally { release.resolve(); if (active) await active.catch(() => {}); await h.close(); }
+});
+
+function coheadQuestion(h: ReturnType<typeof questionMembershipHarness>, collectors = false, rich = false) {
+  const records: { key: string; action: OutboundButtons.TelegramOutboundButtonAction }[] = [];
+  const declarations = collectors ? ['<!-- telegram_choice {"question":"Set","choices":["C","D"],"select":2} -->',
+    '<!-- telegram_choice [{"question":"First","choices":["A","B"]},{"question":"Final","choices":["E","F"],"select":2}] -->'] :
+    ['<!-- telegram_confirm "A" -->', '<!-- telegram_confirm "B" -->'];
+  const plan = OutboundButtons.planTelegramButtonReply(declarations.join("\n"), { questionHeadTail: true, rendering: rich ? "rich" : "html",
+    registerAction(action) { const key = h.store.register(action); records.push({ key, action }); return key; } });
+  const groups = [...new Set(records.map(record => record.action.completionGroup!))]; assert.equal(groups.length, 2);
+  const carrier = { chat_id: h.target.chatId, ...(h.target.threadId === undefined ? {} : { message_thread_id: h.target.threadId }), reply_markup: plan.replyMarkup };
+  return { plan, records, groups, body: { ...carrier, text: plan.markdown }, richBody: { ...carrier, rich_message: { markdown: plan.markdown } } };
+}
+
+for (const previous of ["sdk", "agent"] as const) for (const collectors of [false, true]) for (const threaded of [false, true]) for (const rich of [false, true])
+test(`Co-head first-send shares one ACK without self-demotion (${previous}/Collectors=${collectors}/Thread=${threaded}/Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = questionMembershipHarness({ threaded });
+  try {
+    const peer = previous === "agent" ? h.question() : undefined; if (peer) await h.api.sendMessage(h.body(peer));
+    const sdk = previous === "sdk" ? await openLifetimeSdkHead(h.sdk) : undefined; if (sdk) assert.ok(sdk.ok);
+    let ended = false; if (sdk?.ok) void sdk.handle.result.then(() => { ended = true; });
+    t.mock.timers.tick(1_800_000); const batch = coheadQuestion(h, collectors, rich);
+    if (rich) await h.api.sendRichMessage(batch.richBody); else await h.api.sendMessage(batch.body);
+    assert.deepEqual(batch.groups.map(group => group.deadline!.expiresAt), [88_201_000, 88_201_000]);
+    if (peer) assert.equal(peer.deadline.expiresAt, 5_401_000, "Only the earlier agent question takes a tail");
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); if (sdk) assert.equal(ended, true, "SDK tail begins at the shared ACK, not question birth");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(batch.groups.map(group => group.deadline!.expiresAt), [9_001_000, 9_001_000], "A later SDK head sees every native co-head fact");
+    assert.equal(h.captures(), peer ? 3 : 2);
+  } finally { await h.close(); }
+});
+
+for (const nextKind of ["sdk", "agent"] as const)
+test(`Co-head first-send exposes all facts before original authority callbacks (${nextKind})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onGuard: (() => void) | undefined;
+  const h = questionMembershipHarness({ capture: () => () => { const callback = onGuard; onGuard = undefined; callback?.(); } });
+  let newerSdk: ReturnType<typeof openLifetimeSdkHead> | undefined, newerAgent: ReturnType<typeof h.question> | undefined;
+  try {
+    const before = await openLifetimeSdkHead(h.sdk); assert.ok(before.ok); const batch = coheadQuestion(h);
+    onGuard = () => { t.mock.timers.setTime(2000); if (nextKind === "sdk") newerSdk = openLifetimeSdkHead(h.sdk);
+      else { newerAgent = h.question(); h.store.beginPublication!("sendMessage", h.body(newerAgent))!({ message_id: 202 }, true); } };
+    await h.api.sendMessage(batch.body); assert.deepEqual(batch.groups.map(group => group.deadline!.expiresAt), [3_602_000, 3_602_000]);
+    if (newerAgent) assert.equal(newerAgent.deadline.expiresAt, 86_402_000);
+    if (nextKind === "sdk") { assert.ok(newerSdk); const next = await newerSdk; assert.ok(next.ok); let ended = false;
+      void next.handle.result.then(() => { ended = true; }); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false); }
+  } finally { await h.close(); }
+});
+
+test("Co-head first-send final SDK callback cannot clear the cohort then shorten", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onRead: (() => void) | undefined;
+  const h = questionMembershipHarness({ sdk: { getConfirmationAuthority() { const cb = onRead; onRead = undefined; cb?.(); return { profile: "default", operatorId: 42 }; } },
+    captureSdk: () => { const owner = h.sdk.captureQuestionLifetimeOwner!(); return owner && Object.freeze({ ...owner, captureTail(cohort?: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) {
+      const apply = owner.captureTail(cohort); return () => { onRead = () => h.store.clear!(); apply(); };
+    } }); } });
+  try {
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    await h.api.sendMessage(coheadQuestion(h).body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { await h.close(); }
+});
+
+for (const index of [0, 1]) for (const terminal of ["expiry", "consumed"] as const)
+test(`Co-head first-send preserves a live sibling across known individual termination (${terminal}/${index})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onSend: (() => void) | undefined;
+  const h = questionMembershipHarness({ send: async () => { onSend?.(); return { message_id: 201 }; } });
+  try {
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const batch = coheadQuestion(h); onSend = () => { onSend = undefined; const group = batch.groups[index]!;
+      if (terminal === "expiry") { group.deadline!.shorten(1100); t.mock.timers.tick(100); }
+      else assert.ok(h.store.resolve(batch.records.find(record => record.action.completionGroup === group)!.key)); };
+    await h.api.sendMessage(batch.body); assert.equal(batch.groups[1 - index]!.deadline!.expiresAt, 86_401_000);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(batch.groups[1 - index]!.deadline!.expiresAt, Date.now() + 3_600_000);
+  } finally { await h.close(); }
+});
+
+test("Co-head first-send retains actual publication work across one in-flight group expiry", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const h = questionMembershipHarness({ send: async () => { entered.resolve(); await release.promise; return { message_id: 201 }; } });
+  let pending: Promise<unknown> | undefined;
+  try {
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const batch = coheadQuestion(h); pending = h.api.sendMessage(batch.body); await entered.promise;
+    batch.groups[0]!.deadline!.shorten(1100); t.mock.timers.tick(100); let drained = false;
+    const idle = h.store.waitForPublicationIdle!().then(() => { drained = true; }); await Promise.resolve(); assert.equal(drained, false);
+    release.resolve(); await pending; await idle; assert.equal(drained, true); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true);
+    assert.equal(batch.groups[1]!.deadline!.expiresAt, 86_401_000);
+  } finally { release.resolve(); if (pending) await pending.catch(() => {}); await h.close(); }
+});
+
+for (const held of ["partial", "duplicate", "unknown-key", "ordinary", "alternate", "field", "spent", "missing-owner", "foreign", "lost-peer", "target", "unknown", "deadline", "rows-replaced"] as const)
+test(`Co-head first-send refuses incomplete, foreign or spent whole-publication evidence (${held})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let captures = 0, authorized = true, fail = held === "unknown", onSend: (() => void) | undefined;
+  const h = questionMembershipHarness({ captureSdk: () => held === "missing-owner" && ++captures === 2 ? undefined : held === "foreign" && ++captures === 2 ? foreign.captureQuestionLifetimeOwner!() : h.sdk.captureQuestionLifetimeOwner!(),
+    sdk: { isExplicitTargetAuthorized: () => authorized }, send: async () => { onSend?.(); if (fail) throw new Error("Unknown publication"); return { message_id: 201 }; } });
+  const foreign = createLifetimeSdk(h.target, { onQuestionAdmission: admission => h.store.onQuestionAdmission!(admission) });
+  try {
+    const sdk = await openLifetimeSdkHead(h.sdk), other = await openLifetimeSdkHead(foreign); assert.ok(sdk.ok && other.ok);
+    let ended = false, foreignEnded = false; void sdk.handle.result.then(() => { ended = true; }); void other.handle.result.then(() => { foreignEnded = true; });
+    const batch = coheadQuestion(h), body: Record<string, unknown> & { chat_id: number; text: string } = { ...batch.body }, markup = structuredClone(batch.plan.replyMarkup!);
+    if (held === "partial") markup.inline_keyboard[1] = [markup.inline_keyboard[1]![0]!];
+    if (held === "duplicate") markup.inline_keyboard.push(...markup.inline_keyboard);
+    if (held === "unknown-key") markup.inline_keyboard.push([{ text: "Unknown", callback_data: "tgbtn:12345678" }]);
+    if (held === "ordinary") markup.inline_keyboard.push([{ text: "Ordinary", callback_data: h.store.register({ text: "Ordinary", prompt: "Ordinary" }) }]);
+    if (held === "deadline") markup.inline_keyboard[1] = [{ text: "Unowned deadline", callback_data: h.store.register({ text: "Unowned deadline", prompt: "Data",
+      promptKind: "selection", completionGroup: Object.freeze({}) }) }];
+    if (held === "alternate") body.business_connection_id = "controlled";
+    if (held === "field") body.other = true;
+    if (held === "target") body.message_thread_id = 8;
+    if (held === "rows-replaced") onSend = () => { h.store.register({ text: "Later row", prompt: "Data", promptKind: "selection", completionGroup: batch.groups[0] }); };
+    if (held === "lost-peer") { authorized = false; assert.throws(h.owners[1]!.assertCurrent, /unavailable/u); authorized = true; }
+    if (held === "spent") h.store.beginPublication!("sendMessage", { ...batch.body, reply_markup: { inline_keyboard: [markup.inline_keyboard[0]!] } })!(undefined, false);
+    body.reply_markup = markup; await h.api.sendMessage(body).catch(() => {});
+    if (held === "unknown") { fail = false; await h.api.sendMessage(body); }
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false); assert.equal(foreignEnded, false);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(batch.groups.map(group => group.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { foreign.shutdown(); await h.close(); }
+});
+
+for (const field of ["other", "rich_message"] as const)
+test(`Co-head first-send seals the actual supported body after SDK pre-I/O callbacks (${field})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onScope: (() => void) | undefined, sends = 0;
+  const h = questionMembershipHarness({ send: async () => { sends++; return { message_id: 201 }; }, captureSdk: () => {
+    const owner = h.sdk.captureQuestionLifetimeOwner!(); return owner && Object.freeze({ ...owner, assertScope(value: unknown) {
+      owner.assertScope(value); const cb = onScope; onScope = undefined; cb?.();
+    } }); } });
+  try {
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const batch = coheadQuestion(h), body: Record<string, unknown> & { chat_id: number; text: string } = { ...batch.body };
+    onScope = () => { body[field] = field === "other" ? true : { markdown: "Altered", media: {} }; };
+    await assert.rejects(h.api.sendMessage(body), /locator is unavailable/u); assert.equal(sends, 0);
+    await h.api.sendMessage(batch.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "The original rejected descriptor remains spent");
+  } finally { await h.close(); }
+});
+
+test("Co-head first-send checks surviving head rows after the final older-publication callback", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let captures = 0, reads = 0, onPeer: (() => void) | undefined;
+  const h = questionMembershipHarness({ capture: () => { const n = ++captures; return () => { if (n === 1 && onPeer && ++reads === 3) { const cb = onPeer; onPeer = undefined; cb(); } }; } });
+  try {
+    const previous = h.question(); await h.api.sendMessage(h.body(previous)); const batch = coheadQuestion(h);
+    onPeer = () => { for (const group of batch.groups) group.deadline!.shorten(Date.now()); t.mock.timers.tick(0); };
+    await h.api.sendMessage(batch.body); assert.equal(reads, 3); assert.equal(previous.deadline.expiresAt, 86_401_000, "An ended batch cannot cap a peer after its last guard");
+  } finally { await h.close(); }
+});
+
+test("Co-head first-send preserves native peer history through its final SDK callback", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let authorized = true, onRead: (() => void) | undefined;
+  const h = questionMembershipHarness({ sdk: { isExplicitTargetAuthorized: () => authorized,
+    getConfirmationAuthority() { const cb = onRead; onRead = undefined; cb?.(); return { profile: "default", operatorId: 42 }; } },
+    captureSdk: () => { const owner = h.sdk.captureQuestionLifetimeOwner!(); return owner && Object.freeze({ ...owner, captureTail(cohort?: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) {
+      const apply = owner.captureTail(cohort); return () => { onRead = () => { authorized = false; assert.throws(h.owners[1]!.assertCurrent, /unavailable/u); authorized = true; }; apply(); };
+    } }); } });
+  try {
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    await h.api.sendMessage(coheadQuestion(h).body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { await h.close(); }
+});
+
+test("Co-head known-parent edit cannot republish spent groups as another physical head", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = questionMembershipHarness({ edit: async () => "edited" });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok);
+    let ended = false; void sdk.handle.result.then(() => { ended = true; }); const batch = coheadQuestion(h);
+    await h.api.editMessageText({ ...batch.body, message_id: 201 });
+    const newer = await openLifetimeSdkHead(h.sdk); assert.ok(newer.ok); let newerEnded = false; void newer.handle.result.then(() => { newerEnded = true; });
+    await h.api.sendMessage(batch.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true); assert.equal(newerEnded, false);
+    assert.deepEqual(batch.groups.map(group => group.deadline!.expiresAt), [3_601_000, 3_601_000], "Re-sending spent IDs cannot create another physical head or renew deadlines");
+  } finally { await h.close(); }
+});
+
+for (const rich of [false, true])
+test(`Co-head first-send collectors preserve one lifetime through answers and native revisions (Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = questionMembershipHarness({ edit: async () => "edited" });
+  h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(h.api));
+  try {
+    const batch = coheadQuestion(h, true, rich); if (rich) await h.api.sendRichMessage(batch.richBody); else await h.api.sendMessage(batch.body);
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    let markup = batch.plan.replyMarkup!; const answers: unknown[] = [];
+    const click = (label: string) => OutboundButtons.handleTelegramButtonCallbackQuery({ id: "cohead", data: markup.inline_keyboard.flat().find(button => button.text === label)!.callback_data,
+      message: { chat: { id: 42 }, message_id: 201, message_thread_id: 7, reply_markup: markup } }, undefined, {
+      resolveAction: h.store.resolve, answerCallbackQuery: async () => {}, enqueueButtonPrompt: (_query, action) => { answers.push(JSON.parse(action.prompt)); },
+      updateSelectionKeyboard: async (_query, next, guard) => { guard(); await h.api.editMessageReplyMarkup(42, 201, next, { assertLocalAuthority: guard }); guard(); markup = next; },
+      updateSelectionMessage: async (_query, markdown, rendering, next, guard) => { guard(); await h.api.editMessageText({ chat_id: 42, message_id: 201,
+        ...(rendering === "rich" ? { rich_message: { markdown } } : { text: markdown }), reply_markup: next }, { assertLocalAuthority: guard }); guard(); markup = next; },
+    });
+    await click("C"); assert.deepEqual(answers, []); await click("D");
+    assert.deepEqual(answers, [{ question: "Set", answer: ["C", "D"] }]); await click("A"); assert.equal(answers.length, 1);
+    await click("E"); assert.equal(answers.length, 1); await click("F");
+    assert.deepEqual(answers[1], [{ question: "First", answer: "A" }, { question: "Final", answer: ["E", "F"] }]);
+    assert.equal(h.captures(), 2); assert.deepEqual(batch.groups.map(group => group.deadline!.expiresAt), [3_601_000, 3_601_000]);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "Revisions and finish cannot mint another head");
+  } finally { await h.close(); }
+});
+
+test("Co-head first-send keeps shorter producer cutoffs and never renews an existing tail", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = questionMembershipHarness();
+  try {
+    const batch = coheadQuestion(h); batch.groups[0]!.deadline!.shorten(1500); await h.api.sendMessage(batch.body);
+    t.mock.timers.tick(100); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(batch.groups.map(group => group.deadline!.expiresAt), [1500, 3_601_100]);
+    t.mock.timers.tick(100); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(batch.groups.map(group => group.deadline!.expiresAt), [1500, 3_601_100]);
+  } finally { await h.close(); }
+});
+
+test("Co-head first-send spends every original descriptor before SDK pre-I/O reentry", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onScope: (() => void) | undefined;
+  const h = questionMembershipHarness({ send: async () => { throw new Error("Unknown outer send"); }, captureSdk: () => {
+    const owner = h.sdk.captureQuestionLifetimeOwner!(); return owner && Object.freeze({ ...owner, assertScope(scope: unknown) {
+      owner.assertScope(scope); const cb = onScope; onScope = undefined; cb?.();
+    } }); } });
+  try {
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const batch = coheadQuestion(h);
+    onScope = () => h.store.beginPublication!("sendMessage", { ...batch.body,
+      reply_markup: { inline_keyboard: [batch.plan.replyMarkup!.inline_keyboard[1]!] } })!({ message_id: 909 }, true);
+    await assert.rejects(h.api.sendMessage(batch.body), /Unknown outer send/u);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "No unspent later member can become a reentrant prefix head");
+  } finally { await h.close(); }
+});
+
+for (const mutation of ["reference", "codec", "array", "serializer", "inherited", "caller", "rich-inline"] as const)
+test(`Co-head first-send pins store-owned callback carriers through native client copying (${mutation})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let caller: OutboundButtons.TelegramOutboundButtonMarkup, expected: string[];
+  const h = questionMembershipHarness({ send: async (...args: unknown[]) => {
+    const body = args[0] as Record<string, unknown>, markup = body.reply_markup as OutboundButtons.TelegramOutboundButtonMarkup | undefined;
+    if (mutation === "rich-inline") { assert.equal(Reflect.set(body, "rich_message", { markdown: "Wrong" }), false);
+      assert.equal(Reflect.set(body.rich_message as object, "markdown", "Wrong"), false); }
+    else {
+      assert.ok(markup); assert.notEqual(markup, caller);
+      if (mutation === "reference") assert.equal(Reflect.set(body, "reply_markup", { inline_keyboard: [] }), false);
+      if (mutation === "codec") assert.equal(Reflect.set(markup.inline_keyboard[0]![0]!, "callback_data", "tgbtn:bad00000"), false);
+      if (mutation === "array") assert.equal(Reflect.set(markup.inline_keyboard, "length", 0), false);
+      if (mutation === "serializer") assert.equal(Reflect.set(markup, "toJSON", () => ({ inline_keyboard: [] })), false);
+      if (mutation === "caller") assert.equal(Reflect.set(caller.inline_keyboard[0]![0]!, "callback_data", "tgbtn:bad00000"), true);
+      assert.equal(Reflect.set(markup.inline_keyboard[0]![0]!, "text", "Mutable display label"), true, "Non-identity rendering remains mutable");
+    }
+    const prototype = Object.getPrototypeOf(body), previous = Object.getOwnPropertyDescriptor(prototype, "toJSON");
+    try {
+      if (mutation === "inherited") Object.defineProperty(prototype, "toJSON", { configurable: true, value: () => ({ chat_id: 99, message_thread_id: 8 }) });
+      const wire = JSON.parse(JSON.stringify({ ...body })) as { chat_id: number; message_thread_id: number; reply_markup?: OutboundButtons.TelegramOutboundButtonMarkup; rich_message?: { markdown: string } };
+      assert.equal(wire.chat_id, 42); assert.equal(wire.message_thread_id, 7);
+      assert.ok(Array.isArray(wire.reply_markup?.inline_keyboard) || typeof wire.rich_message?.markdown === "string", "Actual native wire must retain its supported callback carrier");
+      const codes = wire.reply_markup?.inline_keyboard?.flat().map(button => button.callback_data!) ?? [...wire.rich_message!.markdown.matchAll(/data="(tgbtn:[a-f0-9]+)"/g)].map(match => match[1]!);
+      assert.deepEqual(codes, expected);
+    } finally { if (previous) Object.defineProperty(prototype, "toJSON", previous); else Reflect.deleteProperty(prototype, "toJSON"); }
+    return { message_id: 201 };
+  } });
+  try {
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const batch = coheadQuestion(h); caller = batch.plan.replyMarkup!; expected = caller.inline_keyboard.flat().map(button => button.callback_data!);
+    if (mutation === "rich-inline") await h.api.sendRichMessage({ chat_id: 42, message_thread_id: 7, rich_message: {
+      markdown: '<tg-button-row>' + caller.inline_keyboard.flat().map(button => '<tg-button type="callback_data" data="' + button.callback_data + '">' + button.text + '</tg-button>').join("") + '</tg-button-row>' } });
+    else await h.api.sendMessage(batch.body);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true);
+  } finally { await h.close(); }
+});
+
+test("Co-head first-send fixes the ACK clock before original authority callbacks", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onGuard: (() => void) | undefined;
+  const h = questionMembershipHarness({ capture: () => () => { const cb = onGuard; onGuard = undefined; cb?.(); } });
+  try {
+    const previous = h.question(); await h.api.sendMessage(h.body(previous)); const batch = coheadQuestion(h);
+    onGuard = () => t.mock.timers.setTime(1_802_000); await h.api.sendMessage(batch.body);
+    assert.equal(previous.deadline.expiresAt, 3_601_000); assert.deepEqual(batch.groups.map(group => group.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { await h.close(); }
+});
+
+test("Co-head first-send never renews the physical SDK origin from a surviving member", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let authorized = true;
+  const h = questionMembershipHarness({ sdk: { isExplicitTargetAuthorized: () => authorized } });
+  try {
+    const batch = coheadQuestion(h); await h.api.sendMessage(batch.body); assert.ok(h.store.resolve(batch.records[0]!.key));
+    authorized = false; assert.throws(h.owners[0]!.assertCurrent, /unavailable/u); authorized = true;
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(batch.groups[1]!.deadline!.expiresAt, 86_401_000, "A live member cannot borrow a new origin after the physical publisher's SDK scope was lost");
+  } finally { await h.close(); }
+});
+
+test("Co-head first-send pins prepared Rich controls rather than a mutated caller facade", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onScope: (() => void) | undefined;
+  const h = questionMembershipHarness({ send: async (...args: unknown[]) => {
+    const rich = (args[0] as { rich_message: { markdown: string } }).rich_message;
+    assert.match(rich.markdown, /tg-button-row/u); assert.equal(Reflect.set(rich, "markdown", "Wrong controls"), false); return { message_id: 201 };
+  }, captureSdk: () => { const owner = h.sdk.captureQuestionLifetimeOwner!(); return owner && Object.freeze({ ...owner, assertScope(scope: unknown) {
+    owner.assertScope(scope); const cb = onScope; onScope = undefined; cb?.();
+  } }); } });
+  try {
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const batch = coheadQuestion(h), caller = { markdown: '<tg-button-row>' + batch.plan.replyMarkup!.inline_keyboard.flat().map(button =>
+      '<tg-button type="callback_data" data="' + button.callback_data + '">' + button.text + '</tg-button>').join("") + '</tg-button-row>' };
+    onScope = () => { caller.markdown = "Mutable non-control facade"; };
+    await h.api.sendRichMessage({ chat_id: 42, message_thread_id: 7, rich_message: caller });
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true); assert.equal(caller.markdown, "Mutable non-control facade");
+  } finally { await h.close(); }
+});
+
+async function publishCoheadEdit(h: ReturnType<typeof questionMembershipHarness>, batch: ReturnType<typeof coheadQuestion>, mode: "text" | "rich" | "markup") {
+  if (mode === "markup") return h.api.editMessageReplyMarkup(42, 201, batch.plan.replyMarkup!);
+  return h.api.editMessageText({ ...(mode === "rich" ? batch.richBody : batch.body), message_id: 201 });
+}
+
+for (const parentCount of [1, 2]) for (const mode of ["text", "rich", "markup"] as const) for (const collectors of [false, true]) for (const threaded of [false, true])
+test(`Co-head known-parent edit publishes one original cohort (${parentCount}/${mode}/Collectors=${collectors}/Thread=${threaded})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = questionMembershipHarness({ threaded, edit: async () => "edited" });
+  try {
+    const parent = parentCount === 1 ? h.question() : undefined, old = parent ? undefined : coheadQuestion(h);
+    await h.api.sendMessage(parent ? h.body(parent) : old!.body);
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    t.mock.timers.tick(1_800_000); const batch = coheadQuestion(h, collectors, mode === "rich"); await publishCoheadEdit(h, batch, mode);
+    assert.deepEqual(batch.groups.map(g => g.deadline!.expiresAt), [88_201_000, 88_201_000]);
+    assert.equal(h.store.resolve(parent ? parent.keys[0] : old!.records[0]!.key), undefined);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true, "Only the original native edit ACK demotes the previous SDK head");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.deepEqual(batch.groups.map(g => g.deadline!.expiresAt), [9_001_000, 9_001_000], "Every new co-head shares the retained physical origin, without sibling demotion");
+    assert.equal(h.captures(), parentCount + 2, "ACK/revisions do not reacquire owners");
+  } finally { await h.close(); }
+});
+
+for (const held of ["partial", "duplicate", "unknown", "retained-old", "unchanged", "boolean", "exception", "wrong-thread", "alternate", "extra", "foreign", "parent-expired", "parent-row-added", "physical-scope-lost", "publisher-lost", "ordinary-parent", "embedded-rich"] as const)
+test(`Co-head known-parent edit holds unproved original publication (${held})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let lost = false, captures = 0, authorized = true, onEdit: (() => void) | undefined;
+  const foreign = createLifetimeSdk({ chatId: 42, threadId: 7 });
+  const h = questionMembershipHarness({ sdk: { isExplicitTargetAuthorized: () => authorized },
+    capture: () => { const n = ++captures; return () => { if (n === 1 && lost) throw Error("Original publisher lost"); }; },
+    captureSdk: held === "foreign" ? () => captures > 2 ? foreign.captureQuestionLifetimeOwner!() : h.sdk.captureQuestionLifetimeOwner!() : undefined,
+    edit: async () => { onEdit?.(); if (held === "exception") throw Error("Unknown edit"); return held === "unchanged" ? "unchanged" : held === "boolean" ? true : "edited"; } });
+  try {
+    const old = coheadQuestion(h, false, held === "embedded-rich");
+    if (held === "embedded-rich") await h.api.sendRichMessage({ chat_id: 42, message_thread_id: 7, rich_message: { markdown: '<tg-button-row>' + old.plan.replyMarkup!.inline_keyboard.flat().map(button =>
+      '<tg-button type="callback_data" data="' + button.callback_data + '">' + button.text + '</tg-button>').join("") + '</tg-button-row>' } }); else await h.api.sendMessage(old.body);
+    if (held === "ordinary-parent") {
+      const key = h.store.register({ text: "Ordinary", prompt: "Ordinary" });
+      await h.api.editMessageReplyMarkup(42, 201, { inline_keyboard: [...old.plan.replyMarkup!.inline_keyboard, [{ text: "Ordinary", callback_data: key }]] });
+    }
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    assert.deepEqual(old.groups.map(group => group.deadline!.expiresAt), [3_601_000, 3_601_000], "Held edit partitions still start from two genuine positive native parent facts");
+    const batch = coheadQuestion(h), body = { ...batch.body, message_id: 201 }, markup = body.reply_markup!;
+    if (held === "partial") markup.inline_keyboard[1] = [markup.inline_keyboard[1]![0]!];
+    if (held === "duplicate") markup.inline_keyboard.push([markup.inline_keyboard[0]![0]!]);
+    if (held === "unknown") markup.inline_keyboard.push([{ text: "Unknown", callback_data: "tgbtn:bad00000" }]);
+    if (held === "retained-old") markup.inline_keyboard.push(old.plan.replyMarkup!.inline_keyboard[0]!);
+    if (held === "wrong-thread") body.message_thread_id = 8;
+    if (held === "alternate") Object.assign(body, { inline_message_id: "controlled-alternate" });
+    if (held === "extra") Object.assign(body, { unproved: true });
+    if (held === "parent-expired") onEdit = () => { old.groups[0]!.deadline!.shorten(1100); t.mock.timers.tick(100); };
+    if (held === "parent-row-added") onEdit = () => { h.store.register({ ...old.records[0]!.action, text: "New parent row" }); };
+    if (held === "physical-scope-lost") onEdit = () => { authorized = false; assert.throws(h.owners[0]!.assertCurrent, /unavailable/u); authorized = true; };
+    if (held === "publisher-lost") onEdit = () => { lost = true; };
+    if (held === "embedded-rich") await h.api.editMessageReplyMarkup(42, 201, markup);
+    else if (held === "exception") await assert.rejects(h.api.editMessageText(body), /Unknown edit/u);
+    else await h.api.editMessageText(body);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "No original-parent/cohort proof means no SDK demotion");
+    assert.deepEqual(batch.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(batch.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000], "A later SDK head cannot create missing positive facts");
+  } finally { await h.close(); foreign.shutdown(); }
+});
+
+for (const ending of ["parent", "first-fresh", "last-fresh"] as const)
+test(`Co-head known-parent edit retains native work through individual expiry (${ending})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const h = questionMembershipHarness({ edit: async () => { entered.resolve(); await release.promise; return "edited"; } });
+  try {
+    const old = coheadQuestion(h); await h.api.sendMessage(old.body); const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok);
+    let ended = false; void sdk.handle.result.then(() => { ended = true; }); const fresh = coheadQuestion(h), work = publishCoheadEdit(h, fresh, "text"); await entered.promise;
+    const group = ending === "parent" ? old.groups[0]! : fresh.groups[ending === "first-fresh" ? 0 : 1]!;
+    group.deadline!.shorten(1100); t.mock.timers.tick(100); let idle = false; const drain = h.store.waitForPublicationIdle!().then(() => { idle = true; });
+    for (let i = 0; i < 4; i++) await Promise.resolve(); assert.equal(idle, false); release.resolve(); await work; await drain; assert.equal(idle, true);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, ending !== "parent");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); const cutoffs = fresh.groups.map(g => g.deadline!.expiresAt);
+    assert.deepEqual(cutoffs, ending === "parent" ? [86_401_000, 86_401_000] : ending === "first-fresh" ? [1100, Date.now() + 3_600_000] : [Date.now() + 3_600_000, 1100]);
+  } finally { release.resolve(); await h.close(); }
+});
+
+for (const newer of ["sdk", "agent"] as const)
+test(`Co-head known-parent edit exposes every fact before newer ${newer} guard admission`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onGuard: (() => void) | undefined, onEdit: (() => void) | undefined;
+  const h = questionMembershipHarness({ capture: () => () => { const cb = onGuard; onGuard = undefined; cb?.(); }, edit: async () => { onEdit?.(); return "edited"; } });
+  try {
+    const old = coheadQuestion(h); await h.api.sendMessage(old.body); const fresh = coheadQuestion(h); let later: ReturnType<typeof openLifetimeSdkHead> | undefined;
+    let laterAgent: ReturnType<typeof h.question> | undefined;
+    onEdit = () => { onGuard = () => { t.mock.timers.setTime(2000); if (newer === "sdk") later = openLifetimeSdkHead(h.sdk);
+      else { laterAgent = h.question(); const finish = h.store.beginPublication!("sendMessage", h.body(laterAgent)); finish!({ message_id: 909 }, true); } }; };
+    await publishCoheadEdit(h, fresh, "text"); assert.deepEqual(fresh.groups.map(g => g.deadline!.expiresAt), [3_602_000, 3_602_000]);
+    let ended = false; if (later) { const opened = await later; assert.ok(opened.ok); void opened.handle.result.then(() => { ended = true; }); }
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false); if (laterAgent) assert.equal(laterAgent.deadline.expiresAt, 86_402_000);
+  } finally { await h.close(); }
+});
+
+for (const loss of ["rows", "ancestry"] as const)
+test(`Co-head known-parent edit seals original ancestry and rows after last SDK provider (${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let afterProvider: (() => void) | undefined, onEdit: (() => void) | undefined, authorized = true;
+  const h = questionMembershipHarness({ sdk: { isExplicitTargetAuthorized: () => authorized, getConfirmationAuthority() { const cb = afterProvider; afterProvider = undefined; cb?.(); return { profile: "default", operatorId: 42 }; } },
+    captureSdk: () => { const owner = h.sdk.captureQuestionLifetimeOwner!(); return owner && Object.freeze({ ...owner, captureTail(cohort?: Parameters<Delivery.TelegramQuestionLifetimeOwner["captureTail"]>[0]) {
+      const apply = owner.captureTail(cohort); return () => { onEdit?.(); apply(); };
+    } }); }, edit: async () => "edited" });
+  try {
+    const old = coheadQuestion(h); await h.api.sendMessage(old.body); const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const fresh = coheadQuestion(h); onEdit = () => { afterProvider = () => { if (loss === "rows") h.store.clear!(); else { authorized = false; assert.throws(h.owners[0]!.assertCurrent, /unavailable/u); authorized = true; } }; };
+    await publishCoheadEdit(h, fresh, "text"); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "Last provider callback cannot certify a spent head or lost physical SDK ancestor");
+  } finally { await h.close(); }
+});
+
+for (const mode of ["text", "markup"] as const)
+test(`Co-head known-parent edit does not renew original SDK scope after replacements (${mode})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let authorized = true; const h = questionMembershipHarness({ sdk: { isExplicitTargetAuthorized: () => authorized }, edit: async () => "edited" });
+  try {
+    const old = coheadQuestion(h); await h.api.sendMessage(old.body); const fresh = coheadQuestion(h); await publishCoheadEdit(h, fresh, mode);
+    const replacement = coheadQuestion(h); await publishCoheadEdit(h, replacement, mode);
+    authorized = false; assert.throws(h.owners[0]!.assertCurrent, /unavailable/u); authorized = true;
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(replacement.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000], "Immediate fresh owners cannot replace original physical scope");
+  } finally { await h.close(); }
+});
+
+for (const carrier of ["reply_markup", "callback_data", "serializer", "rich"] as const)
+test(`Co-head known-parent edit seals actual prepared callback carrier (${carrier})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = questionMembershipHarness({ edit: async (...args: unknown[]) => {
+    const body = args[0] as { reply_markup: OutboundButtons.TelegramOutboundButtonMarkup; rich_message: { markdown: string } };
+    if (carrier === "reply_markup") assert.equal(Reflect.set(body, "reply_markup", { inline_keyboard: [] }), false);
+    if (carrier === "callback_data") assert.equal(Reflect.set(body.reply_markup.inline_keyboard[0]![0]!, "callback_data", "tgbtn:bad00000"), false);
+    if (carrier === "serializer") assert.equal(Reflect.set(body.reply_markup, "toJSON", () => ({ inline_keyboard: [] })), false);
+    if (carrier === "rich") assert.equal(Reflect.set(body.rich_message, "markdown", "Other controls"), false);
+    return "edited";
+  } });
+  try {
+    const old = coheadQuestion(h); await h.api.sendMessage(old.body); const fresh = coheadQuestion(h, false, carrier === "rich");
+    if (carrier === "rich") { fresh.richBody.rich_message.markdown = '<tg-button-row>' + fresh.plan.replyMarkup!.inline_keyboard.flat().map(button =>
+      '<tg-button type="callback_data" data="' + button.callback_data + '">' + button.text + '</tg-button>').join("") + '</tg-button-row>'; fresh.richBody.reply_markup = { inline_keyboard: [] }; }
+    await publishCoheadEdit(h, fresh, carrier === "rich" ? "rich" : "text");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(fresh.groups.map(group => group.deadline!.expiresAt), [3_601_000, 3_601_000], "The sealed carrier must actually mint complete native edit facts");
+  }
+  finally { await h.close(); }
+});
+
+test("Co-head known-parent edit fixes earlier-agent cutoffs before ACK authority callbacks", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onGuard: (() => void) | undefined;
+  const h = questionMembershipHarness({ capture: () => () => { const cb = onGuard; onGuard = undefined; cb?.(); }, edit: async () => { onGuard = () => t.mock.timers.setTime(3_602_000); return "edited"; } });
+  try {
+    const old = coheadQuestion(h); await h.api.sendMessage(old.body); const peer = h.question(); await h.api.sendMessage(h.body(peer));
+    t.mock.timers.tick(1_800_000); const fresh = coheadQuestion(h); await publishCoheadEdit(h, fresh, "text");
+    assert.equal(peer.deadline.expiresAt, 5_401_000, "One native ACK time, not a later provider clock, owns every earlier-agent tail");
+    assert.deepEqual(fresh.groups.map(g => g.deadline!.expiresAt), [88_201_000, 88_201_000]);
+  } finally { await h.close(); }
+});
+
+test("Co-head known-parent edit spends every fresh descriptor before original SDK scope reentry", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let onScope: (() => void) | undefined;
+  const h = questionMembershipHarness({ edit: async () => "edited", captureSdk: () => { const owner = h.sdk.captureQuestionLifetimeOwner!(); return owner && Object.freeze({ ...owner, assertScope(scope: unknown) {
+    const cb = onScope; onScope = undefined; cb?.(); owner.assertScope(scope);
+  } }); } });
+  try {
+    const old = coheadQuestion(h); await h.api.sendMessage(old.body); const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const fresh = coheadQuestion(h); onScope = () => { const nested = h.store.beginPublication!("editMessageText", { ...fresh.body, message_id: 201 }); nested!("edited", true); };
+    await publishCoheadEdit(h, fresh, "text"); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.deepEqual(fresh.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000], "Neither reentrant descriptor nor stale original parent may mint a prefix");
+  } finally { await h.close(); }
+});
+
+test("Co-head known-parent edit never retries membership after an unknown issued outcome", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let issued = 0;
+  const h = questionMembershipHarness({ edit: async () => { if (++issued === 1) throw Error("Uncertain issued edit"); return "edited"; } });
+  try {
+    const old = coheadQuestion(h); await h.api.sendMessage(old.body); const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const fresh = coheadQuestion(h); await assert.rejects(publishCoheadEdit(h, fresh, "text"), /Uncertain issued edit/u); await publishCoheadEdit(h, fresh, "text");
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false); assert.deepEqual(fresh.groups.map(g => g.deadline!.expiresAt), [86_401_000, 86_401_000]);
+  } finally { await h.close(); }
+});
+
+test("Co-head known-parent edit proves physical SDK ancestry before native issuance", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let issuing = false, originalChecks = 0;
+  const h = questionMembershipHarness({ captureSdk: () => { const owner = h.sdk.captureQuestionLifetimeOwner!(); return owner && Object.freeze({ ...owner, assertScope(scope: unknown) {
+    owner.assertScope(scope); if (issuing && h.owners.slice(0, 2).some(parent => parent.scope === scope)) originalChecks++;
+  } }); }, edit: async () => { assert.ok(originalChecks >= 2, "Original parent scopes must be proved before any native edit is issued, not reconstructed at ACK"); return "edited"; } });
+  try { const old = coheadQuestion(h); await h.api.sendMessage(old.body); const fresh = coheadQuestion(h); issuing = true; await publishCoheadEdit(h, fresh, "text"); }
+  finally { await h.close(); }
+});
+
+for (const mode of ["text", "rich", "markup"] as const) for (const order of ["wizard-first", "set-first"] as const) for (const threaded of [false, true])
+test(`Edited co-head collectors interleave real handler revisions (${mode}/${order}/Thread=${threaded})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = questionMembershipHarness({ threaded, edit: async () => "edited" });
+  h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(h.api));
+  try {
+    const old = coheadQuestion(h, true); await h.api.sendMessage(old.body); const fresh = coheadQuestion(h, true, mode === "rich"); await publishCoheadEdit(h, fresh, mode);
+    assert.equal(h.store.resolve(old.records[0]!.key), undefined); const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const originalCutoffs = fresh.groups.map(group => group.deadline!.expiresAt); assert.deepEqual(originalCutoffs, [3_601_000, 3_601_000]);
+    let markup = fresh.plan.replyMarkup!; const answers: unknown[] = [], toasts: (string | undefined)[] = []; let updates = 0;
+    const click = async (label: string) => {
+      const button = markup.inline_keyboard.flat().find(button => button.text === label); assert.ok(button?.callback_data, `Active peer/step control ${label} must remain visible`);
+      const matched = await OutboundButtons.handleTelegramButtonCallbackQuery({ id: "edited-cohead", data: button.callback_data, message: { chat: { id: 42 }, message_id: 201,
+        ...(threaded ? { message_thread_id: 7 } : {}), reply_markup: markup } }, undefined, {
+        resolveAction: h.store.resolve, answerCallbackQuery: async (_id, text) => { toasts.push(text); },
+        enqueueButtonPrompt: (_query, action) => { answers.push(JSON.parse(action.prompt)); },
+        updateSelectionKeyboard: async (_query, next, guard) => { guard(); await h.api.editMessageReplyMarkup(42, 201, next, { assertLocalAuthority: guard }); guard(); markup = next; updates++; },
+        updateSelectionMessage: async (_query, markdown, rendering, next, guard) => { guard(); await h.api.editMessageText({ chat_id: 42, message_id: 201,
+          ...(rendering === "rich" ? { rich_message: { markdown } } : { text: markdown }), reply_markup: next }, { assertLocalAuthority: guard }); guard(); markup = next; updates++; },
+      });
+      assert.equal(matched, true); await h.store.waitForPublicationIdle!();
+      assert.deepEqual(fresh.groups.map(group => group.deadline!.expiresAt), originalCutoffs, "Neither intermediate revision nor finish renews either original cohort lifetime");
+    };
+    const wizardAnswer = [{ question: "First", answer: "A" }, { question: "Final", answer: ["E", "F"] }], setAnswer = { question: "Set", answer: ["C", "D"] };
+    if (order === "wizard-first") {
+      await click("A"); assert.deepEqual(answers, []); await click("C"); assert.deepEqual(answers, []);
+      await click("E"); assert.deepEqual(answers, []); await click("F"); assert.deepEqual(answers, [wizardAnswer]);
+      assert.ok(markup.inline_keyboard.flat().some(button => button.text === "D" && button.callback_data), "Finishing wizard must preserve the incomplete independent set");
+      await click("D"); assert.deepEqual(answers, [wizardAnswer, setAnswer]);
+    } else {
+      await click("C"); await click("A"); assert.deepEqual(answers, []); await click("D"); assert.deepEqual(answers, [setAnswer]);
+      await click("E"); assert.deepEqual(answers, [setAnswer]); await click("F"); assert.deepEqual(answers, [setAnswer, wizardAnswer]);
+    }
+    assert.equal(updates, 5); assert.equal(h.captures(), 4, "Old/fresh groups capture owners once; callbacks cannot reacquire original SDK scope");
+    assert.equal(toasts.filter(toast => toast === "Queued").length, 2); assert.equal(toasts.filter(toast => toast === "Selection updated").length, 3);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "No handler revision/completion creates another head that demotes the later SDK head");
+  } finally { await h.close(); }
+});
+
+for (const mode of ["text", "rich", "markup"] as const) for (const stage of ["partial", "final"] as const) for (const lossAt of ["in-flight", "commit-guard"] as const)
+test(`Edited co-head collectors reject original publisher loss before semantic commit (${mode}/${stage}/${lossAt})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let block = false, lost = false, captures = 0, onOwnGuard: (() => void) | undefined;
+  const h = questionMembershipHarness({ capture: () => { const n = ++captures; return () => { if (n === 1 && lost) throw Error("Original publisher lost");
+    if (n > 1) { const callback = onOwnGuard; onOwnGuard = undefined; callback?.(); } }; },
+    edit: async () => { if (block) { entered.resolve(); await release.promise; } return "edited"; } });
+  h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(h.api));
+  try {
+    const old = coheadQuestion(h, true); await h.api.sendMessage(old.body); const fresh = coheadQuestion(h, true, mode === "rich"); await publishCoheadEdit(h, fresh, mode);
+    const later = await openLifetimeSdkHead(h.sdk); assert.ok(later.ok); let laterEnded = false; void later.handle.result.then(() => { laterEnded = true; });
+    let markup = fresh.plan.replyMarkup!; const answers: unknown[] = [], toasts: (string | undefined)[] = [];
+    const click = (label: string) => OutboundButtons.handleTelegramButtonCallbackQuery({ id: "lost-parent", data: markup.inline_keyboard.flat().find(button => button.text === label)!.callback_data,
+      message: { chat: { id: 42 }, message_id: 201, message_thread_id: 7, reply_markup: markup } }, undefined, {
+      resolveAction: h.store.resolve, answerCallbackQuery: async (_id, text) => { toasts.push(text); }, enqueueButtonPrompt: (_query, action) => { answers.push(JSON.parse(action.prompt)); },
+      updateSelectionKeyboard: async (_query, next, guard) => { guard(); await h.api.editMessageReplyMarkup(42, 201, next, { assertLocalAuthority: guard }); guard(); markup = next; },
+      updateSelectionMessage: async (_query, markdown, rendering, next, guard) => { guard(); await h.api.editMessageText({ chat_id: 42, message_id: 201,
+        ...(rendering === "rich" ? { rich_message: { markdown } } : { text: markdown }), reply_markup: next }, { assertLocalAuthority: guard }); guard(); markup = next; },
+    });
+    if (stage === "final") await click("C");
+    block = true; const work = click(stage === "final" ? "D" : "A"), failed = assert.rejects(work, /publisher|publication|unavailable/iu); await entered.promise;
+    if (lossAt === "in-flight") lost = true;
+    else { let checks = 0; const revokeAtCommit = () => { if (++checks === 2) lost = true; else onOwnGuard = revokeAtCommit; }; onOwnGuard = revokeAtCommit; }
+    let idle = false; const drain = h.store.waitForPublicationIdle!().then(() => { idle = true; });
+    for (let i = 0; i < 4; i++) await Promise.resolve(); assert.equal(idle, false, "Publisher loss is not actual native I/O drain"); release.resolve(); await failed; await drain; assert.equal(idle, true);
+    assert.deepEqual(answers, [], "Unavailable original publisher cannot commit a prepared collector or enqueue its final answer");
+    lost = false; assert.equal(h.store.resolve(fresh.records[0]!.key), undefined); assert.equal(h.store.resolve(fresh.records.at(-1)!.key), undefined, "Observed physical publisher loss revokes the whole footer, not just the busy collector");
+    assert.equal(toasts.includes("Queued"), false); assert.equal(h.captures(), 4);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(laterEnded, false, "Failed revisions are not new heads");
+  } finally { release.resolve(); await h.close(); }
+});
+
+for (const mode of ["text", "rich", "markup"] as const) for (const threaded of [false, true]) for (const lossAt of ["none", "before", "own-guard", "complete", "diagnostic"] as const)
+test(`Scalar question publisher fence survives physical replacement (${mode}/Thread=${threaded}/${lossAt})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); let lost = false, onOwn: (() => void) | undefined, captures = 0, atClick = false, completed = 0;
+  const h = questionMembershipHarness({ threaded, edit: async () => "edited", capture: () => { const n = ++captures; return () => {
+    if (n === 1 && lost) throw Error("Original publisher lost"); if (n > 1 && atClick) { const cb = onOwn; onOwn = undefined; cb?.(); }
+  }; }, retirement: reason => { if (atClick && lossAt === "diagnostic" && reason === "consumed") lost = true; } });
+  h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(h.api));
+  try {
+    const old = coheadQuestion(h, true); await h.api.sendMessage(old.body);
+    type CompletionGroup = NonNullable<OutboundButtons.TelegramOutboundButtonAction["completionGroup"]>;
+    const aliases = new Map<CompletionGroup, CompletionGroup>();
+    const plan = OutboundButtons.planTelegramButtonReply('<!-- telegram_confirm "C" -->\n<!-- telegram_confirm "D" -->', { questionHeadTail: true, rendering: mode === "rich" ? "rich" : "html", registerAction(action) {
+      const original = action.completionGroup!; let group = aliases.get(original);
+      if (!group) { group = Object.freeze({ ...original, complete(key: string) { completed++; original.complete?.(key); if (lossAt === "complete") lost = true; } }); aliases.set(original, group); }
+      return h.store.register({ ...action, completionGroup: group });
+    } });
+    if (mode === "markup") await h.api.editMessageReplyMarkup(42, 201, plan.replyMarkup!);
+    else await h.api.editMessageText({ chat_id: 42, message_id: 201, ...(mode === "rich" ? { rich_message: { markdown: plan.markdown } } : { text: plan.markdown }), reply_markup: plan.replyMarkup });
+    const later = await openLifetimeSdkHead(h.sdk); assert.ok(later.ok); let laterEnded = false; void later.handle.result.then(() => { laterEnded = true; });
+    assert.deepEqual([...aliases.values()].map(group => group.deadline!.expiresAt), [3_601_000, 3_601_000], "Both scalar questions start with native positive edit membership");
+    if (lossAt === "before") lost = true; if (lossAt === "own-guard") onOwn = () => { lost = true; }; atClick = true;
+    const markup = plan.replyMarkup!, key = markup.inline_keyboard[0]![0]!.callback_data!, peer = markup.inline_keyboard[1]![0]!.callback_data!, answers: unknown[] = [], toasts: (string | undefined)[] = [];
+    assert.equal(await OutboundButtons.handleTelegramButtonCallbackQuery({ id: "scalar", data: key, message: { chat: { id: 42 }, message_id: 201,
+      ...(threaded ? { message_thread_id: 7 } : {}), reply_markup: markup } }, undefined, {
+      resolveAction: h.store.resolve, answerCallbackQuery: async (_id, text) => { toasts.push(text); }, enqueueButtonPrompt: (_query, action) => { answers.push(JSON.parse(action.prompt)); },
+    }), true);
+    await h.store.waitForPublicationIdle!();
+    assert.deepEqual(answers, lossAt === "none" ? [{ question: "C", answer: "✅ Yes" }] : [], "Final result cannot borrow fresh scope or escape a completion/diagnostic revocation");
+    assert.equal(completed, lossAt === "before" || lossAt === "own-guard" ? 0 : 1, "First barrier precedes producer completion; later loss cannot roll back an already spent completion");
+    lost = false; if (lossAt !== "none") { assert.equal(h.store.resolve(peer), undefined, "Original publisher loss is sticky and footer-wide"); assert.equal(toasts.includes("Queued"), false); }
+    else assert.equal(toasts.at(-1), "Queued");
+    assert.equal(h.store.resolve(key), undefined, "A terminal attempt cannot replay"); assert.equal(h.captures(), 4);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(laterEnded, false, "Scalar completion is not a new question head");
+  } finally { await h.close(); }
+});
+
+function knownEditQuestion(h: ReturnType<typeof questionMembershipHarness>, rich = false) {
+  const rows: { key: string; action: OutboundButtons.TelegramOutboundButtonAction }[] = [];
+  const plan = OutboundButtons.planTelegramButtonReply('<!-- telegram_confirm "Fresh" -->', { questionHeadTail: true,
+    rendering: rich ? "rich" : "html", registerAction(action) { const key = h.store.register(action); rows.push({ key, action }); return key; } });
+  return { plan, rows, deadline: rows[0]!.action.completionGroup!.deadline!, body: {
+    chat_id: 42, message_id: 201, ...(rich ? { rich_message: { markdown: plan.markdown } } : { text: plan.markdown }), reply_markup: plan.replyMarkup } };
+}
+
+for (const threaded of [false, true]) for (const rich of [false, true])
+test(`Known question edit-first inherits original physical scope without caller Thread (Thread=${threaded}/Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ threaded, edit: async () => "edited" });
+  try {
+    const parent = h.question(); if (rich) await h.api.sendRichMessage({ chat_id: 42, ...(threaded ? { message_thread_id: 7 } : {}),
+      rich_message: { markdown: "Parent" }, reply_markup: parent.markup }); else await h.api.sendMessage(h.body(parent));
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    t.mock.timers.tick(1_800_000); const next = knownEditQuestion(h, rich); await h.api.editMessageText(next.body);
+    assert.equal(h.store.resolve(parent.keys[0]), undefined); assert.equal(h.captures(), 2);
+    assert.equal(next.deadline.expiresAt, 88_201_000); t.mock.timers.tick(3_600_000 - 1); await Promise.resolve(); assert.equal(ended, false);
+    t.mock.timers.tick(1); await Promise.resolve(); assert.equal(ended, true); assert.deepEqual(await sdk.handle.result, { status: "expired" });
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(next.deadline.expiresAt, Date.now() + 3_600_000, "Retained edit origin also gates SDK-to-agent tails");
+  } finally { await h.close(); }
+});
+
+for (const held of ["ordinary", "unchanged", "boolean", "alternate", "unknown-field", "wrong-thread", "partial", "duplicate", "parent-expired", "parent-consumed", "publisher-lost", "wrong-publication"] as const)
+test(`Known question edit-first refuses incomplete original scope or outcome (${held})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let lost = false, captures = 0, onEdit: (() => void) | undefined;
+  const h = questionMembershipHarness({ capture: () => { const n = ++captures; return () => { if (n === 1 && lost) throw new Error("Original publisher lost"); }; },
+    edit: async () => { onEdit?.(); return held === "unchanged" ? "unchanged" : held === "boolean" ? true : "edited"; } });
+  try {
+    const parent = held === "ordinary" ? undefined : h.question();
+    if (parent) await h.api.sendMessage(h.body(parent)); else { const key = h.store.register({ text: "Ordinary", prompt: "Ordinary" });
+      await h.api.sendMessage({ chat_id: 42, message_thread_id: 7, text: "Ordinary", reply_markup: { inline_keyboard: [[{ text: "Ordinary", callback_data: key }]] } }); }
+    if (held === "wrong-publication") { const key = h.store.register({ text: "Other", prompt: "Other" });
+      await h.api.sendMessage({ chat_id: 42, message_thread_id: 7, text: "Other", reply_markup: { inline_keyboard: [[{ text: "Other", callback_data: key }]] } }); }
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const next = knownEditQuestion(h), body: Record<string, unknown> & { chat_id: number; message_id: number } = { ...next.body };
+    if (held === "wrong-publication") body.message_id = 202;
+    if (held === "alternate") body.inline_message_id = "controlled-inline";
+    if (held === "unknown-field") body.other = true;
+    if (held === "wrong-thread") body.message_thread_id = 8;
+    if (held === "partial") body.reply_markup = { inline_keyboard: [[next.plan.replyMarkup!.inline_keyboard[0]![0]!]] };
+    if (held === "duplicate") body.reply_markup = { inline_keyboard: [...next.plan.replyMarkup!.inline_keyboard, ...next.plan.replyMarkup!.inline_keyboard] };
+    if (held === "parent-expired") onEdit = () => { t.mock.timers.tick(3_600_000); };
+    if (held === "parent-consumed") onEdit = () => { h.store.resolve(parent!.keys[0]); };
+    if (held === "publisher-lost") onEdit = () => { lost = true; };
+    await h.api.editMessageText(body); t.mock.timers.tick(Math.max(0, 3_601_000 - Date.now())); await Promise.resolve();
+    assert.equal(ended, false, "An ineligible edit cannot demote the captured SDK question");
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(next.deadline.expiresAt, 86_401_000, "A retained fact cannot bypass the original publisher guard");
+    lost = false; assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(next.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+test("Known question edit-first cannot borrow a live equal-field foreign SDK runtime", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let current: Delivery.TelegramDeliveryRuntime;
+  const h = questionMembershipHarness({ captureSdk: () => current.captureQuestionLifetimeOwner!(), edit: async () => "edited" }); current = h.sdk;
+  const foreign = createLifetimeSdk(h.target, { onQuestionAdmission: admission => h.store.onQuestionAdmission!(admission) });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); current = foreign;
+    const sdk = await openLifetimeSdkHead(foreign); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const next = knownEditQuestion(h); await h.api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve();
+    assert.equal(ended, false); assert.ok((await openLifetimeSdkHead(foreign)).ok); assert.equal(next.deadline.expiresAt, 86_401_000);
+  } finally { foreign.shutdown(); await h.close(); }
+});
+
+test("Known question edit-first spends superseded callbacks before notifications and cannot demote a notification-admitted head", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let notify: (() => void) | undefined, newer: ReturnType<typeof openLifetimeSdkHead> | undefined;
+  const h = questionMembershipHarness({ edit: async () => "edited", retirement: reason => { if (reason === "superseded") { const callback = notify; notify = undefined; callback?.(); } } });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    const next = knownEditQuestion(h); notify = () => { assert.equal(h.store.resolve(parent.keys[0]), undefined); newer = openLifetimeSdkHead(h.sdk); };
+    await h.api.editMessageText(next.body); assert.ok(newer); const opened = await newer; assert.ok(opened.ok);
+    let ended = false; void opened.handle.result.then(() => { ended = true; });
+    assert.equal(next.deadline.expiresAt, 3_601_000); t.mock.timers.tick(3_600_001); await Promise.resolve(); assert.equal(ended, false);
+  } finally { await h.close(); }
+});
+
+test("Known question edit-first burns its descriptor before original publisher guard reentry", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let callback: (() => void) | undefined;
+  const h = questionMembershipHarness({ edit: async () => "edited", capture: () => () => { const next = callback; callback = undefined; next?.(); } });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok);
+    let ended = false; void sdk.handle.result.then(() => { ended = true; }); const next = knownEditQuestion(h);
+    callback = () => { h.store.beginPublication!("sendMessage", { chat_id: 42, message_thread_id: 7, text: "Nested", reply_markup: next.plan.replyMarkup })?.({ message_id: 303 }, true); };
+    await h.api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { await h.close(); }
+});
+
+test("Known question edit-first retains the original publisher guard after successful replacement", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let n = 0, lost = false;
+  const h = questionMembershipHarness({ edit: async () => "edited", capture: () => { const id = ++n; return () => { if (id === 1 && lost) throw new Error("Original publisher lost"); }; } });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const next = knownEditQuestion(h); await h.api.editMessageText(next.body);
+    lost = true; assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(next.deadline.expiresAt, 86_401_000);
+    lost = false; assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(next.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+test("Known question edit-first cannot renew the original publication SDK scope after observed ancestor loss", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let operatorId = 42;
+  const h = questionMembershipHarness({ edit: async () => "edited", sdk: { getConfirmationAuthority: () => ({ profile: "default", operatorId }) } });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const next = knownEditQuestion(h); await h.api.editMessageText(next.body);
+    operatorId = 99; assert.throws(h.owners[0]!.assertCurrent, /unavailable/u); operatorId = 42;
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(next.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+for (const outcome of ["known", "unknown", "spent"] as const)
+test(`Known question edit-first keeps issued work until actual settlement (${outcome})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const h = questionMembershipHarness({ edit: async () => { entered.resolve(); await release.promise;
+    if (outcome === "unknown") throw new Error("Unknown edit result"); return "edited"; } });
+  let pending: Promise<unknown> | undefined;
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok);
+    let ended = false; void sdk.handle.result.then(() => { ended = true; }); const next = knownEditQuestion(h);
+    pending = h.api.editMessageText(next.body); void pending.catch(() => {}); await entered.promise;
+    if (outcome === "spent") next.deadline.shorten(1100);
+    t.mock.timers.tick(outcome === "spent" ? 100 : 1_800_000);
+    let drained = false; const idle = h.store.waitForPublicationIdle!().then(() => { drained = true; }); await Promise.resolve(); assert.equal(drained, false);
+    release.resolve(); if (outcome === "unknown") await assert.rejects(pending, /Unknown edit/u); else await pending; await idle; assert.equal(drained, true);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, outcome === "known");
+    assert.equal(h.captures(), 2);
+  } finally { release.resolve(); if (pending) await pending.catch(() => {}); await h.close(); }
+});
+
+test("Known question edit-first also demotes original same-runtime agent peers", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ edit: async () => "edited" });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const peer = h.question(); await h.api.sendMessage(h.body(peer));
+    t.mock.timers.tick(1); const next = knownEditQuestion(h); await h.api.editMessageText(next.body);
+    assert.equal(peer.deadline.expiresAt, 3_601_001); assert.equal(next.deadline.expiresAt, 86_401_001);
+  } finally { await h.close(); }
+});
+
+test("Known question edit-first records its fact before ACK guard reentry and cannot select the newer agent back", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let callback: (() => void) | undefined, nextHead: ReturnType<ReturnType<typeof questionMembershipHarness>["question"]> | undefined;
+  const h = questionMembershipHarness({ capture: () => () => { const next = callback; callback = undefined; next?.(); }, edit: async () => {
+    callback = () => { nextHead = h.question(); h.store.beginPublication!("sendMessage", h.body(nextHead))?.({ message_id: 303 }, true); }; return "edited";
+  } });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const next = knownEditQuestion(h); await h.api.editMessageText(next.body);
+    assert.ok(nextHead); assert.equal(next.deadline.expiresAt, 3_601_000); assert.equal(nextHead.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+test("Known question edit-first retains the first publication SDK origin across successive replacements", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let operatorId = 42;
+  const h = questionMembershipHarness({ edit: async () => "edited", sdk: { getConfirmationAuthority: () => ({ profile: "default", operatorId }) } });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const b = knownEditQuestion(h); await h.api.editMessageText(b.body);
+    const c = knownEditQuestion(h); await h.api.editMessageText(c.body); operatorId = 99;
+    assert.throws(h.owners[0]!.assertCurrent, /unavailable/u); operatorId = 42;
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(c.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+test("Known question edit-first fixes the native ACK clock before original publisher callbacks", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let callback: (() => void) | undefined;
+  const h = questionMembershipHarness({ capture: () => () => { const next = callback; callback = undefined; next?.(); },
+    edit: async () => { callback = () => { t.mock.timers.setTime(2000); }; return "edited"; } });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const peer = h.question(); await h.api.sendMessage(h.body(peer));
+    const next = knownEditQuestion(h); await h.api.editMessageText(next.body); assert.equal(Date.now(), 2000);
+    assert.equal(peer.deadline.expiresAt, 3_601_000, "Publisher guard time cannot become demotion time");
+  } finally { await h.close(); }
+});
+
+test("Known question edit-first cannot replay a rejected original descriptor against the same positive parent", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ edit: async () => "edited" });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok);
+    let ended = false; void sdk.handle.result.then(() => { ended = true; }); const next = knownEditQuestion(h);
+    const rejected = h.store.beginPublication!("editMessageText", next.body); assert.ok(rejected); await rejected.ready; rejected(undefined, false, true);
+    await h.api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { await h.close(); }
+});
+
+test("Known question edit-first closes the actual field region after waiting for the original lane", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(); let issued = 0;
+  const h = questionMembershipHarness({ edit: async () => { issued++; entered.resolve(); await release.promise; return "edited"; } });
+  let first: Promise<unknown> | undefined, second: Promise<unknown> | undefined;
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok);
+    let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    first = h.api.editMessageText({ chat_id: 42, message_id: 201, text: "Revision", reply_markup: parent.markup }); await entered.promise;
+    const next = knownEditQuestion(h), body: Record<string, unknown> & { chat_id: number; message_id: number } = { ...next.body };
+    second = h.api.editMessageText(body); void second.catch(() => {}); body.other = true;
+    release.resolve(); await first; await assert.rejects(second, /publication locator is unavailable/u); assert.equal(issued, 1);
+    await h.store.waitForPublicationIdle!(); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { release.resolve(); if (first) await first.catch(() => {}); if (second) await second.catch(() => {}); await h.close(); }
+});
+
+function editCollectorQuestion(h: ReturnType<typeof questionMembershipHarness>, kind: "set" | "wizard", rich: boolean) {
+  const rows: { key: string; action: OutboundButtons.TelegramOutboundButtonAction }[] = [];
+  const set = { question: "Set", choices: ["C", "D"], select: 2 };
+  const plan = OutboundButtons.planTelegramButtonReply(`<!-- telegram_choice ${JSON.stringify(kind === "set" ? set : [{ question: "First", choices: ["A", "B"] }, set])} -->`, {
+    questionHeadTail: true, rendering: rich ? "rich" : "html", registerAction(action) { const key = h.store.register(action); rows.push({ key, action }); return key; },
+  });
+  let markup = plan.replyMarkup!; const answers: unknown[] = [];
+  const body = () => ({ chat_id: 42, message_id: 201, ...(rich ? { rich_message: { markdown: plan.markdown } } : { text: plan.markdown }), reply_markup: markup });
+  const query = (key: string): OutboundButtons.TelegramButtonCallbackQuery => ({ id: "collector", data: key,
+    message: { chat: { id: 42 }, message_id: 201, ...(h.target.threadId === undefined ? {} : { message_thread_id: h.target.threadId }), reply_markup: markup } });
+  const click = (label: string) => {
+    const key = markup.inline_keyboard.flat().find(button => button.text === label)!.callback_data!;
+    return OutboundButtons.handleTelegramButtonCallbackQuery(query(key), undefined, { resolveAction: h.store.resolve,
+      answerCallbackQuery: async () => {}, enqueueButtonPrompt: (_query, action) => { answers.push(JSON.parse(action.prompt)); },
+      updateSelectionKeyboard: async (_query, next, guard) => { guard(); await h.api.editMessageReplyMarkup(42, 201, next, { assertLocalAuthority: guard }); guard(); markup = next; },
+      updateSelectionMessage: async (_query, markdown, _rendering, next, guard) => { guard();
+        await h.api.editMessageText({ chat_id: 42, message_id: 201, ...(rich ? { rich_message: { markdown } } : { text: markdown }), reply_markup: next }, { assertLocalAuthority: guard }); guard(); markup = next; },
+    });
+  };
+  return { rows, plan, body, query, click, answers, deadline: rows[0]!.action.completionGroup!.deadline! };
+}
+
+for (const kind of ["set", "wizard"] as const) for (const threaded of [false, true]) for (const rich of [false, true])
+test(`Collector edit-first keeps one original lifetime through native updates (${kind}/Thread=${threaded}/Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ threaded, edit: async () => "edited" }); h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(h.api));
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const before = await openLifetimeSdkHead(h.sdk); assert.ok(before.ok);
+    let beforeEnded = false; void before.handle.result.then(() => { beforeEnded = true; });
+    const b = editCollectorQuestion(h, kind, rich); await h.api.editMessageText(b.body()); assert.equal(b.deadline.expiresAt, 86_401_000);
+    await b.click(kind === "set" ? "C" : "A"); assert.deepEqual(b.answers, []); assert.equal(h.captures(), 2);
+    t.mock.timers.tick(1); const validations = h.validations(); const later = await openLifetimeSdkHead(h.sdk); assert.ok(later.ok);
+    let laterEnded = false; void later.handle.result.then(() => { laterEnded = true; });
+    assert.ok(h.validations() > validations, "Regenerated rows must retain positive edit membership"); assert.equal(b.deadline.expiresAt, 3_601_001);
+    if (kind === "wizard") { await b.click("C"); assert.deepEqual(b.answers, []); }
+    await b.click("D"); await h.store.waitForPublicationIdle!();
+    assert.deepEqual(b.answers, [kind === "set" ? { question: "Set", answer: ["C", "D"] } : [{ question: "First", answer: "A" }, { question: "Set", answer: ["C", "D"] }]]);
+    assert.ok(b.rows.every(row => row.action.completionGroup === b.rows[0]!.action.completionGroup)); assert.equal(h.captures(), 2);
+    assert.equal(b.deadline.expiresAt, 3_601_001); t.mock.timers.tick(3_600_001); await Promise.resolve();
+    assert.equal(beforeEnded, true, "The original positive edit demotes the captured SDK question");
+    assert.equal(laterEnded, false, "Native collector revisions/finish cannot become another head");
+  } finally { await h.close(); }
+});
+
+for (const parentKind of ["set", "wizard"] as const) for (const rich of [false, true])
+test(`Collector edit-first preserves terminal-safe publisher scope after collector-parent supersession (${parentKind}/Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ edit: async () => "edited" }); h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(h.api));
+  try {
+    const parent = editCollectorQuestion(h, parentKind, rich), seed = { chat_id: 42, message_thread_id: 7, reply_markup: parent.plan.replyMarkup };
+    if (rich) await h.api.sendRichMessage({ ...seed, rich_message: { markdown: parent.plan.markdown } }); else await h.api.sendMessage({ ...seed, text: parent.plan.markdown });
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const b = editCollectorQuestion(h, parentKind === "set" ? "wizard" : "set", rich); await h.api.editMessageText(b.body());
+    assert.equal(parent.rows[0]!.action.selection!.prepare(parent.query(parent.rows[0]!.key)), undefined);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(b.deadline.expiresAt, 3_601_000);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, true); assert.equal(h.captures(), 2);
+  } finally { await h.close(); }
+});
+
+for (const kind of ["set", "wizard"] as const) for (const outcome of ["expired", "unknown", "publisher-lost", "prepared"] as const)
+test(`Collector edit-first holds changed original rows/scopes until actual drain (${kind}/${outcome})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(); let captures = 0, lost = false;
+  const h = questionMembershipHarness({ capture: () => { const n = ++captures; return () => { if (n === 1 && lost) throw new Error("Original publisher lost"); }; },
+    edit: async () => { entered.resolve(); await release.promise; if (outcome === "unknown") throw new Error("Unknown collector edit"); return "edited"; } });
+  h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(h.api));
+  let pending: Promise<unknown> | undefined, prepared: ReturnType<NonNullable<OutboundButtons.TelegramOutboundButtonAction["selection"]>["prepare"]>;
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok);
+    let ended = false; void sdk.handle.result.then(() => { ended = true; }); const b = editCollectorQuestion(h, kind, false);
+    pending = h.api.editMessageText(b.body()); void pending.catch(() => {}); await entered.promise;
+    if (outcome === "expired") { b.deadline.shorten(1100); t.mock.timers.tick(100); }
+    if (outcome === "publisher-lost") lost = true;
+    if (outcome === "prepared") { prepared = b.rows[0]!.action.selection!.prepare(b.query(b.rows[0]!.key)); assert.ok(prepared, "Private producer alias prepares new rows during issued work, not a real early Telegram callback"); }
+    let drained = false; const idle = h.store.waitForPublicationIdle!().then(() => { drained = true; }); await Promise.resolve(); assert.equal(drained, false);
+    release.resolve(); if (outcome === "unknown") await assert.rejects(pending, /Unknown collector/u); else await pending; await idle; assert.equal(drained, true);
+    prepared?.fail(); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "Late/uncertain collector edits cannot demote SDK questions");
+    assert.deepEqual(b.answers, []); assert.equal(h.captures(), 2);
+  } finally { release.resolve(); if (pending) await pending.catch(() => {}); await h.close(); }
+});
+
+for (const kind of ["set", "wizard"] as const)
+test(`Collector edit-first demotes same-runtime agent peers without a second collector registry (${kind})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ edit: async () => "edited" });
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const peer = h.question(); await h.api.sendMessage(h.body(peer));
+    const b = editCollectorQuestion(h, kind, false); await h.api.editMessageText(b.body());
+    assert.equal(peer.deadline.expiresAt, 3_601_000); assert.equal(b.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+for (const kind of ["set", "wizard"] as const) for (const outcome of ["unknown", "expired"] as const)
+test(`Collector edit-first keeps later issued selection updates held after logical failure (${kind}/${outcome})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(); let edits = 0;
+  const h = questionMembershipHarness({ edit: async () => { if (++edits > 1) { entered.resolve(); await release.promise;
+    if (outcome === "unknown") throw new Error("Unknown collector update"); } return "edited"; } });
+  h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(h.api)); let active: Promise<unknown> | undefined;
+  try {
+    const parent = h.question(); await h.api.sendMessage(h.body(parent)); const b = editCollectorQuestion(h, kind, true); await h.api.editMessageText(b.body());
+    active = b.click(kind === "set" ? "C" : "A"); void active.catch(() => {}); await entered.promise;
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    if (outcome === "expired") { b.deadline.shorten(1100); t.mock.timers.tick(100); }
+    let drained = false; const idle = h.store.waitForPublicationIdle!().then(() => { drained = true; }); await Promise.resolve(); assert.equal(drained, false);
+    release.resolve(); await assert.rejects(active, outcome === "unknown" ? /Unknown collector update/u : /unavailable/u); await idle;
+    assert.equal(drained, true); assert.deepEqual(b.answers, []); assert.equal(h.captures(), 2);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false, "A later failed/revised edit cannot become another collector head");
+    for (const row of b.rows) assert.equal(h.store.resolve(row.key), undefined);
+  } finally { release.resolve(); if (active) await active.catch(() => {}); await h.close(); }
+});
+
+for (const kind of ["set", "wizard"] as const) for (const threaded of [false, true]) for (const rich of [false, true])
+test(`Direct positive markup edit retains one native collector lifetime (${kind}/Thread=${threaded}/Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ threaded, edit: async () => "edited" }); h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(h.api));
+  try {
+    const parent = h.question(); if (rich) { const { text: _text, ...richBody } = h.body(parent); await h.api.sendRichMessage({ ...richBody, rich_message: { markdown: "Same question" } }); } else await h.api.sendMessage(h.body(parent));
+    const before = await openLifetimeSdkHead(h.sdk); assert.ok(before.ok); let beforeEnded = false; void before.handle.result.then(() => { beforeEnded = true; });
+    const b = editCollectorQuestion(h, kind, rich); assert.equal(await h.api.editMessageReplyMarkup(42, 201, b.plan.replyMarkup), undefined, "Facade preserves void");
+    await b.click(kind === "set" ? "C" : "A"); assert.deepEqual(b.answers, []); assert.equal(h.captures(), 2);
+    t.mock.timers.tick(1); const later = await openLifetimeSdkHead(h.sdk); assert.ok(later.ok); assert.equal(b.deadline.expiresAt, 3_601_001);
+    let laterEnded = false; void later.handle.result.then(() => { laterEnded = true; });
+    if (kind === "wizard") await b.click("C"); await b.click("D"); await h.store.waitForPublicationIdle!();
+    assert.equal(b.answers.length, 1); assert.equal(h.captures(), 2); t.mock.timers.tick(3_600_001); await Promise.resolve();
+    assert.equal(beforeEnded, true); assert.equal(laterEnded, false, "Revisions and finish cannot mint another head");
+  } finally { await h.close(); }
+});
+
+test("Direct positive markup edit demotes only original same-runtime agent peers", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ edit: async () => "edited" });
+  try { const parent = h.question(); await h.api.sendMessage(h.body(parent)); const peer = h.question(); await h.api.sendMessage(h.body(peer));
+    const b = h.question(); await h.api.editMessageReplyMarkup(42, 201, b.markup); assert.equal(peer.deadline.expiresAt, 3_601_000); assert.equal(b.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+for (const held of ["ordinary-parent", "partial", "duplicate", "retained-rich-controls"] as const)
+test(`Direct positive markup edit still requires original whole-footer evidence (${held})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ edit: async () => "edited" });
+  try {
+    if (held === "ordinary-parent") { const key = h.store.register({ text: "Ordinary", prompt: "Ordinary" }); await h.api.sendMessage({ chat_id: 42, message_thread_id: 7, text: "Ordinary", reply_markup: { inline_keyboard: [[{ text: "Ordinary", callback_data: key }]] } }); }
+    else { const parent = h.question(); if (held === "retained-rich-controls") await h.api.sendRichMessage({ chat_id: 42, message_thread_id: 7,
+      rich_message: { markdown: `<tg-button-row>${parent.keys.map(key => `<tg-button type="callback_data" data="${key}">Answer</tg-button>`).join("")}</tg-button-row>` } }); else await h.api.sendMessage(h.body(parent)); }
+    const sdk = await openLifetimeSdkHead(h.sdk); assert.ok(sdk.ok); let ended = false; void sdk.handle.result.then(() => { ended = true; });
+    const b = h.question(), markup = held === "partial" ? { inline_keyboard: [[b.markup.inline_keyboard[0]![0]!]] } : held === "duplicate" ? { inline_keyboard: [...b.markup.inline_keyboard, ...b.markup.inline_keyboard] } : b.markup;
+    await h.api.editMessageReplyMarkup(42, 201, markup); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(b.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+function nativeRevisionQuestion(h: ReturnType<typeof questionMembershipHarness>) {
+  const deadline = OutboundButtons.createTelegramButtonQuestionDeadline(Date.now() + 86_400_000), group = Object.freeze({ deadline }), owner = {};
+  return { deadline, rows(revision: number) { return { inline_keyboard: [["A", "B"].map(text => ({ text, callback_data: h.store.register({
+    text, prompt: "", promptKind: "selection", expiresAt: deadline.expiresAt, completionGroup: group,
+    selection: { owner, revision, prepare: () => undefined },
+  }) }))] }; } };
+}
+
+for (const threaded of [false, true]) for (const rich of [false, true])
+test(`Agent question head demotes only earlier same-scope agent questions after native ACK (Thread=${threaded}, Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ threaded }); let sdkAdmissions = 0; h.observe(() => { sdkAdmissions++; });
+  try {
+    const a = h.question(); await h.api.sendMessage(h.body(a)); t.mock.timers.setTime(1_801_000);
+    const b = h.question();
+    if (rich) await h.api.sendRichMessage({ chat_id: 42, ...(threaded ? { message_thread_id: 7 } : {}), rich_message: {
+      markdown: `<tg-button-row>${b.keys.map(key => `<tg-button type="callback_data" data="${key}">Answer</tg-button>`).join("")}</tg-button-row>` } });
+    else await h.api.sendMessage(h.body(b));
+    assert.equal(a.deadline.expiresAt, 5_401_000); assert.equal(b.deadline.expiresAt, 88_201_000);
+    h.store.resolve(b.keys[0]); assert.equal(a.deadline.expiresAt, 5_401_000, "Finishing a head never promotes history");
+    t.mock.timers.setTime(2_701_000); const c = h.question(); await h.api.sendMessage(h.body(c));
+    assert.equal(a.deadline.expiresAt, 5_401_000, "A later head cannot renew a tail"); assert.equal(c.deadline.expiresAt, 89_101_000);
+    assert.equal(sdkAdmissions, 0); assert.equal(h.validations(), 0, "Agent heads use original scope matching, not fake SDK admissions");
+  } finally { await h.close(); }
+});
+
+for (const held of ["pending", "unknown", "edit-first", "partial", "target", "head-agent-loss", "peer-agent-loss"] as const)
+test(`Agent question head cannot demote from a rejected/held scope or publication (${held})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let capture = 0, headLost = false, peerLost = false, sends = 0, fail = false;
+  const pending = Promise.withResolvers<{ message_id: number }>();
+  const h = questionMembershipHarness({ capture: () => { const identity = ++capture; return () => {
+    if (identity === 1 && peerLost || identity === 2 && headLost) throw new Error("Original scope lost");
+  }; }, send: async () => { if (++sends > 1 && held === "pending") return pending.promise; if (fail) throw new Error("unknown"); return { message_id: 200 + sends }; } });
+  try {
+    const a = h.question(); await h.api.sendMessage(h.body(a)); const b = h.question(), body = h.body(b);
+    if (held === "pending") { const work = h.api.sendMessage(body); await Promise.resolve(); assert.equal(a.deadline.expiresAt, 86_401_000); pending.resolve({ message_id: 202 }); await work;
+      assert.equal(a.deadline.expiresAt, 3_601_000); return; }
+    if (held === "head-agent-loss") headLost = true; if (held === "peer-agent-loss") peerLost = true;
+    if (held === "unknown") { fail = true; await h.api.sendMessage(body).catch(() => {}); fail = false; await h.api.sendMessage(body); }
+    else if (held === "edit-first") { await h.api.editMessageReplyMarkup(42, 202, b.markup); await h.api.sendMessage(body); }
+    else if (held === "partial") await h.api.sendMessage({ ...body, reply_markup: { inline_keyboard: [[b.markup.inline_keyboard[0]![0]!]] } });
+    else if (held === "target") await h.api.sendMessage({ ...body, message_thread_id: 8 });
+    else await h.api.sendMessage(body);
+    assert.equal(a.deadline.expiresAt, 86_401_000);
+  } finally { pending.resolve({ message_id: 202 }); await h.close(); }
+});
+
+test("Agent question head refuses equal-field distinct live SDK origins", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let current: Delivery.TelegramDeliveryRuntime;
+  const h = questionMembershipHarness({ captureSdk: () => current.captureQuestionLifetimeOwner!() }), foreign = createLifetimeSdk(h.target); current = h.sdk;
+  try {
+    const a = h.question(); await h.api.sendMessage(h.body(a)); current = foreign;
+    const b = h.question(); await h.api.sendMessage(h.body(b)); assert.equal(a.deadline.expiresAt, 86_401_000); assert.equal(b.deadline.expiresAt, 86_401_000);
+    h.owners[0]!.assertCurrent(); h.owners[1]!.assertCurrent();
+  } finally { foreign.shutdown(); await h.close(); }
+});
+
+test("Agent question head cannot renew a peer with restored SDK fields after observed loss", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let authorized = true;
+  const h = questionMembershipHarness({ sdk: { isExplicitTargetAuthorized: () => authorized } });
+  try {
+    const a = h.question(); await h.api.sendMessage(h.body(a)); authorized = false;
+    assert.throws(h.owners[0]!.assertCurrent, /unavailable/u); authorized = true;
+    const b = h.question(); await h.api.sendMessage(h.body(b)); assert.equal(a.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+test("Agent question head rechecks its original agent authority after peer callbacks", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let captures = 0, trigger = false, headLost = false;
+  const h = questionMembershipHarness({ capture: () => { const owner = ++captures; return () => {
+    if (owner === 1 && trigger) headLost = true;
+    if (owner === 2 && headLost) throw new Error("Original head authority lost");
+  }; } });
+  try {
+    const a = h.question(); await h.api.sendMessage(h.body(a)); const b = h.question(); trigger = true;
+    await h.api.sendMessage(h.body(b)); assert.equal(headLost, true); assert.equal(a.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+test("Agent question head snapshots ACK clock before authority callbacks advance time", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let onRead: (() => void) | undefined, afterAck: (() => void) | undefined;
+  const h = questionMembershipHarness({ send: async () => { onRead = afterAck; afterAck = undefined; return { message_id: 201 }; },
+    sdk: { getConfirmationAuthority() { const callback = onRead; onRead = undefined; callback?.(); return { profile: "default", operatorId: 42 }; } } });
+  try {
+    const a = h.question(); await h.api.sendMessage(h.body(a)); t.mock.timers.setTime(2000); const b = h.question();
+    afterAck = () => t.mock.timers.setTime(1_802_000); await h.api.sendMessage(h.body(b)); assert.equal(a.deadline.expiresAt, 3_602_000);
+  } finally { await h.close(); }
+});
+
+test("Agent question head reentry sees the earlier native ACK fact without selecting the newer head back", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let onRead: (() => void) | undefined, afterAck: (() => void) | undefined;
+  const h = questionMembershipHarness({ send: async () => { onRead = afterAck; afterAck = undefined; return { message_id: 201 }; },
+    sdk: { getConfirmationAuthority() { const callback = onRead; onRead = undefined; callback?.(); return { profile: "default", operatorId: 42 }; } } });
+  let newer: ReturnType<typeof h.question> | undefined;
+  try {
+    const a = h.question(); await h.api.sendMessage(h.body(a)); const b = h.question();
+    afterAck = () => { newer = h.question(); const finish = h.store.beginPublication!("sendMessage", h.body(newer)); assert.ok(finish); finish({ message_id: 203 }, true); };
+    await h.api.sendMessage(h.body(b)); assert.ok(newer);
+    assert.equal(a.deadline.expiresAt, 3_601_000); assert.equal(b.deadline.expiresAt, 3_601_000); assert.equal(newer.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+for (const threaded of [false, true]) for (const rich of [false, true])
+test(`Native question membership retains a positive singleton ACK for reciprocal SDK tails (Thread=${threaded}, Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness({ threaded });
+  try {
+    const q = h.question(); assert.equal(q.deadline.expiresAt, 86_401_000);
+    if (rich) await h.api.sendRichMessage({ chat_id: h.target.chatId, ...(threaded ? { message_thread_id: 7 } : {}), rich_message: {
+      markdown: `<tg-button-row>${q.keys.map(key => `<tg-button type="callback_data" data="${key}">Answer</tg-button>`).join("")}</tg-button-row>` } });
+    else await h.api.sendMessage(h.body(q));
+    assert.equal(h.validations(), 0); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.equal(h.validations(), 2); assert.equal(q.deadline.expiresAt, 3_601_000);
+    t.mock.timers.tick(3_600_000); assert.equal(h.store.resolve(q.keys[0]), undefined);
+  } finally { await h.close(); }
+});
+
+test("Native question membership does not treat an opening publication as a positive ACK", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const release = Promise.withResolvers<{ message_id: number }>(), h = questionMembershipHarness({ send: () => release.promise });
+  try {
+    const q = h.question(), pending = h.api.sendMessage(h.body(q));
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(h.validations(), 0); assert.equal(q.deadline.expiresAt, 86_401_000);
+    release.resolve({ message_id: 201 }); await pending; t.mock.timers.setTime(2000);
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(q.deadline.expiresAt, 3_602_000);
+  } finally { release.resolve({ message_id: 201 }); await h.close(); }
+});
+
+for (const held of ["unknown", "edit-first", "partial", "target", "consumed", "clear", "capacity", "unknown-edit", "agent-loss", "sdk-loss"] as const)
+test(`Native question membership cannot be manufactured from spent/held publication history (${held})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let lost = false, failSend = held === "unknown", failEdit = false;
+  const h = questionMembershipHarness({ capture: () => () => { if (lost) throw new Error("original agent lost"); },
+    send: async () => { if (failSend) throw new Error("unknown"); return { message_id: 201 }; },
+    edit: async () => { if (failEdit) throw new Error("unknown edit"); return true; } });
+  try {
+    const q = h.question(), body = h.body(q);
+    if (held === "edit-first") await h.api.editMessageReplyMarkup(body.chat_id, 201, body.reply_markup);
+    else if (held === "partial") await h.api.sendMessage({ ...body, reply_markup: { inline_keyboard: [[q.markup.inline_keyboard[0]![0]!]] } });
+    else if (held === "target") await h.api.sendMessage({ ...body, message_thread_id: 8 });
+    else await h.api.sendMessage(body).catch(() => {});
+    if (["unknown", "edit-first", "partial", "target"].includes(held)) { failSend = false; await h.api.sendMessage(body); }
+    if (held === "consumed") h.store.resolve(q.keys[0]);
+    if (held === "clear") h.store.clear!();
+    if (held === "capacity") for (let i = 0; i < 60; i++) h.store.register({ text: String(i), prompt: String(i) });
+    if (held === "unknown-edit") { failEdit = true; await h.api.editMessageReplyMarkup(body.chat_id, 201, body.reply_markup).catch(() => {}); }
+    if (held === "agent-loss") lost = true;
+    if (held === "sdk-loss") h.sdk.shutdown();
+    if (held === "sdk-loss") {
+      const next = createLifetimeSdk(h.target, { onQuestionAdmission: admission => h.store.onQuestionAdmission!(admission) });
+      try { assert.ok((await openLifetimeSdkHead(next)).ok); } finally { next.shutdown(); }
+    } else assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.equal(q.deadline.expiresAt, 86_401_000, "Held or terminal history cannot grant a new SDK-to-agent demotion");
+  } finally { await h.close(); }
+});
+
+test("Native question membership requires the original live SDK runtime and an open native scope", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness(), foreign = createLifetimeSdk(h.target, { onQuestionAdmission: admission => h.store.onQuestionAdmission!(admission) });
+  try {
+    const q = h.question(); await h.api.sendMessage(h.body(q));
+    h.store.onQuestionAdmission!({ target: h.target, at: 1000 }); assert.ok((await openLifetimeSdkHead(foreign)).ok);
+    assert.equal(q.deadline.expiresAt, 86_401_000);
+    let retained: unknown; h.observe(admission => { retained = admission; }); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    h.store.onQuestionAdmission!(retained); assert.equal(q.deadline.expiresAt, 86_401_000);
+    h.observe(admission => h.store.onQuestionAdmission!(admission)); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    assert.equal(q.deadline.expiresAt, 3_601_000);
+  } finally { foreign.shutdown(); await h.close(); }
+});
+
+test("Native question membership never borrows a relocated revision's different publication", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness();
+  try {
+    const q = nativeRevisionQuestion(h); await h.api.sendMessage({ chat_id: 42, message_thread_id: 7, text: "Native question", reply_markup: q.rows(0) });
+    await h.api.editMessageReplyMarkup(42, 202, q.rows(1));
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(q.deadline.expiresAt, 86_401_000);
+    assert.equal(h.validations(), 0, "Original publication identity is checked before scope callbacks");
+  } finally { await h.close(); }
+});
+
+test("Native question membership never rebases captured rows after a guard-admitted revision", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let onRead: (() => void) | undefined;
+  const h = questionMembershipHarness({ sdk: { getConfirmationAuthority() { const callback = onRead; onRead = undefined; callback?.(); return { profile: "default", operatorId: 42 }; } } });
+  try {
+    const q = nativeRevisionQuestion(h); await h.api.sendMessage({ chat_id: 42, message_thread_id: 7, text: "Native question", reply_markup: q.rows(0) });
+    h.observe(admission => { onRead = () => {
+      const finish = h.store.beginPublication!("editMessageReplyMarkup", { chat_id: 42, message_thread_id: 7, message_id: 201, reply_markup: q.rows(1) });
+      assert.ok(finish); finish(true, true);
+    }; h.store.onQuestionAdmission!(admission); });
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(q.deadline.expiresAt, 86_401_000);
+    assert.equal(h.captures(), 1);
+  } finally { await h.close(); }
+});
+
+test("Native question membership uses the SDK admission clock, never a later guard clock", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let onRead: (() => void) | undefined;
+  const h = questionMembershipHarness({ sdk: { getConfirmationAuthority() { const callback = onRead; onRead = undefined; callback?.(); return { profile: "default", operatorId: 42 }; } } });
+  try {
+    const q = h.question(); await h.api.sendMessage(h.body(q));
+    h.observe(admission => { onRead = () => t.mock.timers.setTime(1_801_000); h.store.onQuestionAdmission!(admission); });
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(q.deadline.expiresAt, 3_601_000);
+  } finally { await h.close(); }
+});
+
+test("Native question membership snapshots exclude a newer positive agent publication admitted by SDK guards", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let onRead: (() => void) | undefined;
+  const h = questionMembershipHarness({ sdk: { getConfirmationAuthority() { const callback = onRead; onRead = undefined; callback?.(); return { profile: "default", operatorId: 42 }; } } });
+  let newer: ReturnType<typeof h.question> | undefined;
+  try {
+    const q = h.question(); await h.api.sendMessage(h.body(q));
+    h.observe(admission => { onRead = () => {
+      newer = h.question();
+      // Synchronous controlled native adapter ACK: required to exercise reentry inside a synchronous SDK guard.
+      const finish = h.store.beginPublication!("sendMessage", h.body(newer)); assert.ok(finish); finish({ message_id: 202 }, true);
+    }; h.store.onQuestionAdmission!(admission); });
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.ok(newer);
+    assert.equal(q.deadline.expiresAt, 3_601_000); assert.equal(newer.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+for (const loss of ["sdk", "rows"] as const)
+test(`Native question membership rechecks original scope and rows after agent guard callbacks (${loss})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  let onGuard: (() => void) | undefined;
+  const h = questionMembershipHarness({ capture: () => () => { const callback = onGuard; onGuard = undefined; callback?.(); } });
+  try {
+    const q = h.question(); await h.api.sendMessage(h.body(q));
+    onGuard = () => { if (loss === "sdk") h.sdk.shutdown(); else h.store.clear!(); };
+    const opened = await openLifetimeSdkHead(h.sdk); assert.equal(opened.ok, loss !== "sdk");
+    assert.equal(q.deadline.expiresAt, 86_401_000);
+  } finally { await h.close(); }
+});
+
+test("Native question membership does not renew tails or consume a shorter producer deadline", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness();
+  try {
+    const q = h.question(); await h.api.sendMessage(h.body(q)); assert.ok((await openLifetimeSdkHead(h.sdk)).ok);
+    t.mock.timers.setTime(2000); assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(q.deadline.expiresAt, 3_601_000);
+    const short = h.question(); short.deadline.shorten(2010); await h.api.sendMessage(h.body(short));
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(short.deadline.expiresAt, 2010);
+  } finally { await h.close(); }
+});
+
+test("Native question membership survives real markup revisions without another admission capture", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const h = questionMembershipHarness();
+  try {
+    const plan = OutboundButtons.planTelegramButtonReply('<!-- telegram_choice {"question":"Pick two","choices":["A","B","C"],"select":2} -->', { registerAction: h.store.register });
+    await h.api.sendMessage({ chat_id: 42, message_thread_id: 7, text: plan.markdown, reply_markup: plan.replyMarkup });
+    const key = plan.replyMarkup!.inline_keyboard[0]![0]!.callback_data!;
+    const query = { id: "q", data: key, message: { chat: { id: 42 }, message_thread_id: 7, message_id: 201, reply_markup: plan.replyMarkup } };
+    const action = h.store.resolve(key, query); assert.ok(action?.selection);
+    const update = action.selection.prepare(query); assert.ok(update);
+    await h.api.editMessageReplyMarkup(42, 201, update.replyMarkup); update.commit();
+    assert.equal(h.captures(), 1); assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(h.validations(), 2);
+  } finally { await h.close(); }
+});
+
+test("Native question membership logical tail expiry retains an already issued publication edit until real drain", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<boolean>();
+  const h = questionMembershipHarness({ edit: async () => { entered.resolve(); return release.promise; } });
+  try {
+    h.store.bindPublicationEditor!(BusApi.createTelegramButtonPublicationEditor(h.api));
+    const q = h.question(); await h.api.sendMessage(h.body(q));
+    const editing = h.api.editMessageReplyMarkup(42, 201, q.markup); await entered.promise;
+    assert.ok((await openLifetimeSdkHead(h.sdk)).ok); assert.equal(q.deadline.expiresAt, 3_601_000);
+    t.mock.timers.tick(3_600_000); assert.equal(h.store.resolve(q.keys[0]), undefined);
+    let drained = false; const idle = h.store.waitForPublicationIdle!().then(() => { drained = true; });
+    await Promise.resolve(); assert.equal(drained, false);
+    release.resolve(true); await editing; await idle; assert.equal(drained, true);
+  } finally { release.resolve(true); await h.close(); }
+});
+
+for (const direct of [false, true]) for (const threaded of [false, true]) for (const rich of [false, true])
+test(`Agent lifetime singleton ACK caps direct owners but holds unproven followers (direct=${direct}, Thread=${threaded}, Rich=${rich})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const target = { chatId: 42, ...(threaded ? { threadId: 7 } : {}) }, sdk = createLifetimeSdk(target);
+  let captures = 0;
+  const store = OutboundButtons.createTelegramButtonActionStore({ captureSelectionAuthority: () => () => {},
+    captureQuestionLifetimeOwner() { captures++; return sdk.captureQuestionLifetimeOwner!(); } });
+  const release = Promise.withResolvers<{ message_id: number }>();
+  const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { sendMessage: () => release.promise, sendRichMessage: () => release.promise } as unknown as TelegramBridgeApiRuntime,
+    ownsDirect: () => direct, callFollowerApi: async () => release.promise, beginButtonPublication: store.beginPublication });
+  try {
+    const plan = OutboundButtons.planTelegramButtonReply(lifetimeAgentDeclaration, { registerAction: store.register }); assert.equal(captures, 1);
+    const head = await openLifetimeSdkHead(sdk); assert.ok(head.ok); let ended = false; void head.handle.result.then(() => { ended = true; });
+    const common = { chat_id: 42, ...(threaded ? { message_thread_id: 7 } : {}), reply_markup: plan.replyMarkup };
+    const sending = rich ? api.sendRichMessage({ ...common, rich_message: { markdown: plan.markdown } }) : api.sendMessage({ ...common, text: plan.markdown });
+    t.mock.timers.tick(1_800_000); await Promise.resolve(); assert.equal(ended, false);
+    release.resolve({ message_id: 201 }); await sending; assert.equal(captures, 1);
+    if (!direct) assert.ok(store.resolve(plan.replyMarkup!.inline_keyboard[0]![0]!.callback_data), "Independent legacy answer remains useful before its original shorter deadline");
+    t.mock.timers.tick(3_600_000 - 1); await Promise.resolve(); assert.equal(ended, false, "Native ACK, not registration or first token, anchors demotion");
+    t.mock.timers.tick(1); await Promise.resolve(); assert.equal(ended, direct, "A follower without original receiver and complete carrier proof cannot demote the SDK");
+    if (direct) assert.deepEqual(await head.handle.result, { status: "expired" });
+  } finally { release.resolve({ message_id: 201 }); store.clear!(); sdk.shutdown(); }
+});
+
+for (const failure of ["missing", "throw", "replacement", "agent-scope", "sdk-scope"] as const)
+test(`Agent lifetime keeps the original admission capture unavailable without a later SDK lookup (${failure})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const target = { chatId: 42, threadId: 7 }, original = createLifetimeSdk(target), successor = createLifetimeSdk(target);
+  let current = original, available = failure !== "missing", agentCurrent = true, captures = 0;
+  const store = OutboundButtons.createTelegramButtonActionStore({ captureSelectionAuthority: () => () => { if (!agentCurrent) throw new Error("Original agent scope lost"); },
+    captureQuestionLifetimeOwner() { captures++; if (failure === "throw") throw new Error("Capture unavailable"); return available ? current.captureQuestionLifetimeOwner!() : undefined; } });
+  try {
+    const plan = OutboundButtons.planTelegramButtonReply(lifetimeAgentDeclaration, { registerAction: store.register }); assert.equal(captures, 1);
+    available = true;
+    if (failure === "replacement") { original.shutdown(); current = successor; }
+    if (failure === "sdk-scope") original.shutdown();
+    if (failure === "agent-scope") agentCurrent = false;
+    const head = await openLifetimeSdkHead(failure === "sdk-scope" ? successor : current); assert.ok(head.ok);
+    let ended = false; void head.handle.result.then(() => { ended = true; });
+    const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { sendMessage: async () => ({ message_id: 201 }) } as unknown as TelegramBridgeApiRuntime,
+      ownsDirect: () => true, callFollowerApi: async () => undefined, beginButtonPublication: store.beginPublication });
+    await api.sendMessage({ chat_id: 42, message_thread_id: 7, text: plan.markdown, reply_markup: plan.replyMarkup });
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false); assert.equal(captures, 1);
+  } finally { store.clear!(); original.shutdown(); successor.shutdown(); }
+});
+
+for (const held of ["unknown", "edit", "partial", "target", "malformed-thread", "expired", "consumed", "clear", "capacity"] as const)
+test(`Agent lifetime first publication attempt remains held rather than replayed (${held})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const target = { chatId: 42, ...(held === "malformed-thread" ? {} : { threadId: 7 }) }, sdk = createLifetimeSdk(target);
+  let captures = 0;
+  const store = OutboundButtons.createTelegramButtonActionStore({ captureSelectionAuthority: () => () => {},
+    captureQuestionLifetimeOwner() { captures++; return sdk.captureQuestionLifetimeOwner!(); } });
+  try {
+    const plan = OutboundButtons.planTelegramButtonReply(lifetimeAgentDeclaration, { registerAction: store.register });
+    const head = await openLifetimeSdkHead(sdk); assert.ok(head.ok); let ended = false; void head.handle.result.then(() => { ended = true; });
+    const full = plan.replyMarkup!, first = full.inline_keyboard[0]![0]!.callback_data!;
+    const body: Record<string, unknown> = { chat_id: 42, ...(target.threadId === undefined ? {} : { message_thread_id: 7 }), text: plan.markdown, reply_markup: full };
+    if (held === "partial") body.reply_markup = { inline_keyboard: [[full.inline_keyboard[0]![0]!]] };
+    if (held === "target") body.message_thread_id = 8;
+    if (held === "malformed-thread") body.message_thread_id = "unknown";
+    if (held === "edit") body.message_id = 201;
+    const finish = store.beginPublication!(held === "edit" ? "editMessageText" : "sendMessage", body); assert.ok(finish);
+    if (held === "expired") t.mock.timers.setTime(3_601_000);
+    if (held === "consumed") assert.ok(store.resolve(first));
+    if (held === "clear") store.clear!();
+    if (held === "capacity") for (let i = 0; i < 61; i++) store.register({ text: String(i), prompt: String(i) });
+    finish({ message_id: 201 }, held !== "unknown");
+    finish({ message_id: 202 }, true);
+    // A later complete/known send cannot turn the same old question into fresh membership.
+    store.beginPublication!("sendMessage", { chat_id: 42, ...(target.threadId === undefined ? {} : { message_thread_id: 7 }), text: plan.markdown, reply_markup: full })?.({ message_id: 203 }, true);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+    assert.equal(captures, 1);
+  } finally { store.clear!(); sdk.shutdown(); }
+});
+
+for (const kind of ["set", "wizard"] as const)
+test(`Agent lifetime revisions preserve the original SDK capture without a second membership (${kind})`, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const sdk = createLifetimeSdk({ chatId: 42, threadId: 7 }); let captures = 0;
+  const store = OutboundButtons.createTelegramButtonActionStore({ captureSelectionAuthority: () => () => {},
+    captureQuestionLifetimeOwner() { captures++; return sdk.captureQuestionLifetimeOwner!(); } });
+  const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { sendMessage: async () => ({ message_id: 201 }), editMessageReplyMarkup: async () => true, call: async () => true } as unknown as TelegramBridgeApiRuntime,
+    ownsDirect: () => true, callFollowerApi: async () => undefined, beginButtonPublication: store.beginPublication });
+  try {
+    const declaration = kind === "set" ? { question: "Set", choices: ["A", "B", "C"], select: 2 } : [{ question: "First", choices: ["A"] }, { question: "Next", choices: ["B"] }];
+    const plan = OutboundButtons.planTelegramButtonReply(`<!-- telegram_choice ${JSON.stringify(declaration)} -->`, { registerAction: store.register });
+    const initial = await openLifetimeSdkHead(sdk); assert.ok(initial.ok);
+    await api.sendMessage({ chat_id: 42, message_thread_id: 7, text: plan.markdown, reply_markup: plan.replyMarkup });
+    const newer = await openLifetimeSdkHead(sdk); assert.ok(newer.ok); let ended = false; void newer.handle.result.then(() => { ended = true; });
+    const data = plan.replyMarkup!.inline_keyboard[0]![0]!.callback_data!;
+    const query = { id: "q", data, message: { chat: { id: 42 }, message_id: 201, message_thread_id: 7, reply_markup: plan.replyMarkup } };
+    await OutboundButtons.handleTelegramButtonCallbackQuery(query, undefined, { resolveAction: store.resolve, answerCallbackQuery: async () => {},
+      enqueueButtonPrompt: () => assert.fail("A partial set is not an answer"), updateSelectionKeyboard: async (_query, next, assertCurrent) => {
+        assertCurrent(); await api.call("editMessageReplyMarkup", { chat_id: 42, message_id: 201, message_thread_id: 7, reply_markup: next }); assertCurrent();
+      }, updateSelectionMessage: async (_query, markdown, _rendering, next, assertCurrent) => {
+        assertCurrent(); await api.call("editMessageText", { chat_id: 42, message_id: 201, message_thread_id: 7, text: markdown, reply_markup: next }); assertCurrent();
+      } });
+    assert.equal(captures, 1); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { store.clear!(); sdk.shutdown(); }
+});
+
+test("Agent lifetime requires original agent authority and captures its optional port once", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const sdk = createLifetimeSdk({ chatId: 42, threadId: 7 }); let reads = 0, calls = 0;
+  const options = { get captureQuestionLifetimeOwner() { reads++; return () => { calls++; return sdk.captureQuestionLifetimeOwner!(); }; } };
+  const store = OutboundButtons.createTelegramButtonActionStore(options);
+  try {
+    assert.equal(reads, 1);
+    const plan = OutboundButtons.planTelegramButtonReply(lifetimeAgentDeclaration, { registerAction: store.register });
+    assert.equal(calls, 0, "SDK scope is not agent/session/transport authority");
+    const head = await openLifetimeSdkHead(sdk); assert.ok(head.ok); let ended = false; void head.handle.result.then(() => { ended = true; });
+    store.beginPublication!("sendMessage", { chat_id: 42, message_thread_id: 7, text: plan.markdown, reply_markup: plan.replyMarkup })?.({ message_id: 201 }, true);
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false); assert.equal(reads, 1);
+  } finally { store.clear!(); sdk.shutdown(); }
+});
+
+test("Agent lifetime SDK capture reentry cannot retain a poisoned partial group", () => {
+  const sdk = createLifetimeSdk({ chatId: 42, threadId: 7 }); let captures = 0;
+  const store = OutboundButtons.createTelegramButtonActionStore({ captureSelectionAuthority: () => () => {},
+    captureQuestionLifetimeOwner() { captures++; assert.throws(() => store.register({ text: "Reenter", prompt: "No" }), /reentered/u); return sdk.captureQuestionLifetimeOwner!(); } });
+  try {
+    let original: OutboundButtons.TelegramOutboundButtonAction | undefined;
+    assert.throws(() => OutboundButtons.planTelegramButtonReply(lifetimeAgentDeclaration, { registerAction: action => { original = action; return store.register(action); } }), /unavailable/u);
+    assert.equal(captures, 1); assert.ok(original);
+    assert.throws(() => store.register(original!), /retired/u, "A failed admission cannot keep a reusable partial original group");
+  } finally { store.clear!(); sdk.shutdown(); }
+});
+
+test("Agent lifetime a late first-send ACK cannot borrow a group already pinned by another ACK", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const sdk = createLifetimeSdk({ chatId: 42, threadId: 7 }), release = Promise.withResolvers<{ message_id: number }>(); let sends = 0;
+  const store = OutboundButtons.createTelegramButtonActionStore({ captureSelectionAuthority: () => () => {}, captureQuestionLifetimeOwner: sdk.captureQuestionLifetimeOwner });
+  const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { sendMessage: () => ++sends === 1 ? release.promise : Promise.resolve({ message_id: 202 }) } as unknown as TelegramBridgeApiRuntime,
+    ownsDirect: () => true, callFollowerApi: async () => undefined, beginButtonPublication: store.beginPublication });
+  store.bindPublicationEditor!(async () => {});
+  try {
+    const plan = OutboundButtons.planTelegramButtonReply(lifetimeAgentDeclaration, { registerAction: store.register });
+    const head = await openLifetimeSdkHead(sdk); assert.ok(head.ok); let ended = false; void head.handle.result.then(() => { ended = true; });
+    const body = { chat_id: 42, message_thread_id: 7, text: plan.markdown, reply_markup: plan.replyMarkup };
+    const pending = api.sendMessage(body); await api.sendMessage(body); release.resolve({ message_id: 201 }); await pending;
+    const key = plan.replyMarkup!.inline_keyboard[0]![0]!.callback_data!;
+    assert.equal(store.resolve(key, { id: "q", message: { chat: { id: 42 }, message_thread_id: 7, message_id: 201 } }), undefined);
+    assert.ok(store.resolve(key, { id: "q", message: { chat: { id: 42 }, message_thread_id: 7, message_id: 202 } }));
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { release.resolve({ message_id: 201 }); store.clear!(); sdk.shutdown(); }
+});
+
+test("Agent lifetime positive membership retains the original pending SDK publication lane", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(); let sends = 0;
+  const sdk = createLifetimeSdk({ chatId: 42, threadId: 7 }, { getTextInputReceiverBotId: () => 99,
+    async sendChunk() { if (++sends === 1) { entered.resolve(); await release.promise; } return 1000 + sends; } });
+  const store = OutboundButtons.createTelegramButtonActionStore({ captureSelectionAuthority: () => () => {}, captureQuestionLifetimeOwner: sdk.captureQuestionLifetimeOwner });
+  const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { sendMessage: async () => ({ message_id: 201 }) } as unknown as TelegramBridgeApiRuntime,
+    ownsDirect: () => true, callFollowerApi: async () => undefined, beginButtonPublication: store.beginPublication });
+  try {
+    const opening = sdk.openTextInput!({ owner: "@test/input", scope: { kind: "instance" }, question: "SDK input", cancelLabel: "Cancel", signal: new AbortController().signal, maxLength: 20, multiline: false });
+    await entered.promise;
+    const plan = OutboundButtons.planTelegramButtonReply(lifetimeAgentDeclaration, { registerAction: store.register });
+    await api.sendMessage({ chat_id: 42, message_thread_id: 7, text: plan.markdown, reply_markup: plan.replyMarkup });
+    let nextEnded = false; const next = openLifetimeSdkHead(sdk); void next.then(() => { nextEnded = true; });
+    t.mock.timers.tick(3_600_000); const expired = await opening; assert.ok(!expired.ok); assert.equal(expired.reason, "expired");
+    assert.equal(sends, 1); assert.equal(nextEnded, false, "A logical SDK tail result is not actual publication I/O completion");
+    release.resolve(); const successor = await next; assert.ok(successor.ok); assert.equal(sends, 2);
+  } finally { release.resolve(); store.clear!(); sdk.shutdown(); }
+});
+
+test("Agent lifetime shortened question deadline holds a late native ACK without timer dispatch", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const sdk = createLifetimeSdk({ chatId: 42, threadId: 7 }), release = Promise.withResolvers<{ message_id: number }>();
+  const store = OutboundButtons.createTelegramButtonActionStore({ captureSelectionAuthority: () => () => {}, captureQuestionLifetimeOwner: sdk.captureQuestionLifetimeOwner });
+  const api = BusApi.createTelegramBusAwareApiRuntime({ directRuntime: { sendMessage: () => release.promise } as unknown as TelegramBridgeApiRuntime,
+    ownsDirect: () => true, callFollowerApi: async () => undefined, beginButtonPublication: store.beginPublication });
+  let shorten: ((deadline: number) => void) | undefined;
+  try {
+    const plan = OutboundButtons.planTelegramButtonReply(lifetimeAgentDeclaration, { registerAction(action) {
+      shorten ??= action.completionGroup?.deadline?.shorten; return store.register(action);
+    } }); assert.ok(shorten);
+    const head = await openLifetimeSdkHead(sdk); assert.ok(head.ok); let ended = false; void head.handle.result.then(() => { ended = true; });
+    const pending = api.sendMessage({ chat_id: 42, message_thread_id: 7, text: plan.markdown, reply_markup: plan.replyMarkup });
+    shorten(1010); t.mock.timers.setTime(1010); release.resolve({ message_id: 201 }); await pending;
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { release.resolve({ message_id: 201 }); store.clear!(); sdk.shutdown(); }
+});
+
+test("Agent lifetime SDK snapshot precedes original agent-authority reentry", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] }); t.mock.timers.setTime(1000);
+  const sdk = createLifetimeSdk({ chatId: 42, threadId: 7 }); let onAssert: (() => void) | undefined, newer: ReturnType<typeof openLifetimeSdkHead> | undefined;
+  const store = OutboundButtons.createTelegramButtonActionStore({ captureSelectionAuthority: () => () => { const callback = onAssert; onAssert = undefined; callback?.(); },
+    captureQuestionLifetimeOwner: sdk.captureQuestionLifetimeOwner });
+  try {
+    const plan = OutboundButtons.planTelegramButtonReply(lifetimeAgentDeclaration, { registerAction: store.register });
+    const first = await openLifetimeSdkHead(sdk); assert.ok(first.ok);
+    const finish = store.beginPublication!("sendMessage", { chat_id: 42, message_thread_id: 7, text: plan.markdown, reply_markup: plan.replyMarkup }); assert.ok(finish);
+    onAssert = () => { newer = openLifetimeSdkHead(sdk); }; finish({ message_id: 201 }, true);
+    assert.ok(newer); const head = await newer; assert.ok(head.ok); let ended = false; void head.handle.result.then(() => { ended = true; });
+    t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { store.clear!(); sdk.shutdown(); }
+});
+
+test("Automatic same-cwd startup holds an unbound session before acquiring, then resumes the original Thread", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-startup-binding-")), path = join(dir, "owners.json");
+  type Context = { cwd: string; sessionId: string };
+  let current = "B", bus = false, topicUnavailable = false, creates = 0, reuses = 0;
+  const events: Array<Record<string, unknown>> = [];
+  const ctx = (sessionId: string): Context => ({ cwd: "/fixture", sessionId });
+  const ports = Polling.createTelegramThreadAwarePollingPorts<Context, Locks.TelegramLockEntry>({
+    getAllowedUserId: () => 7, callApi: async <T,>() => ({ has_topics_enabled: true }) as T,
+    topicTargetStore: { async load() {}, async persist() {}, getBotState: () => ({ threadMode: "enabled" as const }), setBotState() {} },
+    hasRememberedWorkspaceBinding: context => context.sessionId === "A",
+    isBusRuntimeEnabled: () => !topicUnavailable, isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => bus, setPollingStartedWithTelegramBus: value => { bus = value; },
+    setForceFreshLeaderThreadOnNextStart() {}, setTopicModeUnavailable: value => { topicUnavailable = value; },
+    startClassicPolling: () => assert.fail("No classic fallback for an unbound Thread session"), async stopClassicPolling() {},
+    async startBusLeaderPolling(context) { if (context.sessionId === "A") reuses++; else creates++; },
+    async stopBusLeaderPolling() {}, startLeaderHealth() {}, stopLeaderHealth() {},
+    registerFollowerWithLeader: async () => true, stopFollowerRegistration() {}, recordEvent() {},
+  });
+  await writeFile(path, JSON.stringify({ default: { pid: 99, cwd: "/fixture" } }));
+  const before = await readFile(path, "utf8");
+  const lock = Locks.createTelegramLockRuntime<Context>({ locksPath: path, pid: 10, isProcessAlive: () => false });
+  const runtime = Locks.createTelegramLockedPollingRuntime<Context>({ lock, hasBotToken: () => true,
+    getSessionId: context => context.sessionId, isContextCurrent: context => context.sessionId === current,
+    canAutoStartSession: ports.canAutoStartSession, startPolling: ports.startPolling, stopPolling: ports.stopPolling,
+    updateStatus() {}, recordRuntimeEvent(_category, _message, details) { if (details) events.push(details); },
+  });
+  const settled = async () => {
+    for (let attempt = 0; attempt < 100 && !events.some(event => ["auto-start-skip", "auto-start-complete", "auto-start"].includes(String(event.phase))); attempt++)
+      await waitForTimeout(5);
+  };
+  try {
+    await runtime.onSessionStart({}, ctx("B")); await settled();
+    assert.equal(creates, 0, "A temporary/unbound same-cwd session must not enter Thread provisioning");
+    assert.equal(await readFile(path, "utf8"), before, "Skipping must preserve stale continuity for the later real resume");
+    assert.ok(events.some(event => event.phase === "auto-start-skip" && event.reason === "session-binding-unavailable"));
+    current = "A"; events.length = 0;
+    await runtime.onSessionStart({}, ctx("A")); await settled();
+    assert.equal(reuses, 1); assert.equal(creates, 0);
+    await runtime.suspend(); current = "B";
+    assert.equal((await runtime.start(ctx("B"))).ok, true, "Explicit connect still authorizes this new session");
+    assert.equal(creates, 1); assert.equal(reuses, 1);
+  } finally { await runtime.stop(); await rm(dir, { recursive: true, force: true }); }
+});
 
 for (const removedFamily of ["sessions", "snapshot-with-segments"] as const) test(
   `Shutdown diagnostics cannot resurrect a removed journal family (${removedFamily})`, async () => {
@@ -401,6 +4755,19 @@ function runQueueOwnerReplacementProcess(
   });
 }
 
+async function isolateRetainedRuntimeAgentFixture(t: TestContext): Promise<void> {
+  // Retain this scenario's continuity, not its Threaded state in unrelated Classic fixtures.
+  const previousAgentDir = runtimeAgentDir;
+  const previousAgentEnv = process.env.PI_CODING_AGENT_DIR;
+  runtimeAgentDir = await mkdtemp(join(tmpdir(), "pi-telegram-retained-agent-"));
+  process.env.PI_CODING_AGENT_DIR = runtimeAgentDir;
+  t.after(() => {
+    runtimeAgentDir = previousAgentDir;
+    if (previousAgentEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentEnv;
+  });
+}
+
 async function ensureRuntimeAgentDir(): Promise<string> {
   if (!runtimeAgentDir) {
     runtimeAgentDir = await mkdtemp(
@@ -535,6 +4902,7 @@ test("Storage reference preparation rejects historical aliases without redirecti
     import * as Config from ${JSON.stringify(new URL("../lib/config.ts", import.meta.url).href)};
     import * as Journal from ${JSON.stringify(new URL("../lib/journal.ts", import.meta.url).href)};
     import * as Admission from ${JSON.stringify(new URL("../lib/workspace-admission.ts", import.meta.url).href)};
+    console.log("reference-preparation-checkpoint ready");
     const originalCwd = process.cwd();
     const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "pi-telegram-reference-")));
     const snapshot = (directory) => fs.readdirSync(directory, { withFileTypes: true })
@@ -637,10 +5005,11 @@ test("Storage reference preparation rejects historical aliases without redirecti
       process.chdir(originalCwd);
       fs.rmSync(root, { recursive: true, force: true });
     }
-  `);
-  assert.equal(result.code, 0, result.stderr || result.stdout);
-  assert.equal(result.stdout.trim(), "reference-preparation-ok");
-}, 10_000);
+  `, { timeoutMs: 5000, readiness: { stdoutPrefix: "reference-preparation-checkpoint ready", startupTimeoutMs: 10000 } });
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.deepEqual(result.stdout.trim().split(/\r?\n/u), ["reference-preparation-checkpoint ready", "reference-preparation-ok"]);
+}, 20_000);
 
 test("Cross-instance agent turns route in both leader and follower directions", async () => {
   const followerRegistry = Bus.createTelegramBusFollowerRegistry();
@@ -1144,21 +5513,48 @@ for (const scenario of [
         },
       },
     });
-    let requests = 0;
-    const ownershipChecks: Bus.TelegramBusForwardOwnership[] = [];
+    let requests = 0, phase = "send";
+    const ownershipChecks: Array<{ attempt: number; phase: string; snapshot: Bus.TelegramBusForwardOwnership; accepted: boolean }> = [];
+    const assertValidated = (expectedPhase: string) => {
+      const check = ownershipChecks.at(-1);
+      assert.equal(check?.attempt, requests, `${expectedPhase} uses this exact semantic attempt`);
+      assert.equal(check?.phase, expectedPhase, `${expectedPhase} has a preceding ownership validation at its actual native boundary`);
+      assert.equal(check?.accepted, true);
+    };
+    const net = (await import("node:net")).default, originalConnect = net.createConnection;
+    const wireBoundaries: Array<{ attempt: number; phase: string }> = [];
+    let observingForward = false, lifecycleConnections = 0;
+    const connectionMock = mock.method(net, "createConnection", (...args: unknown[]) => {
+      if (!observingForward) { lifecycleConnections++; return Reflect.apply(originalConnect, net, args) as import("node:net").Socket; }
+      assertValidated("pre-connect");
+      wireBoundaries.push({ attempt: requests, phase: "pre-connect" });
+      const socket = Reflect.apply(originalConnect, net, args) as import("node:net").Socket;
+      socket.once("connect", () => { phase = "connect"; });
+      socket.once("data", () => { phase = "ack"; wireBoundaries.push({ attempt: requests, phase: "ack" }); });
+      const write = socket.write.bind(socket);
+      socket.write = ((...args: Parameters<typeof socket.write>) => {
+        assertValidated("connect");
+        wireBoundaries.push({ attempt: requests, phase: "write" });
+        phase = "await-ack";
+        return write(...args);
+      }) as typeof socket.write;
+      return socket;
+    });
+    syncBuiltinESMExports();
     const rejectedDeliveryIds: string[] = [];
     const validate = Bus.createTelegramBusForwardOwnershipValidator(registry);
     const forwarder = Bus.createTelegramBusForeignOwnedUpdateForwarder<
       string, Updates.TelegramMessageReactionUpdated, Updates.TelegramCallbackQuery, Updates.TelegramUpdateMessage
     >({
-      socketPath, createRequestId: () => `fixture:${++requests}`,
-      getAuthSecret: () => "fixture-auth",
+      socketPath, createRequestId: () => { phase = "send"; return `fixture:${++requests}`; },
+      getAuthSecret: () => { assertValidated("send"); phase = "pre-connect"; return "fixture-auth"; },
       recordRuntimeEvent(_category, _error, details) {
         if (typeof details?.deliveryId === "string") rejectedDeliveryIds.push(details.deliveryId);
       },
       validateForwardOwnership(snapshot) {
-        ownershipChecks.push(snapshot);
-        return validate(snapshot);
+        const accepted = validate(snapshot);
+        ownershipChecks.push({ attempt: requests, phase, snapshot, accepted });
+        return accepted;
       },
     });
     const noLocalExecution = () => assert.fail("Foreign input must not execute on the leader");
@@ -1195,10 +5591,17 @@ for (const scenario of [
     });
     try {
       await receiver.start();
+      const beforeProbe = lifecycleConnections;
+      const lifecycleProbe = await BusTransport.probeTelegramBusEndpoint({ endpoint: Bus.resolveTelegramBusSocketPath(socketPath), timeoutMs: 50 });
+      assert.equal(lifecycleProbe.reachable, true, "A transport-only probe must not enter semantic forwarding observations");
+      assert.equal(lifecycleConnections, beforeProbe + 1);
+      assert.equal(requests, 0); assert.equal(ownershipChecks.length, 0); assert.equal(wireBoundaries.length, 0);
+      observingForward = true;
       leaderJournal.appendBatch([source]);
       worker.start("leader-ctx");
       for (let failureCount = 1; failureCount <= 2; failureCount++) {
         await worker.waitForDrain();
+        assertValidated("ack");
         const entry = leaderJournal.read().entries[0]!;
         assert.equal(entry.state, "retry-wait");
         assert.equal(entry.failure?.attemptCount, failureCount);
@@ -1216,11 +5619,17 @@ for (const scenario of [
       await worker.waitForDrain();
       assert.deepEqual(leaderJournal.read().entries, []);
       assert.equal(requests, 3, "Three semantic forwarding attempts retain the existing durable retry contract");
-      assert.equal(ownershipChecks.length, 15, "Each attempt validates ownership before send, connect, encoding/write and ACK");
-      assert.deepEqual(ownershipChecks.map((snapshot) => snapshot.ownerGeneration),
-        (scenario.replace ? ["g1", "g2", "g2"] : ["g1", "g1", "g1"]).flatMap(generation => Array(5).fill(generation)));
-      assert.equal(ownershipChecks.every((attempt) =>
-        JSON.stringify(attempt.protocolIdentity) === JSON.stringify(registration.protocol)), true);
+      assertValidated("ack");
+      const generations = scenario.replace ? ["g1", "g2", "g2"] : ["g1", "g1", "g1"];
+      for (const [index, generation] of generations.entries()) {
+        const checks = ownershipChecks.filter(check => check.attempt === index + 1);
+        assert.deepEqual([...new Set(checks.map(check => check.phase))], ["send", "pre-connect", "connect", "ack"]);
+        assert.equal(checks.every(check => check.accepted && check.snapshot.ownerGeneration === generation), true);
+      }
+      assert.deepEqual(wireBoundaries, generations.flatMap((_generation, index) =>
+        ["pre-connect", "write", "ack"].map(phase => ({ attempt: index + 1, phase }))));
+      assert.equal(ownershipChecks.every(({ snapshot }) =>
+        JSON.stringify(snapshot.protocolIdentity) === JSON.stringify(registration.protocol)), true);
       const admitted = followerJournal.read().entries;
       assert.deepEqual(admitted.map((entry) => entry.updateId), [source.update_id]);
       assert.deepEqual(admitted[0]!.update[scenario.carrier], {
@@ -1244,6 +5653,9 @@ for (const scenario of [
         assert.deepEqual(envelope.delivery, delivery);
       }
     } finally {
+      observingForward = false;
+      connectionMock.mock.restore(); syncBuiltinESMExports();
+      assert.equal(net.createConnection, originalConnect, "Native global exports are restored before another fixture runs");
       await worker.stop();
       await receiver.stop();
       await rm(dir, { recursive: true, force: true });
@@ -1359,16 +5771,8 @@ function getRuntimeTelegramApiText(
   return String(body?.text ?? richMessage?.html ?? richMessage?.markdown ?? "");
 }
 
-function setRuntimeTestFetch(fetchImpl: typeof fetch): () => void {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = fetchImpl;
-  return () => {
-    globalThis.fetch = originalFetch;
-  };
-}
-
-async function createRuntimeTelegramConfigFixture() {
-  const agentDir = await ensureRuntimeAgentDir();
+async function createRuntimeTelegramConfigFixture(agentDirectory?: string) {
+  const agentDir = agentDirectory ?? await ensureRuntimeAgentDir();
   const configPath = join(agentDir, "telegram.json");
   const previousConfig = await readFile(configPath, "utf8").catch(
     () => undefined,
@@ -1465,6 +5869,17 @@ async function createRuntimeSeedWorkspaceStore(): Promise<{ threads: Threads.Tel
 function createRuntimeWorkspaceReader(path: string): Threads.TelegramTopicTargetStore {
   return Threads.createTelegramTopicTargetStore({ path,
     consolidated: { captureAuthority: () => undefined, publishIfOwned: () => ({ committed: false }) } });
+}
+
+/** End an owned default-profile fixture through its real disconnect; a suspended Root still has a live OS PID. */
+async function disconnectRuntimeTelegramFixtureRoot(
+  root: Pick<ReturnType<typeof createRuntimePiHarness>, "commands" | "handlers">,
+  ctx: ReturnType<typeof createRuntimeExtensionContext>,
+): Promise<void> {
+  const disconnect = root.commands.get("telegram-disconnect"); assert.ok(disconnect);
+  await disconnect.handler("", ctx);
+  assert.equal((await readRuntimeTelegramLocks()).default?.pid, undefined, "An ended fixture must release its own transport owner, not leave a replacement-only suspension");
+  await root.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
 }
 
 async function readRuntimeTelegramLocks(): Promise<Record<string, Record<string, unknown>>> {
@@ -1871,11 +6286,12 @@ for (const supersedingCommand of ["abort", "stop"] as const) {
   });
 }
 
-test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-connect ownership", async () => {
+test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-connect ownership", async (t) => {
+  await isolateRetainedRuntimeAgentFixture(t);
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const { handlers, commands, pi } = createRuntimePiHarness();
   const methods: Array<{ method: string; body?: Record<string, unknown> }> = [];
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     methods.push({ method, ...(body ? { body } : {}) });
@@ -2011,6 +6427,12 @@ test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-c
       chat_id: 77,
       message_thread_id: 42,
     }, deleteCall ? undefined : await getRuntimeIntegrationDiagnostics(methods));
+    const retainedState = Locks.readTelegramRuntimeState(join(runtimeAgentPath, "tmp", "pi-telegram", "state.json"));
+    const retainedWorkspace = retainedState.profiles.default?.workspace;
+    assert.ok(retainedWorkspace && typeof retainedWorkspace === "object" && "bot" in retainedWorkspace);
+    assert.ok(retainedWorkspace.bot && typeof retainedWorkspace.bot === "object" && "threadMode" in retainedWorkspace.bot);
+    assert.equal(retainedWorkspace.bot.threadMode, "enabled");
+    assert.deepEqual(journal.read().entries.map(entry => entry.updateId), [1], "Scenario isolation must not erase accepted legacy input");
   } finally {
     restoreFetch();
     await telegramConfig.restore();
@@ -2032,7 +6454,7 @@ for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(
   const messages: unknown[] = [];
   let polls = 0, releaseLiveSibling: (() => void) | undefined;
   const liveSiblingGate = new Promise<void>(resolve => { releaseLiveSibling = resolve; });
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     methods.push(method);
     if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
@@ -2149,7 +6571,7 @@ test("Graceful preserved leader quit publishes inactivity and restores its intac
   const config = await createRuntimeTelegramConfigFixture();
   const { handlers, commands, pi } = createRuntimePiHarness();
   const methods: string[] = [];
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     methods.push(method);
     if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
@@ -2208,7 +6630,7 @@ test("Native connect failure emits one compact notice and retains redacted debug
   const notices: string[] = [];
   const ctx = createRuntimeExtensionContext({ cwd: "/repo/connect-error" });
   ctx.ui.notify = (text?: string) => { notices.push(text ?? ""); };
-  const restoreFetch = setRuntimeTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
     if (method === "createForumTopic") return createRuntimeTelegramApiErrorResponse(401, "Unauthorized token 123:abc");
@@ -2234,7 +6656,8 @@ test("Native connect failure emits one compact notice and retains redacted debug
   }
 }, 20_000);
 
-test("Bare connect followed immediately by resume starts the destination through the native runtime", async () => {
+test("Bare connect followed immediately by resume starts the destination through the native runtime", async (t) => {
+  await isolateRetainedRuntimeAgentFixture(t);
   for (const remembered of [false, true]) {
     const config = await createRuntimeTelegramConfigFixture();
     const source = createRuntimePiHarness();
@@ -2254,7 +6677,7 @@ test("Bare connect followed immediately by resume starts the destination through
     } });
     ctx.ui.notify = (text?: string) => { notices.push(text ?? ""); };
     next.ui.notify = (text?: string) => { notices.push(text ?? ""); };
-    const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const restoreFetch = setTestFetch(async (input, init) => {
       const method = getRuntimeTelegramApiMethod(input);
       methods.push(method);
       if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
@@ -2422,6 +6845,1488 @@ test("Graceful follower disconnect persists intent and deletes through its live 
   }
 });
 
+test("Artifact settled native socket ledger retains neither wire bodies nor raw payload fingerprints", async () => {
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { randomBytes } from "node:crypto";
+    import { getHeapSnapshot } from "node:v8";
+    import { mkdtemp, rm } from "node:fs/promises";
+    import { tmpdir } from "node:os";
+    import { join } from "node:path";
+    import * as Bus from "./lib/bus.ts";
+    import * as Leader from "./lib/bus-leader.ts";
+    import * as Locks from "./lib/locks.ts";
+    import * as Lifecycle from "./lib/lifecycle.ts";
+    import * as Api from "./lib/telegram-api.ts";
+    const dir = await mkdtemp(join(tmpdir(), "pt-artifact-heap-")), socketPath = join(dir, "bus.sock"), ctx = { cwd: dir, sessionId: "heap-session" };
+    const lock = Locks.createTelegramLockRuntime({ locksPath: join(dir, "owners.json"), instanceId: "heap-leader" });
+    const sessions = Lifecycle.createTelegramSessionContextStore(); sessions.set(ctx);
+    const polling = Locks.createTelegramLockedPollingRuntime({ lock, hasBotToken: () => true, isContextCurrent: sessions.isCurrent, getSessionId: ctx => ctx.sessionId, startPolling() {}, async stopPolling() {}, updateStatus() {} });
+    await polling.start(ctx);
+    const protocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "heap", capabilities: ["artifact-document-v1"] }), registry = Bus.createTelegramBusFollowerRegistry();
+    const follower = registry.register({ instanceId: "peer", registrationGeneration: "gen", profileKey: "binding", sessionId: "session", sessionGeneration: 1,
+      target: { chatId: 7, threadId: 8 }, protocol, connectedAtMs: Date.now() });
+    process.env.PI_TELEGRAM_NETWORK_FAMILY = "ipv4";
+    let uploads = 0;
+    globalThis.fetch = async () => ++uploads <= 8 ? new Response(JSON.stringify({ ok: true, result: { message_id: 77 } })) : new Response(JSON.stringify({ ok: false, error_code: 400, description: "private rejection" }), { status: 400 });
+    const restore = Api.setTelegramApiHttpsFetchForTesting(globalThis.fetch), failures = [];
+    const failObserver = () => {
+      const marker = randomBytes(96).toString("hex"); sentinels.push(marker);
+      const error = new Error(marker.repeat(4)); failures.push(new WeakRef(error)); throw error;
+    };
+    const native = Api.createTelegramBridgeApiRuntime({ client: Api.createTelegramApiClient(() => "123:heap"), tempDir: dir, maxFileSizeBytes: 1, tempFileMaxAgeMs: 1,
+      captureRequestErrorHandler: () => async error => { failures.push(new WeakRef(error)); failObserver(); },
+      recordRuntimeEvent() { failObserver(); } });
+    const deps = { followerRegistry: registry, authSecret: "secret", protocolIdentity: protocol, artifactApi: native,
+      captureArtifactTransport: polling.captureCurrentTransportAuthority, getTelegramProfile: () => "default", getAllowedUserId: () => 7 };
+    const handle = Leader.createTelegramBusLeaderEnvelopeHandler(deps), bodies = [], sentinels = [];
+    const server = Bus.createTelegramBusLocalServer({ socketPath, captureArtifactAuthority: Leader.createTelegramBusArtifactAuthorityCapture(deps), handleEnvelope(envelope) {
+      if (envelope.kind === "follower.callApi") bodies.push(new WeakRef(envelope.args[0]));
+      return handle(envelope);
+    } });
+    async function submit(index) {
+      const bytes = randomBytes(65536), bytesBase64 = bytes.toString("base64");
+      sentinels.push(Buffer.from(bytesBase64.slice(0, 128)).toString("utf8"));
+      const response = await Bus.sendTelegramBusLocalEnvelope({ socketPath, envelope: { kind: "follower.callApi", requestId: "heap:" + index, auth: "secret", instanceId: "peer",
+        registrationGeneration: "gen", sentAtMs: 1, method: "sendArtifactDocument", args: [{ version: 1, registrationIncarnation: follower.registrationIncarnation,
+          target: follower.target, fileName: "payload", byteLength: bytes.length, bytesBase64, caption: "private-caption:" + index, expiresAt: Date.now() + 60000 }] } });
+      assert.equal(response.result.effect, index < 8 ? "sent" : "rejected");
+      assert.doesNotMatch(JSON.stringify(response), /private|rejection|observers|cause/);
+    }
+    try {
+      await server.start();
+      for (let i = 0; i < 12; i++) await submit(i);
+      for (let i = 0; i < 8; i++) { await new Promise(resolve => setImmediate(resolve)); globalThis.gc(); }
+      assert.ok(bodies.every(body => body.deref() === undefined), "Settled ledger cannot retain original wire records");
+      assert.equal(uploads, 12); assert.equal(failures.length, 16);
+      assert.ok(failures.every(error => error.deref() === undefined), "Settled ledger cannot retain native or throwing-observer errors");
+      const chunks = []; for await (const chunk of getHeapSnapshot()) chunks.push(chunk);
+      const snapshot = JSON.parse(Buffer.concat(chunks).toString());
+      const leaked = snapshot.strings.filter(value => value.length > 256 && sentinels.some(marker => value.includes(marker)));
+      assert.equal(leaked.length, 0, "Retained fingerprints must be bounded digests, not JSON/base64 payloads");
+      console.log("artifact-ledger-nonretention-pass:8-success:4-observer-failure");
+    } finally { await server.stop(); await polling.stop(); restore(); await rm(dir, { recursive: true, force: true }); }
+  `, { nodeArgs: ["--expose-gc"], timeoutMs: 20000 });
+  assert.equal(result.code, 0, result.stdout + result.stderr); assert.match(result.stdout, /artifact-ledger-nonretention-pass:8-success:4-observer-failure/u);
+}, 25000);
+
+for (const source of [true, false]) for (const threaded of [false, true]) for (const [callbackKind, rich] of [["independent", false], ["read-only", false], ["read-only", true], ["state-written", false], ["pure", false], ["queued", true], ["deferred", false], ["conditional", true], ["lost-sdk", false], ["second-sdk", true], ["retained", true], ["partial-retained", true], ["retained-lost-sdk", true], ["retained-text", false], ["retained-text-mixed", false], ...(["timed-direct", "timed-direct-legacy", "timed-direct-proxy", "timed-direct-sdk-loss", "timed-direct-no-bot", "timed-direct-wrong-bot", "timed-direct-pure", "timed-direct-child-legacy", "timed-direct-child-bot", "timed-direct-child-thread", "timed-direct-parent-loss", "timed-direct-later"] as const).flatMap(kind => [[kind, false], [kind, true]] as const), ["app-coheads", false], ["app-coheads", true]] as const)
+test(`Production question root uses original SDK binding at birth, not ACK (${source ? "source" : "compiled"}/${threaded}/${callbackKind}/rich=${rich})`, async () => {
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { mkdtemp, realpath, writeFile, readFile, rm } from "node:fs/promises";
+    import { join } from "node:path";
+    import { tmpdir } from "node:os";
+    import { mock } from "node:test";
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const base = ${JSON.stringify(source ? "./lib/" : "./dist/lib/")}, suffix = ${JSON.stringify(source ? ".ts" : ".js")};
+    const rows = [], captured = { sdkBirths: [] }, threaded = ${threaded}, callbackKind = ${JSON.stringify(callbackKind)};
+    const now = performance.now.bind(performance), started = now();
+    const phase = name => console.log("root-question-phase:" + name + ":elapsedMs=" + Math.round(now() - started) + ":pid=" + process.pid);
+    phase("import-start");
+    const timedDirect = callbackKind.startsWith("timed-direct"), qualifiedDirect = callbackKind === "timed-direct" || callbackKind === "timed-direct-pure" || callbackKind === "timed-direct-later", timers = new Map(), refreshEntered = Promise.withResolvers(), refreshRelease = Promise.withResolvers(), refreshFinished = Promise.withResolvers();
+    const retained = callbackKind.includes("retained"), textRetention = callbackKind.startsWith("retained-text"), pure = retained && callbackKind !== "retained-text-mixed" || ["pure", "deferred", "conditional", "lost-sdk", "second-sdk"].includes(callbackKind);
+    const feedbackEntered = Promise.withResolvers(), feedbackRelease = Promise.withResolvers(), editorEntered = Promise.withResolvers(), editorRelease = Promise.withResolvers(), resultBegan = Promise.withResolvers();
+    const appsUrl = new URL(base + "generative-apps" + suffix, import.meta.url), apps = await import(appsUrl.href);
+    phase("apps-import-complete");
+    mock.module(appsUrl.href, { namedExports: { ...apps, registerTelegramBindTool(pi, deps) {
+      if (timedDirect) {
+        const plan = deps.planOutput, edit = deps.editView, setRuntime = deps.setLiveSurfaceRuntime;
+        deps.liveSurfaceSetTimer = (callback, delayMs) => { const token = { unref() {} }; timers.set(token, { callback, delayMs }); return token; };
+        deps.liveSurfaceClearTimer = token => timers.delete(token);
+        deps.setLiveSurfaceRuntime = runtime => {
+          const open = runtime.open; runtime.open = surface => { if (surface.app === "timed") captured.surface = surface; return open(surface); };
+          return setRuntime(runtime);
+        };
+        deps.planOutput = (...args) => {
+          if (captured.timedActive) { captured.plans = (captured.plans ?? 0) + 1; captured.binding = args[1]?.binding; }
+          return Reflect.apply(plan, deps, args);
+        };
+        deps.editView = async (...args) => { try { captured.outcome = await Reflect.apply(edit, deps, args); return captured.outcome; } finally { if (captured.timedActive) refreshFinished.resolve(); } };
+      }
+      return apps.registerTelegramBindTool(pi, deps);
+    }, invokeGenerativeApp(options) {
+      if (options.callbackInvocation) { assert.equal(captured.invocation, undefined); captured.invocation = options.callbackInvocation; }
+      return apps.invokeGenerativeApp(options);
+    } } });
+    phase("apps-mock-complete");
+    const { Worker } = await import("node:worker_threads");
+    phase("worker-import-complete");
+    const terminate = Worker.prototype.terminate;
+    const nativeExit = Promise.withResolvers(), workerExit = Promise.withResolvers(), workerRelease = Promise.withResolvers();
+    let holdWorker = false, callbackPlans = 0, executionCaptures = 0, callbackResults = 0;
+    Worker.prototype.terminate = function (...args) {
+      const held = holdWorker; holdWorker = false;
+      if (held) this.once("exit", () => workerExit.resolve());
+      const pending = Reflect.apply(terminate, this, args);
+      return held ? pending.then(async value => { nativeExit.resolve(); await workerRelease.promise; return value; }) : pending;
+    };
+    const dir = await realpath(await mkdtemp(join(tmpdir(), "pt-root-question-")));
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const keepAlive = setInterval(() => {}, 60000);
+    phase("fixture-directory-ready");
+    for (const [module, factory] of [["outbound", "createTelegramButtonActionStore"], ["delivery", "createTelegramBridgeDeliveryLifecycleHooks"], ["bindings", "createTelegramGenerativeAppBoundButtonActionInvoker"], ["bus-leader", "createTelegramBusLeaderRuntimeAssembly"], ["bus-api", "createTelegramBusAwareApiRuntime"]]) {
+      phase("mock-import-" + module);
+      const url = new URL(base + module + suffix, import.meta.url), original = await import(url.href);
+      phase("mock-install-" + module);
+      mock.module(url.href, { namedExports: { ...original, [factory](options) {
+        if (module === "bindings") {
+          const capture = options.getExecutionFence, plan = options.planOutput, record = options.recordRuntimeEvent;
+          options.recordRuntimeEvent = (...args) => { console.log("root-worker-diagnostic:" + String(args[1])); return record(...args); };
+          options.getExecutionFence = function (query) { executionCaptures++; captured.execution = Reflect.apply(capture, options, [query]); console.log("root-worker-phase:execution"); return captured.execution; };
+          options.planOutput = (...args) => {
+            const child = args[1]?.binding;
+            if (callbackKind === "independent" || timedDirect && !qualifiedDirect) assert.equal(captured.invocation, undefined);
+            else {
+              assert.ok(captured.invocation, "Actual Root must pass the native store invocation to the real producer");
+              assert.equal(NativeApps.getGenerativeAppCallbackInvocationKind(child, captured.invocation), callbackKind === "state-written" ? "state-written" : "read-only");
+            }
+            assert.equal(!!captured.callbackOwner?.captureReadOnlySuccessor(child), callbackKind !== "state-written", "Read-only lineage is app-only, never inferred from mutable result DTOs");
+            if (retained) captured.workerOutput = args[0];
+            callbackPlans++; return plan(...args);
+          };
+        }
+        if (module === "outbound") {
+          const failure = options.recordFailure;
+          options.recordFailure = error => { console.log("root-publication-diagnostic:" + String(error?.stack ?? error)); failure(error); };
+        }
+        if (module === "outbound" && timedDirect) {
+          const native = options.captureQuestionLifetimeOwner;
+          options.captureQuestionLifetimeOwner = (...args) => { const owner = Reflect.apply(native, options, args); if (owner) captured.sdkBirths.push(owner); return owner; };
+        }
+        if (module === "bus-api" && callbackKind === "timed-direct-no-bot") options.getQuestionBotId = undefined;
+        const value = original[factory](options);
+        if (module === "outbound") {
+          const captureSource = value.capturePublicationSource;
+          if (timedDirect) value.capturePublicationSource = (...args) => {
+            try {
+              captured.captures = (captured.captures ?? 0) + 1;
+              assert.equal(captured.plans ?? 0, 0); assert.equal(args[0], captured.surface.handle.delivery); assert.equal(args[1], captured.surface.originalAppBinding);
+              const births = captured.sdkBirths.length;
+              for (const owner of captured.sdkBirths.slice(captured.sdkStart)) { owner.assertCurrent(); captured.sdkBirths[captured.sdkStart].assertScope(owner.scope); }
+              captured.source = Reflect.apply(captureSource, value, args);
+              if (["timed-direct-legacy", "timed-direct-no-bot", "timed-direct-wrong-bot"].includes(callbackKind)) assert.equal(captured.source, undefined, "Missing original bot identity or incomplete/foreign native first ACK cannot certify the direct source");
+              else assert.ok(captured.source, "Original direct publisher/bot/method capture and complete first Message certify this native source");
+              assert.equal(captured.sdkBirths.length, births, "A source read cannot repair first-wire ancestry through another SDK capture");
+              if (callbackKind.endsWith("proxy")) captured.source = Object.freeze({ assertCurrent: () => captured.sdkBirths[captured.sdkStart].assertCurrent() });
+              return captured.source;
+            } catch (error) { captured.captureError = error; throw error; }
+          };
+          const register = value.register;
+          value.register = (action, binding) => { const key = register(action, binding); rows.push({ key, action, binding }); return key; };
+          const bindEditor = value.bindPublicationEditor, begin = value.beginPublication, admission = value.onQuestionAdmission;
+          value.bindPublicationEditor = editor => bindEditor(async (view, guard) => {
+            await editor(view, guard);
+            if (captured.holdEditor && view.messageId === captured.callbackMessageId) { editorEntered.resolve(); await editorRelease.promise; }
+          });
+          value.beginPublication = (...args) => {
+            const result = begin(...args);
+            if (captured.callbackMessageId && args[0] === "editMessageText" && JSON.stringify(args[1]).includes("Callback worker result")) resultBegan.resolve();
+            const observed = timedDirect && (JSON.stringify(args[1]).includes("Direct source dashboard") ? "firstObserved" : JSON.stringify(args[1]).includes("Direct refresh questions") ? "editObserved" : undefined);
+            if (observed && result) { const finish = (...values) => { captured[observed] = values; return result(...values); }; return Object.assign(finish, result); }
+            return result;
+          };
+          value.onQuestionAdmission = event => {
+            if (captured.wantAdmissionClock) {
+              const at = captured.originalSdkOwner.matchAdmissionEvent(event); assert.equal(typeof at, "number"); captured.originalAdmissionCutoff = at + 3600000;
+            }
+            return admission(event);
+          };
+          captured.store = value;
+        } else if (module === "delivery") captured.lifecycle = value;
+        else if (module === "bus-leader") captured.brokerOptions = options.runtime;
+        else if (module === "bus-api") { captured.api = value; captured.apiDeps = options; }
+        return value;
+      } } });
+      phase("mock-ready-" + module);
+    }
+    phase("delivery-import");
+    const Delivery = await import(base + "delivery" + suffix);
+    phase("app-binding-import");
+    const NativeApps = await import(base + "generative-apps" + suffix);
+    phase("root-import");
+    const { default: extension } = await import(base + "extension" + suffix);
+    phase("import-complete");
+    const ingress = Promise.withResolvers(), dispatched = Promise.withResolvers(), callbacks = Promise.withResolvers(), callbackDone = Promise.withResolvers();
+    const { pi, handlers, commands, tools } = createRuntimePiHarness({ sendUserMessage() { dispatched.resolve(); } });
+    const ctx = createRuntimeExtensionContext({ cwd: dir, sessionManager: { getSessionId: () => "root-question-session" } });
+    let messageId = 10, hold = false, polls = 0;
+    const entered = Promise.withResolvers(), release = Promise.withResolvers();
+    globalThis.fetch = async (input, init) => {
+      const method = String(input).split("/").at(-1);
+      const response = result => new Response(JSON.stringify({ ok: true, result }), { status: 200, headers: { "content-type": "application/json" } });
+      if (method === "getMe") return response({ id: 123, is_bot: true, username: "root_bot", has_topics_enabled: threaded });
+      if (method === "createForumTopic") return response({ message_thread_id: 43, name: "Anchor" });
+      if (method === "getUpdates") {
+        if (++polls === 1) return response(await ingress.promise);
+        if (polls === 2) return response(await callbacks.promise);
+        return await new Promise((_resolve, reject) => {
+          const abort = () => reject(new DOMException("stop", "AbortError"));
+          if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      if (method === "sendMessage" || method === "sendRichMessage") {
+        const body = JSON.parse(String(init.body));
+        assert.equal(body.chat_id, 77); assert.equal(body.message_thread_id, threaded ? 43 : undefined);
+        if (JSON.stringify(body).includes("Callback view")) captured.callbackInitialMarkup = body.reply_markup;
+        if (hold && JSON.stringify(body).includes("Pending birth")) { entered.resolve(); await release.promise; }
+        if (JSON.stringify(body).includes("Callback worker result")) callbackResults++;
+        const id = ++messageId;
+        if (timedDirect && JSON.stringify(body).includes("Direct source dashboard")) {
+          captured.parentBody = body;
+          captured.firstAck = callbackKind === "timed-direct-legacy" ? { message_id: id } : { message_id: id, chat: { id: 77 }, from: { id: callbackKind === "timed-direct-wrong-bot" ? 456 : 123, is_bot: true }, ...(threaded ? { message_thread_id: 43 } : {}) };
+          return response(captured.firstAck);
+        }
+        return response({ message_id: id });
+      }
+      if (method === "editMessageReplyMarkup" || method === "editMessageText") {
+        const body = JSON.parse(String(init.body));
+        if (timedDirect && JSON.stringify(body).includes("Direct refresh questions")) { captured.refreshBody = body; refreshEntered.resolve(); await refreshRelease.promise;
+          captured.editAck = callbackKind === "timed-direct-child-legacy" ? { message_id: body.message_id } : { message_id: body.message_id, chat: { id: 77 }, from: { id: callbackKind === "timed-direct-child-bot" ? 456 : 123, is_bot: true }, ...(threaded || callbackKind === "timed-direct-child-thread" ? { message_thread_id: callbackKind === "timed-direct-child-thread" ? 44 : 43 } : {}) }; return response(captured.editAck); }
+        if (timedDirect && method === "editMessageReplyMarkup") return response({ message_id: body.message_id, chat: { id: body.chat_id }, ...(threaded ? { message_thread_id: 43 } : {}), from: { id: 123, is_bot: true } });
+        if (JSON.stringify(body).includes("Callback worker result")) {
+          captured.callbackResultBody = body;
+          callbackResults++;
+          if (callbackKind === "timed-direct-later") return response({ message_id: body.message_id, chat: { id: body.chat_id }, ...(threaded ? { message_thread_id: 43 } : {}), from: { id: 123, is_bot: true } });
+        }
+        else if (captured.holdNativeFeedback && body.message_id === captured.callbackMessageId) { feedbackEntered.resolve(); await feedbackRelease.promise; }
+        return response({ message_id: body.message_id, chat: { id: body.chat_id }, ...(threaded ? { message_thread_id: 43 } : {}) });
+      }
+      if (method === "answerCallbackQuery") {
+        const body = JSON.parse(String(init.body));
+        if (body.callback_query_id === "root-worker" && ["Done", "Generative App action failed", "Button action expired"].includes(body.text)) callbackDone.resolve(body.text);
+      }
+      return response(true);
+    };
+    const open = () => Delivery.openTelegramConfirm({ owner: "@test/root-question", scope: { kind: "instance" },
+      question: "SDK native head", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal });
+    const agent = text => tools.get("telegram_message").execute("agent-question", { text: '<!-- telegram_confirm "' + text + '" -->' });
+    let pending;
+    try {
+      await writeFile(join(dir, "telegram.json"), JSON.stringify({ botToken: "123:root-question", botId: 123, allowedUserId: 77, lastUpdateId: 0,
+        threads: { automaticCleanup: false }, assistant: { activity: "quiet", rendering: ${JSON.stringify(rich ? "rich" : "html")} } }), { mode: 0o600 });
+      extension(pi); await handlers.get("session_start")({}, ctx); await commands.get("telegram-connect").handler("", ctx);
+      phase("connected");
+      const brokerTransport = captured.brokerOptions.captureApiTransport?.();
+      assert.equal(typeof brokerTransport, "function", "The production broker captures the actual native polling owner, not Artifact authority or a readiness flag");
+      assert.equal(brokerTransport(), true);
+      assert.ok(Delivery.captureTelegramQuestionLifetimeOwner(), "Root must bind a native coordinated SDK owner, not merely pass a flag");
+      assert.ok((await open()).ok);
+      const first = rows.length; await agent("First birth");
+      const original = rows.slice(first).find(row => row.action.completionGroup)?.action.completionGroup; assert.ok(original?.deadline);
+      assert.ok(original.deadline.expiresAt - Date.now() > 86_390_000, "Actual Root planner adopts the 24-hour head default");
+      assert.ok((await open()).ok);
+      assert.ok(original.deadline.expiresAt - Date.now() <= 3_600_000, "Actual SDK admission reaches the original agent cohort");
+      assert.ok(original.deadline.expiresAt - Date.now() > 3_590_000);
+      hold = true; const start = rows.length; pending = agent("Pending birth"); await entered.promise;
+      const waiting = rows.slice(start).find(row => row.action.completionGroup)?.action.completionGroup; assert.ok(waiting?.deadline);
+      const deadline = waiting.deadline.expiresAt;
+      await captured.lifecycle.onSessionStart(); assert.ok(Delivery.captureTelegramQuestionLifetimeOwner());
+      assert.ok((await open()).ok);
+      release.resolve(); await pending;
+      assert.ok((await open()).ok);
+      assert.equal(waiting.deadline.expiresAt, deadline, "ACK cannot acquire the replacement SDK binding or authenticate its admissions");
+      phase("original-binding-checked");
+      ingress.resolve([{ update_id: 100, message: { message_id: 100, chat: { id: 77, type: "private" },
+        ...(threaded ? { message_thread_id: 43 } : {}), from: { id: 77, is_bot: false }, text: "Native app question fixture" } }]);
+      await dispatched.promise; phase("dispatched"); await handlers.get("agent_start")({}, ctx); phase("agent-started");
+      // Co-head ownership has its own complete configuration controls, not extra setup inside every callback's clock.
+      if (callbackKind === "app-coheads") {
+      const script = join(dir, "question.mjs");
+      await writeFile(script, 'export function init(){return {state:{count:0},output:' + JSON.stringify('<!-- telegram_confirm "Native app birth" --><!-- telegram_confirm "Native app peer" -->') + '}} export function increment({state}){return {state:{count:state.count+1},output:"changed"}}');
+      const appStart = rows.length;
+      phase("app-init-start");
+      const displayed = await tools.get("telegram_bind").execute("root-app-question", { app: "question", script });
+      phase("app-init-done");
+      assert.equal(displayed.details.displayed, true, JSON.stringify(displayed));
+      const appRows = rows.slice(appStart).filter(row => row.action.completionGroup); assert.ok(appRows.length > 0);
+      assert.ok(appRows.every(row => row.binding && row.action.binding === undefined));
+      const appDeadlines = [...new Set(appRows.map(row => row.action.completionGroup.deadline))]; assert.equal(appDeadlines.length, 2);
+      assert.ok(appDeadlines.every(deadline => deadline.expiresAt - Date.now() > 86_390_000));
+      assert.ok((await open()).ok);
+      assert.ok(appDeadlines.every(deadline => deadline.expiresAt - Date.now() <= 3_600_000), "Original native app co-heads join the real Root SDK admission together");
+      const peer = appRows.find(row => row.action.completionGroup !== appRows[0].action.completionGroup); assert.ok(peer);
+      await captured.lifecycle.onSessionStart();
+      assert.ok(captured.store.resolve(appRows[0].key), "SDK-only replacement cannot disable an independently owned app answer");
+      phase("app-change-start");
+      await tools.get("telegram_bind").execute("root-app-change", { app: "question", method: "increment", display: false });
+      phase("app-change-done");
+      assert.equal(captured.store.resolve(peer.key), undefined, "Original app loss still refuses stale native selection");
+      } else {
+        await captured.lifecycle.onSessionStart();
+        phase("callback-sdk-context-ready");
+      }
+      if (callbackKind !== "app-coheads") {
+      if (timedDirect) {
+        assert.equal(captured.apiDeps.ownsDirect(), true);
+        const originalApi = captured.api.captureQuestionAuthority(); assert.equal(typeof originalApi, "function"); originalApi();
+        const botProvider = captured.apiDeps.getQuestionBotId;
+        if (callbackKind === "timed-direct-no-bot") assert.equal(botProvider, undefined);
+        else { assert.equal(typeof botProvider, "function"); assert.equal(botProvider(), 123); }
+        const script = join(dir, "timed.mjs"), counter = join(dir, "direct-refresh-count.txt");
+        await writeFile(script, 'import {readFile,writeFile} from "node:fs/promises"; export function init(){return {state:{count:0},output:"Direct source dashboard <!-- telegram_button {Inspect|timed::inspect} -->",refreshAfterMs:60000}} export async function refresh(){let n=0;try{n=Number(await readFile(' + JSON.stringify(counter) + ',"utf8"))}catch(e){if(e.code!=="ENOENT")throw e}await writeFile(' + JSON.stringify(counter) + ',String(n+1));return {output:' + JSON.stringify('Direct refresh questions <!-- telegram_confirm "Direct fresh one" --><!-- telegram_confirm "Direct fresh two" -->' + (callbackKind === "timed-direct-pure" ? '' : '<!-- telegram_button {Inspect|timed::inspect} -->')) + '}} export function inspect(){return {output:' + JSON.stringify(callbackKind === "timed-direct-later" ? 'Callback worker result <!-- telegram_confirm "Later one" --><!-- telegram_confirm "Later two" --><!-- telegram_button {Inspect|timed::inspect} -->' : 'Callback worker result') + (callbackKind === "timed-direct-later" ? ',viewMode:"edit"' : '') + '}}');
+        captured.sdkStart = captured.sdkBirths.length;
+        const parentStart = rows.length, view = await tools.get("telegram_bind").execute("direct-timed-parent", { app: "timed", script });
+        assert.equal(view.details.displayed, true, JSON.stringify(view)); assert.ok(captured.surface?.originalAppBinding);
+        assert.ok(captured.sdkBirths.length > captured.sdkStart);
+        const born = captured.sdkBirths[captured.sdkStart]; born.assertCurrent(); assert.deepEqual(born.target, { chatId: 77, ...(threaded ? { threadId: 43 } : {}) });
+        assert.equal(rows.slice(parentStart).filter(row => row.action.completionGroup).length, 0, "The physical first wire has no dummy question head");
+        assert.equal(captured.parentBody.reply_markup.inline_keyboard.flat().filter(cell => cell.callback_data).length, 1);
+        assert.equal(captured.firstObserved[1], true);
+        assert.deepEqual(captured.firstObserved[0], captured.firstAck, "The original complete first Message already reaches the native Store, but has no certified direct publisher/bot policy");
+        if (callbackKind === "timed-direct-legacy") assert.deepEqual(captured.firstAck, { message_id: view.details.messageId });
+        else { assert.equal(captured.firstAck.message_id, view.details.messageId); assert.equal(captured.firstAck.chat.id, 77); assert.equal(captured.firstAck.from.id, callbackKind === "timed-direct-wrong-bot" ? 456 : 123); assert.equal(captured.firstAck.message_thread_id, threaded ? 43 : undefined); }
+        originalApi(); assert.equal(captured.apiDeps.getQuestionBotId, botProvider); if (botProvider) assert.equal(botProvider(), 123);
+        const owner = NativeApps.captureGenerativeAppCallbackOwner(captured.surface.originalAppBinding); assert.ok(owner); owner.assertCurrent();
+        assert.equal(timers.size, 1); const scheduled = [...timers.values()][0]; assert.equal(scheduled.delayMs, 60000);
+        const childStart = rows.length; await assert.rejects(readFile(counter, "utf8"), { code: "ENOENT" }); captured.timedActive = true; scheduled.callback();
+        assert.equal(captured.captureError, undefined, "A compatible fallible capture must not hide failed native fixture assertions");
+        assert.equal(captured.captures, 1); assert.equal(!!captured.source, !["timed-direct-legacy", "timed-direct-no-bot", "timed-direct-wrong-bot"].includes(callbackKind));
+        await refreshEntered.promise;
+        assert.equal(captured.plans, 1); assert.equal(await readFile(counter, "utf8"), "1");
+        const resultOwner = NativeApps.captureGenerativeAppCallbackOwner(captured.binding), successor = owner.captureReadOnlySuccessor(captured.binding);
+        assert.ok(resultOwner); assert.ok(successor, "The actual managed refresh retains a native read-only predecessor without a fabricated callback");
+        assert.equal(resultOwner.originalPublicationSource, captured.source); assert.equal(successor.originalPublicationSource, captured.source);
+        assert.equal(NativeApps.getGenerativeAppCallbackInvocationKind(captured.binding, undefined), undefined);
+        if (callbackKind.endsWith("sdk-loss")) { await captured.lifecycle.onSessionStart(); assert.throws(born.assertCurrent); }
+        if (callbackKind === "timed-direct-parent-loss") {
+          const originalControl = rows.slice(parentStart, childStart).find(row => row.action.binding); assert.ok(originalControl); assert.ok(captured.store.resolve(originalControl.key));
+        }
+        refreshRelease.resolve(); await refreshFinished.promise; await captured.store.waitForPublicationIdle(); await new Promise(resolve => setImmediate(resolve));
+        assert.equal(captured.captures, 1); assert.equal(captured.plans, 1);
+        assert.equal(captured.refreshBody.rich_message, undefined); assert.equal(typeof captured.refreshBody.text, "string");
+        assert.equal(captured.editAck.message_id, view.details.messageId);
+        if (callbackKind === "timed-direct-child-legacy") assert.deepEqual(captured.editAck, { message_id: view.details.messageId });
+        else { assert.equal(captured.editAck.chat.id, 77); assert.equal(captured.editAck.message_thread_id, callbackKind === "timed-direct-child-thread" ? 44 : threaded ? 43 : undefined); assert.equal(captured.editAck.from.id, callbackKind === "timed-direct-child-bot" ? 456 : 123); }
+        if (!callbackKind.endsWith("sdk-loss")) {
+          assert.equal(captured.outcome.ok, true, JSON.stringify(captured.outcome));
+          assert.equal(captured.editObserved[1], true); assert.equal(captured.editObserved[0], "edited");
+          assert.deepEqual(captured.editObserved[3], !["timed-direct-legacy", "timed-direct-no-bot", "timed-direct-wrong-bot"].includes(callbackKind) ? captured.editAck : undefined, "Native data from a guarded edit is separate from Store authentication of its pre-worker source");
+        }
+        if (callbackKind.endsWith("proxy")) captured.source.assertCurrent();
+        else if (captured.source) assert.throws(captured.source.assertCurrent, "The issued source remains spent even while the direct raw-edit handoff is held");
+        const children = rows.slice(childStart).filter(row => row.action.completionGroup), deadlines = [...new Set(children.map(row => row.action.completionGroup.deadline))];
+        assert.equal(deadlines.length, 2); const saved = deadlines.map(deadline => deadline.expiresAt);
+        assert.ok(saved.every(value => value > Date.now() + 23 * 3600000)); assert.ok((await open()).ok);
+        if (qualifiedDirect) {
+          assert.ok(deadlines.every((deadline, index) => deadline.expiresAt < saved[index] && deadline.expiresAt <= Date.now() + 3600000));
+          assert.equal(new Set(deadlines.map(deadline => deadline.expiresAt)).size, 1, "The whole native question-free cohort joins at its original ACK");
+        } else assert.deepEqual(deadlines.map(deadline => deadline.expiresAt), saved, "Missing original source or native edit carrier cannot qualify even a prefix");
+        if (!callbackKind.endsWith("sdk-loss")) {
+          if (callbackKind !== "timed-direct-later") { const answer = captured.store.resolve(children[0].key); assert.ok(answer); assert.equal(answer.binding, undefined); assert.equal(JSON.parse(answer.prompt).question, "Direct fresh one"); }
+          await captured.store.waitForPublicationIdle();
+          if (callbackKind !== "timed-direct-pure") {
+          const laterStart = rows.length;
+          const method = rows.slice(childStart).find(row => row.action.binding); assert.ok(method); captured.callbackOwner = NativeApps.captureGenerativeAppCallbackOwner(method.action.binding);
+          callbacks.resolve([{ update_id: 101, callback_query: { id: "root-worker", from: { id: 77, is_bot: false }, data: method.key,
+            message: { message_id: view.details.messageId, chat: { id: 77, type: "private" }, ...(threaded ? { message_thread_id: 43 } : {}) } } }]);
+          assert.equal(await callbackDone.promise, "Done"); assert.equal(executionCaptures, 1); assert.equal(callbackPlans, 1); assert.equal(callbackResults, 1);
+          if (qualifiedDirect) assert.ok(captured.invocation, "A later actual press captures its own qualified invocation; the timer never fabricates one");
+          else assert.equal(captured.invocation, undefined, "A held source never manufactures a callback invocation");
+          if (callbackKind === "timed-direct-later") {
+            const later = [...new Set(rows.slice(laterStart).filter(row => row.action.completionGroup).map(row => row.action.completionGroup.deadline))];
+            assert.equal(later.length, 2); const originalLater = later.map(deadline => deadline.expiresAt); assert.ok(originalLater.every(value => value > Date.now() + 23 * 3600000));
+            assert.ok((await open()).ok);
+            assert.deepEqual(later.map(deadline => deadline.expiresAt), originalLater, "Later direct descendants cannot downgrade to legacy normalized edits or renew first-physical ancestry");
+          }
+          } else { assert.equal(executionCaptures, 0); assert.equal(callbackPlans, 0); }
+        }
+        assert.equal(await readFile(counter, "utf8"), "1");
+      } else {
+      const callbackScript = join(dir, "callback.mjs"), retainedInput = join(dir, "retained-native-row.txt");
+      const callbackDeclaration = 'Callback view ' + (callbackKind === "independent" ? '' : '<!-- telegram_confirm "Callback parent" -->') + '<!-- telegram_button {Inspect|callback::inspect} -->';
+      const callbackOutput = 'Callback worker result' + (retained || pure || callbackKind === "read-only" || callbackKind === "queued" ? ' <!-- telegram_confirm "Callback child" -->' + (pure ? '' : '<!-- telegram_button {Inspect|callback::inspect} -->') : '');
+      await writeFile(callbackScript, 'import {readFile} from "node:fs/promises"; export function init(){return {state:{count:0},output:' + JSON.stringify(callbackDeclaration) + '}} export async function inspect({state}){return {' + (callbackKind === "state-written" ? 'state:{count:state.count+1},' : '') + 'output:' + JSON.stringify(callbackOutput) + (retained ? '+ String.fromCharCode(10) + await readFile(' + JSON.stringify(retainedInput) + ',"utf8")' : '') + ',viewMode:' + JSON.stringify(callbackKind === "independent" || callbackKind === "state-written" ? "new" : "edit") + '}}');
+      const callbackStart = rows.length;
+      phase("callback-init-start");
+      const callbackView = await tools.get("telegram_bind").execute("root-worker-app", { app: "callback", script: callbackScript });
+      phase("callback-init-done");
+      assert.equal(callbackView.details.displayed, true, JSON.stringify(callbackView));
+      const button = rows.slice(callbackStart).find(row => row.action.binding); assert.ok(button);
+      captured.callbackOwner = NativeApps.captureGenerativeAppCallbackOwner(button.action.binding); assert.ok(captured.callbackOwner);
+      const callbackResultStart = rows.length;
+      let retainedGroup, retainedDeadline, retainedCells;
+      if (retained) {
+        const originalRows = rows.slice(callbackStart).filter(row => row.action.completionGroup); retainedGroup = originalRows[0].action.completionGroup;
+        const keys = new Set(originalRows.filter(row => row.action.completionGroup === retainedGroup).map(row => row.key));
+        retainedCells = captured.callbackInitialMarkup.inline_keyboard.flat().filter(button => keys.has(button.callback_data)); assert.equal(retainedCells.length, 2);
+        const proposed = callbackKind === "partial-retained" ? retainedCells.slice(0, 1) : retainedCells;
+        // The actual worker re-emits producer-owned Rich declarations; Text cases measure the resulting native keyboard.
+        await writeFile(retainedInput, '<tg-button-row>' + proposed.map(button => '<tg-button type="callback_data" data="' + button.callback_data + '">' + button.text + '</tg-button>').join('') + '</tg-button-row>');
+        assert.ok((await open()).ok); retainedDeadline = retainedGroup.deadline.expiresAt;
+        assert.ok(retainedDeadline - Date.now() <= 3600000);
+      }
+      captured.callbackMessageId = callbackView.details.messageId;
+      captured.holdNativeFeedback = callbackKind === "queued";
+      captured.holdEditor = retained || ["deferred", "conditional", "lost-sdk", "second-sdk"].includes(callbackKind);
+      captured.originalSdkOwner = Delivery.captureTelegramQuestionLifetimeOwner();
+      if (callbackKind === "independent") { Delivery.clearTelegramDeliveryRuntime(); assert.equal(Delivery.captureTelegramQuestionLifetimeOwner(), undefined); }
+      else assert.ok(Delivery.captureTelegramQuestionLifetimeOwner());
+      holdWorker = true; phase("callback-admitting");
+      callbacks.resolve([{ update_id: 101, callback_query: { id: "root-worker", from: { id: 77, is_bot: false }, data: button.key,
+        message: { message_id: callbackView.details.messageId, chat: { id: 77, type: "private" }, ...(threaded ? { message_thread_id: 43 } : {}) } } }]);
+      await Promise.race([nativeExit.promise, callbackDone.promise.then(status => { assert.fail("Callback ended before native worker exit: " + status); })]);
+      await workerExit.promise; phase("callback-worker-exited");
+      assert.equal(executionCaptures, 1); assert.ok(captured.execution?.signal instanceof AbortSignal);
+      assert.doesNotThrow(captured.execution.assertCurrent);
+      for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+      assert.equal(callbackPlans, 0, "Original worker exit does not substitute for its retained termination ACK");
+      assert.equal(callbackResults, 0, "Actual Root callback cannot publish before original worker drain");
+      if (captured.holdEditor) await editorEntered.promise;
+      workerRelease.resolve();
+      if (callbackKind === "queued") { await feedbackEntered.promise; await resultBegan.promise; feedbackRelease.resolve(); }
+      assert.equal(await callbackDone.promise, "Done");
+      assert.equal(callbackPlans, 1); assert.equal(callbackResults, 1, "Qualified dispatch must preserve ordinary independent and mutating execution");
+      if (callbackKind === "read-only" || retained || pure || callbackKind === "queued") {
+        const childRows = rows.slice(callbackResultStart).filter(row => row.action.completionGroup), child = childRows[0]; assert.ok(child);
+        assert.ok(child.action.completionGroup.deadline.expiresAt - Date.now() > 86_390_000);
+        if (pure) assert.ok(childRows.every(row => row.action.binding === undefined), "Pure selections never become method dispatch");
+        if (captured.holdEditor) {
+          let idle = false; const drained = captured.store.waitForPublicationIdle().then(() => { idle = true; });
+          for (let i = 0; i < 4; i++) await new Promise(resolve => setImmediate(resolve)); assert.equal(idle, false);
+          if (callbackKind === "conditional" || callbackKind === "second-sdk" || callbackKind === "retained") {
+            captured.wantAdmissionClock = true; assert.ok((await open()).ok); captured.wantAdmissionClock = false;
+            if (callbackKind === "second-sdk") assert.ok((await open()).ok);
+            assert.ok(child.action.completionGroup.deadline.expiresAt - Date.now() > 86_390_000, "Pending original editor cannot expose a conditional head");
+          }
+          if (callbackKind === "lost-sdk" || callbackKind === "retained-lost-sdk") await captured.lifecycle.onSessionStart();
+          editorRelease.resolve(); await drained;
+          if (callbackKind === "conditional" || callbackKind === "retained") assert.equal(child.action.completionGroup.deadline.expiresAt, captured.originalAdmissionCutoff, "Original admission time, not editor settlement, supplies the one-hour ceiling");
+        }
+        if (retained) assert.equal(retainedGroup.deadline.expiresAt, retainedDeadline, "Retained original is not reborn, promoted or renewed at ACK/editor settlement");
+        if (textRetention) {
+          assert.equal(typeof captured.callbackResultBody.text, "string"); assert.equal(captured.callbackResultBody.rich_message, undefined);
+          assert.ok(retainedCells.every(button => captured.workerOutput.includes(button.callback_data)), "The actual worker re-emits both producer-owned original callbacks before rendering");
+          const visible = captured.callbackResultBody.reply_markup.inline_keyboard.flat().map(button => button.callback_data);
+          assert.ok(retainedCells.every(button => !visible.includes(button.callback_data)), "A worker-authored native Rich row is not an original Text/reply-markup retention proposal");
+          assert.equal(captured.store.resolve(retainedCells[0].callback_data, { id: "text-original-after-drain", data: retainedCells[0].callback_data,
+            message: { message_id: callbackView.details.messageId, chat: { id: 77 }, ...(threaded ? { message_thread_id: 43 } : {}) } }), undefined, "Omitted original controls are superseded, not rediscovered from matching text");
+        }
+        if (callbackKind === "retained") {
+          const answer = captured.store.resolve(retainedCells[0].callback_data, { id: "retained-answer", data: retainedCells[0].callback_data,
+            message: { chat: { id: 77 }, message_id: callbackView.details.messageId, ...(threaded ? { message_thread_id: 43 } : {}) } });
+          assert.ok(answer); assert.equal(answer.binding, undefined); assert.equal(answer.promptKind, "selection");
+          assert.equal(JSON.parse(answer.prompt).question, "Callback parent"); assert.equal(retainedGroup.deadline.expiresAt, retainedDeadline);
+        }
+        if (callbackKind !== "conditional" && callbackKind !== "retained") {
+          assert.ok((await open()).ok);
+          if (callbackKind === "lost-sdk" || callbackKind === "second-sdk" || callbackKind === "partial-retained" || callbackKind === "retained-lost-sdk") assert.ok(child.action.completionGroup.deadline.expiresAt - Date.now() > 86_390_000, "Lost original namespace or a second admission cannot acquire a replacement parent");
+          else assert.ok(child.action.completionGroup.deadline.expiresAt - Date.now() <= 3_600_000, "Original native callback/feedback parent must qualify the actual edited child, not only the app result");
+        }
+        if (textRetention) {
+          assert.ok(captured.store.resolve(child.key), "The fresh question remains answerable after native supersession and editor drain");
+          await captured.store.waitForPublicationIdle();
+        }
+      }
+      }
+      }
+      console.log("root-question-original-binding-pass");
+    } finally {
+      ingress.resolve([]); callbacks.resolve([]); refreshRelease.resolve(); feedbackRelease.resolve(); editorRelease.resolve(); workerRelease.resolve(); release.resolve(); await pending?.catch(() => {});
+      phase("shutdown-start");
+      await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+      phase("shutdown-done");
+      Delivery.clearTelegramDeliveryRuntime(); Worker.prototype.terminate = terminate; clearInterval(keepAlive); await rm(dir, { recursive: true, force: true });
+    }
+  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: callbackKind.startsWith("timed-direct") ? 20000 : 12000,
+    readiness: { stdoutPrefix: "root-question-phase:import-complete:", startupTimeoutMs: 10000 } });
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 0, result.stdout + result.stderr); assert.match(result.stdout, /root-question-original-binding-pass/u);
+  const phases = [...result.stdout.matchAll(/^root-question-phase:([^:\r\n]+):elapsedMs=(\d+):pid=(\d+)$/gmu)];
+  assert.equal(new Set(phases.map(row => row[3])).size, 1);
+  assert.ok(phases.every((row, index) => Number(row[3]) > 0 && (index === 0 || Number(row[2]) >= Number(phases[index - 1]![2]))));
+  assert.deepEqual(phases.map(row => row[1]).filter(name => name!.startsWith("mock-")),
+    ["outbound", "delivery", "bindings", "bus-leader", "bus-api"].flatMap(module => ["mock-import-", "mock-install-", "mock-ready-"].map(prefix => prefix + module)));
+  assert.match(result.stdout, /root-question-phase:import-complete:elapsedMs=\d+:pid=\d+/u);
+  assert.match(result.stdout, /root-question-phase:shutdown-done:elapsedMs=\d+:pid=\d+/u);
+  for (const name of ["app-init-start", "app-init-done", "app-change-start", "app-change-done"])
+    assert.equal(phases.some(row => row[1] === name), callbackKind === "app-coheads", "Only the app co-head control may execute its separate app setup/mutation");
+  assert.equal(phases.some(row => row[1] === "callback-sdk-context-ready"), callbackKind !== "app-coheads", "Callbacks retain the same original SDK renewal without the unrelated app control");
+}, callbackKind.startsWith("timed-direct") ? 35000 : 25000);
+
+for (const source of [true, false]) for (const [foreign, foreignBootstrap, replaceReceiver, noArtifact, carrier, rich] of [
+  [false, false, false, false, "complete", false],
+  [true, false, false, false, "complete", false],
+  [false, true, false, false, "complete", false],
+  [false, false, true, false, "complete", false],
+  [false, false, false, true, "complete", false],
+  [false, false, false, false, "complete", true],
+  [false, false, false, false, "legacy", false],
+  [false, false, false, false, "legacy", true],
+  [false, false, false, false, "wrong-bot", false],
+  [false, false, false, false, "wrong-bot", true],
+  [false, false, false, false, "sdk-rebind", false],
+  [false, false, false, false, "sdk-rebind", true],
+  [false, false, false, false, "edit", false],
+  [false, false, false, false, "edit", true],
+  ...(["edit-complete", "edit-legacy", "edit-boolean", "edit-wrong-id", "edit-wrong-thread", "edit-wrong-bot", "edit-sdk-rebind", "edit-parent-consumed", "edit-unchanged", "edit-app-parent",
+    "markup-complete", "markup-legacy", "markup-boolean", "markup-wrong-id", "markup-wrong-thread", "markup-wrong-bot", "markup-sdk-rebind", "markup-parent-consumed", "markup-unchanged", "markup-app-parent", "markup-embedded"] as const).flatMap(carrier => [
+    [false, false, false, false, carrier, false], [false, false, false, false, carrier, true],
+  ] as const),
+  [false, false, false, false, "app", false],
+  [false, false, false, false, "app", true],
+  [false, false, false, true, "app", false],
+  [false, false, false, false, "app-legacy", false],
+  [false, false, false, false, "app-legacy", true],
+  [false, false, false, false, "app-wrong-bot", false],
+  [false, false, false, false, "app-wrong-bot", true],
+  [false, false, false, false, "app-sdk-rebind", false],
+  [false, false, false, false, "app-sdk-rebind", true],
+  [false, false, false, false, "app-loss", false],
+  [false, false, false, false, "app-loss", true],
+  [false, false, false, false, "app-mixed", false],
+  [false, false, false, false, "app-mixed", true],
+  ...(["app-mixed-legacy", "app-mixed-wrong-bot", "app-mixed-sdk-rebind", "app-mixed-loss", "app-mixed-other-origin", "app-mixed-question-origin", "app-mixed-unbound", "app-mixed-feedback", "app-mixed-feedback-foreign", "app-mixed-feedback-legacy", "app-mixed-feedback-thread", "app-mixed-feedback-rebound", "app-mixed-feedback-child-legacy", "app-mixed-feedback-child-foreign", "app-mixed-feedback-child-thread", "app-mixed-feedback-child-rebound", "app-mixed-feedback-child-owner-loss", "app-mixed-feedback-child-parent-consumed", "app-mixed-feedback-child-other-origin", "app-mixed-feedback-child-second", "app-mixed-feedback-child-pure", "app-mixed-feedback-child-pure-legacy", "app-mixed-feedback-child-pure-foreign", "app-mixed-feedback-child-pure-thread", "app-mixed-feedback-child-pure-rebound", "app-mixed-feedback-child-pure-owner-loss", "app-mixed-feedback-child-pure-parent-consumed", "app-mixed-feedback-child-pure-other-origin", "app-mixed-feedback-child-pure-unlabeled", "app-mixed-feedback-child-pure-partial", "app-mixed-feedback-child-pure-mixed-origin", "app-mixed-feedback-child-queued", "app-mixed-feedback-child-pure-queued", "app-mixed-feedback-child-queued-bad-feedback", "app-mixed-feedback-child-queued-sdk-loss", "app-mixed-feedback-child-queued-app-loss", "app-mixed-feedback-child-queued-parent-loss", "app-mixed-feedback-child-queued-other-origin", "app-mixed-feedback-child-queued-child-foreign", "app-mixed-feedback-child-queued-editor", "app-mixed-feedback-child-queued-admission", "app-mixed-feedback-child-pure-queued-editor", "app-mixed-feedback-child-queued-editor-admission", "app-mixed-feedback-child-pure-queued-editor-admission", "app-mixed-feedback-child-queued-editor-second", "app-mixed-feedback-child-queued-editor-sdk-loss", "app-mixed-feedback-child-queued-editor-app-loss", "app-mixed-feedback-child-queued-editor-foreign", "app-mixed-feedback-child-queued-editor-cancelled", "app-mixed-feedback-child-queued-editor-earlier", "app-mixed-feedback-child-queued-editor-child-consumed"] as const).flatMap(carrier => [
+    [false, false, false, false, carrier, false], [false, false, false, false, carrier, true],
+  ] as const),
+  ...(["app-mixed-refresh", "app-mixed-refresh-legacy", "app-mixed-refresh-sdk-loss", "app-mixed-refresh-app-loss", "app-mixed-refresh-worker", "app-mixed-refresh-parent-loss", "app-mixed-refresh-no-source", "app-mixed-refresh-forged-source", "app-mixed-refresh-bot", "app-mixed-refresh-thread", "app-mixed-refresh-parent-io", "app-mixed-refresh-question-origin", "app-mixed-refresh-pure", "app-mixed-refresh-ordinary", "app-mixed-refresh-ordinary-legacy", "app-mixed-refresh-ordinary-field", "app-mixed-refresh-ordinary-sdk-loss", "app-mixed-refresh-ordinary-pure", "app-mixed-refresh-ordinary-worker", "app-mixed-refresh-ordinary-app-loss", "app-mixed-refresh-ordinary-bot", "app-mixed-refresh-ordinary-thread", "app-mixed-refresh-ordinary-parent-io", "app-mixed-refresh-ordinary-child-missing", "app-mixed-refresh-ordinary-no-source", "app-mixed-refresh-ordinary-later"] as const).flatMap(carrier => [[false, false, false, false, carrier, false], [false, false, false, false, carrier, true]] as const),
+  ...(["app-mixed-feedback-child-pure-queued-retained", "app-mixed-feedback-child-queued-retained", "app-mixed-feedback-child-pure-queued-editor-retained-admission", "app-mixed-feedback-child-pure-queued-retained-partial", "app-mixed-feedback-child-pure-queued-retained-two", "app-mixed-feedback-child-pure-queued-retained-sdk-loss", "app-mixed-feedback-child-pure-queued-retained-app-loss", "app-mixed-feedback-child-pure-queued-retained-parent-consumed", "app-mixed-feedback-child-pure-queued-retained-other-origin", "app-mixed-feedback-child-pure-queued-retained-foreign", "app-mixed-feedback-child-pure-queued-retained-thread", "app-mixed-feedback-child-pure-queued-editor-retained-sdk-loss"] as const).flatMap(carrier => (carrier === "app-mixed-feedback-child-pure-queued-retained" || carrier === "app-mixed-feedback-child-queued-retained" ? [false, true] : [true]).map(rich => [false, false, false, false, carrier, rich] as const)),
+] as const)
+test(`Production follower SDK first-send refuses foreign native carrier before ownership (${source ? "source" : "compiled"}/${foreign}/bootstrap=${foreignBootstrap}/receiver=${replaceReceiver}/noArtifact=${noArtifact}/carrier=${carrier}/rich=${rich})`, async () => {
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { mkdtemp, realpath, readFile, writeFile, rm } from "node:fs/promises";
+    import { join } from "node:path";
+    import { tmpdir } from "node:os";
+    import { mock } from "node:test";
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const base = ${JSON.stringify(source ? "./lib/" : "./dist/lib/")}, suffix = ${JSON.stringify(source ? ".ts" : ".js")}, foreign = ${foreign}, foreignBootstrap = ${foreignBootstrap}, replaceReceiver = ${replaceReceiver}, noArtifact = ${noArtifact}, carrier = ${JSON.stringify(carrier)}, rich = ${rich};
+    const now = performance.now.bind(performance), started = now(), resources = process.getActiveResourcesInfo.bind(process);
+    const phase = name => console.log("follower-carrier-phase:" + name + ":elapsedMs=" + Math.round(now() - started) + ":pid=" + process.pid);
+    phase("import-start");
+    const dir = await realpath(await mkdtemp(join(tmpdir(), "pt-two-root-carrier-")));
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const keepAlive = setInterval(() => {}, 60000);
+    phase("fixture-ready");
+    let physicalId, agentMessageId, agentNativeBody, agentSends = 0, sends = 0, records = 0, refusedSends = 0, messageId = 100, threadId = 42;
+    const failures = [], events = [], clients = [], states = [], registries = [], stores = [], lifecycles = [], apis = [];
+    const refreshFlow = carrier.startsWith("app-mixed-refresh"), ordinaryRefresh = carrier.startsWith("app-mixed-refresh-ordinary"), refreshUsable = refreshFlow && !carrier.endsWith("sdk-loss") && !carrier.endsWith("app-loss"), refreshQualified = carrier === "app-mixed-refresh" || carrier === "app-mixed-refresh-worker" || carrier === "app-mixed-refresh-pure" || carrier === "app-mixed-refresh-ordinary" || carrier === "app-mixed-refresh-ordinary-pure" || carrier === "app-mixed-refresh-ordinary-worker" || carrier === "app-mixed-refresh-ordinary-later", retainedFlow = carrier.includes("-retained"), queueFlow = carrier.includes("-queued"), deferredFlow = queueFlow && carrier.includes("-editor"), pureChild = carrier.includes("-child-pure"), childFlow = carrier.startsWith("app-mixed-feedback-child-"), feedbackFlow = carrier.startsWith("app-mixed-feedback"), mixedApp = carrier.startsWith("app-mixed"), isMarkup = carrier.startsWith("markup-"), isPlainEdit = carrier.startsWith("edit-") || isMarkup,
+      isApp = carrier.startsWith("app") || carrier.endsWith("app-parent"), ingress = Promise.withResolvers(), dispatched = Promise.withResolvers();
+    const agentEntered = Promise.withResolvers(), agentRelease = Promise.withResolvers(), editEntered = Promise.withResolvers(), editRelease = Promise.withResolvers();
+    let birthAuthority, registrationAuthority, bootstrapReplies = 0, receiverReplacements = 0, ingressUsed = false, callbackUsed = false, secondCallbackUsed = false, replacementKeys = [], otherBinding;
+    const callbackIngress = Promise.withResolvers(), callbackDone = Promise.withResolvers(), secondCallbackIngress = Promise.withResolvers(), secondCallbackDone = Promise.withResolvers(), feedbackEntered = Promise.withResolvers(), feedbackRelease = Promise.withResolvers();
+    const nativeExit = Promise.withResolvers(), workerExit = Promise.withResolvers(), workerRelease = Promise.withResolvers(), childEntered = Promise.withResolvers(), childRelease = Promise.withResolvers();
+    const childPrepared = Promise.withResolvers(), editorEntered = Promise.withResolvers(), editorRelease = Promise.withResolvers();
+    let alternativeChildBinding, originalSdkOwner, admissionCutoff, admissionController, wantAdmissionClock = false, deferredOriginal;
+    let retainedGroup, retainedDeadline, retainedCells, retainedNativeBody, retainedWorkerOutput;
+    const retainedInput = join(dir, "remote-retained-native-row.txt"), refreshCountFile = join(dir, "native-refresh-count.txt");
+    const liveTimers = new Map(), liveRuntimes = [], refreshEntered = Promise.withResolvers(), refreshRelease = Promise.withResolvers(), refreshFinished = Promise.withResolvers();
+    let refreshPlans = 0, refreshEdits = 0, refreshOutcome, refreshBinding, refreshBody, refreshNativeAck, originalAppOwner, refreshHasOriginalAppSource, refreshHandle, refreshSource, refreshResultOwner, refreshParentBinding, ordinaryParentAck, refreshCaptureError, refreshSourceCaptures = 0, refreshParentSpent = false;
+    const spendRefreshParent = () => {
+      const row = stores[1].rows.find(value => ordinaryRefresh ? value.action.binding && !value.action.completionGroup : value.binding && value.action.completionGroup); assert.ok(row);
+      const answer = stores[1].store.resolve(row.key, { id: "pre-worker-parent-answer", from: { id: 77, is_bot: false }, data: row.key,
+        message: { message_id: refreshHandle.messageIds[0], message_thread_id: 44, chat: { id: 77, type: "private" } } });
+      assert.ok(answer); refreshParentSpent = true;
+    };
+    let holdWorker = false, invocation, callbackPlans = 0, callbackResults = 0, callbackNewSends = 0, executionCaptures = 0, modelDispatches = 0, feedbackArmed = false;
+    const callbackObservations = [], refreshedCallbackBindings = [];
+    const { Worker } = await import("node:worker_threads"), terminate = Worker.prototype.terminate;
+    Worker.prototype.terminate = function (...args) {
+      const held = holdWorker; holdWorker = false;
+      if (held) this.once("exit", () => workerExit.resolve());
+      const pending = Reflect.apply(terminate, this, args);
+      return held ? pending.then(async value => { nativeExit.resolve(); await workerRelease.promise; return value; }) : pending;
+    };
+    const url = new URL(base + "ownership" + suffix, import.meta.url), ownership = await import(url.href);
+    mock.module(url.href, { namedExports: { ...ownership, createTelegramBusMessageOwnershipRuntime(...args) {
+      const runtime = ownership.createTelegramBusMessageOwnershipRuntime(...args), record = runtime.recordFollower;
+      runtime.recordFollower = (...args) => { if (args[0].messageId === physicalId) records++; return Reflect.apply(record, runtime, args); };
+      return runtime;
+    } } });
+    const busUrl = new URL(base + "bus" + suffix, import.meta.url), bus = await import(busUrl.href);
+    mock.module(busUrl.href, { namedExports: { ...bus, createTelegramCurrentBusProtocolIdentity(capabilities) {
+      return bus.createTelegramCurrentBusProtocolIdentity(noArtifact ? capabilities.filter(value => value !== bus.TELEGRAM_BUS_CAPABILITY_ARTIFACT_DOCUMENT) : capabilities);
+    }, createTelegramBusFollowerRegistry(...args) {
+      const registry = bus.createTelegramBusFollowerRegistry(...args); registries.push(registry); return registry;
+    }, createTelegramBusLocalServer(options) {
+      const original = options.handleEnvelope;
+      return bus.createTelegramBusLocalServer({ ...options, async handleEnvelope(envelope) {
+        if (replaceReceiver && envelope.kind === "follower.callApi" && JSON.stringify(envelope.args).includes("Carrier root SDK")) {
+          const registry = registries.find(value => value.get(envelope.instanceId)), before = registry.get(envelope.instanceId);
+          assert.equal(envelope.apiRegistrationIncarnation, before.registrationIncarnation, "The attempt carries its acknowledged original row, not just generation/target");
+          registry.register(before); receiverReplacements++;
+          assert.notEqual(registry.get(envelope.instanceId).registrationIncarnation, envelope.apiRegistrationIncarnation);
+        }
+        const response = await original(envelope);
+        if (foreignBootstrap && envelope.kind === "follower.register" && response?.kind === "bus.ack") {
+          bootstrapReplies++; return { ...response, requestId: "foreign-bootstrap" };
+        }
+        return response;
+      } });
+    } } });
+    const followerUrl = new URL(base + "bus-follower" + suffix, import.meta.url), followerModule = await import(followerUrl.href);
+    mock.module(followerUrl.href, { namedExports: { ...followerModule, createTelegramBusFollowerRegistrationState(...args) {
+      const state = followerModule.createTelegramBusFollowerRegistrationState(...args); states.push(state); return state;
+    }, createTelegramBusFollowerClientRuntime(...args) {
+      const actual = followerModule.createTelegramBusFollowerClientRuntime(...args); clients.push(actual); return actual;
+    } } });
+    phase("outbound-import-entered");
+    const outboundUrl = new URL(base + "outbound" + suffix, import.meta.url), outbound = await import(outboundUrl.href);
+    phase("outbound-import-returned");
+    mock.module(outboundUrl.href, { namedExports: { ...outbound, createTelegramButtonActionStore(...args) {
+      const record = args[0].recordFailure, event = args[0].recordRuntimeEvent, sdkBirths = [], nativeSdkCapture = args[0].captureQuestionLifetimeOwner;
+      const config = { ...args[0], recordFailure(error) { failures.push(String(error?.stack ?? error)); record?.(error); },
+        recordRuntimeEvent(...detail) { events.push(detail); event?.(...detail); } };
+      if (ordinaryRefresh) config.captureQuestionLifetimeOwner = (...values) => { const owner = Reflect.apply(nativeSdkCapture, args[0], values); if (owner) sdkBirths.push(owner); return owner; };
+      const store = outbound.createTelegramButtonActionStore(config), row = { store, rows: [], sdkBirths }, register = store.register; stores.push(row);
+      const capturePublication = store.capturePublicationSource;
+      if (refreshFlow) store.capturePublicationSource = (...values) => {
+        try {
+          if (row === stores[1]) {
+            refreshSourceCaptures++; assert.equal(refreshSourceCaptures, 1); assert.equal(values[0], refreshHandle);
+            assert.equal(refreshPlans, 0); assert.equal(refreshEdits, 0); assert.equal(values[1], refreshParentBinding);
+            const births = stores[1].sdkBirths.length;
+            if (ordinaryRefresh) {
+              assert.ok(births > 0); const owner = stores[1].sdkBirths[0]; owner.assertCurrent();
+              assert.deepEqual(owner.target, { chatId: 77, threadId: 44 });
+              for (const peer of stores[1].sdkBirths) owner.assertScope(peer.scope);
+            }
+            refreshSource = Reflect.apply(capturePublication, store, values);
+            if (ordinaryRefresh) {
+              if (carrier.endsWith("legacy") || carrier.endsWith("no-source")) assert.equal(refreshSource, undefined, "An incomplete first-wire ACK or spent original control cannot certify ordinary ancestry");
+              else assert.ok(refreshSource, "The original native first-wire certificate supplies the question-free source");
+              assert.equal(stores[1].sdkBirths.length, births, "Certification and source capture never look up a replacement SDK owner");
+              if (carrier.endsWith("field")) refreshSource = Object.freeze({ assertCurrent: () => stores[1].sdkBirths[0].assertCurrent() });
+            }
+            if (carrier.endsWith("forged-source")) { assert.ok(refreshSource); refreshSource = Object.freeze({ assertCurrent: refreshSource.assertCurrent }); }
+            if (carrier.endsWith("no-source") || ordinaryRefresh && carrier.endsWith("legacy")) assert.equal(refreshSource, undefined);
+            else { assert.ok(refreshSource); refreshSource.assertCurrent(); }
+            return refreshSource;
+          }
+          return Reflect.apply(capturePublication, store, values);
+        } catch (error) { refreshCaptureError = error; throw error; }
+      };
+      const admission = store.onQuestionAdmission;
+      if (deferredFlow) store.onQuestionAdmission = event => {
+        if (wantAdmissionClock && row === stores[1]) {
+          const at = originalSdkOwner.matchAdmissionEvent(event); assert.equal(typeof at, "number"); admissionCutoff = at + 3600000;
+          if (carrier.endsWith("cancelled")) admissionController.abort();
+        }
+        return admission(event);
+      };
+      const bindEditor = store.bindPublicationEditor;
+      if (deferredFlow) store.bindPublicationEditor = editor => bindEditor(async (view, guard) => {
+        await editor(view, guard);
+        if (feedbackArmed && view.messageId === agentMessageId) { editorEntered.resolve(); await editorRelease.promise; }
+      });
+      const begin = store.beginPublication;
+      if (feedbackFlow) store.beginPublication = (method, body) => {
+        if (queueFlow && feedbackArmed && body.message_id === agentMessageId && JSON.stringify(body).includes("Remote callback child")) childPrepared.resolve();
+        const finish = begin(method, body);
+        if (!finish || !feedbackArmed || body.message_id !== agentMessageId) return finish;
+        return Object.assign((...args) => { callbackObservations.push({ method, child: JSON.stringify(body).includes("Remote callback child"), result: args[0], succeeded: args[1], raw: args[3] }); return finish(...args); }, finish);
+      };
+      if (refreshFlow) store.beginPublication = (method, body) => {
+        const finish = begin(method, body);
+        if (!finish || !JSON.stringify(body).includes("Remote refreshed questions")) return finish;
+        return Object.assign((...args) => { refreshNativeAck = args[3]; return finish(...args); }, finish);
+      };
+      store.register = (...values) => {
+        if (carrier === "app-mixed-refresh-question-origin" && values[1] && values[0].prompt.includes('"question":"Refreshed question two"')) {
+          assert.ok(otherBinding); assert.notEqual(otherBinding, values[1]);
+          for (const field of ["app", "generation", "revision"]) assert.equal(otherBinding[field], values[1][field]);
+          values[1] = otherBinding;
+        }
+        if (pureChild && carrier.endsWith("mixed-origin") && values[1] && values[0].prompt.includes('"question":"Remote child two"')) {
+          assert.ok(alternativeChildBinding); assert.notEqual(alternativeChildBinding, values[1]);
+          for (const field of ["app", "generation", "revision"]) assert.equal(alternativeChildBinding[field], values[1][field]);
+          alternativeChildBinding.assertCurrent(); values[1].assertCurrent(); values[1] = alternativeChildBinding;
+        }
+        if (carrier === "app-mixed-question-origin" && values[1] && values[0].prompt.includes('"question":"Remote coordinated question peer"')) {
+          assert.ok(otherBinding); assert.notEqual(otherBinding, values[1]);
+          for (const field of ["app", "generation", "revision"]) assert.equal(otherBinding[field], values[1][field]);
+          otherBinding.assertCurrent(); values[1].assertCurrent(); values[1] = otherBinding;
+        }
+        if (mixedApp && values[0].binding && !values[0].completionGroup) {
+          if (carrier === "app-mixed-unbound") values[0] = { ...values[0], binding: undefined };
+          if (carrier === "app-mixed-other-origin") {
+            assert.ok(otherBinding); assert.notEqual(otherBinding, values[0].binding);
+            for (const field of ["app", "generation", "revision"]) assert.equal(otherBinding[field], values[0].binding[field]);
+            otherBinding.assertCurrent(); values[0].binding.assertCurrent();
+            values[0] = { ...values[0], binding: otherBinding };
+          }
+        }
+        const key = register(...values); row.rows.push({ key, action: values[0], binding: values[1] }); return key;
+      }; return store;
+    } } });
+    const deliveryUrl = new URL(base + "delivery" + suffix, import.meta.url), delivery = await import(deliveryUrl.href);
+    mock.module(deliveryUrl.href, { namedExports: { ...delivery, createTelegramBridgeDeliveryLifecycleHooks(options) {
+      const record = options.recordFailure;
+      const hooks = delivery.createTelegramBridgeDeliveryLifecycleHooks({ ...options, recordFailure(...args) {
+        failures.push(args.map(value => value instanceof Error ? String(value.stack) + " cause: " + String(value.cause) : value)); record(...args);
+      } }); lifecycles.push(hooks); return hooks;
+    } } });
+    const busApiUrl = new URL(base + "bus-api" + suffix, import.meta.url), busApi = await import(busApiUrl.href);
+    mock.module(busApiUrl.href, { namedExports: { ...busApi, createTelegramBusAwareApiRuntime(...args) { const api = busApi.createTelegramBusAwareApiRuntime(...args); apis.push(api); return api; } } });
+    const appsUrl = new URL(base + "generative-apps" + suffix, import.meta.url), nativeApps = await import(appsUrl.href);
+    mock.module(appsUrl.href, { namedExports: { ...nativeApps, registerTelegramBindTool(pi, deps) {
+      if (refreshFlow) {
+        const setRuntime = deps.setLiveSurfaceRuntime, plan = deps.planOutput, edit = deps.editView, send = deps.sendView, isCurrent = deps.isDeliveryHandleCurrent;
+        deps.isDeliveryHandleCurrent = (...args) => {
+          if (carrier.endsWith("parent-loss") && refreshSource && !refreshParentSpent) {
+            spendRefreshParent(); assert.throws(refreshSource.assertCurrent);
+          }
+          return Reflect.apply(isCurrent, deps, args);
+        };
+        deps.sendView = async (...args) => { const result = await Reflect.apply(send, deps, args); if (result.ok) refreshHandle = result.value; return result; };
+        deps.setLiveSurfaceRuntime = runtime => { liveRuntimes.push(runtime); return setRuntime(runtime); };
+        deps.liveSurfaceSetTimer = (callback, delayMs) => { const token = { unref() {} }; liveTimers.set(token, { callback, delayMs }); return token; };
+        deps.liveSurfaceClearTimer = token => { liveTimers.delete(token); };
+        deps.planOutput = (...args) => {
+          if (args[0].includes("Remote refreshed questions")) {
+            refreshPlans++; refreshBinding = args[1].binding; assert.ok(nativeApps.captureGenerativeAppCallbackOwner(refreshBinding));
+            const successor = originalAppOwner.captureReadOnlySuccessor(refreshBinding); refreshResultOwner = successor;
+            refreshHasOriginalAppSource = !!successor; assert.equal(refreshSourceCaptures, 1);
+            assert.equal(successor.originalPublicationSource, refreshSource, "The exact native result retains the original pre-worker source, never a later SDK lookup");
+            assert.equal(Object.keys(successor).includes("originalPublicationSource"), false);
+            if (carrier.endsWith("parent-loss")) assert.throws(successor.originalPublicationSource.assertCurrent);
+            assert.equal(nativeApps.getGenerativeAppCallbackInvocationKind(refreshBinding, undefined), undefined);
+          }
+          return Reflect.apply(plan, deps, args);
+        };
+        deps.editView = async (...args) => { try { refreshOutcome = await Reflect.apply(edit, deps, args); return refreshOutcome; } finally { refreshFinished.resolve(); } };
+      }
+      return nativeApps.registerTelegramBindTool(pi, deps);
+    }, invokeGenerativeApp(options) {
+      if (refreshFlow && options.callbackBinding) {
+        refreshedCallbackBindings.push(options.callbackBinding);
+        if (refreshQualified) assert.ok(options.callbackInvocation, "A real later press captures its own native invocation; the timer never invents one");
+        else assert.equal(options.callbackInvocation, undefined, "Unqualified refresh controls cannot borrow a qualified callback invocation");
+      }
+      if (feedbackFlow && options.callbackInvocation) {
+        if (carrier.endsWith("child-second") && invocation) assert.notEqual(invocation, options.callbackInvocation); else assert.equal(invocation, undefined);
+        invocation = options.callbackInvocation;
+      }
+      return nativeApps.invokeGenerativeApp(options);
+    } } });
+    const bindingsUrl = new URL(base + "bindings" + suffix, import.meta.url), bindings = await import(bindingsUrl.href);
+    mock.module(bindingsUrl.href, { namedExports: { ...bindings, createTelegramGenerativeAppBoundButtonActionInvoker(options) {
+      const plan = options.planOutput, capture = options.getExecutionFence;
+      if (refreshFlow) options.getExecutionFence = function (...args) { executionCaptures++; return Reflect.apply(capture, options, args); };
+      if (feedbackFlow) {
+        options.getExecutionFence = function (...args) { executionCaptures++; return Reflect.apply(capture, options, args); };
+        options.planOutput = (...args) => {
+          assert.ok(invocation); assert.equal(nativeApps.getGenerativeAppCallbackInvocationKind(args[1]?.binding, invocation), "read-only");
+          if (alternativeChildBinding && !carrier.endsWith("mixed-origin")) {
+            assert.notEqual(alternativeChildBinding, args[1].binding);
+            for (const field of ["app", "generation", "revision"]) assert.equal(alternativeChildBinding[field], args[1].binding[field]);
+            alternativeChildBinding.assertCurrent(); args[1].binding.assertCurrent();
+            assert.equal(nativeApps.getGenerativeAppCallbackInvocationKind(alternativeChildBinding, invocation), undefined);
+            args[1] = { ...args[1], binding: alternativeChildBinding };
+          }
+          if (pureChild && carrier.endsWith("unlabeled")) args[1] = { ...args[1], binding: undefined };
+          if (retainedFlow) retainedWorkerOutput = args[0];
+          callbackPlans++; const reply = plan(...args);
+          if (!retainedFlow && pureChild && carrier.endsWith("partial")) {
+            const first = reply.replyMarkup.inline_keyboard[0][0].callback_data;
+            return { ...reply, replyMarkup: { inline_keyboard: reply.replyMarkup.inline_keyboard.map(row => row.map(button => button.callback_data === first ? { ...button, callback_data: "tgbtn:unowned" } : button)) } };
+          }
+          return reply;
+        };
+      }
+      return bindings.createTelegramGenerativeAppBoundButtonActionInvoker(options);
+    } } });
+    phase("root-import-entered");
+    const Delivery = await import(deliveryUrl.href), Api = await import(base + "telegram-api" + suffix), { default: extension } = await import(base + "extension" + suffix);
+    phase("import-complete");
+    globalThis.fetch = async (input, init) => {
+      const method = String(input).split("/").at(-1), body = init?.body ? JSON.parse(String(init.body)) : {};
+      const response = result => new Response(JSON.stringify({ ok: true, result }), { status: 200, headers: { "content-type": "application/json" } });
+      if (method === "getMe") return response({ id: 123, is_bot: true, username: "carrier_bot", has_topics_enabled: true });
+      if (method === "createForumTopic") return response({ message_thread_id: ++threadId, name: "Carrier" });
+      if (method === "getUpdates") return new Promise((resolve, reject) => {
+        const abort = () => reject(new DOMException("stop", "AbortError"));
+        if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+        const updates = isApp && !ingressUsed ? (ingressUsed = true, ingress) : (feedbackFlow || refreshFlow) && !callbackUsed ? (callbackUsed = true, callbackIngress) : carrier.endsWith("child-second") && !secondCallbackUsed ? (secondCallbackUsed = true, secondCallbackIngress) : undefined;
+        updates?.promise.then(value => { init?.signal?.removeEventListener("abort", abort); resolve(response(value)); });
+      });
+      if (method === "sendMessage" || method === "sendRichMessage") {
+        const id = ++messageId, requested = JSON.stringify(body).includes("Carrier root SDK");
+        if (feedbackFlow && JSON.stringify(body).includes("Remote callback child")) callbackNewSends++;
+        if (body.text === "Forbidden publication") refusedSends++;
+        if (requested) { sends++; physicalId = id; }
+        const agent = JSON.stringify(body).includes("Remote coordinated question");
+        if (agent) { agentMessageId = id; agentNativeBody = body; agentSends++; }
+        if (agent && (!isPlainEdit && carrier.endsWith("sdk-rebind") || (carrier === "app-loss" || carrier === "app-mixed-loss"))) { agentEntered.resolve(); await agentRelease.promise; }
+        if (agent && !isPlainEdit && !feedbackFlow && !refreshFlow && carrier.endsWith("legacy")) return response({ message_id: id });
+        const sent = { message_id: id, from: { id: agent && !isPlainEdit && carrier.endsWith("wrong-bot") ? 456 : 123, is_bot: true }, chat: { id: requested && foreign ? 78 : body.chat_id }, ...(body.message_thread_id !== undefined ? { message_thread_id: body.message_thread_id } : {}) };
+        if (ordinaryRefresh && agent) { ordinaryParentAck = carrier.endsWith("legacy") ? { message_id: id } : sent; return response(ordinaryParentAck); }
+        return response(sent);
+      }
+      if (method === "editMessageText" || method === "editMessageReplyMarkup") {
+        if (refreshFlow && JSON.stringify(body).includes("Remote refreshed questions")) {
+          refreshEdits++; refreshBody = body; refreshEntered.resolve(); await refreshRelease.promise;
+          if (carrier.endsWith("legacy") && !ordinaryRefresh || carrier.endsWith("ordinary-child-missing")) return response({ message_id: body.message_id });
+          return response({ message_id: body.message_id, chat: { id: body.chat_id }, message_thread_id: carrier.endsWith("thread") ? 45 : 44, from: { id: carrier.endsWith("bot") ? 456 : 123, is_bot: true } });
+        }
+        if (refreshFlow && JSON.stringify(body).includes("Remote callback child")) {
+          callbackResults++;
+          return response({ message_id: body.message_id, chat: { id: body.chat_id }, message_thread_id: 44, from: { id: 123, is_bot: true } });
+        }
+        if (refreshFlow && method === "editMessageReplyMarkup" && body.message_id === agentMessageId)
+          return response({ message_id: body.message_id, chat: { id: body.chat_id }, message_thread_id: 44, from: { id: 123, is_bot: true } });
+        if (feedbackFlow && feedbackArmed && body.message_id === agentMessageId) {
+          const child = JSON.stringify(body).includes("Remote callback child");
+          if (child) {
+            if (retainedFlow) retainedNativeBody = body;
+            callbackResults++;
+            if (childFlow && (carrier.endsWith("rebound") || carrier.endsWith("owner-loss") || carrier.endsWith("parent-consumed"))) { childEntered.resolve(); await childRelease.promise; }
+          } else { feedbackEntered.resolve(); await feedbackRelease.promise; }
+          const faulty = childFlow ? child : !child;
+          if (faulty && carrier.endsWith("legacy")) return response({ message_id: body.message_id });
+          return response({ message_id: body.message_id, chat: { id: body.chat_id }, message_thread_id: faulty && carrier.endsWith("thread") ? 45 : 44,
+            from: { id: (faulty && carrier.endsWith("foreign") || queueFlow && !child && carrier.endsWith("bad-feedback")) ? 456 : 123, is_bot: true } });
+        }
+        if (isPlainEdit && (JSON.stringify(body).includes("Edited remote question") || isMarkup && method === "editMessageReplyMarkup" && replacementKeys.length && replacementKeys.every(key => JSON.stringify(body).includes(key)))) {
+          if (carrier.endsWith("sdk-rebind") || carrier.endsWith("parent-consumed")) { editEntered.resolve(); await editRelease.promise; }
+          if (carrier.endsWith("unchanged")) return new Response(JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message is not modified" }), { status: 400, headers: { "content-type": "application/json" } });
+          if (carrier.endsWith("boolean")) return response(true);
+          if (carrier.endsWith("legacy")) return response({ message_id: body.message_id });
+          return response({ message_id: body.message_id + (carrier.endsWith("wrong-id") ? 1 : 0), chat: { id: body.chat_id },
+            message_thread_id: carrier.endsWith("wrong-thread") ? 45 : 44, from: { id: carrier.endsWith("wrong-bot") ? 456 : 123, is_bot: true } });
+        }
+        return response({ message_id: body.message_id, chat: { id: body.chat_id }, ...(body.message_thread_id !== undefined ? { message_thread_id: body.message_thread_id } : {}) });
+      }
+      if (method === "answerCallbackQuery" && ["Done", "Generative App action failed", "Button action expired"].includes(body.text)) {
+        if (body.callback_query_id === "remote-feedback") callbackDone.resolve(body.text);
+        if (body.callback_query_id === "remote-feedback-2") secondCallbackDone.resolve(body.text);
+      }
+      return response(true);
+    };
+    const leader = createRuntimePiHarness(), follower = createRuntimePiHarness();
+    if (isApp) follower.pi.sendUserMessage = async () => { modelDispatches++; dispatched.resolve(); };
+    const leaderCtx = createRuntimeExtensionContext({ cwd: join(dir, "leader") }), followerCtx = createRuntimeExtensionContext({ cwd: join(dir, "follower") });
+    let leaderStarted = false, followerStarted = false;
+    try {
+      await writeFile(join(dir, "telegram.json"), JSON.stringify({ botToken: "123:carrier-root", botId: 123, allowedUserId: 77, lastUpdateId: 0,
+        threads: { automaticCleanup: false }, assistant: { activity: "quiet", rendering: rich ? "rich" : "html" } }), { mode: 0o600 });
+      phase("leader-connect-entered");
+      extension(leader.pi); leaderStarted = true; await leader.handlers.get("session_start")({}, leaderCtx); await leader.commands.get("telegram-connect").handler("", leaderCtx);
+      phase("leader-connect-returned");
+      phase("follower-connect-entered");
+      extension(follower.pi); followerStarted = true; await follower.handlers.get("session_start")({}, followerCtx);
+      try { await follower.commands.get("telegram-connect").handler("", followerCtx); } catch (error) { if (!foreignBootstrap) throw error; }
+      phase("follower-connect-settled");
+      assert.equal(threadId, 44, "Two actual Roots provision distinct leader/follower bindings through the real authenticated bus");
+      phase("registration-checked");
+      if (foreignBootstrap) {
+        assert.ok(bootstrapReplies > 0, "The native backend really handled and registered the follower before ACK correlation was lost");
+        assert.equal(states[1].isRegistered(), false, "An unrelated bootstrap cannot publish ready authority");
+        assert.equal(states[1].getGeneration(), undefined); assert.equal(clients[1].captureApiAuthority(), undefined);
+        const refused = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "Carrier root SDK",
+          confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal });
+        assert.equal(refused.ok, false); assert.equal(sends, 0); assert.equal(records, 0);
+        phase("bootstrap-refusal-checked");
+        phase("checks-complete");
+        console.log("two-production-roots-native-carrier-checked");
+      } else {
+        birthAuthority = clients[1].captureApiAuthority(); assert.equal(typeof birthAuthority, "function", "Actual negotiated follower Root captures its native owner before a question"); birthAuthority();
+        registrationAuthority = clients[1].captureApiAuthority("registration"); assert.equal(typeof registrationAuthority, "function"); registrationAuthority();
+        const liveOrigin = registries.flatMap(value => value.list()).find(value => value.registrationGeneration === states[1].getGeneration());
+        assert.ok(liveOrigin); assert.equal(states[1].capturePublicationRegistration().apiIncarnation, liveOrigin.registrationIncarnation);
+        if (noArtifact) assert.equal(states[1].captureArtifactRegistration(), undefined, "Ordinary API origin grants no Artifact scope");
+        await assert.rejects(clients[1].callApi("call", ["sendMessage", { chat_id: 77, message_thread_id: 99, text: "Forbidden publication" }, { maxAttempts: 1, retrySafety: "non-idempotent" }],
+          { assertAuthority: birthAuthority }), error => error instanceof Api.TelegramApiFollowerNotAllowedError && error.rejectedRequestMethod === "sendMessage");
+        assert.equal(refusedSends, 0, "Matching original broker protocol preserves pre-HTTP policy refusal, not effect or fallback laundering"); birthAuthority();
+        assert.ok(Delivery.captureTelegramQuestionLifetimeOwner(), "Native original receiver plus local SDK/bot/provider capture binds the follower namespace before admission");
+        const opened = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "Carrier root SDK",
+          confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal });
+        assert.equal(opened.ok, !foreign && !replaceReceiver, JSON.stringify({ opened, failures, sends, records }));
+        if (foreign || replaceReceiver) assert.equal(opened.reason, "commit-unknown");
+        if (replaceReceiver) assert.equal(receiverReplacements, 1, "An obsolete receiver origin cannot replay against its replacement");
+        assert.equal(sends, replaceReceiver ? 0 : 1, "No reissue or adoption of a replacement receiver"); assert.equal(records, foreign || replaceReceiver ? 0 : 1);
+        phase("first-sdk-checked");
+        if (!foreign && !replaceReceiver) {
+          if (isApp) {
+            ingress.resolve([{ update_id: 100, message: { message_id: 900, message_thread_id: 44, chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false }, text: "Native remote app input" } }]);
+            await dispatched.promise; await follower.handlers.get("agent_start")({}, followerCtx);
+            phase("agent-started");
+            const output = (ordinaryRefresh ? 'Remote coordinated question-free dashboard' : '<!-- telegram_confirm "Remote coordinated question app" --><!-- telegram_confirm "Remote coordinated question peer" -->') +
+              (mixedApp ? feedbackFlow ? '<!-- telegram_button {Inspect|remote::inspect} -->' : '<!-- telegram_button {➕ Increment|remote::increment} -->' : '');
+            const callbackOutput = 'Remote callback child <!-- telegram_confirm "Remote child one" --><!-- telegram_confirm "Remote child two" -->' + (pureChild ? '' : '<!-- telegram_button {Inspect|remote::inspect(2)} -->');
+            await writeFile(join(dir, "remote.mjs"), (retainedFlow ? 'import {readFile} from "node:fs/promises"; ' : refreshFlow ? 'import {readFile,writeFile} from "node:fs/promises"; ' : '') + 'export function init(){return {state:{count:0},output:' + JSON.stringify(output) + (refreshFlow ? ',refreshAfterMs:60000' : '') + '}} export function view(){return {output:' + JSON.stringify(output) + '}} export function increment({state}){return {state:{count:state.count+1},output:"changed"}} export ' + (retainedFlow ? 'async ' : '') + 'function inspect({state,argument}){return {output:' + (feedbackFlow || carrier.endsWith("ordinary-later") ? '(' + JSON.stringify(callbackOutput) + ').replace("Remote callback child",argument===2?"Remote callback second child":"Remote callback child")' + (retainedFlow ? '+ String.fromCharCode(10) + await readFile(' + JSON.stringify(retainedInput) + ',"utf8")' : '') + ',viewMode:"edit"' : '"Count="+state.count') + '}}' + (refreshFlow ? ' export async function refresh(){let n=0;try{n=Number(await readFile(' + JSON.stringify(refreshCountFile) + ',"utf8"))}catch(error){if(error.code!=="ENOENT")throw error}await writeFile(' + JSON.stringify(refreshCountFile) + ',String(n+1));return {output:' + JSON.stringify('Remote refreshed questions <!-- telegram_confirm "Refreshed question one" --><!-- telegram_confirm "Refreshed question two" -->' + (carrier.endsWith("pure") ? '' : '<!-- telegram_button {🔍 Inspect|remote::inspect} -->')) + '}}' : ''));
+            if (carrier === "app-mixed-other-origin" || carrier === "app-mixed-question-origin") {
+              const nativeApps = await import(base + "generative-apps" + suffix);
+              const original = await nativeApps.bindGenerativeApp({ agentDir: dir, app: "remote", script: join(dir, "remote.mjs"), onOwnerObserved: stores[1].store.observeAppOwner });
+              otherBinding = nativeApps.getGenerativeAppCallbackBinding(original); assert.ok(otherBinding); otherBinding.assertCurrent();
+            }
+          }
+          const before = stores[1].rows.length;
+          // Explicit fresh main-side native projection, not copied old controls or app retention intent.
+          const agent = feedbackFlow && rich ? (async () => {
+            // Producer-backed native Rich first publication; telegram_bind's generic Delivery view is a separate carrier.
+            const produced = await nativeApps.bindGenerativeApp({ agentDir: dir, app: "remote", script: join(dir, "remote.mjs"), onOwnerObserved: stores[1].store.observeAppOwner });
+            const original = outbound.createTelegramOutboundReplyPlanner(stores[1].store, () => "rich", true, true)(produced.output, { binding: nativeApps.getGenerativeAppCallbackBinding(produced) });
+            const result = await apis[1].sendRichMessage({ chat_id: 77, message_thread_id: 44, reply_markup: original.replyMarkup, rich_message: { markdown: original.markdown } });
+            return { details: { messageId: result.message_id } };
+          })() : carrier === "markup-embedded" ? (async () => {
+            const original = outbound.planTelegramButtonReply('<!-- telegram_confirm "Remote coordinated question" --><!-- telegram_confirm "Remote coordinated question peer" -->',
+              { registerAction: stores[1].store.register, questionHeadTail: true, rendering: "html" });
+            const rows = original.replyMarkup.inline_keyboard.map(row => '<tg-button-row>' + row.map(button => '<tg-button type="callback_data" data="' + button.callback_data + '">' + button.text + '</tg-button>').join('') + '</tg-button-row>');
+            const result = await apis[1].sendRichMessage({ chat_id: 77, message_thread_id: 44, reply_markup: { inline_keyboard: [] }, rich_message: { markdown: original.markdown + String.fromCharCode(10) + rows.join(String.fromCharCode(10)) } });
+            return { details: { messageId: result.message_id } };
+          })() : isApp ? follower.tools.get("telegram_bind").execute("remote-app", { app: "remote", ...(otherBinding ? { method: "view" } : { script: join(dir, "remote.mjs") }) }) :
+            follower.tools.get("telegram_message").execute("remote-question", { text: '<!-- telegram_confirm "Remote coordinated question" -->' + (isPlainEdit ? '<!-- telegram_confirm "Remote coordinated question peer" -->' : '') });
+          if (!isPlainEdit && carrier.endsWith("sdk-rebind")) {
+            await agentEntered.promise; Delivery.clearTelegramDeliveryRuntime(); await lifecycles[1].onSessionStart();
+            assert.ok(Delivery.captureTelegramQuestionLifetimeOwner()); agentRelease.resolve();
+          } else if (carrier === "app-loss" || carrier === "app-mixed-loss") {
+            await agentEntered.promise;
+            await follower.tools.get("telegram_bind").execute("native-app-change", { app: "remote", method: "increment", display: false }); agentRelease.resolve();
+          }
+          const published = await agent;
+          phase("first-carrier-returned");
+          let row = stores[1].rows.slice(before).find(value => value.action.completionGroup);
+          if (!ordinaryRefresh) assert.ok(row?.action.completionGroup?.deadline);
+          const appSdkRebind = isApp && !isPlainEdit && carrier.endsWith("sdk-rebind");
+          if (appSdkRebind) assert.equal(published.details?.displayFailed, true, "The ended original Delivery binding cannot report publication through its successor");
+          else assert.ok(published.details?.messageId, JSON.stringify({ published, failures, events }));
+          const originalMessageId = appSdkRebind ? agentMessageId : published.details.messageId;
+          assert.ok(originalMessageId); assert.equal(agentSends, 1, "Physical publication is never replayed after owner uncertainty");
+          let editRows = [];
+          if (carrier === "edit" || isPlainEdit) {
+            const parents = stores[1].rows.slice(before).filter(value => value.action.completionGroup);
+            if (isPlainEdit) {
+              assert.equal(new Set(parents.map(value => value.action.completionGroup)).size, 2);
+              if (isMarkup) {
+                const embedded = String(agentNativeBody.rich_message?.markdown ?? "").includes('<tg-button type="callback_data"');
+                assert.equal(embedded, carrier === "markup-embedded", "Actual first physical carrier, not the rendering flag, decides embedded ancestry");
+                if (!embedded) assert.ok(parents.every(value => JSON.stringify(agentNativeBody.reply_markup).includes(value.key)), "Original controls are all in the physical footer keyboard");
+              }
+              if (isApp) assert.ok(parents.every(value => value.binding && Object.isFrozen(value.binding) && value.action.binding === undefined), "The held parent is an actual native app frame");
+              const proof = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "Original parent membership proof", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal });
+              assert.ok(proof.ok); assert.ok(parents.every(value => value.action.completionGroup.deadline.expiresAt <= Date.now() + 3600000), "Both original native first-send parents already have positive SDK membership");
+            }
+            const declaration = isMarkup ? '<!-- telegram_confirm "Remote coordinated question' + (isApp ? ' app' : '') + '" --><!-- telegram_confirm "Remote coordinated question peer" -->' :
+              '<!-- telegram_confirm "Edited remote question" -->' + (isPlainEdit ? '<!-- telegram_confirm "Edited remote question peer" -->' : '');
+            const at = stores[1].rows.length, plan = outbound.planTelegramButtonReply(declaration, { registerAction: stores[1].store.register, questionHeadTail: true, rendering: rich && !isMarkup ? "rich" : "html" });
+            replacementKeys = stores[1].rows.slice(at).filter(value => value.action.completionGroup).map(value => value.key);
+            const editing = isMarkup ? apis[1].editMessageReplyMarkup(77, published.details.messageId, plan.replyMarkup) :
+              apis[1].editMessageText({ chat_id: 77, ...(isPlainEdit ? {} : { message_thread_id: 44 }), message_id: published.details.messageId,
+                reply_markup: plan.replyMarkup, ...(rich ? { rich_message: { markdown: plan.markdown } } : { text: plan.markdown }) });
+            if (isMarkup) void editing.catch(() => {});
+            if (isPlainEdit && carrier.endsWith("sdk-rebind")) {
+              await editEntered.promise; Delivery.clearTelegramDeliveryRuntime(); await lifecycles[1].onSessionStart();
+              assert.ok(Delivery.captureTelegramQuestionLifetimeOwner()); editRelease.resolve();
+            } else if (isPlainEdit && carrier.endsWith("parent-consumed")) {
+              await editEntered.promise; assert.ok(stores[1].store.resolve(parents[0].key)); editRelease.resolve();
+            }
+            if (carrier === "markup-unchanged") await assert.rejects(editing, /not modified/u, "Reply-markup keeps its original error contract");
+            else assert.equal(await editing, isMarkup ? undefined : carrier === "edit-unchanged" ? "unchanged" : "edited");
+            editRows = stores[1].rows.slice(at).filter(value => value.action.completionGroup); row = editRows[0]; assert.ok(row);
+          }
+          const physicallyIncluded = value => !refreshFlow || JSON.stringify(agentNativeBody).includes(value.key);
+          const appRows = isApp && !isPlainEdit ? stores[1].rows.slice(before).filter(value => value.action.completionGroup && physicallyIncluded(value)) : [];
+          if (isApp && !isPlainEdit) assert.ok(appRows.every(value => value.binding && Object.isFrozen(value.binding) && value.action.binding === undefined), "Actual native app origin, not a forged method binding");
+          const methodRows = mixedApp ? stores[1].rows.slice(before).filter(value => !value.action.completionGroup && physicallyIncluded(value)) : [];
+          if (mixedApp) {
+            assert.equal(methodRows.length, 1, "One actual bound control shares the fresh native app frame");
+            if (carrier === "app-mixed-other-origin") assert.notEqual(methodRows[0].action.binding, appRows[0].binding);
+            else if (carrier === "app-mixed-unbound") assert.equal(methodRows[0].action.binding, undefined);
+            else if (!ordinaryRefresh) assert.equal(methodRows[0].action.binding, appRows[0].binding, "Every row retains the same original native result binding");
+            if (ordinaryRefresh) { assert.ok(methodRows[0].action.binding); assert.equal(appRows.length, 0, "The original native parent has no dummy question"); }
+          }
+          const appDeadlines = [...new Set(appRows.map(value => value.action.completionGroup.deadline))];
+          if (isApp && !isPlainEdit) assert.equal(appDeadlines.length, ordinaryRefresh ? 0 : 2, "Count actual first-wire question groups, never planned or dummy rows");
+          const deadline = row?.action.completionGroup?.deadline.expiresAt, originalAppDeadlines = appDeadlines.map(value => value.expiresAt);
+          const editDeadlines = [...new Set(editRows.map(value => value.action.completionGroup.deadline))], originalEditDeadlines = editDeadlines.map(value => value.expiresAt);
+          if (!ordinaryRefresh) assert.ok(deadline > Date.now() + 23 * 60 * 60 * 1000);
+          const successor = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "SDK successor",
+            confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal }); assert.ok(successor.ok, JSON.stringify(successor));
+          phase("sdk-successor-returned");
+          if (!ordinaryRefresh && (carrier === "complete" || carrier === "app" || carrier === "app-mixed" || feedbackFlow || refreshFlow || carrier === "edit-complete" || carrier === "markup-complete")) assert.ok(row.action.completionGroup.deadline.expiresAt <= Date.now() + 3600000, "Complete original native publication joins the SDK tail: " + JSON.stringify({ failures, events, deadline, actual: row.action.completionGroup.deadline.expiresAt }));
+          else if (!ordinaryRefresh) assert.equal(row.action.completionGroup.deadline.expiresAt, deadline, "Legacy/foreign/ACK-time successor cannot mint membership or a new birth");
+          if (!ordinaryRefresh && (carrier === "app" || carrier === "app-mixed" || feedbackFlow || refreshFlow)) {
+            assert.ok(appDeadlines.every(value => value.expiresAt <= Date.now() + 3600000), "Whole native app cohort joins one SDK cutoff");
+            assert.equal(new Set(appDeadlines.map(value => value.expiresAt)).size, 1, "No last-question-wins or partial app cohort");
+          }
+          else if (isApp && !isPlainEdit) assert.deepEqual(appDeadlines.map(value => value.expiresAt), originalAppDeadlines, "No partial/new app cohort or ACK-time SDK owner");
+          if (isPlainEdit) {
+            assert.equal(editDeadlines.length, 2);
+            if (carrier === "edit-complete" || carrier === "markup-complete") {
+              assert.equal(new Set(editDeadlines.map(value => value.expiresAt)).size, 1, "Both fresh groups share one SDK cutoff");
+              assert.ok(editDeadlines.every(value => value.expiresAt <= Date.now() + 3600000));
+            } else assert.deepEqual(editDeadlines.map(value => value.expiresAt), originalEditDeadlines, "Native parent/carrier/SDK loss cannot manufacture a partial or fresh cohort");
+          }
+          const selected = feedbackFlow || refreshFlow ? true : stores[1].store.resolve(row.key, { id: "original-answer", from: { id: 77, is_bot: false }, data: row.key,
+            message: { message_id: originalMessageId, message_thread_id: 44, chat: { id: 77, type: "private" } } });
+          if (carrier === "app-loss" || carrier === "app-mixed-loss" || carrier === "markup-unchanged") assert.equal(selected, undefined, "Lost app ownership or an unpublished rejected edit cannot supply a selection");
+          else assert.ok(selected, "Independent selections remain useful under their original deadline: " + JSON.stringify({ failures, events }));
+          if (carrier === "app" || carrier === "app-mixed") {
+            const state = await follower.tools.get("telegram_bind").execute("native-read-only", { app: "remote", method: "inspect", display: false });
+            assert.equal(state.details.output, "Count=0", "An app question answers as selection data, not a method execution");
+            await follower.tools.get("telegram_bind").execute("native-owner-change", { app: "remote", method: "increment", display: false });
+            const peer = appRows.find(value => value.action.completionGroup !== row.action.completionGroup); assert.ok(peer);
+            assert.equal(stores[1].store.resolve(peer.key), undefined, "Native committed app change retires the independently owned peer selection");
+            if (mixedApp) assert.equal(stores[1].store.resolve(methodRows[0].key), undefined, "The same committed app change revokes the old bound control");
+          }
+          if (refreshFlow) {
+            assert.equal(liveRuntimes.length, 2); assert.equal(liveTimers.size, 1);
+            refreshParentBinding = ordinaryRefresh ? methodRows[0].action.binding : appRows[0].binding;
+            originalAppOwner = nativeApps.captureGenerativeAppCallbackOwner(refreshParentBinding); assert.ok(originalAppOwner);
+            if (ordinaryRefresh) {
+              assert.equal(JSON.stringify(agentNativeBody).includes("telegram_confirm"), false);
+              assert.equal(agentNativeBody.reply_markup.inline_keyboard.flat().filter(value => value.callback_data).length, 1);
+              if (!carrier.endsWith("legacy")) { assert.equal(ordinaryParentAck.chat.id, 77); assert.equal(ordinaryParentAck.message_thread_id, 44); assert.equal(ordinaryParentAck.from.id, 123); assert.equal(ordinaryParentAck.from.is_bot, true); }
+              else assert.deepEqual(ordinaryParentAck, { message_id: originalMessageId });
+            }
+            const start = stores[1].rows.length, scheduled = [...liveTimers.values()][0]; assert.equal(scheduled.delayMs, 60000);
+            assert.ok(refreshHandle); assert.equal(refreshPlans, 0); assert.equal(refreshEdits, 0); assert.equal(refreshSourceCaptures, 0);
+            await assert.rejects(readFile(refreshCountFile, "utf8"), { code: "ENOENT" });
+            if (carrier.endsWith("question-origin")) otherBinding = nativeApps.getGenerativeAppCallbackBinding(await nativeApps.invokeGenerativeApp({ agentDir: dir, app: "remote", method: "inspect" }));
+            if (carrier.endsWith("no-source")) { spendRefreshParent(); await stores[1].store.waitForPublicationIdle(); }
+            if (carrier.endsWith("worker")) holdWorker = true;
+            scheduled.callback();
+            assert.equal(refreshCaptureError, undefined, "Provider failures are compatible, but native fixture assertions must not be swallowed by that fallback");
+            if (ordinaryRefresh && !carrier.endsWith("legacy") && !carrier.endsWith("no-source")) assert.ok(refreshSource, "The genuine pre-worker first-wire source must be observed outside the fallible provider");
+            assert.equal(refreshSourceCaptures, 1, "Production captures before the scheduled refresh's first await, provider/clock callback or worker");
+            if (carrier.endsWith("worker")) {
+              await nativeExit.promise; await workerExit.promise;
+              assert.equal(refreshPlans, 0); assert.equal(refreshEdits, 0, "Actual worker exit cannot substitute for the original termination-call ACK");
+              workerRelease.resolve();
+            }
+            await refreshEntered.promise;
+            assert.equal(refreshHasOriginalAppSource, true, "The actual refresh result retains its captured original app predecessor, not SDK or physical-parent authority");
+            assert.equal(refreshPlans, 1); assert.equal(refreshEdits, 1); assert.equal(refreshBody.message_id, originalMessageId);
+            assert.equal(refreshResultOwner.originalPublicationSource, refreshSource, "The exact original source stays main-side while native edit I/O is pending");
+            assert.equal(await readFile(refreshCountFile, "utf8"), "1", "The genuine trusted refresh worker ran exactly once");
+            if (carrier.endsWith("sdk-loss")) {
+              Delivery.clearTelegramDeliveryRuntime(); await lifecycles[1].onSessionStart(); assert.ok(Delivery.captureTelegramQuestionLifetimeOwner());
+              if (ordinaryRefresh) assert.throws(stores[1].sdkBirths[0].assertCurrent, "A replacement native namespace cannot revive the original ordinary birth");
+            }
+            if (carrier.endsWith("app-loss")) await follower.tools.get("telegram_bind").execute("pending-refresh-owner-change", { app: "remote", method: "increment", display: false });
+            if (carrier.endsWith("parent-io")) spendRefreshParent();
+            refreshRelease.resolve(); await refreshFinished.promise; await stores[1].store.waitForPublicationIdle(); await new Promise(resolve => setImmediate(resolve));
+            assert.ok(refreshOutcome); if (refreshUsable) assert.equal(refreshOutcome.ok, true, JSON.stringify({ refreshOutcome, failures, events }));
+            assert.equal(typeof refreshBody.text, "string"); assert.equal(refreshBody.rich_message, undefined, "The actual managed-view carrier is measured, not inferred from the assistant rendering preference");
+            if (carrier === "app-mixed-refresh" || ordinaryRefresh && !carrier.endsWith("sdk-loss") && !carrier.endsWith("ordinary-child-missing")) {
+              assert.equal(refreshNativeAck.message_id, originalMessageId); assert.equal(refreshNativeAck.chat.id, 77);
+              assert.equal(refreshNativeAck.message_thread_id, carrier.endsWith("thread") ? 45 : 44); assert.equal(refreshNativeAck.from.id, carrier.endsWith("bot") ? 456 : 123); assert.equal(refreshNativeAck.from.is_bot, true);
+            }
+            assert.equal(liveTimers.size, 0, "An omitted refresh hint closes the genuine live surface, without another worker");
+            if (ordinaryRefresh && carrier.endsWith("field")) assert.doesNotThrow(refreshSource.assertCurrent, "Current SDK birth scope alone still cannot certify ordinary physical ancestry");
+            else if (refreshSource) assert.throws(refreshSource.assertCurrent, "The original snapshot cannot certify its own edited successor, restored namespace or lost parent");
+            assert.equal(refreshSourceCaptures, 1, "Planning, native I/O and settlement cannot recapture a missing or lost source");
+            assert.equal(refreshResultOwner.originalPublicationSource, refreshSource, "Settlement cannot swap the original native result association");
+            const refreshed = stores[1].rows.slice(start).filter(value => value.action.completionGroup), deadlines = [...new Set(refreshed.map(value => value.action.completionGroup.deadline))];
+            assert.equal(deadlines.length, 2);
+            assert.ok(refreshed.every(value => value.binding === (carrier.endsWith("question-origin") && value.action.prompt.includes('"question":"Refreshed question two"') ? otherBinding : refreshBinding)));
+            const saved = deadlines.map(value => value.expiresAt); assert.ok(saved.every(value => value > Date.now() + 23 * 60 * 60 * 1000));
+            const next = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "After native timed refresh", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal }); assert.ok(next.ok);
+            if (refreshQualified) {
+              const cutoff = deadlines[0].expiresAt; assert.ok(cutoff <= Date.now() + 3600000 && cutoff > Date.now() + 3590000);
+              assert.ok(deadlines.every(value => value.expiresAt === cutoff));
+              assert.ok(deadlines.every((value, index) => value.expiresAt < saved[index]), "Only the authenticated original store source and one native ACK join the whole fresh cohort");
+            } else assert.deepEqual(deadlines.map(value => value.expiresAt), saved, "Missing/forged/lost source or an incomplete/foreign carrier cannot qualify even a prefix");
+            // Keep the complete original question roster for the later-descendant refusal witness.
+            const answer = carrier.endsWith("ordinary-later") ? undefined : stores[1].store.resolve(refreshed[0].key, { id: "refreshed-independent-answer", from: { id: 77, is_bot: false }, data: refreshed[0].key,
+              message: { message_id: originalMessageId, message_thread_id: 44, chat: { id: 77, type: "private" } } });
+            if (refreshUsable && !carrier.endsWith("ordinary-later")) { assert.ok(answer, JSON.stringify({ failures, events, refreshOutcome })); assert.equal(answer.binding, undefined); assert.equal(JSON.parse(answer.prompt).question, "Refreshed question one"); }
+            else if (carrier.endsWith("app-loss")) assert.equal(answer, undefined);
+            await stores[1].store.waitForPublicationIdle();
+            if (refreshUsable && !carrier.endsWith("pure")) {
+              const method = stores[1].rows.slice(start).find(value => !value.action.completionGroup); assert.ok(method);
+              const callbackStart = stores[1].rows.length;
+              callbackIngress.resolve([{ update_id: 101, callback_query: { id: "remote-feedback", from: { id: 77, is_bot: false }, data: method.key,
+                message: { message_id: originalMessageId, message_thread_id: 44, chat: { id: 77, type: "private" } } } }]);
+              assert.equal(await callbackDone.promise, "Done", JSON.stringify({ failures, events }));
+              assert.deepEqual(refreshedCallbackBindings, [refreshBinding]); assert.equal(executionCaptures, 1, "The independent bound control still captures one original execution");
+              if (carrier.endsWith("ordinary-later")) {
+                assert.equal(callbackResults, 1, "The actual later read-only callback really edits the original physical message through a complete native ACK");
+                const later = [...new Set(stores[1].rows.slice(callbackStart).filter(value => value.action.completionGroup).map(value => value.action.completionGroup.deadline))];
+                assert.equal(later.length, 2); const independent = later.map(deadline => deadline.expiresAt);
+                assert.ok(independent.every(value => value > Date.now() + 23 * 3600000));
+                assert.ok((await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "After later native callback", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal })).ok);
+                assert.deepEqual(later.map(deadline => deadline.expiresAt), independent, "A real later invocation cannot rebase first-physical SDK ancestry to the refresh child's birth");
+              }
+            } else { assert.equal(refreshedCallbackBindings.length, 0); assert.equal(executionCaptures, 0); }
+            assert.equal(refreshPlans, 1); assert.equal(await readFile(refreshCountFile, "utf8"), "1"); assert.equal(modelDispatches, 1);
+          }
+          if (feedbackFlow) {
+            if (retainedFlow) {
+              retainedGroup = appRows[0].action.completionGroup;
+              retainedDeadline = retainedGroup.deadline.expiresAt;
+              const originalKeys = new Set(appRows.filter(value => value.action.completionGroup === retainedGroup).map(value => value.key));
+              retainedCells = agentNativeBody.reply_markup.inline_keyboard.flat().filter(button => originalKeys.has(button.callback_data)); assert.equal(retainedCells.length, 2);
+              const proposed = carrier.endsWith("partial") ? retainedCells.slice(0, 1) : carrier.endsWith("two") ? agentNativeBody.reply_markup.inline_keyboard.flat().filter(button => appRows.some(value => value.key === button.callback_data)) : retainedCells;
+              // Labeled main-side producer input: the trusted worker explicitly re-emits this existing native Rich group.
+              // This is not a standalone retention/discovery API or permission to copy foreign callback keys.
+              await writeFile(retainedInput, '<tg-button-row>' + proposed.map(button => '<tg-button type="callback_data" data="' + button.callback_data + '">' + button.text + '</tg-button>').join('') + '</tg-button-row>');
+            }
+            if (childFlow && (carrier.endsWith("other-origin") || carrier.endsWith("mixed-origin"))) {
+              const unrelated = await nativeApps.bindGenerativeApp({ agentDir: dir, app: "remote", method: "view", onOwnerObserved: stores[1].store.observeAppOwner });
+              alternativeChildBinding = nativeApps.getGenerativeAppCallbackBinding(unrelated); assert.ok(alternativeChildBinding); alternativeChildBinding.assertCurrent();
+            }
+            const start = stores[1].rows.length; holdWorker = true; feedbackArmed = true;
+            if (deferredFlow) { originalSdkOwner = Delivery.captureTelegramQuestionLifetimeOwner(); assert.ok(originalSdkOwner); }
+            callbackIngress.resolve([{ update_id: 101, callback_query: { id: "remote-feedback", from: { id: 77, is_bot: false }, data: methodRows[0].key,
+              message: { message_id: originalMessageId, message_thread_id: 44, chat: { id: 77, type: "private" }, reply_markup: agentNativeBody.reply_markup } } }]);
+            await Promise.race([nativeExit.promise, callbackDone.promise.then(status => { assert.fail("Callback ended before actual worker exit: " + status + JSON.stringify({ failures, events })); })]);
+            await workerExit.promise; phase("worker-exit-observed");
+            await feedbackEntered.promise; phase("feedback-entered");
+            assert.ok(invocation); assert.equal(executionCaptures, 1); assert.equal(callbackPlans, 0); assert.equal(callbackResults, 0);
+            if (queueFlow) {
+              workerRelease.resolve();
+              await Promise.race([childPrepared.promise, callbackDone.promise.then(status => { assert.fail("Callback ended before its child attempted the original native feedback queue: " + status); })]);
+              assert.equal(callbackPlans, 1); assert.equal(callbackResults, 0, "Original-parent child I/O cannot overtake pending native feedback");
+              if (!deferredFlow && carrier.endsWith("sdk-loss")) { Delivery.clearTelegramDeliveryRuntime(); await lifecycles[1].onSessionStart(); assert.ok(Delivery.captureTelegramQuestionLifetimeOwner()); }
+              if (!deferredFlow && carrier.endsWith("app-loss")) await follower.tools.get("telegram_bind").execute("pending-queue-app-change", { app: "remote", method: "increment", display: false });
+              if (carrier.endsWith("parent-loss")) assert.ok(stores[1].store.resolve(appRows[0].key));
+              if (!deferredFlow && carrier.endsWith("admission")) {
+                const pending = stores[1].rows.slice(start).filter(value => value.action.completionGroup).map(value => value.action.completionGroup.deadline.expiresAt);
+                const intervening = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "While feedback is pending", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal }); assert.ok(intervening.ok);
+                assert.deepEqual(stores[1].rows.slice(start).filter(value => value.action.completionGroup).map(value => value.action.completionGroup.deadline.expiresAt), pending, "Queued, unacknowledged children are not pending heads or tails");
+              }
+            }
+            if (carrier === "app-mixed-feedback-rebound") { Delivery.clearTelegramDeliveryRuntime(); await lifecycles[1].onSessionStart(); assert.ok(Delivery.captureTelegramQuestionLifetimeOwner()); }
+            feedbackRelease.resolve(); phase("feedback-release-issued");
+            if (deferredFlow) { await editorEntered.promise; phase("editor-entered"); }
+            else if (queueFlow && carrier.endsWith("parent-consumed")) await childEntered.promise;
+            else await stores[1].store.waitForPublicationIdle();
+            const observed = callbackObservations.find(value => !value.child); assert.ok(observed); assert.equal(observed.succeeded, carrier !== "app-mixed-feedback-rebound" && !(queueFlow && !deferredFlow && (carrier.endsWith("sdk-loss") || carrier.endsWith("app-loss") || carrier.endsWith("parent-loss") || carrier.endsWith("other-origin") || retainedFlow && (carrier.endsWith("partial") || carrier.endsWith("two")))));
+            assert.equal(observed.method, agentNativeBody.rich_message ? "editMessageText" : "editMessageReplyMarkup", "Feedback follows the actual first carrier, never just the rendering setting");
+            assert.equal(observed.result, observed.succeeded && observed.method === "editMessageText" ? "edited" : undefined);
+            if (observed.succeeded) assert.equal(observed.raw.message_id, originalMessageId); else assert.equal(observed.raw, undefined);
+            assert.equal(callbackPlans, queueFlow ? 1 : 0, "Only the original termination-call ACK authorizes planning; feedback ACK alone cannot substitute");
+            workerRelease.resolve();
+            if (childFlow && (carrier.endsWith("rebound") || carrier.endsWith("owner-loss") || carrier.endsWith("parent-consumed"))) {
+              await Promise.race([childEntered.promise, callbackDone.promise.then(status => { assert.fail("Child ended before native I/O: " + status); })]);
+              assert.equal(callbackPlans, 1); assert.equal(callbackResults, 1);
+              if (carrier.endsWith("rebound")) { Delivery.clearTelegramDeliveryRuntime(); await lifecycles[1].onSessionStart(); assert.ok(Delivery.captureTelegramQuestionLifetimeOwner()); }
+              if (carrier.endsWith("owner-loss")) await follower.tools.get("telegram_bind").execute("pending-child-owner-change", { app: "remote", method: "increment", display: false });
+              if (carrier.endsWith("parent-consumed")) assert.ok(stores[1].store.resolve(appRows[0].key), "A captured original parent is consumed while the child edit is pending");
+              childRelease.resolve();
+            }
+            const status = await callbackDone.promise; phase("callback-toast-observed");
+            const valid = carrier === "app-mixed-feedback" || childFlow;
+            if (queueFlow) assert.ok(["Done", "Generative App action failed"].includes(status), JSON.stringify({ failures, events, callbackObservations }));
+            else assert.equal(status, valid ? "Done" : "Generative App action failed", JSON.stringify({ failures, events, callbackObservations }));
+            assert.equal(modelDispatches, 1, "The authenticated native callback bypasses model prompt admission");
+            assert.equal(executionCaptures, 1, "Feedback refusal or rendering fallback cannot recapture or replay the original invocation");
+            assert.equal(callbackPlans, valid ? 1 : 0);
+            if (!queueFlow) assert.equal(callbackResults, valid ? 1 : 0);
+            else if (deferredFlow || carrier.endsWith("retained") || ["app-mixed-feedback-child-queued", "app-mixed-feedback-child-pure-queued"].includes(carrier)) { assert.equal(status, "Done"); assert.equal(callbackResults, 1); assert.equal(callbackNewSends, 0, "A valid queued child edits the original parent without fallback, even while an editor ACK is held"); }
+            if (deferredFlow) {
+              const pending = [...new Set(stores[1].rows.slice(start).filter(value => value.action.completionGroup).map(value => value.action.completionGroup.deadline))];
+              assert.equal(pending.length, 2);
+              if (carrier.endsWith("earlier")) pending[0].shorten(Date.now() + 600000);
+              deferredOriginal = pending.map(value => value.expiresAt);
+              if (!carrier.endsWith("editor")) {
+                wantAdmissionClock = true; admissionController = new AbortController();
+                const later = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "After child ACK before original editor ACK", confirmLabel: "Yes", cancelLabel: "No", signal: admissionController.signal });
+                wantAdmissionClock = false; assert.equal(later.ok, !carrier.endsWith("cancelled")); assert.equal(typeof admissionCutoff, "number");
+                phase("conditional-admission-returned");
+                assert.deepEqual(pending.map(value => value.expiresAt), deferredOriginal, "An authentic admission records only a conditional ceiling, never a pending head or tail");
+                if (carrier.endsWith("second")) assert.ok((await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "Second pending admission", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal })).ok);
+                if (carrier.endsWith("sdk-loss")) { Delivery.clearTelegramDeliveryRuntime(); await lifecycles[1].onSessionStart(); assert.ok(Delivery.captureTelegramQuestionLifetimeOwner()); }
+                if (carrier.endsWith("app-loss")) await follower.tools.get("telegram_bind").execute("deferred-child-app-change", { app: "remote", method: "increment", display: false });
+                if (carrier.endsWith("child-consumed")) assert.ok(stores[1].store.resolve(stores[1].rows.slice(start).find(value => value.action.completionGroup).key), "An original child selection can end while editor acknowledgement remains pending");
+                await new Promise(resolve => setTimeout(resolve, 40));
+                assert.deepEqual(pending.map(value => value.expiresAt), deferredOriginal, "Neither a second event nor source changes can expose provisional child facts");
+              }
+              editorRelease.resolve(); await stores[1].store.waitForPublicationIdle(); phase("editor-queue-returned");
+              if (carrier.endsWith("admission") || carrier.endsWith("cancelled") || carrier.endsWith("earlier")) assert.deepEqual(pending.map(value => value.expiresAt), deferredOriginal.map(value => Math.min(value, admissionCutoff)), "The original authenticated admission time, not editor settlement, fixes both ceilings");
+            }
+            if (valid) {
+              const children = stores[1].rows.slice(start).filter(value => value.action.completionGroup), deadlines = [...new Set(children.map(value => value.action.completionGroup.deadline))];
+              assert.equal(deadlines.length, 2);
+              if (pureChild) assert.equal(stores[1].rows.slice(start).filter(value => !value.action.completionGroup).length, 0, "Pure question output never registers a dummy ordinary control");
+              const original = deferredOriginal ?? deadlines.map(value => value.expiresAt);
+              assert.ok(original.every(value => value > Date.now() + (carrier.endsWith("earlier") ? 0 : 23 * 60 * 60 * 1000)));
+              const next = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "After remote callback", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal });
+              assert.ok(next.ok);
+              if (deferredFlow && (carrier.endsWith("admission") || carrier.endsWith("cancelled") || carrier.endsWith("earlier"))) assert.deepEqual(deadlines.map(value => value.expiresAt), deferredOriginal.map(value => Math.min(value, admissionCutoff)), "A later SDK input cannot renew the captured conditional ceiling");
+              else if (childFlow && !carrier.endsWith("child-second") && !(deferredFlow && carrier.endsWith("editor")) && carrier !== "app-mixed-feedback-child-pure" && carrier !== "app-mixed-feedback-child-queued" && carrier !== "app-mixed-feedback-child-pure-queued" && !carrier.endsWith("retained")) assert.deepEqual(deadlines.map(value => value.expiresAt), original, "An incomplete carrier, changed source/parent/SDK or unrelated native result cannot qualify a child prefix");
+              else {
+                assert.ok(deadlines.every(value => value.expiresAt <= Date.now() + 3600000), "Complete original read-only callback child joins its SDK tail: " + JSON.stringify({ failures, events, callbackObservations }));
+                assert.equal(new Set(deadlines.map(value => value.expiresAt)).size, 1, "Both edited child groups join one cohort, never a qualifying prefix");
+              }
+              if (retainedFlow) {
+                assert.equal(retainedGroup.deadline.expiresAt, retainedDeadline, "Original retained deadline is neither reborn, promoted nor renewed");
+                assert.ok(children.every(value => value.action.completionGroup !== retainedGroup), "A retained native group is never registered again as a fresh group");
+                if (!rich) {
+                  assert.equal(typeof retainedNativeBody.text, "string"); assert.equal(retainedNativeBody.rich_message, undefined);
+                  assert.ok(retainedCells.every(button => retainedWorkerOutput.includes(button.callback_data)), "Both original callbacks arrive from the genuine drained worker result, not a main-side replacement");
+                  const visible = retainedNativeBody.reply_markup.inline_keyboard.flat().map(button => button.callback_data);
+                  assert.ok(retainedCells.every(button => !visible.includes(button.callback_data)), "Native Text does not acquire the worker's raw Rich callback rows as keyboard controls");
+                  assert.equal(stores[1].store.resolve(retainedCells[0].callback_data, { id: "remote-text-original-after-drain", data: retainedCells[0].callback_data,
+                    message: { message_id: originalMessageId, message_thread_id: 44, chat: { id: 77 } } }), undefined, "The original group is superseded, not retained or reborn from raw text");
+                  assert.ok(stores[1].store.resolve(children[0].key), "Fresh native Text questions remain answerable under their own proved parent transition");
+                  await stores[1].store.waitForPublicationIdle();
+                }
+                if (rich && (carrier.endsWith("retained") || carrier.endsWith("admission"))) {
+                  const original = appRows.find(value => value.key === retainedCells[0].callback_data); assert.ok(original);
+                  const selection = stores[1].store.resolve(original.key, { id: "retained-native-answer", from: { id: 77, is_bot: false }, data: original.key,
+                    message: { message_id: originalMessageId, message_thread_id: 44, chat: { id: 77, type: "private" } } });
+                  assert.ok(selection); assert.equal(selection.binding, undefined); assert.equal(selection.promptKind, "selection");
+                  assert.equal(selection.selection, original.action.selection); assert.equal(selection.prompt, original.action.prompt);
+                  assert.deepEqual(new Set(selection.completedCallbacks), new Set(retainedCells.map(value => value.callback_data)), "Resolution spends the same original native group, not a reconstructed question");
+                  assert.equal(JSON.parse(selection.prompt).question, "Remote coordinated question app"); assert.equal(retainedGroup.deadline.expiresAt, retainedDeadline);
+                  await stores[1].store.waitForPublicationIdle();
+                  assert.ok(stores[1].store.resolve(children[0].key), "Fresh controls retain their original physical publisher after the retained question ends");
+                  await stores[1].store.waitForPublicationIdle();
+                  assert.equal(retainedGroup.deadline.expiresAt, retainedDeadline);
+                  assert.equal(executionCaptures, 1); assert.equal(modelDispatches, 1, "Selecting the retained question is not another native method invocation");
+                }
+              }
+              if (carrier.endsWith("child-second")) {
+                const beforeSecond = stores[1].rows.length, method = stores[1].rows.slice(start).find(value => !value.action.completionGroup); assert.ok(method);
+                secondCallbackIngress.resolve([{ update_id: 102, callback_query: { id: "remote-feedback-2", from: { id: 77, is_bot: false }, data: method.key,
+                  message: { message_id: originalMessageId, message_thread_id: 44, chat: { id: 77, type: "private" } } } }]);
+                assert.equal(await secondCallbackDone.promise, "Done", JSON.stringify({ failures, events })); assert.equal(callbackPlans, 2); assert.equal(executionCaptures, 2); assert.equal(modelDispatches, 1);
+                const second = stores[1].rows.slice(beforeSecond).filter(value => value.action.completionGroup), secondDeadlines = [...new Set(second.map(value => value.action.completionGroup.deadline))];
+                assert.equal(secondDeadlines.length, 2); const saved = secondDeadlines.map(value => value.expiresAt);
+                const after = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "After second callback", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal }); assert.ok(after.ok);
+                assert.deepEqual(secondDeadlines.map(value => value.expiresAt), saved, "A second feedback/invocation cannot renew the first physical ancestry through its immediate parent");
+              }
+            }
+          }
+        }
+        phase("checks-complete");
+        console.log("two-production-roots-native-carrier-checked");
+      }
+    } finally {
+      ingress.resolve([]); callbackIngress.resolve([]); secondCallbackIngress.resolve([]); feedbackRelease.resolve(); workerRelease.resolve(); childRelease.resolve(); editorRelease.resolve(); refreshRelease.resolve(); agentRelease.resolve(); editRelease.resolve();
+      Worker.prototype.terminate = terminate;
+      if (followerStarted) { phase("follower-shutdown-entered"); await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, followerCtx); phase("follower-shutdown-returned"); }
+      if (leaderStarted) { phase("leader-shutdown-entered"); await leader.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, leaderCtx); phase("leader-shutdown-returned"); }
+      phase("cleanup-entered");
+      Delivery.clearTelegramDeliveryRuntime(); clearInterval(keepAlive); mock.restoreAll(); await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      if (birthAuthority) assert.throws(birthAuthority, "Shutdown ends the original birth, not merely its future calls");
+      if (registrationAuthority) assert.throws(registrationAuthority);
+      phase("cleanup-returned");
+      // A public resource-type census is evidence only; it neither closes descendants nor certifies settlement.
+      const counts = Object.fromEntries(["FSReqCallback", "FSReqPromise", "FileHandleCloseReq", "PipeWrap", "TCPServerWrap", "TCPSocketWrap", "Timeout", "MessagePort", "other"].map(key => [key, 0]));
+      for (const type of resources()) counts[Object.hasOwn(counts, type) ? type : "other"]++;
+      console.log("follower-carrier-resources:" + JSON.stringify({ pid: process.pid, elapsedMs: Math.round(now() - started), counts }));
+    }
+  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 20000,
+    readiness: { stdoutPrefix: "follower-carrier-phase:import-complete:", startupTimeoutMs: 20000 } });
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 0, result.stdout + result.stderr); assert.match(result.stdout, /two-production-roots-native-carrier-checked/u);
+  const phases = [...result.stdout.matchAll(/^follower-carrier-phase:([^:\r\n]+):elapsedMs=(\d+):pid=(\d+)$/gmu)];
+  const required = ["import-start", "fixture-ready", "outbound-import-entered", "outbound-import-returned", "root-import-entered", "import-complete",
+    "leader-connect-entered", "leader-connect-returned", "follower-connect-entered", "follower-connect-settled", "registration-checked", "checks-complete",
+    "follower-shutdown-entered", "follower-shutdown-returned", "leader-shutdown-entered", "leader-shutdown-returned", "cleanup-entered", "cleanup-returned"];
+  assert.deepEqual(phases.map(row => row[1]!).filter(name => required.includes(name)), required, "Original follower fixture phases must cover checks and actual cleanup in order");
+  const optional = ["bootstrap-refusal-checked", "first-sdk-checked", "agent-started", "first-carrier-returned", "sdk-successor-returned", "worker-exit-observed",
+    "feedback-entered", "feedback-release-issued", "editor-entered", "callback-toast-observed", "conditional-admission-returned", "editor-queue-returned"];
+  assert.ok(phases.every(row => required.includes(row[1]!) || optional.includes(row[1]!)), "Only finite body-free follower fixture phases may be emitted");
+  assert.equal(new Set(phases.map(row => row[1])).size, phases.length);
+  assert.equal(new Set(phases.map(row => row[3])).size, 1);
+  assert.ok(phases.every((row, index) => Number(row[3]) > 0 && (index === 0 || Number(row[2]) >= Number(phases[index - 1]![2]))));
+  const snapshots = [...result.stdout.matchAll(/^follower-carrier-resources:([^\r\n]+)$/gmu)]; assert.equal(snapshots.length, 1);
+  const snapshot = JSON.parse(snapshots[0]![1]!); assert.deepEqual(Object.keys(snapshot), ["pid", "elapsedMs", "counts"]); assert.equal(String(snapshot.pid), phases[0]![3]);
+  assert.ok(Number.isSafeInteger(snapshot.elapsedMs) && snapshot.elapsedMs >= Number(phases.at(-1)![2]));
+  assert.deepEqual(Object.keys(snapshot.counts), ["FSReqCallback", "FSReqPromise", "FileHandleCloseReq", "PipeWrap", "TCPServerWrap", "TCPSocketWrap", "Timeout", "MessagePort", "other"]);
+  assert.ok(Object.values(snapshot.counts).every(value => Number.isSafeInteger(value) && Number(value) >= 0));
+  assert.ok(phases.length + snapshots.length <= 40 && Buffer.byteLength([...phases, ...snapshots].map(row => row[0]).join("\n") + "\n") <= 6144, "Follower fixture evidence must remain finite and body-free");
+}, 45000);
+
+for (const source of [true, false]) for (const [artifact, rich, badAck] of [[false, false, false], [false, true, false], [true, false, false], [true, true, false], [true, false, true], [true, true, true]] as const)
+test(`Production follower question root keeps physical ACK and Artifact incarnation outside SDK membership (${source ? "source" : "compiled"}/artifact=${artifact}/rich=${rich}/badAck=${badAck})`, async () => {
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { mkdtemp, realpath, writeFile, rm } from "node:fs/promises";
+    import { join } from "node:path";
+    import { tmpdir } from "node:os";
+    import { spawn } from "node:child_process";
+    import { mock } from "node:test";
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const base = ${JSON.stringify(source ? "./lib/" : "./dist/lib/")}, suffix = ${JSON.stringify(source ? ".ts" : ".js")};
+    const artifact = ${artifact}, rich = ${rich}, badAck = ${badAck}, captured = {}, rows = [], sent = [], calls = [], failures = [];
+    const dir = await realpath(await mkdtemp(join(tmpdir(), "pt-follower-question-")));
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const keepAlive = setInterval(() => {}, 60000);
+    for (const [module, factory] of [["outbound", "createTelegramButtonActionStore"], ["bus-api", "createTelegramBusAwareApiRuntime"], ["bus-follower", "createTelegramBusFollowerRegistrationState"], ["delivery", "createTelegramBridgeDeliveryLifecycleHooks"]]) {
+      const url = new URL(base + module + suffix, import.meta.url), original = await import(url.href);
+      mock.module(url.href, { namedExports: { ...original, ...(module === "bus-follower" ? {
+        createTelegramBusFollowerClientRuntime(options) {
+          assert.equal(options.capturePublicationRegistration, captured.registration.capturePublicationRegistration);
+          captured.nativeAdmissionWired = true;
+          return original.createTelegramBusFollowerClientRuntime(options);
+        },
+      } : {}), [factory](...args) {
+        if (module === "delivery") {
+          const record = args[0].recordFailure;
+          args[0].recordFailure = (...detail) => { failures.push(detail.map(value => value instanceof Error ? String(value.stack) + " cause: " + String(value.cause?.stack ?? value.cause) : value)); record(...detail); };
+        }
+        const value = original[factory](...args);
+        if (module === "outbound") {
+          captured.store = value;
+          const register = value.register;
+          value.register = (...args) => { const key = register(...args); rows.push({ key, action: args[0] }); return key; };
+        } else if (module === "bus-api") { captured.api = value; captured.caller = args[0].callFollowerApi; }
+        else if (module === "bus-follower") captured.registration = value;
+        return value;
+      } } });
+    }
+    const Bus = await import(base + "bus" + suffix), BusLeader = await import(base + "bus-leader" + suffix);
+    const Paths = await import(base + "paths" + suffix), Ownership = await import(base + "ownership" + suffix);
+    const Api = await import(base + "telegram-api" + suffix), Delivery = await import(base + "delivery" + suffix);
+    const { default: extension } = await import(base + "extension" + suffix);
+    const { pi, handlers, commands, tools } = createRuntimePiHarness();
+    const ctx = createRuntimeExtensionContext({ cwd: dir });
+    const registry = Bus.createTelegramBusFollowerRegistry(), socketPath = Bus.getTelegramBusSocketPath(dir, process.platform, undefined, "consolidated");
+    const target = { chatId: 77, threadId: 43 };
+    const ownership = Ownership.createTelegramBusMessageOwnershipRuntime({ instanceId: "fixture-leader", getProfileKey: () => "default", listFollowers: registry.list });
+    const authorize = Bus.createTelegramFollowerApiCallAuthorizer({ isMessageOwned: ownership.isOwnedByFollower });
+    let messageId = 100, leaderChild, leaderExit, started = false;
+    globalThis.fetch = async (input, init) => {
+      const method = String(input).split("/").at(-1), body = init?.body ? JSON.parse(String(init.body)) : {};
+      const response = result => new Response(JSON.stringify({ ok: true, result }), { status: 200, headers: { "content-type": "application/json" } });
+      if (method === "getMe") return response({ id: 123, is_bot: true, username: "question_bot", has_topics_enabled: true });
+      if (["getUpdates", "createForumTopic", "deleteForumTopic"].includes(method)) assert.fail("A passive follower cannot issue " + method);
+      if (method === "sendMessage" || method === "sendRichMessage") {
+        assert.equal(body.chat_id, 77); assert.equal(body.message_thread_id, 43);
+        const id = ++messageId; sent.push({ id, body: structuredClone(body), method });
+        return response({ message_id: id, chat: { id: 77, type: "private" }, message_thread_id: 43 });
+      }
+      if (["editMessageText", "editMessageReplyMarkup"].includes(method)) return response({ message_id: body.message_id, chat: { id: 77 }, message_thread_id: 43 });
+      return response(true);
+    };
+    const native = Api.createTelegramBridgeApiRuntime({ client: Api.createTelegramApiClient(() => "123:follower-question"),
+      tempDir: dir, maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {} });
+    const proxy = BusLeader.createTelegramBusLeaderApiProxy(native);
+    const protocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "question-peer", capabilities: [
+      Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, Bus.TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+      Bus.TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY, ...(artifact ? [Bus.TELEGRAM_BUS_CAPABILITY_ARTIFACT_DOCUMENT] : [])] });
+    const handleEnvelope = BusLeader.createTelegramBusLeaderEnvelopeHandler({
+      followerRegistry: registry, authSecret: "fixture-secret", protocolIdentity: protocol,
+      provisionFollowerTarget: () => ({ ...target, slot: "A" }), authorizeFollowerApiCall: authorize,
+      recordFollowerMessageOwnership: ownership.recordFollower,
+      async callApi(method, args) { calls.push({ method, args: structuredClone(args) }); return proxy(method, args); },
+    });
+    const server = Bus.createTelegramBusLocalServer({ socketPath, async handleEnvelope(envelope) {
+      const response = await handleEnvelope(envelope);
+      if (badAck && envelope.kind === "follower.callApi" && envelope.method === "call" && ["sendMessage", "sendRichMessage"].includes(envelope.args[0]))
+        return { kind: "bus.ack", requestId: "foreign-request", ok: false,
+          message: "Telegram bus API call is not allowed for this follower.", error: { code: "follower-api-not-allowed", method: envelope.args[0] } };
+      return response;
+    } });
+    const open = async () => {
+      const result = await Delivery.openTelegramConfirm({ owner: "@test/follower-question", scope: { kind: "instance" },
+        question: "Independent SDK", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal });
+      if (!badAck) assert.ok(result.ok, JSON.stringify({ result, calls, sent, failures })); return result;
+    };
+    const agent = async text => {
+      const at = rows.length, published = await tools.get("telegram_message").execute("follower-question", { text: '<!-- telegram_confirm "' + text + '" -->' });
+      const row = rows.slice(at).find(row => row.action.completionGroup); assert.ok(row?.action.completionGroup?.deadline);
+      assert.ok(published.details?.messageId); return { row, messageId: published.details.messageId };
+    };
+    const query = view => ({ id: "independent-answer", from: { id: 77, is_bot: false }, data: view.row.key,
+      message: { message_id: view.messageId, message_thread_id: 43, chat: { id: 77, type: "private" } } });
+    try {
+      await writeFile(join(dir, "telegram.json"), JSON.stringify({ botToken: "123:follower-question", botId: 123, allowedUserId: 77,
+        threads: { automaticCleanup: false }, assistant: { activity: "quiet", rendering: rich ? "rich" : "html" } }), { mode: 0o600 });
+      const leaderSource = [
+        "import * as Locks from " + JSON.stringify(new URL(base + "locks" + suffix, import.meta.url).href) + ";",
+        "import * as Threads from " + JSON.stringify(new URL(base + "threads" + suffix, import.meta.url).href) + ";",
+        "const owner = Locks.createTelegramLockRuntime({ statePath: " + JSON.stringify(Paths.resolveTelegramStatePath(dir)) + ", instanceId: 'fixture-leader', busSocketPath: " + JSON.stringify(socketPath) + ", busSecret: 'fixture-secret' });",
+        "if (!owner.acquire({ cwd: '/fixture-leader' }).ok) throw new Error('Leader fixture acquisition failed');",
+        "const store = Threads.createTelegramTopicTargetStore({ path: " + JSON.stringify(Paths.resolveTelegramStatePath(dir)) + ", consolidated: { captureAuthority: () => owner.owns, publishIfOwned: owner.publishStateSectionIfOwned } });",
+        "await store.load(); store.setBotState({ threadMode: 'enabled' }); await store.persist();",
+        "const timer = setInterval(() => owner.refresh(), 1000); process.on('SIGTERM', () => { clearInterval(timer); owner.release(); process.exit(0); }); console.log('READY');",
+      ].join("\\n");
+      leaderChild = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", leaderSource], { stdio: ["ignore", "pipe", "pipe"] });
+      leaderExit = new Promise(resolve => leaderChild.once("exit", resolve));
+      await new Promise((resolve, reject) => {
+        let output = "", errors = "";
+        const timer = setTimeout(() => reject(new Error("Leader fixture startup: " + errors)), 5000);
+        leaderChild.stdout.on("data", chunk => { output += chunk; if (output.includes("READY")) { clearTimeout(timer); resolve(); } });
+        leaderChild.stderr.on("data", chunk => { errors += chunk; });
+        leaderChild.once("error", error => { clearTimeout(timer); reject(error); });
+        leaderChild.once("exit", code => { clearTimeout(timer); reject(new Error("Leader fixture exited " + code + ": " + errors)); });
+      });
+      await server.start(); extension(pi); started = true;
+      await handlers.get("session_start")({}, ctx); await commands.get("telegram-connect").handler("", ctx);
+      assert.equal(registry.list().length, 1);
+      const first = registry.list()[0], local = captured.registration.capturePublicationRegistration();
+      assert.equal(captured.nativeAdmissionWired, true, "Root supplies the original native registration owner, not a late lookup or policy flag");
+      assert.ok(local?.isCurrent()); assert.equal(!!local.incarnation, artifact);
+      assert.equal(!!captured.registration.captureArtifactRegistration(), artifact, "Actual Artifact incarnation is neither an SDK nor question-publication certificate");
+      assert.equal(captured.caller.captureAuthority(), undefined, "A legacy peer and Artifact incarnation cannot substitute for negotiated ordinary API authority");
+      assert.equal(captured.api.captureQuestionAuthority(), undefined); assert.equal(Delivery.captureTelegramQuestionLifetimeOwner(), undefined);
+      if (badAck) {
+        if (rich) await assert.rejects(agent("Unknown Rich publication"), /sendRichMessage may have committed/u);
+        else { const result = await open(); assert.equal(result.ok, false); assert.equal(result.reason, "commit-unknown", JSON.stringify({ result, failures })); }
+        assert.equal(calls.length, 1); assert.equal(sent.length, 1, "A physical native send with an unrelated rejection ACK cannot be retried as a known pre-HTTP refusal");
+        assert.equal(sent[0].method, rich ? "sendRichMessage" : "sendMessage");
+        console.log("follower-question-physical-ack-remains-independent");
+      } else {
+      assert.ok((await open()).ok);
+      const healthy = await agent("Remote independent question"), held = await agent("Remote original registration");
+      const healthyDeadline = healthy.row.action.completionGroup.deadline.expiresAt, heldDeadline = held.row.action.completionGroup.deadline.expiresAt;
+      assert.ok(heldDeadline - Date.now() > 86_390_000);
+      assert.ok((await open()).ok);
+      assert.equal(healthy.row.action.completionGroup.deadline.expiresAt, healthyDeadline);
+      assert.equal(held.row.action.completionGroup.deadline.expiresAt, heldDeadline, "An actual remote native message ACK cannot demote a follower question without physical provenance");
+      const answer = captured.store.resolve(healthy.row.key, query(healthy));
+      assert.ok(answer); assert.equal(answer.binding, undefined); assert.equal(answer.promptKind, "selection");
+      assert.equal(JSON.parse(answer.prompt).question, "Remote independent question");
+      await captured.store.waitForPublicationIdle();
+      assert.ok(sent.some(view => view.id === healthy.messageId && view.method === (rich ? "sendRichMessage" : "sendMessage")));
+      assert.ok(calls.some(call => call.method === "call" && ["sendMessage", "sendRichMessage"].includes(call.args[0])));
+      await commands.get("telegram-connect").handler("", ctx);
+      const current = registry.list()[0]; assert.deepEqual(current.target, first.target);
+      assert.notEqual(current.registrationGeneration, first.registrationGeneration);
+      assert.equal(local.isCurrent(), false);
+      assert.equal(captured.store.resolve(held.row.key, query(held)), undefined, "A fresh authenticated equal-target registration cannot revive the old original selection");
+      assert.equal(held.row.action.completionGroup.deadline.expiresAt, heldDeadline);
+      assert.equal(captured.api.captureQuestionAuthority(), undefined); assert.equal(Delivery.captureTelegramQuestionLifetimeOwner(), undefined);
+      const fresh = await agent("Fresh independent question"); assert.ok(captured.store.resolve(fresh.row.key, query(fresh)));
+      console.log("follower-question-physical-ack-remains-independent");
+      }
+    } finally {
+      if (started) await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+      await server.stop();
+      if (leaderChild && leaderChild.exitCode === null && leaderChild.signalCode === null) leaderChild.kill("SIGTERM");
+      if (leaderExit) await leaderExit;
+      Delivery.clearTelegramDeliveryRuntime(); clearInterval(keepAlive); mock.restoreAll();
+      await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 20000 });
+  assert.equal(result.code, 0, result.stdout + result.stderr); assert.match(result.stdout, /follower-question-physical-ack-remains-independent/u);
+}, 25000);
+
+test("Source composition root wires Artifact Delivery to actual owned classic native bytes", async () => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture(), { handlers, commands, pi } = createRuntimePiHarness();
+  const dir = await mkdtemp(join(tmpdir(), "pt-root-artifact-")), source = join(dir, "source");
+  await writeFile(source, "root bytes");
+  let uploads = 0;
+  const restoreFetch = setTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "getUpdates") return await new Promise<Response>((_resolve, reject) => { init?.signal?.addEventListener("abort", () => reject(new DOMException("stop", "AbortError"))); });
+    if (method === "sendDocument") {
+      uploads++; const form = init!.body as FormData, file = form.get("document") as File;
+      assert.equal(form.get("chat_id"), "77"); assert.equal(file.name, "result.bin"); assert.equal(await file.text(), "root bytes");
+      return createRuntimeTelegramApiResponse({ message_id: 777 });
+    }
+    if (method === "sendMessage") return createRuntimeTelegramApiResponse({ message_id: 90 });
+    return createRuntimeTelegramApiResponse(true);
+  });
+  const ctx = createRuntimeExtensionContext({ cwd: dir });
+  try {
+    await telegramConfig.write({ botToken: "123:abc", botId: 123, botUsername: "test_bot", allowedUserId: 77, lastUpdateId: 0 });
+    await writeRuntimeTelegramLocks({});
+    const seed = await createRuntimeSeedWorkspaceStore(); seed.threads.setBotState({ threadMode: "disabled", updatedAtMs: Date.now() }); await seed.threads.persist(); await seed.release();
+    (await import("../lib/extension.ts")).default(pi);
+    await handlers.get("session_start")?.({}, ctx); await commands.get("telegram-connect")?.handler("", ctx);
+    const result = await Delivery.sendTelegramArtifact({ owner: "root", scope: { kind: "instance" }, file: { path: source, name: "result.bin" }, timeoutMs: 2000, signal: new AbortController().signal });
+    assert.ok(result.ok, JSON.stringify(result)); assert.equal(result.receipt.messageId, 777); assert.equal(uploads, 1);
+    assert.equal(await readFile(source, "utf8"), "root bytes");
+  } finally {
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+    Delivery.clearTelegramDeliveryRuntime(); restoreFetch(); await telegramConfig.restore(); await rm(dir, { recursive: true, force: true });
+  }
+}, 15000);
+
 test("Public activity delivery reaches the classic instance without blocking agent start", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const { handlers, commands, pi } = createRuntimePiHarness();
@@ -2429,7 +8334,7 @@ test("Public activity delivery reaches the classic instance without blocking age
   const sentBodies: Array<Record<string, unknown>> = [];
   let activityHandledCount = 0;
   let unregisterActivity: (() => void) | undefined;
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook" || method === "setMyCommands") {
@@ -2521,7 +8426,7 @@ test("Verbose activity reaches classic transport before the final assistant answ
     body: Record<string, unknown>;
   }> = [];
   let nextMessageId = 100;
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init) ?? {};
     if (method === "deleteWebhook" || method === "setMyCommands") {
@@ -2830,7 +8735,7 @@ for (const mode of ["thread", "classic", "thread-unavailable"] as const) {
     const threaded = mode !== "classic", target = mode === "thread" ? { chatId: 7, threadId: 42 } : { chatId: 7 };
     let authority: string | undefined = "current", apiCalls = 0, injections = 0;
     const bodies: Array<Record<string, unknown>> = [], failures: unknown[] = [];
-    const restoreFetch = setRuntimeTestFetch(async (_input, init) => { bodies.push(parseJsonRequestBody(init) ?? {}); return createRuntimeTelegramApiResponse(true); });
+    const restoreFetch = setTestFetch(async (_input, init) => { bodies.push(parseJsonRequestBody(init) ?? {}); return createRuntimeTelegramApiResponse(true); });
     const client = createTelegramApiClient(() => "123:fixture", { isThreadedMode: () => threaded });
     const prompt = Runtime.createTelegramPromptDispatchRuntime({
       failureLog: createPassthroughFailureLog(error => failures.push(error)),
@@ -3277,7 +9182,7 @@ for (const profile of [undefined, "work"] as const) for (const boundary of ["rev
     let replacementOwner: ReturnType<typeof Locks.createTelegramLockRuntime> | undefined;
     const resumedCtx = createRuntimeExtensionContext({ cwd: ctx.cwd, modelRegistry, getContextUsage: () => undefined,
       sessionManager: { ...ctx.sessionManager, getSessionFile: () => `/sessions/${ctx.sessionManager.getSessionId()}.jsonl` } });
-    const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const restoreFetch = setTestFetch(async (input, init) => {
       const method = getRuntimeTelegramApiMethod(input); methods.push(method);
       if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: true });
       if (method === "getChat") return createRuntimeTelegramApiResponse({ id: -100123, type: "channel", username: "fixture_channel" });
@@ -3572,7 +9477,157 @@ for (const profile of [undefined, "work"] as const) for (const boundary of ["rev
   });
 }
 
-for (const settlement of ["tool-success", "manual-compaction", "auto-threshold", "auto-overflow"] as const) test(`Real Pi SDK preserves one injection per queued input through a held tool and status (${settlement})`, async () => {
+for (const artifact of ["source", "compiled"] as const)
+for (const profile of [undefined, "work"] as const)
+for (const succession of ["current", "same-context-generation"] as const)
+test(`Production shutdown awaits native button I/O without retiring a successor (${artifact}/${profile ?? "default"}/${succession})`, async () => {
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { mkdtemp, realpath, writeFile, rm } from "node:fs/promises";
+    import { join, dirname } from "node:path";
+    import { tmpdir } from "node:os";
+    import { mock } from "node:test";
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const base = ${JSON.stringify(artifact === "source" ? "./lib/" : "./dist/lib/")}, suffix = ${JSON.stringify(artifact === "source" ? ".ts" : ".js")};
+    const profile = ${JSON.stringify(profile)}, succession = ${JSON.stringify(succession)}, captured = {};
+    const dir = await realpath(await mkdtemp(join(tmpdir(), "pt-awaited-shutdown-")));
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const keepAlive = setInterval(() => {}, 60000), responseGate = Promise.withResolvers(), editorEntered = Promise.withResolvers();
+    let waitEntered = 0, waitReturned = 0, issued = 0, completed = 0, stopped = false, shutdown, shutdownError;
+    for (const [name, factory, key] of [["outbound", "createTelegramButtonActionStore", "buttons"],
+      ["lifecycle", "createTelegramSessionContextStore", "session"], ["queue", "createTelegramQueueStore", "queue"],
+      ["journal", "createTelegramUpdateJournalBindingRuntime", "journal"], ["locks", "createTelegramLockedPollingRuntime", "polling"]]) {
+      const url = new URL(base + name + suffix, import.meta.url), original = await import(url.href);
+      mock.module(url.href, { namedExports: { ...original, [factory](...args) {
+        const value = original[factory](...args); captured[key] = value;
+        if (key === "journal") {
+          const resolve = value.resolveLeader;
+          value.resolveLeader = (...args) => { const binding = resolve(...args); if (binding) captured.originalBinding ??= binding; return binding; };
+        }
+        if (key === "buttons") {
+          const wait = value.waitForPublicationIdle; assert.equal(typeof wait, "function");
+          value.waitForPublicationIdle = async () => { waitEntered++; await wait(); waitReturned++; };
+        }
+        return value;
+      } } });
+    }
+    const Paths = await import(base + "paths" + suffix), Locks = await import(base + "locks" + suffix), Journal = await import(base + "journal" + suffix);
+    const { default: extension } = await import(${JSON.stringify(artifact === "source" ? "./index.ts" : "./dist/index.js")});
+    const dispatches = [], { pi, handlers, commands, tools } = createRuntimePiHarness({ sendUserMessage: content => dispatches.push(content) });
+    const ctx = createRuntimeExtensionContext({ cwd: dir, sessionManager: { getSessionId: () => "awaited-original" }, isIdle: () => false });
+    let pollReply, activePolls = 0, maxPolls = 0, topics = 0, messageId = 100, oldMessageId, freshCallback, freshMessageId;
+    const updates = [], response = result => new Response(JSON.stringify({ ok: true, result }), { status: 200 });
+    const incoming = update => { updates.push(update); if (pollReply) { const reply = pollReply; pollReply = undefined; reply(response(updates.splice(0))); } };
+    globalThis.fetch = async (input, init) => {
+      const method = String(input).split("/").at(-1), body = init?.body && JSON.parse(String(init.body));
+      if (method === "getMe") return response({ id: 123, is_bot: true, has_topics_enabled: true });
+      if (method === "getChat") return response({ id: 77, type: "private" });
+      if (method === "createForumTopic") { topics++; return response({ message_thread_id: 43, name: "Anchor" }); }
+      if (method === "getUpdates") {
+        activePolls++; maxPolls = Math.max(maxPolls, activePolls);
+        try {
+          if (updates.length) return response(updates.splice(0));
+          return await new Promise((resolve, reject) => {
+            pollReply = resolve;
+            const abort = () => { if (pollReply === resolve) pollReply = undefined; reject(new DOMException("stop", "AbortError")); };
+            if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+          });
+        } finally { activePolls--; }
+      }
+      if (method === "sendMessage" || method === "sendRichMessage") {
+        const id = ++messageId;
+        if (JSON.stringify(body).includes("Original shutdown button")) oldMessageId = id;
+        if (JSON.stringify(body).includes("Fresh successor button")) {
+          freshMessageId = id; freshCallback = body.reply_markup?.inline_keyboard.flat().find(cell => cell.callback_data?.startsWith("tgbtn:"))?.callback_data;
+        }
+        return response({ message_id: id, chat: { id: 77, type: "private" }, from: { id: 123, is_bot: true }, message_thread_id: 43 });
+      }
+      if (method?.startsWith("editMessage") && body.message_id === oldMessageId) {
+        issued++; assert.equal(issued, 1, "One original editor invocation, never replayed"); editorEntered.resolve();
+        await responseGate.promise; completed++;
+        return response({ message_id: oldMessageId, chat: { id: 77, type: "private" }, from: { id: 123, is_bot: true }, message_thread_id: 43 });
+      }
+      assert.notEqual(method, "deleteForumTopic", "No cleanup permission follows from a held drain");
+      return response(true);
+    };
+    const entries = () => Locks.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(dir), "journals.transaction"), () => {
+      assert.ok(captured.originalBinding, "Inspection requires a positively observed original Root source");
+      const journalPath = Journal.getTelegramUpdateJournalBindingPath(captured.originalBinding.recoveryKey); assert.ok(journalPath);
+      const family = Journal.inspectTelegramUpdateJournalFamily({ path: journalPath, directory: dirname(journalPath), profile: profile ?? "default",
+        botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "123:awaited-shutdown", botId: 123 }),
+        limits: { maxFiles: 256, maxBytes: 8 * 1024 * 1024, maxEntries: 1000, maxWork: 1000000 } });
+      assert.equal(family.kind, "present"); return family.file.entries;
+    });
+    const until = async (predicate, phase = "unknown") => {
+      const deadline = performance.now() + 4000;
+      while (!predicate()) {
+        if (performance.now() >= deadline) assert.fail("Awaited shutdown phase did not converge: " + phase + "; queue=" + captured.queue.getQueuedItems().length + "; activePolls=" + activePolls + "; entries=" + JSON.stringify(entries().map(row => [row.updateId, row.state, row.failure?.summary])));
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    };
+    const message = id => ({ update_id: id, message: { message_id: id, message_thread_id: 43, chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false }, text: "Accepted shutdown input " + id } });
+    try {
+      await writeFile(join(dir, "telegram.json"), JSON.stringify({ profiles: { [profile ?? "default"]: { botToken: "123:awaited-shutdown", botId: 123, allowedUserId: 77, lastUpdateId: 0 } },
+        threads: { automaticCleanup: false }, assistant: { activity: "quiet", rendering: "html" } }), { mode: 0o600 });
+      extension(pi); await handlers.get("session_start")({}, ctx); await commands.get("telegram-connect").handler(profile ?? "", ctx);
+      await until(() => !!pollReply, "first-poll"); assert.equal(topics, 1);
+      console.log("awaited-teardown-ready " + process.pid);
+      await tools.get("telegram_message").execute("old-publication", { chat_id: 77, thread_id: 43, text: 'Original shutdown button<!-- telegram_button {▶️ Original|original input} -->' });
+      assert.ok(oldMessageId);
+      incoming(message(1)); await until(() => captured.queue.getQueuedItems().length === 1 && entries().some(row => row.updateId === 1 && row.state === "queued"), "original-queued");
+      const original = structuredClone(entries().find(row => row.updateId === 1)), originalItem = captured.queue.getQueuedItems()[0], generation = captured.session.getGeneration();
+      assert.ok(original.queueReceiptId); assert.ok(original.queueOwner);
+      shutdown = Promise.resolve(handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx))
+        .then(() => { stopped = true; }, error => { stopped = true; shutdownError = error; });
+      await editorEntered.promise;
+      assert.equal(waitEntered, 1); assert.equal(waitReturned, 0); assert.equal(completed, 0); assert.equal(stopped, false);
+      assert.deepEqual(entries().find(row => row.updateId === 1), original, "Actual pending teardown retains its original accepted receipt before queue disposition");
+      assert.equal(captured.session.getGeneration(), generation);
+      let successorGeneration;
+      if (succession !== "current") {
+        await handlers.get("session_start")({}, ctx);
+        assert.ok(captured.session.getGeneration() > generation, "The same context and session ID acquired a new generation");
+        assert.equal(captured.session.get(), ctx);
+        await commands.get("telegram-connect").handler(profile ?? "", ctx); await until(() => !!pollReply);
+        assert.deepEqual(entries().find(row => row.updateId === 1), original, "Overlapping start is not permission to forget or replay the original receipt");
+        successorGeneration = captured.session.getGeneration();
+        assert.equal(captured.queue.getQueuedItems().length, 1);
+        assert.equal(captured.queue.getQueuedItems()[0], originalItem, "A newer start cannot replace the retained original object");
+        await tools.get("telegram_message").execute("fresh-publication", { chat_id: 77, thread_id: 43, text: 'Fresh successor button<!-- telegram_button {▶️ Successor|successor input} -->' });
+        assert.ok(freshCallback); assert.equal(waitReturned, 0); assert.equal(stopped, false); assert.equal(completed, 0);
+      }
+      responseGate.resolve(); await shutdown; assert.ifError(shutdownError);
+      assert.equal(issued, 1); assert.equal(completed, 1); assert.equal(waitReturned, 1); assert.equal(maxPolls, 1); assert.equal(topics, 1);
+      assert.deepEqual(dispatches, [], "No accepted input may be injected or replayed by drain settlement");
+      if (succession === "current") {
+        assert.equal(captured.session.get(), undefined); assert.equal(activePolls, 0); assert.equal(entries().length, 0);
+      } else {
+        assert.equal(captured.session.get(), ctx, "Late old shutdown cannot clear the successor session");
+        assert.equal(activePolls, 1);
+        assert.deepEqual(entries().find(row => row.updateId === 1), original, "The retained original receipt is not re-keyed or replayed");
+        assert.equal(captured.session.getGeneration(), successorGeneration);
+        assert.equal(captured.queue.getQueuedItems().length, 1); assert.equal(captured.queue.getQueuedItems()[0], originalItem);
+        const fresh = captured.buttons.resolve(freshCallback, { id: "fresh-after-drain", data: freshCallback,
+          message: { message_id: freshMessageId, message_thread_id: 43, chat: { id: 77, type: "private" } } });
+        assert.equal(fresh?.prompt, "successor input", "The actual successor callback retains its original publication authority");
+        await tools.get("telegram_message").execute("fresh-after-drain", { chat_id: 77, thread_id: 43, text: "Successor transport after old drain" });
+      }
+      console.log("awaited-teardown-passed " + succession);
+    } finally {
+      responseGate.resolve(); if (shutdown) await shutdown.catch(() => {});
+      // The overlapping start retained an old-generation receipt. Fixture cleanup stops transport only; it cannot invent a fresh disposition owner.
+      if (captured.session.get()) await captured.polling.suspend();
+      assert.equal(activePolls, 0);
+      clearInterval(keepAlive); await rm(dir, { recursive: true, force: true });
+    }
+  `, { nodeArgs: ["--experimental-test-module-mocks"], readiness: { stdoutPrefix: "awaited-teardown-ready ", startupTimeoutMs: 10000 }, timeoutMs: 15000 });
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+}, 30000);
+
+for (const settlement of ["tool-success", "manual-compaction", "auto-threshold", "auto-overflow", "public-reload", "public-reload-held", "public-reload-inbound"] as const) test(`Real Pi SDK ${settlement === "public-reload-inbound" ? "reload fences an outstanding inbound source" : settlement === "public-reload-held" ? "reload fences issued SDK publication after logical invalidation" : settlement === "public-reload" ? "reload disposes waiting custody without replay" : "preserves one injection per queued input through a held tool and status"} (${settlement})`, async () => {
+  const reloadCase = settlement.startsWith("public-reload"), heldPublication = settlement === "public-reload-held", heldInbound = settlement === "public-reload-inbound";
   const { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } = await import("@earendil-works/pi-coding-agent");
   const { fauxProvider, fauxAssistantMessage, fauxToolCall, Type } = await import("@earendil-works/pi-ai");
   await ensureRuntimeAgentDir();
@@ -3582,16 +9637,48 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
   const dispatches: string[] = [], errors: string[] = [], updates: unknown[] = [], methods: string[] = [], notices: string[] = [], compactionReasons: string[] = [];
   let pollReply: ((response: Response) => void) | undefined, callback: string | undefined, buttonMessageId = 0;
   let releaseTool = () => {}, toolStarted = false, toolAborts = 0, compactions = 0, messageId = 100;
+  const sdkClock = performance.now.bind(performance), sdkBorn = sdkClock();
+  const sdkPhases: Array<{ phase: string; elapsedMs: number }> = [];
+  let sdkPhasesDropped = 0, unsubscribeSdk = () => {};
+  const sdkPhase = (phase: string) => {
+    if (sdkPhases.length < 64) sdkPhases.push({ phase, elapsedMs: Math.round(sdkClock() - sdkBorn) });
+    else sdkPhasesDropped++;
+  };
+  let reloadRequested = false, reloadDone = false, resourceBirths = 0;
+  const reloadEvents: string[] = [];
+  let questionIssued = 0, questionReturned = 0, releaseQuestion = () => {}, openingSettled = false;
+  let oldQuestionCallback: string | undefined, oldQuestionMessageId: number | undefined;
+  let freshQuestionCallback: string | undefined, freshQuestionMessageId: number | undefined, oldQuestionEdits = 0;
+  const sdkCallbackAnswers = new Set<string>();
+  let reloadWork: Promise<void> | undefined;
+  let releaseInbound = () => {}, inboundReturned = 0;
+  const inboundBirths: number[] = [], inboundDisposers: Array<() => void> = [];
+  let originalExecution: Updates.TelegramUpdateExecutionFence | undefined;
+  const inboundDigests: string[] = [];
+  const inboundHold = new Promise<void>(resolve => { releaseInbound = resolve; });
+  const questionHold = new Promise<void>(resolve => { releaseQuestion = resolve; });
+  let questionOpening: ReturnType<typeof Delivery.openTelegramConfirm> | undefined;
+  let questionResult: Awaited<ReturnType<typeof Delivery.openTelegramConfirm>> | undefined;
+  let beforeReload: Journal.TelegramUpdateJournalEntry[] | undefined, afterOldShutdown: Journal.TelegramUpdateJournalEntry[] | undefined;
   let session: import("@earendil-works/pi-coding-agent").AgentSession | undefined;
+  const inspectOriginalQueue = () => {
+    const path = Paths.resolveTelegramSessionPollingJournalPath(session!.sessionManager.getSessionId(), dir);
+    const evidence = Locks.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(dir), "journals.transaction"), () => Journal.inspectTelegramUpdateJournalFamily({
+      path, directory: dirname(path), profile: "default", botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "123:fixture-sdk", botId: 123 }),
+      limits: { maxFiles: 256, maxBytes: 8 * 1024 * 1024, maxEntries: 1000, maxWork: 1000000 },
+    }));
+    assert.equal(evidence.kind, "present");
+    return evidence.file.entries;
+  };
   const incoming = (update: unknown) => {
     updates.push(update);
     if (pollReply) { const reply = pollReply; pollReply = undefined; reply(createRuntimeTelegramApiResponse(updates.splice(0))); }
   };
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input), body = init?.body ? JSON.parse(String(init.body)) : {};
     methods.push(String(method));
-    if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, is_bot: true, username: "fixture_bot" });
-    if (method === "getChat") return createRuntimeTelegramApiResponse({ id: 99, type: "private" });
+    if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, is_bot: true, username: "fixture_bot", has_topics_enabled: false });
+    if (method === "getChat") return createRuntimeTelegramApiResponse({ id: 77, type: "private" });
     if (method === "getUpdates") {
       if (updates.length) return createRuntimeTelegramApiResponse(updates.splice(0));
       return new Promise<Response>((resolve, reject) => {
@@ -3603,10 +9690,22 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
     if (method === "sendMessage" || method === "sendRichMessage") {
       const id = ++messageId;
       const markup = body.reply_markup ?? body.rich_message?.reply_markup;
+      const sdkCallback = markup?.inline_keyboard?.flat().find((cell: { callback_data?: string }) => cell.callback_data?.startsWith("tgconfirm:"))?.callback_data;
+      if (heldPublication && JSON.stringify(body).includes("Held SDK reload publication")) {
+        oldQuestionCallback = sdkCallback; oldQuestionMessageId = id;
+        questionIssued++;
+        await questionHold;
+        questionReturned++;
+      }
+      if (heldPublication && JSON.stringify(body).includes("Fresh SDK after reload")) {
+        freshQuestionCallback = sdkCallback; freshQuestionMessageId = id;
+      }
       const candidate = markup?.inline_keyboard?.flat().find((cell: { text: string }) => cell.text === "▶️ Queued fixture");
       if (candidate) { callback = candidate.callback_data; buttonMessageId = id; }
-      return createRuntimeTelegramApiResponse({ message_id: id, chat: { id: 99, type: "private" } });
+      return createRuntimeTelegramApiResponse({ message_id: id, chat: { id: 77, type: "private" } });
     }
+    if (method === "answerCallbackQuery" && String(body.callback_query_id).startsWith("sdk-reload-")) sdkCallbackAnswers.add(body.callback_query_id);
+    if (method?.startsWith("editMessage") && oldQuestionMessageId !== undefined && body.message_id === oldQuestionMessageId) oldQuestionEdits++;
     if (["deleteWebhook", "setMyCommands", "sendChatAction", "answerCallbackQuery", "editMessageText", "editMessageReplyMarkup", "sendMessageDraft"].includes(method ?? "")) return createRuntimeTelegramApiResponse(true);
     throw new Error(`Unexpected isolated SDK HTTP operation: ${method}`);
   });
@@ -3620,17 +9719,76 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
     modelRuntime.registerNativeProvider(faux.provider);
     faux.setResponses([() => fauxAssistantMessage(fauxToolCall("telegram_message", { text: 'Fixture button\n<!-- telegram_button {▶️ Queued fixture|button fixture} -->' }), { stopReason: "toolUse" }),
       () => fauxAssistantMessage("Fixture button prepared"), () => fauxAssistantMessage(fauxToolCall("hold_fixture", {}, { id: "held-tool" }), { stopReason: "toolUse" }),
-      ...(settlement === "auto-overflow" ? [() => fauxAssistantMessage("", { stopReason: "error", errorMessage: "context_length_exceeded" })] : []),
+      ...(settlement === "auto-overflow" ? [() => { const response = fauxAssistantMessage("", { stopReason: "error", errorMessage: "context_length_exceeded" }); sdkPhase("provider:overflow"); return response; }] : []),
       ...Array.from({ length: 8 }, () => () => fauxAssistantMessage("Fixture finished"))]);
     const settings = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 1,
       reserveTokens: settlement === "auto-threshold" ? 4000 : 128 }, retry: { enabled: false } });
     const resources = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager: settings,
       extensionFactories: [pi => {
+        const birth = ++resourceBirths;
+        if (heldInbound) {
+          const off = Updates.registerTelegramUpdateHandler(async (update, execution) => {
+            if ((update as { update_id?: number }).update_id !== 5) return "pass";
+            inboundBirths.push(birth);
+            const source = inspectOriginalQueue().find(row => row.updateId === 5); assert.ok(source);
+            const digest = Journal.createTelegramUpdateJournalEntryDigest(source).sourceSha256;
+            assert.deepEqual(JSON.parse(JSON.stringify(update)), source.update);
+            inboundDigests.push(digest);
+            if (birth === 1) { originalExecution = execution; await inboundHold; inboundReturned++; }
+            return "consume";
+          });
+          inboundDisposers.push(off);
+          pi.on("session_shutdown", () => { off(); });
+        }
+        if (reloadCase) {
+          pi.on("session_start", event => { reloadEvents.push(`start:${birth}:${event.reason}`); });
+          pi.on("session_shutdown", event => { reloadEvents.push(`shutdown-enter:${birth}:${event.reason}`); });
+          pi.on("agent_settled", () => {
+            if (!reloadRequested || birth !== 1) return;
+            reloadRequested = false;
+            pi.sendUserMessage("/fixture-public-reload", { expandPromptTemplates: true });
+          });
+          pi.registerCommand("fixture-public-reload", { description: "Isolated public SDK reload assessment", async handler(_args, ctx) {
+            assert.equal(ctx.isIdle(), true);
+            assert.equal(ctx.hasPendingMessages(), false);
+            beforeReload = inspectOriginalQueue();
+            assert.deepEqual(beforeReload.filter(row => row.state === "queued").map(row => row.updateId).sort(), [2, 3, 4]);
+            reloadEvents.push(`command-enter:${birth}`);
+            const originalSessionId = session!.sessionManager.getSessionId();
+            if (heldPublication) {
+              questionOpening = Delivery.openTelegramConfirm({ owner: "@test/sdk-reload", scope: { kind: "target", target: { chatId: 77 } },
+                question: "Held SDK reload publication", confirmLabel: "Proceed", cancelLabel: "Cancel", signal: new AbortController().signal });
+              void questionOpening.then(result => { questionResult = result; openingSettled = true; });
+              await waitForCondition(() => questionIssued === 1 || openingSettled);
+              assert.equal(questionIssued, 1, JSON.stringify(questionResult));
+            }
+            reloadWork = ctx.reload();
+            await reloadWork;
+            await questionOpening;
+            if (heldPublication) {
+              assert.equal(resourceBirths, 2);
+              assert.equal(questionReturned, 0, "Actual old HTTP is still held after SDK reload completes");
+              assert.equal(openingSettled, true);
+              assert.ok(questionResult && !questionResult.ok);
+              assert.equal(questionResult.reason, "invalidated", "Logical SDK invalidation is not physical publication completion");
+            }
+            assert.equal(session!.sessionManager.getSessionId(), originalSessionId, "Resource reload is not new/resume/fork");
+            assert.throws(() => ctx.isIdle(), /no longer active|stale/iu, "The old command frame survives, but its SDK context does not");
+            // Only fixture-owned plain observations survive: the SDK invalidates this command's old context.
+            reloadEvents.push(`command-return:${birth}`);
+            reloadDone = true;
+          } });
+        }
         extension({ ...pi, sendUserMessage(content, options) {
           dispatches.push(typeof content === "string" ? content : content.filter(part => part.type === "text").map(part => part.text).join("\n"));
           pi.sendUserMessage(content, options);
         } });
+        if (reloadCase) pi.on("session_shutdown", () => {
+          if (birth === 1) afterOldShutdown = inspectOriginalQueue();
+          reloadEvents.push(`shutdown-return:${birth}`);
+        });
         pi.on("session_before_compact", async event => {
+          sdkPhase("extension:compaction-enter:" + event.reason);
           compactionReasons.push(event.reason);
           if (settlement.startsWith("auto-")) {
             session!.setAutoCompactionEnabled(false);
@@ -3638,6 +9796,7 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
             await waitForTimeout(1100);
             assert.equal(dispatches.length, beforeCompaction, "Watchdog cannot inject into actual SDK compaction");
           }
+          sdkPhase("extension:compaction-prepared:" + event.reason);
           return { compaction: { summary: "Isolated fixture summary", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
         });
         pi.on("session_compact", () => { compactions++; });
@@ -3656,12 +9815,24 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
     assert.deepEqual(resources.getExtensions().errors, []);
     ({ session } = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime, model: faux.getModel(), thinkingLevel: "off", resourceLoader: resources,
       settingsManager: settings, sessionManager: SessionManager.create(dir, join(dir, "sessions")), tools: ["hold_fixture", "telegram_message"] }));
+    unsubscribeSdk = session.subscribe(event => {
+      if (event.type === "compaction_start") sdkPhase("sdk:compaction_start:" + event.reason);
+      else if (event.type === "compaction_end") sdkPhase("sdk:compaction_end:" + event.reason + (event.errorMessage ? ":error" : event.aborted ? ":aborted" : event.result ? ":result" : ":no-result"));
+      else if (["agent_start", "agent_end", "agent_settled", "tool_execution_start", "tool_execution_end"].includes(event.type)) sdkPhase("sdk:" + event.type);
+    });
     await session.bindExtensions({ mode: "rpc", uiContext: { notify(message) { notices.push(message); } } as import("@earendil-works/pi-coding-agent").ExtensionUIContext,
+      ...(reloadCase ? { commandContextActions: {
+        waitForIdle: () => session!.waitForIdle(), reload: () => session!.reload(),
+        newSession: async () => { throw new Error("No session replacement in reload fixture"); },
+        fork: async () => { throw new Error("No fork in reload fixture"); },
+        navigateTree: async () => { throw new Error("No tree navigation in reload fixture"); },
+        switchSession: async () => { throw new Error("No session switch in reload fixture"); },
+      } } : {}),
       onError: error => { errors.push(JSON.stringify(error)); } });
     assert.ok(session.extensionRunner.getCommand("telegram-connect"));
     await session.prompt("/telegram-connect");
     await session.prompt("Send the isolated fixture button to the paired Telegram chat");
-    incoming({ update_id: 1, message: { message_id: 10, chat: { id: 99, type: "private" }, from: { id: 77, is_bot: false }, text: "held fixture" } });
+    incoming({ update_id: 1, message: { message_id: 10, chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false }, text: "held fixture" } });
     try { await waitForCondition(() => toolStarted && callback !== undefined); }
     catch (error) {
       await session.prompt("/telegram-status --debug");
@@ -3669,25 +9840,103 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
       throw new Error(JSON.stringify({ dispatches, errors, methods, notices, toolStarted, callback, messages: session.messages, logs }), { cause: error });
     }
     for (const [id, text] of [[2, "queued fixture A"], [3, "queued fixture B"]] as const) incoming({ update_id: id, message: { message_id: id + 10,
-      chat: { id: 99, type: "private" }, from: { id: 77, is_bot: false }, text } });
+      chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false }, text } });
     incoming({ update_id: 4, callback_query: { id: "fixture-callback", from: { id: 77, is_bot: false }, data: callback,
-      message: { message_id: buttonMessageId, chat: { id: 99, type: "private" } } } });
+      message: { message_id: buttonMessageId, chat: { id: 77, type: "private" } } } });
     await waitForTimeout(2200);
     assert.equal(dispatches.length, 1, "Multiple actual watchdog ticks cannot inject while a tool is active");
     assert.equal(toolAborts, 0, "Queued Telegram input must not abort the held tool");
     const logPath = Paths.resolveTelegramRuntimeLogPath(dir), before = await readFile(logPath, "utf8");
     await session.prompt("/telegram-status --debug");
     assert.ok((await readFile(logPath, "utf8")).startsWith(before), "The real SDK diagnostic command cannot truncate existing evidence");
+    if (reloadCase) {
+      assert.deepEqual(inspectOriginalQueue().filter(row => row.state === "queued").map(row => row.updateId).sort(), [2, 3, 4]);
+      if (heldInbound) {
+        incoming({ update_id: 5, message: { message_id: 15, chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false }, text: "held inbound source" } });
+        await waitForCondition(() => originalExecution !== undefined);
+        assert.equal(originalExecution!.isCurrent(), true);
+        assert.equal(inspectOriginalQueue().find(row => row.updateId === 5)?.state, "pending");
+      }
+      reloadRequested = true;
+      releaseTool();
+      await waitForCondition(() => reloadDone || errors.length > 0, 5000);
+      assert.deepEqual(errors, []);
+      assert.equal(reloadDone, true);
+      await session.waitForIdle();
+      assert.equal(resourceBirths, 2, "Actual resource reload creates a second Root through its factory");
+      // This is documented ordinary reload behavior, not permission for custody-preserving self-healing.
+      if (heldInbound) {
+        assert.deepEqual(afterOldShutdown?.map(row => [row.updateId, row.state]), [[5, "pending"]]);
+        assert.equal(originalExecution?.signal.aborted, true);
+        assert.equal(originalExecution?.isCurrent(), false);
+        assert.equal(inboundReturned, 0);
+        assert.equal(new Set(inboundDigests).size, 1, "Both handler calls observe the exact same original durable payload digest");
+        assert.deepEqual(inspectOriginalQueue().map(row => [row.updateId, row.state]), [[5, "pending"]], "The successor retains the exact original source while its first handler is unsettled");
+        assert.deepEqual(inboundBirths, [1], "A replacement Root must not re-enter this original source before actual first-handler settlement");
+        releaseInbound();
+        await waitForCondition(() => inboundReturned === 1 && inboundBirths.length === 2);
+        await waitForCondition(() => inspectOriginalQueue().length === 0);
+        assert.deepEqual(inboundBirths, [1, 2], "Replay is admitted only after actual original handler settlement");
+        assert.equal(new Set(inboundDigests).size, 1);
+        assert.equal(originalExecution!.isCurrent(), false);
+        assert.throws(() => originalExecution!.assertCurrent());
+      } else assert.deepEqual(afterOldShutdown, [], "Native graceful shutdown settles the waiting receipt groups before clearing memory");
+      assert.deepEqual(reloadEvents, ["start:1:startup", "command-enter:1", "shutdown-enter:1:reload", "shutdown-return:1", "start:2:reload", "command-return:1"]);
+      assert.equal(beforeReload?.filter(row => row.queueOwner !== undefined).length, 3, "Sources held actual durable queued ownership");
+      await session.prompt("/telegram-connect");
+      if (heldPublication) {
+        assert.equal(questionReturned, 0);
+        const fresh = await Delivery.openTelegramConfirm({ owner: "@test/sdk-reload", scope: { kind: "target", target: { chatId: 77 } },
+          question: "Fresh SDK after reload", confirmLabel: "Proceed", cancelLabel: "Cancel", signal: new AbortController().signal });
+        assert.ok(fresh.ok, JSON.stringify(fresh));
+        let freshSettled = false;
+        void fresh.handle.result.then(() => { freshSettled = true; });
+        assert.ok(oldQuestionCallback && oldQuestionMessageId && freshQuestionCallback && freshQuestionMessageId);
+        assert.notEqual(oldQuestionCallback, freshQuestionCallback);
+        releaseQuestion();
+        // Native HTTP return is observable here; it is not a certificate for every publisher/file writer.
+        await waitForCondition(() => questionReturned === 1);
+        incoming({ update_id: 5, callback_query: { id: "sdk-reload-old", from: { id: 77, is_bot: false }, data: oldQuestionCallback,
+          message: { message_id: oldQuestionMessageId, chat: { id: 77, type: "private" } } } });
+        await waitForCondition(() => sdkCallbackAnswers.has("sdk-reload-old"));
+        assert.equal(freshSettled, false, "Late old publication/callback cannot answer the successor's fresh question");
+        assert.equal(questionResult?.ok, false);
+        assert.equal(oldQuestionEdits, 0, "The old publisher cannot acquire the successor transport for late cleanup");
+        incoming({ update_id: 6, callback_query: { id: "sdk-reload-fresh", from: { id: 77, is_bot: false }, data: freshQuestionCallback,
+          message: { message_id: freshQuestionMessageId, chat: { id: 77, type: "private" } } } });
+        assert.deepEqual(await fresh.handle.result, { status: "confirmed" });
+        await waitForCondition(() => sdkCallbackAnswers.has("sdk-reload-fresh"));
+        assert.equal(questionIssued, 1, "The old physical request is never reissued");
+      }
+      await waitForTimeout(2200);
+      assert.equal(dispatches.length, 1, "Reload must not replay disposed queued inputs through the new Root");
+      if (heldPublication) assert.deepEqual([questionIssued, questionReturned, oldQuestionEdits], [1, 1, 0], "Late old I/O cannot reissue or acquire cleanup authority");
+      for (const text of ["queued fixture A", "queued fixture B", "button fixture"]) assert.equal(session.sessionManager.getEntries().filter(entry =>
+        entry.type === "message" && entry.message.role === "user" && JSON.stringify(entry.message.content).includes(text)).length, 0, "Disposed work never entered Pi's conversation");
+      assert.equal(toolAborts, 0, "The tool actually finishes before the public reload command");
+      assert.deepEqual(errors, []);
+      return;
+    }
     if (settlement === "manual-compaction") {
       await session.compact();
       assert.equal(compactions, 1, "Actual SDK compaction completes, not a supplied bridge event");
       assert.equal(toolAborts, 1, "Only explicit manual SDK compaction aborts the held tool");
     } else {
       if (settlement.startsWith("auto-")) session.setAutoCompactionEnabled(true);
-      releaseTool();
+      sdkPhase("fixture:tool-release"); releaseTool();
       if (settlement.startsWith("auto-")) {
-        await waitForCondition(() => compactions === 1);
-        assert.deepEqual(compactionReasons, [settlement === "auto-threshold" ? "threshold" : "overflow"], "SDK itself chooses automatic compaction, not manual compact()");
+        try { await waitForCondition(() => compactions === 1); }
+        catch (error) {
+          // Capture only existing native observations before cleanup; diagnostic failure cannot replace this exact timeout.
+          try { console.error("sdk-compaction-wait-failure " + JSON.stringify({ settlement, compactions, compactionReasons,
+            dispatchCount: dispatches.length, errorCount: errors.length, toolStarted, toolAborts, sdkPhases, sdkPhasesDropped,
+            streaming: session.isStreaming, compacting: session.isCompacting, retrying: session.isRetrying })); } catch {}
+          throw error;
+        }
+        const reason = settlement === "auto-threshold" ? "threshold" : "overflow";
+        assert.deepEqual(compactionReasons, [reason], "SDK itself chooses automatic compaction, not manual compact()");
+        assert.ok(sdkPhases.some(row => row.phase === "sdk:compaction_start:" + reason));
+        assert.ok(sdkPhases.some(row => row.phase === "extension:compaction-prepared:" + reason));
       }
     }
     try { await waitForCondition(() => dispatches.length === 4); }
@@ -3702,13 +9951,213 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
     }
     assert.deepEqual(errors, []);
   } finally {
-    releaseTool();
+    unsubscribeSdk();
+    releaseTool(); releaseQuestion(); releaseInbound();
+    for (const dispose of inboundDisposers) dispose();
+    await Promise.allSettled([questionOpening, reloadWork]);
     if (session) { await session.abort(); await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); }
     restoreFetch();
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   }
 }, 30000);
+
+for (const artifact of ["source", "compiled"] as const)
+for (const historyFault of [undefined, "missing", "same-revision"] as const)
+test(`Production Root Restore chooser separates native source ACK from issued menu publication (${artifact}${historyFault ? `/${historyFault}` : ""})`, async () => {
+  const run = async () => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), "pt-root-live-origin-")));
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const journalUrl = new URL(artifact === "source" ? "./lib/journal.ts" : "./dist/lib/journal.js", import.meta.url);
+    const JournalModel: typeof Journal = await import(journalUrl.href);
+    const LockModel: typeof Locks = await import(artifact === "source" ? "./lib/locks.ts" : "./dist/lib/locks.js");
+    const readWorkspace = () => LockModel.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(dir), "state.json.transaction"), () => LockModel.readTelegramRuntimeState(Paths.resolveTelegramStatePath(dir)).profiles.default?.workspace);
+    const threadUrl = new URL(artifact === "source" ? "./lib/threads.ts" : "./dist/lib/threads.js", import.meta.url);
+    const ThreadModel: typeof Threads = await import(threadUrl.href);
+    // This Root fixture owns a fake Pi/model registry; installed SDK settings loading has separate source/dist probes.
+    const piUrl = new URL(artifact === "source" ? "./lib/pi.ts" : "./dist/lib/pi.js", import.meta.url);
+    const PiModel: typeof import("../lib/pi.ts") = await import(piUrl.href);
+    let settingsCalls = 0;
+    mock.module(piUrl.href, { namedExports: { ...PiModel, async createSettingsManager(cwd: string) {
+      assert.equal(cwd, "/actual-root-live-origin"); settingsCalls++;
+      return PiModel.normalizeSettingsManager({ flush() {}, getEnabledModels: () => undefined,
+        setEnabledModels() { assert.fail("The source-ACK/publication fixture must not persist model settings"); } });
+    } } });
+    const originalViews = new Set<Threads.TelegramWorkspaceRestore>();
+    mock.module(threadUrl.href, { namedExports: { ...ThreadModel, createTelegramWorkspaceRestoreResolver(options: Parameters<typeof ThreadModel.createTelegramWorkspaceRestoreResolver>[0]) {
+      const resolve = ThreadModel.createTelegramWorkspaceRestoreResolver(options);
+      return () => { const view = resolve(); if (view) originalViews.add(view); return view; };
+    } } });
+    const activityUrl = new URL(artifact === "source" ? "./lib/activity.ts" : "./dist/lib/activity.js", import.meta.url);
+    const ActivityModel: typeof import("../lib/activity.ts") = await import(activityUrl.href);
+    let publication: ReturnType<typeof ActivityModel.createTelegramActivityPublicationRuntime> | undefined;
+    mock.module(activityUrl.href, { namedExports: { ...ActivityModel, createTelegramActivityPublicationRuntime(options: Parameters<typeof ActivityModel.createTelegramActivityPublicationRuntime>[0]) {
+      publication = ActivityModel.createTelegramActivityPublicationRuntime(options); return publication;
+    } } });
+    let source: ReturnType<typeof JournalModel.createTelegramUpdateJournalStore> | undefined, sourceBinding: string | undefined;
+    let removedDigest: Journal.TelegramUpdateJournalEntryDigest | undefined, durableCompletion: Journal.TelegramUpdateJournalSourceCompletion | undefined, removalCount = 0;
+    const updatesUrl = new URL(artifact === "source" ? "./lib/updates.ts" : "./dist/lib/updates.js", import.meta.url);
+    const UpdatesModel: typeof import("../lib/updates.ts") = await import(updatesUrl.href);
+    let completion: import("../lib/updates.ts").TelegramDeferredSourceEvidence | undefined, originalCarrier: unknown;
+    mock.module(updatesUrl.href, { namedExports: { ...UpdatesModel, inspectTelegramDeferredSourceCompletion(value: unknown) {
+      const result = UpdatesModel.inspectTelegramDeferredSourceCompletion(value);
+      if (result?.updateId === 100) { completion = result; originalCarrier = value; }
+      return result;
+    } } });
+    let latestBinding: Journal.TelegramUpdateJournalRuntimeBinding | undefined;
+    mock.module(journalUrl.href, { namedExports: { ...JournalModel, createTelegramUpdateJournalBindingRuntime(options: Parameters<typeof JournalModel.createTelegramUpdateJournalBindingRuntime>[0]) {
+      const runtime = JournalModel.createTelegramUpdateJournalBindingRuntime(options), resolve = runtime.resolveLeader;
+      runtime.resolveLeader = () => {
+        const binding = resolve(); if (!binding) return binding;
+        latestBinding = binding;
+        const journal = binding.journal, remove = journal.removeCompletedExact;
+        journal.removeCompletedExact = (...args: Parameters<typeof remove>) => {
+          const original = args[0].includes(100) ? journal.read().entries.find(row => row.updateId === 100) : undefined;
+          const result = remove(...args);
+          if (original && result.removedUpdateIds.includes(100)) {
+            source = journal; sourceBinding = binding.recoveryKey;
+            durableCompletion = result.sourceCompletions?.find(row => row.updateId === 100); removalCount++;
+            removedDigest = JournalModel.createTelegramUpdateJournalEntryDigest(original);
+          }
+          return result;
+        };
+        return binding;
+      };
+      return runtime;
+    } } });
+    const extension = (await import(artifact === "source" ? "./index.ts" : "./dist/index.js")).default;
+    const dispatched: RuntimeHarnessMessage[] = [], harness = createRuntimePiHarness({ sendUserMessage: value => { dispatched.push(value); } });
+    const ctx = createRuntimeExtensionContext({ cwd: "/actual-root-live-origin", sessionManager: { getSessionId: () => "actual-root-live-origin", getEntries: () => [] },
+      modelRegistry: { refresh() {}, getAvailable: () => [], isUsingOAuth: () => false }, getContextUsage: () => undefined });
+    const payloads: Array<{ method: string; payload: Record<string, unknown>; messageId: number }> = [];
+    const incoming: unknown[] = [], deletions: unknown[] = [], messageThreads = new Map<number, number>();
+    let stopped = false, deliver: (() => void) | undefined, polls = 0, creations = 0, menus = 0, menuReturned = 0, nextMessage = 500, releaseMenu!: () => void;
+    const menuHold = new Promise<void>(resolve => { releaseMenu = resolve; });
+    const submit = (update: unknown) => { incoming.push(update); deliver?.(); };
+    const restoreFetch = setTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input), payload = parseJsonRequestBody(init) ?? {};
+      if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
+      if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: 100 + ++creations, name: "Fixture" });
+      if (method === "getUpdates") {
+        if (++polls === 1) return createRuntimeTelegramApiResponse([]);
+        return await new Promise<Response>((resolve, reject) => {
+          const abort = () => { deliver = undefined; reject(new DOMException("fixture stop", "AbortError")); };
+          deliver = () => { if (!incoming.length) return; const batch = incoming.splice(0); deliver = undefined; init?.signal?.removeEventListener("abort", abort); resolve(createRuntimeTelegramApiResponse(batch)); };
+          if (init?.signal?.aborted) abort(); else { init?.signal?.addEventListener("abort", abort, { once: true }); deliver(); }
+        });
+      }
+      if (["sendMessage", "sendRichMessage", "editMessageText", "editMessageReplyMarkup", "forwardMessage", "copyMessage"].includes(method)) {
+        const messageId = method.startsWith("edit") && typeof payload.message_id === "number" ? payload.message_id : ++nextMessage;
+        if (typeof payload.message_thread_id === "number") messageThreads.set(messageId, payload.message_thread_id);
+        payloads.push({ method, payload, messageId });
+        if (JSON.stringify(payload).includes("menu:model")) {
+          assert.equal(payload.message_thread_id, 102, "The real selected menu is issued in the restored Thread, not All or its old Thread");
+          assert.deepEqual(deletions, [101]); menus++; await menuHold; menuReturned++;
+        }
+        return createRuntimeTelegramApiResponse({ message_id: messageId, chat: { id: 77, type: "private" }, message_thread_id: messageThreads.get(messageId) });
+      }
+      if (method === "deleteForumTopic") { deletions.push(payload.message_thread_id); return createRuntimeTelegramApiResponse(true); }
+      if (["deleteWebhook", "setMyCommands", "sendChatAction", "deleteMessage", "editForumTopic", "answerCallbackQuery"].includes(method)) return createRuntimeTelegramApiResponse(true);
+      throw new Error(`Unexpected actual Root method ${method}`);
+    });
+    const button = (prefix: string) => {
+      for (const row of [...payloads].reverse()) {
+        const markup = row.payload.reply_markup as { inline_keyboard?: Array<Array<{ callback_data?: string }>> } | undefined;
+        const cell = markup?.inline_keyboard?.flat().find(value => value.callback_data?.startsWith(prefix));
+        if (cell?.callback_data) return { data: cell.callback_data, messageId: row.messageId, threadId: messageThreads.get(row.messageId) };
+      }
+      return undefined;
+    };
+    const click = async (prefix: string, updateId: number) => {
+      try { await waitForCondition(() => button(prefix) !== undefined, 5000); }
+      catch (error) { throw new Error(JSON.stringify({ prefix, polls, creations, payloads, entries: latestBinding?.journal.read().entries, logs: await readFile(Paths.resolveTelegramRuntimeLogPath(dir), "utf8").catch(() => "missing") }), { cause: error }); }
+      const row = button(prefix)!;
+      submit({ update_id: updateId, callback_query: { id: `actual-${updateId}`, from: { id: 77, is_bot: false }, data: row.data,
+        message: { message_id: row.messageId, date: 1, chat: { id: 77, type: "private" }, message_thread_id: row.threadId } } });
+    };
+    try {
+      await writeFile(join(dir, "telegram.json"), JSON.stringify({ botToken: "123:actual-origin", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } }), { mode: 0o600 });
+      extension(harness.pi); await harness.handlers.get("session_start")?.({}, ctx);
+      await harness.commands.get("telegram-connect")!.handler("", ctx);
+      submit({ update_id: 100, message: { message_id: 100, date: Math.floor(Date.now() / 1000), chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false }, text: "/start" } });
+      await click("rerouterestore:", 101);
+      await click("reroutenew:", 102);
+      try { await waitForCondition(() => menus === 1 && completion !== undefined, 5000); }
+      catch (error) { throw new Error(JSON.stringify({ menus, menuReturned, removalCount, payloads, entries: latestBinding?.journal.read().entries,
+        workspace: readWorkspace(),
+        logs: await readFile(Paths.resolveTelegramRuntimeLogPath(dir), "utf8").catch(() => "missing") }), { cause: error }); }
+      assert.ok(source && completion && sourceBinding); assert.equal(removalCount, 1); assert.equal(menuReturned, 0);
+      assert.equal(settingsCalls, 1, "The real menu still consumes its fixture-owned settings port before publication");
+      assert.equal(source.read().entries.some(row => row.updateId === 100), false);
+      assert.deepEqual(UpdatesModel.inspectTelegramDeferredSourceCompletion(originalCarrier), completion);
+      assert.deepEqual(completion, { ...removedDigest, journalBindingKey: sourceBinding });
+      assert.equal(durableCompletion, undefined, "This current Root leader path retains a warm exact ACK, not the legacy caller-scoped durable completion");
+      assert.equal(UpdatesModel.inspectTelegramDeferredSourceCompletion(structuredClone(originalCarrier)), undefined, "A cloned payload cannot inherit original worker/source authority");
+      const section = readWorkspace();
+      const rows = (section as { workspaceRestore?: { operations?: unknown[]; liveRebindings?: Array<{ request: { source: { journalBindingKey: string; updateIds: number[] } }; phase: string }> } }).workspaceRestore;
+      assert.ok(Array.isArray(rows?.operations));
+      assert.equal(rows.operations.length, 0, "The current Root did not manufacture a legacy Restore operation");
+      assert.equal(rows?.liveRebindings?.length, 1);
+      assert.deepEqual(rows!.liveRebindings![0]!.request.source, { journalBindingKey: sourceBinding, updateIds: [100] });
+      assert.equal(rows!.liveRebindings![0]!.phase, "finished");
+      assert.equal(creations, 2); assert.deepEqual(dispatched, [], "The selected native /start is not an LLM prompt");
+      assert.ok(publication); assert.equal(publication.hasPending(), true, "Source ACK and canonical finished do not drain the actual Root publication owner");
+      assert.equal(originalViews.size, 1);
+      const originalView = [...originalViews][0]!;
+      assert.equal(originalView.listLiveRebindings().length, 1);
+      let faultSnapshot: unknown;
+      if (historyFault) {
+        const changed = structuredClone(section) as { workspaceRestore?: { liveRebindings?: unknown[]; [key: string]: unknown } };
+        assert.ok(changed.workspaceRestore);
+        if (historyFault === "missing") delete changed.workspaceRestore;
+        else delete changed.workspaceRestore.liveRebindings;
+        assert.ok(ThreadModel.parseTelegramWorkspaceStateSection(changed, "default"), "The injected conflict is a valid Workspace snapshot, not a parser failure");
+        LockModel.mutateTelegramRuntimeStateSection(Paths.resolveTelegramStatePath(dir), "default", "workspace", () => ({ value: changed, result: undefined }), { isCurrent: () => true });
+        faultSnapshot = readWorkspace(); assert.deepEqual(faultSnapshot, changed);
+        const refusesOriginal = () => assert.throws(() => originalView.listLiveRebindings(), error => error instanceof ThreadModel.TelegramWorkspaceRestoreEvidenceError &&
+          error.reason === (historyFault === "missing" ? "missing-snapshot" : "same-revision-conflict"));
+        refusesOriginal();
+        assert.equal(menuReturned, 0); assert.equal(publication.hasPending(), true);
+        assert.deepEqual(UpdatesModel.inspectTelegramDeferredSourceCompletion(originalCarrier), completion, "Namespace refusal cannot fabricate or spend this independent exact warm source ACK");
+      }
+      releaseMenu(); await waitForCondition(() => menuReturned === 1 && publication?.hasPending() === false, 5000);
+      assert.equal(removalCount, 1); assert.equal(menus, 1); assert.deepEqual(UpdatesModel.inspectTelegramDeferredSourceCompletion(originalCarrier), completion);
+      if (historyFault) {
+        assert.deepEqual(readWorkspace(), faultSnapshot, "Actual publisher drain cannot republish the displaced original history");
+        assert.throws(() => originalView.listLiveRebindings(), error => error instanceof ThreadModel.TelegramWorkspaceRestoreEvidenceError &&
+          error.reason === (historyFault === "missing" ? "missing-snapshot" : "same-revision-conflict"));
+        assert.deepEqual(deletions, [101]);
+      } else assert.equal(publication.hasUnconfirmed(), false);
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx); stopped = true;
+      assert.equal(UpdatesModel.inspectTelegramDeferredSourceCompletion(originalCarrier), undefined, "The exact warm ACK ends with its actual worker lifetime, not a durable completion lease");
+    } finally {
+      releaseMenu(); if (!stopped) await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+      restoreFetch(); mock.restoreAll(); await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  };
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { mkdtemp, realpath, writeFile, readFile, rm } from "node:fs/promises";
+    import { join } from "node:path";
+    import { tmpdir } from "node:os";
+    import { mock } from "node:test";
+    import * as Paths from "./lib/paths.ts";
+    import * as Locks from "./lib/locks.ts";
+    const artifact = ${JSON.stringify(artifact)}, historyFault = ${JSON.stringify(historyFault)};
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const parseJsonRequestBody = ${parseJsonRequestBody.toString()};
+    const getRuntimeTelegramApiMethod = ${getRuntimeTelegramApiMethod.toString()};
+    const createRuntimeTelegramApiResponse = ${createRuntimeTelegramApiResponse.toString()};
+    const setTestFetch = ${setTestFetch.toString()};
+    const waitForCondition = ${waitForCondition.toString()};
+    const keepAlive = setInterval(() => {}, 60000);
+    try { await (${run.toString()})(); console.log("actual-root-producer-pass"); }
+    finally { clearInterval(keepAlive); }
+  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 15000 });
+  assert.equal(result.code, 0, result.stdout + result.stderr); assert.match(result.stdout, /actual-root-producer-pass/u);
+}, 20000);
 
 for (const peer of ["legacy", "capable", "status", "abort", "stop", "next", "continue"] as const) test(`Production follower root advertises unified live-rebind capabilities but preserves recipient gates (${peer})`, async () => {
   const extension = await getRuntimeTelegramExtension(), previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -3735,7 +10184,7 @@ for (const peer of ["legacy", "capable", "status", "abort", "stop", "next", "con
       },
       callApi(method) { return method === "getMe" ? { id: 123, has_topics_enabled: true } : true; },
     }) });
-  const restoreFetch = setRuntimeTestFetch(async input => {
+  const restoreFetch = setTestFetch(async input => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
     if (method === "getUpdates" || method === "deleteForumTopic") throw new Error(`Follower must not issue ${method}`);
@@ -3846,7 +10295,8 @@ for (const boundary of ["current", "busy", "recipient-response"] as const) {
           if (key === "command") {
             const send = args[0].sendInteractiveMessage;
             args[0].sendInteractiveMessage = (...values) => {
-              captured.guard = values[4]?.assertAuthority;
+              assert.equal(values[4]?.assertAuthority, undefined);
+              captured.guard = values[4]?.assertLocalAuthority;
               const result = send(...values); captured.delivery = result; void result.catch(() => {}); return result;
             };
             args[0].recordRuntimeEvent = (_category, error, detail) => diagnostics.push([detail?.phase, error]);
@@ -3903,7 +10353,9 @@ for (const boundary of ["current", "busy", "recipient-response"] as const) {
         assert.equal(typeof dispatch, "function"); assert.equal(await dispatch(), true); assert.equal(await dispatch(), false);
         await entered.promise; assert.equal(reports, 1, "Completion does not await confirmation HTTP");
         if (boundary === "recipient-response") captured.session.set({ ...ctx });
-        assert.equal(captured.guard, assertRecipientCurrent);
+        assert.equal(typeof captured.guard, "function");
+        if (boundary === "recipient-response") assert.throws(captured.guard);
+        else assert.doesNotThrow(captured.guard);
         responseGate.resolve();
         if (boundary === "current" || boundary === "busy") await captured.delivery;
         else await assert.rejects(captured.delivery);
@@ -4459,7 +10911,7 @@ for (const fault of ["current", "session-held", "response-session", "lost-ack", 
             };
             const send = args[0].sendInteractiveMessage;
             args[0].sendInteractiveMessage = (...values) => {
-              if (values[4]?.assertAuthority) captured.effectGuard = values[4].assertAuthority;
+              if (values[4]?.assertLocalAuthority) captured.effectGuard = values[4].assertLocalAuthority;
               return send(...values);
             };
           }
@@ -4932,9 +11384,13 @@ for (const boundary of ["current", "ordinary", "entry-session", "caller", "conte
 
 }
 
+for (const artifact of ["source", "compiled"] as const)
+for (const profile of [undefined, "work"] as const)
 for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "invalid-admission"] as const) {
-  test(`Production connect resets damaged shared runtime state and becomes leader (${damage})`, async () => {
-    const extension = await getRuntimeTelegramExtension(), previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  test(`Production connect resets damaged shared runtime state and becomes leader (${artifact}/${profile ?? "default"}/${damage})`, async () => {
+    const sourceExtension = await getRuntimeTelegramExtension();
+    const extension = artifact === "source" ? sourceExtension : (await import("../dist/index.js")).default;
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-reset-")));
     const statePath = Paths.resolveTelegramStatePath(agentDir);
     await mkdir(dirname(statePath), { recursive: true });
@@ -4942,12 +11398,17 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
       : JSON.stringify({ version: 2, profiles: { default: damage === "invalid-admission"
         ? { admission: { version: 1, profileKey: "invalid-fixture-key", leases: [] } }
         : { workspace: { version: 99 } } } }), { mode: 0o600 });
-    await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ botToken: "123:reset-root", botId: 123, allowedUserId: 77 }), { mode: 0o600 });
+    const bot = { botToken: "123:reset-root", botId: 123, allowedUserId: 77 };
+    await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
     const { handlers, commands, tools, pi } = createRuntimePiHarness();
+    const notices: string[] = [];
     const ctx = createRuntimeExtensionContext({ cwd: "/reset-root" });
+    ctx.ui.notify = (...args: unknown[]) => { notices.push(String(args[0] ?? "")); };
     let polls = 0, outbound = 0;
-    const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const methods: Array<string | undefined> = [];
+    const restoreFetch = setTestFetch(async (input, init) => {
       const method = getRuntimeTelegramApiMethod(input);
+      methods.push(method);
       if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot" });
       if (method === "sendMessage" || method === "sendRichMessage") { outbound++; return createRuntimeTelegramApiResponse({ message_id: 1 }); }
       if (method === "getUpdates" && ++polls === 1) return createRuntimeTelegramApiResponse([]);
@@ -4961,16 +11422,39 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
       process.env.PI_CODING_AGENT_DIR = agentDir;
       extension(pi);
       await handlers.get("session_start")?.({}, ctx);
-      await commands.get("telegram-connect")!.handler("", ctx);
+      await commands.get("telegram-connect")!.handler(profile ?? "", ctx);
       await waitForCondition(() => polls >= 2);
       const state = Locks.readTelegramRuntimeState(statePath);
-      assert.ok(state.profiles.default?.transport, "the connecting instance owns the fresh envelope");
+      const sections = state.profiles[profile ?? "default"];
+      assert.ok(sections?.transport, "the connecting instance owns the fresh envelope");
       assert.equal(JSON.stringify(state).includes("damaged") || JSON.stringify(state).includes('"version":99'), false);
-      WorkspaceAdmission.assertTelegramConsolidatedAdmissionSection(state.profiles.default?.admission, "default");
+      WorkspaceAdmission.assertTelegramConsolidatedAdmissionSection(sections?.admission, profile ?? "default");
       await tools.get("telegram_message")!.execute("fixture-recovered-send", { text: "Recovered outbound fixture", chat_id: 77 });
       assert.equal(outbound, 1, "Actual production outbound delivery succeeds through the recovered admission ledger");
-      const logs = await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8");
-      assert.match(logs, /state-reset/u, "the reset leaves one diagnostic event");
+      const readResetEvents = async () => (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8"))
+        .split("\n").filter(Boolean).map(line => JSON.parse(line))
+        .filter(event => event.kind === "event" && event.details?.phase === "state-reset");
+      const resetEvents = await readResetEvents();
+      assert.equal(resetEvents.length, 1, "One positively returned native reset must produce one event, not a substring match");
+      const resetEvent = resetEvents[0]!;
+      const resetMessage = "Damaged Telegram runtime state was reset; previous runtime continuity was discarded.";
+      assert.equal(resetEvent.category, "lock");
+      assert.equal(resetEvent.message, resetMessage);
+      assert.deepEqual(resetEvent.details, { phase: "state-reset" });
+      // Reset precedes named-profile activation and discards every profile's envelope continuity.
+      assert.equal(resetEvent.profile, "default");
+      const beforeDebug = notices.length, methodsBeforeDebug = methods.slice();
+      await commands.get("telegram-status")!.handler("--debug", ctx);
+      const debug = notices.slice(beforeDebug).join("\n");
+      const resetLines = debug.split("\n").filter(line => line.includes(resetMessage));
+      assert.equal(resetLines.length, 1, "The same original reset event remains visible in debug");
+      assert.ok(resetLines[0]!.includes(new Date(resetEvent.at).toISOString()));
+      assert.ok(resetLines[0]!.includes("lock: " + resetMessage));
+      assert.match(resetLines[0]!, /phase="state-reset"/u);
+      assert.deepEqual(methods, methodsBeforeDebug, "Reading diagnostics cannot issue another Bot API request");
+      assert.equal(debug.includes(bot.botToken), false);
+      await commands.get("telegram-connect")!.handler(profile ?? "", ctx);
+      assert.deepEqual(await readResetEvents(), resetEvents, "Debug and a healthy reconnect cannot duplicate or renew the original reset evidence");
     } finally {
       await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
       restoreFetch();
@@ -4980,13 +11464,2522 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
   }, 15000);
 }
 
-test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn into pi", async () => {
-  const telegramConfig = await createRuntimeTelegramConfigFixture();
-  const sentMessages: RuntimeHarnessMessage[] = [];
-  let resolveDispatch: ((value: RuntimeHarnessMessage) => void) | undefined;
-  const dispatched = new Promise<RuntimeHarnessMessage>((resolve) => {
-    resolveDispatch = resolve;
+for (const artifact of ["source", "compiled"] as const)
+for (const origin of ["healthy", "local", "leader"] as const)
+test(`Production warm Restore refusal attributes its original reader (${artifact}/${origin})`, async () => {
+  const sourceExtension = await getRuntimeTelegramExtension();
+  const extension = artifact === "source" ? sourceExtension : (await import("../dist/index.js")).default;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-warm-evidence-")));
+  const statePath = Paths.resolveTelegramStatePath(agentDir);
+  const token = "123:warm-evidence-fixture", tokenSha256 = createHash("sha256").update(token).digest("hex");
+  let historical: NonNullable<ReturnType<typeof Threads.parseTelegramWorkspaceStateSection>> | undefined;
+  // Retired domain history is still an ABA witness, not evidence that current work is absent. Settlement here is fixture-owned.
+  await withWorkspaceRestoreFixture(async fixture => {
+    const view = fixture.open({ tokenSha256 });
+    const relocated = await view.commit(fixture.request, fixture.auth); assert.ok(relocated);
+    const recipient = { kind: "leader" as const, instanceId: "old", sessionId: "session", generation: "fixture" };
+    const issued = view.issueRecipient(relocated, recipient, fixture.auth); assert.ok(issued);
+    const ready = view.confirmReady(issued.intent, recipient, fixture.auth); assert.ok(ready);
+    const routing = view.issueRouting(ready, fixture.auth); assert.ok(routing);
+    const settled = view.recordSourceSettlement(routing.intent, { ...fixture.request.source, kind: "completed" }, fixture.auth); assert.ok(settled);
+    const cleaned = view.recordCleanup(settled, { target: fixture.request.binding.target, kind: "not-issued" }, fixture.auth); assert.ok(cleaned);
+    assert.ok(view.retire(cleaned, fixture.auth));
+    historical = Threads.parseTelegramWorkspaceStateSection(JSON.parse(await readFile(fixture.path, "utf8")), "default");
   });
+  assert.ok(historical?.workspaceRestore);
+  const retained = structuredClone(historical.workspaceRestore);
+  assert.equal(retained.operations.length, 0); assert.ok(retained.revision > 0);
+  const initial = structuredClone(historical);
+  if (origin === "local") delete initial.workspaceRestore;
+  await mkdir(dirname(statePath), { recursive: true });
+  await writeFile(statePath, JSON.stringify({ version: 2, profiles: { default: { workspace: initial } } }), { mode: 0o600 });
+  await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ botToken: token, botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } }), { mode: 0o600 });
+  const leader = createRuntimePiHarness(), follower = createRuntimePiHarness();
+  const leaderCtx = createRuntimeExtensionContext({ cwd: "/warm-evidence-leader" });
+  const warnings: string[] = [];
+  let takeovers = 0;
+  const followerCtx = createRuntimeExtensionContext({ cwd: "/warm-evidence-follower", ui: { ...leaderCtx.ui,
+    notify(message: string, level?: string) { if (level === "warning") warnings.push(message); },
+    async confirm() { takeovers++; return false; },
+  } });
+  let polls = 0, creations = 0, deletions = 0;
+  const restoreFetch = setTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: true });
+    if (method === "createForumTopic") { creations++; return createRuntimeTelegramApiResponse({ message_thread_id: 100 + creations, name: "Fixture" }); }
+    if (method === "deleteForumTopic") { deletions++; return createRuntimeTelegramApiResponse(true); }
+    if (method === "getUpdates" && ++polls === 1) return createRuntimeTelegramApiResponse([]);
+    if (method === "getUpdates") return await new Promise<Response>((_resolve, reject) => {
+      const abort = () => reject(new DOMException("fixture stop", "AbortError"));
+      if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+    if (["deleteWebhook", "setMyCommands", "editForumTopic", "sendChatAction", "sendMessage", "sendRichMessage"].includes(method)) return createRuntimeTelegramApiResponse(true);
+    throw new Error(`Unexpected warm evidence method ${method}`);
+  });
+  const changeRestore = (include: boolean) => Locks.mutateTelegramRuntimeStateSection(statePath, "default", "workspace", current => {
+    const section = Threads.parseTelegramWorkspaceStateSection(current, "default"); assert.ok(section);
+    const next = { ...section };
+    if (include) next.workspaceRestore = structuredClone(retained); else delete next.workspaceRestore;
+    return { value: next, result: undefined };
+  }, { isCurrent: () => true }); // Controlled fixture publication/loss, never a production repair grant.
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    extension(leader.pi);
+    await leader.handlers.get("session_start")?.({}, leaderCtx);
+    await leader.commands.get("telegram-connect")!.handler("", leaderCtx);
+    await waitForCondition(() => polls >= 2);
+    assert.equal(creations, 1);
+    if (origin === "local") changeRestore(true);
+    if (origin === "leader") changeRestore(false);
+    extension(follower.pi);
+    await follower.handlers.get("session_start")?.({}, followerCtx);
+    if (origin === "local") changeRestore(false);
+    const before = Locks.readTelegramRuntimeState(statePath).profiles.default!.workspace;
+    const pollerCalls = polls, deletionsBefore = deletions;
+    await follower.commands.get("telegram-connect")!.handler("", followerCtx);
+    const events = (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+    if (origin === "healthy") {
+      assert.equal(creations, 2, "Intact retired evidence permits normal authenticated registration");
+      assert.deepEqual(warnings, [], "Healthy registration must not claim a Restore conflict");
+      assert.equal(events.some(e => e.details?.phase === "follower-readiness-refresh-refused" || e.details?.phase === "follower-register-rejected"), false);
+    } else {
+      const phase = origin === "local" ? "follower-readiness-refresh-refused" : "follower-register-rejected";
+      const refusal = events.filter(e => e.details?.phase === phase);
+      assert.ok(refusal.length > 0, JSON.stringify(events));
+      assert.equal(refusal.at(-1).details.source, origin);
+      assert.match(refusal.at(-1).message, /missing-snapshot/u);
+      assert.deepEqual(warnings, ["Telegram Workspace Restore history is missing. Connection blocked to protect prior work. Check /telegram-status --debug."],
+        "Actual connect preserves the finite local/leader refusal instead of claiming an unavailable leader");
+      assert.equal(events.some(e => e.details?.phase === (origin === "local" ? "follower-register-rejected" : "follower-readiness-refresh-refused")), false, "Local refresh and correlated remote rejection remain distinct");
+      assert.equal(creations, 1, "Refusal cannot provision a follower Thread");
+      await assert.rejects(follower.tools.get("telegram_message")!.execute("refused-evidence", { text: "Fixture", chat_id: 77, thread_id: 999 }));
+      assert.deepEqual(Locks.readTelegramRuntimeState(statePath).profiles.default!.workspace, before, "Neither cache nor protocol failure repairs or overwrites canonical evidence");
+    }
+    assert.equal(takeovers, 0, "Changing the warning grants no takeover path");
+    assert.equal(polls, pollerCalls, "The follower never starts another poller");
+    assert.equal(deletions, deletionsBefore, "This reconnect cannot add deletion to the already-settled historical fixture cleanup");
+  } finally {
+    await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, followerCtx);
+    await leader.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, leaderCtx);
+    restoreFetch();
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+}, 15000);
+
+for (const artifact of ["source", "compiled"] as const)
+for (const issued of [false, true])
+for (const loss of [false, true, "envelope", "root"] as const)
+test(`Production warm namespace loss preserves independent original lifetimes (${artifact}/issued=${issued}/loss=${loss})`, async () => {
+  const run = async () => {
+  const threadUrl = new URL(artifact === "source" ? "./lib/threads.ts" : "./dist/lib/threads.js", import.meta.url);
+  const ThreadModel: typeof Threads = await import(threadUrl.href);
+  const stores: Threads.TelegramTopicTargetStore[] = [];
+  mock.module(threadUrl.href, { namedExports: { ...ThreadModel, createTelegramTopicTargetStore(options: Threads.TelegramTopicTargetStoreOptions) {
+    const store = ThreadModel.createTelegramTopicTargetStore(options); stores.push(store); return store;
+  } } });
+  const extension = (await import(artifact === "source" ? "./index.ts" : "./dist/index.js")).default;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-warm-original-")));
+  const statePath = Paths.resolveTelegramStatePath(agentDir), token = "123:warm-original-fixture";
+  const tokenSha256 = createHash("sha256").update(token).digest("hex");
+  await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ botToken: token, botId: 123, allowedUserId: 77,
+    threads: { automaticCleanup: false } }), { mode: 0o600 });
+  const leader = createRuntimePiHarness(), follower = createRuntimePiHarness();
+  const leaderCtx = createRuntimeExtensionContext({ cwd: "/warm-original-leader" });
+  const followerCtx = createRuntimeExtensionContext({ cwd: "/warm-original-follower" });
+  let polls = 0, creations = 0, deletions = 0, nativeIssues = 0, nativeCompletions = 0;
+  let release!: () => void, settled = false;
+  const responseGate = new Promise<void>(resolve => { release = resolve; });
+  let pending: Promise<{ kind: "fulfilled"; result: unknown } | { kind: "rejected"; error: unknown }> | undefined;
+  const restoreFetch = setTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input), payload = parseJsonRequestBody(init);
+    if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: true });
+    if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: 100 + ++creations, name: "Fixture" });
+    if (method === "deleteForumTopic") { deletions++; return createRuntimeTelegramApiResponse(true); }
+    if (method === "getUpdates" && ++polls === 1) return createRuntimeTelegramApiResponse([]);
+    if (method === "getUpdates") return await new Promise<Response>((_resolve, reject) => {
+      const abort = () => reject(new DOMException("fixture stop", "AbortError"));
+      if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+    if (method === "sendMessage" || method === "sendRichMessage") {
+      if (JSON.stringify(payload).includes("held-original-publication")) { nativeIssues++; await responseGate; nativeCompletions++; }
+      return createRuntimeTelegramApiResponse({ message_id: 500, chat: { id: 77, type: "private" }, message_thread_id: payload?.message_thread_id });
+    }
+    if (["deleteWebhook", "setMyCommands", "editForumTopic", "sendChatAction"].includes(method)) return createRuntimeTelegramApiResponse(true);
+    throw new Error(`Unexpected original lifetime method ${method}`);
+  });
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    extension(leader.pi);
+    await leader.handlers.get("session_start")?.({}, leaderCtx);
+    await leader.commands.get("telegram-connect")!.handler("", leaderCtx);
+    await waitForCondition(() => polls >= 2);
+    const store = stores[0]!;
+    assert.ok(store, "Capture the actual leader-owned consolidated store, not a standalone writer over state.json");
+    // An independent dormant binding, not the live follower's binding or its issued native publication.
+    const binding = { ...ThreadModel.createTelegramWorkspaceBindingIdentity("/warm-original-dormant", 0, "original-session")!,
+      slot: "C", threadName: "Atlas", target: { chatId: 77, threadId: 900 }, updatedAtMs: 1 };
+    const owner = { profileKey: "cwd:/warm-original-dormant", instanceId: "original", slot: "C", threadName: "Atlas",
+      owner: { kind: "leader" as const, cwd: binding.cwd, instanceId: "original" }, target: binding.target,
+      status: "active" as const, createdAtMs: 1, updatedAtMs: 1 };
+    store.upsert(owner); store.upsertWorkspaceBinding(binding); await store.persist();
+    const journalOptions = { path: join(Paths.resolveTelegramRuntimeDir(agentDir), "held-original.json"), profileName: "default",
+      botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: token, botId: 123 }) };
+    const journal = Journal.createTelegramUpdateJournalStore(journalOptions);
+    journal.appendBatch([{ update_id: 900, message: { message_id: 900, date: 1, chat: { id: 77, type: "private" },
+      from: { id: 77, is_bot: false }, message_thread_id: 901, text: "Fixture retained original" } }], 901);
+    const originals = journal.read();
+    const { exists: originalExists, serializedBytes: originalSize, ...originalFile } = originals;
+    assert.ok(originalExists && originalSize > 0);
+    const familyBytes = (path: string) => {
+      const parent = dirname(path), name = basename(path), files: Array<[string, string]> = [];
+      const visit = (entry: string) => {
+        const info = fs.lstatSync(join(parent, entry));
+        if (info.isDirectory()) for (const child of fs.readdirSync(join(parent, entry)).sort()) visit(join(entry, child));
+        else { assert.ok(info.isFile() && !info.isSymbolicLink()); files.push([entry, createHash("sha256").update(fs.readFileSync(join(parent, entry))).digest("hex")]); }
+      };
+      for (const entry of fs.readdirSync(parent).sort()) if (entry === name || entry.startsWith(name + ".")) visit(entry);
+      return files;
+    };
+    const originalFamilyBytes = familyBytes(journalOptions.path);
+    let retainedJournalPath = journalOptions.path, displacedRoot: string | undefined, displacedWorkspace: unknown;
+    const view = store.workspaceRestore({ profileName: "default", tokenSha256 });
+    const transport = Locks.readTelegramRuntimeState(statePath).profiles.default!.transport as Locks.TelegramLockEntry;
+    const auth = { executor: { instanceId: transport.instanceId!, leaderEpoch: String(transport.leaderEpoch) }, operatorUserId: 77, isCurrent: () => true };
+    const request = { operationId: "held-original", binding, owner, target: { chatId: 77, threadId: 901 },
+      source: { journalBindingKey: Journal.createTelegramUpdateJournalBindingKey(journalOptions), updateIds: [900] } };
+    const relocated = await view.commit(request, auth); assert.ok(relocated);
+    const recipient = { kind: "leader" as const, instanceId: "original", sessionId: "original-session", generation: "fixture-recipient" };
+    const original = issued ? view.issueRecipient(relocated, recipient, auth)?.intent : relocated; assert.ok(original);
+    extension(follower.pi);
+    await follower.handlers.get("session_start")?.({}, followerCtx);
+    await follower.commands.get("telegram-connect")!.handler("", followerCtx);
+    assert.equal(creations, 2, "The original nonempty Restore does not prevent unrelated native registration");
+    assert.deepEqual(view.list(), [original], "Startup/registration has not spent or rebased the independent original");
+    const workspace = ThreadModel.parseTelegramWorkspaceStateSection(Locks.readTelegramRuntimeState(statePath).profiles.default!.workspace, "default")!;
+    const target = workspace.workspaceBindings!.find(row => row.cwd === followerCtx.cwd)!.target;
+    pending = follower.tools.get("telegram_message")!.execute("held-original", { text: "held-original-publication", chat_id: 77, thread_id: target.threadId })
+      .then(result => { settled = true; return { kind: "fulfilled" as const, result }; }, error => { settled = true; return { kind: "rejected" as const, error }; });
+    await waitForCondition(() => nativeIssues === 1);
+    const before = { polls, creations, deletions };
+    if (loss) {
+      // Fixture-exclusive replacement, not a production recovery path or original namespace-retirement grant.
+      const emptyPath = join(agentDir, "empty-workspace.json");
+      const empty = ThreadModel.createTelegramTopicTargetStore({ path: emptyPath });
+      empty.setBotState({ threadMode: "enabled" }); await empty.persist();
+      const replacement = JSON.parse(await readFile(emptyPath, "utf8"));
+      assert.ok(ThreadModel.parseTelegramWorkspaceStateSection(replacement, "default"), "Fault model must be a valid fresh Workspace, not approved envelope damage");
+      if (loss === true) Locks.mutateTelegramRuntimeStateSection(statePath, "default", "workspace", () => ({ value: replacement, result: undefined }), { isCurrent: () => true });
+      else {
+        const replacementPath = join(agentDir, "replacement-envelope.json");
+        const currentTransport = structuredClone(Locks.readTelegramRuntimeState(statePath).profiles.default!.transport);
+        Locks.mutateTelegramRuntimeStateSection(replacementPath, "default", "transport", () => ({ value: currentTransport, result: undefined }), { isCurrent: () => true });
+        Locks.mutateTelegramRuntimeStateSection(replacementPath, "default", "workspace", () => ({ value: replacement, result: undefined }), { isCurrent: () => true });
+        assert.deepEqual(Object.keys(Locks.readTelegramRuntimeState(replacementPath).profiles.default!).sort(), ["transport", "workspace"]);
+        if (loss === "root") {
+          const root = dirname(statePath);
+          displacedRoot = join(agentDir, "displaced-runtime-root");
+          retainedJournalPath = join(displacedRoot, relative(root, journalOptions.path));
+          displacedWorkspace = structuredClone(Locks.readTelegramRuntimeState(statePath).profiles.default!.workspace);
+          fs.renameSync(root, displacedRoot);
+          fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+        }
+        fs.renameSync(replacementPath, statePath);
+        const freshEnvelope = Locks.readTelegramRuntimeState(statePath);
+        assert.deepEqual(Object.keys(freshEnvelope.profiles), ["default"]);
+        assert.deepEqual(Object.keys(freshEnvelope.profiles.default!).sort(), ["transport", "workspace"], "Whole-envelope replacement does not preserve hidden sibling sections");
+        assert.deepEqual(freshEnvelope.profiles.default!.transport, currentTransport, "The fault model preserves the exact original transport, not fresh acquisition authority");
+      }
+      assert.deepEqual(familyBytes(retainedJournalPath), originalFamilyBytes);
+      if (loss === "root") assert.equal(fs.existsSync(journalOptions.path), false, "The displaced accepted family has no fresh canonical clone");
+      await follower.commands.get("telegram-connect")!.handler("", followerCtx);
+      const events = (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+      assert.ok(events.some(row => row.details?.phase === "follower-readiness-refresh-refused" && /missing-snapshot/u.test(row.message)),
+        JSON.stringify(events.map(row => ({ message: row.message, details: row.details }))));
+      assert.equal(events.some(row => row.details?.phase === "state-reset"), false, "Valid namespace loss must not be accepted as damaged-envelope reset");
+    }
+    assert.equal(nativeCompletions, 0, "The original native HTTP response itself is held, not merely a delayed IPC acknowledgement");
+    assert.equal(settled, false, "A refused connect or unchanged snapshot is not original publication drain");
+    const canonical = structuredClone(Locks.readTelegramRuntimeState(statePath).profiles.default!.workspace);
+    const completeOriginal = () => issued ? view.confirmReady(original, recipient, auth) : view.issueRecipient(original, recipient, auth);
+    if (loss) assert.throws(completeOriginal, error => error instanceof ThreadModel.TelegramWorkspaceRestoreEvidenceError && error.reason === "missing-snapshot");
+    else assert.ok(completeOriginal(), "The intact control admits the original native transition, without a new birth");
+    release();
+    const outcome = await pending;
+    assert.equal(outcome.kind, "fulfilled", JSON.stringify(outcome));
+    assert.equal((outcome as { result: { isError?: boolean } }).result.isError, undefined);
+    assert.equal(nativeIssues, 1, "Original issued output is not replayed or retried");
+    assert.equal(nativeCompletions, 1, "Original HTTP work and its caller have actually drained");
+    assert.deepEqual({ polls, creations, deletions }, before, "Late original completion cannot poll, provision or delete");
+    const retained = Journal.inspectTelegramUpdateJournalFamily({ path: retainedJournalPath, directory: dirname(retainedJournalPath), profile: "default", botIdentity: journalOptions.botIdentity,
+      limits: { maxFiles: 32, maxBytes: 1024 * 1024, maxEntries: 32, maxWork: 1024 * 1024 } });
+    assert.ok(retained.kind === "present");
+    assert.deepEqual(retained.file, originalFile, "Strict physical inspection is not source re-keying, settlement or a replacement reader grant");
+    if (loss !== "root") assert.deepEqual(journal.read(), originals);
+    assert.deepEqual(familyBytes(retainedJournalPath), originalFamilyBytes, "Original accepted snapshot/segments remain byte-exact without repair or replay");
+    if (loss === "root") {
+      assert.equal(fs.existsSync(journalOptions.path), false, "Late completion cannot recreate accepted authority under the fresh canonical root");
+      assert.ok(displacedRoot);
+      assert.deepEqual(Locks.readTelegramRuntimeState(join(displacedRoot, basename(statePath))).profiles.default!.workspace, displacedWorkspace, "The displaced original envelope also remains intact");
+    }
+    if (loss) assert.deepEqual(Locks.readTelegramRuntimeState(statePath).profiles.default!.workspace, canonical,
+      "Neither late transition nor independent original output can republish the displaced namespace");
+  } finally {
+    release(); await pending;
+    await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, followerCtx);
+    await leader.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, leaderCtx);
+    restoreFetch();
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+  };
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { createHash } from "node:crypto";
+    import { mkdtemp, realpath, writeFile, readFile, rm } from "node:fs/promises";
+    import fs from "node:fs";
+    import { join, dirname, basename, relative } from "node:path";
+    import { tmpdir } from "node:os";
+    import { mock } from "node:test";
+    import * as Paths from "./lib/paths.ts";
+    import * as Locks from "./lib/locks.ts";
+    import * as Journal from "./lib/journal.ts";
+    const artifact = ${JSON.stringify(artifact)}, issued = ${issued}, loss = ${JSON.stringify(loss)};
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const waitForCondition = ${waitForCondition.toString()};
+    const parseJsonRequestBody = ${parseJsonRequestBody.toString()};
+    const getRuntimeTelegramApiMethod = ${getRuntimeTelegramApiMethod.toString()};
+    const createRuntimeTelegramApiResponse = ${createRuntimeTelegramApiResponse.toString()};
+    const setTestFetch = ${setTestFetch.toString()};
+    const keepAlive = setInterval(() => {}, 60000);
+    try { await (${run.toString()})(); console.log("warm-original-pass"); }
+    finally { clearInterval(keepAlive); mock.restoreAll(); }
+  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 15000 });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /warm-original-pass/u);
+}, 20000);
+
+let productionRootFixtureSequence = 0;
+
+function launchProductionRootFixture<TStats extends { pid: number }>(role: string, source: string, executionMs = 20000) {
+  const launchOrdinal = ++productionRootFixtureSequence;
+  const readClock = performance.now.bind(performance), launchedAt = readClock();
+  const checkpoints: Array<{ phase: string; elapsedMs: number }> = [];
+  let readyOrdinal: number | undefined;
+  const child = spawn(process.execPath, ["--experimental-strip-types", "--experimental-test-module-mocks", "--input-type=module"], { stdio: ["pipe", "pipe", "pipe", "ipc"] });
+  assert.ok(child.stdin && child.stdout && child.stderr);
+  let sequence = 0, stdout = "", stderr = "", closed = false, failure: Error | undefined, checkpoint = "module-linking";
+  const pending = new Map<number, { resolve: (value: TStats) => void; reject: (error: Error) => void }>();
+  const fail = (error: Error) => {
+    failure ??= error;
+    for (const waiter of pending.values()) waiter.reject(failure);
+    pending.clear();
+  };
+  const ready = new Promise<TStats>((resolve, reject) => { pending.set(0, { resolve, reject }); });
+  const deadline = (phase: string) => { fail(new Error(`OS-root ${phase} (${role}; checkpoint=${checkpoint}): ${stderr}`)); child.kill("SIGKILL"); };
+  let timer = setTimeout(() => deadline("startup timeout"), 10000);
+  const total = setTimeout(() => deadline("total bound"), 10000 + executionMs);
+  child.stderr.on("data", chunk => { stderr += String(chunk); });
+  child.stdout.on("data", chunk => { stdout += String(chunk); });
+  child.on("message", raw => {
+    const message = raw as { id: number; result: TStats; error?: string; fixtureCheckpoint?: string; pid?: number };
+    if (message.fixtureCheckpoint && message.pid === child.pid) {
+      checkpoint = message.fixtureCheckpoint;
+      checkpoints.push({ phase: checkpoint, elapsedMs: Math.max(0, Math.round(readClock() - launchedAt)) });
+      if (checkpoints.length > 16) checkpoints.shift();
+      return;
+    }
+    if (message.id === 0) {
+      if (message.result?.pid === child.pid && readyOrdinal === undefined) readyOrdinal = ++productionRootFixtureSequence;
+      clearTimeout(timer); timer = setTimeout(() => deadline("execution/drain timeout"), executionMs);
+    }
+    const waiter = pending.get(message.id); pending.delete(message.id);
+    if (message.error) waiter?.reject(new Error(message.error)); else waiter?.resolve(message.result);
+  });
+  child.on("error", fail); child.stdin.on("error", fail);
+  const completion = new Promise<void>((resolve, reject) => child.once("close", (code, signal) => {
+    closed = true; clearTimeout(timer); clearTimeout(total);
+    const successful = code === 0 && signal === null && !failure;
+    const error = failure ?? new Error(`OS-root closed ${role} ${code}/${signal}: ${stderr}`);
+    if (successful) {
+      for (const waiter of pending.values()) waiter.reject(error);
+      pending.clear(); resolve();
+    } else { fail(error); reject(error); }
+  }));
+  void completion.catch(() => undefined); void ready.catch(() => undefined);
+  child.stdin.end(`process.send?.({ fixtureCheckpoint: "static-imports-complete", pid: process.pid });\n${source}`);
+  const request = (command: string) => new Promise<TStats>((resolve, reject) => {
+    if (closed) { reject(new Error("OS root already closed")); return; }
+    const id = ++sequence; pending.set(id, { resolve, reject }); child.send({ id, command });
+  });
+  return { pid: child.pid, ready, request, waitForExit: () => completion,
+    diagnostics: () => ({ role, pid: child.pid, launchOrdinal, readyOrdinal, checkpoint, checkpoints: checkpoints.map(row => ({ ...row })), closed, stdout, stderr, firstFailure: failure?.message }),
+    async stop() { if (!closed) await request("stop"); await completion; } };
+}
+
+test("OS-root fixture retains its first deadline failure through native close", async () => {
+  const fixture = launchProductionRootFixture<{ pid: number }>("deadline-control", `
+    console.log("fixture native stdout"); console.error("fixture native stderr");
+    process.on("message", () => {});
+    process.send?.({ id: 0, fixtureCheckpoint: "static-imports-complete", pid: process.pid });
+    process.send?.({ id: 0, result: { pid: process.pid } });
+    for (let index = 0; index < 40; index++) process.send?.({ fixtureCheckpoint: "static-imports-complete", pid: process.pid });
+    setInterval(() => process.send?.({ id: 0, fixtureCheckpoint: "static-imports-complete", pid: process.pid }), 5);
+  `, 25);
+  assert.equal((await fixture.ready).pid, fixture.pid, "A diagnostic checkpoint cannot acknowledge readiness");
+  const first = await fixture.request("hold").then(() => undefined, error => error);
+  assert.ok(first instanceof Error);
+  assert.match(first.message, /OS-root execution\/drain timeout \(deadline-control; checkpoint=static-imports-complete\)/u);
+  await assert.rejects(fixture.stop(), error => error === first, "Native close must not replace the exact first deadline failure");
+  const retained = fixture.diagnostics();
+  assert.match(retained.stdout, /fixture native stdout/u); assert.match(retained.stderr, /fixture native stderr/u);
+  assert.equal(retained.firstFailure, first.message); assert.equal(retained.closed, true);
+  assert.equal(retained.checkpoints.length, 16, "Repeated diagnostics remain bounded and cannot renew execution/drain");
+  assert.ok(retained.checkpoints.every(row => row.phase === "static-imports-complete" && row.elapsedMs >= 0));
+}, 15000);
+
+test("OS-root startup checkpoints cannot acknowledge readiness or renew the original deadline", async () => {
+  const fixture = launchProductionRootFixture<{ pid: number }>("startup-progress-control", `
+    process.on("message", () => {});
+    setInterval(() => process.send?.({ id: 0, fixtureCheckpoint: "waiting-without-ready", pid: process.pid }), 5);
+  `, 25);
+  try {
+    const first = await fixture.ready.then(() => undefined, error => error);
+    assert.ok(first instanceof Error);
+    assert.match(first.message, /OS-root startup timeout \(startup-progress-control; checkpoint=waiting-without-ready\)/u);
+    await assert.rejects(fixture.waitForExit(), error => error === first, "Progress cannot replace the exact original startup failure at native close");
+    const retained = fixture.diagnostics();
+    assert.equal(retained.readyOrdinal, undefined); assert.equal(retained.closed, true);
+    assert.equal(retained.firstFailure, first.message);
+    assert.equal(retained.checkpoints.length, 16);
+    assert.ok(retained.checkpoints.every(row => row.phase === "waiting-without-ready" && row.elapsedMs >= 0));
+  } finally { await fixture.waitForExit().catch(() => undefined); }
+}, 15000);
+
+test("OS-root diagnostic snapshot does not invent a first failure after healthy native close", async () => {
+  const fixture = launchProductionRootFixture<{ pid: number }>("healthy-control", `
+    console.log("fixture healthy stdout");
+    process.on("message", ({ id, command }) => {
+      process.send?.({ id, result: { pid: process.pid } }, () => { if (command === "stop") process.disconnect?.(); });
+    });
+    process.send?.({ id: 0, result: { pid: process.pid } });
+  `, 2000);
+  assert.equal((await fixture.ready).pid, fixture.pid);
+  await fixture.stop();
+  const observed = fixture.diagnostics();
+  assert.equal(observed.closed, true); assert.equal(observed.firstFailure, undefined);
+  assert.match(observed.stdout, /fixture healthy stdout/u);
+}, 15000);
+
+for (const artifact of ["source", "compiled"] as const)
+test(`Production separate OS Restore follower separates original ACK from menu publication (${artifact})`, async () => {
+  const childRun = async (role: "leader" | "follower", agentDir: string) => {
+    const { readFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const base = artifact === "source" ? "./lib/" : "./dist/lib/";
+    const suffix = artifact === "source" ? ".ts" : ".js";
+    const moduleUrl = (name: string) => new URL(base + name + suffix, import.meta.url).href;
+    const LockModel: typeof Locks = await import(moduleUrl("locks"));
+    const ThreadModel: typeof Threads = await import(moduleUrl("threads"));
+    const JournalModel: typeof Journal = await import(moduleUrl("journal"));
+    const BusModel: typeof Bus = await import(moduleUrl("bus"));
+    const ActivityModel: typeof import("../lib/activity.ts") = await import(moduleUrl("activity"));
+    const PiModel: typeof import("../lib/pi.ts") = await import(moduleUrl("pi"));
+    let lockState: { kind: string; pid?: number } | undefined;
+    mock.module(moduleUrl("locks"), { namedExports: { ...LockModel, createTelegramLockRuntime(options: Parameters<typeof LockModel.createTelegramLockRuntime>[0]) {
+      const actual = LockModel.createTelegramLockRuntime(options), getState = actual.getState;
+      actual.getState = () => { const state = getState(); lockState = { kind: state.kind, ...("lock" in state ? { pid: state.lock.pid } : {}) }; return state; };
+      return actual;
+    } } });
+    let originalView: Threads.TelegramWorkspaceRestore | undefined;
+    mock.module(moduleUrl("threads"), { namedExports: { ...ThreadModel, createTelegramWorkspaceRestoreResolver(options: Parameters<typeof ThreadModel.createTelegramWorkspaceRestoreResolver>[0]) {
+      const resolve = ThreadModel.createTelegramWorkspaceRestoreResolver(options);
+      return () => { const view = resolve(); if (view) { if (originalView) assert.equal(view, originalView); originalView = view; } return view; };
+    } } });
+    let publication: ReturnType<typeof ActivityModel.createTelegramActivityPublicationRuntime> | undefined;
+    mock.module(moduleUrl("activity"), { namedExports: { ...ActivityModel, createTelegramActivityPublicationRuntime(options: Parameters<typeof ActivityModel.createTelegramActivityPublicationRuntime>[0]) {
+      publication = ActivityModel.createTelegramActivityPublicationRuntime(options); return publication;
+    } } });
+    let registry: ReturnType<typeof BusModel.createTelegramBusFollowerRegistry> | undefined;
+    const registrationPids: number[] = [], menuRequests: Array<{ instanceId: string; operationId: string }> = [];
+    const menuTrace: Array<Record<string, unknown>> = [], traceStartedAt = performance.now();
+    const traceMenu = (phase: string, requestId: string, details: Record<string, unknown> = {}) => {
+      // Evidence is capped without turning diagnostics into a transport veto.
+      if (menuTrace.length < 16) menuTrace.push({ phase, requestId, elapsedMs: Math.round(performance.now() - traceStartedAt), ...details });
+    };
+    const traceReply = (phase: string, requestId: string, reply: Bus.TelegramBusEnvelope | undefined) =>
+      traceMenu(phase, requestId, { kind: reply?.kind, ...(reply?.kind === "bus.ack" ? { replyRequestId: reply.requestId, ok: reply.ok, message: reply.message, errorCode: reply.error?.code } : {}) });
+    const traceError = (phase: string, requestId: string, error: unknown) => {
+      const causes: Array<{ name: string; message: string }> = [];
+      for (let depth = 0; depth < 4 && error instanceof Error; depth++) {
+        causes.push({ name: error.name, message: error.message.slice(0, 192) }); error = error.cause;
+      }
+      traceMenu(phase, requestId, { causes });
+    };
+    mock.module(moduleUrl("bus"), { namedExports: { ...BusModel,
+      sendTelegramBusLocalEnvelope(options: Parameters<typeof BusModel.sendTelegramBusLocalEnvelope>[0]) {
+        if (options.envelope.kind !== "follower.deliverSelectedMenu") return BusModel.sendTelegramBusLocalEnvelope(options);
+        const requestId = options.envelope.requestId;
+        traceMenu("client-call", requestId, { timeoutMs: options.timeoutMs });
+        return BusModel.sendTelegramBusLocalEnvelope(options).then(reply => {
+          traceReply("client-reply", requestId, reply); return reply;
+        }, error => { traceError("client-error", requestId, error); throw error; });
+      },
+      createTelegramBusFollowerRegistry() { registry = BusModel.createTelegramBusFollowerRegistry(); return registry; },
+      createTelegramBusLocalServer(options: Parameters<typeof BusModel.createTelegramBusLocalServer>[0]) {
+        return BusModel.createTelegramBusLocalServer({ ...options, handleEnvelope(request) {
+          if (role === "leader" && request.kind === "follower.register") registrationPids.push(request.registration.pid!);
+          if (role !== "leader" || request.kind !== "follower.deliverSelectedMenu") return options.handleEnvelope(request);
+          menuRequests.push({ instanceId: request.instanceId, operationId: request.operationId });
+          traceMenu("server-call", request.requestId);
+          try {
+            return Promise.resolve(options.handleEnvelope(request)).then(reply => {
+              traceReply("server-reply", request.requestId, reply); return reply;
+            }, error => { traceError("server-error", request.requestId, error); throw error; });
+          } catch (error) { traceError("server-error", request.requestId, error); throw error; }
+        } });
+      },
+    } });
+    let settingsCalls = 0;
+    mock.module(moduleUrl("pi"), { namedExports: { ...PiModel, async createSettingsManager(cwd: string) {
+      assert.equal(role, "follower"); assert.equal(cwd, "/native-restore-follower"); settingsCalls++;
+      return PiModel.normalizeSettingsManager({ flush() {}, getEnabledModels: () => undefined, setEnabledModels() { assert.fail("The native menu witness does not persist model settings"); } });
+    } } });
+    let binding: Journal.TelegramUpdateJournalRuntimeBinding | undefined;
+    let sourceBinding: string | undefined, sourceDigest: Journal.TelegramUpdateJournalEntryDigest | undefined, sourceRemovals = 0;
+    let durableCompletion: Journal.TelegramUpdateJournalSourceCompletion | undefined;
+    const seen = new WeakSet<object>();
+    mock.module(moduleUrl("journal"), { namedExports: { ...JournalModel, createTelegramUpdateJournalBindingRuntime(options: Parameters<typeof JournalModel.createTelegramUpdateJournalBindingRuntime>[0]) {
+      const runtime = JournalModel.createTelegramUpdateJournalBindingRuntime(options);
+      for (const method of ["resolveLeader", "resolveFollower"] as const) {
+        const resolve = runtime[method];
+        runtime[method] = () => {
+          const actual = resolve(); if (!actual) return actual;
+          if ((role === "leader" && method === "resolveLeader") || (role === "follower" && method === "resolveFollower")) binding = actual;
+          if (!seen.has(actual.journal)) {
+            seen.add(actual.journal);
+            const journal = actual.journal, remove = journal.removeCompletedExact;
+            journal.removeCompletedExact = (...args: Parameters<typeof remove>) => {
+              const original = args[0].includes(100) ? journal.read().entries.find(row => row.updateId === 100) : undefined;
+              const result = remove(...args);
+              if (original && result.removedUpdateIds.includes(100)) {
+                sourceBinding = actual.recoveryKey; sourceDigest = JournalModel.createTelegramUpdateJournalEntryDigest(original); sourceRemovals++;
+                durableCompletion = result.sourceCompletions?.find(row => row.updateId === 100);
+              }
+              return result;
+            };
+          }
+          return actual;
+        };
+      }
+      return runtime;
+    } } });
+    const BindingsModel: typeof Bindings = await import(moduleUrl("bindings"));
+    let originalPlan: import("../lib/commands.ts").TelegramPreparedHeldCommand | undefined;
+    mock.module(moduleUrl("bindings"), { namedExports: { ...BindingsModel,
+      createTelegramFollowerSelectedCommandBinding(options: Parameters<typeof BindingsModel.createTelegramFollowerSelectedCommandBinding>[0]) {
+        const owner = BindingsModel.createTelegramFollowerSelectedCommandBinding(options); if (!owner) return owner;
+        const prepare = owner.prepare;
+        owner.prepare = (...args: Parameters<typeof prepare>) => {
+          const plan = prepare(...args); if (plan) { assert.equal(originalPlan, undefined); originalPlan = plan; } return plan;
+        };
+        return owner;
+      },
+    } });
+    const extension = (await import(artifact === "source" ? "./index.ts" : "./dist/index.js")).default;
+    const dispatches: unknown[] = [], notices: string[] = [];
+    const harness = createRuntimePiHarness({ sendUserMessage(message) { dispatches.push(message); } });
+    const ctx = createRuntimeExtensionContext({ cwd: `/native-restore-${role}`,
+      sessionManager: { getSessionId: () => `native-restore-${role}`, getEntries: () => [] },
+      modelRegistry: { refresh() {}, getAvailable: () => [], isUsingOAuth: () => false }, getContextUsage: () => undefined });
+    Object.assign(ctx.ui, { notify(message: string) { notices.push(message); } });
+    const payloads: Array<{ method: string; payload: Record<string, unknown>; messageId: number }> = [];
+    const messageThreads = new Map<number, number>(), incoming: unknown[] = [], deletions: unknown[] = [];
+    let polls = 0, creations = 0, menus = 0, menuReturned = 0, nextMessage = 500, stopped = false;
+    let deliver: (() => void) | undefined, releaseMenu!: () => void;
+    const menuHold = new Promise<void>(resolve => { releaseMenu = resolve; });
+    const submit = (update: unknown) => { incoming.push(update); deliver?.(); };
+    const restoreFetch = setTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input), payload = parseJsonRequestBody(init) ?? {};
+      if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
+      assert.equal(role, "leader", `Follower cannot use direct Telegram transport for ${method}`);
+      if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: 100 + ++creations, name: "Fixture" });
+      if (method === "getUpdates") {
+        if (++polls === 1) return createRuntimeTelegramApiResponse([]);
+        return await new Promise<Response>((resolve, reject) => {
+          const abort = () => { deliver = undefined; reject(new DOMException("fixture stop", "AbortError")); };
+          deliver = () => { if (!incoming.length) return; const batch = incoming.splice(0); deliver = undefined; init?.signal?.removeEventListener("abort", abort); resolve(createRuntimeTelegramApiResponse(batch)); };
+          if (init?.signal?.aborted) abort(); else { init?.signal?.addEventListener("abort", abort, { once: true }); deliver(); }
+        });
+      }
+      if (["sendMessage", "sendRichMessage", "editMessageText", "editMessageReplyMarkup", "forwardMessage", "copyMessage"].includes(method ?? "")) {
+        const messageId = method!.startsWith("edit") && typeof payload.message_id === "number" ? payload.message_id : ++nextMessage;
+        if (typeof payload.message_thread_id === "number") messageThreads.set(messageId, payload.message_thread_id);
+        payloads.push({ method: method!, payload, messageId });
+        if (JSON.stringify(payload).includes("menu:model")) {
+          assert.equal(payload.message_thread_id, 103); assert.deepEqual(deletions, [102]);
+          assert.equal(menuRequests.length, 1, "The held HTTP comes from the actual selected-menu follower RPC");
+          menus++; await menuHold; menuReturned++;
+        }
+        return createRuntimeTelegramApiResponse({ message_id: messageId, chat: { id: 77, type: "private" }, message_thread_id: messageThreads.get(messageId) });
+      }
+      if (method === "deleteForumTopic") { deletions.push(payload.message_thread_id); return createRuntimeTelegramApiResponse(true); }
+      if (["deleteWebhook", "setMyCommands", "sendChatAction", "deleteMessage", "editForumTopic", "answerCallbackQuery"].includes(method ?? "")) return createRuntimeTelegramApiResponse(true);
+      throw new Error(`Unexpected native Restore method ${method}`);
+    });
+    const button = (prefix: string, selectedThread?: number) => {
+      for (const row of [...payloads].reverse()) {
+        const markup = row.payload.reply_markup as { inline_keyboard?: Array<Array<{ callback_data?: string }>> } | undefined;
+        const cell = markup?.inline_keyboard?.flat().find(value => value.callback_data?.startsWith(prefix) && (selectedThread === undefined || value.callback_data.endsWith(`:${selectedThread}`)));
+        if (cell?.callback_data) return { data: cell.callback_data, messageId: row.messageId, threadId: messageThreads.get(row.messageId) };
+      }
+      return undefined;
+    };
+    const stats = () => {
+      const acknowledgement = originalPlan?.inspectCompletion();
+      if (acknowledgement) {
+        assert.deepEqual(acknowledgement, originalPlan!.source);
+        assert.deepEqual(acknowledgement, { ...sourceDigest, journalBindingKey: sourceBinding });
+      }
+      return { pid: process.pid, lockState, polls, creations, menus, menuReturned, sourceRemovals, sourceBinding, sourceDigest,
+        durableCompletion, sourceAck: acknowledgement, preparedSource: originalPlan?.source, journalBindingKey: binding?.recoveryKey,
+        originalPending: binding?.journal.read().entries.some(row => row.updateId === 100),
+        publicationPending: publication?.hasPending(), publicationUnconfirmed: publication?.hasUnconfirmed(),
+        viewRows: originalView && LockModel.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction"), () => originalView!.listLiveRebindings()),
+        registrationPids, menuRequests, menuTrace, deletions, dispatches: dispatches.length, settingsCalls,
+        registered: registry?.list().map(value => ({ instanceId: value.instanceId, sessionId: value.sessionId, pid: value.pid, target: value.target, capabilities: value.protocol?.capabilities })),
+        restoreButton: !!button("rerouterestore:"), followerButton: !!button("reroutenew:", 102), notices };
+    };
+    const perform = async (command: string) => {
+      if (command === "connect") await harness.commands.get("telegram-connect")!.handler("", ctx);
+      else if (command === "admit") submit({ update_id: 100, message: { message_id: 100, date: Math.floor(Date.now() / 1000), chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false }, text: "/start" } });
+      else if (command === "restore" || command === "choose-follower") {
+        assert.equal(role, "leader");
+        const row = button(command === "restore" ? "rerouterestore:" : "reroutenew:", command === "restore" ? undefined : 102); assert.ok(row);
+        submit({ update_id: command === "restore" ? 101 : 102, callback_query: { id: command, from: { id: 77, is_bot: false }, data: row.data,
+          message: { message_id: row.messageId, date: 1, chat: { id: 77, type: "private" }, message_thread_id: row.threadId } } });
+      } else if (command === "release") releaseMenu();
+      else if (command === "diagnostics") return { ...stats(), logs: await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8").catch(() => "missing") };
+      else if (command === "stop") {
+        releaseMenu(); await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx); stopped = true;
+        assert.equal(originalPlan?.inspectCompletion(), undefined, "The native plan ACK ends with its actual follower lifetime");
+        restoreFetch(); mock.restoreAll(); return { pid: process.pid, stopped };
+      } else if (command !== "stats") throw new Error("Unknown native Restore fixture command");
+      return stats();
+    };
+    extension(harness.pi); await harness.handlers.get("session_start")?.({}, ctx);
+    process.on("message", raw => {
+      const { id, command } = raw as { id: number; command: string };
+      void perform(command).then(result => process.send?.({ id, result }, () => { if (command === "stop") process.disconnect?.(); }), async error => {
+        const logs = await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8").catch(() => "missing");
+        process.send?.({ id, error: `${command}: ${error instanceof Error ? error.stack : error}\n${logs}` }, () => {
+          if (command === "stop") { restoreFetch(); mock.restoreAll(); process.disconnect?.(); }
+        });
+      });
+    });
+    process.send?.({ id: 0, result: { pid: process.pid } });
+  };
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-native-restore-origin-")));
+  await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ botToken: "123:native-restore-origin", botId: 123, allowedUserId: 77,
+    threads: { automaticCleanup: false } }), { mode: 0o600 });
+  type Stats = { pid: number; lockState?: { kind: string; pid?: number }; polls?: number; creations?: number; menus?: number; menuReturned?: number;
+    sourceRemovals?: number; sourceBinding?: string; sourceDigest?: Journal.TelegramUpdateJournalEntryDigest; durableCompletion?: unknown;
+    sourceAck?: Updates.TelegramDeferredSourceEvidence; preparedSource?: Updates.TelegramDeferredSourceEvidence; journalBindingKey?: string; originalPending?: boolean; publicationPending?: boolean; publicationUnconfirmed?: boolean;
+    viewRows?: Threads.TelegramWorkspaceLiveRebindIntent[]; registrationPids?: number[]; menuRequests?: Array<{ instanceId: string; operationId: string }>;
+    menuTrace?: Array<{ phase: string; requestId: string; replyRequestId?: string; elapsedMs: number; ok?: boolean; errorCode?: string }>;
+    deletions?: unknown[]; dispatches?: number; settingsCalls?: number; registered?: Array<{ instanceId: string; sessionId: string; pid?: number; target: { chatId: number; threadId?: number }; capabilities?: readonly string[] }>;
+    restoreButton?: boolean; followerButton?: boolean; notices?: string[]; stopped?: boolean };
+  const launch = (role: "leader" | "follower") => launchProductionRootFixture<Stats>(`native-restore-${role}`, `
+    import assert from "node:assert/strict";
+    import { mock } from "node:test";
+    import * as Paths from "./lib/paths.ts";
+    const artifact = ${JSON.stringify(artifact)}, agentDir = ${JSON.stringify(agentDir)};
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const parseJsonRequestBody = ${parseJsonRequestBody.toString()};
+    const getRuntimeTelegramApiMethod = ${getRuntimeTelegramApiMethod.toString()};
+    const createRuntimeTelegramApiResponse = ${createRuntimeTelegramApiResponse.toString()};
+    const setTestFetch = ${setTestFetch.toString()};
+    await (${childRun.toString()})(${JSON.stringify(role)}, agentDir);
+  `);
+  const roots: Array<ReturnType<typeof launch>> = [];
+  let complete = false, leaderObserved: Stats | undefined, followerObserved: Stats | undefined;
+  try {
+    const leader = launch("leader"), follower = launch("follower"); roots.push(leader, follower);
+    assert.equal((await leader.ready).pid, leader.pid); assert.equal((await follower.ready).pid, follower.pid);
+    assert.notEqual(leader.pid, follower.pid);
+    await leader.request("connect"); await follower.request("connect");
+    const registered = (await leader.request("stats")).registered!;
+    assert.equal(registered.length, 1); assert.equal(registered[0]!.pid, follower.pid); assert.equal(registered[0]!.sessionId, "native-restore-follower");
+    for (const capability of [...Bus.TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES, Bus.TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES]) assert.ok(registered[0]!.capabilities?.includes(capability));
+    await leader.request("admit");
+    await waitForAsyncCondition(async () => (await leader.request("stats")).restoreButton === true, 5000);
+    await leader.request("restore");
+    await waitForAsyncCondition(async () => (await leader.request("stats")).followerButton === true, 5000);
+    await leader.request("choose-follower");
+    await waitForAsyncCondition(async () => {
+      leaderObserved = await leader.request("stats"); followerObserved = await follower.request("stats");
+      return leaderObserved.menus === 1 && leaderObserved.sourceRemovals === 1 && !!followerObserved.sourceAck && followerObserved.publicationPending === true;
+    }, 5000);
+    const before = leaderObserved!, recipient = followerObserved!;
+    assert.deepEqual(recipient.lockState, { kind: "active-elsewhere", pid: leader.pid });
+    assert.deepEqual(before.registrationPids, [follower.pid]); assert.equal(recipient.polls, 0);
+    assert.equal(before.creations, 3); assert.equal(before.menuReturned, 0); assert.equal(before.sourceRemovals, 1); assert.equal(before.originalPending, false);
+    assert.equal(before.durableCompletion, undefined); assert.ok(before.sourceBinding && recipient.journalBindingKey);
+    assert.notEqual(before.sourceBinding, recipient.journalBindingKey);
+    assert.deepEqual(before.viewRows?.[0]?.request.source, { journalBindingKey: before.sourceBinding, updateIds: [100] });
+    assert.equal(recipient.sourceRemovals, 1); assert.equal(recipient.originalPending, false); assert.equal(recipient.durableCompletion, undefined);
+    assert.deepEqual(recipient.sourceAck, recipient.preparedSource);
+    assert.deepEqual(recipient.sourceAck, { ...recipient.sourceDigest, journalBindingKey: recipient.journalBindingKey });
+    assert.notEqual(recipient.sourceDigest?.sourceSha256, before.sourceDigest?.sourceSha256, "The projected recipient source is not the donor original");
+    assert.equal(before.viewRows?.length, 1); assert.equal(before.viewRows![0]!.phase, "finished");
+    assert.equal(recipient.viewRows?.length, 1);
+    assert.deepEqual(recipient.viewRows![0]!.request, before.viewRows![0]!.request, "Both original Restore views retain the exact operation, source, binding and target");
+    assert.deepEqual(recipient.viewRows![0]!.recipient, before.viewRows![0]!.recipient, "Both original Restore views retain the exact recipient generation");
+    assert.deepEqual(before.viewRows![0]!.request.target, { chatId: 77, threadId: 103 });
+    assert.equal(before.viewRows![0]!.recipient.kind, "follower");
+    assert.equal(before.viewRows![0]!.recipient.instanceId, registered[0]!.instanceId);
+    assert.equal(before.viewRows![0]!.recipient.sessionId, registered[0]!.sessionId);
+    assert.equal(before.menuRequests?.[0]?.instanceId, registered[0]!.instanceId);
+    assert.equal(before.menuRequests?.[0]?.operationId, before.viewRows![0]!.request.operationId);
+    assert.equal(recipient.settingsCalls, 1); assert.deepEqual(before.deletions, [102]);
+    assert.deepEqual(before.menuTrace?.map(row => row.phase), ["server-call"]);
+    assert.deepEqual(recipient.menuTrace?.map(row => row.phase), ["client-call"]);
+    assert.equal(before.menuTrace![0]!.requestId, recipient.menuTrace![0]!.requestId);
+    assert.equal(before.dispatches, 0); assert.equal(recipient.dispatches, 0);
+    await leader.request("release");
+    await waitForAsyncCondition(async () => (await leader.request("stats")).menuReturned === 1 && (await follower.request("stats")).publicationPending === false, 5000);
+    const after = await leader.request("stats"), afterRecipient = await follower.request("stats");
+    assert.equal(after.sourceRemovals, 1); assert.equal(after.menus, 1); assert.equal(after.menuReturned, 1);
+    assert.deepEqual(afterRecipient.sourceAck, recipient.sourceAck); assert.deepEqual(after.deletions, [102]);
+    assert.equal(afterRecipient.publicationUnconfirmed, false);
+    for (const [observed, phases] of [[after, ["server-call", "server-reply"]], [afterRecipient, ["client-call", "client-reply"]]] as const) {
+      assert.deepEqual(observed.menuTrace?.map(row => row.phase), phases);
+      assert.ok(observed.menuTrace!.every(row => row.requestId === before.menuTrace![0]!.requestId && Number.isSafeInteger(row.elapsedMs) && row.elapsedMs >= 0));
+      assert.equal(observed.menuTrace![1]!.replyRequestId, observed.menuTrace![1]!.requestId);
+      assert.equal(observed.menuTrace![1]!.ok, true); assert.equal(observed.menuTrace![1]!.errorCode, undefined);
+    }
+    assert.equal((await follower.request("stop")).stopped, true); await follower.waitForExit();
+    assert.equal((await leader.request("stop")).stopped, true); await leader.waitForExit();
+    complete = true;
+  } catch (error) {
+    const observations = await Promise.allSettled(roots.map(root => root.request("diagnostics")));
+    try {
+      const failure = { version: 1, artifact, stage: "before-cleanup", pid: process.pid,
+        error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error),
+        leaderObserved, followerObserved, observations: observations.map(row => row.status === "fulfilled" ? row :
+          { status: row.status, reason: row.reason instanceof Error ? { name: row.reason.name, message: row.reason.message, stack: row.reason.stack } : String(row.reason) }) };
+      console.error("native-restore-fixture:" + JSON.stringify(failure));
+      const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
+      if (evidenceDir) {
+        fs.mkdirSync(evidenceDir, { recursive: true });
+        fs.writeFileSync(join(evidenceDir, `restore-${artifact}.json`), JSON.stringify(failure, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+      }
+    } catch (captureError) {
+      try { console.error("native-restore-capture-refused", String(captureError)); } catch { /* Preserve the original fixture Error. */ }
+    }
+    throw error;
+  } finally {
+    const outcomes = await Promise.allSettled(roots.map(root => root.stop()));
+    await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    if (complete) for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+  }
+}, 40000);
+
+
+for (const artifact of ["source", "compiled"] as const)
+for (const profile of [undefined, "work"] as const)
+test(`Production dead queue-owner cleanup retains native process and receipt proof (${artifact}/${profile ?? "default"})`, async (t) => {
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-native-dead-queue-")));
+  const bot = { botToken: "123:native-dead-queue", botId: 123, allowedUserId: 77, lastUpdateId: 0 };
+  await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
+  const journalPath = Paths.resolveTelegramSessionPollingJournalPath("native-donor-session", agentDir, profile);
+  const childRun = async (role: "donor" | "recipient") => {
+    const { readFile } = await import("node:fs/promises"), { existsSync } = await import("node:fs");
+    const JournalModel: typeof Journal = await import(artifact === "source" ? "./lib/journal.ts" : "./dist/lib/journal.js");
+    const extension = (await import(artifact === "source" ? "./index.ts" : "./dist/index.js")).default;
+    const dispatches: unknown[] = [], notices: string[] = [];
+    const harness = createRuntimePiHarness({ sendUserMessage: message => { dispatches.push(message); } });
+    const ctx = createRuntimeExtensionContext({ cwd: `/native-queue-${role}`, isIdle: () => role !== "donor",
+      sessionManager: { getSessionId: () => role === "donor" ? "native-donor-session" : "native-recipient-session" } });
+    Object.assign(ctx.ui, { notify(message: string) { notices.push(message); } });
+    const path = Paths.resolveTelegramSessionPollingJournalPath("native-donor-session", agentDir, profile);
+    const journal = JournalModel.createTelegramUpdateJournalStore({ path, profileName: profile,
+      botIdentity: JournalModel.createTelegramUpdateJournalBotIdentity({ botToken: "123:native-dead-queue", botId: 123 }) });
+    const updates: unknown[] = [];
+    let polls = 0, reply: ((response: Response) => void) | undefined;
+    const restoreFetch = setTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input), body = parseJsonRequestBody(init);
+      if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: false });
+      if (method === "getUpdates") {
+        polls++;
+        if (updates.length || Number(body?.timeout ?? 0) === 0) return createRuntimeTelegramApiResponse(updates.splice(0));
+        return await new Promise<Response>((resolve, reject) => {
+          reply = resolve;
+          const abort = () => { if (reply === resolve) reply = undefined; reject(new DOMException("fixture stop", "AbortError")); };
+          if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      if (method === "sendMessage" || method === "sendRichMessage")
+        return createRuntimeTelegramApiResponse({ message_id: 500, chat: { id: 77, type: "private" } });
+      if (["deleteWebhook", "setMyCommands", "sendChatAction", "setMessageReaction"].includes(method ?? ""))
+        return createRuntimeTelegramApiResponse(true);
+      throw new Error(`Unexpected native queue method ${method}`);
+    });
+    const stats = async () => {
+      const logPath = Paths.resolveTelegramRuntimeLogPath(agentDir);
+      const events = existsSync(logPath) ? (await readFile(logPath, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
+      return { pid: process.pid, polls, dispatches: dispatches.length, notices,
+        entry: existsSync(path) ? journal.read().entries.find(row => row.updateId === 901) : undefined,
+        cleanup: events.filter(event => event.kind === "event" && event.details?.phase === "dead-queue-owner-cleanup"),
+        resets: events.filter(event => event.kind === "event" && event.details?.phase === "state-reset") };
+    };
+    extension(harness.pi); await harness.handlers.get("session_start")?.({}, ctx);
+    process.on("message", raw => {
+      const { id, command } = raw as { id: number; command: string };
+      const perform = async () => {
+        if (command === "connect") await harness.commands.get("telegram-connect")!.handler(profile ?? "", ctx);
+        else if (command === "admit") {
+          assert.equal(role, "donor");
+          updates.push({ update_id: 901, message: { message_id: 901, date: 1, chat: { id: 77, type: "private" },
+            from: { id: 77, is_bot: false, first_name: "Fixture" }, text: "Native accepted input must never replay" } });
+          if (reply) { const resolve = reply; reply = undefined; resolve(createRuntimeTelegramApiResponse(updates.splice(0))); }
+        } else if (command === "disconnect") await harness.commands.get("telegram-disconnect")!.handler("", ctx);
+        else if (command === "debug") await harness.commands.get("telegram-status")!.handler("--debug", ctx);
+        else if (command === "stop") {
+          await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx); restoreFetch();
+          return { pid: process.pid, stopped: true };
+        } else assert.ok(command === "stats" || command === "exit-host");
+        return stats();
+      };
+      void perform().then(result => process.send?.({ id, result }, () => {
+        // Transport was explicitly drained, but this intentionally omits session shutdown: accepted custody survives host exit.
+        if (command === "stop" || command === "exit-host") process.disconnect?.();
+      }), error => process.send?.({ id, error: String(error instanceof Error ? error.stack : error) }));
+    });
+    process.send?.({ id: 0, result: { pid: process.pid } });
+  };
+  type Stats = { pid: number; polls: number; dispatches: number; notices: string[]; entry?: Journal.TelegramUpdateJournalEntry;
+    cleanup: Array<{ category: string; message: string; at: number; profile: string; details: { phase: string; receiptId: string; removedUpdateCount: number } }>;
+    resets: unknown[] };
+  const launch = (role: "donor" | "recipient") => launchProductionRootFixture<Stats>(`native-queue-${role}`, `
+    import assert from "node:assert/strict";
+    import * as Paths from "./lib/paths.ts";
+    const artifact = ${JSON.stringify(artifact)}, profile = ${JSON.stringify(profile)}, agentDir = ${JSON.stringify(agentDir)};
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const parseJsonRequestBody = ${parseJsonRequestBody.toString()};
+    const getRuntimeTelegramApiMethod = ${getRuntimeTelegramApiMethod.toString()};
+    const createRuntimeTelegramApiResponse = ${createRuntimeTelegramApiResponse.toString()};
+    const setTestFetch = ${setTestFetch.toString()};
+    await (${childRun.toString()})(${JSON.stringify(role)});
+  `);
+  const roots: ReturnType<typeof launch>[] = [];
+  let completed = false;
+  try {
+    const donor = launch("donor"); roots.push(donor);
+    assert.equal((await donor.ready).pid, donor.pid);
+    await donor.request("connect"); await donor.request("admit");
+    let original: Stats | undefined;
+    await waitForAsyncCondition(async () => { original = await donor.request("stats"); return original.entry?.state === "queued"; }, 5000);
+    const entry = original!.entry!;
+    assert.ok(entry.queueOwner && entry.queueReceiptId);
+    assert.equal(entry.queueOwner.processId, donor.pid);
+    assert.equal(original!.dispatches, 0);
+    const detached = await donor.request("disconnect");
+    assert.deepEqual(detached.entry, entry, "Transport release cannot dispose or re-key the live session's accepted receipt");
+    assert.equal(ProcessIdentity.isProcessAlive(entry.queueOwner.processId), true);
+    const identity = { instanceId: "native-recovery-observer", processId: process.pid,
+      processBirthId: ProcessIdentity.getTelegramProcessBirthIdentity(process.pid, "native-recovery-observer") };
+    const journal = Journal.createTelegramUpdateJournalStore({ path: journalPath, profileName: profile, queueRuntimeIdentity: identity,
+      botIdentity: Journal.createTelegramUpdateJournalBotIdentity(bot) });
+    const protectedResult = journal.recoverDeadQueueOwner({ queueKind: "prompt", receiptId: entry.queueReceiptId,
+      sourceUpdateIds: [901], deadOwner: entry.queueOwner, recoveryOwner: { ...identity, sessionGeneration: 1 } });
+    assert.ok(protectedResult.status === "owner-alive" || protectedResult.status === "owner-unverifiable",
+      "A live or unverifiable process retains the exact receipt even after transport release");
+    t.diagnostic(`Native owner protection: ${protectedResult.status}`);
+    assert.deepEqual(journal.read().entries, [entry]);
+    assert.equal(detached.cleanup.length, 0);
+    await donor.request("exit-host"); await donor.waitForExit();
+    assert.equal(ProcessIdentity.getTelegramProcessLiveness(entry.queueOwner), "dead",
+      "Natural native close and fresh PID/birth proof, not elapsed time, precede replacement recovery");
+    assert.deepEqual(journal.read().entries, [entry], "Host exit alone cannot settle the original source");
+    const recipient = launch("recipient"); roots.push(recipient);
+    assert.equal((await recipient.ready).pid, recipient.pid);
+    const recovered = await recipient.request("connect");
+    assert.ok(recovered.polls >= 1, "Replacement polling starts independently of receipt disposition");
+    assert.equal(recovered.entry, undefined);
+    assert.equal(recovered.dispatches, 0);
+    assert.equal(recovered.cleanup.length, 1, "One native CAS recovery emits one exact cleanup event");
+    const event = recovered.cleanup[0]!;
+    assert.equal(event.category, "inbound-worker");
+    assert.equal(event.message, "Discarded session-owned queue authority from a confirmed-dead process.");
+    assert.equal(event.profile, profile ?? "default");
+    assert.deepEqual(event.details, { phase: "dead-queue-owner-cleanup", receiptId: entry.queueReceiptId, removedUpdateCount: 1 });
+    const debug = await recipient.request("debug");
+    assert.ok(debug.notices.some(line => line.includes(new Date(event.at).toISOString()) && line.includes(event.message) && line.includes(entry.queueReceiptId!)));
+    assert.equal(debug.resets.length, 0, "Dead queued-owner cleanup is not damaged-envelope reset");
+    assert.deepEqual(journal.read().entries, []);
+    const reconnected = await recipient.request("connect");
+    assert.deepEqual(reconnected.cleanup, recovered.cleanup, "Healthy reconnect cannot renew the old recovery event");
+    assert.equal(reconnected.dispatches, 0, "Terminal dead-owner cleanup never replays the accepted prompt");
+    completed = true;
+  } finally {
+    const cleanup = await Promise.allSettled(roots.map(async root => {
+      try { await root.stop(); } finally { await root.waitForExit(); }
+    }));
+    if (roots.every(root => root.diagnostics().closed)) await rm(agentDir, { recursive: true, force: true });
+    const failed = cleanup.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") {
+      if (completed) throw failed.reason;
+      console.error("Secondary native queue fixture cleanup failure:", failed.reason);
+    }
+  }
+}, 65000);
+
+for (const artifact of ["source", "compiled"] as const)
+for (const profile of [undefined, "work"] as const)
+for (const phase of ["early-threaded", "simultaneous-threaded", "early-classic", "cancel-before-ready-threaded", "cancel-before-ready-classic", "held-ack-threaded", "cancel-after-issue-threaded", "simultaneous-malformed-threaded", "simultaneous-invalid-workspace-threaded", "lost-ack-threaded", "held-receiver-threaded", "cancel-receiver-threaded", "silent-ack-timeout-threaded"] as const)
+test(`Production separate OS startup converges through original admission (${artifact}/${profile ?? "default"}/${phase})`, async () => {
+  const childRun = async (role: "first" | "second", agentDir: string) => {
+    const { join } = await import("node:path");
+    const checkpoint = (stage: string) => process.send?.({ fixtureCheckpoint: stage, pid: process.pid });
+    let registrationPending = false, registrationSocket: import("node:net").Socket | undefined, lostSockets = 0, registrationFailures = 0, nativeTimeouts = 0, replyTimeoutMs: number | undefined, replyElapsedMs: number | undefined;
+    if (phase === "lost-ack-threaded") {
+      const Net = await import("node:net");
+      mock.module("node:net", { namedExports: { ...Net, createConnection(...args: Parameters<typeof Net.createConnection>) {
+        const socket = Net.createConnection(...args);
+        if (registrationPending) registrationSocket = socket;
+        return socket;
+      } } });
+    }
+    const busUrl = new URL(artifact === "source" ? "./lib/bus.ts" : "./dist/lib/bus.js", import.meta.url);
+    const pollingUrl = new URL(artifact === "source" ? "./lib/polling.ts" : "./dist/lib/polling.js", import.meta.url);
+    const lockUrl = new URL(artifact === "source" ? "./lib/locks.ts" : "./dist/lib/locks.js", import.meta.url);
+    const followerUrl = new URL(artifact === "source" ? "./lib/bus-follower.ts" : "./dist/lib/bus-follower.js", import.meta.url);
+    const transportUrl = new URL(artifact === "source" ? "./lib/bus-transport.ts" : "./dist/lib/bus-transport.js", import.meta.url);
+    checkpoint("transport-import");
+    const Transport: typeof import("../lib/bus-transport.ts") = await import(transportUrl.href);
+    checkpoint("transport-import-complete");
+    checkpoint("bus-import");
+    const BusModel: typeof Bus = await import(busUrl.href);
+    checkpoint("bus-import-complete");
+    checkpoint("polling-import");
+    const PollingModel: typeof import("../lib/polling.ts") = await import(pollingUrl.href);
+    checkpoint("polling-import-complete");
+    checkpoint("locks-import");
+    const LockModel: typeof Locks = await import(lockUrl.href);
+    checkpoint("locks-import-complete");
+    let pendingObservations = 0, registrationIssues = 0, registrationAcks = 0, cancelledStarts = 0, preparedAcks = 0, releasedAcks = 0, everRegistered = false, resets = 0;
+    let localRegistration: ReturnType<typeof import("../lib/bus-follower.ts").createTelegramBusFollowerRegistrationState> | undefined;
+    let releaseRegistrationAck!: () => void, releaseReceiver!: () => void;
+    let receiverEntered = 0, receiverReturned = 0, receiverEndpoint: string | undefined;
+    const registrationAckHold = new Promise<void>(resolve => { releaseRegistrationAck = resolve; });
+    const receiverHold = new Promise<void>(resolve => { releaseReceiver = resolve; });
+    mock.module(lockUrl.href, { namedExports: { ...LockModel, createTelegramLockedPollingRuntime(options: Parameters<typeof LockModel.createTelegramLockedPollingRuntime>[0]) {
+      const reset = options.resetDamagedState;
+      const runtime = LockModel.createTelegramLockedPollingRuntime({ ...options, resetDamagedState(assertCurrent) {
+        const changed = reset?.(assertCurrent) ?? false;
+        if (changed) resets++;
+        return changed;
+      } }), start = runtime.start;
+      runtime.start = async (...args: Parameters<typeof start>) => {
+        const result = await start(...args);
+        if (!result.ok && result.canTakeover === false && result.message === "Telegram polling startup was cancelled or superseded.") cancelledStarts++;
+        return result;
+      };
+      return runtime;
+    } } });
+    const registrationPids: number[] = [];
+    mock.module(pollingUrl.href, { namedExports: { ...PollingModel, createTelegramThreadCapabilityOrchestration(options: Parameters<typeof PollingModel.createTelegramThreadCapabilityOrchestration>[0]) {
+      const record = options.recordEvent;
+      return PollingModel.createTelegramThreadCapabilityOrchestration({ ...options, recordEvent(category, error, details) {
+        if (details?.phase === "follower-readiness-wait") pendingObservations++;
+        record(category, error, details);
+      } });
+    } } });
+    mock.module(busUrl.href, { namedExports: { ...BusModel,
+      createTelegramBusLocalServer(options: Parameters<typeof BusModel.createTelegramBusLocalServer>[0]) {
+        return BusModel.createTelegramBusLocalServer({ ...options, async beforeEndpointPublication() {
+          await options.beforeEndpointPublication?.();
+          if (role === "second" && !options.captureArtifactAuthority && (phase === "held-receiver-threaded" || phase === "cancel-receiver-threaded")) {
+            receiverEndpoint = BusModel.resolveTelegramBusSocketPath(options.socketPath);
+            receiverEntered++;
+            await receiverHold;
+            receiverReturned++;
+          }
+        }, async handleEnvelope(request) {
+          if (request.kind === "follower.register") registrationPids.push(request.registration.pid!);
+          const reply = await options.handleEnvelope(request);
+          if (request.kind === "follower.register" && (phase === "held-ack-threaded" || phase === "cancel-after-issue-threaded" || phase === "lost-ack-threaded" || phase === "silent-ack-timeout-threaded")) {
+            assert.equal(reply?.kind === "bus.ack" && reply.ok, true, "The actual leader handler committed a positive native registration result");
+            preparedAcks++;
+            await registrationAckHold;
+            releasedAcks++;
+          }
+          return reply;
+        } });
+      },
+      async sendTelegramBusLocalEnvelope(options: Parameters<typeof BusModel.sendTelegramBusLocalEnvelope>[0]) {
+        if (options.envelope.kind !== "follower.register") return BusModel.sendTelegramBusLocalEnvelope(options);
+        const issued = options.onRequestIssued;
+        let issuedAt: number | undefined;
+        registrationPending = true;
+        replyTimeoutMs = options.timeoutMs;
+        try {
+          const result = await BusModel.sendTelegramBusLocalEnvelope({ ...options, onRequestIssued() { registrationIssues++; issuedAt = performance.now(); issued?.(); } });
+          if (result?.kind === "bus.ack" && result.ok) registrationAcks++;
+          return result;
+        } catch (error) {
+          registrationFailures++;
+          if ((error as NodeJS.ErrnoException).code === "ETIMEDOUT" && Transport.classifyTelegramBusTransportError(error).kind === "timeout") {
+            nativeTimeouts++;
+            replyElapsedMs = issuedAt === undefined ? undefined : performance.now() - issuedAt;
+          }
+          throw error;
+        } finally { registrationPending = false; }
+      },
+    } });
+    // Load the original follower only after installing the delegating Bus observer, so its lexical imports see that observer too.
+    checkpoint("follower-import");
+    const FollowerModel: typeof import("../lib/bus-follower.ts") = await import(followerUrl.href);
+    checkpoint("follower-import-complete");
+    mock.module(followerUrl.href, { namedExports: { ...FollowerModel, createTelegramBusFollowerRegistrationState(options: Parameters<typeof FollowerModel.createTelegramBusFollowerRegistrationState>[0]) {
+      const state = FollowerModel.createTelegramBusFollowerRegistrationState({ ...options, onRegistrationChanged() {
+        everRegistered ||= state.isRegistered();
+        options?.onRegistrationChanged?.();
+      } });
+      localRegistration = state;
+      return state;
+    } } });
+    checkpoint("root-import");
+    const extension = (await import(artifact === "source" ? "./index.ts" : "./dist/index.js")).default;
+    checkpoint("root-import-complete");
+    const harness = createRuntimePiHarness(), ctx = createRuntimeExtensionContext({ cwd: `/os-startup-${role}`, sessionManager: { getSessionId: () => `startup-session-${role}` } });
+    const notices: string[] = [], publications: Array<{ text: string; target: { chatId: unknown; threadId: unknown } }> = [];
+    let connectCalls = 0, connectHandlerEntries = 0, connectSettled = false, capabilityEntered = false, capabilityReturned = false;
+    let polls = 0, activePollers = 0, maxPollers = 0, creations = 0, deletions = 0, takeovers = 0;
+    let releaseCapability!: () => void, releaseStart!: () => void;
+    const capability = new Promise<void>(resolve => { releaseCapability = resolve; }), start = new Promise<void>(resolve => { releaseStart = resolve; });
+    const statePath = Paths.resolveTelegramStatePath(agentDir), name = profile ?? "default";
+    // Observe under the real shared writer guard; peer publication must not race this fixture's strict read.
+    const stats = () => LockModel.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction"), () => {
+      const state = LockModel.readTelegramRuntimeState(statePath).profiles[name];
+      const workspace = state?.workspace as { workspaceBindings?: Array<{ cwd: string; bindingKey: string; slot?: string; target: { chatId: number; threadId?: number } }> } | undefined;
+      const binding = workspace?.workspaceBindings?.find(row => row.cwd === ctx.cwd);
+      return { pid: process.pid, connectCalls, connectHandlerEntries, connectSettled, capabilityEntered, capabilityReturned, pendingObservations, registrationIssues, registrationAcks, cancelledStarts, preparedAcks, releasedAcks, resets, registrationFailures, lostSockets, nativeTimeouts, replyTimeoutMs, replyElapsedMs, receiverEntered, receiverReturned,
+        localRegistered: localRegistration?.isRegistered() ?? false, localTarget: localRegistration?.getTarget(), everRegistered,
+        registrationPids, notices, publications, polls, activePollers, maxPollers, creations, deletions, takeovers,
+        ownerPid: (state?.transport as Locks.TelegramLockEntry | undefined)?.pid, ownerEpoch: (state?.transport as Locks.TelegramLockEntry | undefined)?.leaderEpoch,
+        target: binding?.target, bindingKey: binding?.bindingKey, slot: binding?.slot };
+    });
+    Object.assign(ctx.ui, { notify(text: string) { notices.push(text); }, confirm: async () => { takeovers++; return false; } });
+    const restoreFetch = setTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input), payload = parseJsonRequestBody(init);
+      if (method === "getMe") {
+        capabilityEntered = true;
+        if (role === "first" && !phase.startsWith("simultaneous-")) await capability;
+        capabilityReturned = true;
+        return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: !phase.endsWith("classic") });
+      }
+      if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: 100 + ++creations, name: "Fixture" });
+      if (method === "deleteForumTopic") { deletions++; return createRuntimeTelegramApiResponse(true); }
+      if (method === "getUpdates") {
+        polls++;
+        if (Number(payload?.timeout ?? 0) === 0) return createRuntimeTelegramApiResponse([]);
+        activePollers++; maxPollers = Math.max(maxPollers, activePollers);
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => { activePollers--; reject(new DOMException("fixture stop", "AbortError")); };
+          if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      if (method === "sendMessage" || method === "sendRichMessage") {
+        const text = JSON.stringify(payload);
+        if (text.includes("os-startup-output") || text.includes("os-startup-probe")) {
+          assert.equal(stats().ownerPid, process.pid, "Only the actual native transport owner performs HTTP");
+          publications.push({ text, target: { chatId: payload?.chat_id, threadId: payload?.message_thread_id } });
+        }
+        return createRuntimeTelegramApiResponse({ message_id: 500, chat: { id: 77, type: "private" }, message_thread_id: payload?.message_thread_id });
+      }
+      if (["deleteWebhook", "setMyCommands", "editForumTopic", "sendChatAction"].includes(method)) return createRuntimeTelegramApiResponse(true);
+      throw new Error(`Unexpected startup method ${method}`);
+    });
+    extension(harness.pi); await harness.handlers.get("session_start")?.({}, ctx);
+    const perform = async (command: string): Promise<unknown> => {
+      if (command === "connect") {
+        connectCalls++;
+        if (phase.startsWith("simultaneous-")) await start;
+        connectHandlerEntries++;
+        try { await harness.commands.get("telegram-connect")!.handler(profile ?? "", ctx); } finally { connectSettled = true; }
+        return stats();
+      }
+      if (command === "stats") return stats();
+      if (command === "disconnect") { await harness.commands.get("telegram-disconnect")!.handler("", ctx); return stats(); }
+      if (command === "release") { releaseCapability(); releaseStart(); return { pid: process.pid, released: true }; }
+      if (command === "release-ack") { releaseRegistrationAck(); return stats(); }
+      if (command === "release-receiver") { releaseReceiver(); return stats(); }
+      if (command === "receiver-probe") {
+        assert.ok(receiverEndpoint);
+        const result = await Transport.probeTelegramBusEndpoint({ endpoint: receiverEndpoint, timeoutMs: 100 });
+        let receiverAliasExists: boolean | undefined;
+        if (!Transport.isTelegramBusPipePath(receiverEndpoint)) {
+          const { lstatSync } = await import("node:fs");
+          try { lstatSync(receiverEndpoint); receiverAliasExists = true; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; receiverAliasExists = false; }
+        }
+        return { ...stats(), receiverReachable: result.reachable, receiverAliasExists };
+      }
+      if (command === "lose-reply") {
+        assert.equal(phase, "lost-ack-threaded"); assert.equal(role, "second");
+        assert.ok(registrationPending && registrationSocket && !registrationSocket.destroyed, "The actual issued native registration socket is still pending");
+        registrationSocket.destroy(new Error("Fixture registration reply transport lost"));
+        lostSockets++;
+        return stats();
+      }
+      if (command === "probe") {
+        await assert.rejects(harness.tools.get("telegram_message")!.execute("pending", { text: "os-startup-probe", chat_id: 77, thread_id: 999 }));
+        return stats();
+      }
+      if (command === "publish") {
+        const target = stats().target;
+        assert.ok(phase.endsWith("classic") || target);
+        await harness.tools.get("telegram_message")!.execute("ready", { text: `os-startup-output-${role}`, chat_id: 77, ...(target ? { thread_id: target.threadId } : {}) });
+        return stats();
+      }
+      if (command === "stop") {
+        releaseCapability(); releaseStart(); releaseRegistrationAck(); releaseReceiver();
+        await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+        restoreFetch(); return { stopped: true };
+      }
+      throw new Error("Unknown startup command");
+    };
+    process.on("message", raw => {
+      const { id, command } = raw as { id: number; command: string };
+      void perform(command).then(result => process.send?.({ id, result }, () => { if (command === "stop") process.disconnect?.(); }), error => process.send?.({ id, error: `${command}: ${error instanceof Error ? error.stack : String(error)}` }));
+    });
+    process.send?.({ id: 0, result: { pid: process.pid } });
+  };
+  type Stats = { pid: number; connectCalls: number; connectHandlerEntries: number; connectSettled: boolean; capabilityEntered: boolean; capabilityReturned: boolean; pendingObservations: number;
+    registrationIssues: number; registrationAcks: number; cancelledStarts: number; preparedAcks: number; releasedAcks: number; resets: number; registrationFailures: number; lostSockets: number; nativeTimeouts: number; replyTimeoutMs?: number; replyElapsedMs?: number; receiverEntered: number; receiverReturned: number; receiverReachable?: boolean; receiverAliasExists?: boolean; localRegistered: boolean; localTarget?: { chatId: number; threadId?: number }; everRegistered: boolean;
+    registrationPids: number[]; notices: string[]; publications: Array<{ text: string; target: { chatId: number; threadId?: number } }>;
+    polls: number; activePollers: number; maxPollers: number; creations: number; deletions: number; takeovers: number; ownerPid?: number; ownerEpoch?: string; target?: { chatId: number; threadId?: number }; bindingKey?: string; slot?: string };
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-os-startup-")));
+  const bot = { botToken: "123:os-startup", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } };
+  await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
+  const launch = (role: "first" | "second") => launchProductionRootFixture<Stats>(role, `
+    import assert from "node:assert/strict";
+    import { mock } from "node:test";
+    import * as Paths from "./lib/paths.ts";
+    import * as Locks from "./lib/locks.ts";
+    const artifact = ${JSON.stringify(artifact)}, profile = ${JSON.stringify(profile)}, phase = ${JSON.stringify(phase)};
+    process.env.PI_CODING_AGENT_DIR = ${JSON.stringify(agentDir)};
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const parseJsonRequestBody = ${parseJsonRequestBody.toString()};
+    const getRuntimeTelegramApiMethod = ${getRuntimeTelegramApiMethod.toString()};
+    const createRuntimeTelegramApiResponse = ${createRuntimeTelegramApiResponse.toString()};
+    const setTestFetch = ${setTestFetch.toString()};
+    await (${childRun.toString()})(${JSON.stringify(role)}, ${JSON.stringify(agentDir)});
+  `, phase === "silent-ack-timeout-threaded" ? 45000 : 20000);
+  const first = launch("first"), second = launch("second");
+  const connections: Promise<Stats>[] = [];
+  let originalOwner: Pick<Stats, "ownerPid" | "ownerEpoch"> | undefined;
+  let issuedBinding: Pick<Stats, "target" | "bindingKey" | "slot"> | undefined;
+  const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
+  let stage = "native-roots-ready", failed = false, primaryFailure: unknown;
+  let connectResults: Stats[] | undefined, startupObservation: Stats[] | undefined, publicationObservation: Stats[] | undefined;
+  try {
+    const [a, b] = await Promise.all([first.ready, second.ready]);
+    assert.equal(a.pid, first.pid); assert.equal(b.pid, second.pid); assert.notEqual(a.pid, b.pid); assert.notEqual(a.pid, process.pid); assert.notEqual(b.pid, process.pid);
+    const expectedPhases = ["static-imports-complete", ...["transport", "bus", "polling", "locks", "follower", "root"]
+      .flatMap(name => [`${name}-import`, `${name}-import-complete`])];
+    for (const root of [first, second]) {
+      const diagnostic = root.diagnostics();
+      assert.ok(diagnostic.readyOrdinal !== undefined);
+      assert.deepEqual(diagnostic.checkpoints.map(row => row.phase), expectedPhases, "Native startup progress must cover original import phases in order");
+      assert.ok(diagnostic.checkpoints.every((row, index, rows) => Number.isFinite(row.elapsedMs) && row.elapsedMs >= (rows[index - 1]?.elapsedMs ?? 0)), "Original parent observations are monotonic, not renewed startup clocks");
+    }
+    connections.push(first.request("connect")); void connections[0]!.catch(() => undefined);
+    if (!phase.startsWith("simultaneous-")) {
+      await waitForAsyncCondition(async () => (await first.request("stats")).capabilityEntered);
+      const held = await first.request("stats"); assert.equal(held.ownerPid, a.pid); assert.equal(held.capabilityReturned, false);
+      originalOwner = { ownerPid: held.ownerPid, ownerEpoch: held.ownerEpoch };
+    }
+    connections.push(second.request("connect")); void connections[1]!.catch(() => undefined);
+    if (phase.startsWith("simultaneous-")) {
+      await waitForAsyncCondition(async () => (await first.request("stats")).connectCalls === 1 && (await second.request("stats")).connectCalls === 1);
+      const queued = [await first.request("stats"), await second.request("stats")];
+      assert.ok(queued.every(row => !row.connectSettled && row.connectHandlerEntries === 0), "Both commands are admitted, but neither native handler has entered before the synchronized release");
+      if (phase !== "simultaneous-threaded") {
+        const statePath = Paths.resolveTelegramStatePath(agentDir);
+        await mkdir(dirname(statePath), { recursive: true });
+        const damaged = phase === "simultaneous-malformed-threaded" ? "{ damaged-os-startup" : JSON.stringify({ version: 2, profiles: {
+          default: { workspace: { version: 99 } }, sibling: { runtime: { marker: "fixture-approved-reset-loss" } },
+        } });
+        await writeFile(statePath, damaged, { mode: 0o600 });
+        assert.equal(await readFile(statePath, "utf8"), damaged, "The actual canonical fault precedes both native connect handlers");
+      }
+    } else {
+      await waitForAsyncCondition(async () => (await second.request("stats")).pendingObservations > 0);
+      const waiting = await second.request("probe"), leader = await first.request("stats");
+      assert.equal(waiting.connectSettled, false); assert.equal(waiting.takeovers, 0); assert.equal(waiting.registrationIssues, 0); assert.equal(waiting.registrationAcks, 0);
+      assert.equal(waiting.target, undefined); assert.equal(waiting.polls + leader.polls, 0); assert.equal(waiting.creations + leader.creations, 0);
+      assert.deepEqual(waiting.publications, []); assert.deepEqual(leader.publications, []);
+      if (phase.startsWith("cancel-before-ready")) {
+        await second.request("disconnect");
+        const ended = await connections[1]!;
+        assert.equal(ended.connectSettled, true); assert.equal(ended.cancelledStarts, 1, "Actual native cancellation result, not expiry or a fabricated command-completion flag");
+        assert.equal(ended.registrationIssues + ended.registrationAcks + ended.takeovers + ended.polls, 0);
+        assert.equal(ended.target, undefined);
+        const held = await first.request("stats");
+        assert.equal(held.capabilityReturned, false, "The original leader response is still unsettled after the peer command has actually ended");
+        assert.equal(held.connectSettled, false); assert.equal(held.ownerPid, leader.ownerPid); assert.equal(held.ownerEpoch, leader.ownerEpoch);
+        await second.request("probe");
+      }
+    }
+    stage = "native-connect-release";
+    await Promise.all([first.request("release"), second.request("release")]);
+    if (phase === "held-receiver-threaded" || phase === "cancel-receiver-threaded") {
+      await connections[0];
+      await waitForAsyncCondition(async () => (await second.request("stats")).receiverEntered === 1);
+      const held = await second.request("receiver-probe"), owner = await first.request("stats");
+      assert.equal(held.receiverReturned, 0); assert.equal(held.receiverReachable, false); assert.notEqual(held.receiverAliasExists, true);
+      assert.equal(held.connectSettled, false); assert.equal(held.registrationIssues + held.registrationAcks, 0);
+      assert.equal(held.localRegistered, false); assert.equal(held.everRegistered, false); assert.equal(held.target, undefined);
+      assert.equal(owner.creations, 1); assert.deepEqual(owner.registrationPids, []);
+      await second.request("probe");
+      if (phase === "cancel-receiver-threaded") {
+        await second.request("disconnect");
+        const stopped = await second.request("receiver-probe");
+        assert.equal(stopped.receiverReturned, 0, "Local stop is not settlement of the held original publication callback");
+        assert.equal(stopped.receiverReachable, false); assert.notEqual(stopped.receiverAliasExists, true);
+      }
+      await second.request("release-receiver");
+      await connections[1];
+      const ended = await second.request("receiver-probe");
+      assert.equal(ended.receiverEntered, 1); assert.equal(ended.receiverReturned, 1, "The original native callback actually settled before endpoint assertions");
+      assert.equal(ended.receiverReachable, phase === "held-receiver-threaded");
+      if (phase === "cancel-receiver-threaded") assert.notEqual(ended.receiverAliasExists, true, "No late canonical alias, even a dangling one, after publication cancellation");
+    }
+    if (phase === "held-ack-threaded" || phase === "cancel-after-issue-threaded" || phase === "lost-ack-threaded" || phase === "silent-ack-timeout-threaded") {
+      await connections[0];
+      await waitForAsyncCondition(async () => (await first.request("stats")).preparedAcks === 1);
+      const prepared = await first.request("stats"), issued = await second.request("probe");
+      assert.equal(prepared.creations, 2); assert.equal(prepared.releasedAcks, 0); assert.deepEqual(prepared.registrationPids, [b.pid]);
+      assert.ok(issued.target?.threadId && issued.bindingKey && issued.slot, "The native leader already committed the remote binding before its result returns");
+      issuedBinding = { target: issued.target, bindingKey: issued.bindingKey, slot: issued.slot };
+      assert.equal(issued.registrationIssues, 1); assert.equal(issued.registrationAcks, 0); assert.equal(issued.connectSettled, false);
+      assert.equal(issued.localRegistered, false); assert.equal(issued.localTarget, undefined); assert.equal(issued.everRegistered, false); assert.equal(issued.polls, 0);
+      if (phase === "cancel-after-issue-threaded") {
+        await second.request("disconnect");
+        const stopped = await second.request("probe");
+        assert.equal(stopped.localRegistered, false); assert.equal(stopped.everRegistered, false);
+        assert.deepEqual(stopped.target, issued.target, "Canceling the local caller does not undo the remote committed binding");
+        assert.equal(stopped.deletions, 0); assert.equal((await first.request("stats")).releasedAcks, 0);
+      }
+      if (phase === "lost-ack-threaded") {
+        await second.request("lose-reply");
+        const failed = await connections[1]!;
+        assert.equal(failed.connectSettled, true); assert.equal(failed.cancelledStarts, 0); assert.equal(failed.registrationFailures, 1); assert.equal(failed.lostSockets, 1);
+        assert.equal(failed.registrationIssues, 1); assert.equal(failed.registrationAcks, 0);
+        assert.equal(failed.localRegistered, false); assert.equal(failed.everRegistered, false); assert.equal(failed.takeovers, 0);
+        assert.deepEqual({ target: failed.target, bindingKey: failed.bindingKey, slot: failed.slot }, issuedBinding);
+        assert.equal((await first.request("stats")).releasedAcks, 0, "Caller actually ended after native socket loss, before the positive leader result returns");
+        await second.request("probe");
+      }
+      if (phase === "silent-ack-timeout-threaded") {
+        assert.ok(issued.replyTimeoutMs && issued.replyTimeoutMs > 0 && issued.replyTimeoutMs < 40000, "Observe the unchanged native registration deadline within this fixture's execution bound");
+        const expired = await connections[1]!;
+        assert.equal(expired.replyTimeoutMs, issued.replyTimeoutMs, "The original response deadline is not renewed while pending");
+        assert.equal(expired.nativeTimeouts, 1, "The original native response timer actually expired, not socket loss, readiness expiry or a fixture provider error");
+        assert.ok(expired.replyElapsedMs !== undefined && expired.replyElapsedMs >= issued.replyTimeoutMs * 0.9, "Actual issued ACK wait must respect the native deadline, not a shortened test timer");
+        assert.equal(expired.registrationFailures, 1); assert.equal(expired.lostSockets, 0); assert.equal(expired.cancelledStarts, 0);
+        assert.equal(expired.registrationIssues, 1); assert.equal(expired.registrationAcks, 0); assert.equal(expired.takeovers, 0);
+        assert.equal(expired.localRegistered, false); assert.equal(expired.everRegistered, false);
+        assert.deepEqual({ target: expired.target, bindingKey: expired.bindingKey, slot: expired.slot }, issuedBinding);
+        assert.equal((await first.request("stats")).releasedAcks, 0, "The caller timed out before the held original leader result returned");
+        await second.request("probe");
+      }
+      await first.request("release-ack");
+      await waitForAsyncCondition(async () => (await first.request("stats")).releasedAcks === 1);
+    }
+    connectResults = await Promise.all(connections);
+    stage = "native-poller-convergence";
+    await waitForAsyncCondition(async () => (await first.request("stats")).activePollers + (await second.request("stats")).activePollers === 1);
+    const states = startupObservation = [await first.request("stats"), await second.request("stats")];
+    stage = "native-startup-assertions";
+    assert.equal(states[0]!.ownerPid, states[1]!.ownerPid);
+    if (originalOwner) for (const state of states) assert.deepEqual({ ownerPid: state.ownerPid, ownerEpoch: state.ownerEpoch }, originalOwner, "The original leader epoch survives the peer command and late capability completion");
+    const leader = states.find(row => row.pid === row.ownerPid), follower = states.find(row => row.pid !== row.ownerPid);
+    if (issuedBinding) assert.deepEqual({ target: follower?.target, bindingKey: follower?.bindingKey, slot: follower?.slot }, issuedBinding, "The exact committed target/key/slot survive the late native result without rollback or re-keying");
+    assert.ok(leader && follower);
+    if (phase === "silent-ack-timeout-threaded") assert.ok(leader.polls >= 2, "One long-lived poller may renew sequential HTTP requests while the native ACK timer runs");
+    else assert.equal(leader.polls, 2);
+    assert.equal(leader.activePollers, 1); assert.equal(leader.maxPollers, 1);
+    assert.equal(follower.polls, 0); assert.equal(follower.activePollers, 0); assert.equal(follower.creations, 0);
+    assert.ok(states.every(row => row.connectCalls === 1 && row.connectHandlerEntries === 1 && row.connectSettled)); assert.equal(leader.deletions + follower.deletions, 0);
+    const damagedStart = phase === "simultaneous-malformed-threaded" || phase === "simultaneous-invalid-workspace-threaded";
+    assert.equal(leader.resets + follower.resets, damagedStart ? 1 : 0, "Exactly one positively returned native reset for damage; healthy/canceled/issued controls never reset");
+    if (damagedStart) {
+      const state = Locks.readTelegramRuntimeState(Paths.resolveTelegramStatePath(agentDir));
+      assert.equal(state.profiles.sibling, undefined, "Only the documented approved whole-envelope reset discards sibling continuity");
+      Threads.parseTelegramWorkspaceStateSection(state.profiles[profile ?? "default"]?.workspace, profile ?? "default");
+      WorkspaceAdmission.assertTelegramConsolidatedAdmissionSection(state.profiles[profile ?? "default"]?.admission, profile ?? "default");
+      const config = JSON.parse(await readFile(join(agentDir, "telegram.json"), "utf8"));
+      const selected = config.profiles?.[profile ?? "default"] ?? config;
+      assert.equal(selected.allowedUserId, 77); assert.equal(selected.botToken, "123:os-startup", "Reset never rewrites the paired operator/bot identity");
+    }
+    if (phase === "silent-ack-timeout-threaded") {
+      assert.equal(leader.pid, a.pid); assert.equal(leader.creations, 2); assert.equal(leader.preparedAcks, 1); assert.equal(leader.releasedAcks, 1);
+      assert.equal(follower.registrationIssues, 1); assert.equal(follower.registrationAcks, 0); assert.equal(follower.nativeTimeouts, 1);
+      assert.equal(follower.lostSockets, 0); assert.equal(follower.cancelledStarts, 0); assert.equal(follower.localRegistered, false); assert.equal(follower.localTarget, undefined); assert.equal(follower.everRegistered, false);
+      assert.deepEqual(leader.registrationPids, [b.pid]); assert.equal(leader.takeovers + follower.takeovers, 0);
+      await second.request("probe"); await first.request("publish");
+    } else if (phase === "cancel-receiver-threaded") {
+      assert.equal(leader.pid, a.pid); assert.equal(leader.creations, 1); assert.equal(leader.takeovers + follower.takeovers, 0);
+      assert.equal(follower.cancelledStarts, 1); assert.equal(follower.registrationIssues + follower.registrationAcks, 0);
+      assert.equal(follower.localRegistered, false); assert.equal(follower.localTarget, undefined); assert.equal(follower.everRegistered, false); assert.equal(follower.target, undefined);
+      assert.deepEqual(leader.registrationPids, []);
+      await second.request("probe"); await first.request("publish");
+    } else if (phase === "lost-ack-threaded") {
+      assert.equal(leader.pid, a.pid); assert.equal(leader.creations, 2); assert.equal(leader.preparedAcks, 1); assert.equal(leader.releasedAcks, 1);
+      assert.equal(follower.cancelledStarts, 0); assert.equal(follower.registrationIssues, 1); assert.equal(follower.registrationAcks, 0);
+      assert.equal(follower.registrationFailures, 1); assert.equal(follower.lostSockets, 1);
+      assert.equal(follower.localRegistered, false); assert.equal(follower.localTarget, undefined); assert.equal(follower.everRegistered, false);
+      assert.deepEqual(leader.registrationPids, [b.pid]); assert.equal(leader.takeovers + follower.takeovers, 0);
+      await second.request("probe"); await first.request("publish");
+    } else if (phase === "cancel-after-issue-threaded") {
+      assert.equal(leader.pid, a.pid); assert.equal(leader.creations, 2); assert.equal(leader.preparedAcks, 1); assert.equal(leader.releasedAcks, 1);
+      assert.equal(follower.cancelledStarts, 1); assert.equal(follower.registrationIssues, 1); assert.equal(follower.registrationAcks, 0);
+      assert.ok(follower.target?.threadId); assert.equal(follower.localRegistered, false); assert.equal(follower.localTarget, undefined); assert.equal(follower.everRegistered, false);
+      assert.deepEqual(leader.registrationPids, [b.pid]); assert.equal(leader.takeovers + follower.takeovers, 0);
+      await second.request("probe"); await first.request("publish");
+    } else if (phase.startsWith("cancel-before-ready")) {
+      assert.equal(leader.pid, a.pid); assert.equal(leader.cancelledStarts, 0); assert.equal(follower.cancelledStarts, 1);
+      assert.equal(leader.capabilityReturned, true); assert.equal(leader.creations, phase.endsWith("classic") ? 0 : 1);
+      assert.equal(leader.takeovers + follower.takeovers, 0); assert.equal(follower.registrationIssues + follower.registrationAcks, 0);
+      assert.deepEqual(leader.registrationPids, []); assert.equal(follower.target, undefined);
+      await second.request("probe"); await first.request("publish");
+    } else if (phase === "early-classic") {
+      assert.equal(leader.creations, 0); assert.equal(leader.takeovers, 0); assert.equal(follower.takeovers, 1);
+      assert.equal(follower.target, undefined); assert.equal(follower.registrationIssues + follower.registrationAcks, 0); assert.deepEqual(leader.registrationPids, []);
+      await second.request("probe"); await first.request("publish");
+    } else {
+      assert.equal(leader.creations, 2); assert.equal(leader.takeovers + follower.takeovers, 0);
+      assert.ok(leader.target?.threadId && follower.target?.threadId); assert.notEqual(leader.target.threadId, follower.target.threadId);
+      assert.equal(follower.registrationIssues, 1); assert.equal(follower.registrationAcks, 1); assert.deepEqual(leader.registrationPids, [follower.pid]);
+      assert.equal(follower.localRegistered, true); assert.deepEqual(follower.localTarget, follower.target); assert.equal(follower.everRegistered, true);
+      await first.request("publish"); await second.request("publish");
+    }
+    const final = publicationObservation = [await first.request("stats"), await second.request("stats")], outputs = final.flatMap(row => row.publications);
+    stage = "native-publication-assertions";
+    const singleOutput = phase === "early-classic" || phase.startsWith("cancel-") || phase === "lost-ack-threaded" || phase === "silent-ack-timeout-threaded";
+    assert.equal(outputs.length, singleOutput ? 1 : 2);
+    assert.equal(final.find(row => row.pid === follower.pid)!.publications.length, 0, "Follower output crossed actual leader IPC, not its own HTTP");
+    for (const [index, role] of ["first", "second"].entries()) {
+      if (singleOutput && role === "second") continue;
+      const sent = outputs.filter(row => row.text.includes(`os-startup-output-${role}`));
+      assert.equal(sent.length, 1); assert.deepEqual(sent[0]!.target, states[index]!.target ?? { chatId: 77 });
+    }
+  } catch (error) { failed = true; primaryFailure = error; throw error; }
+  finally {
+    const diagnosticFailures: PromiseRejectedResult[] = [];
+    if (evidenceDir) {
+      try {
+        const logPath = Paths.resolveTelegramRuntimeLogPath(agentDir);
+        let runtimeLog: unknown;
+        try {
+          runtimeLog = fs.statSync(logPath).size <= 2 * 1024 * 1024
+            ? { available: true, text: await readFile(logPath, "utf8") } : { available: false, reason: "over-limit" };
+        } catch (error) { runtimeLog = { available: false, error: String(error) }; }
+        const evidence = { version: 1, artifact, profile: profile ?? "default", phase, stage, failed,
+          failure: primaryFailure instanceof Error ? { name: primaryFailure.name, message: primaryFailure.message, stack: primaryFailure.stack } : String(primaryFailure),
+          connectResults, startupObservation, publicationObservation, originalOwner, issuedBinding,
+          first: first.diagnostics(), second: second.diagnostics(), runtimeLog };
+        await mkdir(evidenceDir, { recursive: true });
+        await writeFile(join(evidenceDir, `startup-${artifact}-${profile ?? "default"}-${phase}.json`),
+          JSON.stringify(evidence, null, 2).replaceAll("123:os-startup", "<fixture-token>") + "\n", { flag: "wx" });
+      } catch (reason) { diagnosticFailures.push({ status: "rejected", reason }); }
+    }
+    await Promise.allSettled([first.request("release"), second.request("release"), first.request("release-ack"), second.request("release-receiver")]);
+    await Promise.allSettled(connections);
+    const stopped = await Promise.allSettled([first, second].map(root => root.stop().finally(() => root.waitForExit())));
+    const removed = first.diagnostics().closed && second.diagnostics().closed
+      ? await Promise.allSettled([rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })]) : [];
+    for (const result of [...diagnosticFailures, ...stopped, ...removed]) if (result.status === "rejected") {
+      if (!failed) throw result.reason;
+      console.error("OS-startup secondary diagnostic/cleanup failure:", result.reason);
+    }
+  }
+}, phase === "silent-ack-timeout-threaded" ? 65000 : 40000);
+
+for (const artifact of ["source", "compiled"] as const)
+for (const profile of [undefined, "work"] as const)
+for (const loss of [false, true, "root", "damaged"] as const)
+for (const refreshBoundary of loss === "damaged" ? [undefined, "held", "cancel", "config"] as const : [undefined])
+for (const ownershipFault of loss === "root" ? [false, true] : [false])
+for (const ipcLoss of loss === "root" && !ownershipFault ? [false, true] : [false])
+test(`Production separate OS roots retain original lifetimes across namespace loss (${artifact}/${profile ?? "default"}/${loss}${refreshBoundary ? `/refresh-${refreshBoundary}` : ""}${ownershipFault ? "/ownership-read-refusal" : ""}${ipcLoss ? "/issued-ipc-loss" : ""})`, async () => {
+  const childRun = async (role: "leader" | "follower", agentDir: string) => {
+    const Net = await import("node:net"), nativeWrite = Net.Socket.prototype.write;
+    let originalPublishSocket: import("node:net").Socket | undefined;
+    Net.Socket.prototype.write = function (this: import("node:net").Socket,
+      ...args: Parameters<typeof nativeWrite> | [Parameters<typeof nativeWrite>[0], Parameters<typeof nativeWrite>[2]?]) {
+      const chunk = typeof args[0] === "string" ? args[0] : Buffer.isBuffer(args[0]) ? args[0].toString("utf8") : "";
+      if (role === "follower" && chunk.includes('"kind":"follower.callApi"') && chunk.includes("os-held-original")) {
+        assert.equal(originalPublishSocket, undefined, "The exact original request cannot replay over another socket");
+        originalPublishSocket = this;
+      }
+      return Reflect.apply(nativeWrite, this, args);
+    };
+    const rootUrl = artifact === "source" ? "./index.ts" : "./dist/index.js";
+    const threadUrl = new URL(artifact === "source" ? "./lib/threads.ts" : "./dist/lib/threads.js", import.meta.url);
+    const busUrl = new URL(artifact === "source" ? "./lib/bus.ts" : "./dist/lib/bus.js", import.meta.url);
+    const lockUrl = new URL(artifact === "source" ? "./lib/locks.ts" : "./dist/lib/locks.js", import.meta.url);
+    const ThreadModel: typeof Threads = await import(threadUrl.href), BusModel: typeof Bus = await import(busUrl.href), LockModel: typeof Locks = await import(lockUrl.href);
+    const configUrl = new URL(artifact === "source" ? "./lib/config.ts" : "./dist/lib/config.js", import.meta.url);
+    const ConfigModel: typeof import("../lib/config.ts") = await import(configUrl.href);
+    const leaderUrl = new URL(artifact === "source" ? "./lib/bus-leader.ts" : "./dist/lib/bus-leader.js", import.meta.url);
+    const ApiModel: typeof import("../lib/telegram-api.ts") = await import(artifact === "source" ? "./lib/telegram-api.ts" : "./dist/lib/telegram-api.js");
+    const { AsyncLocalStorage } = await import("node:async_hooks");
+    const heldRequest = new AsyncLocalStorage<boolean>();
+    const transportChecks: Array<{ current: boolean; completed: number }> = [];
+    let transportCaptures = 0, checkingTransport = false, ownershipReadFault = false, ownershipReadFaults = 0;
+    let nativeOutcome: "returned" | "rejected" | undefined, nativeAuthorityError = false, nativeErrorIssued = false;
+    let callerCommitUnknown = false, callerCommitMethod: string | undefined, publicationMethod: string | undefined;
+    let heldAck: { correlated: boolean; ok: boolean; message?: string } | undefined;
+    let config: ReturnType<typeof ConfigModel.createTelegramConfigStore> | undefined;
+    mock.module(configUrl.href, { namedExports: { ...ConfigModel, createTelegramConfigStore(options: Parameters<typeof ConfigModel.createTelegramConfigStore>[0]) {
+      config = ConfigModel.createTelegramConfigStore(options); return config;
+    } } });
+    let store: Threads.TelegramTopicTargetStore | undefined, resets = 0, starts = 0, lastStartOk: boolean | undefined;
+    let refreshEntered = 0, refreshSettled = 0, refreshReturned = 0, refreshFailed = 0, releaseRefresh!: () => void;
+    const refreshHold = new Promise<void>(resolve => { releaseRefresh = resolve; });
+    const registrationPids: number[] = [];
+    const registrationReplies: Array<{ correlated: boolean; ok: boolean; code?: string; message?: string }> = [];
+    mock.module(lockUrl.href, { namedExports: { ...LockModel, createTelegramLockedPollingRuntime(options: Parameters<typeof LockModel.createTelegramLockedPollingRuntime>[0]) {
+      const reset = options.resetDamagedState, lock = options.lock;
+      const runtime = LockModel.createTelegramLockedPollingRuntime({ ...options, lock: { ...lock, owns(...args: Parameters<typeof lock.owns>) {
+        if (ownershipReadFault && checkingTransport) { ownershipReadFault = false; ownershipReadFaults++; throw new Error("Fixture original ownership observation refused"); }
+        return lock.owns(...args);
+      } }, resetDamagedState(assertCurrent) {
+        const changed = reset?.(assertCurrent) ?? false;
+        if (changed) resets++;
+        return changed;
+      } }), start = runtime.start;
+      runtime.start = async (...args: Parameters<typeof start>) => {
+        starts++; lastStartOk = undefined;
+        const result = await start(...args); lastStartOk = result.ok; return result;
+      };
+      return runtime;
+    } } });
+    mock.module(threadUrl.href, { namedExports: { ...ThreadModel, createTelegramTopicTargetStore(options: Threads.TelegramTopicTargetStoreOptions) {
+      const created = ThreadModel.createTelegramTopicTargetStore(options);
+      if (!store && options.consolidated) {
+        store = created;
+        const refresh = created.refresh; assert.ok(refresh);
+        created.refresh = async () => {
+          const original = refresh();
+          if (role !== "follower" || !refreshBoundary || resets === 0) return original;
+          refreshEntered++;
+          const outcome = await original.then(() => ({ ok: true as const }), error => ({ ok: false as const, error }));
+          refreshSettled++; if (!outcome.ok) refreshFailed++;
+          await refreshHold;
+          refreshReturned++;
+          if (!outcome.ok) throw outcome.error;
+        };
+      }
+      return created;
+    } } });
+    mock.module(busUrl.href, { namedExports: { ...BusModel, createTelegramBusLocalServer(options: Parameters<typeof BusModel.createTelegramBusLocalServer>[0]) {
+      return BusModel.createTelegramBusLocalServer({ ...options, handleEnvelope(request) {
+        if (role === "leader" && request.kind === "follower.register") {
+          registrationPids.push(request.registration.pid!);
+          const expectedRequestId = request.requestId;
+          return Promise.resolve(options.handleEnvelope(request)).then(response => {
+            if (response?.kind === "bus.ack") registrationReplies.push({ correlated: response.requestId === expectedRequestId,
+              ok: response.ok, code: response.error?.code, message: response.message });
+            return response;
+          });
+        }
+        if (role === "leader" && request.kind === "follower.callApi" && JSON.stringify(request.args).includes("os-held-original")) return heldRequest.run(true, async () => {
+          const response = await options.handleEnvelope(request);
+          if (response?.kind === "bus.ack") heldAck = { correlated: response.requestId === request.requestId, ok: response.ok, message: response.message };
+          return response;
+        });
+        return options.handleEnvelope(request);
+      } });
+    } } });
+    // Delegate after installing transport mocks, so the original assembly observes Root's actual server ports.
+    const LeaderModel: typeof import("../lib/bus-leader.ts") = await import(leaderUrl.href);
+    mock.module(leaderUrl.href, { namedExports: { ...LeaderModel, createTelegramBusLeaderRuntimeAssembly(options: Parameters<typeof LeaderModel.createTelegramBusLeaderRuntimeAssembly>[0]) {
+      const capture = options.runtime.captureApiTransport, call = options.callApi;
+      return LeaderModel.createTelegramBusLeaderRuntimeAssembly({ ...options, runtime: { ...options.runtime, ...(capture ? { captureApiTransport() {
+        const original = capture();
+        if (!heldRequest.getStore() || !original) return original;
+        transportCaptures++;
+        return () => {
+          checkingTransport = true;
+          try { const current = original(); transportChecks.push({ current, completed }); return current; }
+          finally { checkingTransport = false; }
+        };
+      } } : {}) }, async callApi<TResponse>(method: string, body: Record<string, unknown>, callOptions?: Parameters<typeof call>[2]): Promise<TResponse> {
+        try { const result = await call<TResponse>(method, body, callOptions); if (heldRequest.getStore()) nativeOutcome = "returned"; return result; }
+        catch (error) {
+          if (heldRequest.getStore()) { nativeOutcome = "rejected"; nativeAuthorityError = error instanceof ApiModel.TelegramApiAuthorityError; nativeErrorIssued = error instanceof ApiModel.TelegramApiAuthorityError && error.requestIssued; }
+          throw error;
+        }
+      } });
+    } } });
+    const bindingsUrl = new URL(artifact === "source" ? "./lib/bindings.ts" : "./dist/lib/bindings.js", import.meta.url);
+    const BindingsModel: typeof Bindings = await import(bindingsUrl.href);
+    mock.module(bindingsUrl.href, { namedExports: { ...BindingsModel, registerTelegramCommandsAndTools(options: Parameters<typeof BindingsModel.registerTelegramCommandsAndTools>[0]) {
+      const record = options.recordRuntimeEvent;
+      return BindingsModel.registerTelegramCommandsAndTools({ ...options, recordRuntimeEvent(category, error, details) {
+        if (role === "follower" && heldRequest.getStore() && category === "message" && details?.phase === "direct") {
+          callerCommitUnknown = error instanceof ApiModel.TelegramApiCommitUnknownError;
+          if (error instanceof ApiModel.TelegramApiCommitUnknownError) callerCommitMethod = error.method;
+        }
+        record(category, error, details);
+      } });
+    } } });
+    process.send?.({ fixtureCheckpoint: "root-import", pid: process.pid });
+    const extension = (await import(rootUrl)).default;
+    process.send?.({ fixtureCheckpoint: "root-import-complete", pid: process.pid });
+    const harness = createRuntimePiHarness(), ctx = createRuntimeExtensionContext({ cwd: `/os-original-${role}`, sessionManager: { getSessionId: () => `os-session-${role}` } });
+    const notices: string[] = [];
+    let polls = 0, creations = 0, deletions = 0, issued = 0, completed = 0, takeovers = 0, continuations = 0, freshIssues = 0;
+    let publicationTarget: { chatId: unknown; threadId: unknown } | undefined;
+    let originalPublicationTarget: { chatId: number; threadId?: number } | undefined;
+    let release!: () => void, finishOriginal: (() => string) | undefined, inspectOriginal: (() => void) | undefined, displacedRoot: string | undefined, displacedWorkspace: unknown;
+    const familyBytes = (path: string) => {
+      const parent = dirname(path), name = basename(path), files: Array<[string, string]> = [];
+      const visit = (entry: string) => {
+        const info = fs.lstatSync(join(parent, entry));
+        if (info.isDirectory()) for (const child of fs.readdirSync(join(parent, entry)).sort()) visit(join(entry, child));
+        else { assert.ok(info.isFile() && !info.isSymbolicLink()); files.push([entry, createHash("sha256").update(fs.readFileSync(join(parent, entry))).digest("hex")]); }
+      };
+      for (const entry of fs.readdirSync(parent).sort()) if (entry === name || entry.startsWith(name + ".")) visit(entry);
+      return files;
+    };
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const statePath = Paths.resolveTelegramStatePath(agentDir), name = profile ?? "default";
+    Object.assign(ctx.ui, { notify(text: string) { notices.push(text); }, confirm: async () => { takeovers++; return false; } });
+    const restoreFetch = setTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input), payload = parseJsonRequestBody(init);
+      if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: true });
+      if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: 100 + ++creations, name: "Fixture" });
+      if (method === "deleteForumTopic") { deletions++; return createRuntimeTelegramApiResponse(true); }
+      if (method === "getUpdates" && ++polls === 1) return createRuntimeTelegramApiResponse([]);
+      if (method === "getUpdates") return await new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(new DOMException("fixture stop", "AbortError"));
+        if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      if (method === "sendMessage" || method === "sendRichMessage") {
+        const owner = LockModel.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction"), () => LockModel.readTelegramRuntimeState(statePath).profiles[name]?.transport) as Locks.TelegramLockEntry | undefined;
+        assert.equal(owner?.pid, process.pid, "Every HTTP publication belongs to the actual native transport owner, including a freshly admitted post-reset leader");
+        if (JSON.stringify(payload).includes("os-fresh-after-reset")) freshIssues++;
+        if (JSON.stringify(payload).includes("os-held-original")) { publicationMethod = method; publicationTarget = { chatId: payload?.chat_id, threadId: payload?.message_thread_id }; issued++; await gate; completed++; }
+        return createRuntimeTelegramApiResponse({ message_id: 500, chat: { id: 77, type: "private" }, message_thread_id: payload?.message_thread_id });
+      }
+      if (["deleteWebhook", "setMyCommands", "editForumTopic", "sendChatAction"].includes(method)) return createRuntimeTelegramApiResponse(true);
+      throw new Error(`Unexpected OS-root method ${method}`);
+    });
+    const workspaceSection = () => LockModel.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction"), () => LockModel.readTelegramRuntimeState(statePath).profiles[name]?.workspace);
+    const workspace = () => ThreadModel.parseTelegramWorkspaceStateSection(workspaceSection(), name)!;
+    const stats = () => {
+      const observed = workspaceSection();
+      return { pid: process.pid, polls, creations, deletions, issued, completed, takeovers, continuations, resets, freshIssues, registrationPids, registrationReplies, notices, publicationTarget,
+        transportCaptures, transportChecks, ownershipReadFaults, nativeOutcome, nativeAuthorityError, nativeErrorIssued, heldAck,
+        callerCommitUnknown, callerCommitMethod, publicationMethod, originalPublishSocketDestroyed: originalPublishSocket?.destroyed,
+        originalPublishSocketEnded: originalPublishSocket?.writableEnded,
+        starts, lastStartOk, refreshEntered, refreshSettled, refreshReturned, refreshFailed, cachedBindings: store?.listWorkspaceBindings().length,
+        target: ThreadModel.parseTelegramWorkspaceStateSection(observed, name)?.workspaceBindings?.find(row => row.cwd === ctx.cwd)?.target,
+        namespaceHash: createHash("sha256").update(JSON.stringify(observed ?? null)).digest("hex") };
+    };
+    process.send?.({ fixtureCheckpoint: "root-construct", pid: process.pid });
+    extension(harness.pi);
+    process.send?.({ fixtureCheckpoint: "session-start", pid: process.pid });
+    await harness.handlers.get("session_start")?.({}, ctx);
+    process.send?.({ fixtureCheckpoint: "session-start-complete", pid: process.pid });
+    const perform = async (command: string): Promise<unknown> => {
+      if (command === "connect") { await harness.commands.get("telegram-connect")!.handler(profile ?? "", ctx); return stats(); }
+      if (command === "stats") return stats();
+      if (command === "ownership-read-fault") { assert.equal(role, "leader"); assert.equal(ownershipFault, true); ownershipReadFault = true; return stats(); }
+      if (command === "prepare") {
+        assert.equal(role, "leader"); assert.ok(store);
+        const binding = { ...ThreadModel.createTelegramWorkspaceBindingIdentity("/os-dormant-original", 0, "original-session")!, slot: "C", threadName: "Atlas", target: { chatId: 77, threadId: 900 }, updatedAtMs: 1 };
+        const sourceOwner = { kind: "leader" as const, cwd: binding.cwd, instanceId: "original", ...(profile ? { telegramProfile: profile } : {}) };
+        const owner = { profileKey: ThreadModel.getTelegramThreadOwnerKey(sourceOwner), instanceId: "original", slot: "C", threadName: "Atlas", owner: sourceOwner, target: binding.target, status: "active" as const, createdAtMs: 1, updatedAtMs: 1 };
+        store.upsert(owner); store.upsertWorkspaceBinding(binding); await store.persist();
+        assert.ok(workspace().workspaceBindings?.some(row => row.bindingKey === binding.bindingKey), "Native owner must actually publish the dormant source binding");
+        const options = { path: join(Paths.resolveTelegramRuntimeDir(agentDir), "os-original.json"), profileName: name, botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "123:os-original", botId: 123 }) };
+        const journal = Journal.createTelegramUpdateJournalStore(options);
+        journal.appendBatch([{ update_id: 900, message: { message_id: 900, date: 1, chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false }, message_thread_id: 901, text: "Fixture retained OS original" } }], 901);
+        const before = journal.read(), originalBytes = familyBytes(options.path);
+        const { exists, serializedBytes, ...originalFile } = before;
+        assert.ok(exists && serializedBytes > 0);
+        inspectOriginal = () => {
+          if (loss === "root") assert.ok(displacedRoot, "Root partition must physically displace the directory, not only replace the envelope");
+          const physicalPath = displacedRoot ? join(displacedRoot, relative(dirname(statePath), options.path)) : options.path;
+          if (displacedRoot) {
+            // This is physical read-only evidence, never a renewed source handle at an archive locator.
+            const retained = Journal.inspectTelegramUpdateJournalFamily({ directory: dirname(physicalPath), path: physicalPath, profile: name, botIdentity: options.botIdentity,
+              limits: { maxFiles: 32, maxBytes: 1024 * 1024, maxEntries: 32, maxWork: 1024 * 1024 } });
+            assert.ok(retained.kind === "present"); assert.deepEqual(retained.file, originalFile);
+            assert.deepEqual(Locks.readTelegramRuntimeState(join(displacedRoot, basename(statePath))).profiles[name]!.workspace, displacedWorkspace, "Original displaced Workspace also remains untouched");
+            assert.equal(fs.existsSync(options.path), false, "No accepted-source clone or implicit reader initialization under the fresh root");
+          } else assert.deepEqual(journal.read(), before, "Accepted original source cannot be settled, replayed or rewritten by reconnect");
+          assert.deepEqual(familyBytes(physicalPath), originalBytes, "Original snapshot and segments stay byte-exact across physical displacement");
+        };
+        const view = store.workspaceRestore({ profileName: name, tokenSha256: createHash("sha256").update("123:os-original").digest("hex") });
+        const transport = Locks.readTelegramRuntimeState(statePath).profiles[name]!.transport as Locks.TelegramLockEntry;
+        const auth = { executor: { instanceId: transport.instanceId!, leaderEpoch: String(transport.leaderEpoch) }, operatorUserId: 77, isCurrent: () => true };
+        const capturedBinding = store.listWorkspaceBindings().find(row => row.bindingKey === binding.bindingKey), capturedOwner = store.getByProfileKey(owner.profileKey);
+        assert.ok(capturedBinding && capturedOwner);
+        const request = { operationId: "os-original", binding: capturedBinding, owner: capturedOwner, target: { chatId: 77, threadId: 901 }, source: { journalBindingKey: Journal.createTelegramUpdateJournalBindingKey(options), updateIds: [900] } };
+        assert.ok(ThreadModel.isTelegramWorkspaceRestoreRequest(request), JSON.stringify({ stage: "request shape", owner: capturedOwner, binding: capturedBinding }));
+        const initial = await view.commit(request, auth);
+        assert.ok(initial, "The actual scoped leader must commit its original Restore before unrelated follower registration");
+        const recipient = { kind: "leader" as const, instanceId: "original", sessionId: "original-session", generation: "fixture-recipient" };
+        const original = view.issueRecipient(initial, recipient, auth)?.intent; assert.ok(original);
+        const confirmReady = view.confirmReady.bind(view);
+        view.confirmReady = (...args: Parameters<typeof confirmReady>) => { continuations++; return confirmReady(...args); };
+        finishOriginal = () => { try { assert.ok(view.confirmReady(original, recipient, auth)); return "ready"; } catch (error) { if (error instanceof ThreadModel.TelegramWorkspaceRestoreEvidenceError) return error.reason; throw error; } };
+        return stats();
+      }
+      if (command === "publish") {
+        const target = stats().target; assert.ok(target); originalPublicationTarget = { ...target };
+        return heldRequest.run(true, () => harness.tools.get("telegram_message")!.execute("os-original", { text: "os-held-original", chat_id: 77, thread_id: target.threadId }));
+      }
+      if (command === "lose-issued-ipc") {
+        assert.equal(role, "follower"); assert.ok(originalPublishSocket && !originalPublishSocket.destroyed);
+        originalPublishSocket.end(); return stats();
+      }
+      if (command === "probe") {
+        assert.ok(loss === "damaged" || ownershipFault); assert.ok(originalPublicationTarget);
+        await assert.rejects(harness.tools.get("telegram_message")!.execute("os-fresh", { text: "os-fresh-after-reset", chat_id: 77, thread_id: originalPublicationTarget.threadId }));
+        return stats();
+      }
+      if (command === "damage") {
+        assert.equal(role, "leader"); assert.equal(loss, "damaged");
+        fs.writeFileSync(statePath, "{ damaged-warm-original", { mode: 0o600 });
+        inspectOriginal?.();
+        return { pid: process.pid, damaged: true };
+      }
+      if (command === "replace") {
+        assert.equal(role, "leader");
+        const emptyPath = join(agentDir, "os-empty.json"), empty = ThreadModel.createTelegramTopicTargetStore({ path: emptyPath, telegramProfile: name });
+        empty.setBotState({ threadMode: "enabled" }); await empty.persist();
+        const replacement = JSON.parse(await readFile(emptyPath, "utf8")), candidate = join(agentDir, "os-envelope.json");
+        assert.ok(ThreadModel.parseTelegramWorkspaceStateSection(replacement, name));
+        const transport = structuredClone(Locks.readTelegramRuntimeState(statePath).profiles[name]!.transport);
+        Locks.mutateTelegramRuntimeStateSection(candidate, name, "transport", () => ({ value: transport, result: undefined }), { isCurrent: () => true });
+        Locks.mutateTelegramRuntimeStateSection(candidate, name, "workspace", () => ({ value: replacement, result: undefined }), { isCurrent: () => true });
+        const expected = Locks.readTelegramRuntimeState(candidate).profiles[name]!.workspace;
+        if (loss === "root") {
+          const root = dirname(statePath);
+          displacedRoot = join(agentDir, "os-displaced-runtime");
+          displacedWorkspace = structuredClone(Locks.readTelegramRuntimeState(statePath).profiles[name]!.workspace);
+          fs.renameSync(root, displacedRoot);
+          fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+        }
+        fs.renameSync(candidate, statePath);
+        assert.deepEqual(Locks.readTelegramRuntimeState(statePath).profiles[name]!.workspace, expected);
+        inspectOriginal?.(); return stats();
+      }
+      if (command === "finish") { assert.ok(finishOriginal); inspectOriginal?.(); return { result: finishOriginal(), ...stats() }; }
+      if (command === "release") { release(); return stats(); }
+      if (command === "refresh-status") return { pid: process.pid, resets, starts, refreshEntered, refreshSettled, refreshReturned, refreshFailed };
+      if (command === "release-refresh") { releaseRefresh(); return stats(); }
+      if (command === "config-churn") {
+        assert.ok(config);
+        const original = config.getStoredConfig(), selected = original.profiles?.[name], token = config.getBotToken(name), active = config.getActiveProfileName();
+        assert.ok(selected); config.setProfile(name, { ...selected });
+        assert.notEqual(config.getStoredConfig(), original, "An equal-value replacement is still a different original config object");
+        assert.equal(config.getBotToken(name), token); assert.equal(config.getActiveProfileName(), active);
+        return stats();
+      }
+      if (command === "disconnect") { await harness.commands.get("telegram-disconnect")!.handler("", ctx); return stats(); }
+      if (command === "inspect") { assert.ok(inspectOriginal); inspectOriginal(); return stats(); }
+      if (command === "stop") { release(); releaseRefresh(); await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx); restoreFetch(); return { stopped: true }; }
+      throw new Error("Unknown fixture command");
+    };
+    process.on("message", raw => {
+      const { id, command } = raw as { id: number; command: string };
+      void perform(command).then(result => process.send?.({ id, result }, () => { if (command === "stop") process.disconnect?.(); }), error => process.send?.({ id, error: `${command}: ${error instanceof Error ? error.stack : String(error)}` }));
+    });
+    process.send?.({ id: 0, result: { ready: true, pid: process.pid } });
+  };
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-os-original-")));
+  const bot = { botToken: "123:os-original", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } };
+  await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
+  type Stats = { pid: number; polls: number; creations: number; deletions: number; issued: number; completed: number; takeovers: number; continuations: number; resets: number; freshIssues: number;
+    starts: number; lastStartOk?: boolean; refreshEntered: number; refreshSettled: number; refreshReturned: number; refreshFailed: number; cachedBindings?: number;
+    transportCaptures: number; transportChecks: Array<{ current: boolean; completed: number }>; ownershipReadFaults: number;
+    nativeOutcome?: "returned" | "rejected"; nativeAuthorityError: boolean; nativeErrorIssued: boolean; heldAck?: { correlated: boolean; ok: boolean; message?: string };
+    callerCommitUnknown: boolean; callerCommitMethod?: string; publicationMethod?: string; originalPublishSocketDestroyed?: boolean; originalPublishSocketEnded?: boolean;
+    registrationPids: number[]; registrationReplies: Array<{ correlated: boolean; ok: boolean; code?: string; message?: string }>;
+    notices: string[]; target?: { chatId: number; threadId?: number }; namespaceHash: string; result?: string; publicationTarget?: { chatId: unknown; threadId: unknown } };
+  const launch = (role: "leader" | "follower") => {
+    const source = `
+      import assert from "node:assert/strict";
+      import fs from "node:fs";
+      import { createHash } from "node:crypto";
+      import { readFile } from "node:fs/promises";
+      import { join, dirname, basename, relative } from "node:path";
+      import { mock } from "node:test";
+      import * as Paths from "./lib/paths.ts";
+      import * as Locks from "./lib/locks.ts";
+      import * as Journal from "./lib/journal.ts";
+      const artifact = ${JSON.stringify(artifact)}, profile = ${JSON.stringify(profile)}, role = ${JSON.stringify(role)}, agentDir = ${JSON.stringify(agentDir)}, loss = ${JSON.stringify(loss)}, refreshBoundary = ${JSON.stringify(refreshBoundary)}, ownershipFault = ${ownershipFault};
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      let runtimeExtensionContextSequence = 0;
+      const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+      const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+      const parseJsonRequestBody = ${parseJsonRequestBody.toString()};
+      const getRuntimeTelegramApiMethod = ${getRuntimeTelegramApiMethod.toString()};
+      const createRuntimeTelegramApiResponse = ${createRuntimeTelegramApiResponse.toString()};
+      const setTestFetch = ${setTestFetch.toString()};
+      await (${childRun.toString()})(role, agentDir);
+    `;
+    return launchProductionRootFixture<Stats>(role, source);
+  };
+  const leader = launch("leader");
+  let followerForCleanup: ReturnType<typeof launch> | undefined;
+  let publication: Promise<{ result?: Stats; error?: unknown }> | undefined, settled = false, reconnect: Promise<Stats> | undefined;
+  const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
+  let stage = "native-roots-ready", primaryFailure: unknown, failed = false;
+  let initialFollower: Stats | undefined, initialLeader: unknown, publicationObservation: unknown, reconnectObservation: Stats | undefined, finalObservation: unknown;
+  try {
+    const l = await leader.ready;
+    // Namespace-loss witnesses need two live roots, not competing module bootstraps; synchronized startup has its own matrix.
+    const follower = followerForCleanup = launch("follower");
+    const f = await follower.ready;
+    const leaderBootstrap = leader.diagnostics(), followerBootstrap = follower.diagnostics();
+    assert.ok(leaderBootstrap.readyOrdinal !== undefined);
+    assert.ok(followerBootstrap.launchOrdinal > leaderBootstrap.readyOrdinal, "The follower bootstrap must follow actual native leader readiness");
+    assert.equal(l.pid, leader.pid); assert.equal(f.pid, follower.pid);
+    assert.notEqual(l.pid, f.pid); assert.notEqual(l.pid, process.pid); assert.notEqual(f.pid, process.pid);
+    stage = "initial-leader-connect-before-fault";
+    const online = await leader.request("connect");
+    assert.ok(online.target, JSON.stringify({ stage, observed: online }));
+    if (!refreshBoundary) await leader.request("prepare");
+    stage = "initial-follower-connect-before-fault";
+    const acknowledged = initialFollower = await follower.request("connect");
+    if (evidenceDir || !acknowledged.target) initialLeader = await leader.request("stats").then(
+      observed => ({ available: true, observed }), error => ({ available: false, error: String(error) }));
+    assert.ok(acknowledged.target, JSON.stringify({ stage, observed: acknowledged, leader: initialLeader }));
+    // The positive refresh reader predates this independent Restore; it never observed the history later lost by reset.
+    if (refreshBoundary) await leader.request("prepare");
+    stage = "retained-history-and-issued-publication";
+    await waitForAsyncCondition(async () => (await leader.request("stats")).polls === 2);
+    const before = await leader.request("stats");
+    assert.deepEqual(before.registrationPids, [f.pid]); assert.equal(before.pid, l.pid); assert.equal(before.creations, 2);
+    publication = follower.request("publish").then(result => ({ result }), error => ({ error })).finally(() => { settled = true; });
+    await waitForAsyncCondition(async () => (await leader.request("stats")).issued === 1);
+    const originalTransport = await leader.request("stats");
+    assert.equal(originalTransport.transportCaptures, 1, "The actual held broker request must capture its native transport exactly once");
+    assert.ok(originalTransport.transportChecks.length > 0 && originalTransport.transportChecks.every(row => row.current && row.completed === 0));
+    assert.equal(settled, false); assert.equal((await leader.request("stats")).completed, 0); assert.equal(before.continuations, 0);
+    let canonical = "";
+    stage = "namespace-fault";
+    if (loss) {
+      if (loss === "damaged") await leader.request("damage");
+      else canonical = (await leader.request("replace")).namespaceHash;
+      if (refreshBoundary) {
+        reconnect = follower.request("connect"); void reconnect.catch(() => undefined);
+        await waitForAsyncCondition(async () => (await follower.request("refresh-status")).refreshSettled === 1);
+        const held = await follower.request("probe");
+        assert.equal(held.resets, 1); assert.equal(held.refreshEntered, 1); assert.equal(held.refreshFailed, 0);
+        assert.equal(held.refreshReturned, 0); assert.equal(held.cachedBindings, 0, "The real refresh replaced the loaded projection with the canonical empty state");
+        assert.equal(held.starts, 1, "A settled native refresh is not return of its held completion or a fresh startup");
+        assert.equal((await leader.request("stats")).completed, 0, "The original physical HTTP remains independently held after reset and native refresh");
+        if (refreshBoundary === "cancel" || refreshBoundary === "config") {
+          const canceled = await follower.request(refreshBoundary === "cancel" ? "disconnect" : "config-churn");
+          assert.equal(canceled.starts, 1); assert.equal(canceled.refreshReturned, 0);
+        }
+        canonical = held.namespaceHash;
+      } else {
+        const refused = await follower.request("connect");
+        assert.ok(refused.notices.some(text => /Restore history is missing/.test(text)), "Original follower process attributes its local reader refusal");
+        if (loss === "damaged") {
+          assert.equal(refused.resets, 1, "The actual native reset occurred before the retained original history refused refresh");
+          canonical = refused.namespaceHash;
+        } else assert.equal(settled, false);
+      }
+    }
+    if (ipcLoss) {
+      assert.equal((await follower.request("lose-issued-ipc")).originalPublishSocketEnded, true);
+      await waitForAsyncCondition(async () => settled);
+      const unconfirmed = await publication;
+      assert.ok(unconfirmed.error, "The actual original IPC channel is lost before any HTTP return");
+      const caller = await follower.request("stats");
+      assert.equal(caller.originalPublishSocketDestroyed, true, "The real peer closes the half-closed original connection");
+      assert.equal(caller.callerCommitUnknown, true, "Only the native caller's commit-unknown class admits issued IPC loss");
+      assert.equal((await leader.request("stats")).completed, 0, "Lost caller settlement is not native HTTP drain");
+    }
+    stage = "late-original-publication";
+    const finish = await leader.request("finish"); assert.equal(finish.result, loss ? "missing-snapshot" : "ready");
+    assert.equal(finish.continuations, 1, "The native original continuation actually ran, not a fabricated missing-history label");
+    if (ownershipFault) await leader.request("ownership-read-fault");
+    await leader.request("release"); const outcome = await publication;
+    const observedPublication = await leader.request("stats"), callerPublication = await follower.request("stats");
+    publicationObservation = { error: String(outcome.error), native: observedPublication, caller: callerPublication };
+    if (ownershipFault) {
+      assert.equal(observedPublication.ownershipReadFaults, 1, "Only the actual original guard's ownership read receives the injected refusal");
+      assert.ok(observedPublication.transportChecks.some(row => !row.current && row.completed === 1), "The original guard refuses after physical HTTP return");
+      assert.ok(outcome.error, "A spent original transport guard cannot report publication success");
+    }
+    if (outcome.error) {
+      if (loss === "root" && observedPublication.nativeOutcome === "returned") {
+        assert.equal(callerPublication.callerCommitUnknown, true, JSON.stringify(publicationObservation));
+        assert.equal(callerPublication.callerCommitMethod, observedPublication.publicationMethod);
+        assert.ok(["sendMessage", "sendRichMessage"].includes(callerPublication.callerCommitMethod!));
+        assert.equal(callerPublication.originalPublishSocketDestroyed, true, "The original physical IPC channel, not native HTTP, was lost");
+        assert.equal(observedPublication.issued, 1); assert.equal(observedPublication.completed, 1);
+        assert.ok(observedPublication.transportChecks.every(row => row.current));
+        assert.ok(observedPublication.transportChecks.some(row => row.completed === 1));
+        assert.deepEqual(observedPublication.heldAck, { correlated: true, ok: true });
+        assert.match(String(outcome.error), /may have committed before transport failed/u);
+      } else if (loss === "root") {
+        assert.equal(observedPublication.nativeOutcome, "rejected", JSON.stringify(publicationObservation));
+        assert.equal(observedPublication.nativeAuthorityError, true, "Only the original native API authority refusal admits this root-loss outcome");
+        assert.equal(observedPublication.nativeErrorIssued, true, "Physical issuance remains unknown to the caller, never no-effect or retry authority");
+        assert.ok(observedPublication.transportChecks.some(row => !row.current && row.completed === 1));
+        assert.deepEqual(observedPublication.heldAck, { correlated: true, ok: false, message: "Telegram API call authority is unavailable." });
+        assert.match(String(outcome.error), /Telegram API call authority is unavailable/u);
+      } else assert.equal(loss, "damaged", `An intact original transport must complete its original issued plaintext operation: ${String(outcome.error)}`);
+      assert.match(String(outcome.error), /Telegram|transport|socket|closed|authority|scope/u);
+      assert.doesNotMatch(String(outcome.error), /AssertionError|TypeError|ReferenceError/u);
+    } else {
+      assert.equal(observedPublication.nativeOutcome, "returned");
+      assert.ok(observedPublication.transportChecks.every(row => row.current), "The successful control retains its original transport through actual response processing");
+      assert.equal(observedPublication.heldAck?.correlated, true); assert.equal(observedPublication.heldAck?.ok, true);
+      const result = outcome.result as unknown as { isError?: boolean; details?: { chatId: number; messageId: number } };
+      assert.equal(result.isError, undefined); assert.deepEqual(result.details, { chatId: 77, messageId: 500 },
+        "An issued plaintext call may report its actual native Message; that result grants no fresh send or namespace authority");
+    }
+    if (refreshBoundary) {
+      await follower.request("release-refresh");
+      const resumed = reconnectObservation = await reconnect!;
+      assert.equal(resumed.refreshReturned, 1); assert.equal(resumed.refreshFailed, 0);
+      assert.equal(resumed.starts, refreshBoundary === "held" ? 2 : 1, "Public cancellation spends the original command before its late native refresh completion");
+      if (refreshBoundary === "held") { assert.equal(resumed.lastStartOk, true); assert.ok(resumed.target); }
+      else assert.equal(resumed.target, undefined);
+      canonical = resumed.namespaceHash;
+      const lateOriginal = await leader.request("finish");
+      assert.equal(lateOriginal.result, "missing-snapshot", "A later fresh startup or cancellation cannot revive the independently retained original Restore");
+      assert.equal(lateOriginal.continuations, 2);
+    }
+    if (ownershipFault || loss === "damaged" && refreshBoundary !== "held") await follower.request("probe");
+    const last = await leader.request("inspect"), other = await follower.request("stats");
+    finalObservation = { leader: last, follower: other };
+    assert.equal(last.issued, 1); assert.equal(last.completed, 1); assert.equal(last.polls, 2); assert.equal(other.polls, refreshBoundary === "held" ? 2 : 0); assert.equal(last.continuations, refreshBoundary ? 2 : 1);
+    assert.deepEqual(last.publicationTarget, acknowledged.target, "The original acknowledged Thread, not All or a sibling, receives the issued output");
+    assert.equal(last.creations, 2); assert.equal(other.creations, refreshBoundary === "held" ? 1 : 0); assert.equal(last.deletions + other.deletions + last.takeovers + other.takeovers, 0);
+    assert.equal(last.resets + other.resets, loss === "damaged" ? 1 : 0);
+    assert.equal(last.freshIssues + other.freshIssues, 0, "No fresh HTTP mutation can borrow the old publication after reset");
+    assert.deepEqual(last.registrationPids, [f.pid], "Refused reconnect cannot register again or replace the original membership");
+    if (loss) assert.equal(last.namespaceHash, canonical, "Neither original completion republishes the lost namespace");
+  } catch (error) { failed = true; primaryFailure = error; throw error; }
+  finally {
+    const follower = followerForCleanup;
+    const diagnosticFailures: PromiseRejectedResult[] = [];
+    if (evidenceDir) {
+      try {
+        const logPath = Paths.resolveTelegramRuntimeLogPath(agentDir);
+        let runtimeLog: unknown;
+        try {
+          runtimeLog = fs.statSync(logPath).size <= 2 * 1024 * 1024
+            ? { available: true, text: await readFile(logPath, "utf8") } : { available: false, reason: "over-limit" };
+        } catch (error) { runtimeLog = { available: false, error: String(error) }; }
+        const evidence = { version: 1, artifact, profile: profile ?? "default", loss, refreshBoundary, ownershipFault, ipcLoss, stage,
+          failed, failure: primaryFailure instanceof Error ? { name: primaryFailure.name, message: primaryFailure.message, stack: primaryFailure.stack } : String(primaryFailure),
+          initialFollower, initialLeader, publicationObservation, reconnectObservation, finalObservation,
+          leader: leader.diagnostics(), follower: follower?.diagnostics() ?? { notStarted: true }, runtimeLog };
+        await mkdir(evidenceDir, { recursive: true });
+        await writeFile(join(evidenceDir, `${artifact}-${profile ?? "default"}-${loss}-${refreshBoundary ?? "none"}-${ownershipFault}-${ipcLoss}.json`),
+          JSON.stringify(evidence, null, 2).replaceAll("123:os-original", "<fixture-token>") + "\n", { flag: "wx" });
+      } catch (reason) { diagnosticFailures.push({ status: "rejected", reason }); }
+    }
+    await follower?.request("release-refresh").catch(() => undefined);
+    await leader.request("release").catch(() => undefined); await publication?.catch(() => undefined); await reconnect?.catch(() => undefined);
+    const stopped = await Promise.allSettled([follower?.stop(), leader.stop()]);
+    const removed = await Promise.allSettled([rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })]);
+    for (const result of [...diagnosticFailures, ...stopped, ...removed]) if (result.status === "rejected") {
+      if (!failed) throw result.reason;
+      console.error("OS-root secondary diagnostic/cleanup failure:", result.reason);
+    }
+  }
+}, 40000);
+
+async function holdNativeConnectEvents(options: {
+  select: () => boolean;
+  connected: (socket: import("node:net").Socket, dispatch: () => void) => void;
+  written: (chunk: unknown) => void;
+}) {
+  const Net = await import("node:net");
+  mock.module("node:net", { namedExports: { ...Net,
+    createConnection(...args: Parameters<typeof Net.createConnection>) {
+      const socket = Net.createConnection(...args);
+      if (!options.select()) return socket;
+      const once = socket.once.bind(socket), write = socket.write.bind(socket);
+      let held = false;
+      socket.once = function(event: string | symbol, listener: (...args: unknown[]) => void) {
+        if (event !== "connect" || held) return once(event, listener);
+        held = true;
+        return once(event, () => options.connected(socket, () => listener.call(socket)));
+      };
+      socket.write = ((...args: Parameters<typeof socket.write>) => { options.written(args[0]); return write(...args); }) as typeof socket.write;
+      return socket;
+    },
+  } });
+}
+
+for (const artifact of ["source", "compiled"] as const)
+for (const outcome of ["ready", "ack-after-connect", "expired", "scope", "port", "marker-expired", "lost-ack"] as const)
+test(`Native held connect keeps readiness and ACK lifetimes separate (${artifact}/${outcome})`, async () => {
+  const run = async () => {
+    let dispatch!: () => void, selected = 0, connected = 0, written = 0, issued = 0, received = 0, waits = 0, current = true, forceExpired = false, settled = false;
+    let capturingConnect = false, lifecycleConnections = 0;
+    let socket: import("node:net").Socket | undefined;
+    await holdNativeConnectEvents({ select: () => { if (!capturingConnect) { lifecycleConnections++; return false; } selected++; return true; }, connected(native, invoke) { connected++; socket = native; dispatch = invoke; }, written() { written++; } });
+    const Bus: typeof import("../lib/bus.ts") = await import(artifact === "source" ? "./lib/bus.ts" : "./dist/lib/bus.js");
+    const dir = await mkdtemp(join(tmpdir(), "pt-held-connect-")), socketPath = join(dir, "bus.sock");
+    const server = Bus.createTelegramBusLocalServer({ socketPath, async handleEnvelope(request) {
+      received++;
+      if (outcome === "lost-ack") return undefined;
+      if (outcome === "ack-after-connect") { forceExpired = true; await new Promise(resolve => setTimeout(resolve, 120)); }
+      return { kind: "bus.ack", requestId: request.requestId, ok: true };
+    } });
+    let pending: Promise<{ result?: unknown; error?: unknown }> | undefined;
+    try {
+      await server.start();
+      const Transport = await import(artifact === "source" ? "./lib/bus-transport.ts" : "./dist/lib/bus-transport.js");
+      const beforeProbe = lifecycleConnections;
+      const lifecycleProbe = await Transport.probeTelegramBusEndpoint({ endpoint: Bus.resolveTelegramBusSocketPath(socketPath), timeoutMs: 50 });
+      assert.equal(lifecycleProbe.reachable, true, "A native lifecycle probe must not be held as the governed request");
+      assert.equal(lifecycleConnections, beforeProbe + 1);
+      assert.equal(selected, 0); assert.equal(connected, 0); assert.equal(issued, 0); assert.equal(written, 0); assert.equal(received, 0);
+      capturingConnect = true;
+      const born = performance.now(), readiness = { remainingMs: () => forceExpired ? 0 : (outcome === "expired" ? 80 : 2000) - (performance.now() - born), async wait() { waits++; return true; } };
+      pending = Bus.sendTelegramBusLocalEnvelope({ socketPath, timeoutMs: 200,
+        envelope: { kind: "follower.register", requestId: "held-connect", registration: { instanceId: "fixture", connectedAtMs: 0 } },
+        connectionReadiness: readiness, assertAuthority() { if (!current) throw new Error("Original scope ended"); },
+        onRequestIssued() { issued++; if (outcome === "marker-expired") forceExpired = true; },
+      }).then(result => ({ result }), error => ({ error })).finally(() => { settled = true; });
+      await waitForCondition(() => connected === 1).catch(async () => {
+        const result = await pending;
+        assert.fail(JSON.stringify({ selected, connected, written, issued, received, error: result?.error instanceof Error ? result.error.message : undefined }));
+      });
+      assert.equal(written, 0); assert.equal(issued, 0); assert.equal(received, 0);
+      if (outcome === "expired") {
+        const result = await pending;
+        assert.ok(result.error instanceof Error && /readiness expired/.test(result.error.message));
+        assert.equal(socket?.destroyed, true);
+      } else {
+        if (outcome === "ready" || outcome === "ack-after-connect") {
+          await new Promise(resolve => setTimeout(resolve, 300));
+          assert.equal(settled, false, "ACK timeout cannot spend the original unissued connect budget");
+        }
+        if (outcome === "scope") current = false;
+        if (outcome === "port") readiness.remainingMs = () => 2000;
+      }
+      dispatch();
+      const result = await pending;
+      if (["expired", "scope", "port", "marker-expired", "lost-ack"].includes(outcome)) {
+        assert.ok(result.error instanceof Error);
+        assert.match(result.error.message, outcome === "expired" || outcome === "marker-expired" ? /readiness expired/ : outcome === "lost-ack" ? /Timed out waiting/ : /authority/);
+      } else assert.ok(result.result && !result.error);
+      if (outcome === "lost-ack") assert.match((result.error as Error).message, /Timed out waiting/);
+      assert.equal(selected, 1); assert.equal(connected, 1); assert.equal(waits, 0, "A held native connect or issued request is not a failed-connect retry proof");
+      const unissued = ["expired", "scope", "port"].includes(outcome), unwritten = unissued || outcome === "marker-expired";
+      assert.equal(issued, unissued ? 0 : 1); assert.equal(written, unwritten ? 0 : 1); assert.equal(received, written);
+    } finally { capturingConnect = false; dispatch?.(); await pending; await server.stop(); await rm(dir, { recursive: true, force: true }); }
+  };
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { mkdtemp, rm } from "node:fs/promises";
+    import { join } from "node:path";
+    import { tmpdir } from "node:os";
+    import { mock } from "node:test";
+    const artifact = ${JSON.stringify(artifact)}, outcome = ${JSON.stringify(outcome)};
+    const waitForCondition = ${waitForCondition.toString()};
+    const holdNativeConnectEvents = ${holdNativeConnectEvents.toString()};
+    const keepAlive = setInterval(() => {}, 60000);
+    try { await (${run.toString()})(); console.log("held-connect-pass"); }
+    finally { clearInterval(keepAlive); mock.restoreAll(); }
+  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 10000 });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /held-connect-pass/);
+}, 15000);
+
+for (const artifact of ["source", "compiled"] as const)
+for (const profile of [undefined, "work"] as const)
+for (const phase of ["publication", "ipc", "ipc-delayed", "ipc-timeout", "receiver", "receiver-stop", "ack", "ack-scope-loss", "connect", "connect-expired", "connect-config", "connect-profile", "connect-session", "connect-locator", "connect-port", "connect-reentry", "connect-auth", "connect-protocol", "receiver-expired", "receiver-config", "receiver-profile", "receiver-session", "receiver-locator", "receiver-port", "receiver-reentry"] as const)
+test(`Production original registration separates mode publication, IPC and ACK (${artifact}/${profile ?? "default"}/${phase})`, async () => {
+  const run = async () => {
+    const checkpoint = (stage: string) => console.log("registration-phases-checkpoint", stage, performance.now());
+    let capturingConnect = false, nativeConnects = 0, nativeWrites = 0, wireReceipts = 0, refusals = 0, locatorLost = false, reenter = false, reentries = 0;
+    let nativeOptions: Parameters<typeof import("../lib/bus.ts").sendTelegramBusLocalEnvelope>[0] | undefined;
+    let receiverAuthority: (() => void) | undefined, receiverNativeOptions: Parameters<typeof import("../lib/bus.ts").createTelegramBusLocalServer>[0] | undefined;
+    if (phase.startsWith("connect")) await holdNativeConnectEvents({
+      select: () => capturingConnect,
+      connected(_socket, dispatch) { nativeConnects++; void hold().then(dispatch); },
+      written(chunk) { if (JSON.parse(String(chunk)).kind === "follower.register") nativeWrites++; },
+    });
+    const threadUrl = new URL(artifact === "source" ? "./lib/threads.ts" : "./dist/lib/threads.js", import.meta.url);
+    const busUrl = new URL(artifact === "source" ? "./lib/bus.ts" : "./dist/lib/bus.js", import.meta.url);
+    const configUrl = new URL(artifact === "source" ? "./lib/config.ts" : "./dist/lib/config.js", import.meta.url);
+    const lockUrl = new URL(artifact === "source" ? "./lib/locks.ts" : "./dist/lib/locks.js", import.meta.url);
+    const ThreadModel: typeof Threads = await import(threadUrl.href);
+    const BusModel: typeof import("../lib/bus.ts") = await import(busUrl.href);
+    const ConfigModel: typeof import("../lib/config.ts") = await import(configUrl.href);
+    const LockModel: typeof Locks = await import(lockUrl.href);
+    const stores: Threads.TelegramTopicTargetStore[] = [], configs: Array<ReturnType<typeof ConfigModel.createTelegramConfigStore>> = [];
+    let entered = false, heldCompletions = 0, clockOffset = 0, received = 0, prepared = 0, returned = 0, leaderStarts = 0, registrationCalls = 0, issued = 0;
+    let release!: () => void, receiverEndpoint: string | undefined;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    async function hold() { entered = true; await gate; heldCompletions++; }
+    mock.module(threadUrl.href, { namedExports: { ...ThreadModel, createTelegramTopicTargetStore(options: Threads.TelegramTopicTargetStoreOptions) {
+      const store = ThreadModel.createTelegramTopicTargetStore(options), persist = store.persist;
+      stores.push(store);
+      store.persist = async () => {
+        if (phase === "publication" && store === stores[0] && store.getBotState().threadMode === "enabled" && !entered) await hold();
+        return persist();
+      };
+      return store;
+    } } });
+    mock.module(configUrl.href, { namedExports: { ...ConfigModel, createTelegramConfigStore(options: Parameters<typeof ConfigModel.createTelegramConfigStore>[0]) {
+      const config = ConfigModel.createTelegramConfigStore(options); configs.push(config); return config;
+    } } });
+    mock.module(lockUrl.href, { namedExports: { ...LockModel, createTelegramLockedPollingRuntime(options: Parameters<typeof LockModel.createTelegramLockedPollingRuntime>[0]) {
+      const endpoint = options.getLeaderEndpoint;
+      return LockModel.createTelegramLockedPollingRuntime({ ...options, readinessClock: () => performance.now() + clockOffset,
+        ...((phase.startsWith("connect") || phase.startsWith("receiver")) && endpoint ? { getLeaderEndpoint() {
+          if (reenter) { reentries++; try { (nativeOptions?.assertAuthority ?? receiverAuthority)?.(); } catch { /* Original reentry loss is deliberately caught. */ } }
+          return endpoint() + (locatorLost ? ".replacement" : "");
+        } } : {}),
+      });
+    } } });
+    mock.module(busUrl.href, { namedExports: { ...BusModel,
+    sendTelegramBusLocalEnvelope(options: Parameters<typeof BusModel.sendTelegramBusLocalEnvelope>[0]) {
+      if (options.envelope.kind !== "follower.register") return BusModel.sendTelegramBusLocalEnvelope(options);
+      registrationCalls++;
+      const issuedCallback = options.onRequestIssued;
+      nativeOptions = options;
+      capturingConnect = true;
+      try {
+        const envelope = phase === "connect-auth" ? { ...options.envelope, auth: "fixture-wrong-auth" }
+          : phase === "connect-protocol" ? { ...options.envelope, registration: { ...options.envelope.registration, protocol: { ...options.envelope.registration.protocol!, protocolVersion: 999 } } }
+          : options.envelope;
+        return BusModel.sendTelegramBusLocalEnvelope({ ...options, envelope, onRequestIssued() {
+          issued++; issuedCallback?.();
+          if (phase === "connect-reentry") { reenter = true; try { options.assertAuthority?.(); } catch { /* Returning normally cannot restore spent scope. */ } finally { reenter = false; } }
+        } });
+      } finally { capturingConnect = false; }
+    },
+    createTelegramBusLocalServer(options: Parameters<typeof BusModel.createTelegramBusLocalServer>[0]) {
+      const leaderServer = !!options.captureArtifactAuthority;
+      const serverOptions: Parameters<typeof BusModel.createTelegramBusLocalServer>[0] = { ...options,
+      ...(!leaderServer && phase === "receiver-reentry" ? { commitEndpointPublication(commit: () => void) {
+        reenter = true; try { receiverAuthority?.(); } catch { /* Even a caught native publisher refusal remains spent. */ } finally { reenter = false; }
+        commit(); return true;
+      } } : {}),
+      shouldDropResponse(request, response) {
+        if (leaderServer && request.kind === "follower.register") {
+          assert.equal(response.requestId, request.requestId);
+          wireReceipts++;
+          if (response.kind === "bus.ack" && !response.ok) refusals++;
+        }
+        return options.shouldDropResponse?.(request, response) ?? false;
+      }, async beforeEndpointPublication() {
+        await options.beforeEndpointPublication?.();
+        if (!leaderServer && phase.startsWith("receiver") && !entered) {
+          receiverEndpoint = BusModel.resolveTelegramBusSocketPath(options.socketPath);
+          await hold();
+        }
+      }, async handleEnvelope(request) {
+        if (!leaderServer || request.kind !== "follower.register") return options.handleEnvelope(request);
+        received++;
+        const response = await options.handleEnvelope(request);
+        assert.ok(response?.kind === "bus.ack");
+        assert.equal(response.ok, phase !== "connect-protocol" && phase !== "connect-auth", "The ACK/refusal is the actual native leader result, not fabricated");
+        if (phase === "connect-auth") assert.match(response.message ?? "", /Unauthorized/);
+        if (phase === "connect-protocol") assert.match(response.message ?? "", /Incompatible/);
+        if (response.ok) prepared++;
+        if (phase === "ack" || phase === "ack-scope-loss") await hold();
+        returned++;
+        return response;
+      } };
+      const server = BusModel.createTelegramBusLocalServer(serverOptions);
+      if (!leaderServer) { receiverNativeOptions = serverOptions; return { ...server, start: ((authority?: () => void) => { receiverAuthority = authority; return server.start(authority); }) }; }
+      return { ...server, async start() {
+        leaderStarts++;
+        if (phase.startsWith("ipc")) await hold();
+        await server.start();
+      } };
+    } } });
+    checkpoint("root-import");
+    const extension = (await import(artifact === "source" ? "./index.ts" : "./dist/index.js")).default;
+    checkpoint("root-import-complete");
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-ready-phases-"))), statePath = Paths.resolveTelegramStatePath(agentDir);
+    const bot = { botToken: "123:readiness-phases", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } };
+    await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
+    const leader = createRuntimePiHarness(), follower = createRuntimePiHarness();
+    let followerSession = "phase-original-session";
+    const leaderCtx = createRuntimeExtensionContext({ cwd: "/readiness-phase-leader" }), followerCtx = createRuntimeExtensionContext({ cwd: "/readiness-phase-follower", sessionManager: { getSessionId: () => followerSession } });
+    let polls = 0, topics = 40, sends = 0, deletes = 0, takeovers = 0, followerSettled = false;
+    const sentTargets: Array<{ chatId: unknown; threadId: unknown }> = [];
+    Object.assign(followerCtx.ui, { confirm: async () => { takeovers++; return false; } });
+    const restoreFetch = setTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input);
+      if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: true });
+      if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: ++topics, name: "Fixture" });
+      if (method === "deleteForumTopic") { deletes++; return createRuntimeTelegramApiResponse(true); }
+      if (method === "getUpdates" && ++polls === 1) return createRuntimeTelegramApiResponse([]);
+      if (method === "getUpdates") return await new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(new DOMException("fixture stop", "AbortError"));
+        if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      if (method === "sendMessage" || method === "sendRichMessage") {
+        const payload = parseJsonRequestBody(init);
+        if (JSON.stringify(payload).includes("phasefixture")) { sends++; sentTargets.push({ chatId: payload?.chat_id, threadId: payload?.message_thread_id }); }
+        return createRuntimeTelegramApiResponse({ message_id: 101 });
+      }
+      if (["deleteWebhook", "setMyCommands", "editForumTopic", "sendChatAction"].includes(method)) return createRuntimeTelegramApiResponse(true);
+      throw new Error(`Unexpected phase method ${method}`);
+    });
+    const events = async (): Promise<Array<{ details?: Record<string, unknown> }>> => {
+      const path = Paths.resolveTelegramRuntimeLogPath(agentDir);
+      return fs.existsSync(path) ? (await readFile(path, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
+    };
+    let connecting: Promise<void> | undefined, following: Promise<void> | undefined;
+    try {
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      extension(leader.pi); extension(follower.pi);
+      await leader.handlers.get("session_start")?.({}, leaderCtx);
+      await follower.handlers.get("session_start")?.({}, followerCtx);
+      assert.deepEqual({ polls, topics, leaderStarts, registrationCalls }, { polls: 0, topics: 40, leaderStarts: 0, registrationCalls: 0 },
+        "Fixture readiness observes initialized Roots before any connection or registration authority");
+      checkpoint("contexts-ready");
+      connecting = leader.commands.get("telegram-connect")!.handler(profile ?? "", leaderCtx);
+      if (phase === "publication" || phase.startsWith("ipc")) await waitForCondition(() => entered);
+      following = follower.commands.get("telegram-connect")!.handler(profile ?? "", followerCtx).finally(() => { followerSettled = true; });
+      if (phase === "publication") await waitForAsyncCondition(async () => (await events()).some(row => row.details?.phase === "follower-readiness-wait"));
+      if (phase.startsWith("ipc")) await waitForAsyncCondition(async () => (await events()).some(row => row.details?.phase === "follower-register-client-retry"));
+      if (phase === "ack" || phase === "ack-scope-loss") await waitForCondition(() => prepared === 1 && entered);
+      if (phase.startsWith("receiver") || phase.startsWith("connect")) await waitForCondition(() => entered);
+      checkpoint("producer-held");
+      assert.equal(followerSettled, false); assert.equal(heldCompletions, 0, "The actual producer boundary has not drained");
+      assert.equal(registrationCalls, phase === "publication" || phase.startsWith("receiver") ? 0 : 1);
+      assert.equal(issued, phase === "ack" || phase === "ack-scope-loss" ? 1 : 0);
+      assert.equal(takeovers, 0); assert.equal(deletes, 0);
+      await assert.rejects(follower.tools.get("telegram_message")!.execute("held-phase", { text: "phasefixture held", chat_id: 77, thread_id: 999 }));
+      assert.equal(sends, 0);
+      if (phase === "publication") {
+        assert.equal(leaderStarts, 0); assert.equal(polls, 0); assert.equal(topics, 40); assert.equal(received, 0);
+        const workspace = ThreadModel.parseTelegramWorkspaceStateSection(Locks.readTelegramRuntimeState(statePath).profiles[profile ?? "default"]?.workspace, profile ?? "default");
+        assert.notEqual(workspace?.bot.threadMode, "enabled", "The held persistence has not published capability");
+      } else if (phase.startsWith("ipc")) {
+        assert.equal(leaderStarts, 1); assert.equal(polls, 0); assert.equal(topics, 41); assert.equal(received, 0);
+        assert.equal(ThreadModel.parseTelegramWorkspaceStateSection(Locks.readTelegramRuntimeState(statePath).profiles[profile ?? "default"]?.workspace, profile ?? "default")?.bot.threadMode, "enabled");
+      } else if (phase.startsWith("connect")) {
+        assert.equal(nativeConnects, 1); assert.equal(nativeWrites, 0); assert.equal(wireReceipts, 0); assert.equal(topics, 41); assert.equal(polls, 2);
+        if (phase === "connect-expired") clockOffset = 8001;
+        if (phase === "connect-config") configs[1]!.set(configs[1]!.get());
+        if (phase === "connect-profile") { configs[1]!.setProfile("other", { botToken: "123:other", allowedUserId: 77 }); assert.equal(configs[1]!.activateProfile("other"), true); }
+        if (phase === "connect-session") followerSession = "phase-replacement-session";
+        if (phase === "connect-locator") locatorLost = true;
+        if (phase === "connect-port") nativeOptions!.connectionReadiness!.remainingMs = () => 8000;
+      } else if (phase.startsWith("receiver")) {
+        assert.equal(topics, 41); assert.equal(polls, 2); assert.equal(received, 0);
+        assert.ok(receiverEndpoint);
+        if (phase === "receiver-stop") await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, followerCtx);
+        if (phase === "receiver-expired") clockOffset = 8001;
+        if (phase === "receiver-config") configs[1]!.set(configs[1]!.get());
+        if (phase === "receiver-profile") { configs[1]!.setProfile("other", { botToken: "123:other", allowedUserId: 77 }); assert.equal(configs[1]!.activateProfile("other"), true); }
+        if (phase === "receiver-session") followerSession = "phase-replacement-session";
+        if (phase === "receiver-locator") locatorLost = true;
+        if (phase === "receiver-port") receiverNativeOptions!.beforeEndpointPublication = async () => {};
+      } else {
+        assert.equal(topics, 42); assert.equal(prepared, 1); assert.equal(returned, 0);
+        clockOffset = 8001;
+        if (phase === "ack-scope-loss") { assert.ok(configs[1]); configs[1].set(configs[1].get()); }
+      }
+      if (phase === "ipc-delayed") {
+        await new Promise(resolve => setTimeout(resolve, 1700));
+        assert.equal(followerSettled, false, "Original connection waiting outlives the old ten-attempt window without renewing its budget");
+        assert.equal(received, 0); assert.equal(issued, 0); assert.equal(registrationCalls, 1);
+      }
+      if (phase === "ipc-timeout") {
+        clockOffset = 8001;
+        await following;
+        assert.equal(received, 0); assert.equal(issued, 0); assert.equal(registrationCalls, 1); assert.equal(topics, 41);
+      }
+      release(); await connecting; await following;
+      checkpoint("commands-returned");
+      await waitForCondition(() => polls >= 2);
+      assert.equal(polls, 2, "Only the leader issues the initial sync and one held long poll");
+      assert.equal(heldCompletions, 1); assert.equal(takeovers, 0); assert.equal(deletes, 0);
+      const refused = phase === "connect-auth" || phase === "connect-protocol";
+      const connectUnissued = ["connect-expired", "connect-config", "connect-profile", "connect-session", "connect-locator", "connect-port"].includes(phase);
+      const receiverRefused = phase.startsWith("receiver-");
+      const failed = phase === "ipc-timeout" || phase === "ack-scope-loss" || receiverRefused || phase.startsWith("connect-");
+      const noPacket = phase === "ipc-timeout" || receiverRefused || connectUnissued || phase === "connect-reentry";
+      assert.equal(registrationCalls, receiverRefused ? 0 : 1, "Only completed original receiver startup reaches the native client");
+      assert.equal(issued, phase === "ipc-timeout" || receiverRefused || connectUnissued ? 0 : 1, "The conservative issuance marker is not proof of a write");
+      assert.equal(wireReceipts, noPacket ? 0 : 1);
+      assert.equal(received, noPacket ? 0 : 1, "The native leader receives the written request; auth/protocol refusal grants no binding");
+      assert.equal(returned, received); assert.equal(topics, noPacket || refused ? 41 : 42);
+      if (phase.startsWith("connect")) {
+        assert.equal(nativeConnects, 1); assert.equal(nativeWrites, noPacket ? 0 : 1); assert.equal(refusals, refused ? 1 : 0);
+        if (phase === "connect-reentry") assert.ok(reentries > 0, "Caught reentry runs at the native issuance callback, not a preflight proxy");
+        assert.equal(prepared, noPacket || refused ? 0 : 1);
+      }
+      if (receiverRefused) {
+        if (phase === "receiver-reentry") assert.ok(reentries > 0 && receiverAuthority, "The actual receiver publisher receives the original guard and catches reentry loss");
+        assert.equal((await BusTransport.probeTelegramBusEndpoint({ endpoint: receiverEndpoint!, timeoutMs: 100 })).reachable, false);
+        if (!receiverEndpoint!.startsWith("\\\\")) assert.throws(() => fs.lstatSync(receiverEndpoint!), { code: "ENOENT" }, "A stopped native receiver cannot publish a late dangling alias");
+      }
+      const workspace = ThreadModel.parseTelegramWorkspaceStateSection(Locks.readTelegramRuntimeState(statePath).profiles[profile ?? "default"]?.workspace, profile ?? "default");
+      assert.ok(workspace);
+      const binding = workspace.workspaceBindings?.find(row => row.cwd === followerCtx.cwd);
+      if (phase === "ack-scope-loss") assert.ok(binding, "Original scope loss does not undo the native leader's committed binding");
+      if (noPacket || refused) assert.equal(binding, undefined, "Unwritten or natively refused registration creates no binding");
+      if (failed) {
+        await assert.rejects(follower.tools.get("telegram_message")!.execute("late-phase", { text: "phasefixture late", chat_id: 77, thread_id: binding?.target.threadId ?? 999 }));
+        assert.equal(sends, 0);
+      } else {
+        assert.ok(binding);
+        await follower.tools.get("telegram_message")!.execute("phase-ready", { text: "phasefixture ready", chat_id: 77, thread_id: binding.target.threadId });
+        assert.equal(sends, 1, "Only the actual returned native ACK grants delivery");
+        assert.deepEqual(sentTargets, [binding.target], "The acknowledged original Thread, not All or a sibling, receives the native API request");
+      }
+      const phases = await events();
+      assert.equal(phases.some(row => row.details?.phase === "follower-readiness-expired"), phase === "ipc-timeout" || phase === "connect-expired" || phase === "receiver-expired", "Only unissued connection waiting is governed by the original observation clock");
+    } catch (error) {
+      // Failure-only evidence reads the existing diagnostic log, never Workspace/Restore state or fresh authority.
+      try {
+        const failure = { version: 1, artifact, profile: profile ?? "default", phase, stage: "before-cleanup", pid: process.pid,
+          error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error),
+          counters: { entered, followerSettled, heldCompletions, registrationCalls, nativeConnects, nativeWrites, wireReceipts,
+            received, prepared, returned, leaderStarts, issued, polls, topics, sends, deletes, takeovers } };
+        console.log("registration-phases-failure", JSON.stringify(failure));
+        const logPath = Paths.resolveTelegramRuntimeLogPath(agentDir);
+        const runtimeLog = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : undefined;
+        const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
+        if (evidenceDir) {
+          fs.mkdirSync(evidenceDir, { recursive: true });
+          fs.writeFileSync(join(evidenceDir, `registration-${artifact}-${profile ?? "default"}-${phase}.json`),
+            JSON.stringify({ ...failure, runtimeLog }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+        } else console.log("registration-phases-runtime-log", JSON.stringify(runtimeLog));
+      } catch (captureError) {
+        try { console.log("registration-phases-capture-refused", String(captureError)); } catch { /* Preserve the original fixture Error. */ }
+      }
+      throw error;
+    } finally {
+      checkpoint("teardown-entered");
+      release(); await connecting; await following;
+      await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, followerCtx);
+      checkpoint("follower-shutdown-returned");
+      await leader.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, leaderCtx);
+      checkpoint("leader-shutdown-returned");
+      restoreFetch();
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  };
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import fs from "node:fs";
+    import { mkdtemp, realpath, writeFile, readFile, rm } from "node:fs/promises";
+    import { join } from "node:path";
+    import { tmpdir } from "node:os";
+    import { mock } from "node:test";
+    import * as Paths from "./lib/paths.ts";
+    import * as Locks from "./lib/locks.ts";
+    const artifact = ${JSON.stringify(artifact)}, profile = ${JSON.stringify(profile)}, phase = ${JSON.stringify(phase)};
+    const holdNativeConnectEvents = ${holdNativeConnectEvents.toString()};
+    const BusTransport = await import("./lib/bus-transport.ts");
+    let runtimeExtensionContextSequence = 0;
+    const createRuntimeExtensionContext = ${createRuntimeExtensionContext.toString()};
+    const createRuntimePiHarness = ${createRuntimePiHarness.toString()};
+    const waitForCondition = ${waitForCondition.toString()};
+    const waitForAsyncCondition = ${waitForAsyncCondition.toString()};
+    const parseJsonRequestBody = ${parseJsonRequestBody.toString()};
+    const getRuntimeTelegramApiMethod = ${getRuntimeTelegramApiMethod.toString()};
+    const createRuntimeTelegramApiResponse = ${createRuntimeTelegramApiResponse.toString()};
+    const setTestFetch = ${setTestFetch.toString()};
+    const keepAlive = setInterval(() => {}, 60000);
+    console.log("registration-phases-entry", performance.now());
+    try { await (${run.toString()})(); console.log("registration-phases-pass", performance.now()); }
+    finally {
+      clearInterval(keepAlive); mock.restoreAll();
+      console.log("registration-phases-drain", performance.now(), JSON.stringify(process.getActiveResourcesInfo()));
+    }
+  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 15000,
+    readiness: { stdoutPrefix: "registration-phases-checkpoint contexts-ready ", startupTimeoutMs: 10000 } });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /registration-phases-pass/u);
+}, 30000);
+
+for (const artifact of ["source", "compiled"] as const)
+for (const profile of [undefined, "work"] as const)
+for (const outcome of ["ready", "classic", "timeout", "disconnect", "owner"] as const)
+test(`Production early follower waits for original leader readiness without manual retry (${artifact}/${profile ?? "default"}/${outcome})`, async () => {
+  const sourceExtension = await getRuntimeTelegramExtension();
+  const extension = artifact === "source" ? sourceExtension : (await import("../dist/index.js")).default;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-readiness-")));
+  const bot = { botToken: "123:readiness-fixture", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } };
+  await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
+  const leader = createRuntimePiHarness(), follower = createRuntimePiHarness();
+  const leaderCtx = createRuntimeExtensionContext({ cwd: "/readiness-leader" });
+  const followerCtx = createRuntimeExtensionContext({ cwd: "/readiness-follower" });
+  let release!: () => void, probeStarted = false, polls = 0, topics = 40, takeovers = 0, sends = 0;
+  const notices: string[] = [], methods: string[] = [];
+  Object.assign(followerCtx.ui, { notify(text: string) { notices.push(text); } });
+  const capability = new Promise<void>(resolve => { release = resolve; });
+  const commandCtx = followerCtx as typeof followerCtx & { ui: { confirm: () => Promise<boolean> } };
+  commandCtx.ui.confirm = async () => { takeovers++; return false; };
+  const restoreFetch = setTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    methods.push(method);
+    if (method === "getMe") { probeStarted = true; await capability; return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: outcome !== "classic" }); }
+    if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: ++topics, name: "Fixture" });
+    if (method === "getUpdates" && ++polls === 1) return createRuntimeTelegramApiResponse([]);
+    if (method === "getUpdates") return await new Promise<Response>((_resolve, reject) => {
+      const abort = () => reject(new DOMException("fixture stop", "AbortError"));
+      if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+    if (method === "sendMessage" || method === "sendRichMessage") { sends++; return createRuntimeTelegramApiResponse({ message_id: 101 }); }
+    if (["deleteWebhook", "setMyCommands", "editForumTopic", "sendChatAction"].includes(method)) return createRuntimeTelegramApiResponse(true);
+    throw new Error(`Unexpected readiness method ${method}`);
+  });
+  const readEvents = async () => (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8"))
+    .split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(event => event.kind === "event");
+  const readReadinessEvents = async () => (await readEvents()).filter(event =>
+    event.details?.phase === "follower-readiness-wait" || event.details?.phase === "follower-readiness-expired");
+  const assertDebugReadiness = async () => {
+    const originalEvents = await readReadinessEvents(), beforeDebug = notices.length, beforeMethods = methods.slice();
+    await follower.commands.get("telegram-status")!.handler("--debug", commandCtx);
+    const debug = notices.slice(beforeDebug).join("\n");
+    for (const event of originalEvents) {
+      const lines = debug.split("\n").filter(line => line.includes(event.message));
+      assert.equal(lines.length, 1, "Debug must expose the same original readiness event once");
+      assert.ok(lines[0]!.includes(new Date(event.at).toISOString()));
+      assert.ok(lines[0]!.includes("bus: " + event.message));
+      for (const [key, value] of Object.entries(event.details)) assert.ok(lines[0]!.includes(`${key}=${JSON.stringify(value)}`));
+    }
+    assert.equal(debug.includes(bot.botToken), false);
+    assert.deepEqual(methods, beforeMethods, "Readiness debug cannot issue another Bot API request");
+    assert.deepEqual(await readReadinessEvents(), originalEvents, "Debug cannot duplicate or renew readiness evidence");
+  };
+  let connecting: Promise<void> | undefined, following: Promise<void> | undefined, followerSettled = false;
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    extension(leader.pi); extension(follower.pi);
+    await leader.handlers.get("session_start")?.({}, leaderCtx);
+    await follower.handlers.get("session_start")?.({}, followerCtx);
+    connecting = leader.commands.get("telegram-connect")!.handler(profile ?? "", leaderCtx);
+    await waitForCondition(() => probeStarted);
+    following = follower.commands.get("telegram-connect")!.handler(profile ?? "", commandCtx).finally(() => { followerSettled = true; });
+    await waitForAsyncCondition(async () => fs.existsSync(Paths.resolveTelegramRuntimeLogPath(agentDir)) &&
+      (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")).includes("follower-readiness-wait"));
+    const initialEvents = await readReadinessEvents();
+    assert.equal(initialEvents.length, 1, "One original native wait produces one event, not a substring match");
+    const waitingEvent = initialEvents[0]!;
+    assert.equal(waitingEvent.category, "bus");
+    assert.equal(waitingEvent.message, "Waiting for original Telegram leader Thread mode.");
+    assert.deepEqual(waitingEvent.details, { phase: "follower-readiness-wait" });
+    assert.equal(waitingEvent.profile, profile ?? "default");
+    await assertDebugReadiness();
+    assert.equal(followerSettled, false, "The original command, not a second admission, waits for capability publication");
+    assert.equal(takeovers, 0, "Unknown capability cannot be offered as classic takeover");
+    assert.equal(polls, 0); assert.equal(topics, 40);
+    await assert.rejects(follower.tools.get("telegram_message")!.execute("not-ready", { text: "Fixture", chat_id: 77, thread_id: 999 }));
+    assert.equal(sends, 0, "Pending observation cannot grant direct or follower delivery");
+    if (outcome === "disconnect") await follower.commands.get("telegram-disconnect")!.handler("", commandCtx);
+    if (outcome === "owner") Locks.mutateTelegramRuntimeStateSection(Paths.resolveTelegramStatePath(agentDir), profile ?? "default", "transport",
+      value => ({ value: { ...(value as Locks.TelegramLockEntry), leaderEpoch: "fixture-replacement" }, result: undefined }), { isCurrent: () => true });
+    if (["timeout", "disconnect", "owner"].includes(outcome)) {
+      await following;
+      assert.equal(polls, 0); assert.equal(topics, 40, "An expired/cancelled wait cannot provision before leader capability settles");
+      if (outcome === "timeout") {
+        assert.ok(notices.some(text => text.includes("Timed out waiting for Telegram leader readiness")));
+        await waitForAsyncCondition(async () => (await readReadinessEvents()).some(event => event.details?.phase === "follower-readiness-expired"));
+        const expired = (await readReadinessEvents()).filter(event => event.details?.phase === "follower-readiness-expired");
+        assert.equal(expired.length, 1, "Only the actual native deadline emits one expiry outcome");
+        assert.equal(expired[0]!.category, "bus");
+        assert.equal(expired[0]!.message, "Original Telegram leader readiness deadline elapsed.");
+        assert.deepEqual(expired[0]!.details, { phase: "follower-readiness-expired", reason: "readiness-deadline" });
+        assert.equal(expired[0]!.profile, profile ?? "default");
+        await assertDebugReadiness();
+      }
+    }
+    release(); await connecting;
+    if (outcome !== "owner") await waitForCondition(() => polls >= 2);
+    const initialPolls = polls;
+    await following;
+    assert.equal(followerSettled, true);
+    assert.equal(topics, outcome === "ready" ? 42 : outcome === "classic" || outcome === "owner" ? 40 : 41);
+    assert.equal(takeovers, outcome === "classic" ? 1 : 0); assert.equal(polls, initialPolls);
+    const state = Locks.readTelegramRuntimeState(Paths.resolveTelegramStatePath(agentDir));
+    const binding = state.profiles[profile ?? "default"]?.workspace as { workspaceBindings?: Array<{ cwd: string; target: { threadId: number } }> } | undefined;
+    const target = binding?.workspaceBindings?.find(row => row.cwd === followerCtx.cwd)?.target;
+    const sendsBefore = sends;
+    if (outcome === "ready") {
+      assert.ok(target);
+      await follower.tools.get("telegram_message")!.execute("now-ready", { text: "Fixture ready", chat_id: 77, thread_id: target.threadId });
+      assert.equal(sends - sendsBefore, 1, "Only actual acknowledged registration grants follower delivery");
+    } else {
+      assert.equal(target, undefined, "Late capability cannot revive an ended wait or turn Classic into membership");
+      await assert.rejects(follower.tools.get("telegram_message")!.execute("still-not-ready", { text: "Fixture", chat_id: 77, thread_id: 999 }));
+      assert.equal(sends, sendsBefore);
+    }
+    const finalEvents = await readReadinessEvents();
+    assert.deepEqual(finalEvents.filter(event => event.details?.phase === "follower-readiness-wait"), initialEvents,
+      "Late capability and terminal observation cannot renew the original wait");
+    assert.equal(finalEvents.filter(event => event.details?.phase === "follower-readiness-expired").length, outcome === "timeout" ? 1 : 0,
+      "Classic, success, disconnect and owner loss are not deadline expiry");
+    assert.equal((await readEvents()).some(event => event.details?.phase === "state-reset"), false);
+  } finally {
+    release(); await connecting; await following;
+    await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, commandCtx);
+    await leader.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, leaderCtx);
+    restoreFetch();
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+}, 15000);
+
+for (const artifact of ["source", "compiled"] as const)
+test(`Production damaged-state profile switch drains its old transport without inventing deletion (${artifact})`, async () => {
+  const sourceExtension = await getRuntimeTelegramExtension();
+  const extension = artifact === "source" ? sourceExtension : (await import("../dist/index.js")).default;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-warm-reset-")));
+  const statePath = Paths.resolveTelegramStatePath(agentDir);
+  const bot = { botToken: "123:warm-profile-recovery", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } };
+  await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
+  const { handlers, commands, pi } = createRuntimePiHarness();
+  const ctx = createRuntimeExtensionContext({ cwd: "/warm-profile-recovery" });
+  let heldPollers = 0, pollingStarts = 0, maxPollers = 0, topics = 40, deletes = 0;
+  const restoreFetch = setTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: true });
+    if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: ++topics, name: "Fixture" });
+    if (method === "deleteForumTopic") { deletes++; return createRuntimeTelegramApiResponse(true); }
+    if (method === "getUpdates") {
+      if (Number(parseJsonRequestBody(init)?.timeout ?? 0) === 0) return createRuntimeTelegramApiResponse([]);
+      heldPollers++; pollingStarts++; maxPollers = Math.max(maxPollers, heldPollers);
+      return await new Promise<Response>((_resolve, reject) => {
+        const abort = () => { heldPollers--; reject(new DOMException("fixture stop", "AbortError")); };
+        if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
+    if (["deleteWebhook", "setMyCommands", "editForumTopic", "sendChatAction", "sendMessage", "sendRichMessage"].includes(method)) return createRuntimeTelegramApiResponse(true);
+    throw new Error(`Unexpected warm recovery method ${method}`);
+  });
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    extension(pi);
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")!.handler("", ctx);
+    await waitForCondition(() => heldPollers === 1);
+    assert.ok(Locks.readTelegramRuntimeState(statePath).profiles.default?.transport);
+    await writeFile(statePath, "{ damaged", { mode: 0o600 });
+    await commands.get("telegram-connect")!.handler("work", ctx);
+    await waitForCondition(() => !!Locks.readTelegramRuntimeState(statePath).profiles.work?.transport && heldPollers === 1 && pollingStarts === 2);
+    assert.equal(maxPollers, 1, "Replacement polling begins only after the old transport drains");
+    assert.equal(topics, 42, "The new profile provisions only its own fresh Thread");
+    assert.equal(deletes, 0, "Reset absence cannot authorize deletion of the old known Thread");
+    assert.equal(Locks.readTelegramRuntimeState(statePath).profiles.default?.transport, undefined);
+  } catch (error) {
+    console.error("warm-recovery-failure:", JSON.stringify({ artifact, heldPollers, pollingStarts, topics, deletes,
+      events: (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8").catch(() => "")).split("\n").filter(Boolean).map(line => JSON.parse(line)) }));
+    throw error;
+  } finally {
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+    restoreFetch();
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+  assert.equal(heldPollers, 0, "The replacement transport also really drains");
+}, 15000);
+
+for (const artifact of ["source", "compiled"] as const)
+for (const refusal of ["missing-profile", "invalid-profile", "unresolved-token", "damaged-guard"] as const)
+test(`Production connect preparation cannot reset through invalid authority (${artifact}/${refusal})`, async () => {
+  const sourceExtension = await getRuntimeTelegramExtension();
+  const extension = artifact === "source" ? sourceExtension : (await import("../dist/index.js")).default;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-prep-refuse-")));
+  const statePath = Paths.resolveTelegramStatePath(agentDir), before = "{ damaged";
+  const bot = { botToken: "123:preparation-refusal", botId: 123, allowedUserId: 77 };
+  const variable = `PT_MISSING_PREPARATION_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  assert.equal(process.env[variable], undefined);
+  await mkdir(dirname(statePath), { recursive: true });
+  await writeFile(statePath, before, { mode: 0o600 });
+  await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: refusal === "missing-profile" ? {} : {
+    work: refusal === "unresolved-token" ? { ...bot, botToken: `$${variable}` } : bot,
+  } }), { mode: 0o600 });
+  const guard = join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction");
+  const marker = join(guard, "owner.preparation-test.json");
+  if (refusal === "damaged-guard") {
+    await mkdir(guard, { recursive: true, mode: 0o700 });
+    await writeFile(marker, "", { mode: 0o600 });
+  }
+  const { handlers, commands, pi } = createRuntimePiHarness();
+  const ctx = createRuntimeExtensionContext({ cwd: "/preparation-refusal" });
+  let calls = 0;
+  const restoreFetch = setTestFetch(async () => { calls++; throw new Error("A refused preparation cannot reach Telegram HTTP"); });
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    extension(pi);
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")!.handler(refusal === "invalid-profile" ? "Work" : "work", ctx);
+    assert.equal(await readFile(statePath, "utf8"), before, "Refusal does not rewrite the damaged envelope");
+    assert.equal(calls, 0);
+    if (refusal === "damaged-guard") assert.equal(await readFile(marker, "utf8"), "", "Unknown guard ownership stays protective");
+    const log = await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8").catch(() => "");
+    assert.doesNotMatch(log, /previous runtime continuity was discarded/u, "No reset success is reported");
+  } finally {
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+    restoreFetch();
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+}, 15000);
+
+test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn into pi", async t => {
+  const extension = await getRuntimeTelegramExtension(), previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-first-pair-")));
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const telegramConfig = await createRuntimeTelegramConfigFixture(agentDir);
+  const sentMessages: RuntimeHarnessMessage[] = [];
+  let phase = "created", completed = false;
+  let resolveDispatch: ((value: RuntimeHarnessMessage) => void) | undefined;
+  let rejectDispatch: ((reason: Error) => void) | undefined;
+  const dispatched = new Promise<RuntimeHarnessMessage>((resolve, reject) => {
+    resolveDispatch = resolve; rejectDispatch = reject;
+  });
+  // A timed-out attempt must unwind and run its captured shutdown rather than retain an unsettled waiter.
+  void dispatched.catch(() => {});
+  const onAbort = () => rejectDispatch?.(new Error(`Runtime dispatch aborted during ${phase}`));
+  t.signal.addEventListener("abort", onAbort, { once: true });
   const { handlers, commands, pi } = createRuntimePiHarness({
     sendUserMessage: (content) => {
       sentMessages.push(content);
@@ -4996,7 +13989,7 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
   let getUpdatesCalls = 0;
   let sendMessageCalls = 0;
   const apiCalls: string[] = [];
-  const restoreFetch = setRuntimeTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
     apiCalls.push(method);
     if (method === "deleteWebhook") {
@@ -5035,485 +14028,44 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     }
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
-  try {
-    await telegramConfig.write({ botToken: "123:abc", lastUpdateId: 0 });
-    (await getRuntimeTelegramExtension())(pi);
-    const ctx = createRuntimeExtensionContext();
-    await handlers.get("session_start")?.({}, ctx);
-    await commands.get("telegram-connect")?.handler("", ctx);
-    const dispatchedContent = await dispatched;
-    await flushMicrotasks();
-    assert.equal(sentMessages.length, 1);
-    assert.equal(Array.isArray(dispatchedContent), true);
-    assert.equal(apiCalls.includes("sendMessage"), true);
-    assert.equal(sendMessageCalls, 2);
-    assert.equal(apiCalls.includes("sendChatAction"), true);
-    const promptBlock = getRuntimeHarnessTextBlock(dispatchedContent);
-    assert.equal(promptBlock.type, "text");
-    assert.match(promptBlock.text ?? "", /^\[telegram\] hello from telegram$/);
-    await handlers.get("session_shutdown")?.({}, ctx);
-  } finally {
-    restoreFetch();
-    await telegramConfig.restore();
-  }
+  const ctx = createRuntimeExtensionContext();
+  t.after(async () => {
+    t.signal.removeEventListener("abort", onAbort);
+    if (!completed) {
+      console.error(`pair-dispatch-phase:${JSON.stringify({ phase, getUpdatesCalls, sendMessageCalls, sent: sentMessages.length, apiCalls })}`);
+      const log = await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8").catch(() => "<unavailable>");
+      console.error(`pair-dispatch-events:${log.slice(-12000)}`);
+    }
+    try { await handlers.get("session_shutdown")?.({}, ctx); }
+    finally {
+      restoreFetch(); await telegramConfig.restore();
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+    if (!completed) console.error("pair-dispatch-cleanup:done");
+  });
+  phase = "config";
+  await telegramConfig.write({ botToken: "123:first-pair-dispatch", lastUpdateId: 0 });
+  phase = "construct";
+  extension(pi);
+  phase = "session-start";
+  await handlers.get("session_start")?.({}, ctx);
+  phase = "connect";
+  await commands.get("telegram-connect")?.handler("", ctx);
+  phase = "await-dispatch";
+  const dispatchedContent = await dispatched;
+  phase = "assertions";
+  await flushMicrotasks();
+  assert.equal(sentMessages.length, 1);
+  assert.equal(Array.isArray(dispatchedContent), true);
+  assert.equal(apiCalls.includes("sendMessage"), true);
+  assert.equal(sendMessageCalls, 2);
+  assert.equal(apiCalls.includes("sendChatAction"), true);
+  const promptBlock = getRuntimeHarnessTextBlock(dispatchedContent);
+  assert.equal(promptBlock.type, "text");
+  assert.match(promptBlock.text ?? "", /^\[telegram\] hello from telegram$/);
+  completed = true;
 });
-
-for (const delivery of ["ordinary", "idle-steer", "active-steer"] as const) {
-const outcomes = delivery === "ordinary"
-  ? ["unchanged", "offered", "transferred", "discarded", "cancelled", "offered-without-wake",
-    "observation-failed", "prompt-unchanged", "prompt-race", "prompt-completion-lost-ack", "discard-completion-lost-ack"] as const
-  : ["prompt-unchanged", "offered-without-wake", "transferred", "cancelled", "discarded",
-    "prompt-completion-lost-ack", "prompt-generation-loss"] as const;
-for (const outcome of outcomes) {
-strictFileTest(`Prepared donor receipt projection gates Queue issuance (${delivery}/${outcome})`, async () => {
-  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-donor-projection-")));
-  const configPath = join(dir, "telegram.json");
-  const botToken = "123:fixture-donor-projection";
-  const owner = { instanceId: "donor", processId: process.pid,
-    processBirthId: `${process.pid}:fixture-donor`, sessionGeneration: 1 };
-  const recipient = { instanceId: "recipient", processId: process.pid + 1,
-    processBirthId: `${process.pid + 1}:fixture-recipient`, sessionGeneration: 1 };
-  let shutdown: (() => Promise<void>) | undefined;
-  try {
-    await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
-    const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
-    const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
-    await config.load(); config.activateProfile("work");
-    const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
-    const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({
-      path: join(dir, "workspace-admission.json"), profileKey: "fixture:work", owner,
-      getProcessLiveness: () => "alive" });
-    const options: Journal.TelegramInputJournalStoreOptions = {
-      path: join(dir, "inbox.work.json"), profileName: "work", botIdentity,
-      queueRuntimeIdentity: owner, workspaceAdmission: ledger,
-      sourceAccess: { directory: dir, limits: {
-        maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
-      withSourceSerialization: journalSerialization,
-      withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
-      getInputContext: () => ({ owner, recipientBindingKey: "workspace:donor" }),
-    };
-    const source = Journal.createTelegramInputJournalStore(options);
-    const isPrompt = delivery !== "ordinary" || outcome.startsWith("prompt-");
-    source.appendBatch([{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }], 3);
-    const input = source.acquireInput({ updateId: 1, recipientBindingKey: "workspace:donor" });
-    source.startInput(input.receipt);
-    const grouped = source.acquireInput({ updateId: 3, recipientBindingKey: "workspace:donor" });
-    source.startInput(grouped.receipt);
-    const queued = source.queueInputs({ queueKind: isPrompt ? "prompt" : "control", receiptId: "donor-receipt",
-      receipts: [grouped.receipt, input.receipt] }).queueReceipt;
-    assert.deepEqual(queued.sourceUpdateIds, [1, 3]);
-    const independent = source.acquireInput({ updateId: 2, recipientBindingKey: "workspace:donor" });
-    source.startInput(independent.receipt);
-    const unrelated = source.queueInputs({ queueKind: "control", receiptId: "unrelated",
-      receipts: [independent.receipt] }).queueReceipt;
-    let readUnavailable = false;
-    // Inject only unavailable observation / a lost return after the native durable completion.
-    const boundSource: Journal.TelegramInputJournalStore = { ...source,
-      read() {
-        if (readUnavailable) throw new Error("fixture observation unavailable");
-        return source.read();
-      },
-      completeQueued(receipts) {
-        const result = source.completeQueued(receipts);
-        if (outcome === "prompt-generation-loss") deferredDispatch.bind("ctx");
-        if (outcome.endsWith("completion-lost-ack")) throw new Error("fixture completion ACK lost");
-        return result;
-      },
-    };
-    const journalBindingKey = Journal.createTelegramUpdateJournalBindingKey(options);
-    const handoff = { queueKind: queued.queueKind, receiptId: queued.receiptId,
-      sourceUpdateIds: queued.sourceUpdateIds, expectedOwner: queued.queueOwner, recipientOwner: recipient,
-      handoffToken: Journal.createTelegramUpdateQueueHandoffToken() };
-    const resolveBinding = Updates.createTelegramInputCustodyLifecycleBindingResolver({
-      isEnabled: () => true,
-      resolveInputJournal: () => ({ runtimeKey: "donor-runtime", recoveryKey: journalBindingKey, journal: boundSource }),
-      getRecipientBindingKey: () => "workspace:donor",
-    });
-    let transport = true;
-    const admission = Updates.createTelegramUpdateAdmissionRuntimeBinding<string>({ isFollowerRegistered: () => false });
-    const assembly = Updates.createTelegramUpdateAdmissionLifecycleAssembly({ runtimeBinding: admission,
-      worker: { getQueueOwnerIdentity: () => owner, isContextCurrent: (ctx: string) => ctx === "ctx",
-        async defaultHandle() { assert.fail("Queued input must not replay its raw handler"); } },
-      leader: { resolveBinding, hasAuthority: () => transport },
-      follower: { resolveBinding: () => undefined, isRegistered: () => false,
-        getGeneration: () => undefined, prepareUpdateForExecution: update => update },
-    });
-    shutdown = admission.onSessionShutdown;
-    const store = Queue.createTelegramQueueStore<string>();
-    const deferredDispatch = Queue.createTelegramDeferredQueueDispatchRuntime<string>();
-    deferredDispatch.bind("ctx");
-    const effects: string[] = [];
-    const binding = Bindings.createTelegramQueueBindingRuntime({ store, admission, deferredDispatch,
-      queue: { allocateItemOrder: () => 1 }, activeTurn: { has: () => false },
-      lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => false },
-      transportStamp: { isActive: () => true }, isIdle: () => delivery !== "active-steer", hasPendingMessages: () => false,
-      isContextCurrent: ctx => ctx === "ctx", isContextAborted: () => false,
-      updateStatus: () => {}, sendTextReply: async () => undefined,
-      sendUserMessage: () => { effects.push("prompt"); },
-      promptDispatch: { startTypingLoop: () => {}, onPromptDispatchFailure: () => {},
-        onPromptDispatchStart: () => {
-          if (outcome === "prompt-race") assembly.leader.offerQueueReceiptHandoff(handoff);
-        } },
-    });
-    const base = { chatId: 7, replyToMessageId: 1, queueOrder: 1, laneOrder: 1,
-      statusSummary: "retained work", admissionReceipts: [{ ...queued, journalBindingKey }] };
-    const item: Queue.TelegramQueueItem<string> = isPrompt
-      ? { ...base, kind: "prompt", queueLane: delivery === "ordinary" ? "default" : "steer", sourceMessageIds: [1, 3], queuedAttachments: [],
-        content: [{ type: "text", text: "retained prompt" }], historyText: "" }
-      : { ...base, kind: "control", controlType: "status", queueLane: "control",
-        async execute() { effects.push("control"); } };
-    binding.mutation.append(item, "ctx");
-    await assembly.leader.onSessionStart("ctx");
-    await new Promise<void>(done => setImmediate(done));
-    assert.equal(admission.getSettlement()!.isItemReady(item), true);
-    // Transport loss cannot revoke otherwise valid accepted local work.
-    transport = false;
-    assembly.leader.signal();
-    await new Promise<void>(done => setImmediate(done));
-    assert.equal(assembly.leader.getState()?.blockedReason, "authority-lost");
-    if (outcome === "discarded") assembly.leader.discardQueueReceipt(handoff);
-    else if (outcome === "offered-without-wake") {
-      Journal.createTelegramInputJournalStore(options).offerQueuedHandoff(handoff);
-    } else if (outcome === "offered" || outcome === "cancelled" || outcome === "transferred") {
-      assembly.leader.offerQueueReceiptHandoff(handoff);
-      if (outcome === "cancelled") assembly.leader.cancelQueueReceiptHandoff(handoff);
-      if (outcome === "transferred") {
-        const receiver = Journal.createTelegramInputJournalStore({ ...options, queueRuntimeIdentity: recipient,
-          getInputContext: () => ({ owner: recipient, recipientBindingKey: "workspace:recipient" }) });
-        receiver.acceptQueuedHandoff(handoff);
-        // Retain donor memory, as after a lost acceptance acknowledgement.
-      }
-    }
-    const settlement = admission.getSettlement()!;
-    if (outcome === "observation-failed") {
-      const before = source.read();
-      readUnavailable = true;
-      assert.equal(settlement.isItemReady(item), false);
-      assert.equal(settlement.getQueueReceiptOwner(item.admissionReceipts![0]!), undefined);
-      assert.throws(() => binding.dispatchNext("ctx"), /observation unavailable/);
-      assert.deepEqual(effects, []);
-      assert.equal(store.getQueuedItems().length, 1);
-      assert.deepEqual(source.read(), before);
-      readUnavailable = false;
-      // A fresh observation restores unchanged accepted work without transport reacquisition or raw drain.
-      assert.equal(settlement.isItemReady(item), true);
-    }
-    const before = source.read();
-    const issue = () => {
-      if (delivery !== "active-steer") return binding.dispatchNext("ctx");
-      const proposal = binding.onTurnEnd({ turnIndex: 1, outcome: "completed" }, "ctx");
-      if (proposal) {
-        assert.equal(proposal.continue, true);
-        assert.equal(proposal.entries?.length, 1);
-        effects.push("proposal");
-      }
-    };
-    if (outcome === "discard-completion-lost-ack") {
-      assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
-    } else issue();
-    await new Promise<void>(done => setImmediate(done));
-    const executable = outcome === "unchanged" || outcome === "cancelled" ||
-      outcome === "observation-failed" || outcome === "prompt-unchanged";
-    const promptEffect = delivery === "active-steer" ? "proposal" : "prompt";
-    assert.deepEqual(effects, executable ? [isPrompt ? promptEffect : "control"] : [],
-      "Durable revocation or missing completion ACK must precede effects");
-    if (!executable) {
-      assert.equal(store.getQueuedItems().length, 1);
-      assert.equal(settlement.isItemReady(item), false);
-      assert.equal(settlement.getQueueReceiptOwner(item.admissionReceipts![0]!), undefined);
-      if (outcome === "prompt-race") assert.ok(source.read().entries[0]!.queueHandoff);
-      else if (outcome.endsWith("completion-lost-ack") || outcome === "prompt-generation-loss") {
-        assert.deepEqual(source.read().entries.map(entry => entry.updateId), [2]);
-      } else assert.deepEqual(source.read(), before);
-      const retained = source.read();
-      issue();
-      assert.deepEqual(effects, [], "Protected attempts or revoked/offered receipts cannot replay");
-      if (outcome === "prompt-generation-loss") {
-        assert.equal(binding.mutation.clear("ctx"), 1, "Exact ACK permits disposal only, never publication into the reused context");
-      } else {
-        assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
-        assert.equal(store.getQueuedItems().length, 1);
-      }
-      assert.deepEqual(source.read(), retained);
-    } else assert.deepEqual(source.read().entries.map(entry => entry.updateId), [2]);
-    assert.equal(settlement.isItemReady({ admissionReceipts: [{ ...unrelated, journalBindingKey }] }), true);
-    if (outcome === "prompt-unchanged" && delivery !== "active-steer") {
-      const receipt = item.admissionReceipts![0]!;
-      const ids = receipt.sourceUpdateIds;
-      receipt.sourceUpdateIds = [1];
-      assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
-      receipt.sourceUpdateIds = ids;
-      item.admissionReceipts = [{ ...receipt }];
-      assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
-      item.admissionReceipts = [receipt];
-      // Confirmed completion permits local cleanup only, even after worker replacement.
-      const retained = source.read();
-      await assembly.leader.onTransportChanged("ctx");
-      await new Promise<void>(done => setImmediate(done));
-      issue();
-      assert.deepEqual(effects, [promptEffect]);
-      assert.equal(binding.mutation.clear("ctx"), 1);
-      assert.deepEqual(source.read(), retained);
-    }
-    assert.deepEqual(ledger.read().leases, []);
-  } finally { await shutdown?.(); await rm(dir, { recursive: true, force: true }); }
-});
-}
-}
-
-for (const outcome of ["accepted", "rejected", "lost-ack"] as const) {
-strictFileTest(`Control reconciliation uses native serial handoff custody (${outcome})`, async () => {
-  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-control-reconciliation-")));
-  const botToken = "123:fixture-control-reconciliation";
-  const configPath = join(dir, "telegram.json");
-  const donorOwner = { instanceId: "donor", processId: process.pid,
-    processBirthId: `${process.pid}:fixture-donor`, sessionGeneration: 1 };
-  const recipientOwner = { instanceId: "recipient", processId: process.pid + 1,
-    processBirthId: `${process.pid + 1}:fixture-recipient`, sessionGeneration: 1 };
-  const target = { chatId: 7, threadId: 42 };
-  const lifecycles: Array<Updates.TelegramUpdateAdmissionLifecycleRuntime<string>> = [];
-  try {
-    await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
-    const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
-    const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
-    await config.load(); config.activateProfile("work");
-    const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
-    const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({ path: join(dir, "admission.json"),
-      profileKey: "fixture:work", owner: donorOwner, getProcessLiveness: () => "alive" });
-    const options: Journal.TelegramInputJournalStoreOptions = {
-      path: join(dir, "inbox.work.json"), profileName: "work", botIdentity, queueRuntimeIdentity: donorOwner,
-      workspaceAdmission: ledger, sourceAccess: { directory: dir, limits: {
-        maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
-      withSourceSerialization: journalSerialization,
-      withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
-      getInputContext: () => ({ owner: donorOwner, recipientBindingKey: "workspace:donor" }),
-    };
-    const donor = Journal.createTelegramInputJournalStore(options);
-    const recipient = Journal.createTelegramInputJournalStore({ ...options, queueRuntimeIdentity: recipientOwner,
-      getInputContext: () => ({ owner: recipientOwner, recipientBindingKey: "workspace:recipient" }) });
-    const key = Journal.createTelegramUpdateJournalBindingKey(options);
-    donor.appendBatch([{ update_id: 1, message: { message_id: 11, chat: { id: 7, type: "private" },
-      from: { id: 7, is_bot: false }, text: "/status" } }], 1);
-    const input = donor.acquireInput({ updateId: 1, recipientBindingKey: "workspace:donor" });
-    donor.startInput(input.receipt);
-    const queued = donor.queueInputs({ queueKind: "control", receiptId: "fixture-control", receipts: [input.receipt] }).queueReceipt;
-    const original = donor.read().entries;
-    const createLifecycle = (journal: Journal.TelegramInputJournalStore, owner: typeof donorOwner, recipientBindingKey: string) => {
-      const lifecycle = Updates.createTelegramUpdateAdmissionLifecycleRuntime<string>({
-        resolveBinding: Updates.createTelegramInputCustodyLifecycleBindingResolver({ isEnabled: () => true,
-          resolveInputJournal: () => ({ runtimeKey: owner.instanceId, recoveryKey: key, journal }),
-          getRecipientBindingKey: () => recipientBindingKey }),
-        createWorker: (port, binding) => Updates.createTelegramUpdateAdmissionWorkerRuntime({
-          journal: port, inputCustody: binding.journal.inputCustody,
-          getJournalBindingKey: () => key, getRecipientBindingKey: () => recipientBindingKey,
-          getQueueOwnerIdentity: () => owner, hasAuthority: () => true,
-          defaultHandle: async () => { assert.fail("Queued control must not replay raw input"); },
-        }),
-      });
-      lifecycles.push(lifecycle);
-      return lifecycle;
-    };
-    const donorLifecycle = createLifecycle(donor, donorOwner, "workspace:donor");
-    const recipientLifecycle = createLifecycle(recipient, recipientOwner, "workspace:recipient");
-    const donorQueue = Queue.createTelegramQueueStore<string>();
-    const recipientQueue = Queue.createTelegramQueueStore<string>();
-    const effects: string[] = [];
-    const item: Queue.PendingTelegramControlItem<string> = { kind: "control", controlType: "status", chatId: 7,
-      target, transportStamp: { profile: "work", generation: "fixture" }, replyToMessageId: 11,
-      queueOrder: 1, queueLane: "control", laneOrder: 1, statusSummary: "status",
-      admissionReceipts: [{ ...queued, journalBindingKey: key }], execute: async () => { effects.push("donor"); } };
-    donorQueue.setQueuedItems([item]);
-    const deferredDispatch = Queue.createTelegramDeferredQueueDispatchRuntime<string>();
-    deferredDispatch.bind("recipient");
-    const queueBinding = Bindings.createTelegramQueueBindingRuntime({ store: recipientQueue, deferredDispatch,
-      admission: { getSettlement: () => recipientLifecycle,
-        hasPendingQueueMutationForItem: recipientLifecycle.hasPendingQueueMutationForItem },
-      queue: { allocateItemOrder: () => 2 }, activeTurn: { has: () => false },
-      lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => false },
-      transportStamp: { isActive: () => true }, isIdle: () => true, hasPendingMessages: () => false,
-      updateStatus: () => {}, sendTextReply: async () => undefined,
-      promptDispatch: { startTypingLoop: () => {}, onPromptDispatchFailure: () => {}, onPromptDispatchStart: () => {} },
-      sendUserMessage: () => { assert.fail("Control handoff must not start a model turn"); },
-    });
-    const accept = Updates.createTelegramQueueHandoffRecipientRuntime({
-      staging: Queue.createTelegramQueueHandoffStagingRuntime({ liveStore: recipientQueue,
-        createControlExecution: Updates.createTelegramQueueHandoffControlExecutionFactory({
-          isContextCurrent: ctx => ctx === "recipient", showStatus: async () => { effects.push("recipient"); },
-          openModelMenu: async () => { assert.fail("Wrong control reconstructed"); },
-        }) }),
-      getRecipientOwner: () => recipientOwner, getLifecycleForBinding: binding => binding === key ? recipientLifecycle : undefined,
-      isTransportStampActive: () => true, dispatchNext: queueBinding.dispatchNext,
-    });
-    let transfers = 0;
-    const reconcile = Updates.createTelegramQueueHandoffReconciler<string>({
-      ownsDirect: () => true, isFollowerRegistered: () => false, isBusEnabled: () => true,
-      listFollowers: () => [{ instanceId: "recipient", pid: recipientOwner.processId,
-        processBirthId: recipientOwner.processBirthId, sessionGeneration: 1, registrationGeneration: "g1",
-        connectedAtMs: 1, lastHeartbeatMs: 1, profileKey: "recipient", target }],
-      createRecipientJournalBindingKey: () => key, getQueuedItems: donorQueue.getQueuedItems,
-      getReceiptOwner: donorLifecycle.getQueueReceiptOwner, getLifecycleForReceipt: () => donorLifecycle,
-      donorInstanceId: "donor", createHandoffToken: Journal.createTelegramUpdateQueueHandoffToken,
-      createRequestId: () => "fixture-handoff", stageThroughFollower: async () => { throw Error("Wrong route"); },
-      async routeThroughLeader(envelope) {
-        transfers++;
-        assert.equal("execute" in envelope.payload, false);
-        const payload = structuredClone(envelope.payload);
-        const decoded = Bus.parseTelegramBusEnvelope(Bus.encodeTelegramBusEnvelope({
-          ...envelope, kind: "leader.offerQueueHandoff", payload,
-        }));
-        assert.ok(decoded?.kind === "leader.offerQueueHandoff", "The serial payload must survive the real wire codec");
-        if (outcome === "rejected") return { kind: "bus.ack", requestId: envelope.requestId, ok: false };
-        const result = await accept(decoded, "recipient");
-        if (outcome === "lost-ack") throw new Error("fixture lost acceptance ACK");
-        return { kind: "bus.ack", requestId: envelope.requestId, ok: true, result };
-      },
-      removeDonorItem: receipt => Queue.removeTelegramQueueItemByReceipt({ receipt, store: donorQueue }),
-    });
-    await donorLifecycle.onSessionStart("donor");
-    await recipientLifecycle.onSessionStart("recipient");
-    await new Promise<void>(done => setImmediate(done));
-    await reconcile("donor");
-    await new Promise<void>(done => setImmediate(done));
-    assert.equal(transfers, 1);
-    assert.deepEqual(effects, outcome === "rejected" ? [] : ["recipient"]);
-    assert.deepEqual(donorQueue.getQueuedItems(), outcome === "accepted" ? [] : [item]);
-    assert.deepEqual(recipientQueue.getQueuedItems(), []);
-    assert.deepEqual(donor.read().entries, outcome === "rejected" ? original : []);
-    assert.equal(donorLifecycle.isItemReady(item), outcome === "rejected");
-    if (outcome === "lost-ack") {
-      await reconcile("donor");
-      assert.equal(transfers, 1, "Unknown post-effect outcome must not replay transport or the control");
-      assert.deepEqual(effects, ["recipient"]);
-    }
-    assert.deepEqual(ledger.read().leases, []);
-  } finally {
-    for (const lifecycle of lifecycles) await lifecycle.onSessionShutdown();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-}
-
-for (const stopped of [false, true]) {
-strictFileTest(`Deferred media enqueue keeps custody behind its execution fence (${stopped ? "stopped" : "active"})`, async () => {
-  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-deferred-custody-")));
-  const botToken = "123:fixture-deferred-custody";
-  const configPath = join(dir, "telegram.json");
-  const owner = { instanceId: "deferred", processId: process.pid,
-    processBirthId: `${process.pid}:fixture-deferred`, sessionGeneration: 1 };
-  const entered = Promise.withResolvers<void>();
-  const downloaded = Promise.withResolvers<void>();
-  const references = Journal.createTelegramUpdateJournalReferenceRegistry({ maxActive: 1 });
-  let shutdown: (() => Promise<void>) | undefined;
-  let clearMedia: (() => void) | undefined;
-  try {
-    await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
-    await writeFile(join(dir, "fixture.txt"), "fixture attachment");
-    const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
-    const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
-    await config.load(); config.activateProfile("work");
-    const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
-    const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({ path: join(dir, "admission.json"),
-      profileKey: "fixture:work", owner, getProcessLiveness: () => "alive" });
-    const options: Journal.TelegramInputJournalStoreOptions = {
-      path: join(dir, "inbox.work.json"), profileName: "work", botIdentity, queueRuntimeIdentity: owner,
-      workspaceAdmission: ledger, sourceAccess: { directory: dir, limits: {
-        maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
-      withSourceSerialization: journalSerialization,
-      withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
-      getInputContext: () => ({ owner, recipientBindingKey: "workspace:deferred" }),
-    };
-    const source = Journal.createTelegramInputJournalStore(options);
-    const bindingKey = Journal.createTelegramUpdateJournalBindingKey(options);
-    let queuedReports = 0;
-    let queueCommits = 0;
-    let completionCommits = 0;
-    const boundSource: Journal.TelegramInputJournalStore = { ...source,
-      queueInputs(input) {
-        queueCommits++;
-        assert.equal(references.list().length, 1, "Custody transition must have a participating reference");
-        return source.queueInputs(input);
-      },
-      completeInput(input) {
-        completionCommits++;
-        assert.equal(references.list().length, 1);
-        return source.completeInput(input);
-      },
-    };
-    const message = { message_id: 11, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
-      media_group_id: "fixture-album", caption: "deferred attachment",
-      document: { file_id: "fixture", file_unique_id: "fixture", file_name: "fixture.txt" } };
-    const store = Queue.createTelegramQueueStore<string>();
-    const prepareTurn = Turns.createTelegramPromptTurnRuntimePreparer<typeof message, string>({
-      allocateQueueOrder: () => 1, getAdmissionScope: () => "fixture", getAdmissionJournalBinding: () => bindingKey,
-      async downloadFile() { entered.resolve(); await downloaded.promise; return join(dir, "fixture.txt"); },
-    });
-    const enqueue = Queue.createTelegramPromptEnqueueController<typeof message, string>({
-      ...store, prepareTurn, hasPendingDispatch: () => false,
-      getFoldQueuedPromptsIntoHistory: () => false, setFoldQueuedPromptsIntoHistory: () => {},
-      assertExecutionCurrent: messages => Updates.assertTelegramUpdateExecutionCurrent(messages[0]),
-      updateStatus: () => {}, dispatchNextQueuedTelegramTurn: () => {},
-    });
-    const groups = Media.createTelegramMediaGroupController<typeof message, string>({
-      setTimer: () => ({ unref() {} }) as ReturnType<typeof setTimeout>, clearTimer: () => {},
-    });
-    clearMedia = groups.clear;
-    const media = Media.createTelegramMediaGroupDispatchRuntime({ mediaGroups: groups,
-      onDeferredMessage: Updates.reportTelegramUpdateDeferred,
-      async dispatchMessages(messages: typeof message[], ctx: string) {
-        await enqueue.enqueue(messages, ctx, turn => {
-          queuedReports++;
-          Updates.reportTelegramQueueAdmission(messages, turn.admissionReceipts ?? []);
-        });
-      },
-    });
-    const admission = Updates.createTelegramUpdateAdmissionRuntimeBinding<string>({ isFollowerRegistered: () => false });
-    const assembly = Updates.createTelegramUpdateAdmissionLifecycleAssembly({ runtimeBinding: admission,
-      acquireSourceReference: (_role, binding) => references.acquire({
-        referenceClass: "leader-lifecycle", recoveryKey: binding.recoveryKey }),
-      worker: { getQueueOwnerIdentity: () => owner,
-        defaultHandle: async (update: Updates.TelegramUpdateFlow, ctx: string) => {
-          await media.handleMessage(update.message as typeof message, ctx);
-        } },
-      leader: { hasAuthority: () => true,
-        resolveBinding: Updates.createTelegramInputCustodyLifecycleBindingResolver({ isEnabled: () => true,
-          resolveInputJournal: () => ({ runtimeKey: "fixture", recoveryKey: bindingKey, journal: boundSource }),
-          getRecipientBindingKey: () => "workspace:deferred" }) },
-      follower: { resolveBinding: () => undefined, isRegistered: () => false,
-        getGeneration: () => undefined, prepareUpdateForExecution: update => update },
-    });
-    shutdown = admission.onSessionShutdown;
-    source.appendBatch([{ update_id: 1, message }], 1);
-    await assembly.leader.onSessionStart("ctx");
-    await new Promise<void>(done => setImmediate(done));
-    assert.equal(assembly.leader.getState()?.deferredClaimCount, 1);
-    const retained = source.read();
-    assert.equal(retained.entries[0]?.inputClaim?.phase, "running");
-    const flushing = groups.flushMessage(11).then(value => ({ value }), error => ({ error }));
-    await entered.promise;
-    if (stopped) { groups.clear(); await assembly.leader.onSessionShutdown(); }
-    downloaded.resolve();
-    const result = await flushing;
-    await new Promise<void>(done => setImmediate(done));
-    assert.equal(completionCommits, 0);
-    if (stopped) {
-      assert.ok("error" in result && result.error instanceof Error && result.error.name === "AbortError");
-      assert.deepEqual(store.getQueuedItems(), []);
-      assert.deepEqual(source.read(), retained, "Expired preparation must not settle outcome-unknown custody");
-      assert.deepEqual([queuedReports, queueCommits], [0, 0]);
-      assert.deepEqual(references.list(), []);
-    } else {
-      assert.deepEqual(result, { value: true });
-      assert.deepEqual([queuedReports, queueCommits], [1, 1]);
-      assert.equal(source.read().entries[0]?.state, "queued");
-      assert.equal(admission.getSettlement()?.isItemReady(store.getQueuedItems()[0]!), true);
-      assert.equal(references.list().length, 1);
-    }
-    assert.deepEqual(ledger.read().leases, []);
-  } finally {
-    downloaded.resolve(); clearMedia?.(); await shutdown?.(); await rm(dir, { recursive: true, force: true });
-  }
-});
-}
 
 for (const scenario of ["acknowledged", "lost-registration-reply"] as const) {
 strictFileTest(`Telegram new gateway composes follower suspension, session registration and predecessor pending adoption (${scenario})`, async () => {
@@ -5739,7 +14291,9 @@ strictFileTest(`Follower registration fences native binding readiness (${outcome
   const executionContexts: typeof ctx[] = [];
   let activeCtx = ctx;
   let sessionGeneration = 1;
-  // A prior generation's real unsettled handler keeps the replacement stop pending.
+  // An old handler stays unsettled; readiness waits for its own preparation callback, not an unrelated source's stop.
+  let handlerReturns = 0;
+  const finishPreparation = Promise.withResolvers<void>();
   let authority = true;
   const blockedLifecycle = Updates.createTelegramUpdateAdmissionLifecycleRuntime<typeof ctx>({
     resolveBinding: () => ({ runtimeKey: selected === oldJournal ? "old" : "next",
@@ -5747,7 +14301,7 @@ strictFileTest(`Follower registration fences native binding readiness (${outcome
     createWorker: journal => Updates.createTelegramUpdateWorkerRuntime({ journal,
       hasAuthority: () => authority,
       executeUpdate: async (_update, current) => {
-        executions++; executionContexts.push(current); await heldHandler; return { kind: "complete" };
+        executions++; executionContexts.push(current); await heldHandler; handlerReturns++; return { kind: "complete" };
       },
     }),
   });
@@ -5789,9 +14343,10 @@ strictFileTest(`Follower registration fences native binding readiness (${outcome
       getSessionId: () => "fixture-session", getSessionGeneration: () => sessionGeneration,
       isContextActive: current => current === activeCtx && contextActive,
       async onRegistered(current) {
-        const replacement = blockedLifecycle.onTransportChanged(current);
+        await blockedLifecycle.onTransportChanged(current);
         enteredRegistration();
-        await replacement;
+        // Hold the callback return after actual native binding preparation, not a claimed worker drain.
+        await finishPreparation.promise;
         if (outcome === "preparation-failed" || failRefresh) throw new Error("fixture binding preparation failed");
       },
     },
@@ -5812,6 +14367,8 @@ strictFileTest(`Follower registration fences native binding readiness (${outcome
     await registrationEntered;
     const generation = registrationState.getGeneration()!;
     assert.ok(generation);
+    assert.equal(blockedLifecycle.getJournalBindingKey(), "next", "The original native preparation actually switched bindings");
+    assert.equal(handlerReturns, 0, "Preparing another binding must not await the original handler");
     const send = (sourceUpdateId = 2) => Bus.sendTelegramBusLocalEnvelope({ socketPath: followerPath, timeoutMs: 1000,
       envelope: { kind: "leader.forwardMessage", requestId: `delivery:${++sequence}`, auth: "fixture",
         recipientInstanceId: "fixture-follower", recipientRegistrationGeneration: generation,
@@ -5823,11 +14380,12 @@ strictFileTest(`Follower registration fences native binding readiness (${outcome
     const before = oldJournal.read();
     const pending = await send();
     assert.equal(pending?.kind === "bus.ack" && pending.ok, false,
-      "Published registration must not admit work into a retained old binding");
+      "Published registration must not admit work before the original preparation callback returns");
+    assert.equal(assembly.getReadySessionId(), undefined, "Native preparation alone cannot publish callback readiness");
     assert.deepEqual(oldJournal.read(), before);
     assert.deepEqual(nextJournal.read().entries, []);
     if (outcome === "context-replaced") contextActive = false;
-    releaseHandler();
+    finishPreparation.resolve();
     const prepared = outcome !== "context-replaced" && outcome !== "preparation-failed";
     if (outcome === "preparation-failed") {
       await assert.rejects(registration, /fixture binding preparation failed/);
@@ -5843,6 +14401,11 @@ strictFileTest(`Follower registration fences native binding readiness (${outcome
     assert.deepEqual(oldJournal.read(), before);
     assert.deepEqual(nextJournal.read().entries.map(entry => entry.updateId), prepared ? [2] : []);
     assert.equal(executions, 1);
+    assert.equal(handlerReturns, 0, "Registration settlement cannot borrow actual old-handler completion");
+    releaseHandler();
+    await new Promise<void>(done => setImmediate(done));
+    assert.equal(handlerReturns, 1);
+    assert.deepEqual(oldJournal.read(), before, "The aborted old handler cannot settle the retained journal");
     if (outcome === "context-refresh" || outcome === "same-context-refresh" || outcome === "refresh-failed") {
       await blockedLifecycle.onSessionShutdown();
       if (outcome !== "same-context-refresh") activeCtx = { cwd: ctx.cwd };
@@ -5878,7 +14441,7 @@ strictFileTest(`Follower registration fences native binding readiness (${outcome
       assert.deepEqual(executionContexts, [ctx, activeCtx, activeCtx]);
     }
   } finally {
-    releaseHandler();
+    releaseHandler(); finishPreparation.resolve();
     await registration?.catch(() => undefined);
     assembly.registration.stop();
     await assembly.receiver.stop(); await leader.stop();
@@ -5886,377 +14449,6 @@ strictFileTest(`Follower registration fences native binding readiness (${outcome
     await rm(dir, { recursive: true, force: true });
   }
 });
-}
-
-for (const scenario of ["business-same-chat", "business-other-chat", "business-discard-failure",
-  "reaction-held", "reaction-failed", "reaction-excluded", "reaction-excluded-repaired", "source-reference-released", "handoff-cancel-after-stop", "handoff-cancel-reference-denied",
-  "handoff-accepted-lost-ack-after-stop", "denial-completion-active", "denial-completion-stopped"] as const) {
-  strictFileTest(`Prepared pending mutations preserve namespace and accepted work (${scenario})`, async () => {
-    const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-pending-mutation-")));
-    const configPath = join(dir, "telegram.json");
-    const botToken = "123:fixture-pending-mutation";
-    const owner = { instanceId: "pending", processId: process.pid,
-      processBirthId: `${process.pid}:fixture-pending`, sessionGeneration: 1 };
-    let shutdown: (() => Promise<void>) | undefined;
-    let releaseReaction!: () => void;
-    const heldReaction = new Promise<void>(resolve => { releaseReaction = resolve; });
-    let businessObserved = 0;
-    const unregister = Updates.registerTelegramUpdateHandler(update => {
-      if (update && typeof update === "object" && "deleted_business_messages" in update) businessObserved++;
-    });
-    try {
-      await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
-      const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
-      const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
-      await config.load(); config.activateProfile("work");
-      const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
-      const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({
-        path: join(dir, "workspace-admission.json"), profileKey: "fixture:work", owner,
-        getProcessLiveness: () => "alive" });
-      const options: Journal.TelegramInputJournalStoreOptions = {
-        path: join(dir, "inbox.work.json"), profileName: "work", botIdentity,
-        queueRuntimeIdentity: owner, workspaceAdmission: ledger,
-        sourceAccess: { directory: dir, limits: {
-          maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
-        withSourceSerialization: journalSerialization,
-        withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
-        getInputContext: () => ({ owner, recipientBindingKey: "workspace:pending" }),
-      };
-      const source = Journal.createTelegramInputJournalStore(options);
-      const journalBindingKey = Journal.createTelegramUpdateJournalBindingKey(options);
-      source.appendBatch([1, 2].map(update_id => ({ update_id, message: {
-        chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, message_id: update_id + 10,
-        text: update_id === 1 ? "governed" : "independent",
-      } })), 2);
-      const items = [1, 2].map(id => {
-        const input = source.acquireInput({ updateId: id, recipientBindingKey: "workspace:pending" });
-        source.startInput(input.receipt);
-        const receipt = source.queueInputs({ queueKind: "prompt", receiptId: `pending-${id}`,
-          receipts: [input.receipt] }).queueReceipt;
-        const item: Queue.PendingTelegramTurn = {
-          kind: "prompt", chatId: 7, replyToMessageId: id + 10, sourceMessageIds: [id + 10],
-          queueOrder: id, queueLane: id === 1 ? "default" : "priority", laneOrder: id,
-          statusSummary: id === 1 ? "governed" : "independent", queuedAttachments: [], historyText: "",
-          content: [{ type: "text", text: id === 1 ? "governed" : "independent" }],
-          admissionReceipts: [{ ...receipt, journalBindingKey }],
-        };
-        return item;
-      });
-      const queuedEntries = source.read().entries;
-      const completionAttempts: number[][] = [];
-      const references = Journal.createTelegramUpdateJournalReferenceRegistry({ maxActive: 1 });
-      let refuseObservation = false;
-      let observationReads = 0;
-      let cancellationCalls = 0;
-      let nativeCancellationCalls = 0;
-      const rawCompletionReferences: number[] = [];
-      const boundSource: Journal.TelegramInputJournalStore = { ...source,
-        read() {
-          if (scenario === "source-reference-released") {
-            assert.equal(references.list().length, 1, "Every actual source read needs a live participating reference");
-            observationReads++;
-            if (refuseObservation) throw new Error("fixture observation unavailable");
-          }
-          return source.read();
-        },
-        cancelQueuedHandoff(input) {
-          if (scenario.startsWith("handoff-")) {
-            cancellationCalls++;
-            assert.equal(references.list().some(ref => ref.recoveryKey === journalBindingKey), true,
-              "Late donor cancellation must hold its source reference");
-          }
-          nativeCancellationCalls++;
-          return source.cancelQueuedHandoff(input);
-        },
-        completeInput(receipt) {
-          rawCompletionReferences.push(references.list().length);
-          return source.completeInput(receipt);
-        },
-        completeQueued(receipts) {
-          completionAttempts.push(receipts.flatMap(receipt => [...receipt.sourceUpdateIds]));
-          if (scenario === "business-discard-failure") throw new Error("fixture discard refused");
-          return source.completeQueued(receipts);
-        },
-      };
-      const resolveBinding = Updates.createTelegramInputCustodyLifecycleBindingResolver({
-        isEnabled: () => true,
-        resolveInputJournal: () => ({ runtimeKey: "pending-runtime", recoveryKey: journalBindingKey, journal: boundSource }),
-        getRecipientBindingKey: () => "workspace:pending",
-      });
-      const removalAttempts: number[][] = [];
-      let reactionCalls = 0;
-      let denialReplies = 0;
-      let binding!: Bindings.TelegramQueueBindingRuntime<string>;
-      const updates = Updates.createTelegramPairedUpdateRuntime<string>({
-        getAllowedUserId: config.getAllowedUserId, persistAllowedUserId: config.persistAllowedUserId,
-        updateStatus: () => {}, removePendingMediaGroupMessages: ids => { removalAttempts.push(ids); },
-        removeQueuedTelegramTurnsByMessageIds: (ids, ctx, scope) => {
-          removalAttempts.push(ids); return binding.mutation.removeByMessageIds(ids, ctx, scope);
-        },
-        applyQueuedTelegramTurnReactionByMessageId: (id, disposition, ctx, scope) =>
-          binding.mutation.applyReactionByMessageId(id, disposition, ctx, scope),
-        flushPendingMediaGroupMessage: async () => {
-          reactionCalls++; await heldReaction;
-          if (scenario === "reaction-failed") throw new Error("fixture mutation outcome unknown");
-          return false;
-        },
-        answerCallbackQuery: async () => {}, answerGuestQuery: async () => {},
-        handleAuthorizedTelegramCallbackQuery: async () => {},
-        sendTextReply: async () => { denialReplies++; await heldReaction; return undefined; },
-        handleAuthorizedTelegramMessage: async () => { assert.fail("Queued input must not replay"); },
-        handleAuthorizedTelegramEditedMessage: () => {},
-      });
-      let transport = true;
-      const admission = Updates.createTelegramUpdateAdmissionRuntimeBinding<string>({ isFollowerRegistered: () => false });
-      const assembly = Updates.createTelegramUpdateAdmissionLifecycleAssembly({ runtimeBinding: admission,
-        acquireSourceReference(role, binding) {
-          return references.acquire({ referenceClass: role === "leader" ? "leader-lifecycle" : "follower-lifecycle",
-            recoveryKey: binding.recoveryKey });
-        },
-        worker: { getQueueOwnerIdentity: () => owner, isContextCurrent: (ctx: string) => ctx === "ctx",
-          defaultHandle: updates.handleUpdate },
-        leader: { resolveBinding, hasAuthority: () => transport },
-        follower: { resolveBinding: () => undefined, isRegistered: () => false,
-          getGeneration: () => undefined, prepareUpdateForExecution: update => update },
-      });
-      shutdown = admission.onSessionShutdown;
-      const store = Queue.createTelegramQueueStore<string>();
-      const deferredDispatch = Queue.createTelegramDeferredQueueDispatchRuntime<string>();
-      deferredDispatch.bind("ctx");
-      const effects: string[] = [];
-      binding = Bindings.createTelegramQueueBindingRuntime({ store, admission, deferredDispatch,
-        queue: { allocateItemOrder: () => 3 }, activeTurn: { has: () => false },
-        lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => false },
-        transportStamp: { isActive: () => true }, isIdle: () => true, hasPendingMessages: () => false,
-        updateStatus: () => {}, sendTextReply: async () => undefined,
-        promptDispatch: { startTypingLoop: () => {}, onPromptDispatchFailure: () => {}, onPromptDispatchStart: () => {} },
-        sendUserMessage: content => {
-          effects.push(content.map(part => part.type === "text" ? part.text : "image").join(""));
-          // Simulate agent_start consuming only the successfully handed-off prompt.
-          store.setQueuedItems(store.getQueuedItems().filter(item => item.kind !== "prompt" || item.content !== content));
-        },
-      });
-      for (const item of items) binding.mutation.append(item, "ctx");
-      await assembly.leader.onSessionStart("ctx");
-      await new Promise<void>(done => setImmediate(done));
-      transport = false;
-      assembly.leader.signal();
-      await new Promise<void>(done => setImmediate(done));
-      if (scenario.startsWith("denial-completion-")) {
-        source.appendBatch([{ update_id: 3, message: { message_id: 13, chat: { id: 8, type: "private" },
-          from: { id: 8, is_bot: false }, text: "unauthorized" } }], 3);
-        transport = true; assembly.leader.signal();
-        await new Promise<void>(done => setImmediate(done));
-        assert.equal(denialReplies, 1, "The real denial branch must reach its awaited reply");
-        const retained = source.read();
-        const running = retained.entries.find(entry => entry.updateId === 3)!;
-        assert.equal(running.inputClaim?.phase, "running");
-        const stopped = scenario === "denial-completion-stopped";
-        if (stopped) {
-          await assembly.leader.onSessionShutdown();
-          assert.deepEqual(references.list(), []);
-        }
-        releaseReaction();
-        await new Promise<void>(done => setImmediate(done));
-        if (stopped) {
-          assert.deepEqual(source.read(), retained,
-            "An awaited denial returning after stop must not complete retained running custody");
-          assert.deepEqual(rawCompletionReferences, [], "No completion attempt may outlive execution authority");
-          await assembly.leader.onSessionStart("ctx");
-          await new Promise<void>(done => setImmediate(done));
-        } else {
-          assert.deepEqual(source.read().entries, queuedEntries);
-          assert.deepEqual(rawCompletionReferences, [1]);
-        }
-        transport = false; assembly.leader.signal();
-        await new Promise<void>(done => setImmediate(done));
-        binding.dispatchNext("ctx"); binding.dispatchNext("ctx");
-        assert.deepEqual(effects, ["independent", "governed"]);
-        assert.deepEqual(source.read().entries, stopped ? [running] : []);
-        assert.equal(denialReplies, 1, "Restart must not replay the interrupted denial");
-        return;
-      }
-      if (scenario.startsWith("handoff-")) {
-        const retainedItems = store.getQueuedItems();
-        const recipientOwner = { ...owner, instanceId: "recipient", processId: process.pid + 1,
-          processBirthId: `${process.pid + 1}:fixture-recipient` };
-        let rejectRemote!: (error: Error) => void;
-        const remote = new Promise<Queue.TelegramQueueHandoffStageResult>((_resolve, reject) => { rejectRemote = reject; });
-        const receipt = items[0]!.admissionReceipts![0]!;
-        const expectedOwner = assembly.leader.getQueueReceiptOwner(receipt)!;
-        assert.ok(expectedOwner);
-        const handoff = Updates.coordinateTelegramQueueHandoff({
-          item: { ...items[0]!, target: { chatId: 7, threadId: 42 },
-            transportStamp: { profile: "work", generation: "fixture" } },
-          expectedOwner, recipientOwner, handoffToken: Journal.createTelegramUpdateQueueHandoffToken(),
-          lifecycle: assembly.leader,
-          stageRemote(input) {
-            if (scenario === "handoff-accepted-lost-ack-after-stop") {
-              const recipient = Journal.createTelegramInputJournalStore({ ...options,
-                queueRuntimeIdentity: recipientOwner,
-                getInputContext: () => ({ owner: recipientOwner, recipientBindingKey: "workspace:recipient" }) });
-              recipient.acceptQueuedHandoff({ queueKind: receipt.queueKind, receiptId: receipt.receiptId,
-                sourceUpdateIds: receipt.sourceUpdateIds, expectedOwner, recipientOwner, handoffToken: input.handoffToken });
-            }
-            return remote;
-          },
-          removeDonorItem: () => { assert.fail("A rejected/lost ACK must retain donor memory"); },
-        });
-        await assembly.leader.onSessionShutdown();
-        assert.deepEqual(references.list(), []);
-        const retained = source.read();
-        const occupy = scenario === "handoff-cancel-reference-denied"
-          ? references.acquire({ referenceClass: "polling-cursor", recoveryKey: "fixture:other" }) : undefined;
-        rejectRemote(new Error("fixture remote ACK unavailable"));
-        const result = await handoff;
-        assert.equal(result.status, "retained");
-        assert.equal(result.status === "retained" && result.cancelled, scenario === "handoff-cancel-after-stop");
-        assert.equal(cancellationCalls, scenario === "handoff-cancel-reference-denied" ? 0 : 1);
-        assert.equal(nativeCancellationCalls, scenario === "handoff-cancel-reference-denied" ? 0 : 1,
-          "A retained post-accept result must come from the native CAS, not a swallowed reference assertion");
-        occupy?.();
-        assert.deepEqual(references.list(), []);
-        if (scenario === "handoff-cancel-after-stop") assert.deepEqual(source.read().entries, queuedEntries);
-        else assert.deepEqual(source.read(), retained, "Denied or post-accept cancellation cannot rewrite durable custody");
-        assert.deepEqual(store.getQueuedItems(), retainedItems);
-        assert.deepEqual(effects, []);
-        assert.equal(admission.getSettlement()?.isItemReady(items[0]!), false);
-        return;
-      }
-      if (scenario === "source-reference-released") {
-        await assembly.leader.onSessionShutdown();
-        assert.deepEqual(references.list(), []);
-        const stoppedReads = observationReads;
-        assert.equal(admission.getSettlement()?.isItemReady(items[0]!), false);
-        assert.equal(assembly.leader.getQueueReceiptOwner(items[0]!.admissionReceipts![0]!), undefined);
-        assert.equal(observationReads, stoppedReads, "Stopped receipt projections must not read a released source");
-        binding.dispatchNext("ctx");
-        assert.deepEqual(effects, [], "Observation cannot restore stopped execution authority");
-        assert.ok(observationReads > stoppedReads, "Actual queue dispatch observes pending mutations");
-        assert.deepEqual(references.list(), [], "A stopped-source observation releases its scoped reference");
-        const occupy = references.acquire({ referenceClass: "polling-cursor", recoveryKey: "fixture:other" });
-        const deniedReads = observationReads;
-        assert.throws(() => admission.hasPendingQueueMutationForItem(items[0]!), /reference registry is unavailable or full/);
-        assert.equal(observationReads, deniedReads, "Reference denial must precede source I/O");
-        occupy();
-        refuseObservation = true;
-        assert.throws(() => admission.hasPendingQueueMutationForItem(items[0]!), /fixture observation unavailable/);
-        assert.deepEqual(references.list(), [], "Failed observations also release their reference");
-        refuseObservation = false;
-        assert.equal(assembly.leader.getJournalEntryCount(), 2);
-        assert.deepEqual(source.read().entries, queuedEntries);
-        assert.deepEqual(references.list(), []);
-        transport = true;
-        await assembly.leader.onSessionStart("ctx");
-        await new Promise<void>(done => setImmediate(done));
-        transport = false;
-        assembly.leader.signal();
-        await new Promise<void>(done => setImmediate(done));
-        binding.dispatchNext("ctx");
-        binding.dispatchNext("ctx");
-        assert.deepEqual(effects, ["independent", "governed"], "Restart preserves accepted work across transport loss");
-        assert.deepEqual(source.read().entries, []);
-        await assembly.leader.onTransportChanged(undefined);
-        assert.deepEqual(references.list(), []);
-        const forgottenReads = observationReads;
-        assert.equal(admission.hasPendingQueueMutationForItem(items[0]!), false);
-        assert.throws(() => assembly.leader.getJournalEntryCount(), /worker is not active/);
-        assert.equal(observationReads, forgottenReads, "A forgotten source cannot be observed");
-        return;
-      }
-      const business = scenario.startsWith("business-");
-      const mutation = business
-        ? { update_id: 3, deleted_business_messages: { business_connection_id: "separate-business-account",
-          chat: { id: scenario === "business-other-chat" ? 8 : 7, type: "private" }, message_ids: [11] } }
-        : { update_id: 3, message_reaction: { chat: { id: 7, type: "private" }, user: { id: 7, is_bot: false },
-          message_id: 11, old_reaction: [], new_reaction: [{ type: "emoji", emoji: "👎" }] } };
-      const excluded = scenario === "reaction-excluded" || scenario === "reaction-excluded-repaired";
-      if (excluded) {
-        config.setProfile("work", { botToken });
-        await config.persist();
-        assert.equal(config.getAllowedUserId(), undefined);
-      }
-      source.appendBatch([mutation], 3);
-      if (excluded) {
-        const veto = source.read().entries.find(entry => entry.updateId === 3)!;
-        assert.equal(veto.preApprovalExcluded, true);
-        if (scenario === "reaction-excluded-repaired") {
-          assert.equal(await config.persistAllowedUserId(7), true);
-          source.appendBatch([mutation], 3);
-        }
-        const reopened = Journal.createTelegramInputJournalStore(options);
-        assert.deepEqual(reopened.read().entries.find(entry => entry.updateId === 3), veto,
-          "Re-pairing, duplicate append and reopening cannot turn an excluded mutation into intent");
-        const beforeMixedRemoval = source.read();
-        assert.throws(() => Updates.createTelegramInputCustodyWorkerJournalPort(source).removeCompleted([3, 1]));
-        assert.deepEqual(source.read(), beforeMixedRemoval, "A mixed request cannot partially remove the exclusion");
-        binding.dispatchNext("ctx");
-        binding.dispatchNext("ctx");
-        assert.deepEqual(effects, ["independent", "governed"],
-          "An immutable exclusion cannot strand previously accepted work after transport loss");
-        assert.equal(admission.hasPendingQueueMutationForItem(items[0]!), false);
-        assert.deepEqual(store.getQueuedItems(), []);
-        assert.deepEqual(source.read().entries, [veto], "Observation does not settle or rewrite the excluded input");
-        if (scenario === "reaction-excluded-repaired") await assembly.leader.onSessionShutdown();
-        transport = true;
-        if (scenario === "reaction-excluded-repaired") await assembly.leader.onSessionStart("ctx");
-        else assembly.leader.signal();
-        await new Promise<void>(done => setImmediate(done));
-        assert.deepEqual(source.read().entries, [], "Restoration or restart must drain excluded input without execution");
-        assert.equal(source.read().acceptedThroughUpdateId, 3);
-        assert.deepEqual(effects, ["independent", "governed"]);
-        assert.equal(reactionCalls, 0);
-        assert.deepEqual(ledger.read().leases, []);
-        return;
-      }
-      assert.equal(admission.hasPendingQueueMutationForItem(items[0]!), !business);
-      assert.equal(admission.hasPendingQueueMutationForItem(items[1]!), false);
-      if (!business) {
-        binding.dispatchNext("ctx");
-        binding.dispatchNext("ctx");
-        assert.deepEqual(effects, ["independent"], "Transport loss preserves unrelated accepted progress");
-        assert.equal(store.getQueuedItems().length, 1);
-      }
-      transport = true;
-      assembly.leader.signal();
-      if (business) {
-        await new Promise<void>(done => setImmediate(done));
-        assert.deepEqual({ removalAttempts, completionAttempts,
-          queued: store.getQueuedItems().map(item => item.queueOrder).sort(),
-          durable: source.read().entries.map(entry => entry.updateId),
-        }, { removalAttempts: [], completionAttempts: [], queued: [1, 2], durable: [1, 2] },
-        "Business deletion cannot govern an independent bot-chat namespace, even with equal chat/message IDs");
-        assert.deepEqual(source.read().entries, queuedEntries);
-        assert.equal(businessObserved, 1, "Raw companion handlers retain their observation surface");
-      } else {
-        await new Promise<void>(done => setImmediate(done));
-        assert.equal(reactionCalls, 1, "A newer explicit wake must survive an older authority-lost drain result");
-        assert.equal(source.read().entries.find(entry => entry.updateId === 3)?.inputClaim?.phase, "running");
-        binding.dispatchNext("ctx");
-        assert.deepEqual(effects, ["independent"]);
-        releaseReaction();
-        await new Promise<void>(done => setImmediate(done));
-        if (scenario === "reaction-held") {
-          assert.equal(admission.hasPendingQueueMutationForItem(items[0]!), false);
-          binding.dispatchNext("ctx");
-          assert.deepEqual(store.getQueuedItems(), []);
-          assert.deepEqual(source.read().entries, []);
-        } else {
-          assembly.leader.signal();
-          await new Promise<void>(done => setImmediate(done));
-          assert.equal(reactionCalls, 1, "Outcome-unknown mutation cannot be replayed");
-          assert.equal(admission.hasPendingQueueMutationForItem(items[0]!), true);
-          binding.dispatchNext("ctx");
-          assert.equal(store.getQueuedItems().length, 1);
-          assert.deepEqual(source.read().entries.map(entry => entry.updateId), [1, 3]);
-        }
-        assert.deepEqual(effects, ["independent"], "The governed prompt must not run after Skip or unknown intent");
-      }
-      assert.deepEqual(ledger.read().leases, []);
-    } finally {
-      releaseReaction(); unregister(); await shutdown?.(); await rm(dir, { recursive: true, force: true });
-    }
-  });
 }
 
 async function assertAsynchronousEnqueueProgress(foldHistory: boolean, deferAgentStart = false): Promise<void> {
@@ -7515,7 +15707,7 @@ test("Extension startup preserves queued authority owned by another process", as
   const { handlers, commands, pi } = createRuntimePiHarness({
     sendUserMessage: (content) => dispatched.push(content),
   });
-  const restoreFetch = setRuntimeTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook" || method === "setMyCommands") {
       return createRuntimeTelegramApiResponse(true);
@@ -7630,7 +15822,7 @@ test("Extension runtime coalesces a cross-batch forward comment into one Pi turn
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
@@ -7721,7 +15913,7 @@ test("Extension runtime fences queued final and preview after polling ownership 
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook") {
@@ -7975,7 +16167,7 @@ test(`Extension runtime preserves accepted work and fences delivery after ${loss
   let releaseConflicts!: () => void;
   const conflictGate = new Promise<void>((resolve) => { releaseConflicts = resolve; });
   const ctx = createRuntimeExtensionContext({ cwd: "/repo/queue-owner-a" });
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook") {
@@ -8105,7 +16297,7 @@ test("Extension runtime ignores the retired proactive opt-out while Telegram is 
   const sentBodies: Array<Record<string, unknown>> = [];
   const typingBodies: Array<Record<string, unknown>> = [];
   const { handlers, commands, pi, getActiveTools } = createRuntimePiHarness();
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
@@ -8215,7 +16407,7 @@ strictFileTest("Channel post tool does not resend lost success or outcome across
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const { handlers, commands, tools, pi } = createRuntimePiHarness();
   let sends = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") return createRuntimeTelegramApiResponse(true);
     if (method === "getUpdates") throw new DOMException("stop", "AbortError");
@@ -8277,7 +16469,7 @@ strictFileTest("Channel media tool publishes one local upload and edits its capt
   await writeFile(mediaPath, Buffer.from("fake-jpeg-bytes"));
   const calls: Array<{ method: string; caption?: unknown; mediaPresent?: boolean }> = [];
   let sends = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") return createRuntimeTelegramApiResponse(true);
     if (method === "getUpdates") throw new DOMException("stop", "AbortError");
@@ -8361,9 +16553,11 @@ test("Extension runtime resolves stale same-cwd lock before proactive local resu
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentBodies: Array<Record<string, unknown>> = [];
   let getUpdatesCalls = 0;
-  const { handlers, pi } = createRuntimePiHarness();
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const { handlers, commands, pi } = createRuntimePiHarness();
+  let shutdownContext: ReturnType<typeof createRuntimeExtensionContext> | undefined, completed = false;
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
+    if (method === "getMe") return createRuntimeTelegramApiResponse({ has_topics_enabled: false });
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
     }
@@ -8383,6 +16577,10 @@ test("Extension runtime resolves stale same-cwd lock before proactive local resu
   });
   try {
     const cwd = "/repo/proactive-stale-owner";
+    await writeRuntimeTelegramLocks({});
+    const seed = await createRuntimeSeedWorkspaceStore();
+    try { seed.threads.setBotState({ threadMode: "disabled", updatedAtMs: Date.now() }); await seed.threads.persist(); }
+    finally { await seed.release(); }
     await telegramConfig.write({
       botToken: "123:abc",
       allowedUserId: 77,
@@ -8397,6 +16595,7 @@ test("Extension runtime resolves stale same-cwd lock before proactive local resu
     });
     (await getRuntimeTelegramExtension())(pi);
     const ctx = createRuntimeExtensionContext({ cwd });
+    shutdownContext = ctx;
     await handlers.get("session_start")?.({}, ctx);
     await waitForEventLoopCondition(() => getUpdatesCalls >= 1, 5000);
     await handlers.get("input")?.(
@@ -8452,10 +16651,11 @@ test("Extension runtime resolves stale same-cwd lock before proactive local resu
       ),
       /Local \*\*done\*\*/,
     );
-    await handlers.get("session_shutdown")?.({}, ctx);
+    completed = true;
   } finally {
-    restoreFetch();
-    await telegramConfig.restore();
+    try { if (shutdownContext) await disconnectRuntimeTelegramFixtureRoot({ handlers, commands }, shutdownContext); }
+    catch (error) { if (completed) throw error; console.error("Secondary stale-owner fixture cleanup failure:", error); }
+    finally { restoreFetch(); await telegramConfig.restore(); }
   }
 });
 
@@ -8463,7 +16663,7 @@ test("Extension runtime sends proactive checkpoints and final once in source ord
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentBodies: Array<Record<string, unknown>> = [];
   const { handlers, commands, pi } = createRuntimePiHarness();
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
@@ -8620,9 +16820,11 @@ test("Extension runtime drops queued proactive blocks after session replacement"
   const firstSendGate = new Promise<void>((resolve) => {
     releaseFirstSend = resolve;
   });
-  const { handlers, pi } = createRuntimePiHarness();
-  const restoreFetch = setRuntimeTestFetch(async (input) => {
+  const { handlers, commands, pi } = createRuntimePiHarness();
+  let shutdownContext: ReturnType<typeof createRuntimeExtensionContext> | undefined, completed = false;
+  const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
+    if (method === "getMe") return createRuntimeTelegramApiResponse({ has_topics_enabled: false });
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
     }
@@ -8642,6 +16844,10 @@ test("Extension runtime drops queued proactive blocks after session replacement"
   });
   try {
     const cwd = "/repo/proactive-replacement";
+    await writeRuntimeTelegramLocks({});
+    const seed = await createRuntimeSeedWorkspaceStore();
+    try { seed.threads.setBotState({ threadMode: "disabled", updatedAtMs: Date.now() }); await seed.threads.persist(); }
+    finally { await seed.release(); }
     await telegramConfig.write({
       botToken: "123:abc",
       allowedUserId: 77,
@@ -8653,6 +16859,7 @@ test("Extension runtime drops queued proactive blocks after session replacement"
     });
     (await getRuntimeTelegramExtension())(pi);
     const oldCtx = createRuntimeExtensionContext({ cwd });
+    shutdownContext = oldCtx;
     await handlers.get("session_start")?.({}, oldCtx);
     await waitForEventLoopCondition(() => getUpdatesCalls >= 1, 5000);
     await handlers.get("input")?.(
@@ -8715,17 +16922,23 @@ test("Extension runtime drops queued proactive blocks after session replacement"
       oldCtx,
     );
     await firstSendStarted;
-    await handlers.get("session_shutdown")?.({}, oldCtx);
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, oldCtx);
+    shutdownContext = undefined;
     const newCtx = createRuntimeExtensionContext({ cwd });
+    shutdownContext = newCtx;
     await handlers.get("session_start")?.({}, newCtx);
     releaseFirstSend();
     await flushMicrotasks(50);
     assert.equal(sendCalls, 1);
-    await handlers.get("session_shutdown")?.({}, newCtx);
+    completed = true;
   } finally {
     releaseFirstSend();
-    restoreFetch();
-    await telegramConfig.restore();
+    try {
+      if (shutdownContext) await disconnectRuntimeTelegramFixtureRoot({ handlers, commands }, shutdownContext);
+    } catch (error) {
+      if (completed) throw error;
+      console.error("Secondary proactive fixture cleanup failure:", error);
+    } finally { restoreFetch(); await telegramConfig.restore(); }
   }
 });
 
@@ -8733,7 +16946,7 @@ test("Extension runtime skips proactive local result without Telegram lock owner
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentBodies: Array<Record<string, unknown>> = [];
   const { handlers, pi } = createRuntimePiHarness();
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "sendMessage" || method === "sendRichMessage") {
       sentBodies.push(parseJsonRequestBody(init) ?? {});
@@ -8793,7 +17006,7 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init) ?? {};
     if (method === "deleteWebhook" || method === "setMyCommands") {
@@ -8967,7 +17180,7 @@ test(`Extension runtime delivers the final answer before automatic compaction co
   let shutdownContext: ReturnType<typeof createRuntimeExtensionContext> | undefined;
   const { handlers, commands, pi } = createRuntimePiHarness({ sendUserMessage: () => { dispatched = true; } });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init) ?? {};
     if (method === "deleteWebhook" || method === "setMyCommands" || method === "sendChatAction") return createRuntimeTelegramApiResponse(true);
@@ -9041,7 +17254,7 @@ test("Extension runtime preserves both busy Next notices through follower queue 
   let getUpdatesCalls = 0;
   const sendTexts: string[] = [];
   const sendBodies: Array<Record<string, unknown>> = [];
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook") {
@@ -9206,7 +17419,7 @@ test("Extension runtime keeps rapid ordinary messages as distinct queued turns",
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
@@ -9329,7 +17542,7 @@ test("Extension runtime clears queued follow-ups after a Telegram stop", async (
   });
   let getUpdatesCalls = 0;
   const sendTexts: string[] = [];
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook") {
@@ -9476,7 +17689,7 @@ test("Extension runtime handles immediate status before queued prompt after agen
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook")
@@ -9613,7 +17826,7 @@ test("Extension runtime opens immediate model menu before queued prompt after ag
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook") {
@@ -9752,7 +17965,8 @@ test("Extension runtime keeps queued turns blocked until compaction settles", as
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  let confirmation: { messageId: number; data: string } | undefined;
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook") {
@@ -9767,7 +17981,7 @@ test("Extension runtime keeps queued turns blocked until compaction settles", as
             update_id: 1,
             message: {
               message_id: 30,
-              chat: { id: 99, type: "private" },
+              chat: { id: 77, type: "private" },
               from: { id: 77, is_bot: false, first_name: "Test" },
               text: "/compact",
             },
@@ -9788,9 +18002,10 @@ test("Extension runtime keeps queued turns blocked until compaction settles", as
       if (text.includes("Compaction failed!")) {
         failureParseModes.push(String(body?.parse_mode ?? ""));
       }
-      return createRuntimeTelegramApiResponse({
-        message_id: 100 + runtimeEvents.length,
-      });
+      const messageId = 100 + runtimeEvents.length;
+      if (text === "<b>Compact session?</b>") confirmation = { messageId,
+        data: (body?.reply_markup as { inline_keyboard: { callback_data: string }[][] }).inline_keyboard[0]![0]!.callback_data };
+      return createRuntimeTelegramApiResponse({ message_id: messageId });
     }
     if (method === "sendChatAction") {
       runtimeEvents.push(
@@ -9838,10 +18053,10 @@ test("Extension runtime keeps queued turns blocked until compaction settles", as
             id: "confirm-compact",
             from: { id: 77, is_bot: false, first_name: "Test" },
             message: {
-              message_id: 101,
-              chat: { id: 99, type: "private" },
+              message_id: confirmation!.messageId,
+              chat: { id: 77, type: "private" },
             },
-            data: "compact:confirm",
+            data: confirmation!.data,
           },
         },
       ]),
@@ -9850,11 +18065,11 @@ test("Extension runtime keeps queued turns blocked until compaction settles", as
     await waitForCondition(
       () =>
         runtimeEvents.includes("edit:<b>🗜 Compaction started.</b>") &&
-        runtimeEvents.includes("typing:99:typing"),
+        runtimeEvents.includes("typing:77:typing"),
     );
     assert.equal(
       runtimeEvents.indexOf("edit:<b>🗜 Compaction started.</b>") <
-        runtimeEvents.indexOf("typing:99:typing"),
+        runtimeEvents.indexOf("typing:77:typing"),
       true,
     );
 
@@ -9865,7 +18080,7 @@ test("Extension runtime keeps queued turns blocked until compaction settles", as
           update_id: 3,
           message: {
             message_id: 31,
-            chat: { id: 99, type: "private" },
+            chat: { id: 77, type: "private" },
             from: { id: 77, is_bot: false, first_name: "Test" },
             text: "follow up after compaction",
           },
@@ -9912,7 +18127,7 @@ for (const outcome of ["completed", "failed", "cancelled", "shutdown"] as const)
       return timer;
     });
     const { handlers, commands, pi } = createRuntimePiHarness();
-    const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const restoreFetch = setTestFetch(async (input, init) => {
       const method = getRuntimeTelegramApiMethod(input);
       if (method === "deleteWebhook" || method === "sendChatAction") return createRuntimeTelegramApiResponse(true);
       if (method === "getUpdates") throw new DOMException("stop", "AbortError");
@@ -9966,7 +18181,7 @@ test("Extension runtime compaction notices cannot overtake a pending local final
   let releaseFinal!: () => void;
   const finalGate = new Promise<void>((resolve) => { releaseFinal = resolve; });
   const { handlers, commands, pi } = createRuntimePiHarness();
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") return createRuntimeTelegramApiResponse(true);
     if (method === "getUpdates") throw new DOMException("stop", "AbortError");
@@ -10049,7 +18264,7 @@ test(`Extension runtime delivers the final answer before observed auto-compactio
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook")
@@ -10221,7 +18436,7 @@ test("Extension runtime coalesces media-group updates into one delayed dispatch"
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
@@ -10291,7 +18506,7 @@ test("Extension runtime coalesces likely split long text updates into one dispat
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
@@ -10360,7 +18575,7 @@ test("Extension runtime clears pending split-text dispatch on shutdown", async (
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
@@ -10414,7 +18629,7 @@ test("Extension runtime clears pending media-group dispatch on shutdown", async 
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
@@ -10475,7 +18690,7 @@ test("Extension runtime applies reaction priority and removal before the next di
     },
   });
   let getUpdatesCalls = 0;
-  const restoreFetch = setRuntimeTestFetch(async (input) => {
+  const restoreFetch = setTestFetch(async (input) => {
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
@@ -10650,7 +18865,7 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
   let getUpdatesCalls = 0;
   let nextMessageId = 100;
   const callbackAnswers: string[] = [];
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook")
@@ -10776,7 +18991,7 @@ test("Extension runtime switches a local run in flight and continues in the mode
   let getUpdatesCalls = 0;
   let nextMessageId = 100;
   const callbackAnswers: string[] = [];
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook") {
@@ -10922,7 +19137,7 @@ test("Extension runtime preserves long-session queue through abort, next, and mo
   let getUpdatesCalls = 0;
   let nextMessageId = 100;
   const callbackAnswers: string[] = [];
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook")
@@ -11142,7 +19357,7 @@ test("Extension runtime delays model-switch abort until the active tool finishes
   let getUpdatesCalls = 0;
   let nextMessageId = 100;
   const callbackAnswers: string[] = [];
-  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+  const restoreFetch = setTestFetch(async (input, init) => {
     const method = getRuntimeTelegramApiMethod(input);
     const body = parseJsonRequestBody(init);
     if (method === "deleteWebhook") {
@@ -11279,3 +19494,8 @@ test("Extension runtime delays model-switch abort until the active tool finishes
     await telegramConfig.restore();
   }
 });
+
+if (inventoryOnly) {
+  clearInterval(eventLoopKeepAlive);
+  console.log(`integration-inventory:${JSON.stringify(selectedTestNames)}`);
+}

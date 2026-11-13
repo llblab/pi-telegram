@@ -278,7 +278,7 @@ export interface TelegramTemporaryThreadCancellationEvidence {
     updateId: number;
     operatorAuthorityId: string;
 }
-/** A bot-created routing tab with an exact creation source; it owns no Pi binding or slot. */
+/** A routing-tab lifecycle frame, or a separately tagged cancelled-orphan intent; neither owns a Pi binding or slot. */
 export interface TelegramTemporaryThreadEntry {
     source: {
         journalBindingKey: string;
@@ -301,7 +301,18 @@ export interface TelegramTemporaryThreadEntry {
     /** Unique title token; the only identity an unacknowledged creation may later be matched by. */
     token: string;
     /** `creating` is published before the one creation request, so after a crash its outcome is unknown. */
-    phase: "creating" | "created";
+    phase: "creating" | "created" | "orphan-cancelled";
+    /** Original Cancel scope and exact retained originals, never implicit-creation evidence or a deletion grant. */
+    orphanCancellation?: {
+        executor: TelegramWorkspaceRestoreExecutor;
+        sessionGeneration: number;
+        originals: {
+            updateId: number;
+            messageId: number;
+            sourceSha256: string;
+            retainedPath: string;
+        }[];
+    };
     target?: TelegramTarget & {
         threadId: number;
     };
@@ -316,8 +327,19 @@ export type TelegramTemporaryThreadTargetObservation = {
 } | {
     kind: "temporary";
 } | {
+    kind: "unbound";
+} | {
     kind: "unknown";
 };
+/** Diagnostic classification only; no reason certifies quiescence, no effect or permission to forget evidence. */
+export type TelegramWorkspaceRestoreEvidenceRefusal = "missing-snapshot" | "profile-changed" | "token-changed" | "revision-regressed" | "same-revision-conflict";
+export declare class TelegramWorkspaceRestoreEvidenceError extends Error {
+    readonly code = "workspace-restore-evidence-conflict";
+    readonly reason: TelegramWorkspaceRestoreEvidenceRefusal;
+    readonly retainedRevision: number;
+    readonly observedRevision?: number;
+    constructor(reason: TelegramWorkspaceRestoreEvidenceRefusal, retainedRevision: number, observedRevision?: number);
+}
 interface TelegramWorkspaceRestoreSnapshot {
     version: 1;
     profileName: string;
@@ -368,7 +390,9 @@ export interface TelegramWorkspaceRestore {
     /** Caller holds admission for effectful use. Fresh exact read grants no adoption, routing, disposition or deletion. */
     inspectTemporaryThreadTarget(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority): TelegramTemporaryThreadTargetObservation | undefined;
     /** Read-only veto for an already-granted in-flight attempt; never another grant, disposable classification or deletion ACK. */
-    isTemporaryThreadCleanupCurrent(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority): boolean;
+    isTemporaryThreadCleanupCurrent(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority & {
+        sessionGeneration?: number;
+    }): boolean;
     /**
      * Publishes `creating` before the caller's single creation request; an existing source entry is returned, never
      * recreated. `group` records an album as the tab's one creating input; it must start at the source update.
@@ -382,6 +406,21 @@ export interface TelegramWorkspaceRestore {
     registerImplicitTemporaryThread(input: TelegramTemporaryThreadInput, target: TelegramTarget & {
         threadId: number;
     }, token: string, authority: TelegramWorkspaceRestoreAuthority): TelegramTemporaryThreadEntry | undefined;
+    /** Caller holds original live Cancel/profile admission. Persists only an unissued orphan intent; never creation or deletion.
+     * Optional supersession requires an exact unissued same-instance older-generation frame, never adoption of its grant. */
+    registerCancelledOrphanThread(input: TelegramTemporaryThreadInput, target: TelegramTarget & {
+        threadId: number;
+    }, token: string, authority: TelegramWorkspaceRestoreAuthority & {
+        sessionGeneration: number;
+    }, inspect: (updateId: number, journalBindingKey?: string) => (TelegramTemporaryThreadCancellationEvidence & {
+        retainedPath: string;
+        originalTarget?: Readonly<{
+            chatId: number;
+            threadId: number;
+            messageId: number;
+            sourceSha256: string;
+        }>;
+    }) | undefined, superseded?: TelegramTemporaryThreadEntry): TelegramTemporaryThreadEntry | undefined;
     /** Records the exact acknowledged creation target; it never reopens a created entry. */
     acknowledgeTemporaryThread(expected: TelegramTemporaryThreadEntry, target: TelegramTarget & {
         threadId: number;
@@ -396,6 +435,22 @@ export interface TelegramWorkspaceRestore {
     recordTemporaryThreadInputCancellation(expected: TelegramTemporaryThreadEntry, input: TelegramTemporaryThreadInput, authority: TelegramWorkspaceRestoreAuthority, inspect: (updateId: number) => TelegramTemporaryThreadCancellationEvidence | undefined): TelegramTemporaryThreadEntry | undefined;
     /** Body-free chooser expiry may terminate an uncertain donor Forward/Restore, never accepted recipient work or a bound target. */
     recordTemporaryThreadInputExpiry(expected: TelegramTemporaryThreadEntry, input: TelegramTemporaryThreadInput, authority: TelegramWorkspaceRestoreAuthority, inspect: (updateId: number) => TelegramTemporaryThreadCancellationEvidence | undefined): TelegramTemporaryThreadEntry | undefined;
+    /** Caller holds fresh profile admission/v2 reader authority and complete namespace clearance; no original Cancel fence is reused. */
+    issueCancelledOrphanThreadCleanup(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority & {
+        sessionGeneration: number;
+    }, inspect: Parameters<TelegramWorkspaceRestore["registerCancelledOrphanThread"]>[4]): {
+        issued: true;
+        entry: TelegramTemporaryThreadEntry;
+    } | undefined;
+    /** Caller observed the exact positive deletion outcome under its live issued grant; no unknown-result retirement. */
+    retireCancelledOrphanThread(expected: TelegramTemporaryThreadEntry, completion: {
+        kind: "confirmed";
+        target: TelegramTarget & {
+            threadId: number;
+        };
+    }, authority: TelegramWorkspaceRestoreAuthority & {
+        sessionGeneration: number;
+    }): TelegramTemporaryThreadEntry | undefined;
     /** Caller holds profile admission and proves fresh source/protection clearance; publication grants one attempt, never retry. */
     issueTemporaryThreadCleanup(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority): {
         issued: true;
@@ -404,7 +459,7 @@ export interface TelegramWorkspaceRestore {
     /** Caller proves source settlement or cancellation and target disposition; this releases protection only. */
     /** `completed` names one newly completed group; every other known group must already be cancelled or completed. */
     retireTemporaryThread(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority, completed?: TelegramTemporaryThreadInput): TelegramTemporaryThreadEntry | undefined;
-    /** New-world restart: atomically forgets this operator's Restore intents and temporary entries from previous runtime instances.
+    /** New-world restart: atomically forgets this operator's Restore intents and temporary entries from previous runtime instances, except issued orphan hazards.
      * Caller may preserve exact unbound temporary tokens for clock-bearing sources. Committed bindings stay; nothing is rolled back, replayed or deleted here. */
     forgetPreviousWorld(authority: TelegramWorkspaceRestoreAuthority, preserveTemporaryTokens?: readonly string[]): {
         operations: TelegramWorkspaceRestoreIntent[];
@@ -460,6 +515,11 @@ export interface TelegramTopicTargetStore {
     load: () => Promise<void>;
     /** Discard process-local projections and reload owner-published state. */
     refresh?: () => Promise<void>;
+    /** Read-only logical storage/profile lifetime; does not forget projections or grant publication. */
+    captureReadScope: (expected?: {
+        path: string;
+        profile: string;
+    }) => () => boolean;
     /** Optional caller fence supplements, never replaces, captured publication authority. */
     persist: (isCurrent?: () => boolean) => Promise<void>;
     invalidateTarget: (target: TelegramTarget, isCurrent: () => boolean, lastSyncError: string) => Promise<boolean>;
@@ -480,7 +540,12 @@ export interface TelegramTopicTargetStore {
     /** Exact synchronous live-operation snapshot, including a current publication frame; no mutation, lock or authority grant. */
     withWorkspaceLiveRebindSnapshot: (expected: TelegramWorkspaceLiveRebindIntent, observe: (snapshot: Readonly<Pick<TelegramTopicTargetFile, "threads" | "workspaceBindings">>) => undefined) => void;
     /** Current live-origin ownership veto; effect callers still require Workspace admission. False is not work/recipient/deletion authority. */
-    hasPreDispatchRebindEvidence: () => boolean;
+    /** Codec requirements from one canonical snapshot; neither execution readiness nor permission to mutate it. */
+    getWorkspaceReaderRequirements: () => {
+        preDispatchRebind: boolean;
+        cancelledOrphanIntent: boolean;
+        cancelledOrphanCleanup: boolean;
+    };
     listProtectedLiveRebindTargets: () => TelegramTarget[];
     isWorkspaceLiveRebindCleanupTargetProtected: (expected: TelegramWorkspaceLiveRebindIntent) => boolean;
     /** Read-only captured identity with an optional exact manual-name result fence; no transport/session/admission grant or lock. */
@@ -821,7 +886,9 @@ export interface TelegramLeaderThreadStateRuntime {
     }): void;
     clear(): void;
 }
-export declare function createTelegramLeaderThreadStateRuntime(): TelegramLeaderThreadStateRuntime;
+export declare function createTelegramLeaderThreadStateRuntime(options?: {
+    onTargetChanged?: () => void;
+}): TelegramLeaderThreadStateRuntime;
 export interface TelegramCurrentInstanceThreadRuntime {
     findRecord(): TelegramTopicTargetRecord | undefined;
     getRecord(): TelegramTopicTargetRecord | undefined;

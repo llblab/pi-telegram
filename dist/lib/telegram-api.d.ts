@@ -5,7 +5,7 @@
  * Wraps bot API calls, file uploads/downloads (including voice messages),
  * multipart sending, runtime transport binding, and Telegram temp-file lifecycle.
  */
-import type { TelegramAttachmentSource } from "./media.ts";
+import { type TelegramAttachmentRequestCandidate, type TelegramAttachmentSource } from "./media.ts";
 export declare const TELEGRAM_FILE_MAX_BYTES: number;
 /** First positive safe-integer byte limit among ordered env names, else the caller's default. */
 export declare function getTelegramByteLimitFromEnv(env: NodeJS.ProcessEnv, names: readonly string[], defaultValue: number): number;
@@ -288,10 +288,19 @@ export interface TelegramApiRetryWait {
     attempt: number;
     retryAfterSeconds?: number;
 }
+/** Process-local resource ownership only; never an execution/transport grant. */
+export interface TelegramArtifactReservation {
+    release: () => void;
+}
 export interface TelegramApiCallOptions {
+    artifactReservation?: TelegramArtifactReservation;
     /** Local per-call effect authority; independent of source completion and transport ownership. */
     assertAuthority?: () => void;
     signal?: AbortSignal;
+    /** Origin-local observation at the actual HTTP boundary; never transported as authority. */
+    onRequestIssued?: () => void;
+    /** Private origin-local positive identity observation before late authority checks. */
+    onArtifactMessageId?: (messageId: number) => void;
     maxAttempts?: number;
     retryRateLimit?: boolean;
     retrySafety?: "safe" | "non-idempotent";
@@ -359,7 +368,9 @@ export interface TelegramAnswerCallbackQueryOptions extends Pick<TelegramApiCall
     recordRuntimeEvent?: (kind: "api", error: unknown, details?: Record<string, unknown>) => void;
 }
 export interface TelegramApiClient {
+    reserveArtifact?: () => TelegramArtifactReservation | undefined;
     call: <TResponse>(method: string, body: Record<string, unknown>, options?: TelegramApiCallOptions) => Promise<TResponse>;
+    callArtifactBytes?: <TResponse>(fields: Record<string, string>, bytes: Uint8Array, fileName: string, options: TelegramApiCallOptions) => Promise<TResponse>;
     callMultipart: <TResponse>(method: string, fields: Record<string, string>, fileField: string, filePath: string, fileName: string, options?: TelegramApiCallOptions) => Promise<TResponse>;
     downloadFile: (fileId: string, suggestedName: string, tempDir: string, options?: TelegramFileDownloadOptions) => Promise<string>;
     answerCallbackQuery: (callbackQueryId: string, text?: string, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
@@ -441,13 +452,61 @@ export interface TelegramBridgeApiRuntimeDeps {
     chatActionMinIntervalMs?: number;
     chatActionMaxGates?: number;
 }
+/** UI caller-lifetime checks may fence IPC issuance/ACK; they are never remote execution grants. */
+export type TelegramApiUiAuthorityOptions = ({
+    assertAuthority?: TelegramApiCallOptions["assertAuthority"];
+    assertLocalAuthority?: never;
+} | {
+    assertAuthority?: never;
+    assertLocalAuthority: NonNullable<TelegramApiCallOptions["assertAuthority"]>;
+}) & {
+    /** @internal Data from this original native edit only, never a publication or execution grant. */
+    onNativeEditResult?: (result: unknown) => void;
+};
+/** @internal Capture callable identity before ownership observations or asynchronous work. */
+export declare function captureTelegramUiAuthorityOptions(options?: TelegramApiUiAuthorityOptions): TelegramApiUiAuthorityOptions | undefined;
+/** The single caller-lifetime fence of a captured UI authority scope, whichever kind it carries. */
+export declare function getTelegramUiAuthorityAssertion(options?: TelegramApiUiAuthorityOptions): (() => void) | undefined;
 /** Typing issuance guard is local authority, never Bot API body or IPC data. */
 export interface TelegramTypingActionOptions extends Pick<TelegramApiCallOptions, "assertAuthority"> {
     message_thread_id?: number;
     /** Diagnostic observation only: an ended loop does not grant issuance, success or retry. */
     isCancelled?: () => boolean;
 }
-export interface TelegramBridgeApiRuntime extends Pick<TelegramApiClient, "call" | "callMultipart"> {
+export interface TelegramArtifactTransport {
+    isCurrent: () => boolean;
+    send: (input: {
+        bytes: Uint8Array;
+        fileName: string;
+        caption?: string;
+        expiresAt: number;
+        signal: AbortSignal;
+        assertAuthority: () => void;
+    }) => Promise<{
+        effect: "sent" | "not-issued" | "rejected" | "unknown";
+        reason: string;
+        messageId?: number;
+    }>;
+}
+export interface TelegramAttachmentPublicationTransport {
+    readonly assertCurrent: () => void;
+    readonly publish: (body: TelegramSendMessageBody, assertAuthority: () => void) => Promise<Readonly<{
+        messageId: number;
+        botId: number;
+    }>>;
+}
+export interface TelegramBridgeApiRuntime extends Pick<TelegramApiClient, "call" | "callMultipart" | "callArtifactBytes" | "reserveArtifact"> {
+    /** Original local direct publisher; unavailable follower provenance never enables common question coordination. */
+    captureQuestionAuthority?: () => (() => void) | undefined;
+    captureArtifactTransport?: (target: {
+        chatId: number;
+        threadId?: number;
+    }) => TelegramArtifactTransport | undefined;
+    /** Private follower question publication only; production composition leaves this unavailable. */
+    captureAttachmentPublication?: (target: {
+        chatId: number;
+        threadId?: number;
+    }) => TelegramAttachmentPublicationTransport | undefined;
     downloadFile: (fileId: string, suggestedName: string, source?: TelegramAttachmentSource) => Promise<string>;
     deleteWebhook: (signal?: AbortSignal) => Promise<boolean>;
     getUpdates: (body: Record<string, unknown>, signal?: AbortSignal) => Promise<TelegramUpdate[]>;
@@ -467,12 +526,12 @@ export interface TelegramBridgeApiRuntime extends Pick<TelegramApiClient, "call"
         entities?: unknown[];
         message_thread_id?: number;
     }) => Promise<boolean>;
-    sendMessage: (body: TelegramSendMessageBody, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<TelegramSentMessage>;
+    sendMessage: (body: TelegramSendMessageBody, options?: TelegramApiUiAuthorityOptions) => Promise<TelegramSentMessage>;
     sendRichMessage: (body: TelegramSendRichMessageBody, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<TelegramSentMessage>;
     sendRichMessageDraft: (body: TelegramSendRichMessageDraftBody) => Promise<boolean>;
-    editMessageText: (body: TelegramEditMessageTextBody, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<"edited" | "unchanged">;
-    editMessageReplyMarkup: (chatId: number, messageId: number, replyMarkup: unknown) => Promise<void>;
-    answerCallbackQuery: (callbackQueryId: string, text?: string, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
+    editMessageText: (body: TelegramEditMessageTextBody, options?: TelegramApiUiAuthorityOptions) => Promise<"edited" | "unchanged">;
+    editMessageReplyMarkup: (chatId: number, messageId: number, replyMarkup: unknown, options?: TelegramApiUiAuthorityOptions) => Promise<void | "edited">;
+    answerCallbackQuery: (callbackQueryId: string, text?: string, options?: TelegramApiUiAuthorityOptions) => Promise<void>;
     answerGuestQuery: (guestQueryId: string, text?: string, options?: TelegramAnswerGuestQueryOptions) => Promise<void>;
     /**
      * Answers the guest query and retains the sent inline message id for final
@@ -481,7 +540,7 @@ export interface TelegramBridgeApiRuntime extends Pick<TelegramApiClient, "call"
      */
     answerGuestQueryForInlineMessage: (guestQueryId: string, text?: string, options?: TelegramAnswerGuestQueryOptions) => Promise<string | undefined>;
     editGuestInlineMessage: (inlineMessageId: string, content: TelegramEditGuestInlineMessageContent, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
-    deleteMessage: (chatId: number, messageId: number) => Promise<void>;
+    deleteMessage: (chatId: number, messageId: number, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
     prepareTempDir: () => Promise<number>;
 }
 /** Names follow `<kind>-<scope>-<messageId>[-<index>][-<name>|.<ext>]`. */
@@ -528,6 +587,8 @@ export declare function isTelegramStaleTargetHttpError(error: unknown): boolean;
 /** Only a parsed Telegram rejection of this method proves a request had no effect. */
 export declare function isTelegramApiRequestRejected(error: unknown, method: string): boolean;
 export declare function isTelegramMessageNotModifiedError(error: unknown): boolean;
+/** Telegram refused the answer because the tap is too old or its ID is unknown; the toast can never be shown. */
+export declare function isTelegramCallbackQueryExpiredError(error: unknown): boolean;
 export declare function isTelegramApiMethodRetrySafe(method: string): boolean;
 export declare function isRetryableTelegramApiError(error: unknown): boolean;
 export declare function getTelegramApiRetryAfterMs(error: unknown): number | undefined;
@@ -546,6 +607,21 @@ export declare function fetchTelegramBotIdentity(botToken: string, fetchImpl?: t
  * (via callTelegramWithRetry), and error recording under the "multipart" category.
  */
 export declare function callTelegramMultipart<TResponse>(botToken: string | undefined, method: string, fields: Record<string, string>, fileField: string, filePath: string, fileName: string, options?: TelegramApiCallOptions): Promise<TResponse>;
+/** @internal */
+export interface TelegramAttachmentCapturedFile {
+    readonly metadata: Readonly<TelegramAttachmentRequestCandidate>;
+    readonly path: string;
+    readonly byteLength: number;
+}
+/** @internal Native lease accounting only; no producer/source execution or settlement grant. */
+export interface TelegramAttachmentConsumerLease {
+    readonly files: readonly (TelegramAttachmentCapturedFile & {
+        readonly expiresAt: number;
+    })[];
+    readonly expiresAt: number;
+    /** Consumer lifetime ended, not evidence that source pins cleared or files were deleted. */
+    readonly ended: Promise<void>;
+}
 export declare function downloadTelegramFile(botToken: string | undefined, fileId: string, suggestedName: string, tempDir: string, options?: TelegramFileDownloadOptions): Promise<string>;
 export declare function answerTelegramCallbackQuery(botToken: string | undefined, callbackQueryId: string, text?: string, options?: TelegramAnswerCallbackQueryOptions): Promise<void>;
 export declare function createTelegramChatActionSender<TAction extends string>(sendChatAction: (chatId: number, action: TAction, options?: TelegramTypingActionOptions) => Promise<unknown>, action: TAction): (chatId: number, options?: TelegramTypingActionOptions) => Promise<unknown>;

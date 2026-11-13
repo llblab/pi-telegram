@@ -30,6 +30,8 @@ If the extension needs a durable top-level Telegram menu section with managed re
 - Typed handlers receive an optional second `execution` argument with `signal`, `updateId`, `generation`, `isCurrent()`, and `assertCurrent()`. Pass `signal` into cancellable work and call `assertCurrent()` immediately before irreversible effects. The runtime also rejects a verdict returned after cancellation. Legacy one-argument and zero-coupling handlers remain compatible, but any effect they commit while still awaiting is their responsibility; replacement replay still waits for that handler's actual settlement.
 - The registry lives on `globalThis`. Module instance identity is not required, so layered extensions can reach it without importing `@llblab/pi-telegram`.
 
+Participating workers with a complete native journal binding additionally retain same-process actual-handler exclusion across Root reconstruction, including source/compiled module copies. Waiter cancellation does not release the original execution, and distinct profile/bot/journal bindings remain independent. This private exclusion index is a veto, never a replay/custody grant or proof that legacy/cross-process writers ended. See [local correction and acceptance limits](./architecture.md#runtime-self-healing-high-priority-planned); ordinary resource reload still disposes waiting Telegram queue work and is not a custody-preserving recovery mechanism.
+
 ## Verdicts
 
 Each handler returns one of:

@@ -19,6 +19,7 @@ import {
 import { createTelegramQueueMenuRuntime } from "../lib/menu-queue.ts";
 import * as Queue from "../lib/queue.ts";
 import { createTelegramMenuDelivery } from "../lib/menu-model.ts";
+import { createTelegramButtonActionStore } from "../lib/outbound-buttons.ts";
 import {
   buildTelegramSettingsMenuReplyMarkup,
   buildTimeInjectionModeSettingsReplyMarkup,
@@ -136,6 +137,41 @@ function createMenuModel(
     ? { provider, id }
     : { provider, id, reasoning };
 }
+
+test("System menus retain sixty messages across modes and evict the least recently accessed", t => {
+  t.mock.timers.enable({ apis: ["Date"] }); t.mock.timers.setTime(1000);
+  const runtime = createTelegramModelMenuRuntime();
+  const modes = ["status", "model", "thinking", "queue", "settings"] as const;
+  for (let i = 1; i <= 60; i++) runtime.storeState(createMenuState(i, { mode: modes[i % modes.length]! }));
+  assert.equal(runtime.getState(1, 1)?.messageId, 1);
+  runtime.storeState(createMenuState(61));
+  assert.equal(runtime.getState(2, 1), undefined);
+  assert.equal(runtime.getState(1, 1)?.messageId, 1);
+  for (let i = 3; i <= 61; i++) assert.equal(runtime.getState(i, 1)?.messageId, i);
+});
+
+test("System menus and callback association capacities are independent", () => {
+  const menus = createTelegramModelMenuRuntime(), callbacks = createTelegramButtonActionStore();
+  for (let i = 1; i <= 60; i++) menus.storeState(createMenuState(i));
+  const keys = Array.from({ length: 61 }, (_, index) => callbacks.register({ text: String(index), prompt: String(index) }));
+  for (let i = 1; i <= 60; i++) assert.equal(menus.getState(i, 1)?.messageId, i);
+  assert.equal(keys.filter(key => callbacks.resolve(key)).length, 60);
+});
+
+test("Menu idle TTL slides for one hour independently from an explicit fixed callback expiry", t => {
+  t.mock.timers.enable({ apis: ["Date"] }); t.mock.timers.setTime(1000);
+  const menus = createTelegramModelMenuRuntime(), callbacks = createTelegramButtonActionStore({ ttlMs: 60 * 60_000 });
+  const key = callbacks.register({ text: "A", prompt: "A" });
+  menus.storeState(createMenuState(1)); menus.storeState(createMenuState(2));
+  t.mock.timers.setTime(1000 + 59 * 60_000);
+  assert.equal(menus.getState(1, 1)?.messageId, 1);
+  t.mock.timers.setTime(1000 + 61 * 60_000);
+  assert.equal(menus.getState(2, 1), undefined);
+  assert.equal(menus.getState(1, 1)?.messageId, 1);
+  assert.equal(callbacks.resolve(key), undefined, "Opening a system menu cannot renew a prompt button");
+  t.mock.timers.setTime(1000 + 122 * 60_000);
+  assert.equal(menus.getState(1, 1), undefined);
+});
 
 test("Menu helpers store, refresh, prune, and bound model menu state", () => {
   const menus = new Map();

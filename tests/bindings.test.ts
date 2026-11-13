@@ -9,7 +9,151 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setImmediate as waitForTurn } from "node:timers/promises";
+import { Worker } from "node:worker_threads";
 import type { MenuModel } from "../lib/model.ts";
+import { createTelegramButtonActionStore } from "../lib/outbound-buttons.ts";
+
+
+
+for (const kind of ["native", "copy", "missing", "mismatch"] as const)
+test(`Private read-only binding forwards exact original lineage only (${kind})`, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-readonly-binding-")), agentDir = join(root, "agent"), script = join(root, "counter.mjs");
+  await writeFile(script, 'export function init(){return {state:0,output:"ready"}} export function peek(){return {output:"next",viewMode:"edit"}}');
+  const r = await GenerativeApps.installGenerativeApp({ agentDir, app: "counter", script }), a = GenerativeApps.getGenerativeAppCallbackBinding(r), owner = GenerativeApps.captureGenerativeAppCallbackOwner(a)!;
+  let reads = 0, enabled = true, plans = 0, child: unknown;
+  const deps = { agentDir, callbackWorkerDrain: true as const, get callbackSuccessor(): true { reads++; return enabled as true; }, assertExecutionCurrent() {}, getExecutionFence() { return undefined; },
+    planOutput(text: string, options?: Parameters<Parameters<typeof createTelegramGenerativeAppBoundButtonActionInvoker>[0]["planOutput"]>[1]) { plans++; child = options?.binding; return { markdown: text }; },
+    async sendMarkdownReply() { assert.fail("No ordinary fallback"); }, async editInteractiveMessage() {}, recordRuntimeEvent() {} };
+  try {
+    const invoke = createTelegramGenerativeAppBoundButtonActionInvoker(deps); enabled = false;
+    const binding = kind === "missing" ? undefined : kind === "copy" ? { ...a } : kind === "mismatch" ? { ...a, app: "foreign" } : a;
+    const work = invoke({ text: "Peek", prompt: "counter::peek", ...(binding ? { binding } : {}) }, { message: { chat: { id: 42 }, message_id: 201 } });
+    if (kind !== "native") { await assert.rejects(work, /callback origin is unavailable/u); assert.equal(plans, 0); }
+    else { assert.equal(await work, "edit"); assert.equal(plans, 1); assert.ok(child); assert.equal(owner.captureReadOnlySuccessor!(child), GenerativeApps.captureGenerativeAppCallbackOwner(child)); }
+    assert.equal(reads, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+for (const bound of [false, true]) for (const changing of [false, true])
+test(`Bound successor composition preserves ordinary execution without fabricating read-only lineage (${bound}/${changing})`, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pt-bound-successor-")), agentDir = join(root, "agent"), script = join(root, "counter.mjs");
+  await writeFile(script, 'export function init(){return {state:0,output:"ready"}} export function peek(){return {output:"next",viewMode:"new"}} export function change({state}){return {state:state+1,output:"changed",viewMode:"new"}}');
+  const installed = await GenerativeApps.installGenerativeApp({ agentDir, app: "counter", script }), binding = GenerativeApps.getGenerativeAppCallbackBinding(installed), owner = GenerativeApps.captureGenerativeAppCallbackOwner(binding)!;
+  let child: unknown, plans = 0;
+  const invoke = createTelegramGenerativeAppBoundButtonActionInvoker({ agentDir, callbackWorkerDrain: true, callbackSuccessor: "bound", callbackDispatch: "qualified",
+    assertExecutionCurrent() {}, getExecutionFence() { return undefined; },
+    planOutput(text, options) { plans++; child = options?.binding; return { markdown: text }; }, async sendMarkdownReply() {}, recordRuntimeEvent() {} });
+  try {
+    assert.equal(await invoke({ text: "Run", prompt: changing ? "counter::change" : "counter::peek", ...(bound ? { binding } : {}) }, { message: { chat: { id: 42 }, message_id: 201 } }), "new");
+    assert.equal(plans, 1); assert.ok(child);
+    assert.equal(!!owner.captureReadOnlySuccessor!(child), bound && !changing, "Only an original bound, no-state-write invocation may issue lineage");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+for (const lost of [false, true])
+test(`App Markdown editor pins its native port and execution instead of falling through to generic HTML (${lost})`, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pt-app-markdown-edit-")), agentDir = join(root, "agent"), script = join(root, "counter.mjs");
+  await writeFile(script, 'export function init(){return {state:0,output:"ready"}} export function peek(){return {output:"next",viewMode:"edit"}}');
+  const installed = await GenerativeApps.installGenerativeApp({ agentDir, app: "counter", script }), binding = GenerativeApps.getGenerativeAppCallbackBinding(installed);
+  let allowed = true, adopted = 0, edits = 0, sends = 0;
+  const execution = { signal: new AbortController().signal, assertCurrent() { if (!allowed) throw Error("Original app edit execution lost"); } };
+  const deps: Parameters<typeof createTelegramGenerativeAppBoundButtonActionInvoker>[0] = { agentDir, callbackWorkerDrain: true, callbackSuccessor: "bound",
+    assertExecutionCurrent() {}, getExecutionFence() { return execution; },
+    planOutput(text) { allowed = !lost; execution.assertCurrent = () => { adopted++; }; return { markdown: text }; },
+    async editMarkdownMessage(chatId, messageId, text, markup, options) {
+      assert.equal(this, deps); assert.equal(chatId, 42); assert.equal(messageId, 201); assert.equal(text, "next"); assert.deepEqual(markup, { inline_keyboard: [] });
+      options!.assertLocalAuthority!(); edits++;
+    }, async editInteractiveMessage() { assert.fail("No HTML downgrade"); }, async sendMarkdownReply() { sends++; }, recordRuntimeEvent() {} };
+  try {
+    const invoke = createTelegramGenerativeAppBoundButtonActionInvoker(deps);
+    deps.editMarkdownMessage = async () => { assert.fail("No replacement editor"); };
+    const work = invoke({ text: "Peek", prompt: "counter::peek", binding }, { message: { chat: { id: 42 }, message_id: 201 } });
+    if (lost) await assert.rejects(work, /Original app edit execution lost/u); else assert.equal(await work, "edit");
+    assert.equal(edits, lost ? 0 : 1); assert.equal(sends, 0); assert.equal(adopted, 0);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+for (const policy of [true, "bound"] as const)
+test(`Successor invocation pins the original native binding before provider replacement (${policy})`, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pt-pinned-successor-")), agentDir = join(root, "agent"), script = join(root, "counter.mjs");
+  await writeFile(script, 'export function init(){return {state:0,output:"ready"}} export function peek(){return {output:"next",viewMode:"new"}}');
+  const installed = await GenerativeApps.installGenerativeApp({ agentDir, app: "counter", script }), original = GenerativeApps.getGenerativeAppCallbackBinding(installed), owner = GenerativeApps.captureGenerativeAppCallbackOwner(original)!;
+  const peer = GenerativeApps.getGenerativeAppCallbackBinding(await GenerativeApps.invokeGenerativeApp({ agentDir, app: "counter", method: "peek" })), peerOwner = GenerativeApps.captureGenerativeAppCallbackOwner(peer)!;
+  const action = { text: "Peek", prompt: "counter::peek", binding: original };
+  let child: unknown;
+  const invoke = createTelegramGenerativeAppBoundButtonActionInvoker({ agentDir, callbackWorkerDrain: true, callbackSuccessor: policy,
+    assertExecutionCurrent() {}, getLiveSurfaceRuntime() { action.binding = peer; return undefined; }, getExecutionFence() { return undefined; },
+    planOutput(text, options) { child = options?.binding; return { markdown: text }; }, async sendMarkdownReply() {}, recordRuntimeEvent() {} });
+  try {
+    assert.notEqual(original, peer); assert.notEqual(owner, peerOwner);
+    assert.equal(await invoke(action, { message: { chat: { id: 42 }, message_id: 201 } }), "new");
+    assert.ok(owner.captureReadOnlySuccessor!(child)); assert.equal(peerOwner.captureReadOnlySuccessor!(child), undefined);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+for (const value of [false, null, 1, "true", {}])
+test(`Private read-only binding rejects invalid successor policy (${JSON.stringify(value)})`, () => {
+  assert.throws(() => createTelegramGenerativeAppBoundButtonActionInvoker({ callbackWorkerDrain: true, callbackSuccessor: value } as never), /Callback successor requires true or bound and original worker drain/u);
+});
+test("Private read-only binding requires original worker drain opt-in", () => {
+  assert.throws(() => createTelegramGenerativeAppBoundButtonActionInvoker({ callbackSuccessor: true } as never), /Callback successor requires true or bound and original worker drain/u);
+  assert.throws(() => createTelegramGenerativeAppBoundButtonActionInvoker({ callbackSuccessor: "bound" } as never), /Callback successor requires true or bound and original worker drain/u);
+});
+
+for (const loss of [false, true])
+test(`Private callback worker binding pins policy and original execution factory (${loss})`, { timeout: 5000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-callback-worker-binding-")), agentDir = join(root, "agent"), script = join(root, "counter.mjs");
+  await writeFile(script, 'export function init(){return {state:0,output:"ready"}} export function peek(){return {output:"next",viewMode:"edit"}}');
+  const installed = await GenerativeApps.installGenerativeApp({ agentDir, app: "counter", script }), binding = GenerativeApps.getGenerativeAppCallbackBinding(installed);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), nativeTerminate = Worker.prototype.terminate;
+  let active = true, plans = 0, edits = 0, captures = 0, flagReads = 0, foreignFactories = 0, callSlots = 0, worker: Worker | undefined;
+  t.mock.method(Worker.prototype, "terminate", function(this: Worker) { worker = this; entered.resolve(); return release.promise.then(() => Reflect.apply(nativeTerminate, this, [])); });
+  const controller = new AbortController(), fence = { signal: controller.signal, assertCurrent() { if (!active) throw Error("Original source lost"); } };
+  const deps = { agentDir, get callbackWorkerDrain(): true { flagReads++; return true; }, assertExecutionCurrent() { fence.assertCurrent(); },
+    getExecutionFence() { assert.equal(this, deps); captures++; return fence; },
+    planOutput(text: string) { plans++; return { markdown: text }; },
+    async sendMarkdownReply() { assert.fail("No new-message fallback"); }, async editInteractiveMessage() { edits++; }, recordRuntimeEvent() {} };
+  const factory = deps.getExecutionFence, invoke = createTelegramGenerativeAppBoundButtonActionInvoker(deps);
+  deps.getExecutionFence = () => { foreignFactories++; return Reflect.apply(factory, deps, []); };
+  Object.defineProperty(factory, "call", { value: () => { callSlots++; return Reflect.apply(factory, deps, []); } });
+  let settled = false;
+  const outcome = invoke({ text: "Peek", prompt: "counter::peek", binding }, { message: { chat: { id: 42 }, message_id: 201 } }).then(value => { settled = true; return value; }, error => { settled = true; throw error; });
+  const observed = outcome.then(value => ({ value }), error => ({ error }));
+  try {
+    await entered.promise; await waitForTurn(); assert.equal(plans, 0); assert.equal(edits, 0); assert.equal(settled, false); assert.ok(worker!.threadId > 0);
+    if (loss) active = false; release.resolve(); const result = await observed;
+    assert.equal("error" in result, loss); assert.equal(plans, loss ? 0 : 1); assert.equal(edits, loss ? 0 : 1); assert.equal(captures, 1); assert.equal(flagReads, 1); assert.equal(foreignFactories, 0); assert.equal(callSlots, 0);
+    assert.equal(worker!.threadId, -1);
+  } finally { release.resolve(); await observed; t.mock.restoreAll(); controller.abort(); await rm(root, { recursive: true, force: true }); }
+});
+for (const drained of [false, true])
+test(`Bound app new replies retain the original callback target across asynchronous providers (drain=${drained})`, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pt-callback-target-")), agentDir = join(root, "agent"), script = join(root, "counter.mjs");
+  await writeFile(script, 'export function init(){return {state:0,output:"ready"}} export function next(){return {output:"next",viewMode:"new"}}');
+  const result = await GenerativeApps.installGenerativeApp({ agentDir, app: "counter", script }), binding = GenerativeApps.getGenerativeAppCallbackBinding(result);
+  const query = { message: { chat: { id: 42 }, message_id: 201, message_thread_id: 11 } }, controller = new AbortController();
+  let target: unknown;
+  const invoke = createTelegramGenerativeAppBoundButtonActionInvoker<typeof query>({
+    agentDir, ...(drained ? { callbackWorkerDrain: true as const } : {}), assertExecutionCurrent() {},
+    getLiveSurfaceRuntime() { query.message.message_thread_id = 88; return undefined; },
+    getExecutionFence(value) { value.message.message_thread_id = 99; return { signal: controller.signal, assertCurrent() {} }; },
+    planOutput(text) { return { markdown: text }; }, async sendMarkdownReply(_chatId, _messageId, _text, options) { target = options?.target; }, recordRuntimeEvent() {},
+  });
+  try {
+    assert.equal(await invoke({ text: "Next", prompt: "counter::next", binding }, query), "new");
+    assert.equal(query.message.message_thread_id, 99); assert.deepEqual(target, { chatId: 42, threadId: 11 });
+  } finally { controller.abort(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("Private callback worker binding refuses a missing private execution factory", () => {
+  assert.throws(() => createTelegramGenerativeAppBoundButtonActionInvoker({ callbackWorkerDrain: true } as never), /Callback worker execution capture is unavailable/u);
+});
+test("Private callback worker binding omission does not read an unrelated execution getter", () => {
+  assert.equal(typeof createTelegramGenerativeAppBoundButtonActionInvoker({ get getExecutionFence() { return assert.fail("Omitted policy must not capture a factory"); } } as never), "function");
+});
+for (const value of [false, null, 1, "true", {}])
+test(`Private callback worker binding rejects invalid constructor policy (${JSON.stringify(value)})`, () => {
+  assert.throws(() => createTelegramGenerativeAppBoundButtonActionInvoker({ callbackWorkerDrain: value } as never), /Callback worker drain must be true or omitted/u);
+});
 
 for (const name of ["status", "abort"] as const) for (const mode of ["current", "unavailable", "unsupported", "missing-command", "missing-menu", "recipient-port", "command-port", "availability-port", "command-name", "menu-port", "deliver-port", "wrong-context", "wrong-target", "wrong-recipient", "target-copy", "getter-command"] as const) {
   test(`Selected command binding composes captured owners without activation or ordinary fallback (${name}/${mode})`, () => {
@@ -527,8 +671,67 @@ test("Agent message tool routing selects leader or follower composition", async 
   ]);
 });
 
+for (const lane of ["default", "steer"] as const) {
+test(`Confirmed quit fences actual completion dispatch before SDK calls and uses normal shutdown disposition (${lane})`, async () => {
+  const store = Queue.createTelegramQueueStore<string>(), deferred = Queue.createTelegramDeferredQueueDispatchRuntime<string>();
+  deferred.bind("ctx");
+  const events: string[] = [];
+  let submitted = 0, committed = 0, shutdown = Promise.resolve();
+  const action = Commands.createTelegramSessionActionRuntime({
+    sendUserMessage: () => assert.fail("Quit never enters a model/command turn"), notifyResult: async () => {},
+    getQuitContext: () => ({
+      abort() { assert.equal(store.getQueuedItems().length, 1); events.push("abort"); },
+      shutdown() { events.push("shutdown"); shutdown = hooks.onSessionShutdown({ type: "session_shutdown", reason: "quit" }, "ctx"); },
+    }),
+  });
+  const binding = createTelegramQueueBindingRuntime({
+    store, deferredDispatch: deferred, queue: { allocateItemOrder: () => 1 },
+    lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => false },
+    activeTurn: { has: () => false }, transportStamp: { isActive: () => true },
+    admission: { getSettlement: () => ({
+      isItemReady: () => true, onControlSettled: () => {},
+      onPromptHandedOff() { committed++; return true; },
+      onItemsDiscarded(items) { assert.equal(items.length, 1); events.push("discard"); return true; },
+    }), hasPendingQueueMutationForItem: () => false },
+    promptDispatch: { startTypingLoop() {}, onPromptDispatchStart() {}, onPromptDispatchFailure() {} },
+    isIdle: () => lane === "default", hasPendingMessages: () => false,
+    isContextCurrent: value => value === "ctx", isContextAborted: () => false,
+    isShutdownRequested: action.isQuitting, updateStatus() {}, sendTextReply: async () => {},
+    sendUserMessage() { submitted++; },
+  });
+  binding.mutation.append({ kind: "prompt", chatId: 7, replyToMessageId: 1, sourceMessageIds: [1],
+    queueOrder: 1, queueLane: lane, laneOrder: 1, queuedAttachments: [], content: [{ type: "text", text: "waiting" }],
+    historyText: "", statusSummary: "waiting",
+    admissionReceipts: [{ queueKind: "prompt", receiptId: "receipt", sourceUpdateIds: [1] }] }, "ctx");
+  const hooks = Queue.createTelegramSessionLifecycleHooks({
+    getCurrentModel: () => undefined, loadConfig: async () => {}, applySessionStartState() {},
+    prepareTempDir: async () => {}, updateStatus() {}, clearPendingMediaGroups() {}, clearModelMenuState() {},
+    getActiveTurnChatId: () => undefined, clearPreview: async () => {}, clearActiveTurn() {}, clearAbort() {},
+    stopPolling: async () => {}, discardQueuedItems: binding.mutation.clear,
+    applySessionShutdownState() { events.push("clear"); assert.equal(store.getQueuedItems().length, 0); },
+  });
+  const owner = Updates.createTelegramUpdateWorkerOwnerRuntime({
+    instanceId: "quit", processId: process.pid, processBirthId: "quit-native", getSessionGeneration: () => 1,
+    isContextCurrent: (value: string) => value === "ctx", requestQueueHandoffReconciliation() {},
+    dispatchNext(value) {
+      events.push("completion-dispatch");
+      if (lane === "default") binding.dispatchNext(value);
+      else assert.equal(binding.onTurnEnd({ turnIndex: 1, outcome: "completed" }, value), undefined);
+    },
+    afterUpdateCompleted(updateId, _ctx, key) { action.onUpdateCompleted(updateId, key); },
+  });
+  assert.equal(action.scheduleAfterUpdate(41, { chatId: 7, messageId: 9 },
+    { journalBindingKey: "original", isCurrent: () => true }, "quit"), true);
+  owner.onUpdateCompleted(41, "ctx", "original");
+  assert.deepEqual(events, ["completion-dispatch"]);
+  await new Promise<void>(resolve => setImmediate(resolve)); await shutdown;
+  assert.equal(submitted, 0); assert.equal(committed, 0);
+  assert.deepEqual(events, ["completion-dispatch", "abort", "shutdown", "discard", "clear"]);
+});
+}
+
 test("Queue binding requires durable handoff for every burst item and fails closed on missing settlement", () => {
-  for (const mode of ["success", "missing", "uncompleted"] as const) {
+  for (const mode of ["success", "missing", "uncompleted", "shutdown"] as const) {
     const store = Queue.createTelegramQueueStore<string>();
     const deferredDispatch = Queue.createTelegramDeferredQueueDispatchRuntime<string>();
     deferredDispatch.bind("ctx");
@@ -561,6 +764,7 @@ test("Queue binding requires durable handoff for every burst item and fails clos
         onPromptDispatchFailure: () => { events.push("failed"); },
       },
       isIdle: () => true, hasPendingMessages: () => false, updateStatus: () => {},
+      isShutdownRequested: () => mode === "shutdown",
       sendTextReply: async () => undefined,
       sendUserMessage: () => {
         const item = store.getQueuedItems()[0]!;
@@ -583,7 +787,8 @@ test("Queue binding requires durable handoff for every burst item and fails clos
       assert.equal(store.getQueuedItems().length, 0);
     } else {
       assert.ok(!events.some((event) => event.startsWith("send:")));
-      assert.ok(events.includes("failed"));
+      if (mode === "shutdown") assert.deepEqual(events, []);
+      else assert.ok(events.includes("failed"));
       assert.equal(store.getQueuedItems().length, 3);
       assert.equal(committed.size, 0);
     }
@@ -591,7 +796,7 @@ test("Queue binding requires durable handoff for every burst item and fails clos
 });
 
 test("Steer binding commits a whole receipt portfolio once and retains uncertain prefixes", () => {
-  for (const mode of ["success", "partial", "missing", "native", "compaction", "pending", "aborted", "wrong-profile", "mutation"] as const) {
+  for (const mode of ["success", "partial", "missing", "native", "compaction", "pending", "aborted", "wrong-profile", "mutation", "shutdown"] as const) {
     const store = Queue.createTelegramQueueStore<string>();
     const deferred = Queue.createTelegramDeferredQueueDispatchRuntime<string>();
     deferred.bind("ctx");
@@ -625,6 +830,7 @@ test("Steer binding commits a whole receipt portfolio once and retains uncertain
         onPromptDispatchStart: () => {}, onPromptDispatchFailure: () => {} },
       isIdle: () => idle, hasPendingMessages: () => mode === "native",
       isContextCurrent: ctx => ctx === "ctx", isContextAborted: () => mode === "aborted",
+      isShutdownRequested: () => mode === "shutdown",
       updateStatus: () => {}, sendTextReply: async () => undefined, sendUserMessage: () => { normalSends++; },
     });
     for (const [index, receipt] of [receipt1, receipt2].entries()) runtime.mutation.append({
@@ -1239,7 +1445,7 @@ function getRequiredBindingHandler(
   return handler;
 }
 
-test("Command binding does not expose a thread rename tool", () => {
+test("Command binding exposes no agent interaction tools or thread rename tool", () => {
   const harness = createBindingApiHarness();
   registerTelegramCommandsAndTools({
     pi: harness.api,
@@ -1268,6 +1474,8 @@ test("Command binding does not expose a thread rename tool", () => {
     recordRuntimeEvent: () => {},
   } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
   assert.equal(harness.tools.has("telegram_rename_thread"), false);
+  for (const name of ["telegram_confirm", "telegram_choice", "telegram_task_view", "telegram_artifact"])
+    assert.equal(harness.tools.has(name), false);
 });
 
 test("Command binding rejects a missing profile without stopping active polling", async () => {
@@ -1338,18 +1546,15 @@ test("Command binding rejects a missing profile without stopping active polling"
 test("Named profile connect completes old teardown before activating new identity", async () => {
   const harness = createBindingApiHarness();
   const events: string[] = [];
+  const storedConfig = { profiles: { active: { botToken: "active-token" }, work: { botToken: "work-token" } } };
   let activeProfileName: string | undefined = "active";
   let stopCompleted = false;
   registerTelegramCommandsAndTools({
     pi: harness.api,
     configStore: {
       get: () => ({ botToken: `${activeProfileName}-token` }),
-      getStoredConfig: () => ({
-        profiles: {
-          active: { botToken: "active-token" },
-          work: { botToken: "work-token" },
-        },
-      }),
+      getStoredConfig: () => storedConfig,
+      getBotToken: (profileName = activeProfileName) => storedConfig.profiles[profileName as keyof typeof storedConfig.profiles]?.botToken,
       getActiveProfileName: () => activeProfileName,
       activateProfile: (profileName?: string) => {
         assert.equal(stopCompleted, true);
@@ -1367,6 +1572,9 @@ test("Named profile connect completes old teardown before activating new identit
     setup: { start: () => true, finish: () => {} },
     activeTurnRuntime: { get: () => undefined },
     lockedPollingRuntime: {
+      prepareConnection: (_ctx: unknown, isCurrent: () => boolean) => {
+        assert.equal(isCurrent(), true); events.push("prepare");
+      },
       start: async () => {
         events.push(`start:${activeProfileName}`);
         return { ok: true };
@@ -1398,6 +1606,7 @@ test("Named profile connect completes old teardown before activating new identit
   assert.equal(activeProfileName, "work");
   assert.deepEqual(events, [
     "load",
+    "prepare",
     "stop:active",
     "activate:work",
     "start:work",
@@ -1414,6 +1623,76 @@ test("Named profile connect completes old teardown before activating new identit
       options: { deliverAs: "nextTurn" },
     },
   ]);
+});
+
+for (const named of [false, true])
+for (const boundary of ["known", "cancel-before-prep", "cancel-in-prep", "profile-in-prep", "config-in-prep", "token-in-prep", "config-in-stop", "cancel-in-stop", "config-after-activate", "profile-after-activate", "cancel-after-activate", "prepare-error", "reset", "cancel-in-refresh", "config-in-refresh", "refresh-error", "refresh-unavailable"] as const)
+test(`Connect preparation pins selected profile before old cleanup (${named ? "named" : "default"}/${boundary})`, async () => {
+  const harness = createBindingApiHarness(), events: string[] = [];
+  const env: NodeJS.ProcessEnv = { SELECTED_CONNECT_TOKEN: "123:selected" };
+  const selected = named ? "work" : "default";
+  const store = Config.createTelegramConfigStore({ env, initialConfig: { profiles: {
+    default: { botToken: "$SELECTED_CONNECT_TOKEN" }, work: { botToken: "$SELECTED_CONNECT_TOKEN" }, old: { botToken: "123:old" },
+  } } });
+  store.activateProfile("old");
+  const activate = store.activateProfile;
+  store.activateProfile = profile => { events.push("activate"); return activate(profile); };
+  let current = true, generation = 1;
+  store.load = async () => { if (boundary === "cancel-before-prep") current = false; };
+  const changeConfig = () => store.setProfile(selected, { botToken: "$SELECTED_CONNECT_TOKEN" });
+  registerTelegramCommandsAndTools({
+    pi: harness.api, configStore: store, setup: { start: () => true, finish() {} }, activeTurnRuntime: { get: () => undefined },
+    lockedPollingRuntime: {
+      prepareConnection(_ctx: unknown, isCurrent: () => boolean) {
+        events.push("prepare");
+        assert.equal(store.getActiveProfileName(), "old", "Inspection does not lend old teardown the new identity");
+        assert.equal(store.getBotToken(selected), "123:selected");
+        if (boundary === "cancel-in-prep") current = false;
+        if (boundary === "profile-in-prep") activate("work");
+        if (boundary === "config-in-prep") changeConfig();
+        if (boundary === "token-in-prep") env.SELECTED_CONNECT_TOKEN = "123:replacement";
+        if (boundary === "prepare-error") throw new Error("Fixture preparation refused");
+        if (!isCurrent()) throw new Error("Fixture preparation superseded");
+        return ["reset", "cancel-in-refresh", "config-in-refresh", "refresh-error", "refresh-unavailable"].includes(boundary);
+      },
+      start: async () => { events.push("start"); assert.equal(store.getActiveProfileName(), named ? "work" : undefined); return { ok: true }; },
+      stop: async () => assert.fail("The captured composed teardown port owns this stop"),
+    },
+    stopPolling: async () => {
+      events.push("stop"); assert.equal(store.getActiveProfileName(), "old");
+      await Promise.resolve();
+      if (boundary === "config-in-stop") changeConfig();
+      if (boundary === "cancel-in-stop") generation++;
+    },
+    ...(boundary === "refresh-unavailable" ? {} : { refreshProfileStateAfterReset: async () => {
+      events.push("refresh");
+      assert.equal(store.getActiveProfileName(), named ? "work" : undefined);
+      await Promise.resolve();
+      if (boundary === "cancel-in-refresh") generation++;
+      if (boundary === "config-in-refresh") changeConfig();
+      if (boundary === "refresh-error") throw new Error("Fixture selected projection refused");
+    } }),
+    onTransportChanged: async () => {
+      await Promise.resolve();
+      if (boundary === "config-after-activate") changeConfig();
+      if (boundary === "profile-after-activate") activate("old");
+      if (boundary === "cancel-after-activate") generation++;
+    },
+    getSessionGeneration: () => generation, isContextCurrent: () => current,
+    getStatusLines: () => [], buttonActionStore: { register: () => "fixture" },
+    sendMarkdownReply: async () => 1, callMultipart: async () => ({ ok: true }), getDefaultChatId: () => 42,
+    canSendDirect: () => true, updateStatus() {}, recordRuntimeEvent() {},
+  } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
+  const connect = harness.commands.get("telegram-connect") as { handler: (args: string, ctx: ExtensionContext) => Promise<void> };
+  await connect.handler(named ? "work" : "", { cwd: "/repo", ui: { notify() {} } } as unknown as ExtensionContext);
+  if (boundary === "known") assert.deepEqual(events, ["prepare", "stop", "activate", "start"]);
+  else if (boundary === "reset") assert.deepEqual(events, ["prepare", "stop", "activate", "refresh", "start"]);
+  else if (["cancel-in-refresh", "config-in-refresh", "refresh-error"].includes(boundary)) assert.deepEqual(events, ["prepare", "stop", "activate", "refresh"]);
+  else if (boundary === "refresh-unavailable") assert.deepEqual(events, ["prepare", "stop", "activate"]);
+  else if (boundary === "cancel-before-prep") assert.deepEqual(events, []);
+  else if (boundary.endsWith("in-stop")) assert.deepEqual(events, ["prepare", "stop"]);
+  else if (boundary.endsWith("after-activate")) assert.deepEqual(events, ["prepare", "stop", "activate"]);
+  else assert.deepEqual(events, ["prepare"], "A refused preparation cannot start old cleanup or change identity");
 });
 
 test("Named profile setup cancellation preserves the active runtime", async () => {
@@ -1543,10 +1822,12 @@ test("Named setup preserves a display preference changed while the token form wa
 
 test("Lifecycle binding drains diagnostics before quit cleanup and preserves cleanup after failure", async () => {
   const events: string[] = [];
-  let holdDiagnostics = false, current = true;
+  const callbacks = createTelegramButtonActionStore();
+  let holdDiagnostics = false, current = true, generation = 1;
   let releaseDiagnostics: (() => void) | undefined;
   let disconnectFails = false;
   let automaticCleanupEnabled = true;
+  let cleanupPreferenceGate: Promise<void> | undefined, disconnectGate: Promise<void> | undefined;
   const harness = createBindingApiHarness();
   const deps = {
     diagnostics: {
@@ -1557,6 +1838,7 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
       },
     },
     isSessionContextActive: () => current,
+    getSessionGeneration: () => generation,
     pi: harness.api,
     activityRuntime: {
       recordInputSource: () => {},
@@ -1622,6 +1904,7 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
       triggerPendingAbort: () => {},
     },
     previewRuntime: {
+      invalidate: () => undefined,
       resetState: () => undefined,
       clear: () => {},
       setPendingText: () => {},
@@ -1635,14 +1918,17 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
     modelContextAvailabilityRuntime: { reconcile: () => {} },
     disconnectOnQuit: async () => {
       events.push("disconnect-on-quit");
+      if (disconnectGate) await disconnectGate;
       if (disconnectFails) throw new Error("cleanup unavailable");
     },
     shutdownGenerativeAppLiveSurfaces: () => {
       events.push("live-surfaces-shutdown");
     },
-    resolveAutomaticThreadCleanupEnabled: async () =>
-      automaticCleanupEnabled,
-    buttonActionStore: { register: () => "button-action" },
+    resolveAutomaticThreadCleanupEnabled: async () => {
+      if (cleanupPreferenceGate) { events.push("cleanup-preference"); await cleanupPreferenceGate; }
+      return automaticCleanupEnabled;
+    },
+    buttonActionStore: callbacks,
     callMultipart: async () => ({ ok: true }),
     sendChatAction: async () => ({ ok: true }),
     sendRecordVoiceAction: async () => ({ ok: true }),
@@ -1667,6 +1953,10 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
   } as unknown as Parameters<typeof registerTelegramLifecycleRuntimeHooks>[0];
 
   registerTelegramLifecycleRuntimeHooks(deps);
+  const oldStart = callbacks.register({ text: "Old session", prompt: "Old session" });
+  await getRequiredBindingHandler(harness.handlers, "session_start")({ type: "session_start" }, {} as ExtensionContext);
+  assert.equal(callbacks.resolve(oldStart), undefined);
+  events.length = 0;
   const preceding = { type: "custom", customType: "preceding", data: { preserved: true } };
   const step = await getRequiredBindingHandler(harness.handlers, "turn_end")(
     { entries: [preceding], turnIndex: 1, outcome: "completed" }, {} as ExtensionContext,
@@ -1674,7 +1964,7 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
   assert.strictEqual(step.entries[0], preceding);
   assert.equal(step.entries[1]!.customType, "telegram-steer");
   assert.equal(step.continue, true);
-  assert.deepEqual(events, [], "Model-step insertion cannot reset active reply/lifecycle ownership");
+  assert.equal(events.length, 0, "Model-step insertion cannot reset active reply/lifecycle ownership");
   await getRequiredBindingHandler(harness.handlers, "session_before_compact")(
     { type: "session_before_compact" },
     {} as ExtensionContext,
@@ -1683,10 +1973,12 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
     harness.handlers,
     "session_shutdown",
   );
+  const oldShutdown = callbacks.register({ text: "Before shutdown", prompt: "Before shutdown" });
   await shutdown(
     { type: "session_shutdown", reason: "reload" },
     {} as ExtensionContext,
   );
+  assert.equal(callbacks.resolve(oldShutdown), undefined);
   await shutdown(
     { type: "session_shutdown", reason: "quit" },
     {} as ExtensionContext,
@@ -1714,10 +2006,47 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
   const stopped = shutdown({ type: "session_shutdown", reason: "quit" }, {} as ExtensionContext);
   await Promise.resolve();
   assert.deepEqual(events, ["diagnostics:suspend", "live-surfaces-shutdown"]);
+  const successor = callbacks.register({ text: "Successor", prompt: "Successor" });
   current = false;
   releaseDiagnostics!();
   await stopped;
+  assert.equal(callbacks.resolve(successor)!.prompt, "Successor");
+  const inactive = callbacks.register({ text: "Inactive shutdown must not clear", prompt: "Keep" });
+  await shutdown({ type: "session_shutdown", reason: "reload" }, {} as ExtensionContext);
+  assert.equal(callbacks.resolve(inactive)!.prompt, "Keep");
   assert.deepEqual(events, ["diagnostics:suspend", "live-surfaces-shutdown"], "Retired shutdown cannot continue into a successor after the drain");
+  current = true;
+  const buttons = Promise.withResolvers<void>(), diagnosticFailure = new Error("Diagnostic stop failed");
+  callbacks.waitForPublicationIdle = () => buttons.promise;
+  deps.diagnostics!.onSessionShutdown = () => Promise.reject(diagnosticFailure);
+  let finished = false;
+  const failed = Promise.resolve(shutdown({ type: "session_shutdown", reason: "quit" }, {} as ExtensionContext))
+    .catch((error: unknown) => { finished = true; return error; });
+  await waitForTurn();
+  assert.equal(finished, false, "A diagnostic failure must not skip actual callback cleanup drain");
+  buttons.resolve();
+  assert.equal(await failed, diagnosticFailure);
+  automaticCleanupEnabled = true; disconnectFails = false;
+  const reused = {} as ExtensionContext;
+  for (const boundary of ["diagnostics", "cleanup-preference", "disconnect"] as const) {
+    events.length = 0;
+    const pending = Promise.withResolvers<void>();
+    deps.diagnostics!.onSessionShutdown = () => {
+      events.push("diagnostics:suspend");
+      return boundary === "diagnostics" ? pending.promise : Promise.resolve();
+    };
+    cleanupPreferenceGate = boundary === "cleanup-preference" ? pending.promise : undefined;
+    disconnectGate = boundary === "disconnect" ? pending.promise : undefined;
+    let returned = false;
+    const old = Promise.resolve(shutdown({ type: "session_shutdown", reason: "quit" }, reused)).then(() => { returned = true; });
+    await waitForTurn();
+    assert.equal(returned, false, "The selected original teardown operation is still awaited");
+    if (boundary !== "diagnostics") assert.ok(events.includes(boundary === "disconnect" ? "disconnect-on-quit" : "cleanup-preference"));
+    generation++;
+    pending.resolve(); await old;
+    assert.equal(events.includes("composed-shutdown"), false, "Late original completion cannot enter the successor's composed teardown");
+    assert.equal(events.includes("disconnect-on-quit"), boundary === "disconnect", "A superseded preference read cannot issue destructive cleanup");
+  }
 });
 
 test("Lifecycle binding routes native typing, previews, and normalized activity", async () => {

@@ -4,6 +4,7 @@
  * Owns stable handler registration, evidence-based activity/source identity, assistant segment and reasoning normalization, ordered public-output projection, executed-tool and compaction events, isolated non-blocking queues, shutdown fencing, diagnostics, and fresh delivery contexts; excludes Pi hook wiring, Telegram rendering implementation, raw transport clients, and consumer-extension behavior
  */
 import { deleteTelegramView, editTelegramView, sendTelegramChatAction, sendTelegramView, } from "./delivery.js";
+import { captureTelegramDrainObserver } from "./machine.js";
 const TELEGRAM_ACTIVITY_REGISTRY_KEY = "__piTelegramActivityRegistry__";
 function getOrCreateTelegramActivityRegistry() {
     const globals = globalThis;
@@ -116,23 +117,6 @@ function coalesceActivityEvents(previous, next) {
     }
     return next;
 }
-/** Optional observation must not change queue/transport settlement. */
-function captureActivityDrainObserver(capture) {
-    try {
-        const notify = capture?.();
-        return () => {
-            try {
-                const emitted = notify?.();
-                if (emitted)
-                    void Promise.resolve(emitted).catch(() => undefined);
-            }
-            catch { /* Observer failure is inert. */ }
-        };
-    }
-    catch {
-        return () => { };
-    }
-}
 /** @internal */
 export function createTelegramActivityDispatcher(deps = {}) {
     const queues = new Map();
@@ -185,7 +169,7 @@ export function createTelegramActivityDispatcher(deps = {}) {
                     queues.set(registration.id, queue);
                 }
                 if (!queue.running && queue.events.length === 0)
-                    queue.notifyDrained = captureActivityDrainObserver(deps.captureDrain);
+                    queue.notifyDrained = captureTelegramDrainObserver(deps.captureDrain);
                 const previous = queue.events.at(-1);
                 if (previous && canCoalesceActivityEvents(previous, event)) {
                     queue.events[queue.events.length - 1] = coalesceActivityEvents(previous, event);
@@ -500,7 +484,7 @@ export function createTelegramActivityPublicationRuntime(deps = {}) {
     const pending = new Set();
     const reserve = () => {
         const admittedGeneration = generation;
-        const notifyDrained = captureActivityDrainObserver(deps.captureDrain);
+        const notifyDrained = captureTelegramDrainObserver(deps.captureDrain);
         let state = "pending";
         let resolve;
         const ready = new Promise((accept) => {
@@ -548,7 +532,7 @@ export function createTelegramActivityPublicationRuntime(deps = {}) {
         hasUnconfirmed: () => unconfirmed,
         beginWork() {
             const admittedGeneration = generation;
-            const notifyDrained = captureActivityDrainObserver(deps.captureDrain);
+            const notifyDrained = captureTelegramDrainObserver(deps.captureDrain);
             let settled = false;
             outstanding += 1;
             return {
