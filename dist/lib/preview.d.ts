@@ -49,7 +49,7 @@ export interface TelegramPreviewControllerDeps {
     minDraftIntervalMs?: number;
     recordRuntimeEvent?: TelegramPreviewEventRecorder;
 }
-type TelegramPreviewTargetOptions = {
+export type TelegramPreviewTargetOptions = {
     target?: TelegramTarget;
 };
 export interface TelegramPreviewController {

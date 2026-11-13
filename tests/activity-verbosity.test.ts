@@ -1,11 +1,13 @@
 /**
  * Telegram activity verbosity projection regressions
- * Covers four activity modes, persistent reasoning, bounded tool disclosures, ordering, redaction, and authority fencing
+ * Covers four activity modes, stream mode, persistent reasoning, bounded tool disclosures, ordering, redaction, and authority fencing
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildTelegramStreamArgsLine,
+  buildTelegramStreamMessageHtml,
   createTelegramActivityVerbosityRuntime,
   renderTelegramThinkingActivityHtml,
   renderTelegramToolActivityHtml,
@@ -953,4 +955,354 @@ test("reset drops accepted events that have not started processing", async () =>
   assert.match(JSON.stringify(richSends[0]), /new session/);
   assert.doesNotMatch(JSON.stringify(richSends[0]), /must not send/);
   releaseReasoning();
+});
+
+type StreamHarnessMode =
+  "quiet" | "thinking" | "tools" | "verbose" | "stream";
+
+function createStreamHarness(
+  options: { mode?: StreamHarnessMode; deleteError?: Error } = {},
+) {
+  let mode: StreamHarnessMode = options.mode ?? "stream";
+  let authority = 1;
+  let nowMs = 0;
+  const sends: TelegramSendMessageBody[] = [];
+  const edits: TelegramEditMessageTextBody[] = [];
+  const deletes: Array<{ chatId: number; messageId: number }> = [];
+  const failures: Array<{
+    operation: string;
+    eventType: TelegramActivityEvent["type"];
+  }> = [];
+  const timers: Array<() => void> = [];
+  const runtime = createTelegramActivityVerbosityRuntime({
+    getActivityMode: () => mode,
+    getNowMs: () => nowMs,
+    setReasoningTimeout: (callback: () => void) => {
+      timers.push(callback);
+      return { unref() {} } as ReturnType<typeof setTimeout>;
+    },
+    clearReasoningTimeout: () => {
+      timers.shift();
+    },
+    resolveTarget: (activity) => activity.target,
+    captureAuthority: () => authority,
+    isAuthorityActive: (captured) => captured === authority,
+    async sendMessage(body) {
+      sends.push(body);
+      return { message_id: sends.length };
+    },
+    async sendRichMessage(body) {
+      throw new Error(
+        `stream mode must not send rich messages: ${JSON.stringify(body).slice(0, 120)}`,
+      );
+    },
+    async editMessageText(body) {
+      edits.push(body);
+      return "edited";
+    },
+    async deleteMessage(chatId, messageId) {
+      if (options.deleteError) throw options.deleteError;
+      deletes.push({ chatId, messageId });
+    },
+    recordFailure(operation, event2) {
+      failures.push({ operation, eventType: event2.type });
+    },
+  });
+  return {
+    runtime,
+    sends,
+    edits,
+    deletes,
+    failures,
+    setMode(value: StreamHarnessMode) {
+      mode = value;
+    },
+    advanceNow(ms: number) {
+      nowMs += ms;
+    },
+    replaceAuthority() {
+      authority += 1;
+    },
+    /** Runs the accepted event task first, fires the armed stream timer, then drains the publish. */
+    async acceptAndPublish(
+      sequence: number,
+      payload: TelegramActivityPayload,
+    ) {
+      runtime.accept(event(sequence, payload));
+      await runtime.waitForIdle();
+      timers.shift()?.();
+      await runtime.waitForIdle();
+    },
+    async accept(sequence: number, payload: TelegramActivityPayload) {
+      runtime.accept(event(sequence, payload));
+      await runtime.waitForIdle();
+    },
+    pendingTimers: () => timers.length,
+  };
+}
+
+test("Stream mode keeps one message per turn: one send, edits only after", async () => {
+  const harness = createStreamHarness();
+  await harness.accept(1, { type: "agent-start" });
+  await harness.acceptAndPublish(2, {
+    type: "reasoning-delta",
+    contentIndex: 0,
+    delta: "checking the repo",
+  });
+  await harness.acceptAndPublish(3, {
+    type: "tool-start",
+    toolCallId: "bash-1",
+    toolName: "bash",
+    args: { command: "git status" },
+  });
+  await harness.acceptAndPublish(4, {
+    type: "tool-end",
+    toolCallId: "bash-1",
+    toolName: "bash",
+    result: "clean",
+    isError: false,
+  });
+  harness.advanceNow(2_000);
+  await harness.acceptAndPublish(5, {
+    type: "assistant-text-delta",
+    contentIndex: 0,
+    delta: "All ",
+  });
+  harness.advanceNow(2_000);
+  await harness.acceptAndPublish(6, {
+    type: "assistant-segment",
+    contentIndex: 0,
+    text: "All checks pass.",
+    placement: "intermediate",
+  });
+  await harness.accept(7, { type: "agent-settled" });
+
+  assert.equal(harness.sends.length, 1);
+  assert.equal(harness.runtime.getStreamMessageId(), 1);
+  assert.ok(harness.edits.length >= 3);
+  assert.deepEqual(
+    harness.edits.map((edit2) => edit2.message_id),
+    harness.edits.map(() => 1),
+  );
+  const lastBody = harness.edits[harness.edits.length - 1]!.text!;
+  assert.match(lastBody, /<blockquote expandable>💭 checking the repo<\/blockquote>/);
+  assert.match(lastBody, /🔧 <b>Bash<\/b> <code>done<\/code>/);
+  assert.match(lastBody, /<code>command: git status<\/code>/);
+  assert.match(lastBody, /All checks pass\./);
+  assert.match(harness.sends[0]!.text!, /💭 checking the repo/);
+});
+
+test("Stream mode ignores separate reasoning and tool messages", async () => {
+  const harness = createStreamHarness();
+  await harness.accept(1, { type: "agent-start" });
+  await harness.acceptAndPublish(2, {
+    type: "reasoning-delta",
+    contentIndex: 0,
+    delta: "plan",
+  });
+  await harness.acceptAndPublish(3, {
+    type: "tool-start",
+    toolCallId: "t",
+    toolName: "read",
+    args: { path: "x.ts" },
+  });
+  await harness.acceptAndPublish(4, {
+    type: "tool-end",
+    toolCallId: "t",
+    toolName: "read",
+    result: "ok",
+    isError: false,
+  });
+  harness.advanceNow(2_000);
+  await harness.acceptAndPublish(5, {
+    type: "reasoning-end",
+    contentIndex: 0,
+    text: "plan",
+  });
+
+  // One streamed message; zero rich tool messages, no extra sends.
+  assert.equal(harness.sends.length, 1);
+  assert.ok(harness.edits.length >= 2);
+});
+
+test("Stream mode stays silent in non-stream modes", async () => {
+  const harness = createStreamHarness({ mode: "verbose" });
+  await harness.accept(1, { type: "agent-start" });
+  await harness.accept(2, {
+    type: "tool-start",
+    toolCallId: "t",
+    toolName: "read",
+    args: { path: "x.ts" },
+  });
+  await harness.accept(3, {
+    type: "tool-end",
+    toolCallId: "t",
+    toolName: "read",
+    result: "ok",
+    isError: false,
+  });
+  assert.equal(harness.runtime.getStreamMessageId(), undefined);
+  assert.equal(harness.sends.length, 0);
+});
+
+test("Stream composition trims tool lines before the answer tail", async () => {
+  const harness = createStreamHarness();
+  await harness.accept(1, { type: "agent-start" });
+  await harness.accept(2, {
+    type: "assistant-text-delta",
+    contentIndex: 0,
+    delta: "A".repeat(2_000),
+  });
+  for (let index = 0; index < 12; index += 1) {
+    await harness.accept(10 + index, {
+      type: "tool-start",
+      toolCallId: `t${index}`,
+      toolName: "bash",
+      args: { command: `cmd-${index} ${"x".repeat(60)}` },
+    });
+    await harness.accept(100 + index, {
+      type: "tool-end",
+      toolCallId: `t${index}`,
+      toolName: "bash",
+      result: "done",
+      isError: false,
+    });
+  }
+  harness.advanceNow(2_000);
+  harness.runtime.accept(event(200, { type: "agent-settled" }));
+  await harness.runtime.waitForIdle();
+
+  const body = harness.sends[0]?.text ?? harness.edits[harness.edits.length - 1]!.text!;
+  assert.ok(body.length <= 3_900, `composed body must fit Telegram cap: ${body.length}`);
+  assert.match(body, /… \[\d+ earlier tools\]/);
+  assert.match(body, /AAAA/);
+  const toolRows = body.split("\n").filter((line) => line.includes("🔧")).length;
+  assert.ok(toolRows <= 8, `at most 8 tool lines, got ${toolRows}`);
+});
+
+test("Stream agent-settled publishes immediately and settles the surface", async () => {
+  const harness = createStreamHarness();
+  await harness.accept(1, { type: "agent-start" });
+  await harness.accept(2, {
+    type: "assistant-text-delta",
+    contentIndex: 0,
+    delta: "partial answer",
+  });
+  // The throttled timer is armed but not fired: settlement publishes directly.
+  assert.equal(harness.sends.length, 0);
+  await harness.accept(3, { type: "agent-settled" });
+  assert.equal(harness.sends.length, 1);
+  assert.match(harness.sends[0]!.text!, /partial answer/);
+  harness.advanceNow(2_000);
+  await harness.accept(4, {
+    type: "assistant-text-delta",
+    contentIndex: 0,
+    delta: " late",
+  });
+  assert.equal(harness.sends.length, 1);
+  assert.equal(harness.edits.length, 0);
+});
+
+test("clearStreamMessage deletes once, tolerates repeats, records delete failures", async () => {
+  const harness = createStreamHarness();
+  await harness.accept(1, { type: "agent-start" });
+  await harness.accept(2, {
+    type: "assistant-text-delta",
+    contentIndex: 0,
+    delta: "answer",
+  });
+  await harness.accept(3, { type: "agent-settled" });
+  assert.equal(harness.runtime.getStreamMessageId(), 1);
+  await harness.runtime.clearStreamMessage();
+  assert.deepEqual(harness.deletes, [{ chatId: 42, messageId: 1 }]);
+  assert.equal(harness.runtime.getStreamMessageId(), undefined);
+  await harness.runtime.clearStreamMessage();
+  assert.equal(harness.deletes.length, 1);
+});
+
+test("clearStreamMessage records delete failures without throwing", async () => {
+  const harness = createStreamHarness({ deleteError: new Error("boom") });
+  await harness.accept(1, { type: "agent-start" });
+  await harness.accept(2, {
+    type: "assistant-text-delta",
+    contentIndex: 0,
+    delta: "answer",
+  });
+  await harness.accept(3, { type: "agent-settled" });
+  await harness.runtime.clearStreamMessage();
+  assert.deepEqual(harness.failures, [
+    { operation: "stream-delete", eventType: "agent-settled" },
+  ]);
+});
+
+test("Stream transport failure blocks the surface and records stream-send", async () => {
+  let mode: StreamHarnessMode = "stream";
+  const failures: string[] = [];
+  const runtime = createTelegramActivityVerbosityRuntime({
+    getActivityMode: () => mode,
+    getNowMs: () => 0,
+    resolveTarget: (activity) => activity.target,
+    captureAuthority: () => 1,
+    isAuthorityActive: () => true,
+    async sendMessage() {
+      throw new Error("HTTP 429: too many requests");
+    },
+    async sendRichMessage() {
+      throw new Error("unreachable");
+    },
+    async editMessageText() {
+      return "edited";
+    },
+    recordFailure(operation) {
+      failures.push(operation);
+    },
+  });
+  runtime.accept(event(1, { type: "agent-start" }));
+  runtime.accept(
+    event(2, { type: "reasoning-delta", contentIndex: 0, delta: "thinking" }),
+  );
+  runtime.accept(event(3, { type: "agent-settled" }));
+  await runtime.waitForIdle();
+  assert.deepEqual(failures, ["stream-send"]);
+});
+
+test("Stream mode follows the target thread of the activity", async () => {
+  const harness = createStreamHarness();
+  await harness.accept(1, { type: "agent-start" });
+  await harness.accept(2, {
+    type: "assistant-text-delta",
+    contentIndex: 0,
+    delta: "hi",
+  });
+  await harness.accept(3, { type: "agent-settled" });
+  assert.equal(harness.sends[0]!.chat_id, 42);
+  assert.equal(harness.sends[0]!.message_thread_id, 7);
+});
+
+test("Stream args line keeps one scalar field and truncates", () => {
+  assert.equal(
+    buildTelegramStreamArgsLine({ command: "git status\n--porcelain" }),
+    "command: git status",
+  );
+  assert.equal(buildTelegramStreamArgsLine({ path: "a/b.ts" }), "path: a/b.ts");
+  assert.equal(buildTelegramStreamArgsLine(undefined), "");
+  assert.equal(buildTelegramStreamArgsLine({}), "");
+  const long = buildTelegramStreamArgsLine({ command: "x".repeat(500) });
+  assert.ok(long.length <= 90);
+  assert.ok(long.endsWith("…"));
+});
+
+test("Stream HTML composition is stable and quote-shaped", () => {
+  const html = buildTelegramStreamMessageHtml({
+    thinking: "deep <b>thoughts</b>",
+    tools: [
+      { id: "1", name: "grep", argsLine: "pattern: needle", status: "done" },
+    ],
+    droppedTools: 2,
+    answer: "final **answer**",
+  });
+  assert.match(html, /<blockquote expandable>💭 deep &lt;b&gt;thoughts&lt;\/b&gt;<\/blockquote>/);
+  assert.match(html, /… \[2 earlier tools\]/);
+  assert.match(html, /🔧 <b>Grep<\/b> <code>done<\/code>/);
+  assert.match(html, /final <b>answer<\/b>/);
 });

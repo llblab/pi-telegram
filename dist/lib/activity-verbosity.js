@@ -14,6 +14,15 @@ export const TELEGRAM_REASONING_BUFFER_MAX_CHARS = 1_200;
 // interval, then publish at most one updated frame per interval.
 const TELEGRAM_REASONING_MIN_INTERVAL_MS = 2_000;
 export const TELEGRAM_TOOL_UPDATE_MAX_ENTRIES = 4;
+// Stream mode: one message per turn carrying quoted thinking/tool lines
+// above the live answer tail; edits are throttled like native drafts.
+const TELEGRAM_STREAM_MIN_INTERVAL_MS = 2_000;
+const TELEGRAM_STREAM_MAX_CHARS = TELEGRAM_ACTIVITY_MESSAGE_MAX_CHARS;
+const TELEGRAM_STREAM_THINKING_TAIL_CHARS = 600;
+const TELEGRAM_STREAM_MAX_TOOL_LINES = 8;
+const TELEGRAM_STREAM_ARGS_MAX_CHARS = 90;
+const TELEGRAM_STREAM_ANSWER_TAIL_CHARS = 2_400;
+const TELEGRAM_STREAM_MAX_FRAMES = 150;
 function redactActivityText(text) {
     return text
         .replace(/\b\d{8,12}:[A-Za-z0-9_-]{30,}\b/g, "[REDACTED_BOT_TOKEN]")
@@ -118,6 +127,84 @@ function formatToolActivityLabel(label) {
     })
         .join(" ");
 }
+function truncateStreamText(text) {
+    const redacted = redactActivityText(text);
+    return redacted.length <= TELEGRAM_STREAM_ARGS_MAX_CHARS
+        ? redacted
+        : `${redacted.slice(0, TELEGRAM_STREAM_ARGS_MAX_CHARS - 1)}…`;
+}
+/** One compact `key: first-line value` for a tool's arguments. */
+export function buildTelegramStreamArgsLine(args) {
+    const firstLine = (text) => text.trim().split("\n")[0]?.trim() ?? "";
+    if (typeof args === "string")
+        return truncateStreamText(firstLine(args));
+    if (args !== null && typeof args === "object" && !Array.isArray(args)) {
+        for (const [key, value] of Object.entries(args)) {
+            if (typeof value === "string" && value.trim())
+                return truncateStreamText(`${key}: ${firstLine(value)}`);
+            if (typeof value === "number" || typeof value === "boolean")
+                return truncateStreamText(`${key}: ${value}`);
+        }
+        return "";
+    }
+    if (args === undefined || args === null)
+        return "";
+    return truncateStreamText(firstLine(String(args)));
+}
+export function buildTelegramStreamToolLineHtml(tool) {
+    const args = tool.argsLine
+        ? `\n<code>${escapeActivityEvidenceHtml(tool.argsLine)}</code>`
+        : "";
+    return `🔧 <b>${escapeHtml(formatToolActivityLabel(tool.name))}</b> <code>${tool.status}</code>${args}`;
+}
+/**
+ * Pure composition of the single stream message: quoted thinking, one quoted
+ * block of compact tool lines, then the live answer tail as inline HTML.
+ */
+export function buildTelegramStreamMessageHtml(input) {
+    const parts = [];
+    if (input.thinking.trim()) {
+        parts.push(`<blockquote expandable>💭 ${renderThinkingActivityEvidenceHtml(redactActivityText(input.thinking))}</blockquote>`);
+    }
+    if (input.tools.length > 0) {
+        const rows = input.tools.map(buildTelegramStreamToolLineHtml);
+        if (input.droppedTools > 0) {
+            rows.unshift(`… [${input.droppedTools} earlier tools]`);
+        }
+        parts.push(`<blockquote>${rows.join("\n")}</blockquote>`);
+    }
+    if (input.answer.trim()) {
+        parts.push(renderTelegramInlineMarkdownHtml(neutralizeActivityAutoLinks(redactActivityText(input.answer)), { allowLinks: false }));
+    }
+    return parts.join("\n\n");
+}
+/** Compose under the message cap, trimming tools, then thinking, never the answer's head. */
+function composeStreamBody(state, thinkingCap = TELEGRAM_STREAM_THINKING_TAIL_CHARS, answerCap = TELEGRAM_STREAM_ANSWER_TAIL_CHARS) {
+    let toolCount = state.tools.length;
+    const build = (thinkingCapNow, answerCapNow) => buildTelegramStreamMessageHtml({
+        thinking: state.thinking.slice(-Math.max(1, Math.floor(thinkingCapNow))),
+        tools: state.tools.slice(state.tools.length - toolCount),
+        droppedTools: state.droppedTools + (state.tools.length - toolCount),
+        answer: state.answer.slice(-Math.max(1, Math.floor(answerCapNow))),
+    });
+    let thinkingCapNow = thinkingCap;
+    let answerCapNow = answerCap;
+    let html = build(thinkingCapNow, answerCapNow);
+    while (html.length > TELEGRAM_STREAM_MAX_CHARS && toolCount > 0) {
+        toolCount -= 1;
+        html = build(thinkingCapNow, answerCapNow);
+    }
+    while (html.length > TELEGRAM_STREAM_MAX_CHARS &&
+        thinkingCapNow > 80) {
+        thinkingCapNow = Math.floor(thinkingCapNow * 0.6);
+        html = build(thinkingCapNow, answerCapNow);
+    }
+    while (html.length > TELEGRAM_STREAM_MAX_CHARS && answerCapNow > 80) {
+        answerCapNow = Math.floor(answerCapNow * 0.6);
+        html = build(thinkingCapNow, answerCapNow);
+    }
+    return html;
+}
 function renderToolActivityHtml(tool) {
     const evidence = [`"arguments": ${tool.args}`];
     if (tool.droppedUpdates > 0) {
@@ -210,6 +297,8 @@ export function createTelegramActivityVerbosityRuntime(deps) {
     let toolMessage;
     const tools = new Map();
     const toolOrder = [];
+    let stream;
+    let streamTimer;
     const clearReasoningFlushTimer = () => {
         if (!reasoningFlushTimer)
             return;
@@ -232,6 +321,32 @@ export function createTelegramActivityVerbosityRuntime(deps) {
         tools.clear();
         toolOrder.length = 0;
     };
+    const clearStreamTimer = () => {
+        if (!streamTimer)
+            return;
+        (deps.clearReasoningTimeout ?? clearTimeout)(streamTimer);
+        streamTimer = undefined;
+    };
+    const clearStreamState = () => {
+        clearStreamTimer();
+        stream = undefined;
+    };
+    /** A replaced activity takes its stream message with it: best-effort delete behind the queue. */
+    const retireStream = () => {
+        const retiring = stream;
+        clearStreamTimer();
+        stream = undefined;
+        if (!retiring?.messageId || !retiring.target || !deps.deleteMessage)
+            return;
+        const chatId = retiring.target.chatId;
+        const messageId = retiring.messageId;
+        const enqueue = deps.enqueue ?? ((next) => tail.then(next));
+        tail = enqueue(async () => {
+            if (!active)
+                return;
+            await deps.deleteMessage?.(chatId, messageId);
+        }).catch(() => undefined);
+    };
     const hasAuthority = () => authority !== undefined && deps.isAuthorityActive(authority);
     const isCurrent = (acceptedGeneration, admittedAuthority) => active &&
         generation === acceptedGeneration &&
@@ -242,6 +357,7 @@ export function createTelegramActivityVerbosityRuntime(deps) {
             return false;
         if (activityId === event.activityId)
             return hasAuthority();
+        retireStream();
         clearActivity();
         if (!admittedTarget)
             return false;
@@ -334,6 +450,190 @@ export function createTelegramActivityVerbosityRuntime(deps) {
             });
         }, delayMs);
         reasoningFlushTimer?.unref?.();
+    };
+    const publishStream = async (event, acceptedGeneration) => {
+        const admittedAuthority = authority;
+        if (!isCurrent(acceptedGeneration, admittedAuthority) ||
+            !target ||
+            !stream ||
+            stream.blocked) {
+            return;
+        }
+        const state = stream;
+        const body = composeStreamBody(state);
+        if (!body)
+            return;
+        if (body === state.lastBody) {
+            state.lastPublishMs = getNowMs();
+            return;
+        }
+        const canEdit = state.messageId !== undefined &&
+            state.target !== undefined &&
+            targetEquals(state.target, target);
+        try {
+            if (canEdit && state.messageId !== undefined) {
+                await deps.editMessageText({
+                    chat_id: target.chatId,
+                    message_id: state.messageId,
+                    text: body,
+                    parse_mode: "HTML",
+                    link_preview_options: { is_disabled: true },
+                });
+            }
+            else {
+                const sent = await deps.sendMessage({
+                    chat_id: target.chatId,
+                    ...(target.threadId === undefined
+                        ? {}
+                        : { message_thread_id: target.threadId }),
+                    text: body,
+                    parse_mode: "HTML",
+                    link_preview_options: { is_disabled: true },
+                });
+                if (!isCurrent(acceptedGeneration, admittedAuthority))
+                    return;
+                state.messageId = sent.message_id;
+                state.target = { ...target };
+            }
+            if (!isCurrent(acceptedGeneration, admittedAuthority))
+                return;
+            state.lastBody = body;
+            state.lastPublishMs = getNowMs();
+            state.frames += 1;
+        }
+        catch (error) {
+            if (!isCurrent(acceptedGeneration, admittedAuthority))
+                return;
+            state.blocked = true;
+            clearStreamTimer();
+            deps.recordFailure?.(canEdit ? "stream-edit" : "stream-send", event, error);
+        }
+    };
+    const scheduleStreamPublish = (event, acceptedGeneration, immediate = false) => {
+        if (!stream || stream.blocked || stream.settled)
+            return;
+        if (stream.frames >= TELEGRAM_STREAM_MAX_FRAMES)
+            return;
+        if (streamTimer && !immediate)
+            return;
+        const elapsed = stream.frames === 0 ? 0 : getNowMs() - stream.lastPublishMs;
+        const delayMs = immediate
+            ? 0
+            : Math.max(0, TELEGRAM_STREAM_MIN_INTERVAL_MS - elapsed);
+        const schedule = deps.setReasoningTimeout ?? setTimeout;
+        if (streamTimer)
+            (deps.clearReasoningTimeout ?? clearTimeout)(streamTimer);
+        streamTimer = schedule(() => {
+            streamTimer = undefined;
+            const admittedAuthority = authority;
+            const task = async () => {
+                if (!isCurrent(acceptedGeneration, admittedAuthority) ||
+                    !stream ||
+                    stream.settled)
+                    return;
+                await publishStream(event, acceptedGeneration);
+            };
+            const enqueue = deps.enqueue ?? ((next) => tail.then(next));
+            tail = enqueue(task).catch((error) => {
+                deps.recordFailure?.("stream-send", event, error);
+            });
+        }, delayMs);
+        streamTimer?.unref?.();
+    };
+    const processStream = async (event, acceptedGeneration) => {
+        const admittedAuthority = authority;
+        if (!isCurrent(acceptedGeneration, admittedAuthority) || !target)
+            return;
+        if (!stream) {
+            stream = {
+                activityId: event.activityId,
+                thinking: "",
+                thinkingClosed: false,
+                tools: [],
+                droppedTools: 0,
+                answer: "",
+                frames: 0,
+                lastPublishMs: 0,
+                blocked: false,
+                settled: false,
+            };
+        }
+        const state = stream;
+        state.lastEvent = event;
+        if (state.settled)
+            return;
+        if (event.type === "reasoning-delta") {
+            if (state.thinkingClosed) {
+                state.thinking = "";
+                state.thinkingClosed = false;
+            }
+            state.thinking = (state.thinking + event.delta).slice(-TELEGRAM_STREAM_THINKING_TAIL_CHARS);
+            scheduleStreamPublish(event, acceptedGeneration);
+            return;
+        }
+        if (event.type === "reasoning-end") {
+            if (!state.thinking && event.text) {
+                state.thinking = event.text.slice(-TELEGRAM_STREAM_THINKING_TAIL_CHARS);
+            }
+            state.thinkingClosed = true;
+            scheduleStreamPublish(event, acceptedGeneration);
+            return;
+        }
+        if (event.type === "tool-start") {
+            state.tools.push({
+                id: event.toolCallId,
+                name: event.toolName,
+                argsLine: buildTelegramStreamArgsLine(event.args),
+                status: "running",
+            });
+            while (state.tools.length > TELEGRAM_STREAM_MAX_TOOL_LINES) {
+                state.tools.shift();
+                state.droppedTools += 1;
+            }
+            scheduleStreamPublish(event, acceptedGeneration, true);
+            return;
+        }
+        if (event.type === "tool-update")
+            return;
+        if (event.type === "tool-end") {
+            const tool = state.tools.find((entry) => entry.id === event.toolCallId);
+            if (tool) {
+                tool.status = event.isError ? "failed" : "done";
+            }
+            else {
+                state.tools.push({
+                    id: event.toolCallId,
+                    name: event.toolName,
+                    argsLine: "",
+                    status: event.isError ? "failed" : "done",
+                });
+                while (state.tools.length > TELEGRAM_STREAM_MAX_TOOL_LINES) {
+                    state.tools.shift();
+                    state.droppedTools += 1;
+                }
+            }
+            scheduleStreamPublish(event, acceptedGeneration, true);
+            return;
+        }
+        if (event.type === "assistant-text-delta") {
+            state.answer = (state.answer + event.delta).slice(-TELEGRAM_STREAM_ANSWER_TAIL_CHARS);
+            scheduleStreamPublish(event, acceptedGeneration);
+            return;
+        }
+        if (event.type === "assistant-segment") {
+            if (event.text.trim()) {
+                state.answer = event.text.slice(-TELEGRAM_STREAM_ANSWER_TAIL_CHARS);
+                scheduleStreamPublish(event, acceptedGeneration);
+            }
+            return;
+        }
+        if (event.type === "agent-end" || event.type === "agent-settled") {
+            clearStreamTimer();
+            await publishStream(event, acceptedGeneration);
+            if (!isCurrent(acceptedGeneration, admittedAuthority))
+                return;
+            state.settled = true;
+        }
     };
     const publishTool = async (event, tool, acceptedGeneration) => {
         const admittedAuthority = authority;
@@ -455,6 +755,10 @@ export function createTelegramActivityVerbosityRuntime(deps) {
         const mode = deps.getActivityMode();
         const showThinking = mode === "thinking" || mode === "verbose";
         const showTools = mode === "tools" || mode === "verbose";
+        if (mode === "stream") {
+            await processStream(event, acceptedGeneration);
+            return;
+        }
         if (event.type === "assistant-text-delta" ||
             event.type === "assistant-segment" ||
             event.type === "reasoning-delta" ||
@@ -583,13 +887,42 @@ export function createTelegramActivityVerbosityRuntime(deps) {
         reset() {
             generation += 1;
             clearActivity();
+            clearStreamState();
             tail = Promise.resolve();
         },
         stop() {
             active = false;
             generation += 1;
             clearActivity();
+            clearStreamState();
             tail = Promise.resolve();
+        },
+        async clearStreamMessage() {
+            const state = stream;
+            clearStreamState();
+            const queued = tail;
+            await queued.catch(() => undefined);
+            if (!state?.messageId || !state.target || !deps.deleteMessage)
+                return;
+            const chatId = state.target.chatId;
+            const messageId = state.messageId;
+            if (!active)
+                return;
+            try {
+                await deps.deleteMessage(chatId, messageId);
+            }
+            catch (error) {
+                deps.recordFailure?.("stream-delete", state.lastEvent ?? {
+                    activityId: state.activityId,
+                    sequence: 0,
+                    source: "telegram",
+                    timestamp: 0,
+                    type: "agent-settled",
+                }, error);
+            }
+        },
+        getStreamMessageId() {
+            return stream?.messageId;
         },
         waitForIdle() {
             return tail;

@@ -707,6 +707,8 @@ export function createTelegramAssistantOutputBindingRuntime<
   prepareTelegramPreview?: () =>
     Activity.TelegramAssistantOutputPreparation | undefined;
   enqueue?: Activity.TelegramActivityPublicationRuntime["enqueue"];
+  /** Stream mode renders live assistant text in its own single message; intermediate segment sends stay silent. */
+  isStreamMode?: () => boolean;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }): TelegramAssistantOutputBindingRuntime<TTransportStamp> {
   const authority = Routing.createTelegramAssistantOutputAuthorityRuntime(
@@ -722,6 +724,9 @@ export function createTelegramAssistantOutputBindingRuntime<
     prepareSend: (event) =>
       event.source === "telegram" ? deps.prepareTelegramPreview?.() : undefined,
     async send(event, authority, isAuthorityActive) {
+      // Stream mode already carries the live text in the single stream
+      // message; admitted-intermediate bookkeeping stays recorded for dedup.
+      if (deps.isStreamMode?.()) return;
       await deps.waitForActivityIdle?.();
       if (!isAuthorityActive()) return;
       await sendOutput(event, authority, isAuthorityActive);
@@ -1367,6 +1372,26 @@ interface TelegramLifecycleBindingDeps {
   onSessionSettled?: (ctx: Pi.ExtensionContext) => void;
 }
 
+export interface TelegramPreviewStreamClearDeps {
+  clearPreview: (
+    chatId: number,
+    options?: Preview.TelegramPreviewTargetOptions,
+  ) => Promise<void>;
+  clearStreamMessage: () => Promise<void>;
+}
+
+/** Composes the preview clear seam with stream-message retirement into one callable. */
+export function createTelegramPreviewStreamClearRuntime(
+  deps: TelegramPreviewStreamClearDeps,
+): { clear: TelegramPreviewStreamClearDeps["clearPreview"] } {
+  return {
+    clear: async function clearPreviewAndStream(chatId, options) {
+      await deps.clearPreview(chatId, options);
+      await deps.clearStreamMessage();
+    },
+  };
+}
+
 export function registerTelegramLifecycleRuntimeHooks({
   pi,
   publicationRuntime,
@@ -1634,8 +1659,10 @@ export function registerTelegramLifecycleRuntimeHooks({
       };
     },
     preparePreviewDelivery,
-    preparePreviewClear: previewRuntime.prepareClear,
-    clearPreview: previewRuntime.clear,
+    clearPreview: async (chatId, options) => {
+      await previewRuntime.clear(chatId, options);
+      await activityVerbosityRuntime?.clearStreamMessage();
+    },
     setPreviewPendingText: previewRuntime.setPendingText,
     finalizeMarkdownPreview,
     sendMarkdownReply,

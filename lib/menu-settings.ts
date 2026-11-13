@@ -287,6 +287,7 @@ export function buildActivityVerbositySettingsText(
     "<code>-</code> <code>thinking</code>: show persistent collapsed thinking.",
     "<code>-</code> <code>tools</code>: show persistent Rich tool details.",
     "<code>-</code> <code>verbose</code> (default): show both thinking and tools.",
+    "<code>-</code> <code>stream</code>: one live message per turn; thinking and tools quoted above the answer, final answer printed clean.",
   ].join("\n");
 }
 
@@ -543,6 +544,7 @@ export function buildActivityVerbositySettingsReplyMarkup(
       [button("quiet")],
       [button("thinking"), button("tools")],
       [button("verbose")],
+      [button("stream")],
     ],
   };
 }
@@ -874,7 +876,8 @@ export async function handleTelegramSettingsMenuCallbackAction(
       verbosity === "quiet" ||
       verbosity === "thinking" ||
       verbosity === "tools" ||
-      verbosity === "verbose"
+      verbosity === "verbose" ||
+      verbosity === "stream"
     ) {
       await deps.setActivityVerbosity(verbosity);
       await updateActivityVerbositySettingsMessage(deps);
