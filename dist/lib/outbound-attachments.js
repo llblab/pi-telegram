@@ -296,7 +296,7 @@ export function registerTelegramOutboundAttachmentTool(pi, deps) {
     pi.registerTool({
         name: "telegram_attach",
         label: "Telegram Attach",
-        description: "Queue one or more local files for the active Telegram reply, or send them immediately to Telegram when no Telegram turn is active.",
+        description: "Queue one or more local files for the active Telegram reply, or send them immediately to Telegram when no Telegram turn is active. Explicit chat_id/thread_id are rejected during an active turn; omit them only to attach to the current reply.",
         promptSnippet: TELEGRAM_ATTACH_PROMPT_SNIPPET,
         promptGuidelines: [...TELEGRAM_ATTACH_PROMPT_GUIDELINES],
         parameters: Type.Object({
@@ -417,6 +417,9 @@ export async function queueTelegramOutboundAttachments(options) {
             canSendDirect: options.canSendDirect,
             statPath: options.statPath,
         });
+    }
+    if (options.chatId !== undefined || options.threadId !== undefined) {
+        throw new Error("telegram_attach cannot use chat_id or thread_id during an active Telegram turn. No files were queued or sent; omit both only to attach to the current reply.");
     }
     if (options.activeTurn.guestQueryId &&
         options.activeTurn.queuedAttachments.length + options.paths.length > 1) {

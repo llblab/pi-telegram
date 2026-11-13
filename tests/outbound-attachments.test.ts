@@ -364,6 +364,26 @@ test("Outbound attachment tool registration delegates queueing", async () => {
   assert.deepEqual(result.details.paths, ["/tmp/report.md"]);
 });
 
+test("Outbound attachment tool rejects explicit destinations during an active turn before file or transport access", async () => {
+  let tool: RegisteredAttachmentTool | undefined;
+  const activeTurn = createAttachmentQueueTarget([{ path: "/tmp/retained.txt", fileName: "retained.txt" }]);
+  const before = structuredClone(activeTurn.queuedAttachments);
+  const api = { registerTool: (definition: RegisteredAttachmentTool) => { tool = definition; } } as unknown as ExtensionAPI;
+  registerTelegramOutboundAttachmentTool(api, {
+    getActiveTurn: () => activeTurn,
+    statPath: async () => assert.fail("Explicit active-turn destinations must refuse before file access"),
+    canSendDirect: () => assert.fail("Refusal must not acquire direct delivery authority"),
+    getDefaultTarget: () => assert.fail("Refusal must not substitute a default target"),
+    sendMultipart: async () => assert.fail("Refusal must not send files"),
+  });
+  assert.ok(tool);
+  for (const destination of [{ chat_id: -1007 }, { chat_id: 77 }, { thread_id: 42 }, { chat_id: 77, thread_id: 42 }, { chat_id: 0 }, { thread_id: 0 }]) {
+    await assert.rejects(tool.execute("tool-call", { paths: ["/tmp/a.txt", "/tmp/b.txt"], ...destination }),
+      /chat_id.*thread_id.*active Telegram turn/);
+    assert.deepEqual(activeTurn.queuedAttachments, before);
+  }
+});
+
 test("Outbound attachment tool sends immediately when no Telegram turn is active", async () => {
   let tool: RegisteredAttachmentTool | undefined;
   const sent: string[] = [];

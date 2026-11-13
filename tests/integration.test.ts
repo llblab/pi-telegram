@@ -9626,8 +9626,19 @@ test(`Production shutdown awaits native button I/O without retiring a successor 
   assert.equal(result.code, 0, result.stderr || result.stdout);
 }, 30000);
 
-for (const settlement of ["tool-success", "manual-compaction", "auto-threshold", "auto-overflow", "public-reload", "public-reload-held", "public-reload-inbound"] as const) test(`Real Pi SDK ${settlement === "public-reload-inbound" ? "reload fences an outstanding inbound source" : settlement === "public-reload-held" ? "reload fences issued SDK publication after logical invalidation" : settlement === "public-reload" ? "reload disposes waiting custody without replay" : "preserves one injection per queued input through a held tool and status"} (${settlement})`, async () => {
+for (const settlement of ["tool-success", "manual-compaction", "manual-compaction-observer-timeout", "auto-threshold", "auto-overflow", "auto-overflow-observer-timeout", "public-reload", "public-reload-held", "public-reload-inbound"] as const) test(`Real Pi SDK ${settlement === "public-reload-inbound" ? "reload fences an outstanding inbound source" : settlement === "public-reload-held" ? "reload fences issued SDK publication after logical invalidation" : settlement === "public-reload" ? "reload disposes waiting custody without replay" : "preserves one injection per queued input through a held tool and status"} (${settlement})`, async t => {
   const reloadCase = settlement.startsWith("public-reload"), heldPublication = settlement === "public-reload-held", heldInbound = settlement === "public-reload-inbound";
+  const observerTimeout = settlement.endsWith("observer-timeout");
+  let captureObserverTimer = false, observerTimers = 0, observerTimeouts = 0;
+  let expireObserver: (() => void) | undefined;
+  if (observerTimeout) t.mock.method(globalThis, "setTimeout", (...args: Parameters<typeof setTimeout>) => {
+    const timer = nativeSetTimeout(...args);
+    if (captureObserverTimer && args[1] === 300_000) {
+      observerTimers++;
+      expireObserver = () => { clearTimeout(timer); args[0](); };
+    }
+    return timer;
+  });
   const { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } = await import("@earendil-works/pi-coding-agent");
   const { fauxProvider, fauxAssistantMessage, fauxToolCall, Type } = await import("@earendil-works/pi-ai");
   await ensureRuntimeAgentDir();
@@ -9719,7 +9730,7 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
     modelRuntime.registerNativeProvider(faux.provider);
     faux.setResponses([() => fauxAssistantMessage(fauxToolCall("telegram_message", { text: 'Fixture button\n<!-- telegram_button {▶️ Queued fixture|button fixture} -->' }), { stopReason: "toolUse" }),
       () => fauxAssistantMessage("Fixture button prepared"), () => fauxAssistantMessage(fauxToolCall("hold_fixture", {}, { id: "held-tool" }), { stopReason: "toolUse" }),
-      ...(settlement === "auto-overflow" ? [() => { const response = fauxAssistantMessage("", { stopReason: "error", errorMessage: "context_length_exceeded" }); sdkPhase("provider:overflow"); return response; }] : []),
+      ...(settlement.startsWith("auto-overflow") ? [() => { const response = fauxAssistantMessage("", { stopReason: "error", errorMessage: "context_length_exceeded" }); sdkPhase("provider:overflow"); return response; }] : []),
       ...Array.from({ length: 8 }, () => () => fauxAssistantMessage("Fixture finished"))]);
     const settings = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 1,
       reserveTokens: settlement === "auto-threshold" ? 4000 : 128 }, retry: { enabled: false } });
@@ -9787,13 +9798,37 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
           if (birth === 1) afterOldShutdown = inspectOriginalQueue();
           reloadEvents.push(`shutdown-return:${birth}`);
         });
-        pi.on("session_before_compact", async event => {
+        pi.on("session_before_compact", async (event, ctx) => {
           sdkPhase("extension:compaction-enter:" + event.reason);
           compactionReasons.push(event.reason);
+          if (observerTimeout) {
+            assert.equal(observerTimers, 1, "Capture the production observer's unchanged five-minute timer");
+            assert.ok(expireObserver);
+            const sessionId = session!.sessionManager.getSessionId(), beforeDispatch = dispatches.length;
+            const queued = () => inspectOriginalQueue().filter(row => [2, 3, 4].includes(row.updateId));
+            const beforeQueue = queued();
+            assert.deepEqual(beforeQueue.map(row => row.updateId).sort(), [2, 3, 4]);
+            assert.ok(beforeQueue.every(row => row.state === "queued"));
+            assert.equal(session!.isCompacting, true);
+            assert.equal(ctx.isIdle(), false);
+            assert.equal(event.signal.aborted, false);
+            const fire = expireObserver; expireObserver = undefined;
+            fire();
+            await waitForTimeout(1100);
+            assert.equal(session!.isCompacting, true, "Observer expiry cannot finish native compaction");
+            assert.equal(ctx.isIdle(), false, "Native readiness remains authoritative after observer expiry");
+            assert.equal(event.signal.aborted, false, "Observer expiry and queued input cannot abort native compaction");
+            assert.equal(session!.sessionManager.getSessionId(), sessionId, "Observer expiry cannot replace the session");
+            assert.equal(dispatches.length, beforeDispatch, "Deferred dispatch and watchdog must both retain queued input");
+            assert.deepEqual(queued(), beforeQueue, "Observer expiry cannot spend or change original queued receipts");
+            const logs = await readFile(Paths.resolveTelegramRuntimeLogPath(dir), "utf8");
+            assert.ok(logs.includes("Compaction observer timed out"), "The actual Root observer, not a supplied event, expired");
+            observerTimeouts++;
+          }
           if (settlement.startsWith("auto-")) {
             session!.setAutoCompactionEnabled(false);
             const beforeCompaction = dispatches.length;
-            await waitForTimeout(1100);
+            if (!observerTimeout) await waitForTimeout(1100);
             assert.equal(dispatches.length, beforeCompaction, "Watchdog cannot inject into actual SDK compaction");
           }
           sdkPhase("extension:compaction-prepared:" + event.reason);
@@ -9917,7 +9952,9 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
       assert.deepEqual(errors, []);
       return;
     }
-    if (settlement === "manual-compaction") {
+    const originalSessionId = session.sessionManager.getSessionId();
+    captureObserverTimer = observerTimeout;
+    if (settlement.startsWith("manual-compaction")) {
       await session.compact();
       assert.equal(compactions, 1, "Actual SDK compaction completes, not a supplied bridge event");
       assert.equal(toolAborts, 1, "Only explicit manual SDK compaction aborts the held tool");
@@ -9943,11 +9980,20 @@ for (const settlement of ["tool-success", "manual-compaction", "auto-threshold",
     catch (error) { throw new Error(JSON.stringify({ dispatches, errors, compactions, compactionReasons, toolAborts }), { cause: error }); }
     await session.waitForIdle(); await waitForTimeout(2200);
     assert.equal(dispatches.length, 4, "One first prompt and exactly three queued inputs, without a redispatch cascade");
-    assert.equal(toolAborts, settlement === "manual-compaction" ? 1 : 0);
+    assert.equal(toolAborts, settlement.startsWith("manual-compaction") ? 1 : 0);
+    if (observerTimeout) {
+      assert.equal(observerTimeouts, 1);
+      assert.equal(session.sessionManager.getSessionId(), originalSessionId);
+      assert.equal(session.sessionManager.getEntries().filter(entry => entry.type === "compaction").length, 1,
+        "Native compaction persists its summary before each queued input is admitted exactly once");
+    }
     for (const text of ["queued fixture A", "queued fixture B", "button fixture"]) {
       assert.equal(dispatches.filter(content => content.includes(text)).length, 1);
       const entries: import("@earendil-works/pi-coding-agent").SessionEntry[] = session.sessionManager.getEntries();
       assert.equal(entries.filter(entry => entry.type === "message" && entry.message.role === "user" && JSON.stringify(entry.message.content).includes(text)).length, 1, "The actual SDK persists each input exactly once");
+      if (observerTimeout) assert.ok(entries.findIndex(entry => entry.type === "compaction") < entries.findIndex(entry =>
+        entry.type === "message" && entry.message.role === "user" && JSON.stringify(entry.message.content).includes(text)),
+      "The native compaction entry precedes each queued input");
     }
     assert.deepEqual(errors, []);
   } finally {
