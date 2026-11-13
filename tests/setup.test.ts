@@ -395,6 +395,7 @@ test("Setup prompt runtime persists the first validated config to missing or emp
             botId: 77,
           },
         },
+        ...(initialFile === undefined ? { threads: { automaticCleanup: false } } : {}),
       });
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -453,6 +454,7 @@ test("Setup prompt runtime persists a first named profile without changing sibli
           botId: 3,
         },
       },
+      threads: { automaticCleanup: false },
     });
   } finally {
     await rm(dir, { recursive: true, force: true });

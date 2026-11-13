@@ -209,7 +209,7 @@ function mergeTelegramConfigDelta(base, desired, latest) {
 }
 function readTelegramConfigForTransaction(configPath) {
     if (!existsSync(configPath))
-        return {};
+        return undefined;
     const parsed = JSON.parse(readFileSync(configPath, "utf8"));
     if (!isPlainConfigRecord(parsed)) {
         throw new Error(`Invalid Telegram config object: ${configPath}`);
@@ -376,7 +376,7 @@ export function createTelegramConfigStore(options = {}) {
             throw new Error("Invalid Telegram pairing admission identity.");
         }
         return withTelegramFileTransaction(`${configPath}.transaction`, () => {
-            const latest = readTelegramConfigForTransaction(configPath);
+            const latest = readTelegramConfigForTransaction(configPath) ?? {};
             const profile = latest.profiles?.[profileName];
             const resolvedToken = typeof profile?.botToken === "string"
                 ? resolveTelegramBotToken(profile.botToken, env)
@@ -519,7 +519,7 @@ export function createTelegramConfigStore(options = {}) {
                 let merged;
                 const publish = () => {
                     merged = withTelegramFileTransaction(`${configPath}.transaction`, () => {
-                        const latest = readTelegramConfigForTransaction(configPath);
+                        const latest = readTelegramConfigForTransaction(configPath) ?? {};
                         const profile = latest.profiles?.[profileKey];
                         if (!botToken || profile?.botToken !== botToken) {
                             throw new Error("Telegram pairing profile is unavailable or changed.");
@@ -578,7 +578,7 @@ export function createTelegramConfigStore(options = {}) {
             }
             config = normalized.changed
                 ? withTelegramFileTransaction(`${configPath}.transaction`, () => {
-                    const latestConfig = readTelegramConfigForTransaction(configPath);
+                    const latestConfig = readTelegramConfigForTransaction(configPath) ?? {};
                     const latestNormalized = normalizeTelegramDefaultProfileConfig(latestConfig);
                     if (latestNormalized.changed) {
                         writeTelegramConfigInTransaction(agentDir, configPath, latestNormalized.config);
@@ -600,8 +600,13 @@ export function createTelegramConfigStore(options = {}) {
                     if (options?.isCurrent && !options.isCurrent()) {
                         throw new Error("Telegram config update lost its originating authority.");
                     }
-                    const latestConfig = readTelegramConfigForTransaction(configPath);
+                    const observedConfig = readTelegramConfigForTransaction(configPath);
+                    const latestConfig = observedConfig ?? {};
                     const merged = mergeTelegramConfigDelta(baseConfig, desiredConfig, latestConfig);
+                    // Only the first publication opts out; legacy files keep their implicit enabled setting.
+                    if (observedConfig === undefined && merged.threads?.automaticCleanup === undefined) {
+                        merged.threads = { ...merged.threads, automaticCleanup: false };
+                    }
                     if (!configValuesEqual(latestConfig, merged)) {
                         writeTelegramConfigInTransaction(agentDir, configPath, merged);
                     }

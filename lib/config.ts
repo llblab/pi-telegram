@@ -219,7 +219,7 @@ export interface TelegramConfig {
   };
   time?: TelegramTimeConfig;
   threads?: {
-    /** Delete this instance's bound Telegram thread on graceful Pi quit. */
+    /** Delete this instance's bound Thread on quit; new configs store false, legacy absence retains true. */
     automaticCleanup?: boolean;
     /** Automatic Thread title strategy shared by every profile; absent or invalid resolves to `letters`. */
     displayMode?: TelegramThreadDisplayMode;
@@ -457,8 +457,8 @@ function mergeTelegramConfigDelta(
   return merged;
 }
 
-function readTelegramConfigForTransaction(configPath: string): TelegramConfig {
-  if (!existsSync(configPath)) return {};
+function readTelegramConfigForTransaction(configPath: string): TelegramConfig | undefined {
+  if (!existsSync(configPath)) return undefined;
   const parsed: unknown = JSON.parse(readFileSync(configPath, "utf8"));
   if (!isPlainConfigRecord(parsed)) {
     throw new Error(`Invalid Telegram config object: ${configPath}`);
@@ -688,7 +688,7 @@ export function createTelegramConfigStore(
       throw new Error("Invalid Telegram pairing admission identity.");
     }
     return withTelegramFileTransaction(`${configPath}.transaction`, () => {
-      const latest = readTelegramConfigForTransaction(configPath);
+      const latest = readTelegramConfigForTransaction(configPath) ?? {};
       const profile = latest.profiles?.[profileName];
       const resolvedToken =
         typeof profile?.botToken === "string"
@@ -857,7 +857,7 @@ export function createTelegramConfigStore(
           merged = withTelegramFileTransaction(
             `${configPath}.transaction`,
             () => {
-              const latest = readTelegramConfigForTransaction(configPath);
+              const latest = readTelegramConfigForTransaction(configPath) ?? {};
               const profile = latest.profiles?.[profileKey];
               if (!botToken || profile?.botToken !== botToken) {
                 throw new Error(
@@ -921,7 +921,7 @@ export function createTelegramConfigStore(
       }
       config = normalized.changed
         ? withTelegramFileTransaction(`${configPath}.transaction`, () => {
-            const latestConfig = readTelegramConfigForTransaction(configPath);
+            const latestConfig = readTelegramConfigForTransaction(configPath) ?? {};
             const latestNormalized =
               normalizeTelegramDefaultProfileConfig(latestConfig);
             if (latestNormalized.changed) {
@@ -956,12 +956,17 @@ export function createTelegramConfigStore(
                 "Telegram config update lost its originating authority.",
               );
             }
-            const latestConfig = readTelegramConfigForTransaction(configPath);
+            const observedConfig = readTelegramConfigForTransaction(configPath);
+            const latestConfig = observedConfig ?? {};
             const merged = mergeTelegramConfigDelta(
               baseConfig as Record<string, unknown>,
               desiredConfig as Record<string, unknown>,
               latestConfig as Record<string, unknown>,
             ) as TelegramConfig;
+            // Only the first publication opts out; legacy files keep their implicit enabled setting.
+            if (observedConfig === undefined && merged.threads?.automaticCleanup === undefined) {
+              merged.threads = { ...merged.threads, automaticCleanup: false };
+            }
             if (!configValuesEqual(latestConfig, merged)) {
               writeTelegramConfigInTransaction(agentDir, configPath, merged);
             }

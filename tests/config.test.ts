@@ -620,6 +620,7 @@ test("Telegram config store persists active named profile configuration without 
 
   assert.deepEqual(await readTelegramConfig(configPath), {
     voice: { replyMode: "mirror" },
+    threads: { automaticCleanup: false },
     profiles: {
       default: {
         botToken: "default-token",
@@ -798,6 +799,7 @@ test("Telegram voice reply mode setter persists telegram.json", async () => {
   assert.deepEqual(await readTelegramConfig(configPath), {
     profiles: { default: { botToken: "123:abc" } },
     voice: { replyMode: "mirror" },
+    threads: { automaticCleanup: false },
   });
 
   await setMode("manual");
@@ -805,6 +807,7 @@ test("Telegram voice reply mode setter persists telegram.json", async () => {
   assert.equal(store.get().voice, undefined);
   assert.deepEqual(await readTelegramConfig(configPath), {
     profiles: { default: { botToken: "123:abc" } },
+    threads: { automaticCleanup: false },
   });
 });
 
@@ -862,6 +865,66 @@ test("Telegram settings setters reload before scoped writes to preserve shared c
   assert.equal(controls.getActivityVerbosity(), "verbose");
   assert.equal(controls.isAutomaticThreadCleanupEnabled(), false);
   assert.deepEqual(secondStore.get().voice, { replyMode: "mirror" });
+});
+
+test("First config publication opts out of Thread cleanup while existing files retain their defaults", async () => {
+  const profile = { profiles: { default: { botToken: "123:abc" } } };
+  const cases: Array<{ existing: boolean; config: TelegramConfig; expected: boolean }> = [
+    { existing: false, config: {}, expected: false },
+    { existing: false, config: profile, expected: false },
+    { existing: false, config: { ...profile, threads: { displayMode: "names" } }, expected: false },
+    { existing: false, config: { ...profile, threads: { automaticCleanup: true } }, expected: true },
+    { existing: false, config: { ...profile, threads: { automaticCleanup: false } }, expected: false },
+    { existing: true, config: {}, expected: true },
+    { existing: true, config: profile, expected: true },
+    { existing: true, config: { ...profile, threads: { displayMode: "names" } }, expected: true },
+    { existing: true, config: { ...profile, threads: { automaticCleanup: true } }, expected: true },
+    { existing: true, config: { ...profile, threads: { automaticCleanup: false } }, expected: false },
+  ];
+  for (const { existing, config, expected } of cases) {
+    const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-cleanup-default-"));
+    const configPath = join(agentDir, "telegram.json");
+    try {
+      if (existing) await writeTelegramConfig(agentDir, configPath, config);
+      const before = existing ? await readFile(configPath, "utf8") : undefined;
+      const store = createTelegramConfigStore({ agentDir, configPath });
+      await store.load();
+      if (!existing) {
+        store.set(config);
+        for (const [name, fields] of Object.entries(config.profiles ?? {})) store.setProfile(name, fields);
+      }
+      await store.persist();
+      assert.equal(createTelegramConfigControls(store).isAutomaticThreadCleanupEnabled(), expected);
+      const saved = await readTelegramConfig(configPath);
+      assert.deepEqual(saved, existing ? config : {
+        ...config, threads: { ...config.threads, automaticCleanup: config.threads?.automaticCleanup ?? false },
+      });
+      if (existing) assert.equal(await readFile(configPath, "utf8"), before, "Legacy observation must not migrate the default");
+      const reopened = createTelegramConfigStore({ agentDir, configPath });
+      await reopened.load();
+      assert.equal(createTelegramConfigControls(reopened).isAutomaticThreadCleanupEnabled(), expected);
+    } finally { await rm(agentDir, { recursive: true, force: true }); }
+  }
+});
+
+test("A stale first-install writer does not overwrite another publisher's cleanup policy", async () => {
+  for (const cleanup of [undefined, true, false]) {
+    const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-cleanup-first-writer-"));
+    const configPath = join(agentDir, "telegram.json");
+    try {
+      const stale = createTelegramConfigStore({ agentDir, configPath });
+      await stale.load();
+      const published: TelegramConfig = { profiles: { default: { botToken: "123:owner" } },
+        ...(cleanup === undefined ? {} : { threads: { automaticCleanup: cleanup } }) };
+      await writeTelegramConfig(agentDir, configPath, published);
+      stale.setProfile("work", { botToken: "456:work" });
+      await stale.persist();
+      assert.equal(createTelegramConfigControls(stale).isAutomaticThreadCleanupEnabled(), cleanup ?? true);
+      assert.deepEqual(await readTelegramConfig(configPath), {
+        ...published, profiles: { ...published.profiles, work: { botToken: "456:work" } },
+      });
+    } finally { await rm(agentDir, { recursive: true, force: true }); }
+  }
 });
 
 test("Thread cleanup fails closed after invalid shared config recovery", async () => {
@@ -989,6 +1052,7 @@ test("Telegram settings menu callbacks persist voice and time settings to telegr
     profiles: { default: { botToken: "123:abc" } },
     assistant: { draftPreviews: true, timeInjection: "always" },
     voice: { replyMode: "mirror" },
+    threads: { automaticCleanup: false },
   });
 });
 
@@ -1015,6 +1079,7 @@ test("Telegram time injection mode setter persists telegram.json", async () => {
     profiles: { default: { botToken: "123:abc" } },
     assistant: { timeInjection: "interval" },
     time: { interval: 5000, injectionMode: "always" },
+    threads: { automaticCleanup: false },
   });
 
   await setMode("hidden");
@@ -1024,6 +1089,7 @@ test("Telegram time injection mode setter persists telegram.json", async () => {
     profiles: { default: { botToken: "123:abc" } },
     assistant: { timeInjection: "hidden" },
     time: { interval: 5000, injectionMode: "always" },
+    threads: { automaticCleanup: false },
   });
 });
 
@@ -1067,6 +1133,7 @@ test("Telegram config store owns load, mutation, and persistence", async () => {
     profiles: {
       default: { botToken: "initial", allowedUserId: 43 },
     },
+    threads: { automaticCleanup: false },
   });
   store.set({ botToken: "next" });
   assert.deepEqual(store.get(), {
@@ -1082,6 +1149,7 @@ test("Telegram config store owns load, mutation, and persistence", async () => {
     },
     botToken: "initial",
     allowedUserId: 43,
+    threads: { automaticCleanup: false },
   });
 });
 
@@ -1948,6 +2016,7 @@ test("Token references persist and reload per named profile without copying secr
         default: { botToken: "$DEFAULT_BOT_TOKEN" },
         work: { botToken: "${WORK_BOT_TOKEN}" },
       },
+      threads: { automaticCleanup: false },
     });
   } finally {
     await rm(agentDir, { recursive: true, force: true });

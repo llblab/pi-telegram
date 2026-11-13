@@ -72,7 +72,7 @@ export interface TelegramConfig {
     };
     time?: TelegramTimeConfig;
     threads?: {
-        /** Delete this instance's bound Telegram thread on graceful Pi quit. */
+        /** Delete this instance's bound Thread on quit; new configs store false, legacy absence retains true. */
         automaticCleanup?: boolean;
         /** Automatic Thread title strategy shared by every profile; absent or invalid resolves to `letters`. */
         displayMode?: TelegramThreadDisplayMode;
