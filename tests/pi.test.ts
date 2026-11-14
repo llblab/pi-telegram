@@ -415,6 +415,53 @@ test("Pi settings first use retains the installed SDK and source/compiled persis
   assert.match(result.stdout, /pi-native-settings-persistence-pass/);
 });
 
+test("Managed compiled entrypoint supplies loader-mapped settings without local host peers", { timeout: 30000 }, async () => {
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { cp, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+    import { createRequire } from "node:module";
+    import { join } from "node:path";
+    import { pathToFileURL, fileURLToPath } from "node:url";
+    import { tmpdir } from "node:os";
+    const host = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const { createJiti } = await import(pathToFileURL(createRequire(host).resolve("jiti")).href);
+    const dir = await mkdtemp(join(tmpdir(), "pt-managed-settings-"));
+    process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
+    await mkdir(process.env.PI_CODING_AGENT_DIR);
+    try {
+      const root = join(dir, "package");
+      await cp("./dist", root, { recursive: true });
+      const adapter = await import(pathToFileURL(join(root, "lib/pi.js")).href);
+      await assert.rejects(adapter.createSettingsManager(dir), { code: "ERR_MODULE_NOT_FOUND" });
+      // Isolate the bootstrap port, not a second runtime: actual entrypoint, SDK boundary and adapter stay intact.
+      await writeFile(join(root, "lib/extension.js"), "export default (pi, settings) => { pi.settings = settings; };\\n");
+      const jiti = createJiti(import.meta.url, { moduleCache: false, alias: {
+        "@earendil-works/pi-coding-agent": fileURLToPath(host),
+        "@sinclair/typebox": fileURLToPath(import.meta.resolve("@sinclair/typebox")),
+      } });
+      const extension = await jiti.import(join(root, "pi-telegram/index.js"), { default: true });
+      const ports = {};
+      extension(ports);
+      assert.equal(typeof ports.settings, "function", "The installed entrypoint must supply the host factory");
+      console.log("pi-managed-settings-ready");
+      const first = await ports.settings(dir);
+      first.setEnabledModels(["openai/managed-settings-probe"]);
+      await first.flush();
+      const second = await ports.settings(dir);
+      await second.reload();
+      assert.deepEqual(second.getEnabledModels(), ["openai/managed-settings-probe"]);
+      second.setEnabledModels(undefined);
+      await second.flush();
+      await first.reload();
+      assert.equal(first.getEnabledModels(), undefined);
+      console.log("pi-managed-settings-persistence-pass");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  `, { timeoutMs: 12000, readiness: { stdoutPrefix: "pi-managed-settings-ready", startupTimeoutMs: 15000 } });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.equal(result.signal, null);
+  assert.match(result.stdout, /pi-managed-settings-persistence-pass/);
+});
+
 test("Pi settings adapter preserves legacy and generic host capabilities", async () => {
   const legacyEvents: string[] = [];
   const legacy = normalizeSettingsManager({

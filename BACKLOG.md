@@ -6,6 +6,12 @@ _This file owns unresolved project work only. Completed behavior belongs in `CHA
 
 - [ ] **TOOL-NAMES — Make channel-post operations explicit.** Migrate `telegram_channel_post` → `telegram_channel_post_update` (keep `action: edit | delete`) and `telegram_channel_posts` → `telegram_channel_post_list`. Preserve `telegram_attach`, `telegram_message` and `telegram_bind` as reduced domain–verb names. Advertise canonical names with a compatible legacy-call path; update Skills, injected descriptions, docs, examples, tests and packaged output. Acceptance: channel-post/registration tests prove canonical/legacy parity, unchanged operation/mutation identity and unknown-outcome refusal, without replaying destructive calls or duplicating publication. Listing remains local retained records, not Telegram channel history. This task grants no live posting, reload or release authority.
 
+## Reported Threaded Mode runtime follow-up
+
+- [ ] Attribute the follower no-reply report at `Workspace snapshot lost captured publication authority` using correlated source, recipient, profile/epoch and actual worker evidence. Agent `settled-failure` is not a source-removal ACK; inspect effective snapshot-plus-segment journal state before claiming a stuck pending source or replay risk.
+- [ ] Localize repeated thirty-second follower typing timeouts across IPC, leader execution and Bot API transport before selecting retry/backoff changes. `transportMs` covers the post-registration RPC interval, not HTTPS alone; retain best-effort typing and independent Thread requests.
+- [ ] Attribute a missed disabled-to-enabled capability transition through the existing monitor's ownership, lifecycle and probe/transition outcomes. Automatic promotion is supported; open TLS sockets do not prove monitor progress, and reconnect-only documentation must not replace diagnosis.
+
 ## Slow-compaction session replacement attribution
 
 Outcome: attribute the reported session replacement during unfinished native compaction before selecting any runtime correction or new timeout setting.

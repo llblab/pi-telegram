@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.59.2: Managed Host Settings Hotfix
+
+- `Host compatibility`: Restores `/start` and model settings for managed npm/git installations without local Pi peers by supplying the loader-mapped host SettingsManager at the package entrypoint. Cold domain imports remain SDK-lazy; no duplicate host dependency or private loader path is introduced. Addresses #380's blocking settings-import defect; its separate Threaded Mode observations remain under investigation.
+
 ## 0.59.1: Explicit Attachment Targets
 
 - `Attachments`: Rejects explicit `chat_id` or `thread_id` during an active Telegram turn before reading files or changing its attachment queue, instead of silently attaching to the current reply. Untargeted current-turn attachments and immediate delivery outside a Telegram turn remain unchanged.
