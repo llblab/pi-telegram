@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.59.1: Explicit Attachment Targets
+
+- `Attachments`: Rejects explicit `chat_id` or `thread_id` during an active Telegram turn before reading files or changing its attachment queue, instead of silently attaching to the current reply. Untargeted current-turn attachments and immediate delivery outside a Telegram turn remain unchanged.
+- `Compaction checks`: Adds native SDK regressions for observer expiry during manual and automatic overflow compaction, preserving queued receipts and the session until native completion, then admitting each input once. Local SDK 1.0.0 and 1.3.0 checks do not reproduce the reported historical reset; the five-minute timeout and runtime policy remain unchanged.
+
 ## 0.59.0: Composable Interactions And Fenced Recovery
 
 - `Interactions`: Adds producer-requested `openTelegramConfirm()` and document delivery through `sendTelegramArtifact()`. Original direct/follower bindings, descriptor-captured bytes and typed receipts keep approval and uncertain publication separate; producers retain business execution and cancellation authority. Collector Cancel stays neutral until pressed, then turns red. No accepting Input/Attachment collector or universal dialog factory is added.
