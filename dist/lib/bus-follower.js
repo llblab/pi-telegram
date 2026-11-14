@@ -322,7 +322,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler(deps) {
         const captured = deps.getContextAuthority(ctx);
         if (!captured)
             throw new Error("Stale Telegram follower Restore context.");
-        const snapshotStore = deps.topicTargetStore, liveSnapshot = snapshotStore.withWorkspaceLiveRebindSnapshot, restoreSnapshot = snapshotStore.withWorkspaceRestoreSnapshot;
+        const snapshotStore = deps.topicTargetStore, liveSnapshot = snapshotStore.withWorkspaceLiveRebindSnapshot, observeSnapshot = snapshotStore.observeWorkspaceSnapshot, restoreSnapshot = snapshotStore.withWorkspaceRestoreSnapshot;
         const authority = structuredClone(captured);
         const request = structuredClone({
             operationId: input.operationId,
@@ -365,6 +365,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler(deps) {
         const assertCurrent = () => {
             if (!isDeepStrictEqual(deps.getContextAuthority(ctx), authority) ||
                 deps.topicTargetStore !== snapshotStore ||
+                snapshotStore.observeWorkspaceSnapshot !== observeSnapshot ||
                 (liveCurrent
                     ? snapshotStore.withWorkspaceLiveRebindSnapshot !== liveSnapshot
                     : snapshotStore.withWorkspaceRestoreSnapshot !== restoreSnapshot) ||
@@ -483,7 +484,11 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler(deps) {
                 if ("kind" in expected) {
                     if (!liveSnapshot)
                         throw new Error("Live-rebind read-only Workspace snapshot is unavailable.");
-                    liveSnapshot.call(snapshotStore, expected, observer);
+                    const sample = () => liveSnapshot.call(snapshotStore, expected, observer);
+                    if (observeSnapshot)
+                        observeSnapshot.call(snapshotStore, sample);
+                    else
+                        sample();
                 }
                 else
                     restoreSnapshot.call(snapshotStore, expected, observer);
@@ -538,7 +543,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler(deps) {
         /** Capture availability only; asserting current recipient requires canonical released/local-applied ownership. */
         prepareLiveCommandRecipient(input, ctx) {
             const expected = structuredClone(input), getAuthority = deps.getContextAuthority, read = deps.readLiveRebindIntent, store = deps.topicTargetStore;
-            const snapshot = store.withWorkspaceLiveRebindSnapshot, state = deps.registrationState;
+            const snapshot = store.withWorkspaceLiveRebindSnapshot, observeSnapshot = store.observeWorkspaceSnapshot, state = deps.registrationState;
             const statePorts = {
                 getTarget: state.getTarget,
                 getSlot: state.getSlot,
@@ -579,6 +584,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler(deps) {
                 deps.readLiveRebindIntent === read &&
                 deps.topicTargetStore === store &&
                 store.withWorkspaceLiveRebindSnapshot === snapshot &&
+                store.observeWorkspaceSnapshot === observeSnapshot &&
                 deps.registrationState === state &&
                 Object.entries(statePorts).every(([key, value]) => Reflect.get(state, key) === value);
             const isCurrent = () => {
@@ -639,7 +645,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler(deps) {
                         throw new Error("Selected command recipient has no exact released intent.");
                     const intent = structuredClone(value);
                     let confirmed = false;
-                    snapshot.call(store, intent, (canonical) => {
+                    const inspect = () => snapshot.call(store, intent, (canonical) => {
                         if (!isCurrent() ||
                             !isDeepStrictEqual(read.call(deps, expected.operationId, authority.profileBindingKey), intent))
                             return;
@@ -667,6 +673,10 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler(deps) {
                                 isCurrent() &&
                                 isDeepStrictEqual(read.call(deps, expected.operationId, authority.profileBindingKey), intent);
                     });
+                    if (observeSnapshot)
+                        observeSnapshot.call(store, inspect);
+                    else
+                        inspect();
                     if (!confirmed || !isCurrent())
                         throw new Error("Selected command canonical/local recipient changed.");
                 },

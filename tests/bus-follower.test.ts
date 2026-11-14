@@ -43,7 +43,7 @@ test("Artifact follower ACK lifetime cannot be refreshed by equal generation or 
   state.setRegistered(true, target, { generation: "same" }); assert.equal(state.captureArtifactRegistration!(), undefined, "Rebind/rename without a genuine incarnation ACK leaves Artifact unavailable");
 });
 
-for (const fault of ["current", "target-copy", "scope-copy", "no-owner", "no-snapshot", "capability", "invalid-target", "wrong-session", "group", "late-context", "late-operator", "late-epoch", "late-generation", "late-slot", "late-target", "context-port", "reader-port", "snapshot-port", "registration-port", "local-target", "canonical-owner", "canonical-binding", "wrong-source", "wrong-recipient", "readback-loss", "post-snapshot", "post-getter-target"] as const) {
+for (const fault of ["current", "target-copy", "scope-copy", "no-owner", "no-snapshot", "capability", "invalid-target", "wrong-session", "group", "late-context", "late-operator", "late-epoch", "late-generation", "late-slot", "late-target", "context-port", "reader-port", "snapshot-port", "observation-port", "registration-port", "local-target", "canonical-owner", "canonical-binding", "wrong-source", "wrong-recipient", "readback-loss", "post-snapshot", "post-getter-target"] as const) {
   test(`Live status recipient capture is pre-binding availability and fresh independent canonical authority (${fault})`, async () => {
     await fixture(async f => {
       f.request.source.updateIds = [100];
@@ -95,6 +95,7 @@ for (const fault of ["current", "target-copy", "scope-copy", "no-owner", "no-sna
       if (fault === "context-port") deps.getContextAuthority = () => authority();
       if (fault === "reader-port") deps.readLiveRebindIntent = (id, scope) => read(id, scope);
       if (fault === "snapshot-port") store.withWorkspaceLiveRebindSnapshot = (...args) => f.threads.withWorkspaceLiveRebindSnapshot(...args);
+      if (fault === "observation-port") store.observeWorkspaceSnapshot = sample => f.threads.observeWorkspaceSnapshot(sample);
       if (fault === "registration-port") { const get = registration.getTarget; registration.getTarget = () => get(); }
       if (fault === "readback-loss") readerLost = true;
       if (fault === "canonical-owner" || fault === "canonical-binding" || fault === "wrong-source" || fault === "wrong-recipient") {

@@ -2124,6 +2124,32 @@ export function createTelegramTopicTargetStore(options) {
             throw new Error("Workspace publication authority changed.");
         return outcome.result;
     };
+    const observeWorkspaceSnapshot = (observe) => {
+        const path = getPath(), profile = activeProfile();
+        const sample = () => {
+            const inherited = workspaceFrame;
+            if (inherited && !scopeMatches(inherited.path, inherited.profile))
+                throw new Error("Workspace observation scope changed.");
+            if (workspaceIO && !inherited)
+                workspaceFrame = { path, profile, value: workspaceIO.readRaw() };
+            try {
+                const result = observe();
+                if (result !== null && (typeof result === "object" || typeof result === "function") && "then" in result)
+                    throw new Error("Workspace observations must finish synchronously.");
+                if (!scopeMatches(path, profile))
+                    throw new Error("Workspace observation scope changed.");
+                return result;
+            }
+            finally {
+                if (!inherited)
+                    workspaceFrame = undefined;
+            }
+        };
+        // Retain the original reader and its revision history; only physical observation is serialized.
+        return workspaceIO && !workspaceFrame
+            ? withTelegramFileTransaction(join(dirname(path), "runtime", `${basename(path)}.transaction`), sample, { recoverAbandoned: false })
+            : sample();
+    };
     const getRecoveryPath = (path) => consolidated
         ? resolveTelegramWorkspaceProvisionRecoveryPath(path, activeProfile(), "consolidated")
         : resolveTelegramWorkspaceProvisionRecoveryPath(path);
@@ -3012,6 +3038,7 @@ export function createTelegramTopicTargetStore(options) {
             persistQueue = refresh.catch(() => undefined);
             return refresh;
         },
+        observeWorkspaceSnapshot,
         async persist(isCurrent) {
             const committed = await persistSnapshot(undefined, isCurrent);
             if ((workspaceIO || isCurrent) && (!committed || isCurrent?.() === false))

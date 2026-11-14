@@ -772,6 +772,8 @@ export interface TelegramTopicTargetStore {
   refresh?: () => Promise<void>;
   /** Read-only logical storage/profile lifetime; does not forget projections or grant publication. */
   captureReadScope: (expected?: { path: string; profile: string }) => () => boolean;
+  /** Synchronous original-reader observation under the canonical envelope guard; never publication or recovery authority. */
+  observeWorkspaceSnapshot: <T>(observe: () => T) => T;
   /** Optional caller fence supplements, never replaces, captured publication authority. */
   persist: (isCurrent?: () => boolean) => Promise<void>;
   invalidateTarget: (
@@ -3948,6 +3950,29 @@ export function createTelegramTopicTargetStore(
       throw new Error("Workspace publication authority changed.");
     return outcome.result;
   };
+  const observeWorkspaceSnapshot = <T>(observe: () => T): T => {
+    const path = getPath(), profile = activeProfile();
+    const sample = () => {
+      const inherited = workspaceFrame;
+      if (inherited && !scopeMatches(inherited.path, inherited.profile))
+        throw new Error("Workspace observation scope changed.");
+      if (workspaceIO && !inherited)
+        workspaceFrame = { path, profile, value: workspaceIO.readRaw() };
+      try {
+        const result = observe();
+        if (result !== null && (typeof result === "object" || typeof result === "function") && "then" in result)
+          throw new Error("Workspace observations must finish synchronously.");
+        if (!scopeMatches(path, profile)) throw new Error("Workspace observation scope changed.");
+        return result;
+      } finally {
+        if (!inherited) workspaceFrame = undefined;
+      }
+    };
+    // Retain the original reader and its revision history; only physical observation is serialized.
+    return workspaceIO && !workspaceFrame
+      ? withTelegramFileTransaction(join(dirname(path), "runtime", `${basename(path)}.transaction`), sample, { recoverAbandoned: false })
+      : sample();
+  };
   const getRecoveryPath = (path: string) =>
     consolidated
       ? resolveTelegramWorkspaceProvisionRecoveryPath(
@@ -5179,6 +5204,7 @@ export function createTelegramTopicTargetStore(
       persistQueue = refresh.catch(() => undefined);
       return refresh;
     },
+    observeWorkspaceSnapshot,
     async persist(isCurrent) {
       const committed = await persistSnapshot(undefined, isCurrent);
       if ((workspaceIO || isCurrent) && (!committed || isCurrent?.() === false))

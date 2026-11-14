@@ -11942,7 +11942,18 @@ test(`Production separate OS Restore follower separates original ACK from menu p
       return actual;
     } } });
     let originalView: Threads.TelegramWorkspaceRestore | undefined;
-    mock.module(moduleUrl("threads"), { namedExports: { ...ThreadModel, createTelegramWorkspaceRestoreResolver(options: Parameters<typeof ThreadModel.createTelegramWorkspaceRestoreResolver>[0]) {
+    let workspaceObservations = 0, observationDepth = 0, protectedSnapshots = 0;
+    mock.module(moduleUrl("threads"), { namedExports: { ...ThreadModel, createTelegramTopicTargetStore(options: Parameters<typeof ThreadModel.createTelegramTopicTargetStore>[0]) {
+      const store = ThreadModel.createTelegramTopicTargetStore(options), observe = store.observeWorkspaceSnapshot, snapshot = store.withWorkspaceLiveRebindSnapshot;
+      store.observeWorkspaceSnapshot = function <T>(sample: () => T): T {
+        return observe(() => { workspaceObservations++; observationDepth++; try { return sample(); } finally { observationDepth--; } });
+      };
+      store.withWorkspaceLiveRebindSnapshot = (...args: Parameters<typeof snapshot>) => {
+        if (role === "follower") { assert.ok(observationDepth > 0, "Original follower snapshots must retain their canonical observation scope"); protectedSnapshots++; }
+        return snapshot(...args);
+      };
+      return store;
+    }, createTelegramWorkspaceRestoreResolver(options: Parameters<typeof ThreadModel.createTelegramWorkspaceRestoreResolver>[0]) {
       const resolve = ThreadModel.createTelegramWorkspaceRestoreResolver(options);
       return () => { const view = resolve(); if (view) { if (originalView) assert.equal(view, originalView); originalView = view; } return view; };
     } } });
@@ -12096,7 +12107,7 @@ test(`Production separate OS Restore follower separates original ACK from menu p
         originalPending: binding?.journal.read().entries.some(row => row.updateId === 100),
         publicationPending: publication?.hasPending(), publicationUnconfirmed: publication?.hasUnconfirmed(),
         viewRows: originalView && LockModel.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction"), () => originalView!.listLiveRebindings()),
-        registrationPids, menuRequests, menuTrace, deletions, dispatches: dispatches.length, settingsCalls,
+        registrationPids, menuRequests, menuTrace, deletions, dispatches: dispatches.length, settingsCalls, workspaceObservations, protectedSnapshots,
         registered: registry?.list().map(value => ({ instanceId: value.instanceId, sessionId: value.sessionId, pid: value.pid, target: value.target, capabilities: value.protocol?.capabilities })),
         restoreButton: !!button("rerouterestore:"), followerButton: !!button("reroutenew:", 102), notices };
     };
@@ -12137,7 +12148,7 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     sourceAck?: Updates.TelegramDeferredSourceEvidence; preparedSource?: Updates.TelegramDeferredSourceEvidence; journalBindingKey?: string; originalPending?: boolean; publicationPending?: boolean; publicationUnconfirmed?: boolean;
     viewRows?: Threads.TelegramWorkspaceLiveRebindIntent[]; registrationPids?: number[]; menuRequests?: Array<{ instanceId: string; operationId: string }>;
     menuTrace?: Array<{ phase: string; requestId: string; replyRequestId?: string; elapsedMs: number; ok?: boolean; errorCode?: string }>;
-    deletions?: unknown[]; dispatches?: number; settingsCalls?: number; registered?: Array<{ instanceId: string; sessionId: string; pid?: number; target: { chatId: number; threadId?: number }; capabilities?: readonly string[] }>;
+    deletions?: unknown[]; dispatches?: number; settingsCalls?: number; workspaceObservations?: number; protectedSnapshots?: number; registered?: Array<{ instanceId: string; sessionId: string; pid?: number; target: { chatId: number; threadId?: number }; capabilities?: readonly string[] }>;
     restoreButton?: boolean; followerButton?: boolean; notices?: string[]; stopped?: boolean };
   const launch = (role: "leader" | "follower") => launchProductionRootFixture<Stats>(`native-restore-${role}`, `
     import assert from "node:assert/strict";
@@ -12195,6 +12206,7 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     assert.equal(before.menuRequests?.[0]?.instanceId, registered[0]!.instanceId);
     assert.equal(before.menuRequests?.[0]?.operationId, before.viewRows![0]!.request.operationId);
     assert.equal(recipient.settingsCalls, 1); assert.deepEqual(before.deletions, [102]);
+    assert.ok(recipient.workspaceObservations! > 0); assert.ok(recipient.protectedSnapshots! > 0);
     assert.deepEqual(before.menuTrace?.map(row => row.phase), ["server-call"]);
     assert.deepEqual(recipient.menuTrace?.map(row => row.phase), ["client-call"]);
     assert.equal(before.menuTrace![0]!.requestId, recipient.menuTrace![0]!.requestId);

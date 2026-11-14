@@ -6,6 +6,11 @@ _This file owns unresolved project work only. Completed behavior belongs in `CHA
 
 - [ ] **TOOL-NAMES — Make channel-post operations explicit.** Migrate `telegram_channel_post` → `telegram_channel_post_update` (keep `action: edit | delete`) and `telegram_channel_posts` → `telegram_channel_post_list`. Preserve `telegram_attach`, `telegram_message` and `telegram_bind` as reduced domain–verb names. Advertise canonical names with a compatible legacy-call path; update Skills, injected descriptions, docs, examples, tests and packaged output. Acceptance: channel-post/registration tests prove canonical/legacy parity, unchanged operation/mutation identity and unknown-outcome refusal, without replaying destructive calls or duplicating publication. Listing remains local retained records, not Telegram channel history. This task grants no live posting, reload or release authority.
 
+## Hotfix platform failure attribution
+
+- [ ] Attribute the original `5c1180c` macOS headless no-active-lock exit timeout. The original child reached `fixture-ready` but neither session/provider entry nor exit; those records do not locate the import/discovery/lifecycle stall. New public Node module-load and resource-discovery checkpoints preserve the twenty-second cap and original process outcome. A successful changed-head run is not historical attribution or proof of post-readiness handle drain.
+- [ ] Retain the same candidate's macOS integration 2/8 thirty-minute service-cap cancellation separately: individual logs are unavailable, no matching recovery artifact exists, and the last API step remains integration-in-progress. No active case, compiler/body execution or closure is established. Use original bounded progress/service evidence from a justified changed candidate; do not guess a case, enlarge allocation/deadlines or rerun unchanged inputs for green.
+
 ## Reported Threaded Mode runtime follow-up
 
 - [ ] Attribute the follower no-reply report at `Workspace snapshot lost captured publication authority` using correlated source, recipient, profile/epoch and actual worker evidence. Agent `settled-failure` is not a source-removal ACK; inspect effective snapshot-plus-segment journal state before claiming a stuck pending source or replay risk.

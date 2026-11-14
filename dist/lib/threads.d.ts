@@ -520,6 +520,8 @@ export interface TelegramTopicTargetStore {
         path: string;
         profile: string;
     }) => () => boolean;
+    /** Synchronous original-reader observation under the canonical envelope guard; never publication or recovery authority. */
+    observeWorkspaceSnapshot: <T>(observe: () => T) => T;
     /** Optional caller fence supplements, never replaces, captured publication authority. */
     persist: (isCurrent?: () => boolean) => Promise<void>;
     invalidateTarget: (target: TelegramTarget, isCurrent: () => boolean, lastSyncError: string) => Promise<boolean>;

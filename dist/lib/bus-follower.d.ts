@@ -396,7 +396,7 @@ export declare function createTelegramBusFollowerWorkspaceRestoreHandler<TContex
     getContextAuthority: (ctx: TContext) => TelegramBusFollowerRestoreContext | undefined;
     readRestoreIntent: (operationId: string, profileBindingKey: string) => TelegramWorkspaceRestoreIntent | undefined;
     readLiveRebindIntent?: (operationId: string, profileBindingKey: string) => Threads.TelegramWorkspaceLiveRebindIntent | undefined;
-    topicTargetStore: Pick<Threads.TelegramTopicTargetStore, "load" | "withWorkspaceRestoreSnapshot"> & Partial<Pick<Threads.TelegramTopicTargetStore, "withWorkspaceLiveRebindSnapshot">>;
+    topicTargetStore: Pick<Threads.TelegramTopicTargetStore, "load" | "withWorkspaceRestoreSnapshot"> & Partial<Pick<Threads.TelegramTopicTargetStore, "withWorkspaceLiveRebindSnapshot" | "observeWorkspaceSnapshot">>;
     registrationState: Pick<TelegramBusFollowerRegistrationState, "getTarget" | "getSlot" | "getGeneration" | "setRegistered" | "getLeaderProtocol">;
     getWorkspaceAdmission: NonNullable<TelegramBusFollowerWorkspaceAdmissionDeps["getWorkspaceAdmission"]>;
     recordRuntimeEvent?: TelegramBusFollowerWorkspaceAdmissionDeps["recordRuntimeEvent"];

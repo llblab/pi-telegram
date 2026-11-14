@@ -1587,20 +1587,24 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
             if (profileBindingKey !==
                 workspaceAdmissionRuntime.resolve()?.getProfileKey())
                 return undefined;
-            return resolveWorkspaceRestoreStore()
-                ?.list()
-                .find(function (intent) {
-                return intent.request.operationId === operationId;
+            return threadStore.observeWorkspaceSnapshot(function () {
+                return resolveWorkspaceRestoreStore()
+                    ?.list()
+                    .find(function (intent) {
+                    return intent.request.operationId === operationId;
+                });
             });
         },
         readLiveRebindIntent(operationId, profileBindingKey) {
             if (profileBindingKey !==
                 workspaceAdmissionRuntime.resolve()?.getProfileKey())
                 return undefined;
-            return resolveWorkspaceRestoreStore()
-                ?.listLiveRebindings()
-                .find(function (intent) {
-                return intent.request.operationId === operationId;
+            return threadStore.observeWorkspaceSnapshot(function () {
+                return resolveWorkspaceRestoreStore()
+                    ?.listLiveRebindings()
+                    .find(function (intent) {
+                    return intent.request.operationId === operationId;
+                });
             });
         },
         topicTargetStore: threadStore,
