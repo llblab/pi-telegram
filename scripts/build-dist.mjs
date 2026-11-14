@@ -128,7 +128,15 @@ try {
   mkdirSync(join(candidate, "pi-telegram"), { recursive: true });
   writeFileSync(
     join(candidate, "pi-telegram", "index.js"),
-    'export { default } from "../index.js";\n',
+    [
+      'import extension from "../index.js";',
+      'import { SettingsManager } from "../lib/pi-host.js";',
+      'import * as Pi from "../lib/pi.js";',
+      'export default function (pi) {',
+      '  return extension(pi, (cwd) => Pi.createSettingsManager(cwd, SettingsManager));',
+      '}',
+      '',
+    ].join("\n"),
     "utf8",
   );
   normalizeTextFiles(candidate);

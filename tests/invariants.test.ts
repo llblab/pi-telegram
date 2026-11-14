@@ -901,7 +901,7 @@ test("Package exports expose only stable public domains", () => {
   ) as { exports?: Record<string, { types: string; default: string }> };
 
   assert.deepEqual(packageJson.exports, {
-    ".": { types: "./dist/index.d.ts", default: "./dist/index.js" },
+    ".": { types: "./dist/index.d.ts", default: "./dist/pi-telegram/index.js" },
     "./inbound": { types: "./dist/api/inbound.d.ts", default: "./dist/api/inbound.js" },
     "./outbound": { types: "./dist/api/outbound.d.ts", default: "./dist/api/outbound.js" },
     "./delivery": { types: "./dist/api/delivery.d.ts", default: "./dist/api/delivery.js" },
@@ -974,7 +974,10 @@ test("Pi SDK imports stay centralized in the pi adapter and entrypoint-only host
   assert.deepEqual(getImportSpecifiers(hostLeaf), ["@earendil-works/pi-coding-agent"]);
   const hostConsumers = getProjectSourceFiles().filter(file =>
     getImportSpecifiers(file).some(specifier => specifier.endsWith("/pi-host.ts")));
-  assert.deepEqual(hostConsumers, ["index.ts"]);
+  assert.deepEqual(hostConsumers, []);
+  assert.deepEqual(getImportSpecifiers("dist/pi-telegram/index.js"), [
+    "../index.js", "../lib/pi-host.js", "../lib/pi.js",
+  ]);
 });
 
 test("Entrypoint stays free of direct Node runtime imports", () => {

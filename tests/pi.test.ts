@@ -376,6 +376,7 @@ test(`Pi cold Root imports defer the settings SDK until first use (${source ? "s
     const Pi = await import(base + "pi" + suffix);
     assert.equal(Pi.isPiStaleContextError(new Error("stale ctx")), true);
     for (const name of ["outbound", "bindings", "extension"]) await import(base + name + suffix);
+    await import(${JSON.stringify(source ? "./index.ts" : "./dist/index.js")});
     console.log("pi-cold-root-import-ready");
     await assert.rejects(Pi.createSettingsManager("unused-cold-probe"), /Settings SDK import refused by original cold-import probe/);
     console.log("pi-lazy-settings-boundary-pass");

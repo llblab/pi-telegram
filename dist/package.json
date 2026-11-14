@@ -57,7 +57,7 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
+      "default": "./dist/pi-telegram/index.js"
     },
     "./inbound": {
       "types": "./dist/api/inbound.d.ts",
