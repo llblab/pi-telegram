@@ -41,7 +41,7 @@ Keep each fact in one authoritative layer:
 
 ## 3. Repository Topology And Local Skills
 
-- `/index.ts`: Thin source entrypoint re-exporting the default extension. The installed/runtime entrypoint is generated under `/dist/pi-telegram`; after every project change, run `npm run build` before reload, restart, or live verification so Pi does not execute stale compiled output.
+- `/index.ts`: Thin host-loader entrypoint supplying the public SettingsManager export to the default extension without putting SDK value imports in cold domains. The installed/runtime entrypoint is generated under `/dist/pi-telegram`; after every project change, run `npm run build` before reload, restart, or live verification so Pi does not execute stale compiled output.
 - `/lib/extension.ts`: Sole extension composition root.
 - `/api/*.ts`: Stable public package membranes documented in `docs/public-api.md`.
 - `/lib/*.ts`: Flat, cohesive runtime domains; package-private unless re-exported through `/api`.
@@ -66,7 +66,7 @@ Use the relevant local skill before non-trivial work in its domain. Keep skill o
 - During refactoring, add a domain only for demonstrated cross-domain reuse or a concrete dependency-direction/cycle problem. Prefer an existing cohesive owner; a closed helper cluster, independent tests or file length alone is insufficient. An acyclic validator result does not justify a new boundary. Do not atomize cohesive modules or create one-use wrappers merely to shrink `index.ts`.
 - `bindings` owns Pi-facing registration and narrow cross-domain assembly; it may connect established ports but must not absorb routing, rendering, transport, or mutable policy.
 - Agent interaction surfaces are Markdown/HTML declarations compiled through existing outbound button actions. Completed answers become ordinary question/answer JSON prompts without SDK envelopes or transport tags; initial buttons are neutral and color only after a press. Do not add agent Confirm/Choice/Task/Artifact tools, SDK waiters or another interaction registry. Logical completion spends the related callback group before external transport/queue callbacks; TTL is fallback protection, never the primary completion mechanism. Companion SDK result/custody contracts remain separate.
-- `pi` owns direct Pi SDK imports and concrete adapter contracts. Other domains use narrow ports; domains that register Pi hooks/tools/commands consume contracts through that adapter.
+- `pi` owns concrete Pi adapter contracts; the `pi-host` leaf owns the static public SDK value import used only by the package entrypoint. Lower domain imports stay SDK-lazy. Other domains use narrow ports; domains that register Pi hooks/tools/commands consume contracts through that adapter.
 - Do not introduce shared buckets such as `lib/constants.ts`, `lib/types.ts`, `lib/globals.ts`, or broad global-augmentation modules. Keep state, constants, registry keys, and concrete transport shapes with their domain owner.
 - Every source `.ts` file starts with a brief responsibility header containing `Zones:` tags such as `telegram`, `pi agent`, `tui`, or `shared utils`.
 - Use namespace imports for local domains in `lib/extension.ts` (`Queue.*`, `Turns.*`) and keep direct `node:*`, filesystem, process, and local-adapter mechanics in owning domains when one exists.

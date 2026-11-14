@@ -1,6 +1,7 @@
 /**
  * Telegram package entrypoint
  * Zones: telegram, pi agent, public API
- * Re-exports the extension composition root without owning runtime wiring.
+ * Anchors host-loader SDK mapping without adding SDK values to cold domains.
  */
-export { default } from "./lib/extension.ts";
+import * as Pi from "./lib/pi.ts";
+export default function (pi: Pi.ExtensionAPI): void;

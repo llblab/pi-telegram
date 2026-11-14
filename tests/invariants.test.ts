@@ -957,9 +957,10 @@ test("Project source avoids empty interface-extension shells", () => {
   assert.deepEqual(emptyInterfaceExtensions, []);
 });
 
-test("Pi SDK imports stay centralized in the pi adapter", () => {
+test("Pi SDK imports stay centralized in the pi adapter and entrypoint-only host leaf", () => {
+  const hostLeaf = normalize(join("lib", "pi-host.ts"));
   const directSdkImportFiles = getProjectSourceFiles().filter((file) => {
-    if (file === normalize(join("lib", "pi.ts"))) return false;
+    if (file === normalize(join("lib", "pi.ts")) || file === hostLeaf) return false;
     const source = readFileSync(join(PROJECT_ROOT, file), "utf8");
     const piSdkPackages = [
       "@mariozechner/pi-coding-agent",
@@ -970,6 +971,10 @@ test("Pi SDK imports stay centralized in the pi adapter", () => {
     return piSdkPackages.some((packageName) => source.includes(packageName));
   });
   assert.deepEqual(directSdkImportFiles, []);
+  assert.deepEqual(getImportSpecifiers(hostLeaf), ["@earendil-works/pi-coding-agent"]);
+  const hostConsumers = getProjectSourceFiles().filter(file =>
+    getImportSpecifiers(file).some(specifier => specifier.endsWith("/pi-host.ts")));
+  assert.deepEqual(hostConsumers, ["index.ts"]);
 });
 
 test("Entrypoint stays free of direct Node runtime imports", () => {

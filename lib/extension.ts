@@ -1,7 +1,7 @@
 /**
  * Telegram bridge extension composition and orchestration layer
  * Zones: telegram, pi agent, orchestration
- * Keeps runtime wiring in one place while the package entrypoint remains a thin re-export
+ * Keeps runtime wiring in one place while the package entrypoint supplies loader-mapped host settings
  */
 
 import * as AgentMessages from "./agent-messages.ts";
@@ -91,7 +91,10 @@ const telegramBusProtocolIdentity =
 
 // --- Extension Runtime ---
 
-export default function (pi: Pi.ExtensionAPI) {
+export default function (
+  pi: Pi.ExtensionAPI,
+  createSettingsManager: typeof Pi.createSettingsManager = Pi.createSettingsManager,
+) {
   Skills.registerTelegramSkillDiscovery(pi);
   const piRuntime = Pi.createExtensionApiRuntimePorts(pi);
   const {
@@ -1206,7 +1209,7 @@ export default function (pi: Pi.ExtensionAPI) {
     });
   const getQueueMenuState = Menu.createTelegramModelMenuStateBuilder({
     runtime: modelMenuRuntime,
-    createSettingsManager: Pi.createSettingsManager,
+    createSettingsManager,
     getActiveModel: currentModelRuntime.get,
   });
   const menuActionPorts = {
@@ -1720,7 +1723,7 @@ export default function (pi: Pi.ExtensionAPI) {
     getThinkingLevel,
     setThinkingLevel,
     persistScopedModelPatterns: Pi.createScopedModelPatternPersister({
-      createSettingsManager: Pi.createSettingsManager,
+      createSettingsManager,
       clearCachedModelMenuInputs: modelMenuRuntime.clearCachedInputs,
     }),
     setModel,
