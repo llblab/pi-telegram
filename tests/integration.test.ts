@@ -12096,13 +12096,21 @@ test(`Production separate OS Restore follower separates original ACK from menu p
       }
       return undefined;
     };
-    const stats = () => {
+    const completion = () => {
       const acknowledgement = originalPlan?.inspectCompletion();
       if (acknowledgement) {
         assert.deepEqual(acknowledgement, originalPlan!.source);
         assert.deepEqual(acknowledgement, { ...sourceDigest, journalBindingKey: sourceBinding });
       }
-      return { pid: process.pid, lockState, polls, creations, menus, menuReturned, sourceRemovals, sourceBinding, sourceDigest,
+      return acknowledgement;
+    };
+    let statsCalls = 0;
+    const progress = () => ({ pid: process.pid, menus, menuReturned, sourceRemovals, sourceAck: completion(),
+      publicationPending: publication?.hasPending(), restoreButton: !!button("rerouterestore:"), followerButton: !!button("reroutenew:", 102) });
+    const stats = () => {
+      statsCalls++;
+      const acknowledgement = completion();
+      return { pid: process.pid, lockState, polls, creations, menus, menuReturned, sourceRemovals, sourceBinding, sourceDigest, statsCalls,
         durableCompletion, sourceAck: acknowledgement, preparedSource: originalPlan?.source, journalBindingKey: binding?.recoveryKey,
         originalPending: binding?.journal.read().entries.some(row => row.updateId === 100),
         publicationPending: publication?.hasPending(), publicationUnconfirmed: publication?.hasUnconfirmed(),
@@ -12120,6 +12128,7 @@ test(`Production separate OS Restore follower separates original ACK from menu p
         submit({ update_id: command === "restore" ? 101 : 102, callback_query: { id: command, from: { id: 77, is_bot: false }, data: row.data,
           message: { message_id: row.messageId, date: 1, chat: { id: 77, type: "private" }, message_thread_id: row.threadId } } });
       } else if (command === "release") releaseMenu();
+      else if (command === "progress") return progress();
       else if (command === "diagnostics") return { ...stats(), logs: await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8").catch(() => "missing") };
       else if (command === "stop") {
         releaseMenu(); await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx); stopped = true;
@@ -12148,7 +12157,7 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     sourceAck?: Updates.TelegramDeferredSourceEvidence; preparedSource?: Updates.TelegramDeferredSourceEvidence; journalBindingKey?: string; originalPending?: boolean; publicationPending?: boolean; publicationUnconfirmed?: boolean;
     viewRows?: Threads.TelegramWorkspaceLiveRebindIntent[]; registrationPids?: number[]; menuRequests?: Array<{ instanceId: string; operationId: string }>;
     menuTrace?: Array<{ phase: string; requestId: string; replyRequestId?: string; elapsedMs: number; ok?: boolean; errorCode?: string }>;
-    deletions?: unknown[]; dispatches?: number; settingsCalls?: number; workspaceObservations?: number; protectedSnapshots?: number; registered?: Array<{ instanceId: string; sessionId: string; pid?: number; target: { chatId: number; threadId?: number }; capabilities?: readonly string[] }>;
+    deletions?: unknown[]; dispatches?: number; settingsCalls?: number; statsCalls?: number; workspaceObservations?: number; protectedSnapshots?: number; registered?: Array<{ instanceId: string; sessionId: string; pid?: number; target: { chatId: number; threadId?: number }; capabilities?: readonly string[] }>;
     restoreButton?: boolean; followerButton?: boolean; notices?: string[]; stopped?: boolean };
   const launch = (role: "leader" | "follower") => launchProductionRootFixture<Stats>(`native-restore-${role}`, `
     import assert from "node:assert/strict";
@@ -12171,20 +12180,23 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     const leader = launch("leader"), follower = launch("follower"); roots.push(leader, follower);
     assert.equal((await leader.ready).pid, leader.pid); assert.equal((await follower.ready).pid, follower.pid);
     assert.notEqual(leader.pid, follower.pid);
-    await leader.request("connect"); await follower.request("connect");
+    await leader.request("connect"); const connectedFollower = await follower.request("connect");
     const registered = (await leader.request("stats")).registered!;
     assert.equal(registered.length, 1); assert.equal(registered[0]!.pid, follower.pid); assert.equal(registered[0]!.sessionId, "native-restore-follower");
     for (const capability of [...Bus.TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES, Bus.TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES]) assert.ok(registered[0]!.capabilities?.includes(capability));
     await leader.request("admit");
-    await waitForAsyncCondition(async () => (await leader.request("stats")).restoreButton === true, 5000);
+    await waitForAsyncCondition(async () => (await leader.request("progress")).restoreButton === true, 5000);
     await leader.request("restore");
-    await waitForAsyncCondition(async () => (await leader.request("stats")).followerButton === true, 5000);
-    await leader.request("choose-follower");
+    await waitForAsyncCondition(async () => (await leader.request("progress")).followerButton === true, 5000);
+    const selected = await leader.request("choose-follower");
     await waitForAsyncCondition(async () => {
-      leaderObserved = await leader.request("stats"); followerObserved = await follower.request("stats");
-      return leaderObserved.menus === 1 && leaderObserved.sourceRemovals === 1 && !!followerObserved.sourceAck && followerObserved.publicationPending === true;
+      const donor = await leader.request("progress"), recipient = await follower.request("progress");
+      return donor.menus === 1 && donor.sourceRemovals === 1 && !!recipient.sourceAck && recipient.publicationPending === true;
     }, 5000);
-    const before = leaderObserved!, recipient = followerObserved!;
+    leaderObserved = await leader.request("stats"); followerObserved = await follower.request("stats");
+    const before = leaderObserved, recipient = followerObserved;
+    assert.equal(before.statsCalls, selected.statsCalls! + 1, "Progress polling must not repeatedly acquire the donor journal and Workspace guards");
+    assert.equal(recipient.statsCalls, connectedFollower.statsCalls! + 1, "Original ACK progress is separate from the full canonical evidence capture");
     assert.deepEqual(recipient.lockState, { kind: "active-elsewhere", pid: leader.pid });
     assert.deepEqual(before.registrationPids, [follower.pid]); assert.equal(recipient.polls, 0);
     assert.equal(before.creations, 3); assert.equal(before.menuReturned, 0); assert.equal(before.sourceRemovals, 1); assert.equal(before.originalPending, false);
@@ -12212,7 +12224,7 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     assert.equal(before.menuTrace![0]!.requestId, recipient.menuTrace![0]!.requestId);
     assert.equal(before.dispatches, 0); assert.equal(recipient.dispatches, 0);
     await leader.request("release");
-    await waitForAsyncCondition(async () => (await leader.request("stats")).menuReturned === 1 && (await follower.request("stats")).publicationPending === false, 5000);
+    await waitForAsyncCondition(async () => (await leader.request("progress")).menuReturned === 1 && (await follower.request("progress")).publicationPending === false, 5000);
     const after = await leader.request("stats"), afterRecipient = await follower.request("stats");
     assert.equal(after.sourceRemovals, 1); assert.equal(after.menus, 1); assert.equal(after.menuReturned, 1);
     assert.deepEqual(afterRecipient.sourceAck, recipient.sourceAck); assert.deepEqual(after.deletions, [102]);
