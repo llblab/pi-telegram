@@ -7,7 +7,7 @@
 ## 0.59.2: Managed Host Settings Hotfix
 
 - `Host compatibility`: Restores `/start` and model settings for managed npm/git installations without local Pi peers by supplying the loader-mapped host SettingsManager at the package entrypoint. Cold domain imports remain SDK-lazy; no duplicate host dependency or private loader path is introduced. Addresses #380's blocking settings-import defect; its separate Threaded Mode observations remain under investigation.
-- `Workspace observations`: Serializes follower retained-intent and live-binding observations with atomic envelope publishers through the existing canonical guard. The same original reader and revision history remain in use; strict damaged-state refusal, publication-frame checks and source-removal authority are unchanged. Read scopes grant neither recovery nor replay.
+- `Workspace observations`: Serializes follower retained-intent and live-binding observations with atomic envelope publishers through the existing canonical guard. Each synchronous recipient assertion uses one frame with the same original reader and revision history; strict damaged-state refusal, publication-frame checks and source-removal authority are unchanged. Read scopes grant neither recovery nor replay.
 - `Startup diagnostics`: Adds bounded public Node module-load and resource-discovery checkpoints to headless Pi process fixtures without changing loader results, provider execution, assertions or deadlines. Load-returned evidence is not module evaluation or session readiness; historical macOS stalls and missing-log cancellations remain unattributed.
 
 ## 0.59.1: Explicit Attachment Targets
