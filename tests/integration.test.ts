@@ -12145,13 +12145,16 @@ test(`Production separate OS Restore follower separates original ACK from menu p
       }
       return acknowledgement;
     };
-    let statsCalls = 0;
-    const progress = () => ({ pid: process.pid, menus, menuReturned, sourceRemovals, sourceAck: completion(),
-      publicationPending: publication?.hasPending(), restoreButton: !!button("rerouterestore:"), followerButton: !!button("reroutenew:", 102) });
+    let statsCalls = 0, prematureAckProgressReads = 0;
+    const progress = () => {
+      if (originalPlan && sourceRemovals === 0) prematureAckProgressReads++;
+      return { pid: process.pid, menus, menuReturned, sourceRemovals, sourceAck: completion(),
+        publicationPending: publication?.hasPending(), restoreButton: !!button("rerouterestore:"), followerButton: !!button("reroutenew:", 102) };
+    };
     const stats = () => {
       statsCalls++;
       const acknowledgement = completion();
-      return { pid: process.pid, lockState, polls, creations, menus, menuReturned, sourceRemovals, sourceBinding, sourceDigest, statsCalls,
+      return { pid: process.pid, lockState, polls, creations, menus, menuReturned, sourceRemovals, sourceBinding, sourceDigest, statsCalls, prematureAckProgressReads,
         durableCompletion, sourceAck: acknowledgement, preparedSource: originalPlan?.source, journalBindingKey: binding?.recoveryKey,
         originalPending: binding?.journal.read().entries.some(row => row.updateId === 100),
         publicationPending: publication?.hasPending(), publicationUnconfirmed: publication?.hasUnconfirmed(),
@@ -12198,7 +12201,7 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     sourceAck?: Updates.TelegramDeferredSourceEvidence; preparedSource?: Updates.TelegramDeferredSourceEvidence; journalBindingKey?: string; originalPending?: boolean; publicationPending?: boolean; publicationUnconfirmed?: boolean;
     viewRows?: Threads.TelegramWorkspaceLiveRebindIntent[]; registrationPids?: number[]; menuRequests?: Array<{ instanceId: string; operationId: string }>;
     menuTrace?: Array<{ phase: string; requestId: string; replyRequestId?: string; elapsedMs: number; ok?: boolean; errorCode?: string }>;
-    deletions?: unknown[]; dispatches?: number; settingsCalls?: number; statsCalls?: number; workspaceObservations?: number; protectedSnapshots?: number; registered?: Array<{ instanceId: string; sessionId: string; pid?: number; target: { chatId: number; threadId?: number }; capabilities?: readonly string[] }>;
+    deletions?: unknown[]; dispatches?: number; settingsCalls?: number; statsCalls?: number; prematureAckProgressReads?: number; workspaceObservations?: number; protectedSnapshots?: number; registered?: Array<{ instanceId: string; sessionId: string; pid?: number; target: { chatId: number; threadId?: number }; capabilities?: readonly string[] }>;
     restoreButton?: boolean; followerButton?: boolean; notices?: string[]; stopped?: boolean };
   const launch = (role: "leader" | "follower") => launchProductionRootFixture<Stats>(`native-restore-${role}`, `
     import assert from "node:assert/strict";
@@ -12231,13 +12234,16 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     await waitForAsyncCondition(async () => (await leader.request("progress")).followerButton === true, 5000);
     const selected = await leader.request("choose-follower");
     await waitForAsyncCondition(async () => {
-      const donor = await leader.request("progress"), recipient = await follower.request("progress");
-      return donor.menus === 1 && donor.sourceRemovals === 1 && !!recipient.sourceAck && recipient.publicationPending === true;
+      const donor = await leader.request("progress");
+      if (donor.menus !== 1 || donor.sourceRemovals !== 1) return false;
+      const recipient = await follower.request("progress");
+      return !!recipient.sourceAck && recipient.publicationPending === true;
     }, 5000);
     leaderObserved = await leader.request("stats"); followerObserved = await follower.request("stats");
     const before = leaderObserved, recipient = followerObserved;
     assert.equal(before.statsCalls, selected.statsCalls! + 1, "Progress polling must not repeatedly acquire the donor journal and Workspace guards");
     assert.equal(recipient.statsCalls, connectedFollower.statsCalls! + 1, "Original ACK progress is separate from the full canonical evidence capture");
+    assert.equal(recipient.prematureAckProgressReads, 0, "The observer must not contend with native execution by inspecting its plan before removal ACK");
     assert.deepEqual(recipient.lockState, { kind: "active-elsewhere", pid: leader.pid });
     assert.deepEqual(before.registrationPids, [follower.pid]); assert.equal(recipient.polls, 0);
     assert.equal(before.creations, 3); assert.equal(before.menuReturned, 0); assert.equal(before.sourceRemovals, 1); assert.equal(before.originalPending, false);
