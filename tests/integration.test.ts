@@ -9536,7 +9536,7 @@ test(`Production shutdown awaits native button I/O without retiring a successor 
     const dir = await realpath(await mkdtemp(join(tmpdir(), "pt-awaited-shutdown-")));
     process.env.PI_CODING_AGENT_DIR = dir;
     const keepAlive = setInterval(() => {}, 60000), responseGate = Promise.withResolvers(), editorEntered = Promise.withResolvers();
-    let waitEntered = 0, waitReturned = 0, issued = 0, completed = 0, stopped = false, shutdown, shutdownError;
+    let waitEntered = 0, waitReturned = 0, issued = 0, completed = 0, stopped = false, shutdown, shutdownError, successorGeneration;
     for (const [name, factory, key] of [["outbound", "createTelegramButtonActionStore", "buttons"],
       ["lifecycle", "createTelegramSessionContextStore", "session"], ["queue", "createTelegramQueueStore", "queue"],
       ["journal", "createTelegramUpdateJournalBindingRuntime", "journal"], ["locks", "createTelegramLockedPollingRuntime", "polling"]]) {
@@ -9626,14 +9626,13 @@ test(`Production shutdown awaits native button I/O without retiring a successor 
       assert.equal(waitEntered, 1); assert.equal(waitReturned, 0); assert.equal(completed, 0); assert.equal(stopped, false);
       assert.deepEqual(entries().find(row => row.updateId === 1), original, "Actual pending teardown retains its original accepted receipt before queue disposition");
       assert.equal(captured.session.getGeneration(), generation);
-      let successorGeneration;
       if (succession !== "current") {
         await handlers.get("session_start")({}, ctx);
+        successorGeneration = captured.session.getGeneration();
         assert.ok(captured.session.getGeneration() > generation, "The same context and session ID acquired a new generation");
         assert.equal(captured.session.get(), ctx);
         await commands.get("telegram-connect").handler(profile ?? "", ctx); await until(() => !!pollReply);
         assert.deepEqual(entries().find(row => row.updateId === 1), original, "Overlapping start is not permission to forget or replay the original receipt");
-        successorGeneration = captured.session.getGeneration();
         assert.equal(captured.queue.getQueuedItems().length, 1);
         assert.equal(captured.queue.getQueuedItems()[0], originalItem, "A newer start cannot replace the retained original object");
         await tools.get("telegram_message").execute("fresh-publication", { chat_id: 77, thread_id: 43, text: 'Fresh successor button<!-- telegram_button {▶️ Successor|successor input} -->' });
@@ -9658,8 +9657,14 @@ test(`Production shutdown awaits native button I/O without retiring a successor 
       console.log("awaited-teardown-passed " + succession);
     } finally {
       responseGate.resolve(); if (shutdown) await shutdown.catch(() => {});
-      // The overlapping start retained an old-generation receipt. Fixture cleanup stops transport only; it cannot invent a fresh disposition owner.
-      if (captured.session.get()) await captured.polling.suspend();
+      if (captured.session.get()) {
+        assert.equal(captured.session.get(), ctx);
+        assert.ok(!shutdown || captured.session.getGeneration() === successorGeneration, "Never retry an uncertain original shutdown");
+        // Invoke the actual current owner; only its existing queue/journal ports may dispose of retained receipts.
+        await handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx);
+      }
+      assert.equal(captured.session.get(), undefined);
+      assert.equal(waitReturned, waitEntered, "Every original and successor publication drain has returned");
       assert.equal(activePolls, 0);
       clearInterval(keepAlive); await rm(dir, { recursive: true, force: true });
     }
@@ -11900,12 +11905,15 @@ function launchProductionRootFixture<TStats extends { pid: number }>(role: strin
   void completion.catch(() => undefined); void ready.catch(() => undefined);
   child.stdin.end(`process.send?.({ fixtureCheckpoint: "static-imports-complete", pid: process.pid });\n${source}`);
   const request = (command: string) => new Promise<TStats>((resolve, reject) => {
-    if (closed) { reject(new Error("OS root already closed")); return; }
+    if (closed || failure) { reject(failure ?? new Error("OS root already closed")); return; }
     const id = ++sequence; pending.set(id, { resolve, reject }); child.send({ id, command });
   });
   return { pid: child.pid, ready, request, waitForExit: () => completion,
     diagnostics: () => ({ role, pid: child.pid, launchOrdinal, readyOrdinal, checkpoint, checkpoints: checkpoints.map(row => ({ ...row })), closed, stdout, stderr, firstFailure: failure?.message }),
-    async stop() { if (!closed) await request("stop"); await completion; } };
+    async stop() {
+      if (!closed && !failure) try { await request("stop"); } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
+      await completion;
+    } };
 }
 
 test("OS-root fixture retains its first deadline failure through native close", async () => {
@@ -11921,6 +11929,7 @@ test("OS-root fixture retains its first deadline failure through native close", 
   const first = await fixture.request("hold").then(() => undefined, error => error);
   assert.ok(first instanceof Error);
   assert.match(first.message, /OS-root execution\/drain timeout \(deadline-control; checkpoint=static-imports-complete\)/u);
+  await assert.rejects(fixture.request("progress"), error => error === first, "Observation after native expiry cannot issue more work or replace the first failure");
   await assert.rejects(fixture.stop(), error => error === first, "Native close must not replace the exact first deadline failure");
   const retained = fixture.diagnostics();
   assert.match(retained.stdout, /fixture native stdout/u); assert.match(retained.stderr, /fixture native stderr/u);
@@ -11963,7 +11972,7 @@ test("OS-root diagnostic snapshot does not invent a first failure after healthy 
 }, 15000);
 
 for (const artifact of ["source", "compiled"] as const)
-test(`Production separate OS Restore follower separates original ACK from menu publication (${artifact})`, async () => {
+test(`Production separate OS Restore follower separates original ACK from menu publication (${artifact})`, async t => {
   const childRun = async (role: "leader" | "follower", agentDir: string) => {
     const { readFile } = await import("node:fs/promises");
     const { join } = await import("node:path");
@@ -12233,12 +12242,16 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     await leader.request("restore");
     await waitForAsyncCondition(async () => (await leader.request("progress")).followerButton === true, 5000);
     const selected = await leader.request("choose-follower");
-    await waitForAsyncCondition(async () => {
+    // The unchanged native execution/drain and outer test caps own semantic progress, not a separate latency SLA.
+    for (;;) {
+      t.signal.throwIfAborted();
       const donor = await leader.request("progress");
-      if (donor.menus !== 1 || donor.sourceRemovals !== 1) return false;
-      const recipient = await follower.request("progress");
-      return !!recipient.sourceAck && recipient.publicationPending === true;
-    }, 5000);
+      if (donor.menus === 1 && donor.sourceRemovals === 1) {
+        const recipient = await follower.request("progress");
+        if (recipient.sourceAck && recipient.publicationPending === true) { t.signal.throwIfAborted(); break; }
+      }
+      await waitForTimeout(10, undefined, { signal: t.signal });
+    }
     leaderObserved = await leader.request("stats"); followerObserved = await follower.request("stats");
     const before = leaderObserved, recipient = followerObserved;
     assert.equal(before.statsCalls, selected.statsCalls! + 1, "Progress polling must not repeatedly acquire the donor journal and Workspace guards");
