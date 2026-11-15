@@ -182,7 +182,7 @@ function appendSourceReadDiagnostic(failure: Error, pid: number | undefined, pat
 
 function runPiPrint(
   args: string[],
-  options: { env?: NodeJS.ProcessEnv; timeoutMs?: number; observationPath?: string } = {},
+  options: { env?: NodeJS.ProcessEnv; timeoutMs?: number; startupTimeoutMs?: number; exitTimeoutMs?: number; observationPath?: string } = {},
 ): Promise<{
   code: number | null;
   signal: NodeJS.Signals | null;
@@ -201,22 +201,29 @@ function runPiPrint(
   child.stdout.on("data", (chunk) => {
     stdout += chunk;
   });
-  child.stderr.on("data", (chunk) => {
-    stderr += chunk;
-  });
   return new Promise((resolve, reject) => {
-    let failure: Error | undefined;
-    const timeout = setTimeout(() => {
-      failure ??= new Error(`pi -p did not exit. stdout=${stdout} stderr=${stderr}`);
-      child.kill("SIGKILL");
-    }, options.timeoutMs ?? 20_000);
-    timeout.unref?.();
-    child.on("error", (error) => {
-      clearTimeout(timeout);
-      failure ??= error;
+    let failure: Error | undefined, exitTimeout: ReturnType<typeof setTimeout> | undefined;
+    const clearDeadlines = () => { clearTimeout(total); clearTimeout(startup); if (exitTimeout) clearTimeout(exitTimeout); };
+    const fail = (deadline: "startup" | "exit" | "overall") => {
+      if (failure) return;
+      failure = new Error(`pi -p did not exit. deadline=${deadline} stdout=${stdout} stderr=${stderr}`);
+      clearDeadlines(); child.kill("SIGKILL");
+    };
+    const total = setTimeout(() => fail("overall"), options.timeoutMs ?? 35_000);
+    const startup = setTimeout(() => fail("startup"), options.startupTimeoutMs ?? 30_000);
+    total.unref?.(); startup.unref?.();
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+      // Only the original SDK agent_end callback starts natural-exit verification; repeated diagnostics cannot renew it.
+      if (failure || exitTimeout || child.exitCode !== null || child.signalCode !== null ||
+          !/(?:^|\n)\[process-probe\] \{"role":"child","stage":"agent-end",/.test(stderr)) return;
+      clearTimeout(startup);
+      exitTimeout = setTimeout(() => fail("exit"), options.exitTimeoutMs ?? 5000);
+      exitTimeout.unref?.();
     });
+    child.on("error", (error) => { clearDeadlines(); failure ??= error; });
     child.on("close", (code, signal) => {
-      clearTimeout(timeout);
+      clearDeadlines();
       if (failure) { appendSourceReadDiagnostic(failure, child.pid, options.observationPath); reject(failure); }
       else resolve({ code, signal, stdout, stderr });
     });
@@ -234,7 +241,9 @@ async function createPiPrintFixtureExtension(tempDir: string): Promise<string> {
       processProbePrelude("child") +
       `export default function (pi) {\n` +
       `  traceProcessStage("fixture-entered");\n` +
-      `  pi.on("agent_end", () => { traceProcessStage("agent-end"); });\n` +
+      `  const startupDelay = Number(process.env.PI_TELEGRAM_TEST_STARTUP_DELAY_MS ?? 0);\n` +
+      `  if (startupDelay > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, startupDelay);\n` +
+      `  pi.on("agent_end", () => { traceProcessStage("agent-end"); if (process.env.PI_TELEGRAM_TEST_RETAIN_AFTER_AGENT === "true") setInterval(() => traceProcessStage("agent-end"), 100); });\n` +
       `  pi.on("session_shutdown", () => { traceProcessStage("session-shutdown"); });\n` +
       `  const agentDir = process.env.PI_CODING_AGENT_DIR;\n` +
       `  if (process.env.PI_TELEGRAM_TEST_LOCK_MODE === "owner" && agentDir) {\n` +
@@ -324,9 +333,10 @@ async function runPiPrintWithTelegram(
   agentDir: string,
   fixtureExtension: string,
   env: NodeJS.ProcessEnv = {},
+  timing: Pick<NonNullable<Parameters<typeof runPiPrint>[1]>, "timeoutMs" | "startupTimeoutMs" | "exitTimeoutMs"> = {},
 ) {
   const observationPath = join(agentDir, "source-read-observation.json");
-  return runPiPrint(
+  const result = await runPiPrint(
     [
       "-p",
       "--offline",
@@ -346,10 +356,12 @@ async function runPiPrintWithTelegram(
       "echo",
       "Say OK.",
     ],
-    { observationPath, env: { PI_CODING_AGENT_DIR: agentDir, ...env,
+    { ...timing, observationPath, env: { PI_CODING_AGENT_DIR: agentDir, ...env,
       NODE_OPTIONS: [env.NODE_OPTIONS ?? process.env.NODE_OPTIONS, piPrintModuleObserver(observationPath)].filter(Boolean).join(" "),
     } },
   );
+  if (result.code === 0 && result.signal === null) assert.match(result.stderr, /\[process-probe\] \{"role":"child","stage":"agent-end",/);
+  return result;
 }
 
 test("Process diagnostics preserve natural exit without keeping the child alive", async () => {
@@ -900,6 +912,30 @@ test(
     }
   },
 );
+
+for (const retain of [false, true])
+test(`Pi CLI exit guard starts after original work and cannot be renewed (retain=${retain})`, { skip: !PI_CLI_AVAILABLE }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pt-cli-exit-budget-"));
+  const fixture = await createPiPrintFixtureExtension(dir), agentDir = await createPiPrintAgentDir({ botToken: "123:abc", allowedUserId: 77 });
+  try {
+    const run = runPiPrintWithTelegram(agentDir, fixture, {
+      PI_TELEGRAM_TEST_STARTUP_DELAY_MS: "1500", PI_TELEGRAM_TEST_RETAIN_AFTER_AGENT: String(retain),
+    }, { exitTimeoutMs: 1000 });
+    if (retain) await assert.rejects(run, (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /pi -p did not exit\. deadline=exit/);
+      assert.ok((error.message.match(/"stage":"agent-end"/g)?.length ?? 0) > 1, "Repeated source checkpoints cannot renew the exit clock");
+      return true;
+    });
+    else {
+      const result = await run;
+      assert.equal(result.code, 0, result.stderr); assert.equal(result.signal, null);
+      assert.match(result.stdout, /fixture ok/);
+    }
+  } finally {
+    await rm(agentDir, { recursive: true, force: true }); await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("Extension session shutdown without active lock lets process exit", async () => {
   const extensionUrl = new URL("../index.ts", import.meta.url).href;
