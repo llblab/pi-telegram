@@ -43,7 +43,7 @@ test("Artifact follower ACK lifetime cannot be refreshed by equal generation or 
   state.setRegistered(true, target, { generation: "same" }); assert.equal(state.captureArtifactRegistration!(), undefined, "Rebind/rename without a genuine incarnation ACK leaves Artifact unavailable");
 });
 
-for (const fault of ["current", "target-copy", "scope-copy", "no-owner", "no-snapshot", "capability", "invalid-target", "wrong-session", "group", "late-context", "late-operator", "late-epoch", "late-generation", "late-slot", "late-target", "context-port", "reader-port", "snapshot-port", "registration-port", "local-target", "canonical-owner", "canonical-binding", "wrong-source", "wrong-recipient", "readback-loss", "post-snapshot", "post-getter-target"] as const) {
+for (const fault of ["current", "one-frame", "target-copy", "scope-copy", "no-owner", "no-snapshot", "capability", "invalid-target", "wrong-session", "group", "late-context", "late-operator", "late-epoch", "late-generation", "late-slot", "late-target", "context-port", "reader-port", "snapshot-port", "observation-port", "registration-port", "local-target", "canonical-owner", "canonical-binding", "wrong-source", "wrong-recipient", "readback-loss", "post-snapshot", "post-getter-target"] as const) {
   test(`Live status recipient capture is pre-binding availability and fresh independent canonical authority (${fault})`, async () => {
     await fixture(async f => {
       f.request.source.updateIds = [100];
@@ -57,9 +57,13 @@ for (const fault of ["current", "target-copy", "scope-copy", "no-owner", "no-sna
         return current ? { executor: { instanceId: "leader", leaderEpoch: epoch }, profileBindingKey: "workspace-scope-not-recipient-profile", operatorUserId: operator,
           cwd: "/repo", sessionId: "session", generation, leaderProtocol: protocol } : undefined;
       };
-      const read = (operationId: string, profile: string) => { assert.equal(operationId, f.request.operationId); assert.equal(profile, "workspace-scope-not-recipient-profile");
+      let observationDepth = 0, observationFrames = 0;
+      const read = (operationId: string, profile: string) => { if (fault === "one-frame") assert.equal(observationDepth, 1, "Every original reader call belongs to the same synchronous assertion frame"); assert.equal(operationId, f.request.operationId); assert.equal(profile, "workspace-scope-not-recipient-profile");
         return readerLost ? undefined : f.store.listLiveRebindings()[0]; };
-      const store = { ...f.threads, withWorkspaceLiveRebindSnapshot(...args: Parameters<typeof f.threads.withWorkspaceLiveRebindSnapshot>) {
+      const store = { ...f.threads, observeWorkspaceSnapshot<T>(sample: () => T): T {
+        observationFrames++; observationDepth++;
+        try { return f.threads.observeWorkspaceSnapshot(sample); } finally { observationDepth--; }
+      }, withWorkspaceLiveRebindSnapshot(...args: Parameters<typeof f.threads.withWorkspaceLiveRebindSnapshot>) {
         snapshots++; const result = f.threads.withWorkspaceLiveRebindSnapshot(...args); if (fault === "post-snapshot") current = false; return result;
       } };
       const deps = { instanceId: "old", getContextAuthority: authority, readRestoreIntent() { assert.fail("Cannot inspect historical Restore"); },
@@ -95,6 +99,7 @@ for (const fault of ["current", "target-copy", "scope-copy", "no-owner", "no-sna
       if (fault === "context-port") deps.getContextAuthority = () => authority();
       if (fault === "reader-port") deps.readLiveRebindIntent = (id, scope) => read(id, scope);
       if (fault === "snapshot-port") store.withWorkspaceLiveRebindSnapshot = (...args) => f.threads.withWorkspaceLiveRebindSnapshot(...args);
+      if (fault === "observation-port") store.observeWorkspaceSnapshot = sample => f.threads.observeWorkspaceSnapshot(sample);
       if (fault === "registration-port") { const get = registration.getTarget; registration.getTarget = () => get(); }
       if (fault === "readback-loss") readerLost = true;
       if (fault === "canonical-owner" || fault === "canonical-binding" || fault === "wrong-source" || fault === "wrong-recipient") {
@@ -105,8 +110,10 @@ for (const fault of ["current", "target-copy", "scope-copy", "no-owner", "no-sna
         if (fault === "wrong-recipient") raw.workspaceRestore.liveRebindings[0].recipient.generation = "foreign";
         writeFileSync(f.path, JSON.stringify(raw));
       }
-      const success = ["current", "target-copy", "scope-copy"].includes(fault);
+      const success = ["current", "one-frame", "target-copy", "scope-copy"].includes(fault);
+      const priorFrames = observationFrames;
       if (success) captured.assertRecipientCurrent(); else assert.throws(captured.assertRecipientCurrent);
+      if (fault === "one-frame") { assert.equal(observationFrames, priorFrames + 1); assert.equal(observationDepth, 0); }
       if (!fault.startsWith("canonical-") && fault !== "wrong-source" && fault !== "wrong-recipient") assert.equal(readFileSync(f.path, "utf8"), released);
       if (fault === "wrong-source" || fault === "wrong-recipient") assert.throws(() => f.store.list(), /changed without revision/);
       else assert.deepEqual(f.store.list(), []);

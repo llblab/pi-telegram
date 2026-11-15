@@ -142,7 +142,8 @@ jobs:
           node-version: 22.19.0
           cache: npm
       - name: Install dependencies
-        run: npm ci
+        timeout-minutes: 5
+        run: npm ci --timing
       - name: Build distributive
         run: npm run build
       - name: Run typecheck

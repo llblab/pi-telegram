@@ -129,8 +129,9 @@ async function withConsolidatedWorkspaceFixture(run: (f: {
 
 
 for (const artifact of ["source", "compiled"] as const)
+for (const observation of ["load", "retained"] as const)
 for (const boundary of ["canonical", "unguarded", "wrong-guard"] as const)
-test(`Consolidated load serializes one original read against a native publisher (${artifact}/${boundary})`, async () => {
+test(`Consolidated ${observation} serializes one original read against a native publisher (${artifact}/${boundary})`, async () => {
   const kernelUrl = new URL(artifact === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
   const threadsUrl = new URL(artifact === "source" ? "../lib/threads.ts" : "../dist/lib/threads.js", import.meta.url).href;
   async function publisher(url: string, dir: string) {
@@ -161,7 +162,7 @@ test(`Consolidated load serializes one original read against a native publisher 
         onPublicationBoundary: (phase: string) => { if (phase === "before-write") fs.writeFileSync(join(dir, "admitted"), "", { flag: "wx" }); } });
     fs.writeFileSync(join(dir, "committed"), String(process.pid), { flag: "wx" });
   }
-  async function reader(url: string, storeUrl: string, publisherSource: string, mode: string) {
+  async function reader(url: string, storeUrl: string, publisherSource: string, mode: string, observation: string) {
     const { default: fs } = await import("node:fs");
     const { syncBuiltinESMExports } = await import("node:module");
     const { mock } = await import("node:test");
@@ -198,6 +199,10 @@ test(`Consolidated load serializes one original read against a native publisher 
     const store = Threads.createTelegramTopicTargetStore({ path: () => path, telegramProfile: () => "work",
       consolidated: { captureAuthority: () => undefined, publishIfOwned: () => { throw new Error("No read-side publication"); } } });
     await store.load();
+    const retained = store.workspaceRestore({ profileName: "work", tokenSha256: "a".repeat(64) });
+    retained.listLiveRebindings();
+    const sample = async () => observation === "load" ? store.refresh() :
+      store.observeWorkspaceSnapshot(() => retained.listLiveRebindings());
     const scope = store.captureReadScope();
     console.log("consolidated-load-reader ready");
     const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", "(" + publisherSource + ")(" + JSON.stringify(url) + "," + JSON.stringify(dir) + ")"],
@@ -257,7 +262,7 @@ test(`Consolidated load serializes one original read against a native publisher 
       syncBuiltinESMExports();
       armed = true;
       let failure: any;
-      try { await store.refresh(); } catch (error) { failure = error; }
+      try { await sample(); } catch (error) { failure = error; }
       if (mode === "canonical") {
         assert.equal(failure, undefined); assert.equal(links, 1); assert.equal(descriptorReads, 1); assert.equal(blocked, true);
         assert.equal(observations.length, 2);
@@ -296,7 +301,7 @@ test(`Consolidated load serializes one original read against a native publisher 
         const before = original.readFileSync(path, "utf8"), priorCalls = calls;
         original.mkdirSync(guard); original.writeFileSync(join(guard, "owner.fixture.json"), "{", { mode: 0o600 });
         armed = true;
-        await assert.rejects(store.refresh(), { name: "TelegramFileTransactionGuardError" });
+        await assert.rejects(sample(), { name: "TelegramFileTransactionGuardError" });
         armed = false;
         assert.equal(calls, priorCalls, "Unverifiable guard refuses before the original snapshot callback");
         assert.equal(original.readFileSync(path, "utf8"), before);
@@ -304,13 +309,18 @@ test(`Consolidated load serializes one original read against a native publisher 
         original.rmSync(guard, { recursive: true });
         const alias = join(dir, "linked-state");
         original.linkSync(path, alias);
-        await assert.rejects(store.refresh(), /private regular file/);
+        await assert.rejects(sample(), /private regular file/);
         original.unlinkSync(alias);
-        const pending = store.refresh();
+        const pending = sample();
         await Promise.resolve();
         store.setBotState({ threadMode: "disabled" });
         await pending;
-        assert.equal(store.getBotState().threadMode, "disabled", "The existing post-await revision fence retains local mutation");
+        assert.equal(store.getBotState().threadMode, "disabled", "Neither a late load nor an observation replaces local mutation");
+        if (observation === "retained") {
+          assert.throws(() => store.observeWorkspaceSnapshot(() => Promise.resolve()), /finish synchronously/);
+          assert.deepEqual(store.observeWorkspaceSnapshot(() => retained.listLiveRebindings()), []);
+          assert.equal(original.existsSync(guard), false, "Refused asynchronous observation releases its own guard");
+        }
       }
       console.log(JSON.stringify({ mode, oneOriginalRead: true, strictRefusal: mode !== "canonical", publisherExited: true }));
     } catch (error) {
@@ -332,7 +342,7 @@ test(`Consolidated load serializes one original read against a native publisher 
       }
     }
   }
-  const result = await runNodeEval("(" + reader.toString() + ")(" + [kernelUrl, threadsUrl, publisher.toString(), boundary].map(value => JSON.stringify(value)).join(",") + ")",
+  const result = await runNodeEval("(" + reader.toString() + ")(" + [kernelUrl, threadsUrl, publisher.toString(), boundary, observation].map(value => JSON.stringify(value)).join(",") + ")",
     { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 12000,
       readiness: { stdoutPrefix: "consolidated-load-reader ready", startupTimeoutMs: 8000 } });
   assert.equal(result.signal, null); assert.equal(result.code, 0, result.stdout + result.stderr);
@@ -487,6 +497,35 @@ test(`Consolidated load keeps the original nonempty Restore view and in-transact
       return { value: current, result: true };
     });
     assert.deepEqual(readTelegramRuntimeState(f.rootPath).profiles.default?.runtime, { marker: "sibling" });
+  });
+});
+
+for (const artifact of ["source", "compiled"] as const)
+for (const reason of ["missing-snapshot", "revision-regressed", "same-revision-conflict"] as const)
+test(`Guarded follower observation retains original private reader refusal (${artifact}/${reason})`, async () => {
+  await withConsolidatedWorkspaceFixture(async f => {
+    f.owner.acquire({ cwd: "/repo" });
+    f.storage.capturePublication()!(() => ({ value: f.workspace, result: true }));
+    const Threads = artifact === "source" ? await import("../lib/threads.ts") : await import("../dist/lib/threads.js");
+    const store = Threads.createTelegramTopicTargetStore({ path: () => f.rootPath, consolidated: {
+      ...f.consolidated, captureAuthority: () => undefined,
+    } });
+    const original = store.workspaceRestore({ profileName: "default", tokenSha256: "a".repeat(64) });
+    const before = store.observeWorkspaceSnapshot(() => original.list());
+    assert.equal(before.length, 1);
+    const file = structuredClone(f.workspace) as any, retainedRevision = file.workspaceRestore.revision;
+    if (reason === "missing-snapshot") delete file.workspaceRestore;
+    if (reason === "revision-regressed") file.workspaceRestore.revision--;
+    if (reason === "same-revision-conflict") file.workspaceRestore.operations = [];
+    mutateTelegramRuntimeStateSection(f.rootPath, "default", "workspace", () => ({ value: file, result: true }), { isCurrent: () => true });
+    const bytes = await readFile(f.rootPath, "utf8");
+    assert.throws(() => store.observeWorkspaceSnapshot(() => original.list()), error => {
+      assert.ok(error instanceof Threads.TelegramWorkspaceRestoreEvidenceError);
+      assert.equal(error.reason, reason); assert.equal(error.retainedRevision, retainedRevision);
+      return true;
+    });
+    assert.equal(await readFile(f.rootPath, "utf8"), bytes, "Guarding the original read grants no reset, rebase or publication");
+    assert.equal(existsSync(join(f.dir, "runtime", "consolidated.json.transaction")), false);
   });
 });
 

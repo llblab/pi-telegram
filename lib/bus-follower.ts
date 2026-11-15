@@ -1013,7 +1013,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
     "load" | "withWorkspaceRestoreSnapshot"
   > &
     Partial<
-      Pick<Threads.TelegramTopicTargetStore, "withWorkspaceLiveRebindSnapshot">
+      Pick<Threads.TelegramTopicTargetStore, "withWorkspaceLiveRebindSnapshot" | "observeWorkspaceSnapshot">
     >;
   registrationState: Pick<
     TelegramBusFollowerRegistrationState,
@@ -1063,6 +1063,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
     if (!captured) throw new Error("Stale Telegram follower Restore context.");
     const snapshotStore = deps.topicTargetStore,
       liveSnapshot = snapshotStore.withWorkspaceLiveRebindSnapshot,
+      observeSnapshot = snapshotStore.observeWorkspaceSnapshot,
       restoreSnapshot = snapshotStore.withWorkspaceRestoreSnapshot;
     const authority = structuredClone(captured);
     const request = structuredClone({
@@ -1128,6 +1129,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
       if (
         !isDeepStrictEqual(deps.getContextAuthority(ctx), authority) ||
         deps.topicTargetStore !== snapshotStore ||
+        snapshotStore.observeWorkspaceSnapshot !== observeSnapshot ||
         (liveCurrent
           ? snapshotStore.withWorkspaceLiveRebindSnapshot !== liveSnapshot
           : snapshotStore.withWorkspaceRestoreSnapshot !== restoreSnapshot) ||
@@ -1281,7 +1283,9 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
           if ("kind" in expected) {
             if (!liveSnapshot)
               throw new Error("Live-rebind read-only Workspace snapshot is unavailable.");
-            liveSnapshot.call(snapshotStore, expected, observer);
+            const sample = () => liveSnapshot.call(snapshotStore, expected, observer);
+            if (observeSnapshot) observeSnapshot.call(snapshotStore, sample);
+            else sample();
           } else restoreSnapshot.call(snapshotStore, expected, observer);
           assertCurrent();
         };
@@ -1365,6 +1369,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
         read = deps.readLiveRebindIntent,
         store = deps.topicTargetStore;
       const snapshot = store.withWorkspaceLiveRebindSnapshot,
+        observeSnapshot = store.observeWorkspaceSnapshot,
         state = deps.registrationState;
       const statePorts = {
         getTarget: state.getTarget,
@@ -1412,6 +1417,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
         deps.readLiveRebindIntent === read &&
         deps.topicTargetStore === store &&
         store.withWorkspaceLiveRebindSnapshot === snapshot &&
+        store.observeWorkspaceSnapshot === observeSnapshot &&
         deps.registrationState === state &&
         Object.entries(statePorts).every(
           ([key, value]) => Reflect.get(state, key) === value,
@@ -1457,102 +1463,106 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
         }
       };
       if (!isCurrent()) return undefined;
+      const assertRecipientCurrent = () => {
+        if (!isCurrent())
+          throw new Error("Selected command recipient authority changed.");
+        const value = read.call(
+          deps,
+          expected.operationId,
+          authority.profileBindingKey,
+        );
+        if (
+          !value ||
+          value.kind !== "live-rebind" ||
+          !Threads.isTelegramLiveRebindInputAuthorized(value) ||
+          value.request.operationId !== expected.operationId ||
+          value.recipient.kind !== "follower" ||
+          value.recipient.instanceId !== instanceId ||
+          value.recipient.sessionId !== expected.sessionId ||
+          value.recipient.generation !== expected.registrationGeneration ||
+          !isDeepStrictEqual(value.executor, authority.executor) ||
+          value.operatorUserId !== authority.operatorUserId ||
+          !isDeepStrictEqual(
+            value.request.source.updateIds,
+            expected.sourceUpdateIds,
+          ) ||
+          !isDeepStrictEqual(value.request.target, expected.target) ||
+          !isDeepStrictEqual(value.request.binding.target, oldTarget) ||
+          value.request.owner.instanceId !== instanceId ||
+          value.request.owner.owner?.kind !== "manual-follower" ||
+          value.request.owner.slot !== slot ||
+          !isDeepStrictEqual(value.request.owner.target, oldTarget) ||
+          value.request.binding.cwd !==
+            WorkspaceIdentity.normalizeTelegramWorkspacePath(authority.cwd) ||
+          value.request.binding.sessionId !== expected.sessionId ||
+          value.request.binding.slot !== slot ||
+          !isCurrent()
+        )
+          throw new Error(
+            "Selected command recipient has no exact released intent.",
+          );
+        const intent = structuredClone(value);
+        let confirmed = false;
+        snapshot.call(store, intent, (canonical) => {
+          if (
+            !isCurrent() ||
+            !isDeepStrictEqual(
+              read.call(
+                deps,
+                expected.operationId,
+                authority.profileBindingKey,
+              ),
+              intent,
+            )
+          )
+            return;
+          const bindings = (canonical.workspaceBindings ?? []).filter(
+            (row) => row.bindingKey === intent.request.binding.bindingKey,
+          );
+          const owners = canonical.threads.filter(
+            (row) =>
+              row.status === "active" &&
+              (row.slot === slot ||
+                isDeepStrictEqual(row.target, expected.target)),
+          );
+          const row = bindings[0],
+            owner = owners[0];
+          confirmed =
+            bindings.length === 1 &&
+            row?.sessionId === expected.sessionId &&
+            row.cwd === intent.request.binding.cwd &&
+            row.slot === slot &&
+            row.workspaceKey === intent.request.binding.workspaceKey &&
+            row.inactiveSinceMs === undefined &&
+            isDeepStrictEqual(row.target, expected.target) &&
+            owners.length === 1 &&
+            owner?.instanceId === instanceId &&
+            owner.owner?.kind === "manual-follower" &&
+            owner.slot === slot &&
+            owner.profileKey === intent.request.owner.profileKey &&
+            isDeepStrictEqual(owner.owner, intent.request.owner.owner) &&
+            isDeepStrictEqual(owner.target, expected.target) &&
+            isDeepStrictEqual(state.getTarget(), expected.target) &&
+            isCurrent() &&
+            isDeepStrictEqual(
+              read.call(
+                deps,
+                expected.operationId,
+                authority.profileBindingKey,
+              ),
+              intent,
+            );
+        });
+        if (!confirmed || !isCurrent())
+          throw new Error(
+            "Selected command canonical/local recipient changed.",
+          );
+      };
       return {
         isCurrent,
         assertRecipientCurrent() {
-          if (!isCurrent())
-            throw new Error("Selected command recipient authority changed.");
-          const value = read.call(
-            deps,
-            expected.operationId,
-            authority.profileBindingKey,
-          );
-          if (
-            !value ||
-            value.kind !== "live-rebind" ||
-            !Threads.isTelegramLiveRebindInputAuthorized(value) ||
-            value.request.operationId !== expected.operationId ||
-            value.recipient.kind !== "follower" ||
-            value.recipient.instanceId !== instanceId ||
-            value.recipient.sessionId !== expected.sessionId ||
-            value.recipient.generation !== expected.registrationGeneration ||
-            !isDeepStrictEqual(value.executor, authority.executor) ||
-            value.operatorUserId !== authority.operatorUserId ||
-            !isDeepStrictEqual(
-              value.request.source.updateIds,
-              expected.sourceUpdateIds,
-            ) ||
-            !isDeepStrictEqual(value.request.target, expected.target) ||
-            !isDeepStrictEqual(value.request.binding.target, oldTarget) ||
-            value.request.owner.instanceId !== instanceId ||
-            value.request.owner.owner?.kind !== "manual-follower" ||
-            value.request.owner.slot !== slot ||
-            !isDeepStrictEqual(value.request.owner.target, oldTarget) ||
-            value.request.binding.cwd !==
-              WorkspaceIdentity.normalizeTelegramWorkspacePath(authority.cwd) ||
-            value.request.binding.sessionId !== expected.sessionId ||
-            value.request.binding.slot !== slot ||
-            !isCurrent()
-          )
-            throw new Error(
-              "Selected command recipient has no exact released intent.",
-            );
-          const intent = structuredClone(value);
-          let confirmed = false;
-          snapshot.call(store, intent, (canonical) => {
-            if (
-              !isCurrent() ||
-              !isDeepStrictEqual(
-                read.call(
-                  deps,
-                  expected.operationId,
-                  authority.profileBindingKey,
-                ),
-                intent,
-              )
-            )
-              return;
-            const bindings = (canonical.workspaceBindings ?? []).filter(
-              (row) => row.bindingKey === intent.request.binding.bindingKey,
-            );
-            const owners = canonical.threads.filter(
-              (row) =>
-                row.status === "active" &&
-                (row.slot === slot ||
-                  isDeepStrictEqual(row.target, expected.target)),
-            );
-            const row = bindings[0],
-              owner = owners[0];
-            confirmed =
-              bindings.length === 1 &&
-              row?.sessionId === expected.sessionId &&
-              row.cwd === intent.request.binding.cwd &&
-              row.slot === slot &&
-              row.workspaceKey === intent.request.binding.workspaceKey &&
-              row.inactiveSinceMs === undefined &&
-              isDeepStrictEqual(row.target, expected.target) &&
-              owners.length === 1 &&
-              owner?.instanceId === instanceId &&
-              owner.owner?.kind === "manual-follower" &&
-              owner.slot === slot &&
-              owner.profileKey === intent.request.owner.profileKey &&
-              isDeepStrictEqual(owner.owner, intent.request.owner.owner) &&
-              isDeepStrictEqual(owner.target, expected.target) &&
-              isDeepStrictEqual(state.getTarget(), expected.target) &&
-              isCurrent() &&
-              isDeepStrictEqual(
-                read.call(
-                  deps,
-                  expected.operationId,
-                  authority.profileBindingKey,
-                ),
-                intent,
-              );
-          });
-          if (!confirmed || !isCurrent())
-            throw new Error(
-              "Selected command canonical/local recipient changed.",
-            );
+          if (observeSnapshot) observeSnapshot.call(store, assertRecipientCurrent);
+          else assertRecipientCurrent();
         },
       };
     },

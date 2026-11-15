@@ -328,13 +328,14 @@ export function normalizeSettingsManager(manager: unknown): PiSettingsManager {
 
 export async function createSettingsManager(
   cwd: string,
+  hostFactory?: PiSettingsManagerFactory,
 ): Promise<PiSettingsManager> {
   // Pi returns its legacy settings surface synchronously. Compatible hosts may
   // resolve a generic settings service asynchronously; normalize both once at
   // the SDK boundary instead of leaking host distinctions into menu domains.
-  // Queue and transport helpers must not load the whole host SDK during cold Root imports.
-  const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
-  const factory = SettingsManager as unknown as PiSettingsManagerFactory;
+  // The package entrypoint supplies its statically loader-mapped host export.
+  // Standalone domain consumers retain lazy native resolution and cold imports.
+  const factory = hostFactory ?? (await import("@earendil-works/pi-coding-agent")).SettingsManager;
   return normalizeSettingsManager(await factory.create(cwd));
 }
 

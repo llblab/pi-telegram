@@ -5691,15 +5691,27 @@ async function waitForRuntimeState(context: TestContext, description: string, pr
 async function waitForCondition(
   predicate: () => boolean,
   timeoutMs = 2000,
+  signal?: AbortSignal,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     if (predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    if (signal) await waitForTimeout(10, undefined, { signal });
+    else await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  signal?.throwIfAborted();
   if (predicate()) return;
   throw new Error("Timed out waiting for condition");
 }
+
+test("Runtime condition cancellation ends its original polling without another predicate", async () => {
+  const controller = new AbortController();
+  let polls = 0;
+  await assert.rejects(waitForCondition(() => { polls++; controller.abort(); return false; }, 1000, controller.signal), { name: "AbortError" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(polls, 1);
+});
 
 async function waitForAsyncCondition(
   predicate: () => Promise<boolean>,
@@ -6439,10 +6451,12 @@ test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-c
   }
 }, 60_000);
 
-for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(`Production startup spends previous-process Restore originals without delivery even after their Thread becomes bound (sibling=${siblingTiming})`, async () => {
+for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(`Production startup spends previous-process Restore originals without delivery even after their Thread becomes bound (sibling=${siblingTiming})`, async t => {
   const withSibling = siblingTiming !== "none", siblingUpdateId = siblingTiming === "live" ? 103 : 99;
-  const config = await createRuntimeTelegramConfigFixture();
-  const agentDir = await ensureRuntimeAgentDir();
+  const previousAgentDir = runtimeAgentDir, previousAgentEnv = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-previous-restore-")));
+  runtimeAgentDir = agentDir; process.env.PI_CODING_AGENT_DIR = agentDir;
+  const config = await createRuntimeTelegramConfigFixture(agentDir);
   const dir = join(agentDir, "tmp", "pi-telegram");
   const dispatched: RuntimeHarnessMessage[] = [];
   const { handlers, commands, pi } = createRuntimePiHarness({ sendUserMessage: content => dispatched.push(content) });
@@ -6485,11 +6499,33 @@ for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(
     }
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
-  try {
+  let phase = "created", assertionsPassed = false, completed = false;
+  let work: Promise<void> | undefined, shutdown: Promise<void> | undefined;
+  let seed: Awaited<ReturnType<typeof createRuntimeSeedWorkspaceStore>> | undefined;
+  const checkpoint = (next: string) => { phase = next; t.signal.throwIfAborted(); };
+  const stop = () => shutdown ??= Promise.resolve().then(async () => {
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+  });
+  const onAbort = () => { releaseLiveSibling?.(); void stop().catch(() => {}); };
+  t.signal.addEventListener("abort", onAbort, { once: true });
+  t.after(async () => {
+    t.signal.removeEventListener("abort", onAbort);
+    if (!completed) console.error("previous-restore-phase:" + JSON.stringify({ siblingTiming, phase, polls, methods: methods.slice(-32),
+      resources: process.getActiveResourcesInfo().slice(0, 16) }));
+    await work?.catch(() => {});
+    await stop();
+    await seed?.release();
+    restoreFetch(); await config.restore();
+    runtimeAgentDir = previousAgentDir;
+    if (previousAgentEnv === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentEnv;
+    await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }, { timeout: 20_000 }); // Cleanup is bounded separately; it cannot turn the original test timeout into success.
+  work = (async () => { try {
+    checkpoint("config");
     await config.write({ botToken: "123:abc", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } });
-    await writeRuntimeTelegramLocks({});
-    await stageRuntimeV02712Artifacts();
-    const seed = await createRuntimeSeedWorkspaceStore();
+    checkpoint("empty-transport"); await writeRuntimeTelegramLocks({});
+    checkpoint("stage-history"); await stageRuntimeV02712Artifacts();
+    checkpoint("seed-owner"); seed = await createRuntimeSeedWorkspaceStore();
     const threads = seed.threads;
     const binding = { ...Threads.createTelegramWorkspaceBindingIdentity(ctx.cwd, 0, ctx.sessionManager.getSessionId())!,
       slot: "A", threadName: "Atlas", target: { chatId: 77, threadId: 10 }, updatedAtMs: 1 };
@@ -6526,18 +6562,21 @@ for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(
     assert.equal(relocated?.phase, "relocated", JSON.stringify({ request, intents: store.list(),
       bindings: threads.listWorkspaceBindings(), records: threads.list() }));
     await seed.release();
-    (await getRuntimeTelegramExtension())(pi);
-    await handlers.get("session_start")?.({}, ctx);
-    await commands.get("telegram-connect")?.handler("", ctx);
+    checkpoint("root-import"); const extension = await getRuntimeTelegramExtension();
+    checkpoint("root-construction"); extension(pi);
+    checkpoint("session-start"); await handlers.get("session_start")?.({}, ctx);
+    checkpoint("connect"); await commands.get("telegram-connect")?.handler("", ctx);
+    checkpoint("current-menu");
     try {
-      await waitForCondition(() => messages.some(message => JSON.stringify(message).includes("menu:model")), 10_000);
+      await waitForCondition(() => messages.some(message => JSON.stringify(message).includes("menu:model")), 10_000, t.signal);
     } catch (error) {
       throw new Error(`${String(error)}\n${JSON.stringify({ methods, messages, dispatched })}\n${await readFile(join(dir, "logs.jsonl"), "utf8")}`);
     }
     if (siblingTiming === "live") {
       releaseLiveSibling!();
-      await waitForCondition(() => messages.filter(message => JSON.stringify(message).includes("menu:model")).length >= 2, 10_000);
+      await waitForCondition(() => messages.filter(message => JSON.stringify(message).includes("menu:model")).length >= 2, 10_000, t.signal);
     }
+    checkpoint("original-source-assertions");
     assert.deepEqual(dispatched, []);
     assert.doesNotMatch(JSON.stringify(messages), /Historical inputs|reroutecancel:history:/);
     assert.equal(journal.read().entries.some(entry => entry.updateId === 100), false, "the new-world restart spends the previous Restore original");
@@ -6551,20 +6590,22 @@ for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(
       assert.equal(journal.inspectAbandonedPending(siblingUpdateId), undefined, "neither spending nor a hold is private cancellation");
     }
     // The new world forgets the previous Restore and temporary entry; the restored tab stays bound and is never deleted.
-    await waitForCondition(() => store.list().length === 0 && store.listTemporaryThreads().length === 0, 10_000);
+    checkpoint("history-retired");
+    await waitForCondition(() => store.list().length === 0 && store.listTemporaryThreads().length === 0, 10_000, t.signal);
     if (siblingTiming === "live") assert.ok(messages.filter(message => JSON.stringify(message).includes("menu:model")).length >= 2);
     await threads.load();
     assert.equal(threads.listWorkspaceBindings().find(value => value.bindingKey === binding.bindingKey)?.target.threadId, 42);
     assert.equal(threads.listWorkspaceBindings().find(value => value.bindingKey === binding.bindingKey)?.slot, "A");
     assert.equal(methods.includes("createForumTopic"), false);
     assert.equal(methods.includes("deleteForumTopic"), false);
+    assertionsPassed = true;
   } finally {
     releaseLiveSibling?.();
-    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
-    await rm(join(dir, "state.json"), { force: true });
-    restoreFetch();
-    await config.restore();
-  }
+    phase = assertionsPassed ? "shutdown" : phase;
+    await stop();
+    completed = assertionsPassed;
+  } })();
+  await work;
 }, 20_000);
 
 test("Graceful preserved leader quit publishes inactivity and restores its intact Workspace", async () => {
@@ -9495,7 +9536,7 @@ test(`Production shutdown awaits native button I/O without retiring a successor 
     const dir = await realpath(await mkdtemp(join(tmpdir(), "pt-awaited-shutdown-")));
     process.env.PI_CODING_AGENT_DIR = dir;
     const keepAlive = setInterval(() => {}, 60000), responseGate = Promise.withResolvers(), editorEntered = Promise.withResolvers();
-    let waitEntered = 0, waitReturned = 0, issued = 0, completed = 0, stopped = false, shutdown, shutdownError;
+    let waitEntered = 0, waitReturned = 0, issued = 0, completed = 0, stopped = false, shutdown, shutdownError, successorGeneration;
     for (const [name, factory, key] of [["outbound", "createTelegramButtonActionStore", "buttons"],
       ["lifecycle", "createTelegramSessionContextStore", "session"], ["queue", "createTelegramQueueStore", "queue"],
       ["journal", "createTelegramUpdateJournalBindingRuntime", "journal"], ["locks", "createTelegramLockedPollingRuntime", "polling"]]) {
@@ -9585,14 +9626,13 @@ test(`Production shutdown awaits native button I/O without retiring a successor 
       assert.equal(waitEntered, 1); assert.equal(waitReturned, 0); assert.equal(completed, 0); assert.equal(stopped, false);
       assert.deepEqual(entries().find(row => row.updateId === 1), original, "Actual pending teardown retains its original accepted receipt before queue disposition");
       assert.equal(captured.session.getGeneration(), generation);
-      let successorGeneration;
       if (succession !== "current") {
         await handlers.get("session_start")({}, ctx);
+        successorGeneration = captured.session.getGeneration();
         assert.ok(captured.session.getGeneration() > generation, "The same context and session ID acquired a new generation");
         assert.equal(captured.session.get(), ctx);
         await commands.get("telegram-connect").handler(profile ?? "", ctx); await until(() => !!pollReply);
         assert.deepEqual(entries().find(row => row.updateId === 1), original, "Overlapping start is not permission to forget or replay the original receipt");
-        successorGeneration = captured.session.getGeneration();
         assert.equal(captured.queue.getQueuedItems().length, 1);
         assert.equal(captured.queue.getQueuedItems()[0], originalItem, "A newer start cannot replace the retained original object");
         await tools.get("telegram_message").execute("fresh-publication", { chat_id: 77, thread_id: 43, text: 'Fresh successor button<!-- telegram_button {▶️ Successor|successor input} -->' });
@@ -9617,8 +9657,14 @@ test(`Production shutdown awaits native button I/O without retiring a successor 
       console.log("awaited-teardown-passed " + succession);
     } finally {
       responseGate.resolve(); if (shutdown) await shutdown.catch(() => {});
-      // The overlapping start retained an old-generation receipt. Fixture cleanup stops transport only; it cannot invent a fresh disposition owner.
-      if (captured.session.get()) await captured.polling.suspend();
+      if (captured.session.get()) {
+        assert.equal(captured.session.get(), ctx);
+        assert.ok(!shutdown || captured.session.getGeneration() === successorGeneration, "Never retry an uncertain original shutdown");
+        // Invoke the actual current owner; only its existing queue/journal ports may dispose of retained receipts.
+        await handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx);
+      }
+      assert.equal(captured.session.get(), undefined);
+      assert.equal(waitReturned, waitEntered, "Every original and successor publication drain has returned");
       assert.equal(activePolls, 0);
       clearInterval(keepAlive); await rm(dir, { recursive: true, force: true });
     }
@@ -11859,12 +11905,15 @@ function launchProductionRootFixture<TStats extends { pid: number }>(role: strin
   void completion.catch(() => undefined); void ready.catch(() => undefined);
   child.stdin.end(`process.send?.({ fixtureCheckpoint: "static-imports-complete", pid: process.pid });\n${source}`);
   const request = (command: string) => new Promise<TStats>((resolve, reject) => {
-    if (closed) { reject(new Error("OS root already closed")); return; }
+    if (closed || failure) { reject(failure ?? new Error("OS root already closed")); return; }
     const id = ++sequence; pending.set(id, { resolve, reject }); child.send({ id, command });
   });
   return { pid: child.pid, ready, request, waitForExit: () => completion,
     diagnostics: () => ({ role, pid: child.pid, launchOrdinal, readyOrdinal, checkpoint, checkpoints: checkpoints.map(row => ({ ...row })), closed, stdout, stderr, firstFailure: failure?.message }),
-    async stop() { if (!closed) await request("stop"); await completion; } };
+    async stop() {
+      if (!closed && !failure) try { await request("stop"); } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
+      await completion;
+    } };
 }
 
 test("OS-root fixture retains its first deadline failure through native close", async () => {
@@ -11880,6 +11929,7 @@ test("OS-root fixture retains its first deadline failure through native close", 
   const first = await fixture.request("hold").then(() => undefined, error => error);
   assert.ok(first instanceof Error);
   assert.match(first.message, /OS-root execution\/drain timeout \(deadline-control; checkpoint=static-imports-complete\)/u);
+  await assert.rejects(fixture.request("progress"), error => error === first, "Observation after native expiry cannot issue more work or replace the first failure");
   await assert.rejects(fixture.stop(), error => error === first, "Native close must not replace the exact first deadline failure");
   const retained = fixture.diagnostics();
   assert.match(retained.stdout, /fixture native stdout/u); assert.match(retained.stderr, /fixture native stderr/u);
@@ -11922,7 +11972,7 @@ test("OS-root diagnostic snapshot does not invent a first failure after healthy 
 }, 15000);
 
 for (const artifact of ["source", "compiled"] as const)
-test(`Production separate OS Restore follower separates original ACK from menu publication (${artifact})`, async () => {
+test(`Production separate OS Restore follower separates original ACK from menu publication (${artifact})`, async t => {
   const childRun = async (role: "leader" | "follower", agentDir: string) => {
     const { readFile } = await import("node:fs/promises");
     const { join } = await import("node:path");
@@ -11942,7 +11992,18 @@ test(`Production separate OS Restore follower separates original ACK from menu p
       return actual;
     } } });
     let originalView: Threads.TelegramWorkspaceRestore | undefined;
-    mock.module(moduleUrl("threads"), { namedExports: { ...ThreadModel, createTelegramWorkspaceRestoreResolver(options: Parameters<typeof ThreadModel.createTelegramWorkspaceRestoreResolver>[0]) {
+    let workspaceObservations = 0, observationDepth = 0, protectedSnapshots = 0;
+    mock.module(moduleUrl("threads"), { namedExports: { ...ThreadModel, createTelegramTopicTargetStore(options: Parameters<typeof ThreadModel.createTelegramTopicTargetStore>[0]) {
+      const store = ThreadModel.createTelegramTopicTargetStore(options), observe = store.observeWorkspaceSnapshot, snapshot = store.withWorkspaceLiveRebindSnapshot;
+      store.observeWorkspaceSnapshot = function <T>(sample: () => T): T {
+        return observe(() => { workspaceObservations++; observationDepth++; try { return sample(); } finally { observationDepth--; } });
+      };
+      store.withWorkspaceLiveRebindSnapshot = (...args: Parameters<typeof snapshot>) => {
+        if (role === "follower") { assert.ok(observationDepth > 0, "Original follower snapshots must retain their canonical observation scope"); protectedSnapshots++; }
+        return snapshot(...args);
+      };
+      return store;
+    }, createTelegramWorkspaceRestoreResolver(options: Parameters<typeof ThreadModel.createTelegramWorkspaceRestoreResolver>[0]) {
       const resolve = ThreadModel.createTelegramWorkspaceRestoreResolver(options);
       return () => { const view = resolve(); if (view) { if (originalView) assert.equal(view, originalView); originalView = view; } return view; };
     } } });
@@ -12085,18 +12146,29 @@ test(`Production separate OS Restore follower separates original ACK from menu p
       }
       return undefined;
     };
-    const stats = () => {
+    const completion = () => {
       const acknowledgement = originalPlan?.inspectCompletion();
       if (acknowledgement) {
         assert.deepEqual(acknowledgement, originalPlan!.source);
         assert.deepEqual(acknowledgement, { ...sourceDigest, journalBindingKey: sourceBinding });
       }
-      return { pid: process.pid, lockState, polls, creations, menus, menuReturned, sourceRemovals, sourceBinding, sourceDigest,
+      return acknowledgement;
+    };
+    let statsCalls = 0, prematureAckProgressReads = 0;
+    const progress = () => {
+      if (originalPlan && sourceRemovals === 0) prematureAckProgressReads++;
+      return { pid: process.pid, menus, menuReturned, sourceRemovals, sourceAck: completion(),
+        publicationPending: publication?.hasPending(), restoreButton: !!button("rerouterestore:"), followerButton: !!button("reroutenew:", 102) };
+    };
+    const stats = () => {
+      statsCalls++;
+      const acknowledgement = completion();
+      return { pid: process.pid, lockState, polls, creations, menus, menuReturned, sourceRemovals, sourceBinding, sourceDigest, statsCalls, prematureAckProgressReads,
         durableCompletion, sourceAck: acknowledgement, preparedSource: originalPlan?.source, journalBindingKey: binding?.recoveryKey,
         originalPending: binding?.journal.read().entries.some(row => row.updateId === 100),
         publicationPending: publication?.hasPending(), publicationUnconfirmed: publication?.hasUnconfirmed(),
         viewRows: originalView && LockModel.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction"), () => originalView!.listLiveRebindings()),
-        registrationPids, menuRequests, menuTrace, deletions, dispatches: dispatches.length, settingsCalls,
+        registrationPids, menuRequests, menuTrace, deletions, dispatches: dispatches.length, settingsCalls, workspaceObservations, protectedSnapshots,
         registered: registry?.list().map(value => ({ instanceId: value.instanceId, sessionId: value.sessionId, pid: value.pid, target: value.target, capabilities: value.protocol?.capabilities })),
         restoreButton: !!button("rerouterestore:"), followerButton: !!button("reroutenew:", 102), notices };
     };
@@ -12109,6 +12181,7 @@ test(`Production separate OS Restore follower separates original ACK from menu p
         submit({ update_id: command === "restore" ? 101 : 102, callback_query: { id: command, from: { id: 77, is_bot: false }, data: row.data,
           message: { message_id: row.messageId, date: 1, chat: { id: 77, type: "private" }, message_thread_id: row.threadId } } });
       } else if (command === "release") releaseMenu();
+      else if (command === "progress") return progress();
       else if (command === "diagnostics") return { ...stats(), logs: await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8").catch(() => "missing") };
       else if (command === "stop") {
         releaseMenu(); await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx); stopped = true;
@@ -12137,7 +12210,7 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     sourceAck?: Updates.TelegramDeferredSourceEvidence; preparedSource?: Updates.TelegramDeferredSourceEvidence; journalBindingKey?: string; originalPending?: boolean; publicationPending?: boolean; publicationUnconfirmed?: boolean;
     viewRows?: Threads.TelegramWorkspaceLiveRebindIntent[]; registrationPids?: number[]; menuRequests?: Array<{ instanceId: string; operationId: string }>;
     menuTrace?: Array<{ phase: string; requestId: string; replyRequestId?: string; elapsedMs: number; ok?: boolean; errorCode?: string }>;
-    deletions?: unknown[]; dispatches?: number; settingsCalls?: number; registered?: Array<{ instanceId: string; sessionId: string; pid?: number; target: { chatId: number; threadId?: number }; capabilities?: readonly string[] }>;
+    deletions?: unknown[]; dispatches?: number; settingsCalls?: number; statsCalls?: number; prematureAckProgressReads?: number; workspaceObservations?: number; protectedSnapshots?: number; registered?: Array<{ instanceId: string; sessionId: string; pid?: number; target: { chatId: number; threadId?: number }; capabilities?: readonly string[] }>;
     restoreButton?: boolean; followerButton?: boolean; notices?: string[]; stopped?: boolean };
   const launch = (role: "leader" | "follower") => launchProductionRootFixture<Stats>(`native-restore-${role}`, `
     import assert from "node:assert/strict";
@@ -12160,20 +12233,30 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     const leader = launch("leader"), follower = launch("follower"); roots.push(leader, follower);
     assert.equal((await leader.ready).pid, leader.pid); assert.equal((await follower.ready).pid, follower.pid);
     assert.notEqual(leader.pid, follower.pid);
-    await leader.request("connect"); await follower.request("connect");
+    await leader.request("connect"); const connectedFollower = await follower.request("connect");
     const registered = (await leader.request("stats")).registered!;
     assert.equal(registered.length, 1); assert.equal(registered[0]!.pid, follower.pid); assert.equal(registered[0]!.sessionId, "native-restore-follower");
     for (const capability of [...Bus.TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES, Bus.TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES]) assert.ok(registered[0]!.capabilities?.includes(capability));
     await leader.request("admit");
-    await waitForAsyncCondition(async () => (await leader.request("stats")).restoreButton === true, 5000);
+    await waitForAsyncCondition(async () => (await leader.request("progress")).restoreButton === true, 5000);
     await leader.request("restore");
-    await waitForAsyncCondition(async () => (await leader.request("stats")).followerButton === true, 5000);
-    await leader.request("choose-follower");
-    await waitForAsyncCondition(async () => {
-      leaderObserved = await leader.request("stats"); followerObserved = await follower.request("stats");
-      return leaderObserved.menus === 1 && leaderObserved.sourceRemovals === 1 && !!followerObserved.sourceAck && followerObserved.publicationPending === true;
-    }, 5000);
-    const before = leaderObserved!, recipient = followerObserved!;
+    await waitForAsyncCondition(async () => (await leader.request("progress")).followerButton === true, 5000);
+    const selected = await leader.request("choose-follower");
+    // The unchanged native execution/drain and outer test caps own semantic progress, not a separate latency SLA.
+    for (;;) {
+      t.signal.throwIfAborted();
+      const donor = await leader.request("progress");
+      if (donor.menus === 1 && donor.sourceRemovals === 1) {
+        const recipient = await follower.request("progress");
+        if (recipient.sourceAck && recipient.publicationPending === true) { t.signal.throwIfAborted(); break; }
+      }
+      await waitForTimeout(10, undefined, { signal: t.signal });
+    }
+    leaderObserved = await leader.request("stats"); followerObserved = await follower.request("stats");
+    const before = leaderObserved, recipient = followerObserved;
+    assert.equal(before.statsCalls, selected.statsCalls! + 1, "Progress polling must not repeatedly acquire the donor journal and Workspace guards");
+    assert.equal(recipient.statsCalls, connectedFollower.statsCalls! + 1, "Original ACK progress is separate from the full canonical evidence capture");
+    assert.equal(recipient.prematureAckProgressReads, 0, "The observer must not contend with native execution by inspecting its plan before removal ACK");
     assert.deepEqual(recipient.lockState, { kind: "active-elsewhere", pid: leader.pid });
     assert.deepEqual(before.registrationPids, [follower.pid]); assert.equal(recipient.polls, 0);
     assert.equal(before.creations, 3); assert.equal(before.menuReturned, 0); assert.equal(before.sourceRemovals, 1); assert.equal(before.originalPending, false);
@@ -12195,12 +12278,13 @@ test(`Production separate OS Restore follower separates original ACK from menu p
     assert.equal(before.menuRequests?.[0]?.instanceId, registered[0]!.instanceId);
     assert.equal(before.menuRequests?.[0]?.operationId, before.viewRows![0]!.request.operationId);
     assert.equal(recipient.settingsCalls, 1); assert.deepEqual(before.deletions, [102]);
+    assert.ok(recipient.workspaceObservations! > 0); assert.ok(recipient.protectedSnapshots! > 0);
     assert.deepEqual(before.menuTrace?.map(row => row.phase), ["server-call"]);
     assert.deepEqual(recipient.menuTrace?.map(row => row.phase), ["client-call"]);
     assert.equal(before.menuTrace![0]!.requestId, recipient.menuTrace![0]!.requestId);
     assert.equal(before.dispatches, 0); assert.equal(recipient.dispatches, 0);
     await leader.request("release");
-    await waitForAsyncCondition(async () => (await leader.request("stats")).menuReturned === 1 && (await follower.request("stats")).publicationPending === false, 5000);
+    await waitForAsyncCondition(async () => (await leader.request("progress")).menuReturned === 1 && (await follower.request("progress")).publicationPending === false, 5000);
     const after = await leader.request("stats"), afterRecipient = await follower.request("stats");
     assert.equal(after.sourceRemovals, 1); assert.equal(after.menus, 1); assert.equal(after.menuReturned, 1);
     assert.deepEqual(afterRecipient.sourceAck, recipient.sourceAck); assert.deepEqual(after.deletions, [102]);

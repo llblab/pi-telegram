@@ -69,8 +69,11 @@ export interface PiExtensionApiRuntimePorts {
     captureCommandProvider?(): Readonly<PiCommandProviderCapture>;
 }
 export declare function createExtensionApiRuntimePorts(api: Pick<ExtensionAPI, "sendUserMessage" | "exec" | "getCommands" | "getThinkingLevel" | "setThinkingLevel" | "getActiveTools" | "setActiveTools" | "setModel" | "registerCommand">, commandProvider?: true): PiExtensionApiRuntimePorts;
+type PiSettingsManagerFactory = {
+    create: (cwd: string) => unknown | PromiseLike<unknown>;
+};
 export declare function normalizeSettingsManager(manager: unknown): PiSettingsManager;
-export declare function createSettingsManager(cwd: string): Promise<PiSettingsManager>;
+export declare function createSettingsManager(cwd: string, hostFactory?: PiSettingsManagerFactory): Promise<PiSettingsManager>;
 export declare function createScopedModelPatternPersister(deps: {
     createSettingsManager: (cwd: string) => PiSettingsManager | PromiseLike<PiSettingsManager>;
     clearCachedModelMenuInputs: () => void;

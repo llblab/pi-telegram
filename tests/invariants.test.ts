@@ -70,6 +70,17 @@ test("Unreleased changelog respects the project release-entry budget", () => {
   );
 });
 
+test("CI dependency installation has its own bounded timing phase without retry or failure suppression", () => {
+  for (const file of ["validate.yml", "recovery-diagnostics.yml", "release.yml"]) {
+    const source = readFileSync(join(PROJECT_ROOT, ".github", "workflows", file), "utf8");
+    const install = source.match(/      - name: Install (?:exact )?dependencies\n((?:        [^\n]*\n)+)/u)?.[1];
+    assert.ok(install, file);
+    assert.match(install, /^        timeout-minutes: 5$/mu);
+    assert.match(install, /^        run: npm ci --timing$/mu);
+    assert.doesNotMatch(install, /continue-on-error|retry|\|\|/u);
+  }
+});
+
 test("CI native progress stays finite, body-free and separate from native completion", async () => {
   const result = await runNodeEval(String.raw`
     import assert from "node:assert/strict";
@@ -901,7 +912,7 @@ test("Package exports expose only stable public domains", () => {
   ) as { exports?: Record<string, { types: string; default: string }> };
 
   assert.deepEqual(packageJson.exports, {
-    ".": { types: "./dist/index.d.ts", default: "./dist/index.js" },
+    ".": { types: "./dist/index.d.ts", default: "./dist/pi-telegram/index.js" },
     "./inbound": { types: "./dist/api/inbound.d.ts", default: "./dist/api/inbound.js" },
     "./outbound": { types: "./dist/api/outbound.d.ts", default: "./dist/api/outbound.js" },
     "./delivery": { types: "./dist/api/delivery.d.ts", default: "./dist/api/delivery.js" },
@@ -957,9 +968,10 @@ test("Project source avoids empty interface-extension shells", () => {
   assert.deepEqual(emptyInterfaceExtensions, []);
 });
 
-test("Pi SDK imports stay centralized in the pi adapter", () => {
+test("Pi SDK imports stay centralized in the pi adapter and entrypoint-only host leaf", () => {
+  const hostLeaf = normalize(join("lib", "pi-host.ts"));
   const directSdkImportFiles = getProjectSourceFiles().filter((file) => {
-    if (file === normalize(join("lib", "pi.ts"))) return false;
+    if (file === normalize(join("lib", "pi.ts")) || file === hostLeaf) return false;
     const source = readFileSync(join(PROJECT_ROOT, file), "utf8");
     const piSdkPackages = [
       "@mariozechner/pi-coding-agent",
@@ -970,6 +982,13 @@ test("Pi SDK imports stay centralized in the pi adapter", () => {
     return piSdkPackages.some((packageName) => source.includes(packageName));
   });
   assert.deepEqual(directSdkImportFiles, []);
+  assert.deepEqual(getImportSpecifiers(hostLeaf), ["@earendil-works/pi-coding-agent"]);
+  const hostConsumers = getProjectSourceFiles().filter(file =>
+    getImportSpecifiers(file).some(specifier => specifier.endsWith("/pi-host.ts")));
+  assert.deepEqual(hostConsumers, []);
+  assert.deepEqual(getImportSpecifiers("dist/pi-telegram/index.js"), [
+    "../index.js", "../lib/pi-host.js", "../lib/pi.js",
+  ]);
 });
 
 test("Entrypoint stays free of direct Node runtime imports", () => {

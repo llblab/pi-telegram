@@ -10,7 +10,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const PI_CLI_AVAILABLE = (() => {
@@ -81,7 +81,7 @@ function runNodeScript(
 }
 
 /** Fixed stage names and resource types only; synchronous writes and exit listeners add no referenced timer or pipe. */
-function processProbePrelude(role: "parent" | "child"): string {
+function processProbePrelude(role: "parent" | "child" | "loader"): string {
   return `
     import { writeSync as writeProcessProbe } from "node:fs";
     const processProbeStartedAt = performance.now();
@@ -99,6 +99,30 @@ function processProbePrelude(role: "parent" | "child"): string {
     process.once("exit", () => traceProcessStage("exit"));
     traceProcessStage("eval");
   `;
+}
+
+function piPrintModuleObserver(): string {
+  const watched = ["index.ts", "lib/extension.ts", "lib/pi.ts", "lib/skills.ts"].map((path, index) =>
+    [pathToFileURL(join(REPO_ROOT, path)).href, ["entry", "root", "adapter", "skills"][index]]);
+  const source = processProbePrelude("loader") + `
+    import { registerHooks } from "node:module";
+    const watched = new Map(${JSON.stringify(watched)}), seen = new Set();
+    const once = stage => { if (!seen.has(stage)) { seen.add(stage); traceProcessStage(stage); } };
+    registerHooks({
+      load(url, context, nextLoad) {
+        const selected = watched.get(url.split("?")[0]);
+        if (!selected) return nextLoad(url, context);
+        once(selected + "-load-entered");
+        try {
+          const result = nextLoad(url, context);
+          once(selected + "-load-returned");
+          return result;
+        } catch (error) { once(selected + "-load-rejected"); throw error; }
+      }
+    });
+    traceProcessStage("loader-ready");
+  `;
+  return "--import=data:text/javascript;base64," + Buffer.from(source).toString("base64");
 }
 
 async function waitForFileText(
@@ -179,6 +203,7 @@ async function createPiPrintFixtureExtension(tempDir: string): Promise<string> {
       `    mkdirSync(ownersDir, { recursive: true });\n` +
       `    writeFileSync(join(ownersDir, "state.json"), JSON.stringify({ version: 2, profiles: { default: { transport: { pid: process.pid } } } }) + "\\n", { mode: 0o600 });\n` +
       `  }\n` +
+      `  pi.on("resources_discover", () => { traceProcessStage("resources-discover"); });\n` +
       `  pi.on("session_start", (_event, ctx) => {\n` +
       `    traceProcessStage("session-start");\n` +
       `    const forcedMode = process.env.PI_TELEGRAM_TEST_CTX_MODE;\n` +
@@ -281,7 +306,9 @@ async function runPiPrintWithTelegram(
       "echo",
       "Say OK.",
     ],
-    { env: { PI_CODING_AGENT_DIR: agentDir, ...env } },
+    { env: { PI_CODING_AGENT_DIR: agentDir, ...env,
+      NODE_OPTIONS: [env.NODE_OPTIONS ?? process.env.NODE_OPTIONS, piPrintModuleObserver()].filter(Boolean).join(" "),
+    } },
   );
 }
 
@@ -292,6 +319,21 @@ test("Process diagnostics preserve natural exit without keeping the child alive"
   assert.equal(result.stdout, "");
   assert.match(result.stderr, /\[process-probe\].*"stage":"eval"/);
   assert.match(result.stderr, /\[process-probe\].*"stage":"before-exit"/);
+});
+
+test("Pi startup module observer preserves actual cold imports and natural exit", async () => {
+  const result = await runNodeScript(`await import(${JSON.stringify(new URL("../index.ts", import.meta.url).href)});`,
+    { env: { NODE_OPTIONS: [process.env.NODE_OPTIONS, piPrintModuleObserver()].filter(Boolean).join(" ") } });
+  assert.equal(result.code, 0, result.stderr); assert.equal(result.signal, null);
+  const records = Array.from(result.stderr.matchAll(/\[process-probe\] (\{[^\n]+\})/g), match => JSON.parse(match[1]!));
+  assert.ok(records.length <= 12);
+  for (const stage of ["entry", "root", "adapter", "skills"]) {
+    assert.equal(records.filter(row => row.stage === `${stage}-load-entered`).length, 1);
+    assert.equal(records.filter(row => row.stage === `${stage}-load-returned`).length, 1);
+  }
+  assert.ok(records.every(row => row.role === "loader"));
+  assert.doesNotMatch(result.stderr, /["'](?:url|path|specifier|source)["']\s*:/);
+  assert.equal(records.at(-1)!.stage, "exit");
 });
 
 test("Process diagnostics identify an injected shutdown stall without exposing fixture secrets", async () => {

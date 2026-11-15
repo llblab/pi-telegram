@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+## 0.59.2: Managed Host Settings Hotfix
+
+- `Host compatibility`: Restores `/start` and model settings for managed npm/git installations without local Pi peers by supplying the loader-mapped host SettingsManager at the package entrypoint. Cold domain imports remain SDK-lazy; no duplicate host dependency or private loader path is introduced. Addresses #380's blocking settings-import defect; its separate Threaded Mode observations remain under investigation.
+- `Workspace observations`: Serializes follower retained-intent and live-binding observations with atomic envelope publishers through the existing canonical guard. Each synchronous recipient assertion uses one frame with the same original reader and revision history; strict damaged-state refusal, publication-frame checks and source-removal authority are unchanged. Read scopes grant neither recovery nor replay.
+- `Validation`: Restore fixtures isolate state and drain original/successor sessions before shared-state restoration or directory deletion. Startup checkpoints and post-donor-ACK observation retain source/publication proof. ACK observation uses the existing native execution/drain budget instead of a five-second sub-limit; native/parent deadlines stay unchanged. Historical stalls remain unattributed.
+- `CI installation`: Bounds dependency installation to five minutes in validation, recovery and publication jobs and enables npm timing diagnostics. Installation failure remains blocking, without retries or failure suppression; test deadlines and matrix allocation are unchanged. The original missing-log install-stage cancellation remains unattributed.
+
 ## 0.59.1: Explicit Attachment Targets
 
 - `Attachments`: Rejects explicit `chat_id` or `thread_id` during an active Telegram turn before reading files or changing its attachment queue, instead of silently attaching to the current reply. Untargeted current-turn attachments and immediate delivery outside a Telegram turn remain unchanged.
