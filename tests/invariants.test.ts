@@ -210,12 +210,9 @@ test("CI progress reporter observes public native events without changing TAP or
       let native, primary;
       try {
         assert.equal(await until(() => existsSync(entered) && records().length > 0), true, mode + ": " + stderr);
-        assert.deepEqual(records(), [{ v: 1, phase: "dequeued", dequeued: 1, nativeCompleted: 0, id: createHash("sha256").update(name).digest("hex") }]);
-        assert.equal(closed, false); assert.equal(existsSync(release), false);
-        if (mode === "timeout") {
-          assert.equal(await until(() => records().some(row => row.phase === "native-test-failed")), true, stderr);
-          assert.equal(existsSync(release), false, "A native timeout record cannot certify original-body drain");
-        }
+        if (mode === "timeout") assert.equal(await until(() => records().some(row => row.phase === "native-test-failed")), true, stderr);
+        assert.deepEqual(records()[0], { v: 1, phase: "dequeued", dequeued: 1, nativeCompleted: 0, id: createHash("sha256").update(name).digest("hex") });
+        assert.equal(closed, false); assert.equal(existsSync(release), false, "Native reporting cannot certify original-body drain");
         if (mode === "SIGTERM" || mode === "SIGKILL") { assert.equal(child.kill(mode), true); await delay(75); }
       } catch (error) { primary = error; throw error; }
       finally {

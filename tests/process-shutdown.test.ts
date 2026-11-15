@@ -6,6 +6,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,7 +21,7 @@ const PI_CLI_AVAILABLE = (() => {
 
 function runNodeScript(
   script: string,
-  options: { env?: NodeJS.ProcessEnv; timeoutMs?: number; exitTimeoutMs?: number } = {},
+  options: { env?: NodeJS.ProcessEnv; timeoutMs?: number; exitTimeoutMs?: number; observationPath?: string } = {},
 ): Promise<{
   code: number | null;
   signal: NodeJS.Signals | null;
@@ -45,18 +46,16 @@ function runNodeScript(
     stdout += chunk;
   });
   return new Promise((resolve, reject) => {
-    let exitTimeout: ReturnType<typeof setTimeout> | undefined;
+    let exitTimeout: ReturnType<typeof setTimeout> | undefined, failure: Error | undefined;
     const clearDeadlines = () => {
       clearTimeout(timeout);
       if (exitTimeout) clearTimeout(exitTimeout);
     };
     const fail = (deadline: "overall" | "exit") => {
       clearDeadlines();
-      child.kill("SIGKILL");
       const phase = options.exitTimeoutMs === undefined ? "" : ` deadline=${deadline}`;
-      reject(new Error(
-        `Child process did not exit. elapsedMs=${Math.round(performance.now() - startedAt)}${phase} stdout=${stdout} stderr=${stderr}`,
-      ));
+      failure ??= new Error(`Child process did not exit. elapsedMs=${Math.round(performance.now() - startedAt)}${phase} stdout=${stdout} stderr=${stderr}`);
+      child.kill("SIGKILL");
     };
     const timeout = setTimeout(() => fail("overall"), options.timeoutMs ?? 20_000);
     timeout.unref?.();
@@ -71,11 +70,12 @@ function runNodeScript(
     });
     child.on("error", (error) => {
       clearDeadlines();
-      reject(error);
+      failure ??= error;
     });
-    child.on("exit", (code, signal) => {
+    child.on("close", (code, signal) => {
       clearDeadlines();
-      resolve({ code, signal, stdout, stderr });
+      if (failure) { appendSourceReadDiagnostic(failure, child.pid, options.observationPath); reject(failure); }
+      else resolve({ code, signal, stdout, stderr });
     });
   });
 }
@@ -101,13 +101,40 @@ function processProbePrelude(role: "parent" | "child" | "loader"): string {
   `;
 }
 
-function piPrintModuleObserver(): string {
+function piPrintModuleObserver(snapshotPath?: string): string {
   const watched = ["index.ts", "lib/extension.ts", "lib/pi.ts", "lib/skills.ts"].map((path, index) =>
     [pathToFileURL(join(REPO_ROOT, path)).href, ["entry", "root", "adapter", "skills"][index]]);
+  const observedSources = readdirSync(join(REPO_ROOT, "lib")).filter(name => /^[a-z0-9-]+\.ts$/.test(name));
   const source = processProbePrelude("loader") + `
-    import { registerHooks } from "node:module";
+    import { registerHooks, syncBuiltinESMExports } from "node:module";
+    import sourceFs from "node:fs";
+    import { join as joinSourceProbe } from "node:path";
+    import { pathToFileURL as sourceProbeUrl } from "node:url";
     const watched = new Map(${JSON.stringify(watched)}), seen = new Set();
+    const watchedPaths = new Map(${JSON.stringify(watched.map(([url, name]) => [fileURLToPath(url!), name]))});
+    const sourcePaths = new Map(${JSON.stringify(observedSources)}.map(name => [joinSourceProbe(${JSON.stringify(join(REPO_ROOT, "lib"))}, name), "source-" + name.slice(0, -3)]));
+    const sourceUrls = new Map([...sourcePaths].map(([path, name]) => [sourceProbeUrl(path).href, name]));
+    // One fixed-size scratch slot survives a killed importer without adding a timer or buffering source text.
+    const snapshotFd = (() => { try { return ${JSON.stringify(snapshotPath ?? null)} === null ? undefined : sourceFs.openSync(${JSON.stringify(snapshotPath ?? null)}, "w", 0o600); } catch { return undefined; } })();
+    if (snapshotFd !== undefined) process.once("exit", () => { try { sourceFs.closeSync(snapshotFd); } catch {} });
+    const snapshot = stage => {
+      if (snapshotFd === undefined) return;
+      try { writeProcessProbe(snapshotFd, (JSON.stringify({ pid: process.pid, stage, elapsedMs: Math.round(performance.now() - processProbeStartedAt) }) + "\\n").padEnd(512, " "), 0, "utf8"); } catch {}
+    };
     const once = stage => { if (!seen.has(stage)) { seen.add(stage); traceProcessStage(stage); } };
+    // Public source reads also cover transpilers that do not enter Node's native module-load hook.
+    const read = sourceFs.readFileSync;
+    sourceFs.readFileSync = function (...args) {
+      const path = args[0];
+      const key = typeof path === "string" ? path : Buffer.isBuffer(path) ? path.toString() : undefined;
+      const selected = key !== undefined ? watchedPaths.get(key) : path instanceof URL ? watched.get(path.href) : undefined;
+      const tracked = selected ?? (key !== undefined ? sourcePaths.get(key) : path instanceof URL ? sourceUrls.get(path.href) : undefined);
+      if (!tracked) return Reflect.apply(read, this, args);
+      snapshot(tracked + "-read-entered"); if (selected) once(selected + "-read-entered");
+      try { const result = Reflect.apply(read, this, args); snapshot(tracked + "-read-returned"); if (selected) once(selected + "-read-returned"); return result; }
+      catch (error) { snapshot(tracked + "-read-rejected"); if (selected) once(selected + "-read-rejected"); throw error; }
+    };
+    syncBuiltinESMExports();
     registerHooks({
       load(url, context, nextLoad) {
         const selected = watched.get(url.split("?")[0]);
@@ -141,9 +168,21 @@ async function waitForFileText(
   assert.fail(`Timed out waiting for ${path}. Current text: ${text}`);
 }
 
+function appendSourceReadDiagnostic(failure: Error, pid: number | undefined, path: string | undefined): void {
+  if (!path) return;
+  try {
+    assert.ok(statSync(path).size <= 512);
+    const observed = JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown; stage?: unknown; elapsedMs?: unknown };
+    assert.equal(observed.pid, pid);
+    assert.ok(typeof observed.stage === "string" && /^[a-z0-9-]{1,100}-read-(?:entered|returned|rejected)$/.test(observed.stage));
+    assert.ok(typeof observed.elapsedMs === "number" && Number.isSafeInteger(observed.elapsedMs) && observed.elapsedMs >= 0);
+    failure.message += "\n[process-observation] " + JSON.stringify({ pid: observed.pid, stage: observed.stage, elapsedMs: observed.elapsedMs });
+  } catch { failure.message += "\n[process-observation] unavailable"; }
+}
+
 function runPiPrint(
   args: string[],
-  options: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+  options: { env?: NodeJS.ProcessEnv; timeoutMs?: number; observationPath?: string } = {},
 ): Promise<{
   code: number | null;
   signal: NodeJS.Signals | null;
@@ -166,20 +205,20 @@ function runPiPrint(
     stderr += chunk;
   });
   return new Promise((resolve, reject) => {
+    let failure: Error | undefined;
     const timeout = setTimeout(() => {
+      failure ??= new Error(`pi -p did not exit. stdout=${stdout} stderr=${stderr}`);
       child.kill("SIGKILL");
-      reject(
-        new Error(`pi -p did not exit. stdout=${stdout} stderr=${stderr}`),
-      );
     }, options.timeoutMs ?? 20_000);
     timeout.unref?.();
     child.on("error", (error) => {
       clearTimeout(timeout);
-      reject(error);
+      failure ??= error;
     });
-    child.on("exit", (code, signal) => {
+    child.on("close", (code, signal) => {
       clearTimeout(timeout);
-      resolve({ code, signal, stdout, stderr });
+      if (failure) { appendSourceReadDiagnostic(failure, child.pid, options.observationPath); reject(failure); }
+      else resolve({ code, signal, stdout, stderr });
     });
   });
 }
@@ -286,6 +325,7 @@ async function runPiPrintWithTelegram(
   fixtureExtension: string,
   env: NodeJS.ProcessEnv = {},
 ) {
+  const observationPath = join(agentDir, "source-read-observation.json");
   return runPiPrint(
     [
       "-p",
@@ -306,8 +346,8 @@ async function runPiPrintWithTelegram(
       "echo",
       "Say OK.",
     ],
-    { env: { PI_CODING_AGENT_DIR: agentDir, ...env,
-      NODE_OPTIONS: [env.NODE_OPTIONS ?? process.env.NODE_OPTIONS, piPrintModuleObserver()].filter(Boolean).join(" "),
+    { observationPath, env: { PI_CODING_AGENT_DIR: agentDir, ...env,
+      NODE_OPTIONS: [env.NODE_OPTIONS ?? process.env.NODE_OPTIONS, piPrintModuleObserver(observationPath)].filter(Boolean).join(" "),
     } },
   );
 }
@@ -322,11 +362,12 @@ test("Process diagnostics preserve natural exit without keeping the child alive"
 });
 
 test("Pi startup module observer preserves actual cold imports and natural exit", async () => {
+  assert.ok(Buffer.byteLength(piPrintModuleObserver()) < 24_000, "The probe must fit Windows' per-variable environment bound");
   const result = await runNodeScript(`await import(${JSON.stringify(new URL("../index.ts", import.meta.url).href)});`,
     { env: { NODE_OPTIONS: [process.env.NODE_OPTIONS, piPrintModuleObserver()].filter(Boolean).join(" ") } });
   assert.equal(result.code, 0, result.stderr); assert.equal(result.signal, null);
   const records = Array.from(result.stderr.matchAll(/\[process-probe\] (\{[^\n]+\})/g), match => JSON.parse(match[1]!));
-  assert.ok(records.length <= 12);
+  assert.ok(records.length <= 28);
   for (const stage of ["entry", "root", "adapter", "skills"]) {
     assert.equal(records.filter(row => row.stage === `${stage}-load-entered`).length, 1);
     assert.equal(records.filter(row => row.stage === `${stage}-load-returned`).length, 1);
@@ -334,6 +375,66 @@ test("Pi startup module observer preserves actual cold imports and natural exit"
   assert.ok(records.every(row => row.role === "loader"));
   assert.doesNotMatch(result.stderr, /["'](?:url|path|specifier|source)["']\s*:/);
   assert.equal(records.at(-1)!.stage, "exit");
+});
+
+test("Pi startup observer preserves public source reads and native read rejection", async () => {
+  const files = ["index.ts", "lib/extension.ts", "lib/pi.ts", "lib/skills.ts"].map(path => join(REPO_ROOT, path));
+  const dir = await mkdtemp(join(tmpdir(), "pt-source-observation-")), observationPath = join(dir, "observation.json");
+  try {
+    const result = await runNodeScript(`
+      import assert from "node:assert/strict";
+      import { readFileSync } from "node:fs";
+      import { readFile } from "node:fs/promises";
+      import { pathToFileURL } from "node:url";
+      const files = ${JSON.stringify(files)};
+      for (const [index, path] of files.slice(0, 3).entries()) {
+        const input = index === 0 ? pathToFileURL(path) : index === 1 ? Buffer.from(path) : path;
+        assert.deepEqual(readFileSync(input), await readFile(path));
+      }
+      const extraFile = ${JSON.stringify(join(REPO_ROOT, "lib/agent-messages.ts"))};
+      assert.deepEqual(readFileSync(extraFile), await readFile(extraFile));
+      assert.equal(JSON.parse(readFileSync(${JSON.stringify(observationPath)}, "utf8")).stage, "source-agent-messages-read-returned");
+      assert.throws(() => readFileSync(files[3], "fixture-invalid-encoding"), { code: "ERR_INVALID_ARG_VALUE" });
+      console.log("read-probe-pid:" + process.pid);
+    `, { env: { NODE_OPTIONS: [process.env.NODE_OPTIONS, piPrintModuleObserver(observationPath)].filter(Boolean).join(" ") } });
+    assert.equal(result.code, 0, result.stderr); assert.equal(result.signal, null);
+    const records = Array.from(result.stderr.matchAll(/\[process-probe\] (\{[^\n]+\})/g), match => JSON.parse(match[1]!));
+    assert.ok(records.length <= 28);
+    for (const stage of ["entry", "root", "adapter"]) {
+      assert.equal(records.filter(row => row.stage === `${stage}-read-entered`).length, 1);
+      assert.equal(records.filter(row => row.stage === `${stage}-read-returned`).length, 1);
+    }
+    assert.equal(records.filter(row => row.stage === "skills-read-rejected").length, 1);
+    assert.doesNotMatch(result.stderr, /["'](?:url|path|specifier|source)["']\s*:/);
+    const observation = await readFile(observationPath, "utf8"), observed = JSON.parse(observation);
+    assert.equal(Buffer.byteLength(observation), 512);
+    assert.equal(observed.pid, Number(result.stdout.match(/read-probe-pid:(\d+)/)?.[1]));
+    assert.equal(observed.stage, "skills-read-rejected");
+    assert.deepEqual(Object.keys(observed).sort(), ["elapsedMs", "pid", "stage"]);
+    assert.ok(Number.isSafeInteger(observed.elapsedMs) && observed.elapsedMs >= 0);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+for (const evidence of ["valid", "foreign-pid", "malformed"] as const)
+test(`Source-read diagnostics survive native kill without changing the first failure (${evidence})`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pt-source-kill-")), path = join(dir, "observation.json");
+  try {
+    await assert.rejects(runNodeScript(`
+      ${processProbePrelude("child")}
+      import { readFileSync, writeFileSync } from "node:fs";
+      readFileSync(${JSON.stringify(join(REPO_ROOT, "lib/agent-messages.ts"))});
+      ${evidence === "foreign-pid" ? `writeFileSync(${JSON.stringify(path)}, JSON.stringify({ pid: process.pid + 1, stage: "source-agent-messages-read-returned", elapsedMs: 1 }));` : evidence === "malformed" ? `writeFileSync(${JSON.stringify(path)}, "private-fixture-payload");` : ""}
+      traceProcessStage("event-loop-drained");
+      setInterval(() => {}, 60_000);
+    `, { timeoutMs: 5000, exitTimeoutMs: 1000, observationPath: path,
+      env: { NODE_OPTIONS: [process.env.NODE_OPTIONS, piPrintModuleObserver(path)].filter(Boolean).join(" ") } }), (error: unknown) => {
+      assert.ok(error instanceof Error); assert.match(error.message, /deadline=exit/);
+      if (evidence === "valid") assert.match(error.message, /\[process-observation\] \{"pid":\d+,"stage":"source-agent-messages-read-returned","elapsedMs":\d+\}/);
+      else assert.match(error.message, /\[process-observation\] unavailable/);
+      assert.doesNotMatch(error.message, /private-fixture-payload/);
+      return true;
+    });
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("Process diagnostics identify an injected shutdown stall without exposing fixture secrets", async () => {
