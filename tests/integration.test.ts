@@ -5691,15 +5691,27 @@ async function waitForRuntimeState(context: TestContext, description: string, pr
 async function waitForCondition(
   predicate: () => boolean,
   timeoutMs = 2000,
+  signal?: AbortSignal,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     if (predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    if (signal) await waitForTimeout(10, undefined, { signal });
+    else await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  signal?.throwIfAborted();
   if (predicate()) return;
   throw new Error("Timed out waiting for condition");
 }
+
+test("Runtime condition cancellation ends its original polling without another predicate", async () => {
+  const controller = new AbortController();
+  let polls = 0;
+  await assert.rejects(waitForCondition(() => { polls++; controller.abort(); return false; }, 1000, controller.signal), { name: "AbortError" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(polls, 1);
+});
 
 async function waitForAsyncCondition(
   predicate: () => Promise<boolean>,
@@ -6439,10 +6451,12 @@ test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-c
   }
 }, 60_000);
 
-for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(`Production startup spends previous-process Restore originals without delivery even after their Thread becomes bound (sibling=${siblingTiming})`, async () => {
+for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(`Production startup spends previous-process Restore originals without delivery even after their Thread becomes bound (sibling=${siblingTiming})`, async t => {
   const withSibling = siblingTiming !== "none", siblingUpdateId = siblingTiming === "live" ? 103 : 99;
-  const config = await createRuntimeTelegramConfigFixture();
-  const agentDir = await ensureRuntimeAgentDir();
+  const previousAgentDir = runtimeAgentDir, previousAgentEnv = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-previous-restore-")));
+  runtimeAgentDir = agentDir; process.env.PI_CODING_AGENT_DIR = agentDir;
+  const config = await createRuntimeTelegramConfigFixture(agentDir);
   const dir = join(agentDir, "tmp", "pi-telegram");
   const dispatched: RuntimeHarnessMessage[] = [];
   const { handlers, commands, pi } = createRuntimePiHarness({ sendUserMessage: content => dispatched.push(content) });
@@ -6485,11 +6499,33 @@ for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(
     }
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
-  try {
+  let phase = "created", assertionsPassed = false, completed = false;
+  let work: Promise<void> | undefined, shutdown: Promise<void> | undefined;
+  let seed: Awaited<ReturnType<typeof createRuntimeSeedWorkspaceStore>> | undefined;
+  const checkpoint = (next: string) => { phase = next; t.signal.throwIfAborted(); };
+  const stop = () => shutdown ??= Promise.resolve().then(async () => {
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+  });
+  const onAbort = () => { releaseLiveSibling?.(); void stop().catch(() => {}); };
+  t.signal.addEventListener("abort", onAbort, { once: true });
+  t.after(async () => {
+    t.signal.removeEventListener("abort", onAbort);
+    if (!completed) console.error("previous-restore-phase:" + JSON.stringify({ siblingTiming, phase, polls, methods: methods.slice(-32),
+      resources: process.getActiveResourcesInfo().slice(0, 16) }));
+    await work?.catch(() => {});
+    await stop();
+    await seed?.release();
+    restoreFetch(); await config.restore();
+    runtimeAgentDir = previousAgentDir;
+    if (previousAgentEnv === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentEnv;
+    await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }, { timeout: 20_000 }); // Cleanup is bounded separately; it cannot turn the original test timeout into success.
+  work = (async () => { try {
+    checkpoint("config");
     await config.write({ botToken: "123:abc", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } });
-    await writeRuntimeTelegramLocks({});
-    await stageRuntimeV02712Artifacts();
-    const seed = await createRuntimeSeedWorkspaceStore();
+    checkpoint("empty-transport"); await writeRuntimeTelegramLocks({});
+    checkpoint("stage-history"); await stageRuntimeV02712Artifacts();
+    checkpoint("seed-owner"); seed = await createRuntimeSeedWorkspaceStore();
     const threads = seed.threads;
     const binding = { ...Threads.createTelegramWorkspaceBindingIdentity(ctx.cwd, 0, ctx.sessionManager.getSessionId())!,
       slot: "A", threadName: "Atlas", target: { chatId: 77, threadId: 10 }, updatedAtMs: 1 };
@@ -6526,18 +6562,21 @@ for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(
     assert.equal(relocated?.phase, "relocated", JSON.stringify({ request, intents: store.list(),
       bindings: threads.listWorkspaceBindings(), records: threads.list() }));
     await seed.release();
-    (await getRuntimeTelegramExtension())(pi);
-    await handlers.get("session_start")?.({}, ctx);
-    await commands.get("telegram-connect")?.handler("", ctx);
+    checkpoint("root-import"); const extension = await getRuntimeTelegramExtension();
+    checkpoint("root-construction"); extension(pi);
+    checkpoint("session-start"); await handlers.get("session_start")?.({}, ctx);
+    checkpoint("connect"); await commands.get("telegram-connect")?.handler("", ctx);
+    checkpoint("current-menu");
     try {
-      await waitForCondition(() => messages.some(message => JSON.stringify(message).includes("menu:model")), 10_000);
+      await waitForCondition(() => messages.some(message => JSON.stringify(message).includes("menu:model")), 10_000, t.signal);
     } catch (error) {
       throw new Error(`${String(error)}\n${JSON.stringify({ methods, messages, dispatched })}\n${await readFile(join(dir, "logs.jsonl"), "utf8")}`);
     }
     if (siblingTiming === "live") {
       releaseLiveSibling!();
-      await waitForCondition(() => messages.filter(message => JSON.stringify(message).includes("menu:model")).length >= 2, 10_000);
+      await waitForCondition(() => messages.filter(message => JSON.stringify(message).includes("menu:model")).length >= 2, 10_000, t.signal);
     }
+    checkpoint("original-source-assertions");
     assert.deepEqual(dispatched, []);
     assert.doesNotMatch(JSON.stringify(messages), /Historical inputs|reroutecancel:history:/);
     assert.equal(journal.read().entries.some(entry => entry.updateId === 100), false, "the new-world restart spends the previous Restore original");
@@ -6551,20 +6590,22 @@ for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(
       assert.equal(journal.inspectAbandonedPending(siblingUpdateId), undefined, "neither spending nor a hold is private cancellation");
     }
     // The new world forgets the previous Restore and temporary entry; the restored tab stays bound and is never deleted.
-    await waitForCondition(() => store.list().length === 0 && store.listTemporaryThreads().length === 0, 10_000);
+    checkpoint("history-retired");
+    await waitForCondition(() => store.list().length === 0 && store.listTemporaryThreads().length === 0, 10_000, t.signal);
     if (siblingTiming === "live") assert.ok(messages.filter(message => JSON.stringify(message).includes("menu:model")).length >= 2);
     await threads.load();
     assert.equal(threads.listWorkspaceBindings().find(value => value.bindingKey === binding.bindingKey)?.target.threadId, 42);
     assert.equal(threads.listWorkspaceBindings().find(value => value.bindingKey === binding.bindingKey)?.slot, "A");
     assert.equal(methods.includes("createForumTopic"), false);
     assert.equal(methods.includes("deleteForumTopic"), false);
+    assertionsPassed = true;
   } finally {
     releaseLiveSibling?.();
-    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
-    await rm(join(dir, "state.json"), { force: true });
-    restoreFetch();
-    await config.restore();
-  }
+    phase = assertionsPassed ? "shutdown" : phase;
+    await stop();
+    completed = assertionsPassed;
+  } })();
+  await work;
 }, 20_000);
 
 test("Graceful preserved leader quit publishes inactivity and restores its intact Workspace", async () => {
