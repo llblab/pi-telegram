@@ -11885,6 +11885,8 @@ function launchProductionRootFixture<TStats extends { pid: number }>(role: strin
       if (checkpoints.length > 16) checkpoints.shift();
       return;
     }
+    // Late bootstrap is observation, never readiness or a renewed execution clock after failure.
+    if (failure) return;
     if (message.id === 0) {
       if (message.result?.pid === child.pid && readyOrdinal === undefined) readyOrdinal = ++productionRootFixtureSequence;
       clearTimeout(timer); timer = setTimeout(() => deadline("execution/drain timeout"), executionMs);
@@ -11938,18 +11940,37 @@ test("OS-root fixture retains its first deadline failure through native close", 
   assert.ok(retained.checkpoints.every(row => row.phase === "static-imports-complete" && row.elapsedMs >= 0));
 }, 15000);
 
-test("OS-root startup checkpoints cannot acknowledge readiness or renew the original deadline", async () => {
+test("OS-root startup checkpoints cannot acknowledge readiness or renew the original deadline", async t => {
+  const { ChildProcess } = await import("node:child_process"), nativeKill = ChildProcess.prototype.kill;
+  let controlledPid: number | undefined, intercepted = false, lateReadyObserved = false;
+  t.mock.method(ChildProcess.prototype, "kill", function (this: import("node:child_process").ChildProcess, signal?: NodeJS.Signals | number) {
+    if (controlledPid === undefined || this.pid !== controlledPid || intercepted || signal !== "SIGKILL") return nativeKill.call(this, signal);
+    intercepted = true;
+    // Hold only this control's first kill long enough for a real, post-failure native ready message.
+    const force = nativeSetTimeout(() => nativeKill.call(this, "SIGKILL"), 500);
+    const observe = (raw: unknown) => {
+      const message = raw as { id?: number; result?: { pid?: number } };
+      if (message.id !== 0 || message.result?.pid !== this.pid) return;
+      lateReadyObserved = true; clearTimeout(force); this.off("message", observe); nativeKill.call(this, "SIGKILL");
+    };
+    this.on("message", observe);
+    this.once("close", () => { clearTimeout(force); this.off("message", observe); });
+    this.send({ control: "finish-bootstrap" });
+    return true;
+  });
   const fixture = launchProductionRootFixture<{ pid: number }>("startup-progress-control", `
-    process.on("message", () => {});
+    process.on("message", raw => { if (raw.control === "finish-bootstrap") process.send?.({ id: 0, result: { pid: process.pid } }); });
     setInterval(() => process.send?.({ id: 0, fixtureCheckpoint: "waiting-without-ready", pid: process.pid }), 5);
-  `, 25);
+  `, 1000);
+  controlledPid = fixture.pid;
   try {
     const first = await fixture.ready.then(() => undefined, error => error);
     assert.ok(first instanceof Error);
     assert.match(first.message, /OS-root startup timeout \(startup-progress-control; checkpoint=waiting-without-ready\)/u);
     await assert.rejects(fixture.waitForExit(), error => error === first, "Progress cannot replace the exact original startup failure at native close");
     const retained = fixture.diagnostics();
-    assert.equal(retained.readyOrdinal, undefined); assert.equal(retained.closed, true);
+    assert.equal(lateReadyObserved, true, "The original child actually reports late readiness after its startup failure");
+    assert.equal(retained.readyOrdinal, undefined, "A late native ready message cannot mint readiness after the first failure"); assert.equal(retained.closed, true);
     assert.equal(retained.firstFailure, first.message);
     assert.equal(retained.checkpoints.length, 16);
     assert.ok(retained.checkpoints.every(row => row.phase === "waiting-without-ready" && row.elapsedMs >= 0));
@@ -12960,7 +12981,10 @@ for (const ownershipFault of loss === "root" ? [false, true] : [false])
 for (const ipcLoss of loss === "root" && !ownershipFault ? [false, true] : [false])
 test(`Production separate OS roots retain original lifetimes across namespace loss (${artifact}/${profile ?? "default"}/${loss}${refreshBoundary ? `/refresh-${refreshBoundary}` : ""}${ownershipFault ? "/ownership-read-refusal" : ""}${ipcLoss ? "/issued-ipc-loss" : ""})`, async () => {
   const childRun = async (role: "leader" | "follower", agentDir: string) => {
+    const checkpoint = (phase: string) => process.send?.({ fixtureCheckpoint: phase, pid: process.pid });
+    checkpoint("net-import");
     const Net = await import("node:net"), nativeWrite = Net.Socket.prototype.write;
+    checkpoint("net-imported");
     let originalPublishSocket: import("node:net").Socket | undefined;
     Net.Socket.prototype.write = function (this: import("node:net").Socket,
       ...args: Parameters<typeof nativeWrite> | [Parameters<typeof nativeWrite>[0], Parameters<typeof nativeWrite>[2]?]) {
@@ -12975,11 +12999,19 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     const threadUrl = new URL(artifact === "source" ? "./lib/threads.ts" : "./dist/lib/threads.js", import.meta.url);
     const busUrl = new URL(artifact === "source" ? "./lib/bus.ts" : "./dist/lib/bus.js", import.meta.url);
     const lockUrl = new URL(artifact === "source" ? "./lib/locks.ts" : "./dist/lib/locks.js", import.meta.url);
-    const ThreadModel: typeof Threads = await import(threadUrl.href), BusModel: typeof Bus = await import(busUrl.href), LockModel: typeof Locks = await import(lockUrl.href);
+    checkpoint("threads-import");
+    const ThreadModel: typeof Threads = await import(threadUrl.href);
+    checkpoint("bus-import");
+    const BusModel: typeof Bus = await import(busUrl.href);
+    checkpoint("locks-import");
+    const LockModel: typeof Locks = await import(lockUrl.href);
     const configUrl = new URL(artifact === "source" ? "./lib/config.ts" : "./dist/lib/config.js", import.meta.url);
+    checkpoint("config-import");
     const ConfigModel: typeof import("../lib/config.ts") = await import(configUrl.href);
     const leaderUrl = new URL(artifact === "source" ? "./lib/bus-leader.ts" : "./dist/lib/bus-leader.js", import.meta.url);
+    checkpoint("api-import");
     const ApiModel: typeof import("../lib/telegram-api.ts") = await import(artifact === "source" ? "./lib/telegram-api.ts" : "./dist/lib/telegram-api.js");
+    checkpoint("api-imported");
     const { AsyncLocalStorage } = await import("node:async_hooks");
     const heldRequest = new AsyncLocalStorage<boolean>();
     const transportChecks: Array<{ current: boolean; completed: number }> = [];
@@ -13050,7 +13082,9 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
       } });
     } } });
     // Delegate after installing transport mocks, so the original assembly observes Root's actual server ports.
+    checkpoint("leader-import");
     const LeaderModel: typeof import("../lib/bus-leader.ts") = await import(leaderUrl.href);
+    checkpoint("leader-imported");
     mock.module(leaderUrl.href, { namedExports: { ...LeaderModel, createTelegramBusLeaderRuntimeAssembly(options: Parameters<typeof LeaderModel.createTelegramBusLeaderRuntimeAssembly>[0]) {
       const capture = options.runtime.captureApiTransport, call = options.callApi;
       return LeaderModel.createTelegramBusLeaderRuntimeAssembly({ ...options, runtime: { ...options.runtime, ...(capture ? { captureApiTransport() {
@@ -13071,7 +13105,9 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
       } });
     } } });
     const bindingsUrl = new URL(artifact === "source" ? "./lib/bindings.ts" : "./dist/lib/bindings.js", import.meta.url);
+    checkpoint("bindings-import");
     const BindingsModel: typeof Bindings = await import(bindingsUrl.href);
+    checkpoint("bindings-imported");
     mock.module(bindingsUrl.href, { namedExports: { ...BindingsModel, registerTelegramCommandsAndTools(options: Parameters<typeof BindingsModel.registerTelegramCommandsAndTools>[0]) {
       const record = options.recordRuntimeEvent;
       return BindingsModel.registerTelegramCommandsAndTools({ ...options, recordRuntimeEvent(category, error, details) {
@@ -13298,6 +13334,13 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     const leaderBootstrap = leader.diagnostics(), followerBootstrap = follower.diagnostics();
     assert.ok(leaderBootstrap.readyOrdinal !== undefined);
     assert.ok(followerBootstrap.launchOrdinal > leaderBootstrap.readyOrdinal, "The follower bootstrap must follow actual native leader readiness");
+    for (const bootstrap of [leaderBootstrap, followerBootstrap]) {
+      const phases = bootstrap.checkpoints.map(row => row.phase), bindings = phases.indexOf("bindings-import");
+      assert.ok(bindings >= 0 && phases.indexOf("bindings-imported") > bindings, "Original binding import boundaries must be observed");
+      assert.ok(phases.indexOf("root-import") > phases.indexOf("bindings-imported"));
+      assert.ok(phases.indexOf("root-import-complete") > phases.indexOf("root-import"));
+      assert.equal(phases.at(-1), "session-start-complete", "Only the actual returned session callback precedes native readiness");
+    }
     assert.equal(l.pid, leader.pid); assert.equal(f.pid, follower.pid);
     assert.notEqual(l.pid, f.pid); assert.notEqual(l.pid, process.pid); assert.notEqual(f.pid, process.pid);
     stage = "initial-leader-connect-before-fault";
