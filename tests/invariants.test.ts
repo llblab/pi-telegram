@@ -70,6 +70,17 @@ test("Unreleased changelog respects the project release-entry budget", () => {
   );
 });
 
+test("CI dependency installation has its own bounded timing phase without retry or failure suppression", () => {
+  for (const file of ["validate.yml", "recovery-diagnostics.yml", "release.yml"]) {
+    const source = readFileSync(join(PROJECT_ROOT, ".github", "workflows", file), "utf8");
+    const install = source.match(/      - name: Install (?:exact )?dependencies\n((?:        [^\n]*\n)+)/u)?.[1];
+    assert.ok(install, file);
+    assert.match(install, /^        timeout-minutes: 5$/mu);
+    assert.match(install, /^        run: npm ci --timing$/mu);
+    assert.doesNotMatch(install, /continue-on-error|retry|\|\|/u);
+  }
+});
+
 test("CI native progress stays finite, body-free and separate from native completion", async () => {
   const result = await runNodeEval(String.raw`
     import assert from "node:assert/strict";
