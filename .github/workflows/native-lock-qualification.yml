@@ -55,6 +55,9 @@ jobs:
       - name: Audit the isolated dependency closure
         timeout-minutes: 2
         run: npm audit --prefix tests/fixtures/native-file-lock --omit=dev --json > "$QUALIFICATION_EVIDENCE/audit.json"
+      - name: Verify registry signatures and supplied attestations
+        timeout-minutes: 2
+        run: npm audit signatures --prefix tests/fixtures/native-file-lock --json > "$QUALIFICATION_EVIDENCE/signature-audit.json"
       - name: Qualify actual native behavior in disposable storage
         timeout-minutes: 2
         run: |

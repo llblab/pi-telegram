@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Guard qualification`: Adds a dependency-isolated native lock probe and read-only six-cell x64 CI across Linux, Windows and Intel macOS on Node 22.19/26.8, with registry-signature and supplied-attestation verification before addon loading. Real process/worker witnesses cover exclusion, descriptor lifetime and crash release; countermodels retain uncancelled-wait and inherited-handle limits. No runtime dependency adoption, guard repair or live-state mutation is enabled.
+
 ## 0.59.2: Managed Host Settings Hotfix
 
 - `Host compatibility`: Restores `/start` and model settings for managed npm/git installations without local Pi peers by supplying the loader-mapped host SettingsManager at the package entrypoint. Cold domain imports remain SDK-lazy; no duplicate host dependency or private loader path is introduced. Addresses #380's blocking settings-import defect; its separate Threaded Mode observations remain under investigation.

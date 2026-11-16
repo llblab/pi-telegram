@@ -113,6 +113,9 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
     workflow.match(/^          path: (.+)$/mu)?.[1], "Capture and upload the same context-free evidence directory");
   assert.match(workflow, /^          persist-credentials: false$/mu);
   assert.match(workflow, /npm ci --prefix tests\/fixtures\/native-file-lock --ignore-scripts --bin-links=false/u);
+  assert.match(workflow, /npm audit signatures --prefix tests\/fixtures\/native-file-lock --json/u);
+  assert.ok(workflow.indexOf("npm audit signatures") < workflow.indexOf("node scripts/probe-native-file-lock.mjs"),
+    "Verify registry signatures and supplied attestations before loading the native candidate");
   assert.match(workflow, /^          exit "\$status"$/mu);
   assert.doesNotMatch(workflow, /pull_request_target|workflow_run|^  push:|secrets\.|:\s*write\b|continue-on-error/u);
 });
