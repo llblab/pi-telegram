@@ -30,7 +30,7 @@ jobs:
       run:
         shell: bash
     env:
-      QUALIFICATION_EVIDENCE: ${{ runner.temp }}/native-lock-evidence
+      QUALIFICATION_EVIDENCE: native-lock-evidence
     steps:
       - name: Check out qualification source without retained credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -71,6 +71,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-lock-${{ matrix.os }}-node-${{ matrix.node }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/native-lock-evidence
+          path: native-lock-evidence
           if-no-files-found: error
           retention-days: 14

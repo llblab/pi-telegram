@@ -106,6 +106,11 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
     "scripts/probe-native-file-lock.mjs", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
   ]);
   assert.match(workflow, /^  contents: read$/mu);
+  const jobEnvironment = workflow.match(/^    env:\n((?:      [^\n]+\n)+)/mu)?.[1];
+  assert.ok(jobEnvironment);
+  assert.doesNotMatch(jobEnvironment, /\$\{\{\s*runner\./u, "Runner context is unavailable in job-level env");
+  assert.equal(workflow.match(/^      QUALIFICATION_EVIDENCE: (.+)$/mu)?.[1],
+    workflow.match(/^          path: (.+)$/mu)?.[1], "Capture and upload the same context-free evidence directory");
   assert.match(workflow, /^          persist-credentials: false$/mu);
   assert.match(workflow, /npm ci --prefix tests\/fixtures\/native-file-lock --ignore-scripts --bin-links=false/u);
   assert.match(workflow, /^          exit "\$status"$/mu);
