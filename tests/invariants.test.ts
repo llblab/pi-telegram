@@ -114,8 +114,16 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   assert.match(workflow, /^          persist-credentials: false$/mu);
   assert.match(workflow, /npm ci --prefix tests\/fixtures\/native-file-lock --ignore-scripts --bin-links=false/u);
   assert.match(workflow, /npm audit signatures --prefix tests\/fixtures\/native-file-lock --json/u);
-  assert.ok(workflow.indexOf("npm audit signatures") < workflow.indexOf("node scripts/probe-native-file-lock.mjs"),
-    "Verify registry signatures and supplied attestations before loading the native candidate");
+  for (const probe of ["node scripts/probe-native-file-lock.mjs", "node scripts/probe-owned-native-lease.mjs"]) {
+    assert.ok(workflow.indexOf("npm audit signatures") < workflow.indexOf(probe),
+      "Verify registry signatures and supplied attestations before loading either native candidate");
+  }
+  const ownership = workflow.match(/      - name: Qualify Linux-only environment-owned lease fixture\n((?:        [^\n]*\n)+)/u)?.[1];
+  assert.ok(ownership);
+  assert.match(ownership, /^        if: runner\.os == 'Linux'$/mu);
+  assert.match(ownership, /-DOWNED_LEASE_SUPPRESS_TEARDOWN=1/u);
+  assert.match(ownership, /test "\$status" -eq 1/u);
+  assert.match(ownership, /Actual Worker exit, not a stop request or JS finally, precedes reacquisition/u);
   assert.match(workflow, /^          exit "\$status"$/mu);
   assert.doesNotMatch(workflow, /pull_request_target|workflow_run|^  push:|secrets\.|:\s*write\b|continue-on-error/u);
 });
