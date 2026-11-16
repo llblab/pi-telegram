@@ -103,7 +103,7 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   const paths = workflow.match(/^    paths:\n((?:      - [^\n]+\n)+)/mu)?.[1];
   assert.ok(paths);
   assert.deepEqual(paths.trim().split("\n").map(line => line.trim().replace(/^- "|"$/gu, "")), [
-    "scripts/probe-native-file-lock.mjs", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
+    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
   ]);
   assert.match(workflow, /^  contents: read$/mu);
   const jobEnvironment = workflow.match(/^    env:\n((?:      [^\n]+\n)+)/mu)?.[1];
@@ -118,9 +118,11 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
     assert.ok(workflow.indexOf("npm audit signatures") < workflow.indexOf(probe),
       "Verify registry signatures and supplied attestations before loading either native candidate");
   }
-  const ownership = workflow.match(/      - name: Qualify Linux-only environment-owned lease fixture\n((?:        [^\n]*\n)+)/u)?.[1];
+  const ownership = workflow.match(/      - name: Qualify Linux and Darwin environment-owned lease fixture\n((?:        [^\n]*\n)+)/u)?.[1];
   assert.ok(ownership);
-  assert.match(ownership, /^        if: runner\.os == 'Linux'$/mu);
+  assert.match(ownership, /^        if: runner\.os == 'Linux' \|\| runner\.os == 'macOS'$/mu);
+  assert.match(ownership, /flags\+=\(-bundle -undefined dynamic_lookup\)/u);
+  assert.doesNotMatch(ownership, /sha256sum/u, "Fingerprint through Node rather than a Linux-only tool");
   assert.match(ownership, /-DOWNED_LEASE_SUPPRESS_TEARDOWN=1/u);
   assert.match(ownership, /test "\$status" -eq 1/u);
   assert.match(ownership, /Actual Worker exit, not a stop request or JS finally, precedes reacquisition/u);

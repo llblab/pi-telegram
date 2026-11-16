@@ -1,12 +1,19 @@
 /*
- * Linux-only qualification fixture for environment-owned kernel leases.
+ * Linux/Darwin qualification fixture for environment-owned kernel leases.
  * Zones: native resource lifetime, disposable validation
  * Not a production backend, stable API, migration or recovery implementation.
- * Build: cc -std=c11 -shared -fPIC -I <public-node-include> owned-lease.c -o owned-lease.node
+ * Linux build: cc -std=c11 -shared -fPIC -I <public-node-include> owned-lease.c -o owned-lease.node
+ * Darwin build: use -bundle -undefined dynamic_lookup instead of -shared.
  */
 #define _GNU_SOURCE
-#ifndef __linux__
-#error "This ownership prototype is qualified on Linux only"
+#define _DARWIN_C_SOURCE
+#if defined(__linux__)
+#define LEASE_FIXTURE_KIND "linux-owned-lease-prototype-v1"
+#elif defined(__APPLE__) && defined(__MACH__)
+#define LEASE_FIXTURE_KIND "darwin-owned-lease-prototype-v1"
+#include <sys/file.h>
+#else
+#error "This ownership prototype supports Linux and Darwin only"
 #endif
 #include <node_api.h>
 #include <errno.h>
@@ -46,8 +53,8 @@ static napi_value system_failure(napi_env env, int number, const char *operation
   napi_throw(env, error);
   return NULL;
 }
-/* Spend before close. Linux may retire a descriptor even when close reports an error;
- * retrying its number could close a later unrelated resource. No blind close retry. */
+/* Spend before close: an error need not preserve descriptor ownership, so retrying
+ * the number could close a successor. Error retirement remains unqualified; no retry. */
 static int close_once(lease *value) {
   if (value->spent) return 0;
   const int fd = value->fd;
@@ -109,16 +116,28 @@ static napi_value try_acquire(napi_env env, napi_callback_info info) {
   if (!S_ISREG(identity.st_mode) || identity.st_nlink != 1 || (identity.st_mode & 0077) != 0) {
     (void)close(fd); return fail(env, "ERR_LEASE_ANCHOR", "Anchor must be a private single-link regular file");
   }
+#if defined(__linux__)
   struct flock request = { 0 };
   request.l_type = F_WRLCK; request.l_whence = SEEK_SET;
-  if (fcntl(fd, F_OFD_SETLK, &request) < 0) {
+  const int locked = fcntl(fd, F_OFD_SETLK, &request);
+  const char *operation = "fcntl";
+#else
+  const int locked = flock(fd, LOCK_EX | LOCK_NB);
+  const char *operation = "flock";
+#endif
+  if (locked < 0) {
     const int error = errno; (void)close(fd);
-    if (error == EAGAIN || error == EACCES) {
+#if defined(__linux__)
+    const bool not_acquired = error == EAGAIN || error == EACCES;
+#else
+    const bool not_acquired = error == EWOULDBLOCK;
+#endif
+    if (not_acquired) {
       napi_value missing;
       if (napi_get_undefined(env, &missing) != napi_ok) return api_failure(env);
       return missing; /* Not acquired, never proof of a live owner or semantic authority. */
     }
-    return system_failure(env, error, "fcntl");
+    return system_failure(env, error, operation);
   }
   lease *value = calloc(1, sizeof(*value));
   if (!value) { (void)close(fd); return fail(env, "ERR_LEASE_MEMORY", "Cannot allocate prototype lease"); }
@@ -165,7 +184,7 @@ NAPI_MODULE_INIT() {
       napi_set_named_property(env, exports, "tryAcquire", method) != napi_ok ||
       napi_create_function(env, "release", NAPI_AUTO_LENGTH, release, context, &method) != napi_ok ||
       napi_set_named_property(env, exports, "release", method) != napi_ok ||
-      napi_create_string_utf8(env, "linux-owned-lease-prototype-v1", NAPI_AUTO_LENGTH, &kind) != napi_ok ||
+      napi_create_string_utf8(env, LEASE_FIXTURE_KIND, NAPI_AUTO_LENGTH, &kind) != napi_ok ||
       napi_set_named_property(env, exports, "fixtureKind", kind) != napi_ok) return api_failure(env);
   return exports;
 }

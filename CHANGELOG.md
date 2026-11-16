@@ -5,7 +5,7 @@
 ## Unreleased
 
 - `Guard qualification`: Adds a dependency-isolated native lock probe and read-only six-cell x64 CI across Linux, Windows and Intel macOS on Node 22.19/26.8, with registry-signature and supplied-attestation verification before addon loading. Real process/worker witnesses cover exclusion, descriptor lifetime and crash release; countermodels retain uncancelled-wait and inherited-handle limits. No runtime dependency adoption, guard repair or live-state mutation is enabled.
-- `Ownership qualification`: Adds a Linux-only N-API opaque-lease fixture and CI recompilation/probe stage with a teardown-suppression falsifier. Disposable Worker witnesses exercise cleanup without unmanaged FD tracking, foreign/spent lease refusal and successor protection. This remains experimental evidence, not a production adapter or other-platform acceptance.
+- `Ownership qualification`: Adds a Linux/Darwin N-API opaque-lease fixture and CI recompilation/probe stage with a teardown-suppression falsifier; either probe's edits trigger qualification. Disposable Worker witnesses exercise cleanup without unmanaged FD tracking, foreign/spent lease refusal and successor protection. Platform execution remains separately evidenced, not a production adapter, Windows support or general close-error retirement guarantee.
 
 ## 0.59.2: Managed Host Settings Hotfix
 

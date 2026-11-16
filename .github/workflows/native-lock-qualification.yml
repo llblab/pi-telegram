@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - "scripts/probe-native-file-lock.mjs"
+      - "scripts/probe-owned-native-lease.mjs"
       - "tests/fixtures/native-file-lock/**"
       - ".github/workflows/native-lock-qualification.yml"
 
@@ -69,8 +70,8 @@ jobs:
           while IFS= read -r line; do printf '%s\n' "$line"; done < "$QUALIFICATION_EVIDENCE/report.json"
           while IFS= read -r line; do printf '%s\n' "$line" >&2; done < "$QUALIFICATION_EVIDENCE/probe.stderr"
           exit "$status"
-      - name: Qualify Linux-only environment-owned lease fixture
-        if: runner.os == 'Linux'
+      - name: Qualify Linux and Darwin environment-owned lease fixture
+        if: runner.os == 'Linux' || runner.os == 'macOS'
         timeout-minutes: 3
         run: |
           build="$RUNNER_TEMP/owned-lease-prototype"
@@ -78,9 +79,11 @@ jobs:
           include="$(node -p 'require("node:path").join(require("node:path").dirname(process.execPath), "..", "include", "node")')"
           test -f "$include/node_api.h"
           cc --version > "$QUALIFICATION_EVIDENCE/owned-lease-compiler.txt"
-          cc -std=c11 -shared -fPIC -Wall -Wextra -Werror -DNAPI_VERSION=8 -I "$include" tests/fixtures/native-file-lock/owned-lease.c -o "$build/owned-lease.node"
-          cc -std=c11 -shared -fPIC -Wall -Wextra -Werror -DNAPI_VERSION=8 -DOWNED_LEASE_SUPPRESS_TEARDOWN=1 -I "$include" tests/fixtures/native-file-lock/owned-lease.c -o "$build/without-teardown.node"
-          sha256sum tests/fixtures/native-file-lock/owned-lease.c scripts/probe-owned-native-lease.mjs "$build/owned-lease.node" > "$QUALIFICATION_EVIDENCE/owned-lease-inputs.txt"
+          flags=(-std=c11 -fPIC -Wall -Wextra -Werror -DNAPI_VERSION=8 -I "$include")
+          if [ "$RUNNER_OS" = macOS ]; then flags+=(-bundle -undefined dynamic_lookup); else flags+=(-shared); fi
+          cc "${flags[@]}" tests/fixtures/native-file-lock/owned-lease.c -o "$build/owned-lease.node"
+          cc "${flags[@]}" -DOWNED_LEASE_SUPPRESS_TEARDOWN=1 tests/fixtures/native-file-lock/owned-lease.c -o "$build/without-teardown.node"
+          node --input-type=module -e 'import{createHash}from"node:crypto";import{readFileSync}from"node:fs";for(const path of process.argv.slice(1))console.log(createHash("sha256").update(readFileSync(path)).digest("hex")+"  "+path)' tests/fixtures/native-file-lock/owned-lease.c scripts/probe-owned-native-lease.mjs "$build/owned-lease.node" > "$QUALIFICATION_EVIDENCE/owned-lease-inputs.txt"
           set +e
           node scripts/probe-owned-native-lease.mjs --addon "$build/owned-lease.node" > "$QUALIFICATION_EVIDENCE/owned-lease-report.json" 2> "$QUALIFICATION_EVIDENCE/owned-lease.stderr"
           status=$?

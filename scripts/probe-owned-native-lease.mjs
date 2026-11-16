@@ -1,5 +1,5 @@
 /**
- * Opt-in Linux-only resource-ownership probe for an independently compiled fixture addon.
+ * Opt-in Linux/Darwin resource-ownership probe for an independently compiled fixture addon.
  * Zones: native resource lifetime, disposable validation
  * Usage (repository checkout): node scripts/probe-owned-native-lease.mjs --addon /tmp/build/owned-lease.node
  * No Pi import, configured storage lookup, runtime dependency or backend activation.
@@ -16,12 +16,12 @@ import { isMainThread, parentPort, threadId, Worker, workerData } from "node:wor
 
 const require = createRequire(import.meta.url), script = fileURLToPath(import.meta.url);
 const args = process.argv.slice(2), child = isMainThread && args[0] === "--child";
-assert.equal(process.platform, "linux", "This fixture has no Darwin/Windows qualification yet");
+assert.ok(["linux", "darwin"].includes(process.platform), "This fixture has no Windows qualification yet");
 if (isMainThread) assert.ok(child ? args.length === 3 : args.length === 2 && args[0] === "--addon");
 else assert.equal(workerData.kind, "owned-lease-worker");
 const addonPath = realpathSync(resolve(isMainThread ? args[1] : workerData.addonPath));
 const native = require(addonPath);
-assert.equal(native.fixtureKind, "linux-owned-lease-prototype-v1");
+assert.equal(native.fixtureKind, `${process.platform}-owned-lease-prototype-v1`);
 for (const name of ["tryAcquire", "release"]) assert.equal(typeof native[name], "function");
 function anchor(root) {
   assert.equal(dirname(root), realpathSync(tmpdir()));
