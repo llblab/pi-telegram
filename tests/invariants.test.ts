@@ -81,6 +81,37 @@ test("CI dependency installation has its own bounded timing phase without retry 
   }
 });
 
+test("Native lock qualification freezes an isolated candidate without runtime adoption or privileged CI", () => {
+  const directory = join(PROJECT_ROOT, "tests", "fixtures", "native-file-lock");
+  const fixture = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
+  const frozen = JSON.parse(readFileSync(join(directory, "package-lock.json"), "utf8"));
+  const main = JSON.parse(readFileSync(join(PROJECT_ROOT, "package.json"), "utf8"));
+  const mainLock = JSON.parse(readFileSync(join(PROJECT_ROOT, "package-lock.json"), "utf8"));
+  assert.equal(fixture.private, true);
+  assert.deepEqual(fixture.dependencies, { "fs-native-extensions": "1.5.3" });
+  assert.deepEqual(frozen.packages[""].dependencies, fixture.dependencies);
+  assert.equal(frozen.packages["node_modules/fs-native-extensions"].version, "1.5.3");
+  assert.equal(frozen.packages["node_modules/fs-native-extensions"].integrity,
+    "sha512-pl39uoPqAdANcule683Wghiw3UlQc+tDagBtKT8ltKaK/Jxu9cDL5sMjca+4eTgrHnn3I7qRO5jPG/658GOsdg==");
+  assert.equal(Object.keys(fixture.scripts ?? {}).length, 0);
+  for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+    assert.equal(main[field]?.["fs-native-extensions"], undefined, "Candidate qualification cannot adopt a runtime or root test dependency");
+  }
+  assert.equal(mainLock.packages["node_modules/fs-native-extensions"], undefined);
+  const workflow = readFileSync(join(PROJECT_ROOT, ".github", "workflows", "native-lock-qualification.yml"), "utf8");
+  assert.match(workflow, /^  workflow_dispatch:$/mu);
+  const paths = workflow.match(/^    paths:\n((?:      - [^\n]+\n)+)/mu)?.[1];
+  assert.ok(paths);
+  assert.deepEqual(paths.trim().split("\n").map(line => line.trim().replace(/^- "|"$/gu, "")), [
+    "scripts/probe-native-file-lock.mjs", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
+  ]);
+  assert.match(workflow, /^  contents: read$/mu);
+  assert.match(workflow, /^          persist-credentials: false$/mu);
+  assert.match(workflow, /npm ci --prefix tests\/fixtures\/native-file-lock --ignore-scripts --bin-links=false/u);
+  assert.match(workflow, /^          exit "\$status"$/mu);
+  assert.doesNotMatch(workflow, /pull_request_target|workflow_run|^  push:|secrets\.|:\s*write\b|continue-on-error/u);
+});
+
 test("CI native progress stays finite, body-free and separate from native completion", async () => {
   const result = await runNodeEval(String.raw`
     import assert from "node:assert/strict";

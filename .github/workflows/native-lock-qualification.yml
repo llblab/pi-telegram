@@ -1,0 +1,76 @@
+name: Native lock qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/probe-native-file-lock.mjs"
+      - "tests/fixtures/native-file-lock/**"
+      - ".github/workflows/native-lock-qualification.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-lock-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: native lock (${{ matrix.os }}, Node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-26-intel]
+        node: [22.19.0, 26.8.1]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      QUALIFICATION_EVIDENCE: ${{ runner.temp }}/native-lock-evidence
+    steps:
+      - name: Check out qualification source without retained credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up exact Node.js runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - name: Record source, runtime and frozen dependency inputs
+        run: |
+          mkdir -p "$QUALIFICATION_EVIDENCE"
+          git rev-parse HEAD > "$QUALIFICATION_EVIDENCE/source-commit.txt"
+          node --version > "$QUALIFICATION_EVIDENCE/node-version.txt"
+          npm --version > "$QUALIFICATION_EVIDENCE/npm-version.txt"
+          cp tests/fixtures/native-file-lock/package.json "$QUALIFICATION_EVIDENCE/package.json"
+          cp tests/fixtures/native-file-lock/package-lock.json "$QUALIFICATION_EVIDENCE/package-lock.json"
+      - name: Install only the frozen candidate without lifecycle hooks
+        timeout-minutes: 5
+        run: npm ci --prefix tests/fixtures/native-file-lock --ignore-scripts --bin-links=false --no-fund
+      - name: Audit the isolated dependency closure
+        timeout-minutes: 2
+        run: npm audit --prefix tests/fixtures/native-file-lock --omit=dev --json > "$QUALIFICATION_EVIDENCE/audit.json"
+      - name: Qualify actual native behavior in disposable storage
+        timeout-minutes: 2
+        run: |
+          set +e
+          node scripts/probe-native-file-lock.mjs --addon tests/fixtures/native-file-lock/node_modules/fs-native-extensions > "$QUALIFICATION_EVIDENCE/report.json" 2> "$QUALIFICATION_EVIDENCE/probe.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/exit-code.txt"
+          while IFS= read -r line; do printf '%s\n' "$line"; done < "$QUALIFICATION_EVIDENCE/report.json"
+          while IFS= read -r line; do printf '%s\n' "$line" >&2; done < "$QUALIFICATION_EVIDENCE/probe.stderr"
+          exit "$status"
+      - name: Preserve qualification and failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-lock-${{ matrix.os }}-node-${{ matrix.node }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-lock-evidence
+          if-no-files-found: error
+          retention-days: 14
