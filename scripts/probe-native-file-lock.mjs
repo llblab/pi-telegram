@@ -10,7 +10,7 @@ import { createHash } from "node:crypto";
 import { closeSync, fstatSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, toNamespacedPath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
@@ -217,8 +217,9 @@ if (childMode) {
         process.report.excludeEnv = true;
         const diagnostic = process.report.getReport();
         assert.equal(Object.hasOwn(diagnostic, "environmentVariables"), false, "Never collect inherited secrets for binary qualification");
-        const mapped = [...new Set(diagnostic.sharedObjects.filter(file => basename(file) === "fs-native-extensions.node").map(file => realpathSync(file)))];
-        assert.deepEqual(mapped, [realpathSync(binary)]);
+        // Windows reports extended-length image paths; compare both real paths in the same public namespace.
+        const mapped = [...new Set(diagnostic.sharedObjects.filter(file => basename(file) === "fs-native-extensions.node").map(file => toNamespacedPath(realpathSync(file))))];
+        assert.deepEqual(mapped, [toNamespacedPath(realpathSync(binary))]);
         report.mappedPrebuild = `prebuilds/${process.platform}-${process.arch}/fs-native-extensions.node`;
         report.mappedPrebuildSha256 = createHash("sha256").update(readFileSync(mapped[0])).digest("hex");
         assert.equal(report.mappedPrebuildSha256, report.packagedPrebuildSha256);
