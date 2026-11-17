@@ -3495,11 +3495,16 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
   "cleanup-capability", "cleanup-port", "cleanup-wrong-ack", "cleanup-lost-ack", "cleanup-missing-carrier", "cleanup-source-stopped",
   "cleanup-chooser-expired", "cleanup-target-mutated", "cleanup-before-claim", "cleanup-after-second-work", "cleanup-after-second-claim",
   "cleanup-unknown-flag", "cleanup-missing-peer", "cleanup-missing-journal", "cleanup-profile-alias", "cleanup-command-render", "cleanup-command-api", "cleanup-command-unknown",
-  "cleanup-issue-clear", "cleanup-issue-busy", "cleanup-issue-lost", "prelaunch-peer-clear", "prelaunch-peer-busy", "prelaunch-peer-lost", "prelaunch-peer-release-lost", "prelaunch-peer-observe-lost", "prelaunch-peer-registration", "prelaunch-peer-group", "prelaunch-peer-legacy", "guard-model", "guard-pending", "guard-compaction", "guard-dispatch",
+  "cleanup-issue-clear", "cleanup-issue-busy", "cleanup-issue-lost", "prelaunch-peer-clear", "prelaunch-peer-busy", "prelaunch-peer-lost", "prelaunch-peer-release-lost", "prelaunch-peer-observe-lost", "prelaunch-peer-teardown-running", "prelaunch-peer-registration", "prelaunch-peer-group", "prelaunch-peer-legacy", "guard-model", "guard-pending", "guard-compaction", "guard-dispatch",
   "display-current", "display-response-lost", "display-context", "display-generation", "display-mode", "display-binding", "display-persist-lost", "display-publication", "all-peer-text", "all-peer-voice", "all-peer-album", "all-peer-donor-before", "all-peer-donor-after", "all-peer-donor-ack", "all-peer-group-donor-ack", "all-peer-donor-context"] as const) {
-  test(`Admitted live chooser composes authenticated follower journal save/apply/release and exact donor disposal (${fault})`, async () => {
+  test(`Admitted live chooser composes authenticated follower journal save/apply/release and exact donor disposal (${fault})`,
+    fault === "prelaunch-peer-teardown-running" ? { timeout: 5000 } : {}, async t => {
     await withLiveChooserProfileFixture(async f => {
       const allPeer = fault.startsWith("all-peer-");
+      const teardownProbe = fault === "prelaunch-peer-teardown-running";
+      const cleanupArmed = Promise.withResolvers<void>(), cleanupEntered = Promise.withResolvers<void>(), cleanupRelease = Promise.withResolvers<void>();
+      void cleanupEntered.promise.catch(() => undefined);
+      let activeCleanup = 0, teardownProbeArmed = false, semanticFailed = false, semanticFailure: unknown;
       const displayCase = fault.startsWith("display-");
       const recipientCwd = displayCase ? homedir() : "/repo";
       const ctx = { cwd: "/leader" }, recipientCtx = { cwd: recipientCwd }, root = dirname(f.path);
@@ -3561,6 +3566,22 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
       const ledger = createTelegramWorkspaceAdmissionLedger({ path: `${f.path}.admission`, profileKey: "profile-a:bot-a",
         owner: { processId: process.pid, processBirthId: `${process.pid}:follower-chooser` }, getProcessLiveness: () => "alive" });
       const operations = createTelegramWorkspaceOperationRuntime({ getWorkspaceAdmission: () => ledger });
+      const runWorkspaceOperation: typeof operations.run = teardownProbe ? async (metadata, operation) => {
+        if (metadata.operationKind !== "workspace.live-rebind-cleanup") return operations.run(metadata, operation);
+        activeCleanup++;
+        try {
+          // Do not monopolize the real profile gate while the original repeated chooser callbacks still drain.
+          await cleanupArmed.promise;
+          return await operations.run(metadata, async () => {
+            cleanupEntered.resolve();
+            const leases = ledger.read().leases;
+            assert.equal(leases.length, 1); assert.equal(leases[0]!.operationKind, metadata.operationKind);
+            assert.deepEqual(leases[0]!.scope, { kind: "profile" }, "The original scheduled cleanup owns real profile admission");
+            await cleanupRelease.promise;
+            return operation();
+          });
+        } finally { activeCleanup--; }
+      } : operations.run;
       const oldMenuState: Menu.TelegramModelMenuState = { chatId: 7, threadId: 10, messageId: 0, mode: "model", scope: "all", page: 0, scopedModels: [], allModels: [] };
       const commandRendered = createTelegramRenderedMessageDeliveryRuntime({ async sendMessage(body) {
         const end = apiActivity.begin("sendMessage", body); commandBodies.push(body as unknown as Record<string, unknown>); commandApiEntered.resolve();
@@ -3613,6 +3634,9 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
           if (fault === "apply-lost" && !dropped) { dropped = true; throw new Error("Local apply reply lost"); } } },
       });
       let callerCurrent = true, callerEpoch = "epoch", recipientBusy = false, observing = false, observations = 0;
+      if (teardownProbe) t.signal.addEventListener("abort", () => {
+        callerCurrent = false; cleanupArmed.resolve(); cleanupRelease.resolve(); cleanupEntered.reject(t.signal.reason);
+      }, { once: true });
       const activity = Activity.createTelegramActivityBridgeRuntime({ generation: "peer-work" });
       const apiActivity = createTelegramApiTargetActivityRuntime();
       const delivery = Delivery.createTelegramDeliveryLifecycleHooks(() => Delivery.createTelegramDeliveryRuntime({ generation: "peer-work",
@@ -3644,7 +3668,7 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
             observations++;
             assert.equal(recipientExecutions, 0, "Observation sees applied target with the selected input still held");
             if (fault === "prelaunch-peer-registration") registry.register({ ...registry.get("old")!, registrationGeneration: "replacement" });
-            if (fault === "prelaunch-peer-observe-lost") throw new Error("Held work ACK lost");
+            if (fault === "prelaunch-peer-observe-lost" || teardownProbe) throw new Error("Held work ACK lost");
           }
           if (envelope.mode === "observe") {
             observations++;
@@ -3675,7 +3699,7 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
       const harness = createRouteHarness({ instanceId: "leader", threadStore: titleStore, getWorkspaceRestoreStore: () => isolationStore,
         ...(displayCase ? { getDisplayTitle: target => f.threads.getWorkspaceBindingByTarget(target, "session")?.displayTitle ?? projectedTitle() } : {}),
         getAdmissionJournalBinding: () => sourceKey, getSessionGeneration: () => 1, getCurrentLeaderEpoch: () => callerEpoch,
-        isContextActive: value => value === ctx && callerCurrent, runWorkspaceOperation: operations.run,
+        isContextActive: value => value === ctx && callerCurrent, runWorkspaceOperation,
         hasWorkspaceRestoreAuthority: () => false, hasWorkspaceLiveRebindAuthority: () => true,
         getLiveThreadTargets: () => [f.request.binding.target],
         workspaceRestoreRecipient: { getSessionId: () => "leader-session", getCwd: () => "/leader", getLeaderIdentity: () => undefined,
@@ -3874,7 +3898,7 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
         if (prelaunch) {
           const value = f.store.listLiveRebindings()[0]!;
           const blocked = fault === "prelaunch-peer-registration";
-          const deferred = recipientBusy || fault === "prelaunch-peer-observe-lost" || fault === "prelaunch-peer-legacy";
+          const deferred = recipientBusy || fault === "prelaunch-peer-observe-lost" || teardownProbe || fault === "prelaunch-peer-legacy";
           assert.equal(value.inputRelease, fault === "prelaunch-peer-legacy" ? undefined : blocked ? "held" : "accepted", JSON.stringify(harness.events));
           assert.equal(recipientExecutions, blocked ? 0 : selectedIds.length);
           assert.equal(setters, 1); assert.equal(appends, 1);
@@ -3884,7 +3908,11 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
           assert.deepEqual(f.threads.listProtectedLiveRebindTargets(), fault === "prelaunch-peer-lost" ? [f.request.binding.target] : []);
           assert.deepEqual(source.read().entries.filter(entry => selectedIds.includes(entry.updateId)).map(entry => entry.updateId), blocked ? selectedIds : []);
           assert.equal(recipientRoute.telegramQueueStore.getQueuedItems().length, blocked ? 0 : 1);
-          assert.deepEqual(ledger.read().leases, []); f.assertOtherProfile(); return;
+          if (teardownProbe) {
+            // Let the original pacing timer enter admission, with a clear recipient, before ending its session.
+            recipientRoute.bridgeRuntime.lifecycle.setDispatchPending(false); teardownProbeArmed = true;
+          } else assert.deepEqual(ledger.read().leases, []);
+          f.assertOtherProfile(); return;
         }
         const released = cleanupCase || !!guard || ["normal", "busy", "save-lost", "apply-lost", "release-lost", "payload-projection", "donor-before", "donor-after", "donor-ack",
           "group", "group-busy", "group-release-lost", "group-donor-before", "group-donor-after", "isolation-neighbor", "profile-neighbor"].includes(fault);
@@ -4031,8 +4059,41 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
           }
           }
         }
-      } finally { commandRender.resolve(); commandApi.resolve(); Date.now = originalNow; if (reservation) await reservation.publish(async () => {}); activity.onSessionShutdown(); await delivery.onSessionShutdown();
-        await sourceWorker.stop(); await receiver.stop(); await admission.onSessionShutdown(); }
+      } catch (error) { semanticFailed = true; semanticFailure = error; throw error; }
+      finally {
+        const cleanupErrors: unknown[] = [];
+        const clean = async (operation: () => unknown) => { try { await operation(); } catch (error) { cleanupErrors.push(error); } };
+        cleanupArmed.resolve();
+        if (teardownProbeArmed) await clean(() => cleanupEntered.promise);
+        // Worker/socket shutdown alone does not fence or drain the original routing cleanup timer.
+        callerCurrent = false;
+        commandRender.resolve(); commandApi.resolve(); Date.now = originalNow;
+        const settlement = harness.routeRuntime.waitForRestoreSettlement();
+        let settled = false; void settlement.then(() => { settled = true; }, () => {});
+        if (teardownProbeArmed) await clean(async () => {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.equal(settled, false, "A held native cleanup remains unsettled after session invalidation");
+          assert.equal(activeCleanup, 1); assert.equal(ledger.read().leases.length, 1);
+        });
+        cleanupRelease.resolve();
+        await clean(async () => {
+          await settlement;
+          assert.equal(activeCleanup, 0, "Native cleanup admission must settle before fixture teardown");
+        });
+        const heldReservation = reservation;
+        if (heldReservation) await clean(() => heldReservation.publish(async () => {}));
+        await clean(() => activity.onSessionShutdown()); await clean(() => delivery.onSessionShutdown());
+        await clean(() => sourceWorker.stop()); await clean(() => receiver.stop()); await clean(() => admission.onSessionShutdown());
+        if (cleanupErrors.length) await clean(() => settlement);
+        if (teardownProbeArmed) await clean(() => {
+          assert.deepEqual(ledger.read().leases, []);
+          assert.equal(effects.filter(method => method === "deleteForumTopic").length, 0, "Late cleanup cannot delete after its captured session ends");
+          assert.deepEqual(registration.getTarget(), f.request.target);
+        });
+        if (cleanupErrors.length) throw semanticFailed
+          ? new AggregateError([semanticFailure, ...cleanupErrors], "Routing assertion and fixture teardown failed")
+          : cleanupErrors.length === 1 ? cleanupErrors[0] : new AggregateError(cleanupErrors, "Routing fixture teardown failed");
+      }
     }, "follower", fault.startsWith("cleanup-") || fault.startsWith("profile-") || fault.startsWith("display-") || fault.startsWith("all-peer-"));
   });
 }
