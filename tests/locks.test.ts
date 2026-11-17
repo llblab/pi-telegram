@@ -1244,7 +1244,8 @@ test(`Transaction guard recensus distinguishes a released directory from invalid
       "import fs from 'node:fs'; import { withTelegramFileTransaction } from " + JSON.stringify(moduleUrl) + ";",
       "const guard = " + JSON.stringify(guard) + ";",
       "const wait = path => { const deadline = Date.now() + 5000; while (!fs.existsSync(path)) { if (Date.now() >= deadline) throw new Error('Owner fixture wait expired'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2); } };",
-      "withTelegramFileTransaction(guard, () => { fs.writeFileSync(" + JSON.stringify(ready) + ", String(process.pid)); wait(" + JSON.stringify(release) + "); });",
+      // A real opened-but-not-yet-written checkpoint must not establish readiness.
+      "withTelegramFileTransaction(guard, () => { const fd = fs.openSync(" + JSON.stringify(ready) + ", 'wx'); try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); fs.writeFileSync(fd, String(process.pid)); } finally { fs.closeSync(fd); } wait(" + JSON.stringify(release) + "); });",
       "fs.writeFileSync(" + JSON.stringify(retired) + ", 'released');",
       ...(succession === "replacement" ? ["withTelegramFileTransaction(guard, () => { fs.writeFileSync(" + JSON.stringify(replacementReady) + ", 'ready'); wait(" + JSON.stringify(replacementRelease) + "); });"] : []),
     ].join("\n");
@@ -1257,7 +1258,10 @@ test(`Transaction guard recensus distinguishes a released directory from invalid
     let armed = true, observedEmpty = false, operations = 0;
     try {
       const startupDeadline = Date.now() + 5000;
-      while (!fs.existsSync(ready) && Date.now() < startupDeadline) await delay(5);
+      while (Date.now() < startupDeadline) {
+        if (fs.existsSync(ready) && fs.readFileSync(ready, "utf8") === String(owner.pid)) break;
+        await delay(5);
+      }
       assert.equal(fs.readFileSync(ready, "utf8"), String(owner.pid));
       console.log("guard-enumeration-checkpoint ready");
       fs.readdirSync = function(path, ...args) {
