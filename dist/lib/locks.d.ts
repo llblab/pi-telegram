@@ -184,7 +184,24 @@ export declare class TelegramFileTransactionGuardError extends Error {
         phase?: "acquire" | "release";
     });
 }
+/** Private per-resource port; callers own immutable anchor placement and backend admission.
+ * Kernel exclusion supplements the legacy guard; it grants no reset or old-writer closure. */
+export interface TelegramFileTransactionKernel {
+    readonly anchorPath: string;
+    readonly signal?: AbortSignal;
+    tryAcquire(anchorPath: string): object | undefined;
+    release(lease: object): boolean;
+}
+export declare class TelegramFileTransactionKernelError extends Error {
+    readonly code = "kernel-transaction-refused";
+    readonly resource: string;
+    readonly reason: "busy" | "invalid-port" | "acquire-failed" | "release-unconfirmed";
+    readonly phase: "acquire" | "release";
+    constructor(resource: string, reason: TelegramFileTransactionKernelError["reason"], phase: TelegramFileTransactionKernelError["phase"], options?: ErrorOptions);
+}
 export interface TelegramFileTransactionOptions {
+    /** Dormant until an admitted backend is supplied; no default loader or recovery activation. */
+    kernel?: TelegramFileTransactionKernel;
     recoveryRename?: typeof renameSync;
     publishRename?: typeof renameSync;
     /** Observation leases may contend but must not acquire abandoned-owner recovery authority. */

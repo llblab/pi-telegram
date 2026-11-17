@@ -50,6 +50,8 @@ import {
   TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE,
   TELEGRAM_OWNERSHIP_REFRESH_MS,
   withTelegramFileTransaction,
+  TelegramFileTransactionKernelError,
+  type TelegramFileTransactionKernel,
   publishTelegramPrivateFile,
   readTelegramPrivateFile,
   TelegramPrivateFileError,
@@ -60,6 +62,125 @@ import {
 } from "../lib/locks.ts";
 import { createTelegramSessionContextStore } from "../lib/lifecycle.ts";
 import { readTelegramSyncBlockTotals } from "../lib/loop-lag.ts";
+
+for (const mode of ["success", "busy", "acquire-error", "invalid-lease", "async-lease", "pre-aborted", "acquire-aborted", "legacy-aborted", "legacy-damaged",
+  "operation-error", "release-false", "release-error", "async-release", "both-errors"] as const) {
+  test(`Private kernel transaction port preserves legacy exclusion and one-shot retirement (${mode})`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "pt-kernel-port-")), guard = join(dir, "state.transaction");
+    const controller = new AbortController(), nativeError = new Error("native fixture failure"), operationError = new Error("operation failure");
+    const lease = Object.freeze({});
+    let acquisitions = 0, releases = 0, operations = 0, held = false;
+    const kernel: TelegramFileTransactionKernel = {
+      anchorPath: join(dir, "immutable.lock"), signal: controller.signal,
+      tryAcquire(path) {
+        assert.equal(this, kernel); assert.equal(path, kernel.anchorPath); acquisitions++;
+        assert.equal(existsSync(guard), mode === "legacy-damaged", "Kernel admission precedes legacy guard changes");
+        if (mode === "busy") return undefined;
+        if (mode === "acquire-error") throw nativeError;
+        if (mode === "invalid-lease") return 7 as unknown as object;
+        if (mode === "async-lease") return Promise.resolve(lease);
+        held = true;
+        if (mode === "acquire-aborted") controller.abort(nativeError);
+        return lease;
+      },
+      release(value) {
+        assert.equal(this, kernel); assert.equal(value, lease); releases++;
+        assert.equal(existsSync(guard), mode === "legacy-damaged", "Legacy release/refusal precedes kernel retirement");
+        if (mode === "release-error" || mode === "both-errors") throw nativeError;
+        if (mode === "release-false") return false;
+        if (mode === "async-release") return Promise.resolve(true) as unknown as boolean;
+        held = false; return true;
+      },
+    };
+    try {
+      if (mode === "legacy-damaged") { mkdirSync(guard); writeFileSync(join(guard, "owner.fixture.json"), ""); }
+      if (mode === "pre-aborted") controller.abort(nativeError);
+      let failure: unknown;
+      try {
+        assert.equal(withTelegramFileTransaction(guard, () => {
+          operations++; assert.equal(held, true); assert.equal(existsSync(guard), true);
+          if (mode === "operation-error" || mode === "both-errors") throw operationError;
+          return 17;
+        }, { kernel, attempts: 1, ...(mode === "legacy-aborted" ? {
+          publishRename(...args: Parameters<typeof renameSync>) { renameSync(...args); controller.abort(nativeError); },
+        } : {}) }), 17);
+      } catch (error) { failure = error; }
+      const executes = ["success", "operation-error", "release-false", "release-error", "async-release", "both-errors"].includes(mode);
+      const acquired = !["busy", "acquire-error", "invalid-lease", "async-lease", "pre-aborted"].includes(mode);
+      assert.equal(operations, executes ? 1 : 0);
+      assert.equal(acquisitions, mode === "pre-aborted" ? 0 : 1, "No native wait loop or implicit retry");
+      assert.equal(releases, acquired ? 1 : 0, "No repeated native release, including after failure");
+      if (mode === "success") assert.equal(failure, undefined);
+      else if (mode === "pre-aborted" || mode === "acquire-aborted" || mode === "legacy-aborted") assert.equal(failure, nativeError);
+      else if (mode === "operation-error") assert.equal(failure, operationError);
+      else if (mode === "legacy-damaged") {
+        assert.equal((failure as { code: string }).code, "guard-unverifiable");
+        assert.equal(readFileSync(join(guard, "owner.fixture.json"), "utf8"), "", "Kernel ownership never repairs a damaged legacy guard");
+        assert.deepEqual(readdirSync(guard), ["owner.fixture.json"]);
+      } else {
+        assert.ok(failure instanceof TelegramFileTransactionKernelError);
+        assert.equal(failure.phase, mode.startsWith("release-") || mode === "async-release" || mode === "both-errors" ? "release" : "acquire");
+        if (mode === "acquire-error" || mode === "release-error") assert.equal(failure.cause, nativeError);
+        if (mode === "both-errors") {
+          assert.ok(failure.cause instanceof AggregateError);
+          assert.deepEqual(failure.cause.errors, [operationError, nativeError], "Neither original failure may be hidden by teardown");
+        }
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Private kernel port captures its admitted callables and preserves synchronous-prefix lifetime", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-kernel-sync-")), guard = join(dir, "state.transaction");
+  let held = false, releases = 0;
+  const kernel: TelegramFileTransactionKernel = {
+    anchorPath: join(dir, "immutable.lock"),
+    tryAcquire() {
+      held = true;
+      kernel.release = () => { throw new Error("Replacement callable has no authority over the captured lease"); };
+      return {};
+    },
+    release() { held = false; releases++; return true; },
+  };
+  try {
+    const pending = withTelegramFileTransaction(guard, async () => {
+      assert.equal(held, true); assert.equal(existsSync(guard), true);
+      await Promise.resolve();
+      assert.equal(held, false); assert.equal(existsSync(guard), false);
+      return 31;
+    }, { kernel });
+    assert.equal(held, false); assert.equal(releases, 1);
+    assert.equal(await pending, 31, "Returning a Promise never invents an await-held file transaction");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("Private kernel admission keeps per-resource granularity and refuses guard-contained anchors", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-kernel-resources-")), held = new Map<object, string>();
+  const kernel = (name: string): TelegramFileTransactionKernel => ({
+    anchorPath: join(dir, `${name}.immutable.lock`),
+    tryAcquire(path) {
+      if ([...held.values()].includes(path)) return undefined;
+      const lease = {}; held.set(lease, path); return lease;
+    },
+    release(lease) { return held.delete(lease); },
+  });
+  const first = kernel("first"), second = kernel("second"), guard = join(dir, "first.transaction");
+  try {
+    withTelegramFileTransaction(guard, () => {
+      assert.throws(() => withTelegramFileTransaction(guard, () => assert.fail("Nested same-resource work"), { kernel: first }),
+        { code: "kernel-transaction-refused", reason: "busy" });
+      assert.equal(withTelegramFileTransaction(join(dir, "second.transaction"), () => held.size, { kernel: second }), 2);
+      assert.equal(held.size, 1);
+    }, { kernel: first });
+    assert.equal(held.size, 0);
+    for (const anchorPath of [guard, join(guard, "anchor"), "relative.lock", `${guard}\0suffix`]) {
+      assert.throws(() => withTelegramFileTransaction(guard, () => assert.fail("Invalid-anchor work"), { kernel: {
+        ...first, anchorPath, tryAcquire() { assert.fail("Invalid anchor must refuse before native issuance"); },
+      } }), { code: "kernel-transaction-refused", reason: "invalid-port" });
+    }
+    assert.equal(existsSync(guard), false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 for (const change of ["replace-session", "same-context-restart", "clear", "release", "re-elect"] as const) {
   test(`Shared-state grant binds exact session generation and leader epoch (${change})`, () => {

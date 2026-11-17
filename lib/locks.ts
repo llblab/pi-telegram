@@ -22,7 +22,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import {
@@ -647,7 +647,37 @@ type TelegramTransactionGlobal = typeof globalThis & {
   [TELEGRAM_ACTIVE_TRANSACTION_RECLAIMS]?: Set<string>;
 };
 
+/** Private per-resource port; callers own immutable anchor placement and backend admission.
+ * Kernel exclusion supplements the legacy guard; it grants no reset or old-writer closure. */
+export interface TelegramFileTransactionKernel {
+  readonly anchorPath: string;
+  readonly signal?: AbortSignal;
+  tryAcquire(anchorPath: string): object | undefined;
+  release(lease: object): boolean;
+}
+
+export class TelegramFileTransactionKernelError extends Error {
+  readonly code = "kernel-transaction-refused";
+  readonly resource: string;
+  readonly reason: "busy" | "invalid-port" | "acquire-failed" | "release-unconfirmed";
+  readonly phase: "acquire" | "release";
+  constructor(
+    resource: string,
+    reason: TelegramFileTransactionKernelError["reason"],
+    phase: TelegramFileTransactionKernelError["phase"],
+    options?: ErrorOptions,
+  ) {
+    super(`Telegram kernel transaction ${reason} during ${phase}: ${resource}`, options);
+    this.name = "TelegramFileTransactionKernelError";
+    this.resource = resource;
+    this.reason = reason;
+    this.phase = phase;
+  }
+}
+
 export interface TelegramFileTransactionOptions {
+  /** Dormant until an admitted backend is supplied; no default loader or recovery activation. */
+  kernel?: TelegramFileTransactionKernel;
   recoveryRename?: typeof renameSync;
   publishRename?: typeof renameSync;
   /** Observation leases may contend but must not acquire abandoned-owner recovery authority. */
@@ -932,6 +962,50 @@ export function withTelegramFileTransaction<T>(
   transactionPath: string,
   operation: () => T,
   options: TelegramFileTransactionOptions = {},
+): T {
+  const kernel = options.kernel;
+  if (!kernel) return withLegacyFileTransaction(transactionPath, operation, options);
+  const { anchorPath, signal, tryAcquire, release } = kernel;
+  // This is lexical validation only, not proof of stable ancestry or writer closure.
+  const guard = resolve(transactionPath), anchor = typeof anchorPath === "string" ? resolve(anchorPath) : "";
+  const placement = relative(guard, anchor);
+  if (typeof anchorPath !== "string" || !isAbsolute(anchorPath) || anchorPath.includes("\0") ||
+      !placement || (!isAbsolute(placement) && placement !== ".." && !placement.startsWith(`..${sep}`)) ||
+      typeof tryAcquire !== "function" || typeof release !== "function")
+    throw new TelegramFileTransactionKernelError(transactionPath, "invalid-port", "acquire");
+  signal?.throwIfAborted();
+  let lease: object | undefined;
+  try { lease = tryAcquire.call(kernel, anchorPath); }
+  catch (cause) { throw new TelegramFileTransactionKernelError(transactionPath, "acquire-failed", "acquire", { cause }); }
+  if (lease === undefined) throw new TelegramFileTransactionKernelError(transactionPath, "busy", "acquire");
+  if (!lease || typeof lease !== "object" || "then" in lease)
+    throw new TelegramFileTransactionKernelError(transactionPath, "invalid-port", "acquire");
+  let failed = false, operationError: unknown;
+  try {
+    signal?.throwIfAborted();
+    return withLegacyFileTransaction(transactionPath, () => {
+      signal?.throwIfAborted();
+      return operation();
+    }, options);
+  } catch (error) {
+    failed = true; operationError = error;
+    throw error;
+  } finally {
+    try {
+      // One attempt only. False, a thrown error or a Promise is not positive retirement.
+      if (release.call(kernel, lease) !== true) throw new Error("Kernel lease retirement lacks a positive acknowledgement.");
+    } catch (cause) {
+      throw new TelegramFileTransactionKernelError(transactionPath, "release-unconfirmed", "release", {
+        cause: failed ? new AggregateError([operationError, cause], "Transaction and kernel retirement both failed.") : cause,
+      });
+    }
+  }
+}
+
+function withLegacyFileTransaction<T>(
+  transactionPath: string,
+  operation: () => T,
+  options: TelegramFileTransactionOptions,
 ): T {
   const owner = acquireLockTransaction(transactionPath, options);
   const heldAtMs = Date.now();
