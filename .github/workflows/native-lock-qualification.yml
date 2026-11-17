@@ -181,7 +181,9 @@ jobs:
           node scripts/probe-owned-native-lease.mjs --addon "$build/without-teardown.node" > "$evidence/owned-lease-control.stdout" 2> "$evidence/owned-lease-control.stderr"
           $status = $LASTEXITCODE
           $status | Set-Content "$evidence/owned-lease-control-exit-code.txt"
+          # The runner otherwise propagates the expected native exit 1 after this assertion.
           if ($status -ne 1 -or !(Select-String -Path "$evidence/owned-lease-control.stderr" -SimpleMatch 'Actual Worker exit, not a stop request or JS finally, precedes reacquisition' -Quiet)) { throw 'Windows teardown falsifier did not reach the expected failure' }
+          exit 0
       - name: Preserve qualification and failure evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

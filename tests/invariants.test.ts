@@ -159,6 +159,8 @@ test("Windows N-API SDK qualification pins only public x64 build inputs", () => 
   assert.match(handles, /advapi32\.lib/u);
   assert.match(handles, /\/DOWNED_LEASE_SUPPRESS_TEARDOWN=1/u);
   assert.match(handles, /\$status -ne 1.*expected failure/u);
+  assert.match(handles, /expected failure' \}\n          exit 0\n$/u,
+    "Only verified negative-control failure may end with success instead of the runner's LASTEXITCODE suffix");
   assert.ok(workflow.indexOf("Compile and load public Windows N-API smoke fixture") < workflow.indexOf("Qualify Windows environment-owned HANDLE fixture"));
 });
 
