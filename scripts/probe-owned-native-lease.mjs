@@ -17,11 +17,16 @@ import { isMainThread, parentPort, threadId, Worker, workerData } from "node:wor
 const require = createRequire(import.meta.url), script = fileURLToPath(import.meta.url);
 const args = process.argv.slice(2), child = isMainThread && args[0] === "--child";
 assert.ok(["linux", "darwin", "win32"].includes(process.platform), "Unsupported qualification platform");
-if (isMainThread) assert.ok(child ? args.length === 3 : args.length === 2 && args[0] === "--addon");
+if (isMainThread) assert.ok(child ? args.length === 3 || args.length === 4 && args[3] === "--backend" : args.length === 2 && ["--addon", "--backend"].includes(args[0]));
 else assert.equal(workerData.kind, "owned-lease-worker");
+const distribution = isMainThread ? child ? args[3] === "--backend" : args[0] === "--backend" : workerData.distribution === true;
 const addonPath = realpathSync(resolve(isMainThread ? args[1] : workerData.addonPath));
 const native = require(addonPath);
-assert.equal(native.fixtureKind, `${process.platform}-owned-lease-prototype-v1`);
+if (distribution) {
+  assert.equal(native.backendKind, `pi-telegram-kernel-v1-${process.platform}`);
+  assert.equal(native.napi, 8);
+  assert.equal(native.fixtureKind, undefined);
+} else assert.equal(native.fixtureKind, `${process.platform}-owned-lease-prototype-v1`);
 for (const name of ["tryAcquire", "release"]) assert.equal(typeof native[name], "function");
 assert.equal(native.protectClose, undefined, "Nominal fixture never exposes close-fault injection");
 function anchor(root) {
@@ -50,7 +55,7 @@ if (!isMainThread) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "pt-owned-lease-")));
   const path = anchor(root), active = new Set(), workers = new Set(), checks = [];
   const report = { node: process.version, platform: process.platform, arch: process.arch,
-    fixture: native.fixtureKind, anchorPolicy: process.platform === "win32" ? "user-system-administrators-dacl" : "private-posix-mode", binarySha256: createHash("sha256").update(readFileSync(addonPath)).digest("hex"), checks };
+    fixture: distribution ? native.backendKind : native.fixtureKind, anchorPolicy: process.platform === "win32" ? "user-system-administrators-dacl" : "private-posix-mode", binarySha256: createHash("sha256").update(readFileSync(addonPath)).digest("hex"), checks };
   const total = setTimeout(() => {
     console.error("Owned-lease probe exceeded its 60-second total bound; disposable storage retained:", root);
     process.exit(1);
@@ -59,7 +64,7 @@ if (!isMainThread) {
   function acquire() { const lease = native.tryAcquire(path); if (lease) active.add(lease); return lease; }
   function release(lease) { const result = native.release(lease); if (result) active.delete(lease); return result; }
   function attempt() {
-    const result = spawnSync(process.execPath, [script, "--child", addonPath, root],
+    const result = spawnSync(process.execPath, [script, "--child", addonPath, root, ...(distribution ? ["--backend"] : [])],
       { encoding: "utf8", timeout: 5000, killSignal: "SIGKILL", maxBuffer: 64 * 1024 });
     assert.ifError(result.error); assert.equal(result.status, 0, result.stderr);
     const value = JSON.parse(result.stdout);
@@ -68,7 +73,7 @@ if (!isMainThread) {
   }
   function launchWorker() {
     const worker = new Worker(new URL(import.meta.url), { trackUnmanagedFds: false,
-      workerData: { kind: "owned-lease-worker", root, addonPath } });
+      workerData: { kind: "owned-lease-worker", root, addonPath, distribution } });
     let exited = false, error;
     worker.on("error", value => { error ??= value; });
     const closed = new Promise(resolveExit => worker.once("exit", code => { exited = true; resolveExit(code); }));

@@ -103,7 +103,7 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   const paths = workflow.match(/^    paths:\n((?:      - [^\n]+\n)+)/mu)?.[1];
   assert.ok(paths);
   assert.deepEqual(paths.trim().split("\n").map(line => line.trim().replace(/^- "|"$/gu, "")), [
-    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "scripts/probe-owned-native-close-failure.mjs", "scripts/probe-native-napi-build.mjs", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
+    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "scripts/probe-owned-native-close-failure.mjs", "scripts/probe-native-napi-build.mjs", "scripts/package-native-lock.mjs", "native/**", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
   ]);
   assert.match(workflow, /^  contents: read$/mu);
   const jobEnvironment = workflow.match(/^    env:\n((?:      [^\n]+\n)+)/mu)?.[1];
@@ -114,7 +114,7 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   assert.match(workflow, /^          persist-credentials: false$/mu);
   assert.match(workflow, /npm ci --prefix tests\/fixtures\/native-file-lock --ignore-scripts --bin-links=false/u);
   assert.match(workflow, /npm audit signatures --prefix tests\/fixtures\/native-file-lock --json/u);
-  for (const probe of ["node scripts/probe-native-file-lock.mjs", "node scripts/probe-owned-native-lease.mjs", "node scripts/probe-owned-native-close-failure.mjs", "node scripts/probe-native-napi-build.mjs"]) {
+  for (const probe of ["node scripts/probe-native-file-lock.mjs", "node scripts/probe-owned-native-lease.mjs", "node scripts/probe-owned-native-close-failure.mjs", "node scripts/probe-native-napi-build.mjs", "node scripts/package-native-lock.mjs"]) {
     assert.ok(workflow.indexOf("npm audit signatures") < workflow.indexOf(probe),
       "Verify registry signatures and supplied attestations before loading either native candidate");
   }
@@ -128,6 +128,28 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   assert.match(ownership, /Actual Worker exit, not a stop request or JS finally, precedes reacquisition/u);
   assert.match(workflow, /^          exit "\$status"$/mu);
   assert.doesNotMatch(workflow, /pull_request_target|workflow_run|^  push:|secrets\.|:\s*write\b|continue-on-error/u);
+});
+
+test("Private kernel package builds use one source and preserve image identity across runtimes", () => {
+  const fixture = readFileSync(join(PROJECT_ROOT, "tests/fixtures/native-file-lock/owned-lease.c"), "utf8");
+  const source = readFileSync(join(PROJECT_ROOT, "native/locks.c"), "utf8");
+  const packager = readFileSync(join(PROJECT_ROOT, "scripts/package-native-lock.mjs"), "utf8");
+  const workflow = readFileSync(join(PROJECT_ROOT, ".github/workflows/native-lock-qualification.yml"), "utf8");
+  assert.match(fixture, /^#include "\.\.\/\.\.\/\.\.\/native\/locks\.c"$/mu);
+  assert.doesNotMatch(fixture, /NAPI_MODULE_INIT|static .*\(/u, "The fixture cannot fork the native implementation");
+  assert.match(source, /defined\(OWNED_LEASE_DISTRIBUTION\).*defined\(OWNED_LEASE_SUPPRESS_TEARDOWN\).*defined\(OWNED_LEASE_FORGET_CLOSE_ERROR\).*defined\(OWNED_LEASE_CLOSE_FAILURE_WITNESS\)/u);
+  assert.match(source, /#error "Distribution builds cannot contain qualification fault switches"/u);
+  assert.match(packager, /Reflect\.ownKeys\(native\)\.sort\(\)/u);
+  assert.match(packager, /mkdirSync\(output, \{ mode: 0o700 \}\)/u);
+  assert.match(packager, /source: \{ file: "locks\.c", sha256: digest\(sourceBytes\)/u);
+  assert.doesNotMatch(packager, /child_process|https?:|fetch\(|rmSync|recursive: true/u, "Assembly cannot download, compile, overwrite or clean existing output");
+  assert.match(workflow, /-DOWNED_LEASE_DISTRIBUTION=1 native\/locks\.c/u);
+  assert.match(workflow, /'distribution' \{ '\/DOWNED_LEASE_DISTRIBUTION=1' \}/u);
+  assert.match(workflow, /node-version: \$\{\{ matrix\.node == '22\.19\.0' && '26\.8\.1' \|\| '22\.19\.0' \}\}/u);
+  const alternate = workflow.match(/      - name: Verify identical packaged image on alternate runtime without rebuilding\n((?:        [^\n]*\n)+)/u)?.[1];
+  assert.ok(alternate);
+  assert.match(alternate, /--backend "\$QUALIFICATION_EVIDENCE\/kernel-backend\/locks\.node"/u);
+  assert.doesNotMatch(alternate, /cc |cl\.exe|package-native-lock/u, "The alternate runtime must load the very same packaged bytes");
 });
 
 test("Windows N-API SDK qualification pins only public x64 build inputs", () => {
