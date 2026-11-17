@@ -13620,7 +13620,7 @@ test(`Production original registration separates mode publication, IPC and ACK (
     const ConfigModel: typeof import("../lib/config.ts") = await import(configUrl.href);
     const LockModel: typeof Locks = await import(lockUrl.href);
     const stores: Threads.TelegramTopicTargetStore[] = [], configs: Array<ReturnType<typeof ConfigModel.createTelegramConfigStore>> = [];
-    let entered = false, heldCompletions = 0, clockOffset = 0, received = 0, prepared = 0, returned = 0, leaderStarts = 0, registrationCalls = 0, issued = 0;
+    let entered = false, heldCompletions = 0, clockOffset = 0, received = 0, prepared = 0, returned = 0, leaderStarts = 0, leaderReady = false, startupDelayed = false, registrationCalls = 0, issued = 0;
     let release!: () => void, receiverEndpoint: string | undefined;
     const gate = new Promise<void>(resolve => { release = resolve; });
     async function hold() { entered = true; await gate; heldCompletions++; }
@@ -13629,6 +13629,10 @@ test(`Production original registration separates mode publication, IPC and ACK (
       stores.push(store);
       store.persist = async () => {
         if (phase === "publication" && store === stores[0] && store.getBotState().threadMode === "enabled" && !entered) await hold();
+        // Startup may exceed the later producer observer while remaining within its original work budget.
+        if (phase === "connect-protocol" && store === stores[0] && store.getBotState().threadMode === "enabled" && !startupDelayed) {
+          startupDelayed = true; await new Promise(resolve => setTimeout(resolve, 2500));
+        }
         return persist();
       };
       return store;
@@ -13701,6 +13705,7 @@ test(`Production original registration separates mode publication, IPC and ACK (
         leaderStarts++;
         if (phase.startsWith("ipc")) await hold();
         await server.start();
+        leaderReady = true;
       } };
     } } });
     checkpoint("root-import");
@@ -13749,6 +13754,15 @@ test(`Production original registration separates mode publication, IPC and ACK (
       checkpoint("contexts-ready");
       connecting = leader.commands.get("telegram-connect")!.handler(profile ?? "", leaderCtx);
       if (phase === "publication" || phase.startsWith("ipc")) await waitForCondition(() => entered);
+      else {
+        // Later producer clocks must not include unrelated leader bootstrap. Early readiness keeps its own cases.
+        await connecting;
+        assert.equal(leaderReady, true, "The original leader server start must return before later producer observation");
+        assert.equal(registrationCalls, 0);
+        assert.equal(ThreadModel.parseTelegramWorkspaceStateSection(Locks.readTelegramRuntimeState(statePath).profiles[profile ?? "default"]?.workspace,
+          profile ?? "default")?.bot.threadMode, "enabled");
+        checkpoint("leader-ready");
+      }
       following = follower.commands.get("telegram-connect")!.handler(profile ?? "", followerCtx).finally(() => { followerSettled = true; });
       if (phase === "publication") await waitForAsyncCondition(async () => (await events()).some(row => row.details?.phase === "follower-readiness-wait"));
       if (phase.startsWith("ipc")) await waitForAsyncCondition(async () => (await events()).some(row => row.details?.phase === "follower-register-client-retry"));
@@ -13848,7 +13862,7 @@ test(`Production original registration separates mode publication, IPC and ACK (
         const failure = { version: 1, artifact, profile: profile ?? "default", phase, stage: "before-cleanup", pid: process.pid,
           error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error),
           counters: { entered, followerSettled, heldCompletions, registrationCalls, nativeConnects, nativeWrites, wireReceipts,
-            received, prepared, returned, leaderStarts, issued, polls, topics, sends, deletes, takeovers } };
+            received, prepared, returned, leaderStarts, leaderReady, startupDelayed, issued, polls, topics, sends, deletes, takeovers } };
         console.log("registration-phases-failure", JSON.stringify(failure));
         const logPath = Paths.resolveTelegramRuntimeLogPath(agentDir);
         const runtimeLog = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : undefined;
