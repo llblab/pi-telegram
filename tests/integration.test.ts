@@ -12979,7 +12979,8 @@ for (const loss of [false, true, "root", "damaged"] as const)
 for (const refreshBoundary of loss === "damaged" ? [undefined, "held", "cancel", "config"] as const : [undefined])
 for (const ownershipFault of loss === "root" ? [false, true] : [false])
 for (const ipcLoss of loss === "root" && !ownershipFault ? [false, true] : [false])
-test(`Production separate OS roots retain original lifetimes across namespace loss (${artifact}/${profile ?? "default"}/${loss}${refreshBoundary ? `/refresh-${refreshBoundary}` : ""}${ownershipFault ? "/ownership-read-refusal" : ""}${ipcLoss ? "/issued-ipc-loss" : ""})`, async () => {
+for (const overlappingObservation of refreshBoundary === "cancel" ? [false, true] : [false])
+test(`Production separate OS roots retain original lifetimes across namespace loss (${artifact}/${profile ?? "default"}/${loss}${refreshBoundary ? `/refresh-${refreshBoundary}` : ""}${ownershipFault ? "/ownership-read-refusal" : ""}${ipcLoss ? "/issued-ipc-loss" : ""}${overlappingObservation ? "/overlapping-observation" : ""})`, async () => {
   const childRun = async (role: "leader" | "follower", agentDir: string) => {
     const checkpoint = (phase: string) => process.send?.({ fixtureCheckpoint: phase, pid: process.pid });
     checkpoint("net-import");
@@ -13014,6 +13015,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     checkpoint("api-imported");
     const { AsyncLocalStorage } = await import("node:async_hooks");
     const heldRequest = new AsyncLocalStorage<boolean>();
+    const refreshRequest = new AsyncLocalStorage<{ captured: boolean }>();
     const transportChecks: Array<{ current: boolean; completed: number }> = [];
     let transportCaptures = 0, checkingTransport = false, ownershipReadFault = false, ownershipReadFaults = 0;
     let nativeOutcome: "returned" | "rejected" | undefined, nativeAuthorityError = false, nativeErrorIssued = false;
@@ -13025,6 +13027,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     } } });
     let store: Threads.TelegramTopicTargetStore | undefined, resets = 0, starts = 0, lastStartOk: boolean | undefined;
     let refreshEntered = 0, refreshSettled = 0, refreshReturned = 0, refreshFailed = 0, releaseRefresh!: () => void;
+    let unrelatedRefreshEntered = 0, unrelatedRefreshSettled = 0, unrelatedRefreshReturned = 0, unrelatedRefreshFailed = 0;
     const refreshHold = new Promise<void>(resolve => { releaseRefresh = resolve; });
     const registrationPids: number[] = [];
     const registrationReplies: Array<{ correlated: boolean; ok: boolean; code?: string; message?: string }> = [];
@@ -13052,11 +13055,13 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
         created.refresh = async () => {
           const original = refresh();
           if (role !== "follower" || !refreshBoundary || resets === 0) return original;
-          refreshEntered++;
+          const request = refreshRequest.getStore(), selected = !!request && !request.captured;
+          // Hold exactly the reconnect's first native refresh, not later independent observations or timer work.
+          if (selected) { request.captured = true; refreshEntered++; } else unrelatedRefreshEntered++;
           const outcome = await original.then(() => ({ ok: true as const }), error => ({ ok: false as const, error }));
-          refreshSettled++; if (!outcome.ok) refreshFailed++;
-          await refreshHold;
-          refreshReturned++;
+          if (selected) { refreshSettled++; if (!outcome.ok) refreshFailed++; }
+          else { unrelatedRefreshSettled++; if (!outcome.ok) unrelatedRefreshFailed++; }
+          if (selected) { await refreshHold; refreshReturned++; } else unrelatedRefreshReturned++;
           if (!outcome.ok) throw outcome.error;
         };
       }
@@ -13168,7 +13173,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
         transportCaptures, transportChecks, ownershipReadFaults, nativeOutcome, nativeAuthorityError, nativeErrorIssued, heldAck,
         callerCommitUnknown, callerCommitMethod, publicationMethod, originalPublishSocketDestroyed: originalPublishSocket?.destroyed,
         originalPublishSocketEnded: originalPublishSocket?.writableEnded,
-        starts, lastStartOk, refreshEntered, refreshSettled, refreshReturned, refreshFailed, cachedBindings: store?.listWorkspaceBindings().length,
+        starts, lastStartOk, refreshEntered, refreshSettled, refreshReturned, refreshFailed, unrelatedRefreshEntered, unrelatedRefreshSettled, unrelatedRefreshReturned, unrelatedRefreshFailed, cachedBindings: store?.listWorkspaceBindings().length,
         target: ThreadModel.parseTelegramWorkspaceStateSection(observed, name)?.workspaceBindings?.find(row => row.cwd === ctx.cwd)?.target,
         namespaceHash: createHash("sha256").update(JSON.stringify(observed ?? null)).digest("hex") };
     };
@@ -13178,7 +13183,10 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     await harness.handlers.get("session_start")?.({}, ctx);
     process.send?.({ fixtureCheckpoint: "session-start-complete", pid: process.pid });
     const perform = async (command: string): Promise<unknown> => {
-      if (command === "connect") { await harness.commands.get("telegram-connect")!.handler(profile ?? "", ctx); return stats(); }
+      if (command === "connect" || command === "connect-refresh") {
+        const connect = async () => { await harness.commands.get("telegram-connect")!.handler(profile ?? "", ctx); return stats(); };
+        return command === "connect-refresh" ? refreshRequest.run({ captured: false }, connect) : connect();
+      }
       if (command === "stats") return stats();
       if (command === "ownership-read-fault") { assert.equal(role, "leader"); assert.equal(ownershipFault, true); ownershipReadFault = true; return stats(); }
       if (command === "prepare") {
@@ -13265,7 +13273,8 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
       }
       if (command === "finish") { assert.ok(finishOriginal); inspectOriginal?.(); return { result: finishOriginal(), ...stats() }; }
       if (command === "release") { release(); return stats(); }
-      if (command === "refresh-status") return { pid: process.pid, resets, starts, refreshEntered, refreshSettled, refreshReturned, refreshFailed };
+      if (command === "refresh-status") return { pid: process.pid, resets, starts, refreshEntered, refreshSettled, refreshReturned, refreshFailed, unrelatedRefreshEntered, unrelatedRefreshSettled, unrelatedRefreshReturned, unrelatedRefreshFailed };
+      if (command === "observe-refresh") { assert.ok(store?.refresh); await store.refresh(); return stats(); }
       if (command === "release-refresh") { releaseRefresh(); return stats(); }
       if (command === "config-churn") {
         assert.ok(config);
@@ -13291,6 +13300,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
   await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
   type Stats = { pid: number; polls: number; creations: number; deletions: number; issued: number; completed: number; takeovers: number; continuations: number; resets: number; freshIssues: number;
     starts: number; lastStartOk?: boolean; refreshEntered: number; refreshSettled: number; refreshReturned: number; refreshFailed: number; cachedBindings?: number;
+    unrelatedRefreshEntered: number; unrelatedRefreshSettled: number; unrelatedRefreshReturned: number; unrelatedRefreshFailed: number;
     transportCaptures: number; transportChecks: Array<{ current: boolean; completed: number }>; ownershipReadFaults: number;
     nativeOutcome?: "returned" | "rejected"; nativeAuthorityError: boolean; nativeErrorIssued: boolean; heldAck?: { correlated: boolean; ok: boolean; message?: string };
     callerCommitUnknown: boolean; callerCommitMethod?: string; publicationMethod?: string; originalPublishSocketDestroyed?: boolean; originalPublishSocketEnded?: boolean;
@@ -13322,7 +13332,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
   };
   const leader = launch("leader");
   let followerForCleanup: ReturnType<typeof launch> | undefined;
-  let publication: Promise<{ result?: Stats; error?: unknown }> | undefined, settled = false, reconnect: Promise<Stats> | undefined;
+  let publication: Promise<{ result?: Stats; error?: unknown }> | undefined, settled = false, reconnect: Promise<Stats> | undefined, overlappingRefresh: Promise<Stats> | undefined;
   const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
   let stage = "native-roots-ready", primaryFailure: unknown, failed = false;
   let initialFollower: Stats | undefined, initialLeader: unknown, publicationObservation: unknown, reconnectObservation: Stats | undefined, finalObservation: unknown;
@@ -13370,7 +13380,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
       if (loss === "damaged") await leader.request("damage");
       else canonical = (await leader.request("replace")).namespaceHash;
       if (refreshBoundary) {
-        reconnect = follower.request("connect"); void reconnect.catch(() => undefined);
+        reconnect = follower.request("connect-refresh"); void reconnect.catch(() => undefined);
         await waitForAsyncCondition(async () => (await follower.request("refresh-status")).refreshSettled === 1);
         const held = await follower.request("probe");
         assert.equal(held.resets, 1); assert.equal(held.refreshEntered, 1); assert.equal(held.refreshFailed, 0);
@@ -13380,6 +13390,10 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
         if (refreshBoundary === "cancel" || refreshBoundary === "config") {
           const canceled = await follower.request(refreshBoundary === "cancel" ? "disconnect" : "config-churn");
           assert.equal(canceled.starts, 1); assert.equal(canceled.refreshReturned, 0);
+        }
+        if (overlappingObservation) {
+          overlappingRefresh = follower.request("observe-refresh"); void overlappingRefresh.catch(() => undefined);
+          await waitForAsyncCondition(async () => { const observed = await follower.request("refresh-status"); return observed.refreshSettled + observed.unrelatedRefreshSettled >= 2; });
         }
         canonical = held.namespaceHash;
       } else {
@@ -13445,6 +13459,11 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     if (refreshBoundary) {
       await follower.request("release-refresh");
       const resumed = reconnectObservation = await reconnect!;
+      if (overlappingRefresh) {
+        const observed = await overlappingRefresh;
+        assert.ok(observed.unrelatedRefreshSettled >= 1); assert.ok(observed.unrelatedRefreshReturned >= 1);
+        assert.equal(observed.unrelatedRefreshFailed, 0);
+      }
       assert.equal(resumed.refreshReturned, 1); assert.equal(resumed.refreshFailed, 0);
       assert.equal(resumed.starts, refreshBoundary === "held" ? 2 : 1, "Public cancellation spends the original command before its late native refresh completion");
       if (refreshBoundary === "held") { assert.equal(resumed.lastStartOk, true); assert.ok(resumed.target); }
@@ -13481,7 +13500,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
           initialFollower, initialLeader, publicationObservation, reconnectObservation, finalObservation,
           leader: leader.diagnostics(), follower: follower?.diagnostics() ?? { notStarted: true }, runtimeLog };
         await mkdir(evidenceDir, { recursive: true });
-        await writeFile(join(evidenceDir, `${artifact}-${profile ?? "default"}-${loss}-${refreshBoundary ?? "none"}-${ownershipFault}-${ipcLoss}.json`),
+        await writeFile(join(evidenceDir, `${artifact}-${profile ?? "default"}-${loss}-${refreshBoundary ?? "none"}-${ownershipFault}-${ipcLoss}${overlappingObservation ? "-overlapping-observation" : ""}.json`),
           JSON.stringify(evidence, null, 2).replaceAll("123:os-original", "<fixture-token>") + "\n", { flag: "wx" });
       } catch (reason) { diagnosticFailures.push({ status: "rejected", reason }); }
     }
