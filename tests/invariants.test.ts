@@ -103,7 +103,7 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   const paths = workflow.match(/^    paths:\n((?:      - [^\n]+\n)+)/mu)?.[1];
   assert.ok(paths);
   assert.deepEqual(paths.trim().split("\n").map(line => line.trim().replace(/^- "|"$/gu, "")), [
-    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "scripts/probe-owned-native-close-failure.mjs", "scripts/probe-native-napi-build.mjs", "scripts/package-native-lock.mjs", "native/**", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
+    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "scripts/probe-owned-native-close-failure.mjs", "scripts/probe-native-napi-build.mjs", "scripts/package-native-lock.mjs", "scripts/build-linux-native-lock.mjs", "native/**", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
   ]);
   assert.match(workflow, /^  contents: read$/mu);
   const jobEnvironment = workflow.match(/^    env:\n((?:      [^\n]+\n)+)/mu)?.[1];
@@ -142,7 +142,9 @@ test("Private kernel package builds use one source and preserve image identity a
   assert.match(packager, /Reflect\.ownKeys\(native\)\.sort\(\)/u);
   assert.match(packager, /mkdirSync\(output, \{ mode: 0o700 \}\)/u);
   assert.match(packager, /source: \{ file: "locks\.c", sha256: digest\(sourceBytes\)/u);
-  assert.doesNotMatch(packager, /child_process|https?:|fetch\(|rmSync|recursive: true/u, "Assembly cannot download, compile, overwrite or clean existing output");
+  assert.doesNotMatch(packager, /https?:|fetch\(|rmSync|recursive: true/u, "Assembly cannot download, compile, overwrite or clean existing output");
+  assert.match(packager, /execFileSync\("readelf", \[flag, "--", binary\]/u);
+  assert.doesNotMatch(packager, /execFileSync\("(?:cc|gcc|cl|docker|sh|bash)"/u, "ELF inspection is not compilation or a shell escape");
   assert.match(workflow, /-DOWNED_LEASE_DISTRIBUTION=1 native\/locks\.c/u);
   assert.match(workflow, /'distribution' \{ '\/DOWNED_LEASE_DISTRIBUTION=1' \}/u);
   assert.match(workflow, /node-version: \$\{\{ matrix\.node == '22\.19\.0' && '26\.8\.1' \|\| '22\.19\.0' \}\}/u);
@@ -150,6 +152,41 @@ test("Private kernel package builds use one source and preserve image identity a
   assert.ok(alternate);
   assert.match(alternate, /--backend "\$QUALIFICATION_EVIDENCE\/kernel-backend\/locks\.node"/u);
   assert.doesNotMatch(alternate, /cc |cl\.exe|package-native-lock/u, "The alternate runtime must load the very same packaged bytes");
+});
+
+test("Linux native build pins its minimum-userland toolchain without widening container authority", () => {
+  const lock = JSON.parse(readFileSync(join(PROJECT_ROOT, "native/linux-toolchain.json"), "utf8"));
+  const builder = readFileSync(join(PROJECT_ROOT, "scripts/build-linux-native-lock.mjs"), "utf8");
+  const workflow = readFileSync(join(PROJECT_ROOT, ".github/workflows/native-lock-qualification.yml"), "utf8");
+  assert.equal(lock.version, 1); assert.equal(lock.platform, "linux/amd64"); assert.equal(lock.glibcBaseline, "2.28");
+  assert.match(lock.image, /^quay\.io\/pypa\/manylinux_2_28_x86_64@sha256:[a-f0-9]{64}$/u);
+  assert.match(lock.configDigest, /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(lock.compiler, "/opt/rh/gcc-toolset-14/root/usr/bin/gcc");
+  for (const restriction of ["--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user"]) assert.ok(builder.includes(restriction));
+  assert.doesNotMatch(builder, /--privileged|--network=host|docker\.sock|\bsudo\b/u);
+  assert.match(builder, /images\[0\]\.Id, lock\.configDigest/u);
+  assert.match(builder, /host\.glibc, lock\.glibcBaseline/u);
+  assert.match(builder, /inspectLinuxNativeImage\(binary\)/u);
+  assert.match(workflow, /if \[ "\$RUNNER_OS" = macOS \]; then cc .*OWNED_LEASE_DISTRIBUTION/u,
+    "Linux distribution may not silently return to the newer runner-host compiler");
+  const step = workflow.match(/      - name: Build Linux distribution against pinned GLIBC baseline\n((?:        [^\n]*\n)+)/u)?.[1];
+  assert.ok(step); assert.match(step, /if: runner\.os == 'Linux'/u); assert.match(step, /timeout-minutes: 7/u);
+});
+
+test("Linux image admission rejects newer GLIBC before loading or package publication", async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { validateLinuxNativeVersionNeeds } from "./scripts/package-native-lock.mjs";
+    const dynamic = "Shared library: [libc.so.6]";
+    assert.deepEqual(validateLinuxNativeVersionNeeds(dynamic, "Name: GLIBC_2.2.5\nName: GLIBC_2.28\nName: GLIBC_2.4"),
+      { family: "glibc", baseline: "2.28", highestRequired: "2.28", libraries: ["libc.so.6"] });
+    for (const versions of ["Name: GLIBC_2.33", "Name: GLIBC_2.28.1", "Name: GLIBC_3.0"])
+      assert.throws(() => validateLinuxNativeVersionNeeds(dynamic, versions), /exceeds the Node 22 GLIBC 2.28 baseline/u);
+    assert.throws(() => validateLinuxNativeVersionNeeds(dynamic, "Name: GLIBC_PRIVATE"), /Unknown native GLIBC requirement/u);
+    assert.throws(() => validateLinuxNativeVersionNeeds(dynamic, ""), /inspectable GLIBC/u);
+    assert.throws(() => validateLinuxNativeVersionNeeds(dynamic + "\nShared library: [libssl.so.3]", "Name: GLIBC_2.28"), /depend only on libc/u);
+  `);
+  assert.equal(result.code, 0, result.stderr);
 });
 
 test("Windows N-API SDK qualification pins only public x64 build inputs", () => {

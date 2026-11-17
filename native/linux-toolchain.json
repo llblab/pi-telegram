@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "image": "quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c",
+  "configDigest": "sha256:0e62e29c1a02b743a8415b2dd8d547b3c3f8dc22bcd5d0723d545321ad06cd23",
+  "platform": "linux/amd64",
+  "compiler": "/opt/rh/gcc-toolset-14/root/usr/bin/gcc",
+  "glibcBaseline": "2.28"
+}
