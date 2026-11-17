@@ -130,6 +130,20 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   assert.doesNotMatch(workflow, /pull_request_target|workflow_run|^  push:|secrets\.|:\s*write\b|continue-on-error/u);
 });
 
+test("Windows N-API SDK qualification pins only public x64 build inputs", () => {
+  const sdk = JSON.parse(readFileSync(join(PROJECT_ROOT, "tests", "fixtures", "native-file-lock", "windows-node-sdk.json"), "utf8"));
+  assert.equal(sdk.source, "https://nodejs.org/dist/");
+  assert.equal(sdk.arch, "x64");
+  assert.equal(sdk.napi, 8);
+  assert.deepEqual(Object.keys(sdk.versions), ["22.19.0", "26.8.1"]);
+  for (const version of Object.keys(sdk.versions)) {
+    const release = sdk.versions[version];
+    assert.equal(release.headers.file, `node-v${version}-headers.tar.gz`);
+    assert.equal(release.importLibrary.file, "win-x64/node.lib");
+    for (const input of [release.headers, release.importLibrary]) assert.match(input.sha256, /^[a-f0-9]{64}$/u);
+  }
+});
+
 test("CI native progress stays finite, body-free and separate from native completion", async () => {
   const result = await runNodeEval(String.raw`
     import assert from "node:assert/strict";
