@@ -31,6 +31,7 @@ import { fileURLToPath } from "node:url";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
 import { runNodeEval } from "./fixtures/node-eval.ts";
+import { createNativeTestPhaseObserver } from "./fixtures/native-test-phase.ts";
 import { createIntegrationShardSelector } from "./fixtures/shared.ts";
 import * as RoutingFixture from "./fixtures/routing.ts";
 import { withWorkspaceRestoreFixture } from "./fixtures/workspace.ts";
@@ -1553,12 +1554,14 @@ test(`Native Rich feedback keeps literal callback examples inert (${literal})`, 
 });
 for (const boundary of ["omitted", "markup-only", "missing-keyboard", "clone-rich", "clone-keyboard", "changed-rich-content", "drop-rich-callback", "duplicate-cross-carrier", "legacy-ack", "void", "query-loss", "clear", "intervening-view"] as const)
 test(`Native Rich feedback refuses an incomplete or renewed carrier (${boundary})`, async t => {
+  const phase = createNativeTestPhaseObserver(t);
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
   const h = await richFeedbackFixture({ ordinaryCount: 2, ordinaryRichFeedbackParent: boundary === "omitted" ? undefined : true });
   try {
-    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false, calls = 0; void prior.handle.result.then(() => { ended = true; });
+    phase.enter("invoke"); const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!;
+    phase.enter("sdk-open"); const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false, calls = 0; void prior.handle.result.then(() => { ended = true; });
     const api = ordinaryParentTransport(h, async () => boundary === "legacy-ack" && ++calls === 1 ? true : "edited"), native = BusApi.createTelegramButtonPublicationEditor(api);
-    h.store.bindPublicationEditor!(async (view, guard) => {
+    phase.enter("editor-bind"); h.store.bindPublicationEditor!(async (view, guard) => {
       if (boundary === "void") return;
       if (boundary === "markup-only") return api.editMessageReplyMarkup(42, 201, view.replyMarkup!);
       if (boundary === "missing-keyboard") return native({ ...view, replyMarkup: undefined }, guard);
@@ -1568,12 +1571,14 @@ test(`Native Rich feedback refuses an incomplete or renewed carrier (${boundary}
       if (boundary === "drop-rich-callback") (view.richMessage as { markdown: string }).markdown = view.richMessage!.markdown.replace(/<tg-button-row>[\s\S]*?<\/tg-button-row>/g, "");
       if (boundary === "duplicate-cross-carrier") (view.richMessage as { markdown: string }).markdown += `\n<tg-button-row><tg-button type="callback_data" data="${view.replyMarkup!.inline_keyboard[0]![0]!.callback_data}">Duplicate</tg-button></tg-button-row>\n`;
       await native(view, guard);
-    }); await h.store.waitForPublicationIdle!();
+    }); phase.enter("editor-drain"); await h.store.waitForPublicationIdle!();
     if (boundary === "query-loss") { const id = h.query.id; h.query.id = "lost"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
     if (boundary === "clear") h.store.clear!();
+    phase.enter("replacement");
     if (boundary === "intervening-view") await api.editMessageText({ chat_id: 42, message_id: 201, rich_message: { markdown: h.plan.markdown }, reply_markup: h.plan.replyMarkup });
-    const next = ordinaryParentReplacement(h, { binding }); await api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
-  } finally { await h.close(); }
+    const next = ordinaryParentReplacement(h, { binding }); await api.editMessageText(next.body);
+    phase.enter("assertions"); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { phase.enter("cleanup"); await h.close(); phase.complete(); }
 });
 test("Native Rich feedback seals even a projected Rich carrier with zero remaining inline callbacks", async t => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await richFeedbackFixture();

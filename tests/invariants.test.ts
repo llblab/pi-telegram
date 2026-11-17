@@ -436,7 +436,22 @@ test("CI progress reporter observes public native events without changing TAP or
     import { setTimeout as delay } from "node:timers/promises";
     import { pathToFileURL } from "node:url";
     const reporterSource = resolve("scripts/ci-test-progress.mjs");
+    const phaseModule = pathToFileURL(resolve("tests/fixtures/native-test-phase.ts")).href;
+    const { createNativeTestPhaseObserver } = await import(phaseModule);
     const name = "held-123:private-title\n::error::not-a-command";
+    const frames = [], abort = new AbortController();
+    const observer = createNativeTestPhaseObserver({ name, signal: abort.signal, diagnostic: value => frames.push(JSON.parse(value)) });
+    observer.enter("invoke"); abort.abort({ get message() { throw Error("Never inspect abort bodies"); } });
+    observer.enter("cleanup"); observer.complete(); abort.abort();
+    assert.equal(frames.length, 1); assert.equal(frames[0].stage, "invoke"); assert.equal(frames[0].ordinal, 1);
+    assert.equal(frames[0].id, createHash("sha256").update(name).digest("hex"));
+    assert.ok(Buffer.byteLength(JSON.stringify(frames[0])) <= 384); assert.equal(JSON.stringify(frames).includes("123:"), false);
+    const complete = new AbortController(), completedFrames = [];
+    createNativeTestPhaseObserver({ name, signal: complete.signal, diagnostic: value => completedFrames.push(value) }).complete();
+    complete.abort(); assert.deepEqual(completedFrames, [], "Completed tests emit no abort phase");
+    const unavailable = new AbortController();
+    createNativeTestPhaseObserver({ name, signal: unavailable.signal, diagnostic() { throw Error("Unavailable diagnostic sink"); } });
+    unavailable.abort();
     for (const github of [false, true]) for (const mode of ["healthy", "failure", "timeout", "SIGTERM", "SIGKILL"]) {
       const root = mkdtempSync(join(tmpdir(), "pt-progress-native # % λ-"));
       mkdirSync(join(root, "tests"));
@@ -447,10 +462,14 @@ test("CI progress reporter observes public native events without changing TAP or
       writeFileSync(join(root, "tests", "integration.test.ts"), [
         'import assert from "node:assert/strict"; import test from "node:test";',
         'import { existsSync, writeFileSync } from "node:fs"; import { setTimeout as delay } from "node:timers/promises";',
-        'test(' + JSON.stringify(name) + ', { timeout: ' + (mode === "timeout" ? 150 : 4000) + ' }, async () => {',
+        'import { createNativeTestPhaseObserver } from ' + JSON.stringify(phaseModule) + ';',
+        'test(' + JSON.stringify(name) + ', { timeout: ' + (mode === "timeout" ? 150 : 4000) + ' }, async t => {',
+        't.mock.timers.enable({ apis: ["Date"], now: 1000 });',
+        'const phase = createNativeTestPhaseObserver(t); phase.enter("invoke"); t.mock.timers.tick(3600000);',
         'writeFileSync(' + JSON.stringify(entered) + ', "body-entered"); const end = performance.now() + 3000;',
         'while (!existsSync(' + JSON.stringify(release) + ')) { if (performance.now() >= end) throw new Error("Probe release missing"); await delay(10); }',
         ...(mode === "failure" ? ['assert.fail("123:assertion-body");'] : []),
+        'phase.enter("cleanup"); phase.complete();',
         '});',
         'test("skip-123:hidden", { skip: "123:reason" }, () => assert.fail("Skipped body cannot run"));',
         'test("last-native-pass", () => {});',
@@ -466,11 +485,16 @@ test("CI progress reporter observes public native events without changing TAP or
       });
       const prefix = github ? "::notice title=CI native progress::" : "ci-native-progress:";
       const records = () => (github ? stdout : stderr).split("\n").filter(line => line.startsWith(prefix)).map(line => JSON.parse(line.slice(prefix.length)));
+      const phases = () => stdout.split("\n").filter(line => line.startsWith('# {"v":1,"phase":"native-test-phase"')).map(line => JSON.parse(line.slice(2)));
       const until = async predicate => { const end = performance.now() + 2000; while (!predicate() && !closed && performance.now() < end) await delay(10); return predicate(); };
       let native, primary;
       try {
         assert.equal(await until(() => existsSync(entered) && records().length > 0), true, mode + ": " + stderr);
-        if (mode === "timeout") assert.equal(await until(() => records().some(row => row.phase === "native-test-failed")), true, stderr);
+        if (mode === "timeout") {
+          assert.equal(await until(() => records().some(row => row.phase === "native-test-failed") && phases().length === 1), true, stderr);
+          assert.equal(phases()[0].stage, "invoke"); assert.equal(phases()[0].ordinal, 1);
+          assert.ok(phases()[0].elapsedMs < 3600000, "Virtual Date advancement cannot inflate native elapsed time");
+        }
         assert.deepEqual(records()[0], { v: 1, phase: "dequeued", dequeued: 1, nativeCompleted: 0, id: createHash("sha256").update(name).digest("hex") });
         assert.equal(closed, false); assert.equal(existsSync(release), false, "Native reporting cannot certify original-body drain");
         if (mode === "SIGTERM" || mode === "SIGKILL") { assert.equal(child.kill(mode), true); await delay(75); }
@@ -493,6 +517,13 @@ test("CI progress reporter observes public native events without changing TAP or
         }
       }
       const projected = records();
+      assert.ok(phases().length <= 1);
+      for (const phase of phases()) {
+        assert.equal(phase.id, createHash("sha256").update(name).digest("hex"));
+        assert.ok(Buffer.byteLength(JSON.stringify(phase)) <= 384); assert.equal(JSON.stringify(phase).includes("123:"), false);
+      }
+      if (mode === "healthy") assert.deepEqual(phases(), []);
+      if (mode === "timeout") { assert.equal(phases().length, 1); assert.equal(phases()[0].stage, "invoke"); assert.match(stdout, /test timed out after 150ms/u); }
       assert.equal(JSON.stringify(projected).includes("123:"), false); assert.equal(JSON.stringify(projected).includes(root), false);
       assert.equal(stdout.includes("ci-native-progress:"), false);
       assert.equal(stdout.includes("::notice title=CI native progress::"), github);
