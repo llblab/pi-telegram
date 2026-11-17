@@ -164,13 +164,35 @@ test("Linux native build pins its minimum-userland toolchain without widening co
   assert.equal(lock.compiler, "/opt/rh/gcc-toolset-14/root/usr/bin/gcc");
   for (const restriction of ["--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user"]) assert.ok(builder.includes(restriction));
   assert.doesNotMatch(builder, /--privileged|--network=host|docker\.sock|\bsudo\b/u);
-  assert.match(builder, /images\[0\]\.Id, lock\.configDigest/u);
+  assert.match(builder, /validateLinuxNativeBuilderIdentity\(images\[0\], manifest, lock\)/u);
   assert.match(builder, /host\.glibc, lock\.glibcBaseline/u);
   assert.match(builder, /inspectLinuxNativeImage\(binary\)/u);
   assert.match(workflow, /if \[ "\$RUNNER_OS" = macOS \]; then cc .*OWNED_LEASE_DISTRIBUTION/u,
     "Linux distribution may not silently return to the newer runner-host compiler");
   const step = workflow.match(/      - name: Build Linux distribution against pinned GLIBC baseline\n((?:        [^\n]*\n)+)/u)?.[1];
   assert.ok(step); assert.match(step, /if: runner\.os == 'Linux'/u); assert.match(step, /timeout-minutes: 7/u);
+});
+
+test("Linux builder binds manifest and config across classic and containerd identity views", async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { readFileSync } from "node:fs";
+    import { validateLinuxNativeBuilderIdentity } from "./scripts/build-linux-native-lock.mjs";
+    const lock = JSON.parse(readFileSync("native/linux-toolchain.json", "utf8"));
+    const digest = lock.image.split("@")[1], foreign = "sha256:" + "0".repeat(64);
+    const manifest = { schemaVersion: 2, mediaType: "application/vnd.docker.distribution.manifest.v2+json", config: { digest: lock.configDigest } };
+    const image = { Id: digest, Architecture: "amd64", Os: "linux", RepoDigests: [lock.image], Descriptor: { digest } };
+    assert.equal(validateLinuxNativeBuilderIdentity(image, manifest, lock).daemonImageId, digest);
+    const classic = { ...image, Id: lock.configDigest }; delete classic.Descriptor;
+    assert.equal(validateLinuxNativeBuilderIdentity(classic, manifest, lock).daemonImageId, lock.configDigest);
+    for (const changed of [
+      { ...image, Id: foreign }, { ...image, RepoDigests: [lock.image.split("@")[0] + "@" + foreign] },
+      { ...image, Descriptor: { digest: foreign } }, { ...image, Architecture: "arm64" },
+    ]) assert.throws(() => validateLinuxNativeBuilderIdentity(changed, manifest, lock));
+    assert.throws(() => validateLinuxNativeBuilderIdentity(image, { ...manifest, config: { digest: foreign } }, lock));
+    assert.throws(() => validateLinuxNativeBuilderIdentity(image, { ...manifest, mediaType: "application/vnd.oci.image.index.v1+json" }, lock));
+  `);
+  assert.equal(result.code, 0, result.stderr);
 });
 
 test("Linux image admission rejects newer GLIBC before loading or package publication", async () => {
