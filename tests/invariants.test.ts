@@ -167,7 +167,11 @@ test("Linux native build pins its minimum-userland toolchain without widening co
   assert.match(builder, /validateLinuxNativeBuilderIdentity\(images\[0\], manifest, lock\)/u);
   assert.match(builder, /host\.glibc, lock\.glibcBaseline/u);
   assert.match(builder, /inspectLinuxNativeImage\(binary\)/u);
-  assert.match(workflow, /if \[ "\$RUNNER_OS" = macOS \]; then cc .*OWNED_LEASE_DISTRIBUTION/u,
+  const macDistribution = workflow.match(/^          if \[ "\$RUNNER_OS" = macOS \]; then\n(?:            [^\n]*\n)+          fi$/mu)?.[0];
+  assert.ok(macDistribution, "Distribution compilation must retain its explicit macOS-only branch");
+  assert.match(macDistribution, /-mmacosx-version-min=11\.0 -DOWNED_LEASE_DISTRIBUTION=1/u);
+  assert.match(macDistribution, /-mmacosx-version-min=26\.0 -DOWNED_LEASE_DISTRIBUTION=1/u);
+  assert.doesNotMatch(workflow.replace(macDistribution, ""), /^\s*cc .*OWNED_LEASE_DISTRIBUTION/mu,
     "Linux distribution may not silently return to the newer runner-host compiler");
   const step = workflow.match(/      - name: Build Linux distribution against pinned GLIBC baseline\n((?:        [^\n]*\n)+)/u)?.[1];
   assert.ok(step); assert.match(step, /if: runner\.os == 'Linux'/u); assert.match(step, /timeout-minutes: 7/u);

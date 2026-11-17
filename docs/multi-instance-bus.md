@@ -449,7 +449,7 @@ The local Bot API reference in [`../.agents/skills/telegram-bot/api.md`](../.age
 
 - `User` returned by `getMe` can include `has_topics_enabled` and `allows_users_to_create_topics`; these are the private-chat Threaded Mode capability fields and are the startup/runtime probe source for this extension.
 - `createForumTopic` works in a private chat with a user and returns a `ForumTopic`, so the returned `message_thread_id` is persistable as an instance thread target.
-- Private-thread management uses Bot API methods such as `editForumTopic`, `closeForumTopic`, `reopenForumTopic`, `deleteForumTopic`, and related unpin methods. Thread-unavailable errors from these methods are degradation evidence when Threaded Mode is disabled or unavailable for the bot.
+- Private-thread management supports `editForumTopic`, `deleteForumTopic`, and related unpin methods. `closeForumTopic` and `reopenForumTopic` are forum-supergroup methods, not prerequisites for private Thread deletion. Keep method eligibility separate from Thread-existence or mode-degradation evidence.
 - `Message` exposes `message_thread_id` and `is_topic_message`; an incoming private-chat message with `message_thread_id` is a live Threaded Mode observation and can trigger progressive upgrade.
 - Topic lifecycle service messages include `forum_topic_created`, `forum_topic_edited`, `forum_topic_closed`, `forum_topic_reopened`, `general_forum_topic_hidden`, and `general_forum_topic_unhidden`.
 - `message_thread_id` is supported by the send/upload methods the bridge uses or may need: `sendMessage`, `sendPhoto`, `sendDocument`, `sendVoice`, `sendMediaGroup`, `sendSticker`, `sendRichMessage`, `sendMessageDraft`, `sendRichMessageDraft`, and `sendChatAction`.

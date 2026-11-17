@@ -7194,9 +7194,8 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
           const retained = journal.inspectPendingRetention(sourceEntry);
           assert.ok(retained);
           assert.deepEqual(JSON.parse(await readFile(retained.retainedPath, "utf8")).entry.update, update);
-          // With nothing unspent left in the cancelled unbound tab it is deleted like a routing tab; the private original stays.
-          assert.equal(apiCalls.filter(method => method === "deleteForumTopic").length, scenario === "orphan-protected" ? 0 : 1,
-            "A cancelled unbound tab is deleted exactly once unless the journal census still names it");
+          assert.deepEqual(apiCalls.filter(method => method === "closeForumTopic" || method === "deleteForumTopic"), [],
+            "Source cancellation alone cannot delete a tab without composed reader, original and one-shot Workspace authority");
           await click("reroute:1:42");
           await click("reroutecancel:1");
           assert.equal(telegramQueueStore.getQueuedItems().length, 0);
@@ -7213,8 +7212,10 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
   });
 }
 
-for (const runtimeChurn of [false, true]) for (const deferredReceipt of [false, true]) for (const readerMode of ["uncomposed", "supported", "changed", "unsupported-origin", "non-leader", "drain-during-toast", "unknown", "session", "binding", "v1-only", "new-work", "reader-issued", "http-fence", "api-false", "new-epoch", "timer-only", "session-hint", "source-lost", "session-renewed", "session-renewed-clear", "session-issued", "same-session-new"] as const)
-test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authority (runtimeChurn=${runtimeChurn}, deferredReceipt=${deferredReceipt}, readers=${readerMode})`, async () => {
+for (const artifact of ["source", "compiled"] as const) {
+for (const runtimeChurn of [false, true]) for (const deferredReceipt of [false, true]) for (const readerMode of ["uncomposed", "supported", "changed", "unsupported-origin", "non-leader", "drain-during-toast", "unknown", "session", "binding", "v1-only", "new-work", "reader-issued", "http-fence", "api-false", "new-epoch", "timer-only", "session-hint", "source-lost", "session-renewed", "session-renewed-clear", "session-issued", "same-session-new"] as const) {
+if (artifact === "compiled" && (deferredReceipt || (readerMode !== "supported" && readerMode !== "unknown"))) continue;
+test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authority (runtimeChurn=${runtimeChurn}, deferredReceipt=${deferredReceipt}, readers=${readerMode}${artifact === "compiled" ? ", artifact=compiled" : ""})`, async () => {
   await withTopicStore(async (threadStore, path) => {
     const chatId = readerMode === "uncomposed" || readerMode === "unsupported-origin" ? 100 : 7;
     const readerRegistry = Bus.createTelegramBusFollowerRegistry(), readerProtocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "same", capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER, ...(readerMode === "v1-only" ? [] : [Bus.TELEGRAM_BUS_CAPABILITY_ORPHAN_CLEANUP_READER])] });
@@ -7298,14 +7299,15 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
           readerRegistry.remove("reader"); readerRegistry.register(reader);
         }
         try { options?.assertAuthority?.(); } catch (error) { nativeFenceRefused = true; throw error; }
-        if (method === "deleteForumTopic" && deferredReceipt && workspace.listTemporaryThreads().some(value => value.cleanupIssued)) {
+        if (method === "deleteForumTopic") {
+          assert.equal(workspace.listTemporaryThreads()[0]?.cleanupIssued, true, "Clear and deferred orphan cleanup both durably spend before transport");
           assert.equal(options?.maxAttempts, 1); assert.equal(options?.retrySafety, "non-idempotent"); assert.equal(typeof options?.assertAuthority, "function");
           assert.ok(ledger.read().leases.some(value => value.operationKind === "workspace.temporary-thread"), "HTTP remains inside fresh profile admission");
-          if (readerMode === "session-renewed" || readerMode === "session-renewed-clear") {
+          if (deferredReceipt && (readerMode === "session-renewed" || readerMode === "session-renewed-clear")) {
             assert.equal(workspace.listTemporaryThreads()[0]?.orphanCancellation?.sessionGeneration, 2);
             assert.equal(workspace.listTemporaryThreads()[0]?.source.updateId, 400);
           }
-          if (readerMode === "new-epoch") {
+          if (deferredReceipt && readerMode === "new-epoch") {
             const frame = workspace.listTemporaryThreads()[0]!;
             assert.equal(frame.executor.leaderEpoch, "2"); assert.equal(frame.orphanCancellation?.executor.leaderEpoch, "1");
           }
@@ -7316,7 +7318,9 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
       },
       async deleteMessage() { if (capturedReaders && readerMode === "changed") { readerRegistry.remove("reader"); readerRegistry.register(reader); } },
     });
-    const { routeRuntime } = harness;
+    const nativeUpdates = artifact === "source" ? Updates : await import("../dist/lib/updates.js") as unknown as typeof Updates;
+    const routeRuntime = artifact === "source" ? harness.routeRuntime :
+      (await import("../dist/lib/routing.js") as unknown as typeof Routing).createTelegramInboundRouteRuntime<TestUpdate, TestMessage, TestCallbackQuery, TestContext, TestModel>(harness.routingDeps);
     if (readerMode === "drain-during-toast") {
       const answer = harness.routingDeps.answerCallbackQuery;
       harness.routingDeps.answerCallbackQuery = async (id, text) => {
@@ -7325,7 +7329,7 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
         await answer(id, text);
       };
     }
-    const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
+    const worker = nativeUpdates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
       journal, getJournalBindingKey: () => bindingKey, hasAuthority: () => true,
       defaultHandle: (input, ctx) => routeRuntime.handleUpdate(input, ctx),
     });
@@ -7352,9 +7356,26 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
       await click("reroutecancel:2", 201);
       await routeRuntime.waitForRestoreSettlement();
       const deletions = apiCalls.filter(call => call.method === "deleteForumTopic");
-      assert.equal(deletions.length, (deferredReceipt && readerMode !== "drain-during-toast") ? 0 : 1, JSON.stringify(apiCalls) + events.join("|"));
-      if (!deferredReceipt) assert.equal(deletions[0]!.threadId, 99);
-      else {
+      const clearCleanupRefused = ["uncomposed", "changed", "unsupported-origin", "non-leader", "v1-only"].includes(readerMode);
+      assert.equal(deletions.length, (deferredReceipt && readerMode !== "drain-during-toast") || clearCleanupRefused ? 0 : 1,
+        JSON.stringify(apiCalls) + events.join("|"));
+      if (!deferredReceipt) {
+        if (!clearCleanupRefused) assert.equal(deletions[0]!.threadId, 99);
+        if (readerMode === "unknown") {
+          const originals = [101, 102].map(id => {
+            const proof = journal.inspectAbandonedPending(id)!;
+            return { path: proof.retainedPath, bytes: fs.readFileSync(proof.retainedPath) };
+          });
+          journal.appendBatch([message(400, "/quit")]); worker.signal(); await worker.waitForDrain();
+          nextUpdateId = 401;
+          await click("reroutecancel:3", 202); await routeRuntime.waitForRestoreSettlement();
+          assert.equal(journal.inspectAbandonedPending(400)?.updateId, 400, "The fresh routing source can be cancelled without replaying cleanup");
+          for (const original of originals) assert.deepEqual(fs.readFileSync(original.path), original.bytes);
+          assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0);
+          assert.equal(apiCalls.filter(call => call.method === "deleteForumTopic").length, 1,
+            "An issued unknown orphan deletion must remain spent across a fresh input and its final Cancel");
+        }
+      } else {
         assert.ok(receipt);
         const renewBlocked = readerMode === "session-renewed" || readerMode === "same-session-new";
         if (readerMode !== "drain-during-toast" && !renewBlocked) assert.deepEqual(independent.completeQueued([receipt]).removedUpdateIds, [900, 901]);
@@ -7427,14 +7448,20 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
         assert.equal(injected, true); assert.equal(workspace.listTemporaryThreads()[0]?.cleanupIssued, undefined);
         assert.equal(independent.read().entries.find(value => value.updateId === 902)?.queueReceiptId, "late-queue", "New custody is not erased to manufacture clearance");
       }
+      assert.equal(apiCalls.some(call => call.method === "closeForumTopic"), false, "Private orphan deletion cannot depend on unsupported forum closing");
       assert.equal(apiCalls.some(call => call.method === "deleteForumTopic" && call.threadId === 42), false, "A bound tab is never touched");
-      assert.ok(inspections > 0); assert.deepEqual(references.list(), []);
+      assert.equal(inspections > 0, deferredReceipt || !clearCleanupRefused,
+        "Missing origin/reader/leader admission refuses before namespace access; admitted cleanup still requires its census");
+      assert.deepEqual(references.list(), []);
       if (heldOriginal) { const held = heldOriginal; fs.renameSync(held.held, held.path); heldOriginal = undefined; assert.deepEqual(fs.readFileSync(held.path), held.bytes); }
       assert.equal(journal.inspectAbandonedPending(101)?.updateId, 101);
       assert.equal(journal.inspectAbandonedPending(102)?.updateId, 102);
     } finally { sessionGeneration += 1; if (heldOriginal) fs.renameSync(heldOriginal.held, heldOriginal.path); await worker.stop(); }
   });
 });
+
+}
+}
 
 for (const artifact of ["source", "compiled"] as const) for (const scenario of [
   "clear", "queued", "same-id", "crossed-proof", "reader-loss", "session-loss",
