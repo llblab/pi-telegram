@@ -1,5 +1,5 @@
 /**
- * Opt-in Linux/Darwin resource-ownership probe for an independently compiled fixture addon.
+ * Opt-in resource-ownership probe for an independently compiled platform fixture addon.
  * Zones: native resource lifetime, disposable validation
  * Usage (repository checkout): node scripts/probe-owned-native-lease.mjs --addon /tmp/build/owned-lease.node
  * No Pi import, configured storage lookup, runtime dependency or backend activation.
@@ -16,7 +16,7 @@ import { isMainThread, parentPort, threadId, Worker, workerData } from "node:wor
 
 const require = createRequire(import.meta.url), script = fileURLToPath(import.meta.url);
 const args = process.argv.slice(2), child = isMainThread && args[0] === "--child";
-assert.ok(["linux", "darwin"].includes(process.platform), "This fixture has no Windows qualification yet");
+assert.ok(["linux", "darwin", "win32"].includes(process.platform), "Unsupported qualification platform");
 if (isMainThread) assert.ok(child ? args.length === 3 : args.length === 2 && args[0] === "--addon");
 else assert.equal(workerData.kind, "owned-lease-worker");
 const addonPath = realpathSync(resolve(isMainThread ? args[1] : workerData.addonPath));
@@ -49,7 +49,7 @@ if (!isMainThread) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "pt-owned-lease-")));
   const path = anchor(root), active = new Set(), workers = new Set(), checks = [];
   const report = { node: process.version, platform: process.platform, arch: process.arch,
-    fixture: native.fixtureKind, binarySha256: createHash("sha256").update(readFileSync(addonPath)).digest("hex"), checks };
+    fixture: native.fixtureKind, anchorPolicy: process.platform === "win32" ? "user-system-administrators-dacl" : "private-posix-mode", binarySha256: createHash("sha256").update(readFileSync(addonPath)).digest("hex"), checks };
   const total = setTimeout(() => {
     console.error("Owned-lease probe exceeded its 60-second total bound; disposable storage retained:", root);
     process.exit(1);
@@ -99,7 +99,11 @@ if (!isMainThread) {
       let copy;
       try { copy = structuredClone(lease); } catch (error) { assert.equal(error.name, "DataCloneError"); }
       if (copy !== undefined) assert.throws(() => native.release(copy), { code: "ERR_INVALID_LEASE" });
-      const otherPath = join(root, "foreign.node"); copyFileSync(addonPath, otherPath);
+      // Windows keeps DLL images mapped until process exit; retain that disposable
+      // image separately instead of claiming an in-process unlink as teardown proof.
+      const imageRoot = process.platform === "win32" ? realpathSync(mkdtempSync(join(tmpdir(), "pt-owned-image-"))) : root;
+      const otherPath = join(imageRoot, "foreign.node"); copyFileSync(addonPath, otherPath);
+      if (process.platform === "win32") report.retainedBuildImage = otherPath;
       const foreign = require(otherPath);
       assert.throws(() => foreign.release(lease), { code: "ERR_INVALID_LEASE" });
       assert.equal(attempt(), false); assert.equal(release(lease), true);
@@ -110,13 +114,26 @@ if (!isMainThread) {
       assert.equal(release(old), false); assert.equal(attempt(), false);
       assert.equal(release(successor), true); assert.equal(attempt(), true);
     });
-    await assess("anchor-validation-refuses-links-public-mode-and-relative-paths", () => {
+    await assess("anchor-validation-refuses-links-public-access-and-relative-paths", () => {
       assert.throws(() => native.tryAcquire("relative.lock"), { code: "ERR_LEASE_PATH" });
       assert.throws(() => native.tryAcquire(path + "\0suffix"), { code: "ERR_LEASE_PATH" });
-      const publicPath = join(root, "public.lock"); writeFileSync(publicPath, ""); chmodSync(publicPath, 0o644);
+      if (process.platform === "win32") {
+        for (const relative of ["C:relative.lock", "\\relative.lock"])
+          assert.throws(() => native.tryAcquire(relative), { code: "ERR_LEASE_PATH" });
+      }
+      const unicodePath = join(root, "lease-λ.lock"); writeFileSync(unicodePath, "", { mode: 0o600 });
+      const unicode = native.tryAcquire(unicodePath); assert.ok(unicode);
+      assert.equal(native.tryAcquire(unicodePath), undefined); assert.equal(native.release(unicode), true);
+      const publicPath = join(root, "public.lock"); writeFileSync(publicPath, "");
+      if (process.platform === "win32") {
+        const grant = spawnSync("icacls.exe", [publicPath, "/grant", "*S-1-1-0:(R)"],
+          { encoding: "utf8", timeout: 5000, killSignal: "SIGKILL", maxBuffer: 64 * 1024 });
+        assert.ifError(grant.error); assert.equal(grant.status, 0, grant.stderr);
+      } else chmodSync(publicPath, 0o644);
       assert.throws(() => native.tryAcquire(publicPath), { code: "ERR_LEASE_ANCHOR" });
       const alias = join(root, "alias.lock"); symlinkSync(path, alias);
-      assert.throws(() => native.tryAcquire(alias), error => error.syscall === "open");
+      assert.throws(() => native.tryAcquire(alias), error => process.platform === "win32"
+        ? error.code === "ERR_LEASE_ANCHOR" : error.syscall === "open");
       const linked = join(root, "hard.lock"); linkSync(path, linked);
       try { assert.throws(() => native.tryAcquire(path), { code: "ERR_LEASE_ANCHOR" }); }
       finally { rmSync(linked); }

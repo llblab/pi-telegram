@@ -152,6 +152,14 @@ test("Windows N-API SDK qualification pins only public x64 build inputs", () => 
   assert.match(windows, /\/std:c11.*\/DNAPI_VERSION=8/u);
   assert.match(windows, /windows-napi-compile-exit-code\.txt/u);
   assert.match(windows, /windows-napi-load-exit-code\.txt/u);
+  const handles = workflow.match(/      - name: Qualify Windows environment-owned HANDLE fixture\n((?:        [^\n]*\n)+)/u)?.[1];
+  assert.ok(handles);
+  assert.match(handles, /^        if: runner\.os == 'Windows'$/mu);
+  assert.match(handles, /^        shell: pwsh$/mu);
+  assert.match(handles, /advapi32\.lib/u);
+  assert.match(handles, /\/DOWNED_LEASE_SUPPRESS_TEARDOWN=1/u);
+  assert.match(handles, /\$status -ne 1.*expected failure/u);
+  assert.ok(workflow.indexOf("Compile and load public Windows N-API smoke fixture") < workflow.indexOf("Qualify Windows environment-owned HANDLE fixture"));
 });
 
 test("CI native progress stays finite, body-free and separate from native completion", async () => {

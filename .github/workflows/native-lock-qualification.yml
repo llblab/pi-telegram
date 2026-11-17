@@ -146,6 +146,42 @@ jobs:
           $status = $LASTEXITCODE
           $status | Set-Content "$evidence/windows-napi-load-exit-code.txt"
           exit $status
+      - name: Qualify Windows environment-owned HANDLE fixture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $version = (node -p process.versions.node).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $build = Join-Path $env:RUNNER_TEMP 'windows-napi-build'
+          $include = Join-Path $build "node-v$version/include/node"
+          $evidence = $env:QUALIFICATION_EVIDENCE
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installation = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          if ($LASTEXITCODE -ne 0 -or !$installation) { throw 'No public MSVC development environment found' }
+          $developer = Join-Path $installation.Trim() 'Common7/Tools/VsDevCmd.bat'
+          $source = (Resolve-Path tests/fixtures/native-file-lock/owned-lease.c).Path
+          @{ node = $version; sourceSha256 = (Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant(); probeSha256 = (Get-FileHash scripts/probe-owned-native-lease.mjs -Algorithm SHA256).Hash.ToLowerInvariant(); sdkEvidence = (Get-Content "$evidence/windows-napi-inputs.json" -Raw | ConvertFrom-Json) } | ConvertTo-Json -Depth 8 | Set-Content "$evidence/windows-owned-inputs.json"
+          foreach ($name in @('owned-lease', 'without-teardown')) {
+            $define = if ($name -eq 'without-teardown') { '/DOWNED_LEASE_SUPPRESS_TEARDOWN=1' } else { '' }
+            $command = Join-Path $build "$name.cmd"
+            @('@echo off', "call `"$developer`" -no_logo -arch=x64 -host_arch=x64", 'if errorlevel 1 exit /b %errorlevel%', "cl.exe /nologo /Bv /LD /MD /std:c11 /W4 /WX /DNAPI_VERSION=8 $define /I`"$include`" `"$source`" /Fo`"$build/$name.obj`" /link /OUT:`"$build/$name.node`" /IMPLIB:`"$build/$name.lib`" /INCREMENTAL:NO `"$build/node.lib`" advapi32.lib", 'exit /b %errorlevel%') | Set-Content $command -Encoding ascii
+            & $env:ComSpec /d /s /c "`"$command`"" > "$evidence/windows-$name-compile.stdout" 2> "$evidence/windows-$name-compile.stderr"
+            $status = $LASTEXITCODE
+            $status | Set-Content "$evidence/windows-$name-compile-exit-code.txt"
+            if ($status -ne 0) { exit $status }
+            (Get-FileHash "$build/$name.node" -Algorithm SHA256).Hash.ToLowerInvariant() | Set-Content "$evidence/windows-$name-binary-sha256.txt"
+          }
+          node scripts/probe-owned-native-lease.mjs --addon "$build/owned-lease.node" > "$evidence/owned-lease-report.json" 2> "$evidence/owned-lease.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/owned-lease-exit-code.txt"
+          if ($status -ne 0) { exit $status }
+          node scripts/probe-owned-native-lease.mjs --addon "$build/without-teardown.node" > "$evidence/owned-lease-control.stdout" 2> "$evidence/owned-lease-control.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/owned-lease-control-exit-code.txt"
+          if ($status -ne 1 -or !(Select-String -Path "$evidence/owned-lease-control.stderr" -SimpleMatch 'Actual Worker exit, not a stop request or JS finally, precedes reacquisition' -Quiet)) { throw 'Windows teardown falsifier did not reach the expected failure' }
       - name: Preserve qualification and failure evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
