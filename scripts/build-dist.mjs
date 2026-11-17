@@ -19,8 +19,8 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { dirname, join, relative } from "node:path";
-import { readNativeLockDistribution } from "./package-native-lock.mjs";
+import { join, relative } from "node:path";
+import { validateNativeLockDistribution } from "./package-native-lock.mjs";
 
 const DIST_DIR = "dist";
 const checkOnly = process.argv.includes("--check");
@@ -116,7 +116,8 @@ function replaceDist(candidate) {
 }
 
 reportBuild("build-entered", { check: checkOnly });
-const nativeAssets = readNativeLockDistribution("native");
+// Canonical native code is immutable package data, not part of the replaceable JS output tree.
+validateNativeLockDistribution("native");
 const candidate = mkdtempSync(join(process.cwd(), ".dist-build-"));
 try {
   run(process.execPath, [
@@ -149,11 +150,6 @@ try {
     join("lib", "generative-app-worker.mjs"),
     join(candidate, "lib", "generative-app-worker.mjs"),
   );
-  for (const asset of nativeAssets) {
-    const path = join(candidate, "native", asset.path);
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, asset.bytes, { flag: "wx" });
-  }
   reportBuild("assets-prepared");
   run(process.execPath, ["--check", join(candidate, "pi-telegram", "index.js")]);
 

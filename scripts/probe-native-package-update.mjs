@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -34,7 +34,7 @@ if (child) {
     assert.ok(process.send); assert.ok(lease, "Holder must acquire the actual opaque lease");
     const total = setTimeout(() => { throw new Error("Mapped-image holder exceeded its disposable bound"); }, 80000);
     const mapped = () => {
-      const catalog = JSON.parse(readFileSync(join(root, "dist/native/catalog.json"))), hash = catalog.targets[`${process.platform}-x64`].binarySha256;
+      const catalog = JSON.parse(readFileSync(join(root, "native/catalog.json"))), hash = catalog.targets[`${process.platform}-x64`].binarySha256;
       const images = process.report.getReport().sharedObjects.filter(path => path.includes(hash + ".node"));
       assert.equal(images.length, 1, "Original native image must remain observably mapped");
       return { imageSha256: hash, mappedImages: images };
@@ -55,7 +55,7 @@ if (child) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "pt-native-update-"))), children = new Set();
   const report = { version: 1, node: process.version, platform: process.platform, arch: process.arch, root,
     compiler: "byte-copy-stand-in", inputs: {}, builds: [], observations: [], cleanup: {} };
-  let timedOut = false, failure, holder, holderClosed, holderMessages = [], holderError, holderStdout = "", holderStderr = "";
+  let timedOut = false, failure, holder, holderClosed, holderMessages = [], holderError, holderStdout = "", holderStderr = "", canonicalImage;
   const total = setTimeout(() => { timedOut = true; for (const process of children) process.kill("SIGKILL"); }, 90000);
   function launch(argv, options = {}) {
     assert.equal(timedOut, false, "Mapped-update total bound expired");
@@ -95,6 +95,10 @@ if (child) {
       activeGeneration: existsSync(active) ? /native-update-generation:(\w+)/u.exec(readFileSync(active, "utf8"))?.[1] ?? "unknown" : "absent",
       retainedBackups: readdirSync(root).filter(name => name.startsWith(".dist-backup-")) };
     report.builds.push(observation);
+    const stat = lstatSync(canonicalImage.path);
+    assert.equal(stat.dev, canonicalImage.dev); assert.equal(stat.ino, canonicalImage.ino);
+    assert.equal(digest(readFileSync(canonicalImage.path)), report.imageSha256, "JS publication must not replace canonical native code");
+    assert.equal(existsSync(join(root, "dist/native")), false, "A native image cannot be copied back into the JS swap tree");
     if (result.code === 0) assert.equal(observation.activeGeneration, generation, "Native build success must publish/verify the exact generation");
     return result;
   }
@@ -134,6 +138,9 @@ if (child) {
     report.imageSha256 = entry.binarySha256;
     const imageRelative = join("native/prebuilds", `${process.platform}-x64`, `${entry.binarySha256}.node`);
     assert.equal(digest(readFileSync(join(root, imageRelative))), entry.binarySha256);
+    const imageStat = lstatSync(join(root, imageRelative));
+    canonicalImage = { path: join(root, imageRelative), dev: imageStat.dev, ino: imageStat.ino };
+    report.canonicalImage = canonicalImage;
     assertHealthy(await build("initial-build", "original"));
     writeFileSync(join(root, "coord.lock"), "", { mode: 0o600 });
     holder = launch([script, "--holder", root], { stdio: ["ignore", "pipe", "pipe", "ipc"] });
@@ -164,7 +171,7 @@ if (child) {
     await contender("after-actual-exit-contender", true);
     assertHealthy(await build("after-actual-exit-rebuild", "exited"));
     assertHealthy(await build("after-actual-exit-check", "exited", true));
-    assert.equal(digest(readFileSync(join(root, "dist", imageRelative))), entry.binarySha256);
+    assert.equal(digest(readFileSync(join(root, imageRelative))), entry.binarySha256);
     // Preserve an original mapped-build failure even when actual process exit permits a later build.
     assertHealthy(mapped); assertHealthy(released);
     assert.ok(report.builds.every(build => build.retainedBackups.length === 0), "Successful publication must not hide incomplete mapped-image cleanup");

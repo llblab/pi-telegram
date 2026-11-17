@@ -482,7 +482,9 @@ export function loadTelegramFileTransactionKernelBackend() {
     }
     let loading = false;
     try {
-        const directory = fileURLToPath(new URL("../native/", import.meta.url));
+        // Both declared code layouts use one package-level image, outside the replaceable dist tree.
+        const assetPath = new URL(import.meta.url).pathname.endsWith("/dist/lib/locks.js") ? "../../native/" : "../native/";
+        const directory = fileURLToPath(new URL(assetPath, import.meta.url));
         const catalog = readTelegramKernelAsset(join(directory, "catalog.json"), 16384);
         const index = JSON.parse(catalog.bytes.toString("utf8"));
         const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");

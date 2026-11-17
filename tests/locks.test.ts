@@ -82,7 +82,7 @@ for (const layout of ["source", "compiled"] as const) {
           import { once } from "node:events";
           import { Worker } from "node:worker_threads";
           const root = ${JSON.stringify(root)}, moduleUrl = ${JSON.stringify(moduleUrl)}, fault = ${JSON.stringify(fault)};
-          const defaultURL = new URL("../native/", moduleUrl), defaultPath = url.fileURLToPath(defaultURL), directory = join(root, "native");
+          const defaultURL = new URL(${JSON.stringify(new URL("../native/", import.meta.url).href)}), defaultPath = url.fileURLToPath(defaultURL), directory = join(root, "native");
           const agent = join(root, "must-not-create-agent"); process.env.PI_CODING_AGENT_DIR = agent;
           fs.cpSync(defaultPath, directory, { recursive: true, filter: () => true });
           const catalogPath = join(directory, "catalog.json"), catalog = JSON.parse(fs.readFileSync(catalogPath));
@@ -203,6 +203,26 @@ for (const layout of ["source", "compiled"] as const) {
     });
   }
 }
+
+test("Private source and compiled kernel loaders share one canonical native instance", { skip: process.arch !== "x64" }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "pt-kernel-shared-image-"));
+  try {
+    const result = await runNodeEval(`
+      import assert from "node:assert/strict";
+      import { writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      const source = await import(${JSON.stringify(new URL("../lib/locks.ts", import.meta.url).href)});
+      const compiled = await import(${JSON.stringify(new URL("../dist/lib/locks.js?canonical-layout", import.meta.url).href)});
+      const first = source.loadTelegramFileTransactionKernelBackend(), second = compiled.loadTelegramFileTransactionKernelBackend();
+      const path = join(${JSON.stringify(root)}, "coord.lock"); writeFileSync(path, "", { mode: 0o600 });
+      const lease = first.tryAcquire(path); assert.ok(lease);
+      assert.equal(second.tryAcquire(path), undefined);
+      assert.equal(second.release(lease), true, "Both code projections must reach the same package-level module, not copied native instances");
+      assert.equal(first.release(lease), false);
+    `);
+    assert.equal(result.code, 0, result.stderr);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 for (const mode of ["success", "busy", "acquire-error", "invalid-lease", "async-lease", "pre-aborted", "acquire-aborted", "legacy-aborted", "legacy-damaged",
   "operation-error", "release-false", "release-error", "async-release", "both-errors"] as const) {

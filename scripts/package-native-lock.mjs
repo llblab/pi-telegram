@@ -68,8 +68,8 @@ export function validateDarwinNativeImage(bytes) {
   return deployment;
 }
 
-/** Return checked buffers, not source paths that a later copy could reread after validation. Never load foreign images. */
-export function readNativeLockDistribution(directory) {
+/** Validate immutable package-level images without copying them into replaceable JS output or loading foreign code. */
+export function validateNativeLockDistribution(directory) {
   const digest = bytes => createHash("sha256").update(bytes).digest("hex");
   const read = (path, limit) => {
     const stat = lstatSync(path);
@@ -87,7 +87,6 @@ export function readNativeLockDistribution(directory) {
   const targets = ["darwin-x64", "linux-x64", "win32-x64"];
   assert.deepEqual(Object.keys(catalog.targets ?? {}).sort(), targets, "Unqualified native target inventory");
   assert.deepEqual(readdirSync(join(directory, "prebuilds")).sort(), targets, "Unclassified native distribution directories");
-  const files = [{ path: "catalog.json", bytes: catalogBytes }];
   for (const target of targets) {
     const entry = catalog.targets[target], platform = target.slice(0, -4), base = join(directory, "prebuilds", target);
     for (const field of ["binarySha256", "manifestSha256"]) assert.match(entry[field] ?? "", /^[a-f0-9]{64}$/u, "Invalid native image identity");
@@ -118,9 +117,7 @@ export function readNativeLockDistribution(directory) {
       assert.ok(pe >= 64 && pe + 26 <= image.length && image.readUInt32LE(pe) === 0x4550 && image.readUInt16LE(pe + 4) === 0x8664 &&
         (image.readUInt16LE(pe + 22) & 0x2000) !== 0 && image.readUInt16LE(pe + 24) === 0x20b, "Expected an x64 PE32+ DLL");
     }
-    files.push({ path: `prebuilds/${target}/manifest.json`, bytes: manifestBytes }, { path: `prebuilds/${target}/${filename}`, bytes: image });
   }
-  return files;
 }
 
 export function inspectLinuxNativeImage(binary) {
