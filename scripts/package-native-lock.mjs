@@ -1,5 +1,5 @@
 /**
- * Assemble one host-matched private kernel image; checkout tooling, never runtime installation.
+ * Assemble host images and validate a frozen distribution inventory; build tooling, never runtime installation.
  * Zones: native build artifacts, package identity
  * Usage: node scripts/package-native-lock.mjs --binary <compiled.node> --out <new-directory>
  * Admit ELF/GLIBC or bounded x64 Mach-O deployment metadata before loading/writing output.
@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -66,6 +66,61 @@ export function validateDarwinNativeImage(bytes) {
   assert.equal(offset, end, "Unclassified Mach-O command bytes");
   assert.ok(deployment, "Missing macOS deployment command");
   return deployment;
+}
+
+/** Return checked buffers, not source paths that a later copy could reread after validation. Never load foreign images. */
+export function readNativeLockDistribution(directory) {
+  const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+  const read = (path, limit) => {
+    const stat = lstatSync(path);
+    assert.ok(stat.isFile() && stat.nlink === 1 && stat.size > 0 && stat.size <= limit, "Invalid native distribution input");
+    const bytes = readFileSync(path);
+    assert.equal(bytes.length, stat.size, "Native distribution input changed during read");
+    return bytes;
+  };
+  const catalogBytes = read(join(directory, "catalog.json"), 16384), catalog = JSON.parse(catalogBytes);
+  const source = read(join(directory, "locks.c"), 1024 * 1024);
+  assert.equal(catalog.version, 1, "Unsupported native distribution catalog");
+  assert.equal(catalog.sourceSha256, digest(source), "Native source changed; qualify and promote new images before building");
+  assert.match(catalog.qualification?.run ?? "", /^\d{1,20}$/u, "Missing native qualification run");
+  for (const field of ["head", "merge", "tree"]) assert.match(catalog.qualification?.[field] ?? "", /^[a-f0-9]{40}$/u, "Missing native qualification identity");
+  const targets = ["darwin-x64", "linux-x64", "win32-x64"];
+  assert.deepEqual(Object.keys(catalog.targets ?? {}).sort(), targets, "Unqualified native target inventory");
+  assert.deepEqual(readdirSync(join(directory, "prebuilds")).sort(), targets, "Unclassified native distribution directories");
+  const files = [{ path: "catalog.json", bytes: catalogBytes }];
+  for (const target of targets) {
+    const entry = catalog.targets[target], platform = target.slice(0, -4), base = join(directory, "prebuilds", target);
+    for (const field of ["binarySha256", "manifestSha256"]) assert.match(entry[field] ?? "", /^[a-f0-9]{64}$/u, "Invalid native image identity");
+    const filename = `${entry.binarySha256}.node`;
+    assert.deepEqual(readdirSync(base).sort(), [filename, "manifest.json"].sort(), "Unclassified native distribution files");
+    const manifestBytes = read(join(base, "manifest.json"), 16384), image = read(join(base, filename), 10 * 1024 * 1024);
+    assert.equal(digest(manifestBytes), entry.manifestSha256, "Native manifest identity mismatch");
+    assert.equal(digest(image), entry.binarySha256, "Native image identity mismatch");
+    const manifest = JSON.parse(manifestBytes);
+    assert.equal(manifest.version, 1); assert.equal(manifest.platform, platform); assert.equal(manifest.arch, "x64");
+    assert.equal(manifest.backendKind, `pi-telegram-kernel-v1-${platform}`); assert.equal(manifest.napi, 8);
+    assert.equal(manifest.minimumNode, "22.19.0");
+    assert.ok(["22.19.0", "26.8.1"].includes(manifest.builtWithNode), "Unqualified native build runtime");
+    // source.file is the original CI compile-input name, never an installed runtime lookup.
+    assert.equal(manifest.source?.file, "locks.c"); assert.equal(manifest.source?.sha256, catalog.sourceSha256); assert.equal(manifest.source?.bytes, source.length);
+    assert.equal(manifest.binary?.file, "locks.node"); assert.equal(manifest.binary?.sha256, entry.binarySha256); assert.equal(manifest.binary?.bytes, image.length);
+    if (platform === "darwin") assert.deepEqual(validateDarwinNativeImage(image), manifest.deployment);
+    if (platform === "linux") {
+      assert.ok(image.length >= 20 && image.subarray(0, 6).equals(Buffer.from([127, 69, 76, 70, 2, 1])) && image.readUInt16LE(18) === 62, "Expected an x64 little-endian ELF image");
+      assert.equal(manifest.libc?.family, "glibc"); assert.equal(manifest.libc?.baseline, "2.28"); assert.deepEqual(manifest.libc?.libraries, ["libc.so.6"]);
+      assert.match(manifest.libc?.highestRequired ?? "", /^\d+\.\d+(?:\.\d+)?$/u);
+      const [major, minor, patch = 0] = manifest.libc.highestRequired.split(".").map(Number);
+      assert.ok(major < 2 || major === 2 && (minor < 28 || minor === 28 && patch === 0), "Unqualified native GLIBC minimum");
+    }
+    if (platform === "win32") {
+      assert.ok(image.length >= 64 && image.readUInt16LE(0) === 0x5a4d, "Expected a PE native image");
+      const pe = image.readUInt32LE(60);
+      assert.ok(pe >= 64 && pe + 26 <= image.length && image.readUInt32LE(pe) === 0x4550 && image.readUInt16LE(pe + 4) === 0x8664 &&
+        (image.readUInt16LE(pe + 22) & 0x2000) !== 0 && image.readUInt16LE(pe + 24) === 0x20b, "Expected an x64 PE32+ DLL");
+    }
+    files.push({ path: `prebuilds/${target}/manifest.json`, bytes: manifestBytes }, { path: `prebuilds/${target}/${filename}`, bytes: image });
+  }
+  return files;
 }
 
 export function inspectLinuxNativeImage(binary) {

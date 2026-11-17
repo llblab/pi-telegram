@@ -44,6 +44,7 @@
     "index.ts",
     "api/",
     "lib/",
+    "native/",
     "dist/",
     "README.md",
     "AGENTS.md",

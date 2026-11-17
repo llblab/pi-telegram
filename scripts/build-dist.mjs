@@ -19,7 +19,8 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
+import { readNativeLockDistribution } from "./package-native-lock.mjs";
 
 const DIST_DIR = "dist";
 const checkOnly = process.argv.includes("--check");
@@ -115,6 +116,7 @@ function replaceDist(candidate) {
 }
 
 reportBuild("build-entered", { check: checkOnly });
+const nativeAssets = readNativeLockDistribution("native");
 const candidate = mkdtempSync(join(process.cwd(), ".dist-build-"));
 try {
   run(process.execPath, [
@@ -147,6 +149,11 @@ try {
     join("lib", "generative-app-worker.mjs"),
     join(candidate, "lib", "generative-app-worker.mjs"),
   );
+  for (const asset of nativeAssets) {
+    const path = join(candidate, "native", asset.path);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, asset.bytes, { flag: "wx" });
+  }
   reportBuild("assets-prepared");
   run(process.execPath, ["--check", join(candidate, "pi-telegram", "index.js")]);
 

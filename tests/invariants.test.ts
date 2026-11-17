@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, normalize, relative } from "node:path";
 import test from "node:test";
@@ -152,6 +152,60 @@ test("Private kernel package builds use one source and preserve image identity a
   assert.ok(alternate);
   assert.match(alternate, /--backend "\$QUALIFICATION_EVIDENCE\/kernel-backend\/locks\.node"/u);
   assert.doesNotMatch(alternate, /cc |cl\.exe|package-native-lock/u, "The alternate runtime must load the very same packaged bytes");
+});
+
+test("Native distribution admission binds portable inventory and freezes copied bytes before package build", async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import fs from "node:fs";
+    import { createHash } from "node:crypto";
+    import { tmpdir } from "node:os";
+    import { join } from "node:path";
+    import { readNativeLockDistribution } from "./scripts/package-native-lock.mjs";
+    const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+    const snapshot = readNativeLockDistribution("native");
+    assert.equal(snapshot.length, 7);
+    assert.equal(snapshot.filter(file => file.path.endsWith(".node")).length, 3);
+    assert.doesNotMatch(readNativeLockDistribution.toString(), /createRequire|execFile|spawn|fetch\(/u, "Inventory admission must never execute foreign images or tools");
+    const root = fs.mkdtempSync(join(tmpdir(), "pt-native-inventory-")), dir = join(root, "native");
+    const catalog = JSON.parse(snapshot[0].bytes), target = catalog.targets["linux-x64"];
+    const imagePath = join(dir, "prebuilds/linux-x64/" + target.binarySha256 + ".node"), manifestPath = join(dir, "prebuilds/linux-x64/manifest.json");
+    try {
+      for (const fault of ["source", "image", "manifest", "relabelled", "architecture", "extra-image", "hardlink", "directory", "oversized", "version"]) {
+        fs.rmSync(dir, { recursive: true, force: true }); fs.cpSync("native", dir, { recursive: true, filter: () => true });
+        if (fault === "source" || fault === "image") {
+          const path = fault === "source" ? join(dir, "locks.c") : imagePath, bytes = fs.readFileSync(path);
+          bytes[bytes.length - 1] ^= 1; fs.writeFileSync(path, bytes);
+        }
+        if (fault === "manifest") fs.appendFileSync(manifestPath, " ");
+        if (fault === "relabelled") {
+          const changed = JSON.parse(fs.readFileSync(manifestPath)); changed.napi = 9;
+          const bytes = Buffer.from(JSON.stringify(changed)); fs.writeFileSync(manifestPath, bytes);
+          const next = structuredClone(catalog); next.targets["linux-x64"].manifestSha256 = digest(bytes);
+          fs.writeFileSync(join(dir, "catalog.json"), JSON.stringify(next));
+        }
+        if (fault === "architecture") fs.mkdirSync(join(dir, "prebuilds/linux-arm64"));
+        if (fault === "extra-image") fs.writeFileSync(join(dir, "prebuilds/linux-x64/fault.node"), "unclassified");
+        if (fault === "hardlink") fs.linkSync(imagePath, join(root, "alias.node"));
+        if (fault === "directory") { fs.unlinkSync(manifestPath); fs.mkdirSync(manifestPath); }
+        if (fault === "oversized") fs.writeFileSync(join(dir, "catalog.json"), "x".repeat(16385));
+        if (fault === "version") fs.writeFileSync(join(dir, "catalog.json"), JSON.stringify({ ...catalog, version: 2 }));
+        assert.throws(() => readNativeLockDistribution(dir), undefined, fault);
+        if (fault === "hardlink") fs.unlinkSync(join(root, "alias.node"));
+      }
+      fs.rmSync(dir, { recursive: true, force: true }); fs.cpSync("native", dir, { recursive: true, filter: () => true });
+      const checked = readNativeLockDistribution(dir), checkedImage = checked.find(file => file.path.endsWith(target.binarySha256 + ".node"));
+      fs.writeFileSync(imagePath, "changed after inspection");
+      assert.equal(digest(checkedImage.bytes), target.binarySha256, "Build writes the checked buffer, not a later reread of changed inputs");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  `);
+  assert.equal(result.code, 0, result.stderr);
+  const pkg = JSON.parse(readFileSync(join(PROJECT_ROOT, "package.json"), "utf8"));
+  assert.ok(pkg.files.includes("native/") && pkg.files.includes("dist/"));
+  const build = readFileSync(join(PROJECT_ROOT, "scripts/build-dist.mjs"), "utf8");
+  assert.match(build, /readNativeLockDistribution\("native"\)/u);
+  assert.match(build, /writeFileSync\(path, asset\.bytes, \{ flag: "wx" \}\)/u);
+  assert.match(readFileSync(join(PROJECT_ROOT, ".gitattributes"), "utf8"), /^\*\.node binary$/mu);
 });
 
 test("Linux native build pins its minimum-userland toolchain without widening container authority", () => {
@@ -707,6 +761,8 @@ async function createNativeBuildFixture() {
   for (const path of ["scripts", ".git", "node_modules/typescript/bin", "skills", "lib"])
     await mkdir(join(root, path), { recursive: true });
   await writeFile(join(root, "scripts/build-dist.mjs"), readFileSync(join(PROJECT_ROOT, "scripts/build-dist.mjs")));
+  await writeFile(join(root, "scripts/package-native-lock.mjs"), readFileSync(join(PROJECT_ROOT, "scripts/package-native-lock.mjs")));
+  await cp(join(PROJECT_ROOT, "native"), join(root, "native"), { recursive: true, filter: () => true });
   await writeFile(join(root, "package.json"), '{"type":"module"}');
   await writeFile(join(root, ".git/HEAD"), "ab".repeat(20) + "\n");
   await writeFile(join(root, "skills/probe.md"), "fixture asset\n");
@@ -776,6 +832,17 @@ test("CI build checkpoints retain native compiler outcomes and rollback-safe pub
     assert.notEqual(readNativeBuildRecords(checked.stdout)[0]!.build, records[0]!.build, "Another build cannot borrow the original invocation identity");
     assert.equal(readFileSync(join(root, "dist/skills/nested λ#/percent %.md"), "utf8"), "nested Unicode asset\n");
     const originalDist = readFileSync(join(root, "dist/index.js"));
+    const catalogPath = join(root, "native/catalog.json"), catalogBytes = readFileSync(catalogPath), catalog = JSON.parse(catalogBytes.toString());
+    const nativeFiles = ["catalog.json", ...Object.keys(catalog.targets).flatMap(target => [
+      `prebuilds/${target}/manifest.json`, `prebuilds/${target}/${catalog.targets[target].binarySha256}.node`,
+    ])];
+    const originalNative = nativeFiles.map(path => readFileSync(join(root, "dist/native", path)));
+    await writeFile(catalogPath, JSON.stringify({ ...catalog, version: 2 }));
+    const invalid = run(); assert.equal(invalid.status, 1); assert.match(invalid.stderr, /Unsupported native distribution catalog/u);
+    assert.deepEqual(readNativeBuildRecords(invalid.stdout).map(r => r.phase), ["build-entered"], "Invalid package bytes cannot start a compiler or publication");
+    assert.deepEqual(readFileSync(join(root, "dist/index.js")), originalDist);
+    nativeFiles.forEach((path, index) => assert.deepEqual(readFileSync(join(root, "dist/native", path)), originalNative[index]));
+    await writeFile(catalogPath, catalogBytes);
     const failed = run("true", [], "7"); assert.equal(failed.status, 1); assert.equal(failed.signal, null);
     const failure = readNativeBuildRecords(failed.stdout);
     assert.equal(failure.find(r => r.phase === "compiler-node-exiting")!.code, 7);
