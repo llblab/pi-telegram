@@ -103,7 +103,9 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   const paths = workflow.match(/^    paths:\n((?:      - [^\n]+\n)+)/mu)?.[1];
   assert.ok(paths);
   assert.deepEqual(paths.trim().split("\n").map(line => line.trim().replace(/^- "|"$/gu, "")), [
-    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "scripts/probe-owned-native-close-failure.mjs", "scripts/probe-native-napi-build.mjs", "scripts/package-native-lock.mjs", "scripts/build-linux-native-lock.mjs", "native/**", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
+    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "scripts/probe-owned-native-close-failure.mjs", "scripts/probe-native-napi-build.mjs",
+    "scripts/probe-native-package-update.mjs", "scripts/build-dist.mjs", "lib/locks.ts", "dist/lib/locks.js",
+    "scripts/package-native-lock.mjs", "scripts/build-linux-native-lock.mjs", "native/**", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
   ]);
   assert.match(workflow, /^  contents: read$/mu);
   const jobEnvironment = workflow.match(/^    env:\n((?:      [^\n]+\n)+)/mu)?.[1];
@@ -114,7 +116,7 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   assert.match(workflow, /^          persist-credentials: false$/mu);
   assert.match(workflow, /npm ci --prefix tests\/fixtures\/native-file-lock --ignore-scripts --bin-links=false/u);
   assert.match(workflow, /npm audit signatures --prefix tests\/fixtures\/native-file-lock --json/u);
-  for (const probe of ["node scripts/probe-native-file-lock.mjs", "node scripts/probe-owned-native-lease.mjs", "node scripts/probe-owned-native-close-failure.mjs", "node scripts/probe-native-napi-build.mjs", "node scripts/package-native-lock.mjs"]) {
+  for (const probe of ["node scripts/probe-native-file-lock.mjs", "node scripts/probe-owned-native-lease.mjs", "node scripts/probe-owned-native-close-failure.mjs", "node scripts/probe-native-napi-build.mjs", "node scripts/package-native-lock.mjs", "node scripts/probe-native-package-update.mjs"]) {
     assert.ok(workflow.indexOf("npm audit signatures") < workflow.indexOf(probe),
       "Verify registry signatures and supplied attestations before loading either native candidate");
   }
@@ -793,6 +795,32 @@ function readNativeBuildRecords(stdout: string): Record<string, unknown>[] {
   return stdout.split(/\r?\n/u).filter(line => line.startsWith("::notice title=CI native build::"))
     .map(line => JSON.parse(line.slice("::notice title=CI native build::".length)) as Record<string, unknown>);
 }
+
+test("Mapped native package rebuild observes actual holder lifetime and retains publication outcomes", { timeout: 110000, skip: process.arch !== "x64" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pt-mapped-build-evidence-")), output = join(root, "evidence");
+  try {
+    const result = spawnSync(process.execPath, [join(PROJECT_ROOT, "scripts/probe-native-package-update.mjs"), "--out", output], {
+      cwd: PROJECT_ROOT, encoding: "utf8", timeout: 100000,
+    });
+    assert.equal(result.error, undefined); assert.equal(result.signal, null); assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(readFileSync(join(output, "report.json"), "utf8"));
+    assert.equal(report.node, process.version); assert.equal(report.compiler, "byte-copy-stand-in");
+    assert.equal(report.checks.length, 6); assert.equal(report.cleanup.timedOut, false);
+    assert.deepEqual(report.holderExit, { code: 0, signal: null });
+    assert.ok(report.builds.every((build: { code: number; signal: string | null }) => build.code === 0 && build.signal === null));
+    for (const phase of ["held", "released"]) {
+      const observation = report.observations.find((value: { phase?: string }) => value.phase === phase);
+      assert.equal(observation.imageSha256, report.imageSha256); assert.equal(observation.mappedImages.length, 1);
+    }
+    const workflow = readFileSync(join(PROJECT_ROOT, ".github/workflows/native-lock-qualification.yml"), "utf8");
+    for (const trigger of ["scripts/probe-native-package-update.mjs", "scripts/build-dist.mjs", "lib/locks.ts", "dist/lib/locks.js"])
+      assert.ok(workflow.includes(`      - "${trigger}"`));
+    assert.match(workflow, /node scripts\/probe-native-package-update\.mjs --out/u);
+    assert.match(workflow, /mapped-native-update-exit-code\.txt/u);
+    const probe = readFileSync(join(PROJECT_ROOT, "scripts/probe-native-package-update.mjs"), "utf8");
+    assert.doesNotMatch(probe, /execFile|npm |https?:|fetch\(|cc |cl\.exe|docker|process\.env\.PI_CODING_AGENT_DIR/u, "Publication observation cannot install/compile native code or resolve configured storage");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test("CI build checkpoints retain native compiler outcomes and rollback-safe publication", { timeout: 20000 }, async () => {
   const root = await createNativeBuildFixture();

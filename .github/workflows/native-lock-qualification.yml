@@ -9,6 +9,10 @@ on:
       - "scripts/probe-owned-native-lease.mjs"
       - "scripts/probe-owned-native-close-failure.mjs"
       - "scripts/probe-native-napi-build.mjs"
+      - "scripts/probe-native-package-update.mjs"
+      - "scripts/build-dist.mjs"
+      - "lib/locks.ts"
+      - "dist/lib/locks.js"
       - "scripts/package-native-lock.mjs"
       - "scripts/build-linux-native-lock.mjs"
       - "native/**"
@@ -242,6 +246,15 @@ jobs:
           status=$?
           set -e
           printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/kernel-package-owner-exit-code.txt"
+          exit "$status"
+      - name: Observe mapped native package publication and actual holder exit
+        timeout-minutes: 3
+        run: |
+          set +e
+          node scripts/probe-native-package-update.mjs --out "$QUALIFICATION_EVIDENCE/mapped-native-update" > "$QUALIFICATION_EVIDENCE/mapped-native-update.stdout" 2> "$QUALIFICATION_EVIDENCE/mapped-native-update.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/mapped-native-update-exit-code.txt"
           exit "$status"
       - name: Set up alternate exact Node.js runtime for the same image
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
