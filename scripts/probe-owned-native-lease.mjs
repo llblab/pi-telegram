@@ -23,6 +23,7 @@ const addonPath = realpathSync(resolve(isMainThread ? args[1] : workerData.addon
 const native = require(addonPath);
 assert.equal(native.fixtureKind, `${process.platform}-owned-lease-prototype-v1`);
 for (const name of ["tryAcquire", "release"]) assert.equal(typeof native[name], "function");
+assert.equal(native.protectClose, undefined, "Nominal fixture never exposes close-fault injection");
 function anchor(root) {
   assert.equal(dirname(root), realpathSync(tmpdir()));
   assert.ok(basename(root).startsWith("pt-owned-lease-"), "Refuse configured runtime paths");

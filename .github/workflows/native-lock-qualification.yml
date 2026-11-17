@@ -7,6 +7,7 @@ on:
     paths:
       - "scripts/probe-native-file-lock.mjs"
       - "scripts/probe-owned-native-lease.mjs"
+      - "scripts/probe-owned-native-close-failure.mjs"
       - "scripts/probe-native-napi-build.mjs"
       - "tests/fixtures/native-file-lock/**"
       - ".github/workflows/native-lock-qualification.yml"
@@ -163,9 +164,14 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or !$installation) { throw 'No public MSVC development environment found' }
           $developer = Join-Path $installation.Trim() 'Common7/Tools/VsDevCmd.bat'
           $source = (Resolve-Path tests/fixtures/native-file-lock/owned-lease.c).Path
-          @{ node = $version; sourceSha256 = (Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant(); probeSha256 = (Get-FileHash scripts/probe-owned-native-lease.mjs -Algorithm SHA256).Hash.ToLowerInvariant(); sdkEvidence = (Get-Content "$evidence/windows-napi-inputs.json" -Raw | ConvertFrom-Json) } | ConvertTo-Json -Depth 8 | Set-Content "$evidence/windows-owned-inputs.json"
-          foreach ($name in @('owned-lease', 'without-teardown')) {
-            $define = if ($name -eq 'without-teardown') { '/DOWNED_LEASE_SUPPRESS_TEARDOWN=1' } else { '' }
+          @{ node = $version; sourceSha256 = (Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant(); probeSha256 = (Get-FileHash scripts/probe-owned-native-lease.mjs -Algorithm SHA256).Hash.ToLowerInvariant(); closeFailureProbeSha256 = (Get-FileHash scripts/probe-owned-native-close-failure.mjs -Algorithm SHA256).Hash.ToLowerInvariant(); sdkEvidence = (Get-Content "$evidence/windows-napi-inputs.json" -Raw | ConvertFrom-Json) } | ConvertTo-Json -Depth 8 | Set-Content "$evidence/windows-owned-inputs.json"
+          foreach ($name in @('owned-lease', 'without-teardown', 'protected-close', 'forgotten-close-error')) {
+            $define = switch ($name) {
+              'without-teardown' { '/DOWNED_LEASE_SUPPRESS_TEARDOWN=1' }
+              'protected-close' { '/DOWNED_LEASE_CLOSE_FAILURE_WITNESS=1' }
+              'forgotten-close-error' { '/DOWNED_LEASE_CLOSE_FAILURE_WITNESS=1 /DOWNED_LEASE_FORGET_CLOSE_ERROR=1' }
+              default { '' }
+            }
             $command = Join-Path $build "$name.cmd"
             @('@echo off', "call `"$developer`" -no_logo -arch=x64 -host_arch=x64", 'if errorlevel 1 exit /b %errorlevel%', "cl.exe /nologo /Bv /LD /MD /std:c11 /W4 /WX /DNAPI_VERSION=8 $define /I`"$include`" `"$source`" /Fo`"$build/$name.obj`" /link /OUT:`"$build/$name.node`" /IMPLIB:`"$build/$name.lib`" /INCREMENTAL:NO `"$build/node.lib`" advapi32.lib", 'exit /b %errorlevel%') | Set-Content $command -Encoding ascii
             & $env:ComSpec /d /s /c "`"$command`"" > "$evidence/windows-$name-compile.stdout" 2> "$evidence/windows-$name-compile.stderr"
@@ -183,6 +189,14 @@ jobs:
           $status | Set-Content "$evidence/owned-lease-control-exit-code.txt"
           # The runner otherwise propagates the expected native exit 1 after this assertion.
           if ($status -ne 1 -or !(Select-String -Path "$evidence/owned-lease-control.stderr" -SimpleMatch 'Actual Worker exit, not a stop request or JS finally, precedes reacquisition' -Quiet)) { throw 'Windows teardown falsifier did not reach the expected failure' }
+          node scripts/probe-owned-native-close-failure.mjs --addon "$build/protected-close.node" > "$evidence/owned-close-failure-report.json" 2> "$evidence/owned-close-failure.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/owned-close-failure-exit-code.txt"
+          if ($status -ne 0) { exit $status }
+          node scripts/probe-owned-native-close-failure.mjs --addon "$build/forgotten-close-error.node" > "$evidence/owned-close-failure-control.stdout" 2> "$evidence/owned-close-failure-control.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/owned-close-failure-control-exit-code.txt"
+          if ($status -ne 1 -or !(Select-String -Path "$evidence/owned-close-failure-control.stderr" -SimpleMatch 'Repeated release preserves unconfirmed native retirement' -Quiet)) { throw 'Windows failed-close falsifier did not reach the expected failure' }
           exit 0
       - name: Preserve qualification and failure evidence
         if: always()

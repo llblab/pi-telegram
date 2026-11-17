@@ -103,7 +103,7 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   const paths = workflow.match(/^    paths:\n((?:      - [^\n]+\n)+)/mu)?.[1];
   assert.ok(paths);
   assert.deepEqual(paths.trim().split("\n").map(line => line.trim().replace(/^- "|"$/gu, "")), [
-    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "scripts/probe-native-napi-build.mjs", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
+    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "scripts/probe-owned-native-close-failure.mjs", "scripts/probe-native-napi-build.mjs", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
   ]);
   assert.match(workflow, /^  contents: read$/mu);
   const jobEnvironment = workflow.match(/^    env:\n((?:      [^\n]+\n)+)/mu)?.[1];
@@ -114,7 +114,7 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   assert.match(workflow, /^          persist-credentials: false$/mu);
   assert.match(workflow, /npm ci --prefix tests\/fixtures\/native-file-lock --ignore-scripts --bin-links=false/u);
   assert.match(workflow, /npm audit signatures --prefix tests\/fixtures\/native-file-lock --json/u);
-  for (const probe of ["node scripts/probe-native-file-lock.mjs", "node scripts/probe-owned-native-lease.mjs", "node scripts/probe-native-napi-build.mjs"]) {
+  for (const probe of ["node scripts/probe-native-file-lock.mjs", "node scripts/probe-owned-native-lease.mjs", "node scripts/probe-owned-native-close-failure.mjs", "node scripts/probe-native-napi-build.mjs"]) {
     assert.ok(workflow.indexOf("npm audit signatures") < workflow.indexOf(probe),
       "Verify registry signatures and supplied attestations before loading either native candidate");
   }
@@ -159,7 +159,10 @@ test("Windows N-API SDK qualification pins only public x64 build inputs", () => 
   assert.match(handles, /advapi32\.lib/u);
   assert.match(handles, /\/DOWNED_LEASE_SUPPRESS_TEARDOWN=1/u);
   assert.match(handles, /\$status -ne 1.*expected failure/u);
-  assert.match(handles, /expected failure' \}\n          exit 0\n$/u,
+  assert.match(handles, /\/DOWNED_LEASE_CLOSE_FAILURE_WITNESS=1/u);
+  assert.match(handles, /\/DOWNED_LEASE_FORGET_CLOSE_ERROR=1/u);
+  assert.match(handles, /owned-close-failure-exit-code\.txt/u);
+  assert.match(handles, /\$status -ne 1.*Repeated release preserves unconfirmed native retirement.*expected failure' \}\n          exit 0\n$/u,
     "Only verified negative-control failure may end with success instead of the runner's LASTEXITCODE suffix");
   assert.ok(workflow.indexOf("Compile and load public Windows N-API smoke fixture") < workflow.indexOf("Qualify Windows environment-owned HANDLE fixture"));
 });

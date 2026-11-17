@@ -41,7 +41,7 @@ typedef int native_file;
 typedef struct owner owner;
 typedef struct lease lease;
 struct owner { lease *head; size_t references; bool closing; };
-struct lease { owner *context; lease *previous, *next; native_file file; bool spent; };
+struct lease { owner *context; lease *previous, *next; native_file file; bool spent; uint32_t close_error; };
 static const napi_type_tag lease_tag = { 0x50744c6561736531ULL, 0xa3d7c1196b8e25f0ULL };
 
 static napi_value fail(napi_env env, const char *code, const char *message) {
@@ -73,11 +73,14 @@ static napi_value system_failure(napi_env env, uint32_t number, const char *oper
       napi_set_named_property(env, error, field, value) != napi_ok ||
       napi_create_string_utf8(env, operation, NAPI_AUTO_LENGTH, &value) != napi_ok ||
       napi_set_named_property(env, error, "syscall", value) != napi_ok) return api_failure(env);
+  if (strcmp(operation, CLOSE_OPERATION) == 0 &&
+      (napi_create_string_utf8(env, "unconfirmed", NAPI_AUTO_LENGTH, &value) != napi_ok ||
+       napi_set_named_property(env, error, "retirement", value) != napi_ok)) return api_failure(env);
   napi_throw(env, error);
   return NULL;
 }
 /* Spend before close: an error need not preserve descriptor ownership, so retrying
- * the number could close a successor. Error retirement remains unqualified; no retry. */
+ * the number could close a successor. Retain the error, not release authority. */
 static uint32_t close_file(native_file file) {
 #if defined(_WIN32)
   return CloseHandle(file) ? 0 : GetLastError();
@@ -86,10 +89,14 @@ static uint32_t close_file(native_file file) {
 #endif
 }
 static uint32_t close_once(lease *value) {
-  if (value->spent) return 0;
+  if (value->spent) return value->close_error;
   const native_file file = value->file;
   value->spent = true;
-  return close_file(file);
+  const uint32_t error = close_file(file);
+#ifndef OWNED_LEASE_FORGET_CLOSE_ERROR
+  value->close_error = error;
+#endif
+  return error;
 }
 static void finalize_lease(napi_env env, void *data, void *hint) {
   (void)env; (void)hint;
@@ -293,6 +300,26 @@ static napi_value release(napi_env env, napi_callback_info info) {
   if (napi_get_boolean(env, first, &result) != napi_ok) return api_failure(env);
   return result;
 }
+#if defined(_WIN32) && defined(OWNED_LEASE_CLOSE_FAILURE_WITNESS)
+/* Fault injection only on this environment's own still-held fixture handle. No raw
+ * handle escapes, unprotection or close retry; only actual process exit retires it. */
+static napi_value protect_close(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argument, result;
+  void *data = NULL;
+  bool tagged = false;
+  if (napi_get_cb_info(env, info, &argc, &argument, NULL, &data) != napi_ok) return api_failure(env);
+  if (argc != 1 || napi_check_object_type_tag(env, argument, &lease_tag, &tagged) != napi_ok || !tagged)
+    return fail(env, "ERR_INVALID_LEASE", "Expected this prototype environment's opaque lease");
+  lease *value = NULL;
+  if (napi_unwrap(env, argument, (void **)&value) != napi_ok || !value || value->context != data || value->spent)
+    return fail(env, "ERR_INVALID_LEASE", "Expected an unspent fixture-owned lease");
+  if (!SetHandleInformation(value->file, HANDLE_FLAG_PROTECT_FROM_CLOSE, HANDLE_FLAG_PROTECT_FROM_CLOSE))
+    return system_failure(env, GetLastError(), "SetHandleInformation");
+  if (napi_get_undefined(env, &result) != napi_ok) return api_failure(env);
+  return result;
+}
+#endif
 NAPI_MODULE_INIT() {
   owner *context = calloc(1, sizeof(*context));
   if (!context) return fail(env, "ERR_LEASE_MEMORY", "Cannot allocate prototype environment");
@@ -306,5 +333,9 @@ NAPI_MODULE_INIT() {
       napi_set_named_property(env, exports, "release", method) != napi_ok ||
       napi_create_string_utf8(env, LEASE_FIXTURE_KIND, NAPI_AUTO_LENGTH, &kind) != napi_ok ||
       napi_set_named_property(env, exports, "fixtureKind", kind) != napi_ok) return api_failure(env);
+#if defined(_WIN32) && defined(OWNED_LEASE_CLOSE_FAILURE_WITNESS)
+  if (napi_create_function(env, "protectClose", NAPI_AUTO_LENGTH, protect_close, context, &method) != napi_ok ||
+      napi_set_named_property(env, exports, "protectClose", method) != napi_ok) return api_failure(env);
+#endif
   return exports;
 }
