@@ -2,7 +2,7 @@
  * Assemble one host-matched private kernel image; checkout tooling, never runtime installation.
  * Zones: native build artifacts, package identity
  * Usage: node scripts/package-native-lock.mjs --binary <compiled.node> --out <new-directory>
- * Linux inspects versioned ELF imports with readelf before loading or writing output.
+ * Admit ELF/GLIBC or bounded x64 Mach-O deployment metadata before loading/writing output.
  * No download, compiler, Pi import, backend activation or configured storage lookup.
  */
 import assert from "node:assert/strict";
@@ -31,6 +31,43 @@ export function validateLinuxNativeVersionNeeds(dynamic, versions) {
   return { family: "glibc", baseline: "2.28", highestRequired: highest[2] ? highest.join(".") : highest.slice(0, 2).join("."), libraries };
 }
 
+export function validateDarwinNativeImage(bytes) {
+  assert.ok(bytes.length >= 32 && bytes.readUInt32LE(0) === 0xfeedfacf, "Expected a thin little-endian 64-bit Mach-O image");
+  assert.equal(bytes.readUInt32LE(4), 0x01000007, "Darwin kernel image must target x86_64");
+  const subtype = bytes.readUInt32LE(8);
+  assert.ok(subtype === 3 || subtype === 0x80000003, "Unqualified Darwin CPU subtype");
+  assert.equal(bytes.readUInt32LE(12), 8, "Darwin kernel image must be a loadable bundle");
+  const count = bytes.readUInt32LE(16), commandBytes = bytes.readUInt32LE(20), end = 32 + commandBytes;
+  assert.ok(count > 0 && count <= 128 && commandBytes <= 65536 && end <= bytes.length, "Unbounded or truncated Mach-O commands");
+  let offset = 32, deployment;
+  const version = value => `${value >>> 16}.${value >>> 8 & 255}.${value & 255}`;
+  for (let index = 0; index < count; index++) {
+    assert.ok(offset + 8 <= end, "Missing Mach-O command header");
+    const kind = bytes.readUInt32LE(offset), size = bytes.readUInt32LE(offset + 4);
+    assert.ok(size >= 8 && size % 4 === 0 && offset + size <= end, "Invalid Mach-O command extent");
+    if (kind === 0x32 || kind === 0x24) {
+      assert.equal(deployment, undefined, "Conflicting Mach-O deployment commands");
+      let minimum, sdk;
+      if (kind === 0x32) {
+        assert.ok(size >= 24, "Truncated Mach-O build version");
+        assert.equal(bytes.readUInt32LE(offset + 8), 1, "Darwin kernel image must target macOS");
+        assert.equal(size, 24 + bytes.readUInt32LE(offset + 20) * 8, "Invalid Mach-O build tools extent");
+        minimum = bytes.readUInt32LE(offset + 12); sdk = bytes.readUInt32LE(offset + 16);
+      } else {
+        assert.equal(size, 16, "Invalid Mach-O minimum-version extent");
+        minimum = bytes.readUInt32LE(offset + 8); sdk = bytes.readUInt32LE(offset + 12);
+      }
+      assert.ok(minimum > 0 && sdk > 0, "Missing Darwin deployment version evidence");
+      assert.ok(minimum <= 11 * 65536, `Darwin native image exceeds the Node 22 macOS 11 baseline (${version(minimum)})`);
+      deployment = { platform: "macos", baseline: "11.0", minimumOS: version(minimum), sdk: version(sdk) };
+    }
+    offset += size;
+  }
+  assert.equal(offset, end, "Unclassified Mach-O command bytes");
+  assert.ok(deployment, "Missing macOS deployment command");
+  return deployment;
+}
+
 export function inspectLinuxNativeImage(binary) {
   const inspect = flag => execFileSync("readelf", [flag, "--", binary], { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024 });
   return validateLinuxNativeVersionNeeds(inspect("--dynamic"), inspect("--version-info"));
@@ -51,6 +88,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   const libc = process.platform === "linux" ? inspectLinuxNativeImage(binary) : undefined;
   const digest = bytes => createHash("sha256").update(bytes).digest("hex");
   const binaryBytes = readFileSync(binary), sourceBytes = readFileSync(sourcePath);
+  const deployment = process.platform === "darwin" ? validateDarwinNativeImage(binaryBytes) : undefined;
   mkdirSync(output, { mode: 0o700 });
   const image = join(output, "locks.node");
   copyFileSync(binary, image);
@@ -67,7 +105,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   const manifest = {
     version: 1, backendKind: native.backendKind, platform: process.platform, arch: process.arch,
     napi: 8, minimumNode: "22.19.0", builtWithNode: process.versions.node,
-    ...(libc ? { libc } : {}),
+    ...(libc ? { libc } : {}), ...(deployment ? { deployment } : {}),
     source: { file: "locks.c", sha256: digest(sourceBytes), bytes: sourceBytes.length },
     binary: { file: "locks.node", sha256: binarySha256, bytes: binaryBytes.length },
   };

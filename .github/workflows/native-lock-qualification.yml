@@ -88,7 +88,10 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then flags+=(-bundle -undefined dynamic_lookup); else flags+=(-shared); fi
           cc "${flags[@]}" tests/fixtures/native-file-lock/owned-lease.c -o "$build/owned-lease.node"
           cc "${flags[@]}" -DOWNED_LEASE_SUPPRESS_TEARDOWN=1 tests/fixtures/native-file-lock/owned-lease.c -o "$build/without-teardown.node"
-          if [ "$RUNNER_OS" = macOS ]; then cc "${flags[@]}" -DOWNED_LEASE_DISTRIBUTION=1 native/locks.c -o "$build/distribution.node"; fi
+          if [ "$RUNNER_OS" = macOS ]; then
+            cc "${flags[@]}" -mmacosx-version-min=11.0 -DOWNED_LEASE_DISTRIBUTION=1 native/locks.c -o "$build/distribution.node"
+            cc "${flags[@]}" -mmacosx-version-min=26.0 -DOWNED_LEASE_DISTRIBUTION=1 native/locks.c -o "$build/deployment-incompatible.node"
+          fi
           node --input-type=module -e 'import{createHash}from"node:crypto";import{readFileSync}from"node:fs";for(const path of process.argv.slice(1))console.log(createHash("sha256").update(readFileSync(path)).digest("hex")+"  "+path)' tests/fixtures/native-file-lock/owned-lease.c native/locks.c scripts/probe-owned-native-lease.mjs "$build/owned-lease.node" > "$QUALIFICATION_EVIDENCE/owned-lease-inputs.txt"
           set +e
           node scripts/probe-owned-native-lease.mjs --addon "$build/owned-lease.node" > "$QUALIFICATION_EVIDENCE/owned-lease-report.json" 2> "$QUALIFICATION_EVIDENCE/owned-lease.stderr"
@@ -217,6 +220,17 @@ jobs:
       - name: Assemble private backend package without installer or runtime compilation
         run: |
           if [ "$RUNNER_OS" = Windows ]; then build="$RUNNER_TEMP/windows-napi-build"; elif [ "$RUNNER_OS" = Linux ]; then build="$QUALIFICATION_EVIDENCE/linux-baseline"; else build="$RUNNER_TEMP/owned-lease-prototype"; fi
+          if [ "$RUNNER_OS" = macOS ]; then
+            cp "$build/deployment-incompatible.node" "$QUALIFICATION_EVIDENCE/darwin-deployment-incompatible.node"
+            set +e
+            node scripts/package-native-lock.mjs --binary "$build/deployment-incompatible.node" --out "$QUALIFICATION_EVIDENCE/darwin-refused-backend" > "$QUALIFICATION_EVIDENCE/darwin-deployment-refusal.stdout" 2> "$QUALIFICATION_EVIDENCE/darwin-deployment-refusal.stderr"
+            refusal=$?
+            set -e
+            printf '%s\n' "$refusal" > "$QUALIFICATION_EVIDENCE/darwin-deployment-refusal-exit-code.txt"
+            test "$refusal" -eq 1
+            grep -F 'exceeds the Node 22 macOS 11 baseline (26.0.0)' "$QUALIFICATION_EVIDENCE/darwin-deployment-refusal.stderr"
+            test ! -e "$QUALIFICATION_EVIDENCE/darwin-refused-backend"
+          fi
           set +e
           node scripts/package-native-lock.mjs --binary "$build/distribution.node" --out "$QUALIFICATION_EVIDENCE/kernel-backend" > "$QUALIFICATION_EVIDENCE/kernel-package-report.json" 2> "$QUALIFICATION_EVIDENCE/kernel-package.stderr"
           status=$?

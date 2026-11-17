@@ -145,7 +145,7 @@ test("Private kernel package builds use one source and preserve image identity a
   assert.doesNotMatch(packager, /https?:|fetch\(|rmSync|recursive: true/u, "Assembly cannot download, compile, overwrite or clean existing output");
   assert.match(packager, /execFileSync\("readelf", \[flag, "--", binary\]/u);
   assert.doesNotMatch(packager, /execFileSync\("(?:cc|gcc|cl|docker|sh|bash)"/u, "ELF inspection is not compilation or a shell escape");
-  assert.match(workflow, /-DOWNED_LEASE_DISTRIBUTION=1 native\/locks\.c/u);
+  assert.match(workflow, /-mmacosx-version-min=11\.0 -DOWNED_LEASE_DISTRIBUTION=1 native\/locks\.c/u);
   assert.match(workflow, /'distribution' \{ '\/DOWNED_LEASE_DISTRIBUTION=1' \}/u);
   assert.match(workflow, /node-version: \$\{\{ matrix\.node == '22\.19\.0' && '26\.8\.1' \|\| '22\.19\.0' \}\}/u);
   const alternate = workflow.match(/      - name: Verify identical packaged image on alternate runtime without rebuilding\n((?:        [^\n]*\n)+)/u)?.[1];
@@ -207,6 +207,45 @@ test("Linux image admission rejects newer GLIBC before loading or package public
     assert.throws(() => validateLinuxNativeVersionNeeds(dynamic, "Name: GLIBC_PRIVATE"), /Unknown native GLIBC requirement/u);
     assert.throws(() => validateLinuxNativeVersionNeeds(dynamic, ""), /inspectable GLIBC/u);
     assert.throws(() => validateLinuxNativeVersionNeeds(dynamic + "\nShared library: [libssl.so.3]", "Name: GLIBC_2.28"), /depend only on libc/u);
+  `);
+  assert.equal(result.code, 0, result.stderr);
+});
+
+test("Darwin image admission bounds native load commands and preserves the Node macOS baseline", async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { validateDarwinNativeImage } from "./scripts/package-native-lock.mjs";
+    const version = (major, minor = 0, patch = 0) => major * 65536 + minor * 256 + patch;
+    const modern = (minimum = version(11), platform = 1) => {
+      const command = Buffer.alloc(24);
+      [0x32, 24, platform, minimum, version(26, 5), 0].forEach((value, index) => command.writeUInt32LE(value, index * 4));
+      return command;
+    };
+    const legacy = Buffer.alloc(16);
+    [0x24, 16, version(10, 15, 7), version(26, 5)].forEach((value, index) => legacy.writeUInt32LE(value, index * 4));
+    const image = (...commands) => {
+      const bytes = Buffer.alloc(32 + commands.reduce((size, command) => size + command.length, 0));
+      [0xfeedfacf, 0x01000007, 3, 8, commands.length, bytes.length - 32, 0, 0].forEach((value, index) => bytes.writeUInt32LE(value, index * 4));
+      let offset = 32; for (const command of commands) { command.copy(bytes, offset); offset += command.length; }
+      return bytes;
+    };
+    assert.deepEqual(validateDarwinNativeImage(image(modern())), { platform: "macos", baseline: "11.0", minimumOS: "11.0.0", sdk: "26.5.0" });
+    assert.equal(validateDarwinNativeImage(image(legacy)).minimumOS, "10.15.7");
+    const lib64 = image(modern()); lib64.writeUInt32LE(0x80000003, 8);
+    assert.equal(validateDarwinNativeImage(lib64).minimumOS, "11.0.0");
+    for (const minimum of [version(26), version(11, 1), version(11, 0, 1)])
+      assert.throws(() => validateDarwinNativeImage(image(modern(minimum))), /exceeds the Node 22 macOS 11 baseline/u);
+    assert.throws(() => validateDarwinNativeImage(image(modern(version(11), 2))), /target macOS/u);
+    assert.throws(() => validateDarwinNativeImage(image(legacy, modern())), /Conflicting/u);
+    for (const [offset, value] of [[0, 0xcafebabe], [4, 0x0100000c], [8, 8], [8, 0x01000003], [12, 2], [16, 129], [20, 65537], [36, 4], [52, 1], [44, 0], [48, 0]]) {
+      const bytes = image(modern()); bytes.writeUInt32LE(value, offset);
+      assert.throws(() => validateDarwinNativeImage(bytes));
+    }
+    assert.throws(() => validateDarwinNativeImage(image(modern()).subarray(0, 40)), /truncated/u);
+    const unknown = Buffer.alloc(8); unknown.writeUInt32LE(0x99); unknown.writeUInt32LE(8, 4);
+    assert.throws(() => validateDarwinNativeImage(image(unknown)), /Missing macOS deployment/u);
+    const extra = Buffer.concat([image(modern()), Buffer.alloc(8)]); extra.writeUInt32LE(32, 20);
+    assert.throws(() => validateDarwinNativeImage(extra), /Unclassified/u);
   `);
   assert.equal(result.code, 0, result.stderr);
 });
