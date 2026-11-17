@@ -6,6 +6,7 @@
 
 - `Guard qualification`: Adds a dependency-isolated native lock probe and read-only six-cell x64 CI across Linux, Windows and Intel macOS on Node 22.19/26.8, with registry-signature and supplied-attestation verification before addon loading. Real process/worker witnesses cover exclusion, descriptor lifetime and crash release; countermodels retain uncancelled-wait and inherited-handle limits. No runtime dependency adoption, guard repair or live-state mutation is enabled.
 - `Ownership qualification`: Adds a Linux/Darwin N-API opaque-lease fixture and CI recompilation/probe stage with a teardown-suppression falsifier; either probe's edits trigger qualification. Disposable Worker witnesses exercise cleanup without unmanaged FD tracking, foreign/spent lease refusal and successor protection. Platform execution remains separately evidenced, not a production adapter, Windows support or general close-error retirement guarantee.
+- `Windows build qualification`: Pins public x64 Node SDK inputs and adds an isolated MSVC compile/load smoke fixture with N-API version/branding checks and retained compiler/load diagnostics. SDK bytes are checked before compilation; temporary build outputs and read-only CI remain separate from runtime dependencies. This does not enable Windows handle ownership, guard recovery or a production native ABI.
 
 ## 0.59.2: Managed Host Settings Hotfix
 

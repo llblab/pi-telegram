@@ -103,7 +103,7 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   const paths = workflow.match(/^    paths:\n((?:      - [^\n]+\n)+)/mu)?.[1];
   assert.ok(paths);
   assert.deepEqual(paths.trim().split("\n").map(line => line.trim().replace(/^- "|"$/gu, "")), [
-    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
+    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "scripts/probe-native-napi-build.mjs", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
   ]);
   assert.match(workflow, /^  contents: read$/mu);
   const jobEnvironment = workflow.match(/^    env:\n((?:      [^\n]+\n)+)/mu)?.[1];
@@ -114,7 +114,7 @@ test("Native lock qualification freezes an isolated candidate without runtime ad
   assert.match(workflow, /^          persist-credentials: false$/mu);
   assert.match(workflow, /npm ci --prefix tests\/fixtures\/native-file-lock --ignore-scripts --bin-links=false/u);
   assert.match(workflow, /npm audit signatures --prefix tests\/fixtures\/native-file-lock --json/u);
-  for (const probe of ["node scripts/probe-native-file-lock.mjs", "node scripts/probe-owned-native-lease.mjs"]) {
+  for (const probe of ["node scripts/probe-native-file-lock.mjs", "node scripts/probe-owned-native-lease.mjs", "node scripts/probe-native-napi-build.mjs"]) {
     assert.ok(workflow.indexOf("npm audit signatures") < workflow.indexOf(probe),
       "Verify registry signatures and supplied attestations before loading either native candidate");
   }
@@ -142,6 +142,16 @@ test("Windows N-API SDK qualification pins only public x64 build inputs", () => 
     assert.equal(release.importLibrary.file, "win-x64/node.lib");
     for (const input of [release.headers, release.importLibrary]) assert.match(input.sha256, /^[a-f0-9]{64}$/u);
   }
+  const workflow = readFileSync(join(PROJECT_ROOT, ".github", "workflows", "native-lock-qualification.yml"), "utf8");
+  const windows = workflow.match(/      - name: Compile and load public Windows N-API smoke fixture\n((?:        [^\n]*\n)+)/u)?.[1];
+  assert.ok(windows);
+  assert.match(windows, /^        if: runner\.os == 'Windows'$/mu);
+  assert.match(windows, /^        shell: pwsh$/mu);
+  assert.match(windows, /Get-FileHash \$file -Algorithm SHA256.*-ne \$asset\.sha256/u);
+  assert.ok(windows.indexOf("SDK digest mismatch") >= 0 && windows.indexOf("SDK digest mismatch") < windows.indexOf("cl.exe"), "Check pinned SDK bytes before compilation");
+  assert.match(windows, /\/std:c11.*\/DNAPI_VERSION=8/u);
+  assert.match(windows, /windows-napi-compile-exit-code\.txt/u);
+  assert.match(windows, /windows-napi-load-exit-code\.txt/u);
 });
 
 test("CI native progress stays finite, body-free and separate from native completion", async () => {

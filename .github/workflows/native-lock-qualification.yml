@@ -7,6 +7,7 @@ on:
     paths:
       - "scripts/probe-native-file-lock.mjs"
       - "scripts/probe-owned-native-lease.mjs"
+      - "scripts/probe-native-napi-build.mjs"
       - "tests/fixtures/native-file-lock/**"
       - ".github/workflows/native-lock-qualification.yml"
 
@@ -98,6 +99,53 @@ jobs:
           printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/owned-lease-control-exit-code.txt"
           test "$status" -eq 1
           grep -Fq 'Actual Worker exit, not a stop request or JS finally, precedes reacquisition' "$QUALIFICATION_EVIDENCE/owned-lease-control.stderr"
+      - name: Compile and load public Windows N-API smoke fixture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $version = (node -p process.versions.node).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $arch = (node -p process.arch).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $manifest = Get-Content tests/fixtures/native-file-lock/windows-node-sdk.json -Raw | ConvertFrom-Json -AsHashtable
+          $release = $manifest.versions[$version]
+          if (!$release -or $arch -ne $manifest.arch -or $manifest.napi -ne 8) { throw 'Unsupported SDK qualification tuple' }
+          $build = Join-Path $env:RUNNER_TEMP 'windows-napi-build'
+          New-Item -ItemType Directory -Force $build | Out-Null
+          $evidence = $env:QUALIFICATION_EVIDENCE
+          $source = (Resolve-Path tests/fixtures/native-file-lock/napi-build.c).Path
+          @{ node = $version; arch = $arch; sdk = $release; sourceSha256 = (Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant(); probeSha256 = (Get-FileHash scripts/probe-native-napi-build.mjs -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json -Depth 6 | Set-Content "$evidence/windows-napi-inputs.json"
+          foreach ($name in @('headers', 'importLibrary')) {
+            $asset = $release[$name]
+            $file = Join-Path $build $(if ($name -eq 'importLibrary') { 'node.lib' } else { 'headers.tar.gz' })
+            Invoke-WebRequest -Uri "$($manifest.source)v$version/$($asset.file)" -OutFile $file -TimeoutSec 45 -MaximumRedirection 0
+            if ((Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant() -ne $asset.sha256) { throw "SDK digest mismatch: $name" }
+          }
+          tar.exe -xzf "$build/headers.tar.gz" -C $build > "$evidence/windows-napi-extract.stdout" 2> "$evidence/windows-napi-extract.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/windows-napi-extract-exit-code.txt"
+          if ($status -ne 0) { exit $status }
+          $include = Join-Path $build "node-v$version/include/node"
+          if (!(Test-Path "$include/node_api.h")) { throw 'Missing public Node headers' }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installation = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          if ($LASTEXITCODE -ne 0 -or !$installation) { throw 'No public MSVC development environment found' }
+          $developer = Join-Path $installation.Trim() 'Common7/Tools/VsDevCmd.bat'
+          $binary = Join-Path $build 'napi-build.node'
+          $command = Join-Path $build 'compile.cmd'
+          @('@echo off', "call `"$developer`" -no_logo -arch=x64 -host_arch=x64", 'if errorlevel 1 exit /b %errorlevel%', "cl.exe /nologo /Bv /LD /MD /std:c11 /W4 /WX /DNAPI_VERSION=8 /I`"$include`" `"$source`" /Fo`"$build/napi-build.obj`" /link /OUT:`"$binary`" /IMPLIB:`"$build/napi-build.lib`" /INCREMENTAL:NO `"$build/node.lib`"", 'exit /b %errorlevel%') | Set-Content $command -Encoding ascii
+          & $env:ComSpec /d /s /c "`"$command`"" > "$evidence/windows-napi-compile.stdout" 2> "$evidence/windows-napi-compile.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/windows-napi-compile-exit-code.txt"
+          if ($status -ne 0) { exit $status }
+          (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() | Set-Content "$evidence/windows-napi-binary-sha256.txt"
+          node scripts/probe-native-napi-build.mjs --addon $binary > "$evidence/windows-napi-report.json" 2> "$evidence/windows-napi-load.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/windows-napi-load-exit-code.txt"
+          exit $status
       - name: Preserve qualification and failure evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
