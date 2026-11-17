@@ -63,6 +63,147 @@ import {
 import { createTelegramSessionContextStore } from "../lib/lifecycle.ts";
 import { readTelegramSyncBlockTotals } from "../lib/loop-lag.ts";
 
+for (const layout of ["source", "compiled"] as const) {
+  for (const fault of ["cold", "healthy", "worker", "missing", "catalog", "manifest", "image", "tuple", "hardlink", "directory", "oversized", "read-race",
+    "arch", "node", "napi", "old-napi", "alternate", "musl", "old-glibc", "old-os", "bad-exports", "accessor", "late-change"] as const) {
+    test(`Private kernel loader admits exact package bytes without default activation (${layout}/${fault})`, { skip: process.arch !== "x64" }, async () => {
+      const root = mkdtempSync(join(tmpdir(), "pt-kernel-loader-"));
+      const moduleUrl = new URL(layout === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+      try {
+        const result = await runNodeEval(`
+          import assert from "node:assert/strict";
+          import fs from "node:fs";
+          import url from "node:url";
+          import os from "node:os";
+          import { createRequire } from "node:module";
+          import { createHash } from "node:crypto";
+          import { join, sep } from "node:path";
+          import { mock } from "node:test";
+          import { once } from "node:events";
+          import { Worker } from "node:worker_threads";
+          const root = ${JSON.stringify(root)}, moduleUrl = ${JSON.stringify(moduleUrl)}, fault = ${JSON.stringify(fault)};
+          const defaultURL = new URL("../native/", moduleUrl), defaultPath = url.fileURLToPath(defaultURL), directory = join(root, "native");
+          const agent = join(root, "must-not-create-agent"); process.env.PI_CODING_AGENT_DIR = agent;
+          fs.cpSync(defaultPath, directory, { recursive: true, filter: () => true });
+          const catalogPath = join(directory, "catalog.json"), catalog = JSON.parse(fs.readFileSync(catalogPath));
+          const target = process.platform + "-x64", base = join(directory, "prebuilds", target), entry = catalog.targets[target];
+          const manifestPath = join(base, "manifest.json"), imagePath = join(base, entry.binarySha256 + ".node");
+          if (fault === "missing") fs.unlinkSync(imagePath);
+          if (fault === "catalog") fs.writeFileSync(catalogPath, JSON.stringify({ ...catalog, version: 2 }));
+          if (fault === "manifest") fs.appendFileSync(manifestPath, " ");
+          if (fault === "image") {
+            const bytes = fs.readFileSync(imagePath); bytes[bytes.length - 1] ^= 1; fs.writeFileSync(imagePath, bytes);
+          }
+          if (fault === "tuple") {
+            const data = JSON.parse(fs.readFileSync(manifestPath)); data.source.sha256 = "f".repeat(64);
+            const bytes = Buffer.from(JSON.stringify(data)); fs.writeFileSync(manifestPath, bytes);
+            entry.manifestSha256 = createHash("sha256").update(bytes).digest("hex"); fs.writeFileSync(catalogPath, JSON.stringify(catalog));
+          }
+          if (fault === "hardlink") fs.linkSync(imagePath, join(root, "alias.node"));
+          if (fault === "directory") { fs.unlinkSync(manifestPath); fs.mkdirSync(manifestPath); }
+          if (fault === "oversized") fs.writeFileSync(catalogPath, "x".repeat(16385));
+          if (fault === "arch") Object.defineProperty(process, "arch", { value: "arm64" });
+          if (fault === "node") Object.defineProperty(process.versions, "node", { value: "22.18.0" });
+          if (fault === "napi" || fault === "old-napi") Object.defineProperty(process.versions, "napi", { value: fault === "napi" ? "unknown" : "7" });
+          if (fault === "alternate") Object.defineProperty(process.versions, "electron", { value: "unqualified" });
+          if (fault === "musl" || fault === "old-glibc") {
+            Object.defineProperty(process, "platform", { value: "linux" });
+            Object.defineProperty(process, "report", { value: { getReport: () => ({ header: fault === "musl" ? {} : { glibcVersionRuntime: "2.27" } }) } });
+          }
+          if (fault === "old-os") Object.defineProperty(process, "platform", { value: "darwin" });
+          let loads = 0, observations = 0, getterCalls = 0, imageFd, raced = false;
+          mock.module("node:fs", { namedExports: { ...fs, openSync(path, ...args) {
+            const fd = fs.openSync(path, ...args); if (path === imagePath) imageFd = fd; return fd;
+          }, readSync(fd, ...args) {
+            if (fault === "read-race" && fd === imageFd && !raced) { raced = true; fs.appendFileSync(imagePath, "x"); }
+            return fs.readSync(fd, ...args);
+          }, lstatSync(path, ...args) {
+            if (typeof path === "string" && (path.startsWith(directory + sep) || path.startsWith(defaultPath))) observations++;
+            return fs.lstatSync(path, ...args);
+          } } });
+          mock.module("node:os", { namedExports: { ...os, release: () => fault === "old-os" ? "19.6.0" : os.release() } });
+          mock.module("node:url", { namedExports: { ...url, fileURLToPath(value, ...args) {
+            if (!["cold", "healthy", "worker"].includes(fault) && value?.href === defaultURL.href) return directory;
+            return url.fileURLToPath(value, ...args);
+          } } });
+          mock.module("node:module", { namedExports: { createRequire(value) {
+            const require = createRequire(value);
+            return path => {
+              if (typeof path === "string" && path.endsWith(".node")) {
+                loads++;
+                if (fault === "bad-exports") return { backendKind: "wrong", napi: 8, tryAcquire() {}, release() {} };
+                if (fault === "accessor") return { backendKind: "pi-telegram-kernel-v1-" + process.platform, napi: 8,
+                  get tryAcquire() { getterCalls++; throw new Error("Accessor must not execute"); }, release() {} };
+                if (!["healthy", "worker", "late-change"].includes(fault)) throw new Error("Unverified input reached native loading");
+                const result = require(path);
+                if (fault === "late-change") fs.appendFileSync(manifestPath, " ");
+                return result;
+              }
+              return require(path);
+            };
+          } } });
+          const Kernel = await import(moduleUrl);
+          assert.equal(typeof Kernel.loadTelegramFileTransactionKernelBackend, "function");
+          assert.equal(loads, 0); assert.equal(observations, 0); assert.equal(fs.existsSync(agent), false);
+          if (fault === "healthy") {
+            const backend = Kernel.loadTelegramFileTransactionKernelBackend();
+            assert.equal(loads, 1); assert.ok(Object.isFrozen(backend));
+            assert.deepEqual(Reflect.ownKeys(backend).sort(), ["backendKind", "napi", "release", "tryAcquire"]);
+            assert.equal(backend.napi, 8); assert.equal(backend.backendKind, "pi-telegram-kernel-v1-" + process.platform);
+            const actualPath = join(defaultPath, "prebuilds", target, entry.binarySha256 + ".node"), native = createRequire(import.meta.url)(actualPath);
+            native.tryAcquire = native.release = () => { throw new Error("Replaced exports have no authority over captured methods"); };
+            const anchor = join(root, "coord.lock"); fs.writeFileSync(anchor, "", { mode: 0o600 });
+            const lease = backend.tryAcquire(anchor); assert.ok(lease); assert.deepEqual(Reflect.ownKeys(lease), []);
+            try {
+              assert.equal(backend.tryAcquire(anchor), undefined);
+              assert.throws(() => backend.release({}), { code: "ERR_INVALID_LEASE" });
+            } finally { assert.equal(backend.release(lease), true); }
+            assert.equal(backend.release(lease), false);
+          } else if (fault === "worker") {
+            const backend = Kernel.loadTelegramFileTransactionKernelBackend(), path = join(root, "coord.lock");
+            fs.writeFileSync(path, "", { mode: 0o600 });
+            const worker = new Worker(\`
+              import { parentPort, workerData } from "node:worker_threads";
+              import(workerData.moduleUrl).then(Kernel => {
+                const backend = Kernel.loadTelegramFileTransactionKernelBackend();
+                globalThis.privateLoaderLease = backend.tryAcquire(workerData.path);
+                if (!globalThis.privateLoaderLease) throw new Error("Worker must own the real lease");
+                parentPort.on("message", () => parentPort.close());
+                parentPort.postMessage("held");
+              }).catch(error => { throw error; });
+            \`, { eval: true, trackUnmanagedFds: false, workerData: { moduleUrl, path } });
+            let exited = false; worker.once("exit", () => { exited = true; });
+            try {
+              const [ready] = await once(worker, "message", { signal: AbortSignal.timeout(5000) }); assert.equal(ready, "held");
+              assert.equal(backend.tryAcquire(path), undefined);
+              const closed = once(worker, "exit", { signal: AbortSignal.timeout(5000) }); worker.postMessage("exit");
+              assert.deepEqual(await closed, [0]);
+              const successor = backend.tryAcquire(path); assert.ok(successor); assert.equal(backend.release(successor), true);
+            } finally { if (!exited) await worker.terminate(); }
+          } else if (fault !== "cold") {
+            const unsupported = ["arch", "node", "napi", "old-napi", "alternate", "musl", "old-glibc", "old-os"].includes(fault);
+            const issued = ["bad-exports", "accessor", "late-change"].includes(fault);
+            assert.throws(() => Kernel.loadTelegramFileTransactionKernelBackend(), {
+              code: "kernel-backend-refused", reason: unsupported ? "unsupported-host" : issued ? "load-failed" : "invalid-distribution",
+            });
+            assert.equal(loads, issued ? 1 : 0); assert.equal(getterCalls, 0);
+            if (unsupported) assert.equal(observations, 0, "Unsupported host refuses before package I/O");
+            if (fault === "late-change") {
+              assert.throws(() => Kernel.loadTelegramFileTransactionKernelBackend(), { reason: "invalid-distribution" });
+              assert.equal(loads, 1, "Observed post-load change grants no cache-clearing or native replay");
+            }
+          }
+          assert.equal(fs.existsSync(agent), false, "Package admission never reads or repairs configured runtime storage");
+        `, { nodeArgs: ["--experimental-test-module-mocks"] });
+        assert.equal(result.code, 0, result.stderr);
+      } finally {
+        // Native DLLs remain mapped until actual child exit, not a logical completion or JS cleanup request.
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
 for (const mode of ["success", "busy", "acquire-error", "invalid-lease", "async-lease", "pre-aborted", "acquire-aborted", "legacy-aborted", "legacy-damaged",
   "operation-error", "release-false", "release-error", "async-release", "both-errors"] as const) {
   test(`Private kernel transaction port preserves legacy exclusion and one-shot retirement (${mode})`, () => {

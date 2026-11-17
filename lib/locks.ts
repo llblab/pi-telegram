@@ -1,10 +1,13 @@
 /**
  * Telegram singleton lock helpers
  * Zones: telegram ownership, filesystem, transport authority
- * Owns filesystem authority, atomic runtime-section publication and Telegram bridge ownership semantics
+ * Owns filesystem authority, private kernel admission, atomic runtime-section publication and Telegram bridge ownership semantics
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
+import { release as osRelease } from "node:os";
+import { fileURLToPath } from "node:url";
 import {
   chmodSync,
   closeSync,
@@ -16,7 +19,9 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
+  type Stats,
   renameSync,
   rmSync,
   unlinkSync,
@@ -654,6 +659,111 @@ export interface TelegramFileTransactionKernel {
   readonly signal?: AbortSignal;
   tryAcquire(anchorPath: string): object | undefined;
   release(lease: object): boolean;
+}
+
+export interface TelegramFileTransactionKernelBackend extends Readonly<Pick<TelegramFileTransactionKernel, "tryAcquire" | "release">> {
+  readonly backendKind: string;
+  readonly napi: 8;
+}
+
+export class TelegramKernelBackendError extends Error {
+  readonly code = "kernel-backend-refused";
+  readonly reason: "unsupported-host" | "invalid-distribution" | "load-failed";
+  constructor(reason: TelegramKernelBackendError["reason"], options?: ErrorOptions) {
+    super(`Telegram kernel backend ${reason}.`, options);
+    this.name = "TelegramKernelBackendError";
+    this.reason = reason;
+  }
+}
+
+/** Package code, not runtime state: bounded descriptor read with observed path continuity. No ancestry/hostile-updater proof. */
+function readTelegramKernelAsset(path: string, limit: number) {
+  const original = lstatSync(path);
+  const matches = (stat: Stats) => stat.isFile() && stat.nlink === 1 && stat.dev === original.dev && stat.ino === original.ino &&
+    stat.size === original.size && stat.mtimeMs === original.mtimeMs && stat.ctimeMs === original.ctimeMs;
+  if (!matches(original) || original.size <= 0 || original.size > limit) throw new Error("Invalid kernel package file.");
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  let bytes: Buffer;
+  try {
+    if (!matches(fstatSync(fd))) throw new Error("Kernel package file changed before reading.");
+    const buffer = Buffer.alloc(original.size + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const count = readSync(fd, buffer, length, buffer.length - length, null);
+      if (!count) break;
+      length += count;
+    }
+    if (length !== original.size || !matches(fstatSync(fd))) throw new Error("Kernel package file changed during reading.");
+    bytes = buffer.subarray(0, length);
+  } finally { closeSync(fd); }
+  const recheck = () => { if (!matches(lstatSync(path))) throw new Error("Kernel package file identity changed."); };
+  recheck();
+  return { bytes, recheck };
+}
+
+/** Explicit private admission only. No default caller, resource creation, recovery, downloads or native compilation. */
+export function loadTelegramFileTransactionKernelBackend(): TelegramFileTransactionKernelBackend {
+  const atLeast = (value: unknown, floor: readonly [number, number, number]) => {
+    const match = typeof value === "string" && /^(\d+)\.(\d+)(?:\.(\d+))?$/u.exec(value);
+    if (!match) return false;
+    const major = Number(match[1]), minor = Number(match[2]), patch = Number(match[3] ?? 0);
+    return [major, minor, patch].every(Number.isSafeInteger) &&
+      (major > floor[0] || major === floor[0] && (minor > floor[1] || minor === floor[1] && patch >= floor[2]));
+  };
+  try {
+    if (process.release.name !== "node" || process.versions.electron || process.versions.bun || process.arch !== "x64" ||
+        !["linux", "darwin", "win32"].includes(process.platform) || !atLeast(process.versions.node, [22, 19, 0]) ||
+        !/^\d+$/u.test(process.versions.napi ?? "") || !Number.isSafeInteger(Number(process.versions.napi)) || Number(process.versions.napi) < 8)
+      throw new Error("Unsupported Node/platform/ABI tuple.");
+    if (process.platform === "linux") {
+      const report: unknown = process.report?.getReport();
+      if (!runtimeStateRecord(report) || !runtimeStateRecord(report.header) || !atLeast(report.header.glibcVersionRuntime, [2, 28, 0]))
+        throw new Error("Kernel backend requires the qualified GLIBC baseline.");
+    } else if (!atLeast(osRelease(), process.platform === "darwin" ? [20, 0, 0] : [10, 0, 0])) {
+      throw new Error("Unsupported kernel OS baseline.");
+    }
+  } catch (cause) { throw new TelegramKernelBackendError("unsupported-host", { cause }); }
+  let loading = false;
+  try {
+    const directory = fileURLToPath(new URL("../native/", import.meta.url));
+    const catalog = readTelegramKernelAsset(join(directory, "catalog.json"), 16384);
+    const index: unknown = JSON.parse(catalog.bytes.toString("utf8"));
+    const hash = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+    const isHash = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
+    if (!runtimeStateRecord(index) || index.version !== 1 || !isHash(index.sourceSha256) || !runtimeStateRecord(index.targets) ||
+        Object.keys(index.targets).sort().join(",") !== "darwin-x64,linux-x64,win32-x64") throw new Error("Invalid kernel catalog.");
+    const entry = index.targets[`${process.platform}-x64`];
+    if (!runtimeStateRecord(entry) || !isHash(entry.binarySha256) || !isHash(entry.manifestSha256)) throw new Error("Invalid kernel target identity.");
+    const base = join(directory, "prebuilds", `${process.platform}-x64`);
+    const manifest = readTelegramKernelAsset(join(base, "manifest.json"), 16384);
+    if (hash(manifest.bytes) !== entry.manifestSha256) throw new Error("Kernel manifest identity mismatch.");
+    const metadata: unknown = JSON.parse(manifest.bytes.toString("utf8"));
+    const kind = `pi-telegram-kernel-v1-${process.platform}`;
+    if (!runtimeStateRecord(metadata) || metadata.version !== 1 || metadata.backendKind !== kind || metadata.napi !== 8 ||
+        metadata.platform !== process.platform || metadata.arch !== "x64" || metadata.minimumNode !== "22.19.0" ||
+        !runtimeStateRecord(metadata.source) || metadata.source.file !== "locks.c" || metadata.source.sha256 !== index.sourceSha256 ||
+        !Number.isSafeInteger(metadata.source.bytes) || (metadata.source.bytes as number) <= 0 || (metadata.source.bytes as number) > 1048576 ||
+        !runtimeStateRecord(metadata.binary) || metadata.binary.file !== "locks.node" || metadata.binary.sha256 !== entry.binarySha256)
+      throw new Error("Kernel manifest ABI/source tuple mismatch.");
+    const binaryPath = join(base, `${entry.binarySha256}.node`);
+    const image = readTelegramKernelAsset(binaryPath, 10 * 1024 * 1024);
+    if (image.bytes.length !== metadata.binary.bytes || hash(image.bytes) !== entry.binarySha256) throw new Error("Kernel image identity mismatch.");
+    const recheck = () => { catalog.recheck(); manifest.recheck(); image.recheck(); };
+    recheck();
+    loading = true;
+    // Content-addressed names avoid reusing an old require-cache entry for changed bytes. Never clear or replay that cache.
+    const native: unknown = createRequire(import.meta.url)(binaryPath);
+    recheck();
+    if (!runtimeStateRecord(native) || Reflect.ownKeys(native).sort().join(",") !== "backendKind,napi,release,tryAcquire")
+      throw new Error("Unexpected kernel module exports.");
+    const fields = Object.getOwnPropertyDescriptors(native);
+    if (fields.backendKind?.value !== kind || fields.napi?.value !== 8 ||
+        typeof fields.tryAcquire?.value !== "function" || typeof fields.release?.value !== "function") throw new Error("Invalid kernel module ABI.");
+    const acquire = fields.tryAcquire.value as TelegramFileTransactionKernel["tryAcquire"], release = fields.release.value as TelegramFileTransactionKernel["release"];
+    return Object.freeze({ backendKind: kind, napi: 8 as const,
+      tryAcquire: (path: string) => Reflect.apply(acquire, native, [path]) as object | undefined,
+      release: (lease: object) => Reflect.apply(release, native, [lease]) as boolean });
+  } catch (cause) { throw new TelegramKernelBackendError(loading ? "load-failed" : "invalid-distribution", { cause }); }
 }
 
 export class TelegramFileTransactionKernelError extends Error {

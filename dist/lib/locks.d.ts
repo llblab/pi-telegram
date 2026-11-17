@@ -1,7 +1,7 @@
 /**
  * Telegram singleton lock helpers
  * Zones: telegram ownership, filesystem, transport authority
- * Owns filesystem authority, atomic runtime-section publication and Telegram bridge ownership semantics
+ * Owns filesystem authority, private kernel admission, atomic runtime-section publication and Telegram bridge ownership semantics
  */
 import { renameSync } from "node:fs";
 import { type TelegramFollowerRegistrationOptions, type TelegramFollowerRegistrationResult } from "./polling.ts";
@@ -192,6 +192,17 @@ export interface TelegramFileTransactionKernel {
     tryAcquire(anchorPath: string): object | undefined;
     release(lease: object): boolean;
 }
+export interface TelegramFileTransactionKernelBackend extends Readonly<Pick<TelegramFileTransactionKernel, "tryAcquire" | "release">> {
+    readonly backendKind: string;
+    readonly napi: 8;
+}
+export declare class TelegramKernelBackendError extends Error {
+    readonly code = "kernel-backend-refused";
+    readonly reason: "unsupported-host" | "invalid-distribution" | "load-failed";
+    constructor(reason: TelegramKernelBackendError["reason"], options?: ErrorOptions);
+}
+/** Explicit private admission only. No default caller, resource creation, recovery, downloads or native compilation. */
+export declare function loadTelegramFileTransactionKernelBackend(): TelegramFileTransactionKernelBackend;
 export declare class TelegramFileTransactionKernelError extends Error {
     readonly code = "kernel-transaction-refused";
     readonly resource: string;
