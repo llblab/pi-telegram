@@ -1249,7 +1249,7 @@ export function createTelegramBridgeApiRuntime(deps) {
             }
         },
         deleteWebhook: (signal) => callRecorded("deleteWebhook", { drop_pending_updates: false }, { signal }),
-        getUpdates: (body, signal) => callRecorded("getUpdates", body, { signal }),
+        getUpdates: (body, signal, assertAuthority) => callRecorded("getUpdates", body, { signal, assertAuthority }),
         setMyCommands: (commands, options) => callRecorded("setMyCommands", { commands }, options),
         sendChatAction: (chatId, action, options) => callRecorded("sendChatAction", {
             chat_id: chatId,

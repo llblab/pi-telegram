@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+## 0.59.3: Connection Recovery And Routing Cleanup
+
+- `Connect recovery`: After one coordinated offline preparation on a supported x64 host, `/telegram-connect` can recover from a damaged shared-state guard and reports success only once transport starts. Concurrent attempts share one reset and one poller. Healthy state stays intact; incomplete preparation refuses. Recovery can discard runtime continuity across profiles but does not touch credentials, Pi history or Telegram tabs.
+- `Routing cleanup`: The last Cancel removes an eligible unbound tab once, whether it formerly belonged to a leader or follower. Remaining inputs and protected work keep the tab. Callback answers and debug diagnostics distinguish cancellation from blocked cleanup or unconfirmed removal. An issued delete with unknown outcome is not repeated; cancelled originals remain private.
+- `Native packaging`: npm and Git layouts bundle verified x64 lock images for Linux, Windows and Intel macOS, with no install-time download or compilation. Source and compiled loaders share one image outside the replaceable JavaScript tree, so rebuilding does not try to remove a mapped Windows DLL. Native-image replacement still requires coordinated process drain.
+- `macOS admission`: Reuses a successful birth proof for the current process instead of invoking `ps` repeatedly inside Workspace and journal admission. Peer processes still require fresh proof, and inaccessible evidence grants no new authority.
+- `Validation`: Native process and worker checks cover lock exclusion and lifetime, concurrent reconnect, and one-shot routing cleanup. Failures retain their original results and bounded phase diagnostics; fixture teardown joins original work rather than widening deadlines or replaying effects.
+
 ## 0.59.2: Managed Host Settings Hotfix
 
 - `Host compatibility`: Restores `/start` and model settings for managed npm/git installations without local Pi peers by supplying the loader-mapped host SettingsManager at the package entrypoint. Cold domain imports remain SDK-lazy; no duplicate host dependency or private loader path is introduced. Addresses #380's blocking settings-import defect; its separate Threaded Mode observations remain under investigation.

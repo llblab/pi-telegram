@@ -589,7 +589,7 @@ export function createTelegramWorkspaceAdmissionRuntimeBinding(input) {
                 const options = {
                     path: getStatePath ? getStatePath() : getPath(configuredProfileName),
                     ...(getStatePath
-                        ? { stateProfile: configuredProfileName ?? "default" }
+                        ? { stateProfile: configuredProfileName ?? "default", stateTransaction: input.stateTransaction }
                         : {}),
                     profileKey,
                     owner: input.owner,
@@ -604,6 +604,7 @@ export function createTelegramWorkspaceAdmissionRuntimeBinding(input) {
                 if (current && current.botToken === botToken &&
                     current.authority.path === authority.path &&
                     current.authority.stateProfile === authority.stateProfile &&
+                    current.authority.stateTransaction === authority.stateTransaction &&
                     current.authority.profileKey === authority.profileKey &&
                     areOwnersEqual(current.authority.owner, authority.owner) &&
                     areOwnersEqual(current.options.owner, current.authority.owner) &&
@@ -756,6 +757,7 @@ export function createTelegramWorkspaceAdmissionLedger(options) {
     const isStorageCurrent = () => suppliedOptions.path === path &&
         suppliedOptions.profileKey === profileKey &&
         suppliedOptions.stateProfile === stateProfile &&
+        suppliedOptions.stateTransaction === options.stateTransaction &&
         areOwnersEqual(suppliedOptions.owner, boundOwner);
     const mapStateError = (error) => {
         if (error instanceof TelegramRuntimeStateError)
@@ -779,6 +781,7 @@ export function createTelegramWorkspaceAdmissionLedger(options) {
                     };
                 }, {
                     isCurrent: isStorageCurrent,
+                    stateTransaction: options.stateTransaction,
                     publishRename: publication.publishRename,
                     onPublicationBoundary(boundary) {
                         if (boundary !== "after-rename")

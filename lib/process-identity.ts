@@ -64,8 +64,8 @@ function readWindowsProcessStart(pid: number): string {
   ).trim();
 }
 
-/** The current process never changes birth, so its slow Windows proof is read once; other PIDs are never cached. */
-let ownWindowsBirthProof: TelegramProcessBirthProof | undefined;
+/** A successful self-proof is immutable; do not repeat shell probes inside admission transactions. */
+const ownBirthProofs = new Map<"darwin" | "win32", TelegramProcessBirthProof>();
 
 function getTelegramProcessBirthProof(
   pid: number,
@@ -92,6 +92,9 @@ function getTelegramProcessBirthProof(
       /* inaccessible process metadata */
     }
   } else if (platform === "darwin") {
+    const cacheable = pid === process.pid && !options.readDarwinProcessStart;
+    const cached = cacheable && ownBirthProofs.get(platform);
+    if (cached) return cached;
     try {
       const startedAt = (
         options.readDarwinProcessStart ?? readDarwinProcessStart
@@ -101,15 +104,18 @@ function getTelegramProcessBirthProof(
           .update(startedAt)
           .digest("hex")
           .slice(0, 16);
-        return { status: "proven", identity: `${pid}:start:${fingerprint}` };
+        const proof = { status: "proven", identity: `${pid}:start:${fingerprint}` } as const;
+        if (cacheable) ownBirthProofs.set(platform, proof);
+        return proof;
       }
     } catch {
       /* inaccessible process metadata */
     }
   } else if (platform === "win32") {
     const injected = options.readWindowsProcessStart;
-    if (!injected && pid === process.pid && ownWindowsBirthProof)
-      return ownWindowsBirthProof;
+    const cacheable = pid === process.pid && !injected;
+    const cached = cacheable && ownBirthProofs.get(platform);
+    if (cached) return cached;
     let proof: TelegramProcessBirthProof = { status: "unverifiable" };
     try {
       const ticks = (injected ?? readWindowsProcessStart)(pid);
@@ -118,8 +124,7 @@ function getTelegramProcessBirthProof(
     } catch {
       /* inaccessible process metadata, including another user's process */
     }
-    if (!injected && pid === process.pid && proof.status === "proven")
-      ownWindowsBirthProof = proof;
+    if (cacheable && proof.status === "proven") ownBirthProofs.set(platform, proof);
     return proof;
   }
   return { status: "unverifiable" };

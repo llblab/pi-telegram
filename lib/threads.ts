@@ -54,6 +54,8 @@ import {
   TELEGRAM_STRICT_READ_FLAGS,
   readTelegramRuntimeState,
   withTelegramFileTransaction,
+  withTelegramRuntimeStateTransaction,
+  type TelegramRuntimeStateTransaction,
   type TelegramLockContext,
   type TelegramLockRuntime,
   type TelegramOwnedStatePublicationOptions,
@@ -1175,7 +1177,7 @@ export interface TelegramTopicTargetStoreOptions {
   consolidated?: Pick<
     TelegramConsolidatedWorkspaceStorageOptions,
     "captureAuthority" | "publishIfOwned"
-  >;
+  > & { stateTransaction?: TelegramRuntimeStateTransaction };
   getExternalReservedSlots?: () => readonly string[];
 }
 
@@ -3970,7 +3972,7 @@ export function createTelegramTopicTargetStore(
     };
     // Retain the original reader and its revision history; only physical observation is serialized.
     return workspaceIO && !workspaceFrame
-      ? withTelegramFileTransaction(join(dirname(path), "runtime", `${basename(path)}.transaction`), sample, { recoverAbandoned: false })
+      ? (consolidated?.stateTransaction ?? withTelegramRuntimeStateTransaction)(path, sample, { recoverAbandoned: false })
       : sample();
   };
   const getRecoveryPath = (path: string) =>
@@ -4157,8 +4159,8 @@ export function createTelegramTopicTargetStore(
     const revision = mutationRevision;
     // Serialize this original load with envelope publishers, without recovering guards or locking retained/frame reads.
     const rawFile = await (workspaceIO && !workspaceFrame
-      ? withTelegramFileTransaction(
-          join(dirname(path), "runtime", `${basename(path)}.transaction`),
+      ? (consolidated?.stateTransaction ?? withTelegramRuntimeStateTransaction)(
+          path,
           () => readStoreSnapshot(path, !!workspaceRestore),
           { recoverAbandoned: false },
         )

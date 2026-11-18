@@ -3495,11 +3495,16 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
   "cleanup-capability", "cleanup-port", "cleanup-wrong-ack", "cleanup-lost-ack", "cleanup-missing-carrier", "cleanup-source-stopped",
   "cleanup-chooser-expired", "cleanup-target-mutated", "cleanup-before-claim", "cleanup-after-second-work", "cleanup-after-second-claim",
   "cleanup-unknown-flag", "cleanup-missing-peer", "cleanup-missing-journal", "cleanup-profile-alias", "cleanup-command-render", "cleanup-command-api", "cleanup-command-unknown",
-  "cleanup-issue-clear", "cleanup-issue-busy", "cleanup-issue-lost", "prelaunch-peer-clear", "prelaunch-peer-busy", "prelaunch-peer-lost", "prelaunch-peer-release-lost", "prelaunch-peer-observe-lost", "prelaunch-peer-registration", "prelaunch-peer-group", "prelaunch-peer-legacy", "guard-model", "guard-pending", "guard-compaction", "guard-dispatch",
+  "cleanup-issue-clear", "cleanup-issue-busy", "cleanup-issue-lost", "prelaunch-peer-clear", "prelaunch-peer-busy", "prelaunch-peer-lost", "prelaunch-peer-release-lost", "prelaunch-peer-observe-lost", "prelaunch-peer-teardown-running", "prelaunch-peer-registration", "prelaunch-peer-group", "prelaunch-peer-legacy", "guard-model", "guard-pending", "guard-compaction", "guard-dispatch",
   "display-current", "display-response-lost", "display-context", "display-generation", "display-mode", "display-binding", "display-persist-lost", "display-publication", "all-peer-text", "all-peer-voice", "all-peer-album", "all-peer-donor-before", "all-peer-donor-after", "all-peer-donor-ack", "all-peer-group-donor-ack", "all-peer-donor-context"] as const) {
-  test(`Admitted live chooser composes authenticated follower journal save/apply/release and exact donor disposal (${fault})`, async () => {
+  test(`Admitted live chooser composes authenticated follower journal save/apply/release and exact donor disposal (${fault})`,
+    fault === "prelaunch-peer-teardown-running" ? { timeout: 5000 } : {}, async t => {
     await withLiveChooserProfileFixture(async f => {
       const allPeer = fault.startsWith("all-peer-");
+      const teardownProbe = fault === "prelaunch-peer-teardown-running";
+      const cleanupArmed = Promise.withResolvers<void>(), cleanupEntered = Promise.withResolvers<void>(), cleanupRelease = Promise.withResolvers<void>();
+      void cleanupEntered.promise.catch(() => undefined);
+      let activeCleanup = 0, teardownProbeArmed = false, semanticFailed = false, semanticFailure: unknown;
       const displayCase = fault.startsWith("display-");
       const recipientCwd = displayCase ? homedir() : "/repo";
       const ctx = { cwd: "/leader" }, recipientCtx = { cwd: recipientCwd }, root = dirname(f.path);
@@ -3561,6 +3566,22 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
       const ledger = createTelegramWorkspaceAdmissionLedger({ path: `${f.path}.admission`, profileKey: "profile-a:bot-a",
         owner: { processId: process.pid, processBirthId: `${process.pid}:follower-chooser` }, getProcessLiveness: () => "alive" });
       const operations = createTelegramWorkspaceOperationRuntime({ getWorkspaceAdmission: () => ledger });
+      const runWorkspaceOperation: typeof operations.run = teardownProbe ? async (metadata, operation) => {
+        if (metadata.operationKind !== "workspace.live-rebind-cleanup") return operations.run(metadata, operation);
+        activeCleanup++;
+        try {
+          // Do not monopolize the real profile gate while the original repeated chooser callbacks still drain.
+          await cleanupArmed.promise;
+          return await operations.run(metadata, async () => {
+            cleanupEntered.resolve();
+            const leases = ledger.read().leases;
+            assert.equal(leases.length, 1); assert.equal(leases[0]!.operationKind, metadata.operationKind);
+            assert.deepEqual(leases[0]!.scope, { kind: "profile" }, "The original scheduled cleanup owns real profile admission");
+            await cleanupRelease.promise;
+            return operation();
+          });
+        } finally { activeCleanup--; }
+      } : operations.run;
       const oldMenuState: Menu.TelegramModelMenuState = { chatId: 7, threadId: 10, messageId: 0, mode: "model", scope: "all", page: 0, scopedModels: [], allModels: [] };
       const commandRendered = createTelegramRenderedMessageDeliveryRuntime({ async sendMessage(body) {
         const end = apiActivity.begin("sendMessage", body); commandBodies.push(body as unknown as Record<string, unknown>); commandApiEntered.resolve();
@@ -3613,6 +3634,9 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
           if (fault === "apply-lost" && !dropped) { dropped = true; throw new Error("Local apply reply lost"); } } },
       });
       let callerCurrent = true, callerEpoch = "epoch", recipientBusy = false, observing = false, observations = 0;
+      if (teardownProbe) t.signal.addEventListener("abort", () => {
+        callerCurrent = false; cleanupArmed.resolve(); cleanupRelease.resolve(); cleanupEntered.reject(t.signal.reason);
+      }, { once: true });
       const activity = Activity.createTelegramActivityBridgeRuntime({ generation: "peer-work" });
       const apiActivity = createTelegramApiTargetActivityRuntime();
       const delivery = Delivery.createTelegramDeliveryLifecycleHooks(() => Delivery.createTelegramDeliveryRuntime({ generation: "peer-work",
@@ -3644,7 +3668,7 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
             observations++;
             assert.equal(recipientExecutions, 0, "Observation sees applied target with the selected input still held");
             if (fault === "prelaunch-peer-registration") registry.register({ ...registry.get("old")!, registrationGeneration: "replacement" });
-            if (fault === "prelaunch-peer-observe-lost") throw new Error("Held work ACK lost");
+            if (fault === "prelaunch-peer-observe-lost" || teardownProbe) throw new Error("Held work ACK lost");
           }
           if (envelope.mode === "observe") {
             observations++;
@@ -3675,7 +3699,7 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
       const harness = createRouteHarness({ instanceId: "leader", threadStore: titleStore, getWorkspaceRestoreStore: () => isolationStore,
         ...(displayCase ? { getDisplayTitle: target => f.threads.getWorkspaceBindingByTarget(target, "session")?.displayTitle ?? projectedTitle() } : {}),
         getAdmissionJournalBinding: () => sourceKey, getSessionGeneration: () => 1, getCurrentLeaderEpoch: () => callerEpoch,
-        isContextActive: value => value === ctx && callerCurrent, runWorkspaceOperation: operations.run,
+        isContextActive: value => value === ctx && callerCurrent, runWorkspaceOperation,
         hasWorkspaceRestoreAuthority: () => false, hasWorkspaceLiveRebindAuthority: () => true,
         getLiveThreadTargets: () => [f.request.binding.target],
         workspaceRestoreRecipient: { getSessionId: () => "leader-session", getCwd: () => "/leader", getLeaderIdentity: () => undefined,
@@ -3874,7 +3898,7 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
         if (prelaunch) {
           const value = f.store.listLiveRebindings()[0]!;
           const blocked = fault === "prelaunch-peer-registration";
-          const deferred = recipientBusy || fault === "prelaunch-peer-observe-lost" || fault === "prelaunch-peer-legacy";
+          const deferred = recipientBusy || fault === "prelaunch-peer-observe-lost" || teardownProbe || fault === "prelaunch-peer-legacy";
           assert.equal(value.inputRelease, fault === "prelaunch-peer-legacy" ? undefined : blocked ? "held" : "accepted", JSON.stringify(harness.events));
           assert.equal(recipientExecutions, blocked ? 0 : selectedIds.length);
           assert.equal(setters, 1); assert.equal(appends, 1);
@@ -3884,7 +3908,11 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
           assert.deepEqual(f.threads.listProtectedLiveRebindTargets(), fault === "prelaunch-peer-lost" ? [f.request.binding.target] : []);
           assert.deepEqual(source.read().entries.filter(entry => selectedIds.includes(entry.updateId)).map(entry => entry.updateId), blocked ? selectedIds : []);
           assert.equal(recipientRoute.telegramQueueStore.getQueuedItems().length, blocked ? 0 : 1);
-          assert.deepEqual(ledger.read().leases, []); f.assertOtherProfile(); return;
+          if (teardownProbe) {
+            // Let the original pacing timer enter admission, with a clear recipient, before ending its session.
+            recipientRoute.bridgeRuntime.lifecycle.setDispatchPending(false); teardownProbeArmed = true;
+          } else assert.deepEqual(ledger.read().leases, []);
+          f.assertOtherProfile(); return;
         }
         const released = cleanupCase || !!guard || ["normal", "busy", "save-lost", "apply-lost", "release-lost", "payload-projection", "donor-before", "donor-after", "donor-ack",
           "group", "group-busy", "group-release-lost", "group-donor-before", "group-donor-after", "isolation-neighbor", "profile-neighbor"].includes(fault);
@@ -4031,8 +4059,41 @@ for (const fault of ["normal", "busy", "save-lost", "apply-lost", "release-lost"
           }
           }
         }
-      } finally { commandRender.resolve(); commandApi.resolve(); Date.now = originalNow; if (reservation) await reservation.publish(async () => {}); activity.onSessionShutdown(); await delivery.onSessionShutdown();
-        await sourceWorker.stop(); await receiver.stop(); await admission.onSessionShutdown(); }
+      } catch (error) { semanticFailed = true; semanticFailure = error; throw error; }
+      finally {
+        const cleanupErrors: unknown[] = [];
+        const clean = async (operation: () => unknown) => { try { await operation(); } catch (error) { cleanupErrors.push(error); } };
+        cleanupArmed.resolve();
+        if (teardownProbeArmed) await clean(() => cleanupEntered.promise);
+        // Worker/socket shutdown alone does not fence or drain the original routing cleanup timer.
+        callerCurrent = false;
+        commandRender.resolve(); commandApi.resolve(); Date.now = originalNow;
+        const settlement = harness.routeRuntime.waitForRestoreSettlement();
+        let settled = false; void settlement.then(() => { settled = true; }, () => {});
+        if (teardownProbeArmed) await clean(async () => {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.equal(settled, false, "A held native cleanup remains unsettled after session invalidation");
+          assert.equal(activeCleanup, 1); assert.equal(ledger.read().leases.length, 1);
+        });
+        cleanupRelease.resolve();
+        await clean(async () => {
+          await settlement;
+          assert.equal(activeCleanup, 0, "Native cleanup admission must settle before fixture teardown");
+        });
+        const heldReservation = reservation;
+        if (heldReservation) await clean(() => heldReservation.publish(async () => {}));
+        await clean(() => activity.onSessionShutdown()); await clean(() => delivery.onSessionShutdown());
+        await clean(() => sourceWorker.stop()); await clean(() => receiver.stop()); await clean(() => admission.onSessionShutdown());
+        if (cleanupErrors.length) await clean(() => settlement);
+        if (teardownProbeArmed) await clean(() => {
+          assert.deepEqual(ledger.read().leases, []);
+          assert.equal(effects.filter(method => method === "deleteForumTopic").length, 0, "Late cleanup cannot delete after its captured session ends");
+          assert.deepEqual(registration.getTarget(), f.request.target);
+        });
+        if (cleanupErrors.length) throw semanticFailed
+          ? new AggregateError([semanticFailure, ...cleanupErrors], "Routing assertion and fixture teardown failed")
+          : cleanupErrors.length === 1 ? cleanupErrors[0] : new AggregateError(cleanupErrors, "Routing fixture teardown failed");
+      }
     }, "follower", fault.startsWith("cleanup-") || fault.startsWith("profile-") || fault.startsWith("display-") || fault.startsWith("all-peer-"));
   });
 }
@@ -7194,9 +7255,8 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
           const retained = journal.inspectPendingRetention(sourceEntry);
           assert.ok(retained);
           assert.deepEqual(JSON.parse(await readFile(retained.retainedPath, "utf8")).entry.update, update);
-          // With nothing unspent left in the cancelled unbound tab it is deleted like a routing tab; the private original stays.
-          assert.equal(apiCalls.filter(method => method === "deleteForumTopic").length, scenario === "orphan-protected" ? 0 : 1,
-            "A cancelled unbound tab is deleted exactly once unless the journal census still names it");
+          assert.deepEqual(apiCalls.filter(method => method === "closeForumTopic" || method === "deleteForumTopic"), [],
+            "Source cancellation alone cannot delete a tab without composed reader, original and one-shot Workspace authority");
           await click("reroute:1:42");
           await click("reroutecancel:1");
           assert.equal(telegramQueueStore.getQueuedItems().length, 0);
@@ -7213,8 +7273,10 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
   });
 }
 
-for (const runtimeChurn of [false, true]) for (const deferredReceipt of [false, true]) for (const readerMode of ["uncomposed", "supported", "changed", "unsupported-origin", "non-leader", "drain-during-toast", "unknown", "session", "binding", "v1-only", "new-work", "reader-issued", "http-fence", "api-false", "new-epoch", "timer-only", "session-hint", "source-lost", "session-renewed", "session-renewed-clear", "session-issued", "same-session-new"] as const)
-test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authority (runtimeChurn=${runtimeChurn}, deferredReceipt=${deferredReceipt}, readers=${readerMode})`, async () => {
+for (const artifact of ["source", "compiled"] as const) {
+for (const runtimeChurn of [false, true]) for (const deferredReceipt of [false, true]) for (const readerMode of ["uncomposed", "supported", "changed", "unsupported-origin", "non-leader", "drain-during-toast", "unknown", "session", "binding", "v1-only", "new-work", "reader-issued", "http-fence", "api-false", "new-epoch", "timer-only", "session-hint", "source-lost", "session-renewed", "session-renewed-clear", "session-issued", "same-session-new"] as const) {
+if (artifact === "compiled" && (deferredReceipt || (readerMode !== "supported" && readerMode !== "unknown"))) continue;
+test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authority (runtimeChurn=${runtimeChurn}, deferredReceipt=${deferredReceipt}, readers=${readerMode}${artifact === "compiled" ? ", artifact=compiled" : ""})`, async () => {
   await withTopicStore(async (threadStore, path) => {
     const chatId = readerMode === "uncomposed" || readerMode === "unsupported-origin" ? 100 : 7;
     const readerRegistry = Bus.createTelegramBusFollowerRegistry(), readerProtocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "same", capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_ORPHAN_INTENT_READER, ...(readerMode === "v1-only" ? [] : [Bus.TELEGRAM_BUS_CAPABILITY_ORPHAN_CLEANUP_READER])] });
@@ -7262,10 +7324,14 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
     await writeFile(join(directory, "logs.jsonl"), "first event\n");
     let inspections = 0;
     const apiCalls: Array<{ method: string; threadId?: unknown }> = [];
+    const cleanupOutcomes: unknown[] = [];
     let nextChooser = 200;
     let heldOriginal: { path: string; held: string; bytes: Buffer } | undefined;
     const events: string[] = [];
     const harness = createRouteHarness({ threadStore, instanceId: "leader-a", getSessionGeneration: () => sessionGeneration,
+      recordRuntimeEvent(_category, _error, details) {
+        if (details?.phase === "orphan-cancel-cleanup-outcome") cleanupOutcomes.push(details.outcome);
+      },
       getWorkspaceRestoreStore: () => workspace, inspectRestoreSourceAbandonment: id => journal.inspectAbandonedPending(id),
       ...(readerMode !== "uncomposed" ? { captureOrphanIntentReaderCompatibility() { capturedReaders = true; return readerRegistry.captureOrphanIntentReaderCompatibility!(readerProtocol); },
         hasWorkspaceRestoreAuthority: () => readerMode !== "non-leader",
@@ -7298,14 +7364,15 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
           readerRegistry.remove("reader"); readerRegistry.register(reader);
         }
         try { options?.assertAuthority?.(); } catch (error) { nativeFenceRefused = true; throw error; }
-        if (method === "deleteForumTopic" && deferredReceipt && workspace.listTemporaryThreads().some(value => value.cleanupIssued)) {
+        if (method === "deleteForumTopic") {
+          assert.equal(workspace.listTemporaryThreads()[0]?.cleanupIssued, true, "Clear and deferred orphan cleanup both durably spend before transport");
           assert.equal(options?.maxAttempts, 1); assert.equal(options?.retrySafety, "non-idempotent"); assert.equal(typeof options?.assertAuthority, "function");
           assert.ok(ledger.read().leases.some(value => value.operationKind === "workspace.temporary-thread"), "HTTP remains inside fresh profile admission");
-          if (readerMode === "session-renewed" || readerMode === "session-renewed-clear") {
+          if (deferredReceipt && (readerMode === "session-renewed" || readerMode === "session-renewed-clear")) {
             assert.equal(workspace.listTemporaryThreads()[0]?.orphanCancellation?.sessionGeneration, 2);
             assert.equal(workspace.listTemporaryThreads()[0]?.source.updateId, 400);
           }
-          if (readerMode === "new-epoch") {
+          if (deferredReceipt && readerMode === "new-epoch") {
             const frame = workspace.listTemporaryThreads()[0]!;
             assert.equal(frame.executor.leaderEpoch, "2"); assert.equal(frame.orphanCancellation?.executor.leaderEpoch, "1");
           }
@@ -7316,7 +7383,9 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
       },
       async deleteMessage() { if (capturedReaders && readerMode === "changed") { readerRegistry.remove("reader"); readerRegistry.register(reader); } },
     });
-    const { routeRuntime } = harness;
+    const nativeUpdates = artifact === "source" ? Updates : await import("../dist/lib/updates.js") as unknown as typeof Updates;
+    const routeRuntime = artifact === "source" ? harness.routeRuntime :
+      (await import("../dist/lib/routing.js") as unknown as typeof Routing).createTelegramInboundRouteRuntime<TestUpdate, TestMessage, TestCallbackQuery, TestContext, TestModel>(harness.routingDeps);
     if (readerMode === "drain-during-toast") {
       const answer = harness.routingDeps.answerCallbackQuery;
       harness.routingDeps.answerCallbackQuery = async (id, text) => {
@@ -7325,7 +7394,7 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
         await answer(id, text);
       };
     }
-    const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
+    const worker = nativeUpdates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
       journal, getJournalBindingKey: () => bindingKey, hasAuthority: () => true,
       defaultHandle: (input, ctx) => routeRuntime.handleUpdate(input, ctx),
     });
@@ -7349,12 +7418,41 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
       await worker.waitForDrain();
       await click("reroutecancel:1", 200);
       assert.equal(apiCalls.some(call => call.method === "deleteForumTopic"), false, "A second unspent input still needs the tab");
+      assert.ok(harness.events.includes("answer:Routing cancelled"));
+      assert.deepEqual(cleanupOutcomes, [], "Ordinary sibling protection is not an exceptional final-Cancel outcome");
       await click("reroutecancel:2", 201);
       await routeRuntime.waitForRestoreSettlement();
       const deletions = apiCalls.filter(call => call.method === "deleteForumTopic");
-      assert.equal(deletions.length, (deferredReceipt && readerMode !== "drain-during-toast") ? 0 : 1, JSON.stringify(apiCalls) + events.join("|"));
-      if (!deferredReceipt) assert.equal(deletions[0]!.threadId, 99);
-      else {
+      if (["uncomposed", "changed", "non-leader"].includes(readerMode)) {
+        assert.equal(harness.events.filter(event => event === "answer:Routing cancelled; tab cleanup unavailable").length, 1);
+        assert.deepEqual(cleanupOutcomes, [], "A refused intent is reported once on the original tap, without a detached attempt");
+        assert.equal(journal.inspectAbandonedPending(102)?.updateId, 102);
+      }
+      if (readerMode === "supported" || readerMode === "v1-only")
+        assert.deepEqual(cleanupOutcomes, deferredReceipt || readerMode === "v1-only" ? ["retained"] : []);
+      if (readerMode === "unknown" && !deferredReceipt) assert.deepEqual(cleanupOutcomes, ["unconfirmed"]);
+      const clearCleanupRefused = ["uncomposed", "changed", "unsupported-origin", "non-leader", "v1-only"].includes(readerMode);
+      assert.equal(deletions.length, (deferredReceipt && readerMode !== "drain-during-toast") || clearCleanupRefused ? 0 : 1,
+        JSON.stringify(apiCalls) + events.join("|"));
+      if (!deferredReceipt) {
+        if (!clearCleanupRefused) assert.equal(deletions[0]!.threadId, 99);
+        if (readerMode === "unknown") {
+          const originals = [101, 102].map(id => {
+            const proof = journal.inspectAbandonedPending(id)!;
+            return { path: proof.retainedPath, bytes: fs.readFileSync(proof.retainedPath) };
+          });
+          journal.appendBatch([message(400, "/quit")]); worker.signal(); await worker.waitForDrain();
+          nextUpdateId = 401;
+          await click("reroutecancel:3", 202); await routeRuntime.waitForRestoreSettlement();
+          assert.equal(journal.inspectAbandonedPending(400)?.updateId, 400, "The fresh routing source can be cancelled without replaying cleanup");
+          assert.equal(harness.events.filter(event => event === "answer:Routing cancelled; tab removal unconfirmed").length, 1);
+          assert.deepEqual(cleanupOutcomes, ["unconfirmed"], "A new cancel cannot renew or relabel the issued cleanup outcome");
+          for (const original of originals) assert.deepEqual(fs.readFileSync(original.path), original.bytes);
+          assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0);
+          assert.equal(apiCalls.filter(call => call.method === "deleteForumTopic").length, 1,
+            "An issued unknown orphan deletion must remain spent across a fresh input and its final Cancel");
+        }
+      } else {
         assert.ok(receipt);
         const renewBlocked = readerMode === "session-renewed" || readerMode === "same-session-new";
         if (readerMode !== "drain-during-toast" && !renewBlocked) assert.deepEqual(independent.completeQueued([receipt]).removedUpdateIds, [900, 901]);
@@ -7427,14 +7525,20 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
         assert.equal(injected, true); assert.equal(workspace.listTemporaryThreads()[0]?.cleanupIssued, undefined);
         assert.equal(independent.read().entries.find(value => value.updateId === 902)?.queueReceiptId, "late-queue", "New custody is not erased to manufacture clearance");
       }
+      assert.equal(apiCalls.some(call => call.method === "closeForumTopic"), false, "Private orphan deletion cannot depend on unsupported forum closing");
       assert.equal(apiCalls.some(call => call.method === "deleteForumTopic" && call.threadId === 42), false, "A bound tab is never touched");
-      assert.ok(inspections > 0); assert.deepEqual(references.list(), []);
+      assert.equal(inspections > 0, deferredReceipt || !clearCleanupRefused,
+        "Missing origin/reader/leader admission refuses before namespace access; admitted cleanup still requires its census");
+      assert.deepEqual(references.list(), []);
       if (heldOriginal) { const held = heldOriginal; fs.renameSync(held.held, held.path); heldOriginal = undefined; assert.deepEqual(fs.readFileSync(held.path), held.bytes); }
       assert.equal(journal.inspectAbandonedPending(101)?.updateId, 101);
       assert.equal(journal.inspectAbandonedPending(102)?.updateId, 102);
     } finally { sessionGeneration += 1; if (heldOriginal) fs.renameSync(heldOriginal.held, heldOriginal.path); await worker.stop(); }
   });
 });
+
+}
+}
 
 for (const artifact of ["source", "compiled"] as const) for (const scenario of [
   "clear", "queued", "same-id", "crossed-proof", "reader-loss", "session-loss",

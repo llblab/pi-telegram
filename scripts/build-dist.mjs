@@ -20,6 +20,7 @@ import {
   writeSync,
 } from "node:fs";
 import { join, relative } from "node:path";
+import { validateNativeLockDistribution } from "./package-native-lock.mjs";
 
 const DIST_DIR = "dist";
 const checkOnly = process.argv.includes("--check");
@@ -115,6 +116,8 @@ function replaceDist(candidate) {
 }
 
 reportBuild("build-entered", { check: checkOnly });
+// Canonical native code is immutable package data, not part of the replaceable JS output tree.
+validateNativeLockDistribution("native");
 const candidate = mkdtempSync(join(process.cwd(), ".dist-build-"));
 try {
   run(process.execPath, [

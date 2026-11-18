@@ -5262,8 +5262,23 @@ export function createTelegramInboundRouteRuntime(deps) {
     };
     // Reuse the one timer per tab for body-free metadata retries. Future retry timers do not join settlement waits;
     // only their running attempt does. No retry is licensed once a destructive grant may have been issued.
-    const queueTemporaryThreadCleanup = (token, cap, delay, reconcileExpiry, retry = false) => {
+    const queueTemporaryThreadCleanup = (token, cap, delay, reconcileExpiry, retry = false, reportCancellationOutcome = false) => {
         cancelTemporaryThreadCleanup(token);
+        const reportRetained = (retained) => {
+            if (!reportCancellationOutcome || retained?.phase !== "orphan-cancelled" || !cap.isCurrent())
+                return;
+            reportCancellationOutcome = false;
+            try {
+                deps.recordRuntimeEvent?.("routing", retained.cleanupIssued
+                    ? "Routing cancelled; Thread removal is unconfirmed and will not be retried."
+                    : "Routing cancelled; Thread cleanup is blocked by work protection or unavailable proof.", {
+                    phase: "orphan-cancel-cleanup-outcome",
+                    outcome: retained.cleanupIssued ? "unconfirmed" : "retained",
+                    chatId: retained.target?.chatId, threadId: retained.target?.threadId,
+                });
+            }
+            catch { /* Outcome reporting cannot influence cleanup or retry authority. */ }
+        };
         let settle = () => undefined;
         const task = new Promise((resolve) => {
             settle = resolve;
@@ -5279,6 +5294,7 @@ export function createTelegramInboundRouteRuntime(deps) {
                 if (!cap.isCurrent())
                     return;
                 const retained = cap.store.listTemporaryThreads().find(value => value.token === token);
+                reportRetained(retained);
                 // A follower ACK can precede recipient receipt disposal. Reobserve a protected, unissued tab;
                 // elapsed time never grants deletion, and an issued/unknown delete can never enter this path.
                 if (retained?.phase === "created" && !retained.cleanupIssued &&
@@ -5302,6 +5318,7 @@ export function createTelegramInboundRouteRuntime(deps) {
                     const retained = cap.store
                         .listTemporaryThreads()
                         .find((value) => value.token === token);
+                    reportRetained(retained);
                     if (retained && !retained.cleanupIssued && (reconcileExpiry || retained.phase === "orphan-cancelled") && cap.isCurrent())
                         queueTemporaryThreadCleanup(token, cap, 60_000, reconcileExpiry, true);
                 }
@@ -5318,7 +5335,7 @@ export function createTelegramInboundRouteRuntime(deps) {
         void task.finally(() => restoreSettlementTasks.delete(task));
     };
     /** Starts the quiet period for resolved groups or body-free expiry reconciliation; fresh input/authority revokes it. */
-    const scheduleTemporaryThreadCleanup = (target, ctx, reconcileExpiry = false) => {
+    const scheduleTemporaryThreadCleanup = (target, ctx, reconcileExpiry = false, reportCancellationOutcome = false) => {
         const cap = captureTemporaryThreadAuthority(ctx);
         if (!cap ||
             !deps.runWorkspaceOperation ||
@@ -5366,7 +5383,7 @@ export function createTelegramInboundRouteRuntime(deps) {
         const delay = typeof requested === "number" && Number.isFinite(requested)
             ? Math.max(0, requested)
             : 0;
-        queueTemporaryThreadCleanup(entry.token, cap, delay, reconcileExpiry);
+        queueTemporaryThreadCleanup(entry.token, cap, delay, reconcileExpiry, false, reportCancellationOutcome);
     };
     const recordCancelledTemporaryThreadInput = (pending, ctx, isCurrent) => {
         const store = deps.getWorkspaceRestoreStore?.(), target = pending.sourceTarget;
@@ -5929,6 +5946,17 @@ export function createTelegramInboundRouteRuntime(deps) {
         rows.push([{ text: "🔄 Refresh", callback_data: data("refresh") }]);
         await deps.editInteractiveMessage(view.target.chatId, view.messageId, lines.join("\n"), "html", { inline_keyboard: rows });
     };
+    const captureOrphanCancellationReaders = () => {
+        const capture = deps.captureOrphanIntentReaderCompatibility;
+        try {
+            const scope = capture?.();
+            return scope ? () => deps.captureOrphanIntentReaderCompatibility === capture && scope() : undefined;
+        }
+        catch (error) {
+            deps.recordRuntimeEvent?.("routing", error, { phase: "orphan-cancel-reader-capture" });
+            return undefined;
+        }
+    };
     const handleCancellationReview = async (query, ctx) => {
         const matches = (view) => query.message?.message_id === view.messageId &&
             query.message.chat.id === view.target.chatId &&
@@ -6063,6 +6091,7 @@ export function createTelegramInboundRouteRuntime(deps) {
                     activeView.isCurrent() &&
                     recoveryPreview(source, owner, activeView.target.chatId, journalBindingKey) !== undefined;
                 view.running = true;
+                const readers = captureOrphanCancellationReaders();
                 await deps.runWorkspaceOperation({
                     operationId: `workspace-cancellation-recovery:${query.id}`,
                     operationKind: "workspace.recover-unbound-cancellation",
@@ -6086,8 +6115,10 @@ export function createTelegramInboundRouteRuntime(deps) {
                         if (!recordRecoveredRerouteSource(pending, source.original.updateId, source.result))
                             continue;
                         try {
-                            if (await retireCancellationChooser(id, pending, isCurrent))
-                                await deleteCancelledOrphanTab(pending, pending.abandonment, isCurrent);
+                            if (await retireCancellationChooser(id, pending, isCurrent)) {
+                                retainCancelledOrphanIntent(pending, ctx, isCurrent, readers);
+                                scheduleTemporaryThreadCleanup(pending.sourceTarget, ctx);
+                            }
                         }
                         catch (error) {
                             deps.recordRuntimeEvent?.("routing", error, {
@@ -6123,36 +6154,40 @@ export function createTelegramInboundRouteRuntime(deps) {
      */
     const retainCancelledOrphanIntent = (pending, ctx, isCancelCurrent, readers) => {
         const { chatId, threadId } = pending.sourceTarget;
-        if (!readers || threadId === undefined || pending.temporaryThread || isTemporaryTabTarget(pending.sourceTarget) ||
+        if (threadId === undefined || pending.temporaryThread || isTemporaryTabTarget(pending.sourceTarget) ||
             hasPendingRerouteForTarget(pending.sourceTarget) || !pending.abandonment || !isPendingRerouteCancelled(pending))
-            return;
+            return "not-needed";
+        if (!readers)
+            return "unavailable";
         try {
             const leader = deps.hasWorkspaceRestoreAuthority, inspect = deps.inspectRestoreSourceAbandonment, sources = deps.inspectTemporaryThreadSources, getStore = deps.getWorkspaceRestoreStore;
             if (!leader || !inspect || !sources || !getStore)
-                return;
+                return "unavailable";
             const extra = () => isCancelCurrent() && readers() && deps.hasWorkspaceRestoreAuthority === leader && leader() &&
                 deps.inspectRestoreSourceAbandonment === inspect && deps.inspectTemporaryThreadSources === sources && deps.getWorkspaceRestoreStore === getStore &&
                 isCancelCurrent() && readers();
             if (!extra())
-                return;
+                return "unavailable";
             const cap = captureTemporaryThreadAuthority(ctx, extra);
             if (!cap || cap.generation === undefined || !Number.isSafeInteger(cap.generation) || cap.generation < 0 || !cap.isCurrent() ||
                 cap.journalBindingKey !== pending.abandonment.journalBindingKey)
-                return;
+                return "unavailable";
             const input = { journalBindingKey: cap.journalBindingKey, updateIds: Updates.collectTelegramAdmissionSourceUpdateIds(pending.messages) };
             const list = cap.store.listTemporaryThreads;
             const retained = list.call(cap.store).filter(value => value.target?.chatId === chatId && value.target.threadId === threadId);
             const prior = retained.length === 1 ? retained[0] : undefined;
+            if (!cap.isCurrent())
+                return "unavailable";
+            if (prior?.phase === "orphan-cancelled" && prior.cleanupIssued)
+                return "unconfirmed";
             const superseded = prior?.phase === "orphan-cancelled" && !prior.cleanupIssued &&
                 prior.operatorUserId === cap.operatorUserId && prior.executor.instanceId === cap.authority.executor.instanceId &&
                 prior.orphanCancellation && prior.orphanCancellation.sessionGeneration < cap.generation ? prior : undefined;
-            // A clear Cancel keeps its immediate path unless an ended-generation frame still vetoes that target.
-            if (sources({ chatId, threadId }, [input.journalBindingKey], [input])?.length === 0 && !superseded || !cap.isCurrent())
-                return;
+            // Even an immediately clear tab needs durable issuance: a lost delete ACK must survive a later fresh Cancel.
             const register = cap.store.registerCancelledOrphanThread;
             if (typeof register !== "function")
-                return;
-            register.call(cap.store, input, { chatId, threadId }, randomBytes(16).toString("hex"), {
+                return "unavailable";
+            const registered = register.call(cap.store, input, { chatId, threadId }, randomBytes(16).toString("hex"), {
                 ...cap.authority, sessionGeneration: cap.generation,
                 isCurrent: () => cap.isCurrent() && getStore() === cap.store && cap.store.registerCancelledOrphanThread === register &&
                     cap.store.listTemporaryThreads === list && cap.isCurrent(),
@@ -6160,41 +6195,15 @@ export function createTelegramInboundRouteRuntime(deps) {
                 const evidence = inspect(id, key);
                 return evidence?.retainedPath && evidence.originalTarget ? { ...evidence, retainedPath: evidence.retainedPath } : undefined;
             }, superseded);
+            if (registered || (prior?.phase === "orphan-cancelled" && prior.operatorUserId === cap.operatorUserId &&
+                prior.source.journalBindingKey === cap.journalBindingKey && prior.orphanCancellation?.sessionGeneration === cap.generation &&
+                prior.orphanCancellation.executor.instanceId === cap.authority.executor.instanceId))
+                return "admitted";
+            return "unavailable";
         }
         catch (error) {
             deps.recordRuntimeEvent?.("routing", error, { phase: "orphan-cancel-intent-registration", chatId, threadId });
-        }
-    };
-    const deleteCancelledOrphanTab = async (pending, cancellation, isAuthorityCurrent) => {
-        const { chatId, threadId } = pending.sourceTarget;
-        if (threadId === undefined ||
-            pending.temporaryThread ||
-            isTemporaryTabTarget({ chatId, threadId }) ||
-            hasPendingRerouteForTarget({ chatId, threadId }) ||
-            !deps.inspectTemporaryThreadSources)
-            return;
-        const target = { chatId, threadId };
-        try {
-            const own = {
-                journalBindingKey: cancellation.journalBindingKey,
-                updateIds: Updates.collectTelegramAdmissionSourceUpdateIds(pending.messages),
-            };
-            const assertCurrent = () => {
-                if (!isAuthorityCurrent())
-                    throw new Error("Unbound tab cleanup authority changed.");
-            };
-            assertCurrent();
-            if (deps.inspectTemporaryThreadSources(target, [cancellation.journalBindingKey], [own])?.length !== 0)
-                return;
-            assertCurrent();
-            await closeReroutedUnboundTopic(target, pending.chooserMessageId, assertCurrent);
-        }
-        catch (error) {
-            deps.recordRuntimeEvent?.("routing", error, {
-                phase: "unbound-cancel-tab-cleanup",
-                chatId: target.chatId,
-                threadId: target.threadId,
-            });
+            return "unconfirmed";
         }
     };
     const handleUnboundRerouteCancelCallback = async (query, ctx) => {
@@ -6207,17 +6216,7 @@ export function createTelegramInboundRouteRuntime(deps) {
         const cancellation = pending?.abandonment;
         const sources = pending?.messages ?? [];
         const execution = Updates.getTelegramUpdateExecutionFence(query);
-        const captureReaders = deps.captureOrphanIntentReaderCompatibility;
-        let readerScope;
-        if (pending && cancellation && execution) {
-            try {
-                readerScope = captureReaders?.();
-            }
-            catch (error) {
-                deps.recordRuntimeEvent?.("routing", error, { phase: "orphan-cancel-reader-capture" });
-            }
-        }
-        const readers = readerScope ? () => deps.captureOrphanIntentReaderCompatibility === captureReaders && readerScope() : undefined;
+        const readers = pending && cancellation && execution ? captureOrphanCancellationReaders() : undefined;
         const isAuthorityCurrent = () => !!cancellation &&
             execution?.isCurrent() === true &&
             sources.length > 0 &&
@@ -6252,7 +6251,7 @@ export function createTelegramInboundRouteRuntime(deps) {
             return true;
         }
         cancellation.running = true;
-        let closed = false;
+        let cancellationAnswer;
         try {
             await deps.runWorkspaceOperation({
                 operationId: `workspace-reroute-cancel:${query.id}`,
@@ -6280,17 +6279,17 @@ export function createTelegramInboundRouteRuntime(deps) {
                 }
                 if ((await retireCancellationChooser(rerouteId, pending, isCurrent)) &&
                     isAuthorityCurrent()) {
-                    retainCancelledOrphanIntent(pending, ctx, isAuthorityCurrent, readers);
-                    scheduleTemporaryThreadCleanup(pending.sourceTarget, ctx);
-                    closed = true;
+                    const cleanup = retainCancelledOrphanIntent(pending, ctx, isAuthorityCurrent, readers);
+                    scheduleTemporaryThreadCleanup(pending.sourceTarget, ctx, false, cleanup === "admitted");
+                    cancellationAnswer = cleanup === "unavailable" ? "Routing cancelled; tab cleanup unavailable" :
+                        cleanup === "unconfirmed" ? "Routing cancelled; tab removal unconfirmed" : "Routing cancelled";
                 }
             });
-            // Released admission lets the tab cleanup start right after the notice; the toast and All copy go alongside it.
-            if (closed)
+            // Cleanup reacquires profile admission through the existing one-shot runner; callback feedback owns no delete grant.
+            if (cancellationAnswer)
                 await Promise.all([
-                    deps.answerCallbackQuery(query.id, "Routing cancelled"),
+                    deps.answerCallbackQuery(query.id, cancellationAnswer),
                     deleteAllTabCopies(pending),
-                    deleteCancelledOrphanTab(pending, cancellation, isAuthorityCurrent),
                 ]);
         }
         catch (error) {

@@ -46,6 +46,7 @@ Keep each fact in one authoritative layer:
 - `/api/*.ts`: Stable public package membranes documented in `docs/public-api.md`.
 - `/lib/*.ts`: Flat, cohesive runtime domains; package-private unless re-exported through `/api`.
 - `/tests/*.test.ts`: Domain-mirrored suites; `tests/integration.test.ts` owns cross-domain runtime flows.
+- `/native/locks.c`: Single authoritative private N-API kernel-lease source owned by Locks. Qualification wrappers include it rather than forking it; distribution builds reject fixture fault switches. Native compilation belongs to explicit build/CI tooling, never extension startup or installation.
 - `/skills/telegram-bridge`: Stable agent operating protocol for Telegram turns, delivery, actions, Threaded Mode, and diagnosis.
 - `/skills/generated-control-surface`: Optional state-derived, late-bound interface over truthful domain evidence, capabilities, workflows, and choices; it remains renderer-neutral, independent from the bridge skill, and owns no parallel state.
 - `/skills/generative-apps`: Agent operating contract for compiling stable repeated Telegram interaction into deterministic standalone applications or bounded view/controller adapters whose buttons bypass model inference.

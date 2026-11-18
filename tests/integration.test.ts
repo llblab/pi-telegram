@@ -31,6 +31,7 @@ import { fileURLToPath } from "node:url";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
 import { runNodeEval } from "./fixtures/node-eval.ts";
+import { createNativeTestPhaseObserver } from "./fixtures/native-test-phase.ts";
 import { createIntegrationShardSelector } from "./fixtures/shared.ts";
 import * as RoutingFixture from "./fixtures/routing.ts";
 import { withWorkspaceRestoreFixture } from "./fixtures/workspace.ts";
@@ -1553,12 +1554,14 @@ test(`Native Rich feedback keeps literal callback examples inert (${literal})`, 
 });
 for (const boundary of ["omitted", "markup-only", "missing-keyboard", "clone-rich", "clone-keyboard", "changed-rich-content", "drop-rich-callback", "duplicate-cross-carrier", "legacy-ack", "void", "query-loss", "clear", "intervening-view"] as const)
 test(`Native Rich feedback refuses an incomplete or renewed carrier (${boundary})`, async t => {
+  const phase = createNativeTestPhaseObserver(t);
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
   const h = await richFeedbackFixture({ ordinaryCount: 2, ordinaryRichFeedbackParent: boundary === "omitted" ? undefined : true });
   try {
-    const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!, prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false, calls = 0; void prior.handle.result.then(() => { ended = true; });
+    phase.enter("invoke"); const binding = GenerativeApps.getGenerativeAppCallbackBinding(await h.run())!;
+    phase.enter("sdk-open"); const prior = await openLifetimeSdkHead(h.sdk); assert.ok(prior.ok); let ended = false, calls = 0; void prior.handle.result.then(() => { ended = true; });
     const api = ordinaryParentTransport(h, async () => boundary === "legacy-ack" && ++calls === 1 ? true : "edited"), native = BusApi.createTelegramButtonPublicationEditor(api);
-    h.store.bindPublicationEditor!(async (view, guard) => {
+    phase.enter("editor-bind"); h.store.bindPublicationEditor!(async (view, guard) => {
       if (boundary === "void") return;
       if (boundary === "markup-only") return api.editMessageReplyMarkup(42, 201, view.replyMarkup!);
       if (boundary === "missing-keyboard") return native({ ...view, replyMarkup: undefined }, guard);
@@ -1568,12 +1571,14 @@ test(`Native Rich feedback refuses an incomplete or renewed carrier (${boundary}
       if (boundary === "drop-rich-callback") (view.richMessage as { markdown: string }).markdown = view.richMessage!.markdown.replace(/<tg-button-row>[\s\S]*?<\/tg-button-row>/g, "");
       if (boundary === "duplicate-cross-carrier") (view.richMessage as { markdown: string }).markdown += `\n<tg-button-row><tg-button type="callback_data" data="${view.replyMarkup!.inline_keyboard[0]![0]!.callback_data}">Duplicate</tg-button></tg-button-row>\n`;
       await native(view, guard);
-    }); await h.store.waitForPublicationIdle!();
+    }); phase.enter("editor-drain"); await h.store.waitForPublicationIdle!();
     if (boundary === "query-loss") { const id = h.query.id; h.query.id = "lost"; assert.throws(h.dispatch.assertObservedCurrent); h.query.id = id; }
     if (boundary === "clear") h.store.clear!();
+    phase.enter("replacement");
     if (boundary === "intervening-view") await api.editMessageText({ chat_id: 42, message_id: 201, rich_message: { markdown: h.plan.markdown }, reply_markup: h.plan.replyMarkup });
-    const next = ordinaryParentReplacement(h, { binding }); await api.editMessageText(next.body); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
-  } finally { await h.close(); }
+    const next = ordinaryParentReplacement(h, { binding }); await api.editMessageText(next.body);
+    phase.enter("assertions"); t.mock.timers.tick(3_600_000); await Promise.resolve(); assert.equal(ended, false);
+  } finally { phase.enter("cleanup"); await h.close(); phase.complete(); }
 });
 test("Native Rich feedback seals even a projected Rich carrier with zero remaining inline callbacks", async t => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 }); const h = await richFeedbackFixture();
@@ -8078,7 +8083,9 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
               if (pureChild) assert.equal(stores[1].rows.slice(start).filter(value => !value.action.completionGroup).length, 0, "Pure question output never registers a dummy ordinary control");
               const original = deferredOriginal ?? deadlines.map(value => value.expiresAt);
               assert.ok(original.every(value => value > Date.now() + (carrier.endsWith("earlier") ? 0 : 23 * 60 * 60 * 1000)));
+              phase("post-feedback-sdk-entered");
               const next = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "After remote callback", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal });
+              phase("post-feedback-sdk-returned");
               assert.ok(next.ok);
               if (deferredFlow && (carrier.endsWith("admission") || carrier.endsWith("cancelled") || carrier.endsWith("earlier"))) assert.deepEqual(deadlines.map(value => value.expiresAt), deferredOriginal.map(value => Math.min(value, admissionCutoff)), "A later SDK input cannot renew the captured conditional ceiling");
               else if (childFlow && !carrier.endsWith("child-second") && !(deferredFlow && carrier.endsWith("editor")) && carrier !== "app-mixed-feedback-child-pure" && carrier !== "app-mixed-feedback-child-queued" && carrier !== "app-mixed-feedback-child-pure-queued" && !carrier.endsWith("retained")) assert.deepEqual(deadlines.map(value => value.expiresAt), original, "An incomplete carrier, changed source/parent/SDK or unrelated native result cannot qualify a child prefix");
@@ -8097,7 +8104,9 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
                   assert.equal(stores[1].store.resolve(retainedCells[0].callback_data, { id: "remote-text-original-after-drain", data: retainedCells[0].callback_data,
                     message: { message_id: originalMessageId, message_thread_id: 44, chat: { id: 77 } } }), undefined, "The original group is superseded, not retained or reborn from raw text");
                   assert.ok(stores[1].store.resolve(children[0].key), "Fresh native Text questions remain answerable under their own proved parent transition");
+                  phase("retained-text-publication-drain-entered");
                   await stores[1].store.waitForPublicationIdle();
+                  phase("retained-text-publication-drain-returned");
                 }
                 if (rich && (carrier.endsWith("retained") || carrier.endsWith("admission"))) {
                   const original = appRows.find(value => value.key === retainedCells[0].callback_data); assert.ok(original);
@@ -8155,7 +8164,8 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
     "follower-shutdown-entered", "follower-shutdown-returned", "leader-shutdown-entered", "leader-shutdown-returned", "cleanup-entered", "cleanup-returned"];
   assert.deepEqual(phases.map(row => row[1]!).filter(name => required.includes(name)), required, "Original follower fixture phases must cover checks and actual cleanup in order");
   const optional = ["bootstrap-refusal-checked", "first-sdk-checked", "agent-started", "first-carrier-returned", "sdk-successor-returned", "worker-exit-observed",
-    "feedback-entered", "feedback-release-issued", "editor-entered", "callback-toast-observed", "conditional-admission-returned", "editor-queue-returned"];
+    "feedback-entered", "feedback-release-issued", "editor-entered", "callback-toast-observed", "conditional-admission-returned", "editor-queue-returned",
+    "post-feedback-sdk-entered", "post-feedback-sdk-returned", "retained-text-publication-drain-entered", "retained-text-publication-drain-returned"];
   assert.ok(phases.every(row => required.includes(row[1]!) || optional.includes(row[1]!)), "Only finite body-free follower fixture phases may be emitted");
   assert.equal(new Set(phases.map(row => row[1])).size, phases.length);
   assert.equal(new Set(phases.map(row => row[3])).size, 1);
@@ -11476,9 +11486,19 @@ for (const boundary of ["current", "ordinary", "entry-session", "caller", "conte
 
 }
 
+async function prepareRuntimeFixtureColdCutover(agentDir: string): Promise<void> {
+  const prepare = await runNodeEval(`
+    process.argv = [process.execPath, "prepare-cold-cutover.mjs", "--agent-dir", ${JSON.stringify(agentDir)}, "--confirm-all-writers-stopped"];
+    await import(${JSON.stringify(new URL("../scripts/prepare-cold-cutover.mjs", import.meta.url).href)});
+  `);
+  assert.equal(prepare.code, 0, prepare.stdout + prepare.stderr);
+  assert.match(prepare.stdout, /No connection was started/u);
+}
+
 for (const artifact of ["source", "compiled"] as const)
 for (const profile of [undefined, "work"] as const)
-for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "invalid-admission"] as const) {
+for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "invalid-admission",
+  ...(process.arch === "x64" ? ["cutover-envelope" as const] : [])] as const) {
   test(`Production connect resets damaged shared runtime state and becomes leader (${artifact}/${profile ?? "default"}/${damage})`, async () => {
     const sourceExtension = await getRuntimeTelegramExtension();
     const extension = artifact === "source" ? sourceExtension : (await import("../dist/index.js")).default;
@@ -11486,7 +11506,9 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
     const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-reset-")));
     const statePath = Paths.resolveTelegramStatePath(agentDir);
     await mkdir(dirname(statePath), { recursive: true });
-    await writeFile(statePath, damage === "malformed-json" ? "{ damaged" : damage === "nul-envelope" ? Buffer.alloc(706)
+    const legacyGuard = join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction");
+    const retainedOwner = join(legacyGuard, "owner.fixture.json");
+    await writeFile(statePath, damage === "malformed-json" || damage === "cutover-envelope" ? "{ damaged" : damage === "nul-envelope" ? Buffer.alloc(706)
       : JSON.stringify({ version: 2, profiles: { default: damage === "invalid-admission"
         ? { admission: { version: 1, profileKey: "invalid-fixture-key", leases: [] } }
         : { workspace: { version: 99 } } } }), { mode: 0o600 });
@@ -11497,6 +11519,7 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
     const ctx = createRuntimeExtensionContext({ cwd: "/reset-root" });
     ctx.ui.notify = (...args: unknown[]) => { notices.push(String(args[0] ?? "")); };
     let polls = 0, outbound = 0;
+    let releaseHeldPoll: ((value: Response) => void) | undefined;
     const methods: Array<string | undefined> = [];
     const restoreFetch = setTestFetch(async (input, init) => {
       const method = getRuntimeTelegramApiMethod(input);
@@ -11504,13 +11527,25 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
       if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot" });
       if (method === "sendMessage" || method === "sendRichMessage") { outbound++; return createRuntimeTelegramApiResponse({ message_id: 1 }); }
       if (method === "getUpdates" && ++polls === 1) return createRuntimeTelegramApiResponse([]);
-      if (method === "getUpdates") return await new Promise<Response>((_resolve, reject) => {
-        const abort = () => reject(new DOMException("stop", "AbortError"));
+      if (method === "getUpdates") return await new Promise<Response>((resolve, reject) => {
+        const release = (value: Response) => { if (releaseHeldPoll === release) releaseHeldPoll = undefined; resolve(value); };
+        if (damage === "cutover-envelope") releaseHeldPoll = release;
+        const abort = () => {
+          if (releaseHeldPoll === release) releaseHeldPoll = undefined;
+          reject(new DOMException("stop", "AbortError"));
+        };
         if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
       });
       return createRuntimeTelegramApiResponse(true);
     });
     try {
+      if (damage === "cutover-envelope") {
+        await mkdir(legacyGuard, { recursive: true, mode: 0o700 });
+        await writeFile(retainedOwner, "", { mode: 0o600 });
+        await prepareRuntimeFixtureColdCutover(agentDir);
+        assert.equal(await readFile(statePath, "utf8"), "{ damaged", "Cold preparation does not reset the envelope");
+        assert.deepEqual(JSON.parse(await readFile(join(agentDir, "telegram.json"), "utf8")), { ...bot, profiles: { work: bot } });
+      }
       process.env.PI_CODING_AGENT_DIR = agentDir;
       extension(pi);
       await handlers.get("session_start")?.({}, ctx);
@@ -11519,10 +11554,15 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
       const state = Locks.readTelegramRuntimeState(statePath);
       const sections = state.profiles[profile ?? "default"];
       assert.ok(sections?.transport, "the connecting instance owns the fresh envelope");
+      assert.ok(notices.some(notice => notice.startsWith("Telegram bridge connected.")), "The actual command reports its successful connection");
       assert.equal(JSON.stringify(state).includes("damaged") || JSON.stringify(state).includes('"version":99'), false);
       WorkspaceAdmission.assertTelegramConsolidatedAdmissionSection(sections?.admission, profile ?? "default");
       await tools.get("telegram_message")!.execute("fixture-recovered-send", { text: "Recovered outbound fixture", chat_id: 77 });
       assert.equal(outbound, 1, "Actual production outbound delivery succeeds through the recovered admission ledger");
+      if (damage === "cutover-envelope") {
+        assert.equal((await readFile(retainedOwner)).length, 0, "Connect never rewrites the old guard evidence");
+        assert.deepEqual((await readdir(legacyGuard)).sort(), ["kernel-cutover-v1", "owner.fixture.json"]);
+      }
       const readResetEvents = async () => (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8"))
         .split("\n").filter(Boolean).map(line => JSON.parse(line))
         .filter(event => event.kind === "event" && event.details?.phase === "state-reset");
@@ -11547,6 +11587,26 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
       assert.equal(debug.includes(bot.botToken), false);
       await commands.get("telegram-connect")!.handler(profile ?? "", ctx);
       assert.deepEqual(await readResetEvents(), resetEvents, "Debug and a healthy reconnect cannot duplicate or renew the original reset evidence");
+      if (damage === "cutover-envelope") {
+        await waitForCondition(() => releaseHeldPoll !== undefined);
+        const { journalPath } = sections.transport as { journalPath: string };
+        const journal = Journal.createTelegramUpdateJournalStore({ path: journalPath, profileName: profile ?? "default",
+          botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: bot.botToken, botId: bot.botId }) });
+        const beforeCursor = journal.read().acceptedThroughUpdateId, issued = polls;
+        const marker = join(legacyGuard, "kernel-cutover-v1"), displaced = join(agentDir, "fixture-cutover-marker");
+        fs.renameSync(marker, displaced);
+        try {
+          releaseHeldPoll!(createRuntimeTelegramApiResponse([{ update_id: (beforeCursor ?? 100) + 1,
+            message: { message_id: 99, date: Math.floor(Date.now() / 1000), chat: { id: 77, type: "private" }, from: { id: 77 }, text: "Late fixture input" } }]));
+          await waitForAsyncCondition(async () => (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8"))
+            .split("\n").filter(Boolean).map(line => JSON.parse(line))
+            .some(event => event.category === "polling" && event.details?.phase === "loop" && event.message === "Telegram API call authority is unavailable."));
+          await assert.rejects(tools.get("telegram_message")!.execute("fixture-spent-send", { text: "Must not send", chat_id: 77 }));
+          await waitForAsyncCondition(async () => (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")).includes('"phase":"ownership-lost"'));
+          assert.equal(journal.read().acceptedThroughUpdateId, beforeCursor, "A physically returned late response cannot enter the durable journal");
+          assert.equal(polls, issued); assert.equal(outbound, 1);
+        } finally { fs.renameSync(displaced, marker); }
+      }
     } finally {
       await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
       restoreFetch();
@@ -11555,6 +11615,129 @@ for (const damage of ["malformed-json", "nul-envelope", "invalid-workspace", "in
     }
   }, 15000);
 }
+
+if (process.arch === "x64") for (const artifact of ["source", "compiled"] as const)
+for (const profile of [undefined, "work"] as const)
+for (const scenario of ["healthy", "legacy-guard", "missing-barrier", "cancelled", "writer-held"] as const)
+test(`Production cold cutover Connect preserves its exact boundary (${artifact}/${profile ?? "default"}/${scenario})`, async () => {
+  const extension = artifact === "source" ? await getRuntimeTelegramExtension() : (await import("../dist/index.js")).default;
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-cutover-connect-")));
+  const statePath = Paths.resolveTelegramStatePath(agentDir), guard = join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction");
+  const owner = join(guard, "owner.fixture.json"), marker = join(guard, "kernel-cutover-v1");
+  const configPath = join(agentDir, "telegram.json"), historyPath = join(agentDir, "sessions", "fixture", "history.jsonl");
+  const bot = { botToken: "123:cutover-boundary", botId: 123, allowedUserId: 77 };
+  const config = JSON.stringify({ profiles: { default: bot, work: bot } });
+  const history = '{"type":"session","version":3,"id":"fixture-history"}\n';
+  const safeSibling = { runtime: { marker: "keep unrelated healthy continuity" } };
+  const state = scenario === "healthy" ? JSON.stringify({ version: 2, profiles: { sibling: safeSibling } }) : "{ damaged-fixture";
+  const harness = createRuntimePiHarness(), ctx = createRuntimeExtensionContext({ cwd: "/cutover-boundary" });
+  const notices: string[] = [], methods: string[] = [];
+  ctx.ui.notify = (...args: unknown[]) => { notices.push(String(args[0] ?? "")); };
+  let releaseCapability!: () => void, held = false;
+  let connection: Promise<unknown> | undefined, failed = false;
+  let writer: ReturnType<typeof launchProductionRootFixture<{ pid: number }>> | undefined;
+  const capability = new Promise<void>(resolve => { releaseCapability = resolve; });
+  const restoreFetch = setTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input) ?? "unknown";
+    methods.push(method);
+    if (method === "getMe") {
+      if (scenario === "cancelled") { held = true; await capability; }
+      return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: false });
+    }
+    if (method === "getUpdates" && methods.filter(value => value === method).length > 1) return await new Promise<Response>((_resolve, reject) => {
+      const abort = () => reject(new DOMException("stop", "AbortError"));
+      if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+    return createRuntimeTelegramApiResponse(method === "getUpdates" ? [] : true);
+  });
+  const connected = () => notices.some(notice => notice.startsWith("Telegram bridge connected."));
+  try {
+    await mkdir(guard, { recursive: true, mode: 0o700 });
+    await mkdir(dirname(historyPath), { recursive: true });
+    await writeFile(owner, "", { mode: 0o600 }); await writeFile(configPath, config, { mode: 0o600 });
+    await writeFile(historyPath, history, { mode: 0o600 }); await writeFile(statePath, state, { mode: 0o600 });
+    if (scenario !== "legacy-guard") await prepareRuntimeFixtureColdCutover(agentDir);
+    assert.equal(await readFile(statePath, "utf8"), state, "Offline preparation never resets even damaged state");
+    const installed = scenario === "legacy-guard" ? undefined : await readFile(marker);
+    if (scenario === "missing-barrier") fs.renameSync(marker, join(agentDir, "displaced-fixture-marker"));
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    extension(harness.pi);
+    await harness.handlers.get("session_start")?.({}, ctx);
+    if (scenario === "writer-held") {
+      writer = launchProductionRootFixture("cutover-held-writer", `
+        import assert from "node:assert/strict";
+        import { loadTelegramFileTransactionKernelBackend } from ${JSON.stringify(new URL("../dist/lib/locks.js", import.meta.url).href)};
+        const backend = loadTelegramFileTransactionKernelBackend();
+        const lease = backend.tryAcquire(${JSON.stringify(join(agentDir, "telegram-kernel-cutover", "state.lock"))});
+        assert.ok(lease);
+        process.on("message", ({ id, command }) => {
+          assert.equal(command, "stop"); assert.equal(backend.release(lease), true);
+          process.send({ id, result: { pid: process.pid } }, () => process.disconnect());
+        });
+        process.send({ id: 0, result: { pid: process.pid } });
+      `);
+      assert.equal((await writer.ready).pid, writer.pid);
+    }
+    connection = harness.commands.get("telegram-connect")!.handler(profile ?? "", ctx);
+    if (scenario === "cancelled") {
+      await waitForCondition(() => held);
+      assert.equal(connected(), false, "An issued but unsettled capability check is not transport readiness");
+      assert.equal(methods.includes("getUpdates"), false);
+      await harness.commands.get("telegram-disconnect")!.handler("", ctx);
+      releaseCapability();
+    }
+    await connection;
+    if (scenario === "writer-held") {
+      assert.equal(connected(), false); assert.equal(methods.includes("getUpdates"), false);
+      assert.equal(await readFile(statePath, "utf8"), state, "A still-held native writer cannot be bypassed by explicit Connect");
+      assert.ok((await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")).includes("kernel transaction busy during acquire"));
+      assert.equal(writer!.diagnostics().closed, false);
+      await writer!.stop(); assert.throws(() => process.kill(writer!.pid!, 0), { code: "ESRCH" });
+      connection = harness.commands.get("telegram-connect")!.handler(profile ?? "", ctx);
+      await connection;
+    }
+    if (scenario === "healthy" || scenario === "writer-held") {
+      await waitForCondition(() => methods.includes("getUpdates"));
+      assert.equal(connected(), true);
+      const current = Locks.readTelegramRuntimeState(statePath);
+      if (scenario === "healthy") assert.deepEqual(current.profiles.sibling, safeSibling);
+      assert.ok(current.profiles[profile ?? "default"]?.transport);
+    } else {
+      assert.equal(connected(), false);
+      assert.equal(methods.includes("getUpdates"), false);
+      assert.equal(methods.some(method => method === "createForumTopic" || method === "deleteForumTopic" || method === "sendMessage"), false);
+      if (scenario !== "cancelled") {
+        assert.ok(notices.some(notice => /Connection blocked|Telegram connection failed/u.test(notice)), notices.join("\n"));
+        assert.equal(await readFile(statePath, "utf8"), state, "Unsafe or incomplete preparation grants no reset");
+      }
+    }
+    const log = await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8");
+    const resets = log.split("\n").filter(line => line.includes("Damaged Telegram runtime state was reset; previous runtime continuity was discarded."));
+    assert.equal(resets.length, scenario === "cancelled" || scenario === "writer-held" ? 1 : 0,
+      "Only the admitted damaged state is reset; completion remains separate from reset");
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), JSON.parse(config));
+    assert.equal(await readFile(historyPath, "utf8"), history);
+    assert.equal((await readFile(owner)).length, 0);
+    if (scenario === "legacy-guard" || scenario === "missing-barrier") assert.equal(fs.existsSync(marker), false);
+    else assert.deepEqual(await readFile(marker), installed);
+  } catch (error) { failed = true; throw error; }
+  finally {
+    releaseCapability(); await connection?.catch(() => undefined);
+    const cleanupErrors: unknown[] = [];
+    try { await writer?.stop(); } catch (error) { cleanupErrors.push(error); }
+    try { await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx); }
+    catch (error) { cleanupErrors.push(error); }
+    restoreFetch();
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    if (!writer || writer.diagnostics().closed) {
+      try { await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
+      catch (error) { cleanupErrors.push(error); }
+    }
+    if (cleanupErrors.length && !failed) throw new AggregateError(cleanupErrors, "Cold-cutover fixture cleanup failed");
+    for (const error of cleanupErrors) console.error("Secondary cold-cutover fixture cleanup failure:", error);
+  }
+}, 15000);
 
 for (const artifact of ["source", "compiled"] as const)
 for (const origin of ["healthy", "local", "leader"] as const)
@@ -12498,10 +12681,10 @@ test(`Production dead queue-owner cleanup retains native process and receipt pro
 
 for (const artifact of ["source", "compiled"] as const)
 for (const profile of [undefined, "work"] as const)
-for (const phase of ["early-threaded", "simultaneous-threaded", "early-classic", "cancel-before-ready-threaded", "cancel-before-ready-classic", "held-ack-threaded", "cancel-after-issue-threaded", "simultaneous-malformed-threaded", "simultaneous-invalid-workspace-threaded", "lost-ack-threaded", "held-receiver-threaded", "cancel-receiver-threaded", "silent-ack-timeout-threaded"] as const)
+for (const phase of ["early-threaded", "simultaneous-threaded", "early-classic", "cancel-before-ready-threaded", "cancel-before-ready-classic", "held-ack-threaded", "cancel-after-issue-threaded", "simultaneous-malformed-threaded", "simultaneous-invalid-workspace-threaded", "lost-ack-threaded", "held-receiver-threaded", "cancel-receiver-threaded", "silent-ack-timeout-threaded", "simultaneous-former-roles-threaded",
+  ...(process.arch === "x64" ? ["simultaneous-cutover-threaded" as const] : [])] as const)
 test(`Production separate OS startup converges through original admission (${artifact}/${profile ?? "default"}/${phase})`, async () => {
-  const childRun = async (role: "first" | "second", agentDir: string) => {
-    const { join } = await import("node:path");
+  const childRun = async (role: "first" | "second" | "successor", agentDir: string) => {
     const checkpoint = (stage: string) => process.send?.({ fixtureCheckpoint: stage, pid: process.pid });
     let registrationPending = false, registrationSocket: import("node:net").Socket | undefined, lostSockets = 0, registrationFailures = 0, nativeTimeouts = 0, replyTimeoutMs: number | undefined, replyElapsedMs: number | undefined;
     if (phase === "lost-ack-threaded") {
@@ -12611,6 +12794,25 @@ test(`Production separate OS startup converges through original admission (${art
       localRegistration = state;
       return state;
     } } });
+    let pendingCancel: { updateId: number; complete: () => void } | undefined;
+    let drainCancelCleanup: (() => Promise<void>) | undefined;
+    let completedCancel: number | undefined, drainedCancel: number | undefined;
+    if (role === "successor") {
+      const routeUrl = new URL(artifact === "source" ? "./lib/routing.ts" : "./dist/lib/routing.js", import.meta.url);
+      const RouteModel: typeof import("../lib/routing.ts") = await import(routeUrl.href);
+      mock.module(routeUrl.href, { namedExports: { ...RouteModel, createTelegramInboundRouteRuntime(...args: Parameters<typeof RouteModel.createTelegramInboundRouteRuntime>) {
+        const runtime = RouteModel.createTelegramInboundRouteRuntime(...args), observe = runtime.onUpdateCompleted;
+        assert.equal(drainCancelCleanup, undefined);
+        drainCancelCleanup = runtime.waitForRestoreSettlement;
+        runtime.onUpdateCompleted = (updateId, ctx, key) => {
+          observe(updateId, ctx, key);
+          if (pendingCancel?.updateId !== updateId) return;
+          completedCancel = updateId;
+          pendingCancel.complete();
+        };
+        return runtime;
+      } } });
+    }
     checkpoint("root-import");
     const extension = (await import(artifact === "source" ? "./index.ts" : "./dist/index.js")).default;
     checkpoint("root-import-complete");
@@ -12618,17 +12820,24 @@ test(`Production separate OS startup converges through original admission (${art
     const notices: string[] = [], publications: Array<{ text: string; target: { chatId: unknown; threadId: unknown } }> = [];
     let connectCalls = 0, connectHandlerEntries = 0, connectSettled = false, capabilityEntered = false, capabilityReturned = false;
     let polls = 0, activePollers = 0, maxPollers = 0, creations = 0, deletions = 0, takeovers = 0;
+    const choosers: Array<{ threadId: number; messageId: number; cancel: string }> = [];
+    const cancelled: string[] = [], deletedTargets: number[] = [];
+    let deliverPoll: ((update: unknown) => void) | undefined, nextUpdateId = 1000;
     let releaseCapability!: () => void, releaseStart!: () => void;
     const capability = new Promise<void>(resolve => { releaseCapability = resolve; }), start = new Promise<void>(resolve => { releaseStart = resolve; });
     const statePath = Paths.resolveTelegramStatePath(agentDir), name = profile ?? "default";
     // Observe under the real shared writer guard; peer publication must not race this fixture's strict read.
-    const stats = () => LockModel.withTelegramFileTransaction(join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction"), () => {
+    const stateAccess = phase === "simultaneous-cutover-threaded" ? LockModel.createTelegramRuntimeStateAccess(agentDir).transact : LockModel.withTelegramRuntimeStateTransaction;
+    const stats = () => stateAccess(statePath, () => {
       const state = LockModel.readTelegramRuntimeState(statePath).profiles[name];
-      const workspace = state?.workspace as { workspaceBindings?: Array<{ cwd: string; bindingKey: string; slot?: string; target: { chatId: number; threadId?: number } }> } | undefined;
+      const workspace = state?.workspace as Threads.TelegramTopicTargetFile | undefined;
       const binding = workspace?.workspaceBindings?.find(row => row.cwd === ctx.cwd);
+      const cleanupTargets = workspace?.workspaceRestore?.temporaryThreads?.filter(row => row.phase === "orphan-cancelled").map(row => row.target?.threadId) ?? [];
       return { pid: process.pid, connectCalls, connectHandlerEntries, connectSettled, capabilityEntered, capabilityReturned, pendingObservations, registrationIssues, registrationAcks, cancelledStarts, preparedAcks, releasedAcks, resets, registrationFailures, lostSockets, nativeTimeouts, replyTimeoutMs, replyElapsedMs, receiverEntered, receiverReturned,
         localRegistered: localRegistration?.isRegistered() ?? false, localTarget: localRegistration?.getTarget(), everRegistered,
         registrationPids, notices, publications, polls, activePollers, maxPollers, creations, deletions, takeovers,
+        choosers, cancelled, deletedTargets, cleanupTargets, canInject: deliverPoll !== undefined,
+        pendingCancelId: pendingCancel?.updateId, completedCancel, drainedCancel,
         ownerPid: (state?.transport as Locks.TelegramLockEntry | undefined)?.pid, ownerEpoch: (state?.transport as Locks.TelegramLockEntry | undefined)?.leaderEpoch,
         target: binding?.target, bindingKey: binding?.bindingKey, slot: binding?.slot };
     });
@@ -12641,25 +12850,46 @@ test(`Production separate OS startup converges through original admission (${art
         capabilityReturned = true;
         return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: !phase.endsWith("classic") });
       }
-      if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: 100 + ++creations, name: "Fixture" });
-      if (method === "deleteForumTopic") { deletions++; return createRuntimeTelegramApiResponse(true); }
+      if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: (role === "successor" ? 200 : 100) + ++creations, name: "Fixture" });
+      if (method === "deleteForumTopic") {
+        const target = Number(payload?.message_thread_id);
+        deletions++; deletedTargets.push(target);
+        if (role === "successor" && target === 299)
+          return new Response(JSON.stringify({ ok: false, error_code: 503, description: "fixture response unavailable" }), { status: 503 });
+        return createRuntimeTelegramApiResponse(true);
+      }
       if (method === "getUpdates") {
         polls++;
         if (Number(payload?.timeout ?? 0) === 0) return createRuntimeTelegramApiResponse([]);
         activePollers++; maxPollers = Math.max(maxPollers, activePollers);
-        return await new Promise<Response>((_resolve, reject) => {
-          const abort = () => { activePollers--; reject(new DOMException("fixture stop", "AbortError")); };
-          if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+        return await new Promise<Response>((resolve, reject) => {
+          const abort = () => { deliverPoll = undefined; activePollers--; reject(new DOMException("fixture stop", "AbortError")); };
+          if (init?.signal?.aborted) { abort(); return; }
+          init?.signal?.addEventListener("abort", abort, { once: true });
+          if (role === "successor") deliverPoll = update => {
+            deliverPoll = undefined; activePollers--; init?.signal?.removeEventListener("abort", abort);
+            resolve(createRuntimeTelegramApiResponse([update]));
+          };
         });
       }
       if (method === "sendMessage" || method === "sendRichMessage") {
         const text = JSON.stringify(payload);
+        if (role === "successor") {
+          const cancel = text.match(/reroutecancel:[a-z0-9]+/u)?.[0];
+          if (cancel) {
+            const messageId = 600 + choosers.length, threadId = Number(payload?.message_thread_id);
+            choosers.push({ cancel, messageId, threadId });
+            return createRuntimeTelegramApiResponse({ message_id: messageId, chat: { id: 77, type: "private" }, message_thread_id: threadId });
+          }
+        }
         if (text.includes("os-startup-output") || text.includes("os-startup-probe")) {
           assert.equal(stats().ownerPid, process.pid, "Only the actual native transport owner performs HTTP");
           publications.push({ text, target: { chatId: payload?.chat_id, threadId: payload?.message_thread_id } });
         }
         return createRuntimeTelegramApiResponse({ message_id: 500, chat: { id: 77, type: "private" }, message_thread_id: payload?.message_thread_id });
       }
+      if (role === "successor" && method === "answerCallbackQuery") { cancelled.push(String(payload?.text ?? "")); return createRuntimeTelegramApiResponse(true); }
+      if (role === "successor" && ["editMessageText", "editMessageReplyMarkup", "deleteMessage"].includes(method)) return createRuntimeTelegramApiResponse(true);
       if (["deleteWebhook", "setMyCommands", "editForumTopic", "sendChatAction"].includes(method)) return createRuntimeTelegramApiResponse(true);
       throw new Error(`Unexpected startup method ${method}`);
     });
@@ -12673,6 +12903,34 @@ test(`Production separate OS startup converges through original admission (${art
         return stats();
       }
       if (command === "stats") return stats();
+      if (role === "successor" && command === "debug") {
+        await harness.commands.get("telegram-status")!.handler("--debug", ctx);
+        return stats();
+      }
+      if (role === "successor" && /^(arrive|cancel):\d+$/u.test(command)) {
+        const [action, parameter] = command.split(":");
+        assert.ok(deliverPoll, "Use the actual pending Bot API poll");
+        const update_id = nextUpdateId++, from = { id: 77, first_name: "Fixture", is_bot: false }, chat = { id: 77, type: "private" }, date = Math.floor(Date.now() / 1000);
+        if (action === "arrive") deliverPoll({ update_id, message: { message_id: update_id, message_thread_id: Number(parameter), chat, from, date, text: `Fixture routing ${update_id}` } });
+        else {
+          const chooser = choosers.find(value => value.messageId === Number(parameter)); assert.ok(chooser);
+          assert.ok(!pendingCancel && drainCancelCleanup);
+          const completed = new Promise<void>(complete => { pendingCancel = { updateId: update_id, complete }; });
+          const checkpointCancel = chooser.threadId === 299;
+          try {
+            if (checkpointCancel) checkpoint("ambiguous-cancel-released-to-poller");
+            deliverPoll({ update_id, callback_query: { id: `cancel-${update_id}`, from, data: chooser.cancel,
+              message: { message_id: chooser.messageId, message_thread_id: chooser.threadId, chat, date } } });
+            // Poll response release is not semantic completion. Join the real journal callback ACK before joining its cleanup.
+            await completed;
+            if (checkpointCancel) checkpoint("ambiguous-cancel-journal-completed");
+            await drainCancelCleanup();
+            if (checkpointCancel) checkpoint("ambiguous-cancel-cleanup-drained");
+            drainedCancel = update_id;
+          } finally { pendingCancel = undefined; }
+        }
+        return { updateId: update_id };
+      }
       if (command === "disconnect") { await harness.commands.get("telegram-disconnect")!.handler("", ctx); return stats(); }
       if (command === "release") { releaseCapability(); releaseStart(); return { pid: process.pid, released: true }; }
       if (command === "release-ack") { releaseRegistrationAck(); return stats(); }
@@ -12721,11 +12979,24 @@ test(`Production separate OS startup converges through original admission (${art
   type Stats = { pid: number; connectCalls: number; connectHandlerEntries: number; connectSettled: boolean; capabilityEntered: boolean; capabilityReturned: boolean; pendingObservations: number;
     registrationIssues: number; registrationAcks: number; cancelledStarts: number; preparedAcks: number; releasedAcks: number; resets: number; registrationFailures: number; lostSockets: number; nativeTimeouts: number; replyTimeoutMs?: number; replyElapsedMs?: number; receiverEntered: number; receiverReturned: number; receiverReachable?: boolean; receiverAliasExists?: boolean; localRegistered: boolean; localTarget?: { chatId: number; threadId?: number }; everRegistered: boolean;
     registrationPids: number[]; notices: string[]; publications: Array<{ text: string; target: { chatId: number; threadId?: number } }>;
-    polls: number; activePollers: number; maxPollers: number; creations: number; deletions: number; takeovers: number; ownerPid?: number; ownerEpoch?: string; target?: { chatId: number; threadId?: number }; bindingKey?: string; slot?: string };
+    polls: number; activePollers: number; maxPollers: number; creations: number; deletions: number; takeovers: number; ownerPid?: number; ownerEpoch?: string; target?: { chatId: number; threadId?: number }; bindingKey?: string; slot?: string;
+    choosers: Array<{ threadId: number; messageId: number; cancel: string }>; cancelled: string[]; deletedTargets: number[]; cleanupTargets: number[]; canInject: boolean; updateId: number;
+    pendingCancelId?: number; completedCancel?: number; drainedCancel?: number };
   const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-os-startup-")));
   const bot = { botToken: "123:os-startup", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } };
   await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
-  const launch = (role: "first" | "second") => launchProductionRootFixture<Stats>(role, `
+  const cutoverGuard = phase === "simultaneous-cutover-threaded" ? join(Paths.resolveTelegramRuntimeDir(agentDir), "state.json.transaction") : undefined;
+  const cutoverOwner = cutoverGuard ? join(cutoverGuard, "owner.fixture.json") : undefined;
+  if (cutoverGuard && cutoverOwner) {
+    try {
+      await mkdir(cutoverGuard, { recursive: true, mode: 0o700 });
+      await writeFile(cutoverOwner, "", { mode: 0o600 });
+      await prepareRuntimeFixtureColdCutover(agentDir);
+    } catch (error) {
+      await rm(agentDir, { recursive: true, force: true }); throw error;
+    }
+  }
+  const launch = (role: "first" | "second" | "successor") => launchProductionRootFixture<Stats>(role, `
     import assert from "node:assert/strict";
     import { mock } from "node:test";
     import * as Paths from "./lib/paths.ts";
@@ -12741,8 +13012,9 @@ test(`Production separate OS startup converges through original admission (${art
     const setTestFetch = ${setTestFetch.toString()};
     await (${childRun.toString()})(${JSON.stringify(role)}, ${JSON.stringify(agentDir)});
   `, phase === "silent-ack-timeout-threaded" ? 45000 : 20000);
-  const first = launch("first"), second = launch("second");
+  const first = launch("first"), second = launch("second"), roots = [first, second];
   const connections: Promise<Stats>[] = [];
+  let formerRoleSuccessor: ReturnType<typeof launch> | undefined, formerRoleObservation: Stats | undefined;
   let originalOwner: Pick<Stats, "ownerPid" | "ownerEpoch"> | undefined;
   let issuedBinding: Pick<Stats, "target" | "bindingKey" | "slot"> | undefined;
   const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
@@ -12770,10 +13042,10 @@ test(`Production separate OS startup converges through original admission (${art
       await waitForAsyncCondition(async () => (await first.request("stats")).connectCalls === 1 && (await second.request("stats")).connectCalls === 1);
       const queued = [await first.request("stats"), await second.request("stats")];
       assert.ok(queued.every(row => !row.connectSettled && row.connectHandlerEntries === 0), "Both commands are admitted, but neither native handler has entered before the synchronized release");
-      if (phase !== "simultaneous-threaded") {
+      if (phase !== "simultaneous-threaded" && phase !== "simultaneous-former-roles-threaded") {
         const statePath = Paths.resolveTelegramStatePath(agentDir);
         await mkdir(dirname(statePath), { recursive: true });
-        const damaged = phase === "simultaneous-malformed-threaded" ? "{ damaged-os-startup" : JSON.stringify({ version: 2, profiles: {
+        const damaged = phase === "simultaneous-malformed-threaded" || cutoverGuard ? "{ damaged-os-startup" : JSON.stringify({ version: 2, profiles: {
           default: { workspace: { version: 99 } }, sibling: { runtime: { marker: "fixture-approved-reset-loss" } },
         } });
         await writeFile(statePath, damaged, { mode: 0o600 });
@@ -12878,8 +13150,13 @@ test(`Production separate OS startup converges through original admission (${art
     assert.equal(leader.activePollers, 1); assert.equal(leader.maxPollers, 1);
     assert.equal(follower.polls, 0); assert.equal(follower.activePollers, 0); assert.equal(follower.creations, 0);
     assert.ok(states.every(row => row.connectCalls === 1 && row.connectHandlerEntries === 1 && row.connectSettled)); assert.equal(leader.deletions + follower.deletions, 0);
-    const damagedStart = phase === "simultaneous-malformed-threaded" || phase === "simultaneous-invalid-workspace-threaded";
+    const damagedStart = phase === "simultaneous-malformed-threaded" || phase === "simultaneous-invalid-workspace-threaded" || cutoverGuard !== undefined;
     assert.equal(leader.resets + follower.resets, damagedStart ? 1 : 0, "Exactly one positively returned native reset for damage; healthy/canceled/issued controls never reset");
+    if (cutoverGuard && cutoverOwner) {
+      assert.equal((await readFile(cutoverOwner)).length, 0);
+      assert.deepEqual((await readdir(cutoverGuard)).sort(), ["kernel-cutover-v1", "owner.fixture.json"]);
+      assert.ok(leader.notices.some(notice => notice.startsWith("Telegram bridge connected.")));
+    }
     if (damagedStart) {
       const state = Locks.readTelegramRuntimeState(Paths.resolveTelegramStatePath(agentDir));
       assert.equal(state.profiles.sibling, undefined, "Only the documented approved whole-envelope reset discards sibling continuity");
@@ -12941,6 +13218,87 @@ test(`Production separate OS startup converges through original admission (${art
       const sent = outputs.filter(row => row.text.includes(`os-startup-output-${role}`));
       assert.equal(sent.length, 1); assert.deepEqual(sent[0]!.target, states[index]!.target ?? { chatId: 77 });
     }
+    if (phase === "simultaneous-former-roles-threaded") {
+      stage = "former-roles-native-exit";
+      const formerTargets = [leader.target!.threadId!, follower.target!.threadId!];
+      const oldLeader = leader.pid === first.pid ? first : second, oldFollower = follower.pid === first.pid ? first : second;
+      await oldFollower.stop(); await oldLeader.stop();
+      for (const root of [oldLeader, oldFollower]) {
+        assert.equal(root.diagnostics().closed, true);
+        assert.throws(() => process.kill(root.pid!, 0), { code: "ESRCH" });
+      }
+      const statePath = Paths.resolveTelegramStatePath(agentDir), selected = profile ?? "default";
+      // Model the reported unbound layout, not a deletion or a proposed way to detach active tabs.
+      // Keep both former processes' real journals and every non-Workspace section untouched.
+      Locks.mutateTelegramRuntimeStateSection(statePath, selected, "workspace", current => {
+        const bindings = Threads.parseTelegramWorkspaceStateSection(current, selected)?.workspaceBindings ?? [];
+        assert.deepEqual(bindings.map(value => value.target.threadId).sort(), [...formerTargets].sort());
+        return { value: undefined, result: undefined };
+      }, { isCurrent: () => oldLeader.diagnostics().closed && oldFollower.diagnostics().closed });
+      stage = "former-roles-successor";
+      const successor = formerRoleSuccessor = launch("successor"); roots.push(successor);
+      await successor.ready;
+      const online = successor.request("connect"); void online.catch(() => undefined);
+      await successor.request("release"); await online;
+      const inspect = async () => formerRoleObservation = await successor.request("stats");
+      await waitForAsyncCondition(async () => (await inspect()).canInject);
+      const retainedBinding = (await inspect()).target;
+      assert.ok(retainedBinding?.threadId && !formerTargets.includes(retainedBinding.threadId));
+      const state = Locks.readTelegramRuntimeState(statePath);
+      const journalPath = Locks.readTelegramLockJournalPath(state.profiles[selected]?.transport);
+      assert.ok(journalPath);
+      const journal = Journal.createTelegramUpdateJournalStore({ path: journalPath, profileName: selected,
+        botIdentity: Journal.createTelegramUpdateJournalBotIdentity(bot) });
+      const inject = async (command: string) => {
+        await waitForAsyncCondition(async () => (await inspect()).canInject);
+        return (await successor.request(command)).updateId;
+      };
+      for (const [index, target] of formerTargets.entries()) {
+        stage = index === 0 ? "former-leader-last-cancel" : "former-follower-last-cancel";
+        const firstId = await inject(`arrive:${target}`), secondId = await inject(`arrive:${target}`);
+        await waitForAsyncCondition(async () => (await inspect()).choosers.filter(value => value.threadId === target).length === 2);
+        const [one, two] = (await inspect()).choosers.filter(value => value.threadId === target);
+        const firstCancel = await inject(`cancel:${one!.messageId}`), firstSettled = await inspect();
+        assert.equal(firstSettled.completedCancel, firstCancel); assert.equal(firstSettled.drainedCancel, firstCancel);
+        assert.equal(firstSettled.cancelled.length, index * 2 + 1);
+        assert.equal(journal.inspectAbandonedPending(firstId)?.updateId, firstId);
+        assert.equal(journal.inspectAbandonedPending(secondId), undefined);
+        assert.deepEqual(firstSettled.deletedTargets, formerTargets.slice(0, index), "Another unspent input still needs this exact tab");
+        const finalCancel = await inject(`cancel:${two!.messageId}`), settled = await inspect();
+        assert.equal(settled.completedCancel, finalCancel); assert.equal(settled.drainedCancel, finalCancel);
+        assert.equal(settled.cleanupTargets.includes(target), false);
+        assert.deepEqual(settled.deletedTargets, formerTargets.slice(0, index + 1));
+        assert.deepEqual(settled.cancelled, Array<string>(2 * (index + 1)).fill("Routing cancelled"));
+        for (const id of [firstId, secondId]) {
+          const retained = journal.inspectAbandonedPending(id);
+          assert.equal(retained?.updateId, id);
+          const original = JSON.parse(await readFile(retained!.retainedPath, "utf8")).entry.update;
+          assert.deepEqual([original.update_id, original.message.message_thread_id, original.message.text], [id, target, `Fixture routing ${id}`]);
+        }
+        assert.deepEqual(settled.target, retainedBinding, "A genuinely bound workspace tab is never the cleanup target");
+      }
+      stage = "issued-removal-unconfirmed";
+      const unknownId = await inject("arrive:299");
+      await waitForAsyncCondition(async () => (await inspect()).choosers.some(value => value.threadId === 299));
+      const unknown = (await inspect()).choosers.find(value => value.threadId === 299)!;
+      const unknownCancel = await inject(`cancel:${unknown.messageId}`);
+      const warning = "Routing cancelled; Thread removal is unconfirmed and will not be retried.";
+      const debug = formerRoleObservation = await successor.request("debug");
+      assert.equal(debug.completedCancel, unknownCancel); assert.equal(debug.drainedCancel, unknownCancel);
+      assert.ok((await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")).includes(warning));
+      assert.ok(debug.notices.at(-1)?.includes(warning), "The actual status surface reports the exceptional outcome");
+      assert.deepEqual(debug.deletedTargets, [...formerTargets, 299]);
+      assert.ok(debug.cleanupTargets.includes(299), "Ambiguous removal retains its one-shot frame");
+      const freshId = await inject("arrive:299");
+      await waitForAsyncCondition(async () => (await inspect()).choosers.filter(value => value.threadId === 299).length === 2);
+      const fresh = (await inspect()).choosers.filter(value => value.threadId === 299)[1]!;
+      const freshCancel = await inject(`cancel:${fresh.messageId}`), afterFresh = await inspect();
+      assert.equal(afterFresh.completedCancel, freshCancel); assert.equal(afterFresh.drainedCancel, freshCancel);
+      assert.equal(afterFresh.cancelled.at(-1), "Routing cancelled; tab removal unconfirmed");
+      assert.deepEqual(afterFresh.deletedTargets, [...formerTargets, 299], "A later Cancel does not reissue the old removal");
+      assert.equal(journal.inspectAbandonedPending(unknownId)?.updateId, unknownId);
+      assert.equal(journal.inspectAbandonedPending(freshId)?.updateId, freshId);
+    }
   } catch (error) { failed = true; primaryFailure = error; throw error; }
   finally {
     const diagnosticFailures: PromiseRejectedResult[] = [];
@@ -12955,7 +13313,7 @@ test(`Production separate OS startup converges through original admission (${art
         const evidence = { version: 1, artifact, profile: profile ?? "default", phase, stage, failed,
           failure: primaryFailure instanceof Error ? { name: primaryFailure.name, message: primaryFailure.message, stack: primaryFailure.stack } : String(primaryFailure),
           connectResults, startupObservation, publicationObservation, originalOwner, issuedBinding,
-          first: first.diagnostics(), second: second.diagnostics(), runtimeLog };
+          first: first.diagnostics(), second: second.diagnostics(), formerRoleObservation, formerRoleSuccessor: formerRoleSuccessor?.diagnostics(), runtimeLog };
         await mkdir(evidenceDir, { recursive: true });
         await writeFile(join(evidenceDir, `startup-${artifact}-${profile ?? "default"}-${phase}.json`),
           JSON.stringify(evidence, null, 2).replaceAll("123:os-startup", "<fixture-token>") + "\n", { flag: "wx" });
@@ -12963,8 +13321,8 @@ test(`Production separate OS startup converges through original admission (${art
     }
     await Promise.allSettled([first.request("release"), second.request("release"), first.request("release-ack"), second.request("release-receiver")]);
     await Promise.allSettled(connections);
-    const stopped = await Promise.allSettled([first, second].map(root => root.stop().finally(() => root.waitForExit())));
-    const removed = first.diagnostics().closed && second.diagnostics().closed
+    const stopped = await Promise.allSettled(roots.map(root => root.stop().finally(() => root.waitForExit())));
+    const removed = roots.every(root => root.diagnostics().closed)
       ? await Promise.allSettled([rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })]) : [];
     for (const result of [...diagnosticFailures, ...stopped, ...removed]) if (result.status === "rejected") {
       if (!failed) throw result.reason;
@@ -12979,7 +13337,8 @@ for (const loss of [false, true, "root", "damaged"] as const)
 for (const refreshBoundary of loss === "damaged" ? [undefined, "held", "cancel", "config"] as const : [undefined])
 for (const ownershipFault of loss === "root" ? [false, true] : [false])
 for (const ipcLoss of loss === "root" && !ownershipFault ? [false, true] : [false])
-test(`Production separate OS roots retain original lifetimes across namespace loss (${artifact}/${profile ?? "default"}/${loss}${refreshBoundary ? `/refresh-${refreshBoundary}` : ""}${ownershipFault ? "/ownership-read-refusal" : ""}${ipcLoss ? "/issued-ipc-loss" : ""})`, async () => {
+for (const overlappingObservation of refreshBoundary === "cancel" ? [false, true] : [false])
+test(`Production separate OS roots retain original lifetimes across namespace loss (${artifact}/${profile ?? "default"}/${loss}${refreshBoundary ? `/refresh-${refreshBoundary}` : ""}${ownershipFault ? "/ownership-read-refusal" : ""}${ipcLoss ? "/issued-ipc-loss" : ""}${overlappingObservation ? "/overlapping-observation" : ""})`, async () => {
   const childRun = async (role: "leader" | "follower", agentDir: string) => {
     const checkpoint = (phase: string) => process.send?.({ fixtureCheckpoint: phase, pid: process.pid });
     checkpoint("net-import");
@@ -13014,6 +13373,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     checkpoint("api-imported");
     const { AsyncLocalStorage } = await import("node:async_hooks");
     const heldRequest = new AsyncLocalStorage<boolean>();
+    const refreshRequest = new AsyncLocalStorage<{ captured: boolean }>();
     const transportChecks: Array<{ current: boolean; completed: number }> = [];
     let transportCaptures = 0, checkingTransport = false, ownershipReadFault = false, ownershipReadFaults = 0;
     let nativeOutcome: "returned" | "rejected" | undefined, nativeAuthorityError = false, nativeErrorIssued = false;
@@ -13025,6 +13385,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     } } });
     let store: Threads.TelegramTopicTargetStore | undefined, resets = 0, starts = 0, lastStartOk: boolean | undefined;
     let refreshEntered = 0, refreshSettled = 0, refreshReturned = 0, refreshFailed = 0, releaseRefresh!: () => void;
+    let unrelatedRefreshEntered = 0, unrelatedRefreshSettled = 0, unrelatedRefreshReturned = 0, unrelatedRefreshFailed = 0;
     const refreshHold = new Promise<void>(resolve => { releaseRefresh = resolve; });
     const registrationPids: number[] = [];
     const registrationReplies: Array<{ correlated: boolean; ok: boolean; code?: string; message?: string }> = [];
@@ -13052,11 +13413,13 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
         created.refresh = async () => {
           const original = refresh();
           if (role !== "follower" || !refreshBoundary || resets === 0) return original;
-          refreshEntered++;
+          const request = refreshRequest.getStore(), selected = !!request && !request.captured;
+          // Hold exactly the reconnect's first native refresh, not later independent observations or timer work.
+          if (selected) { request.captured = true; refreshEntered++; } else unrelatedRefreshEntered++;
           const outcome = await original.then(() => ({ ok: true as const }), error => ({ ok: false as const, error }));
-          refreshSettled++; if (!outcome.ok) refreshFailed++;
-          await refreshHold;
-          refreshReturned++;
+          if (selected) { refreshSettled++; if (!outcome.ok) refreshFailed++; }
+          else { unrelatedRefreshSettled++; if (!outcome.ok) unrelatedRefreshFailed++; }
+          if (selected) { await refreshHold; refreshReturned++; } else unrelatedRefreshReturned++;
           if (!outcome.ok) throw outcome.error;
         };
       }
@@ -13168,7 +13531,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
         transportCaptures, transportChecks, ownershipReadFaults, nativeOutcome, nativeAuthorityError, nativeErrorIssued, heldAck,
         callerCommitUnknown, callerCommitMethod, publicationMethod, originalPublishSocketDestroyed: originalPublishSocket?.destroyed,
         originalPublishSocketEnded: originalPublishSocket?.writableEnded,
-        starts, lastStartOk, refreshEntered, refreshSettled, refreshReturned, refreshFailed, cachedBindings: store?.listWorkspaceBindings().length,
+        starts, lastStartOk, refreshEntered, refreshSettled, refreshReturned, refreshFailed, unrelatedRefreshEntered, unrelatedRefreshSettled, unrelatedRefreshReturned, unrelatedRefreshFailed, cachedBindings: store?.listWorkspaceBindings().length,
         target: ThreadModel.parseTelegramWorkspaceStateSection(observed, name)?.workspaceBindings?.find(row => row.cwd === ctx.cwd)?.target,
         namespaceHash: createHash("sha256").update(JSON.stringify(observed ?? null)).digest("hex") };
     };
@@ -13178,7 +13541,10 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     await harness.handlers.get("session_start")?.({}, ctx);
     process.send?.({ fixtureCheckpoint: "session-start-complete", pid: process.pid });
     const perform = async (command: string): Promise<unknown> => {
-      if (command === "connect") { await harness.commands.get("telegram-connect")!.handler(profile ?? "", ctx); return stats(); }
+      if (command === "connect" || command === "connect-refresh") {
+        const connect = async () => { await harness.commands.get("telegram-connect")!.handler(profile ?? "", ctx); return stats(); };
+        return command === "connect-refresh" ? refreshRequest.run({ captured: false }, connect) : connect();
+      }
       if (command === "stats") return stats();
       if (command === "ownership-read-fault") { assert.equal(role, "leader"); assert.equal(ownershipFault, true); ownershipReadFault = true; return stats(); }
       if (command === "prepare") {
@@ -13265,7 +13631,8 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
       }
       if (command === "finish") { assert.ok(finishOriginal); inspectOriginal?.(); return { result: finishOriginal(), ...stats() }; }
       if (command === "release") { release(); return stats(); }
-      if (command === "refresh-status") return { pid: process.pid, resets, starts, refreshEntered, refreshSettled, refreshReturned, refreshFailed };
+      if (command === "refresh-status") return { pid: process.pid, resets, starts, refreshEntered, refreshSettled, refreshReturned, refreshFailed, unrelatedRefreshEntered, unrelatedRefreshSettled, unrelatedRefreshReturned, unrelatedRefreshFailed };
+      if (command === "observe-refresh") { assert.ok(store?.refresh); await store.refresh(); return stats(); }
       if (command === "release-refresh") { releaseRefresh(); return stats(); }
       if (command === "config-churn") {
         assert.ok(config);
@@ -13291,6 +13658,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
   await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
   type Stats = { pid: number; polls: number; creations: number; deletions: number; issued: number; completed: number; takeovers: number; continuations: number; resets: number; freshIssues: number;
     starts: number; lastStartOk?: boolean; refreshEntered: number; refreshSettled: number; refreshReturned: number; refreshFailed: number; cachedBindings?: number;
+    unrelatedRefreshEntered: number; unrelatedRefreshSettled: number; unrelatedRefreshReturned: number; unrelatedRefreshFailed: number;
     transportCaptures: number; transportChecks: Array<{ current: boolean; completed: number }>; ownershipReadFaults: number;
     nativeOutcome?: "returned" | "rejected"; nativeAuthorityError: boolean; nativeErrorIssued: boolean; heldAck?: { correlated: boolean; ok: boolean; message?: string };
     callerCommitUnknown: boolean; callerCommitMethod?: string; publicationMethod?: string; originalPublishSocketDestroyed?: boolean; originalPublishSocketEnded?: boolean;
@@ -13322,7 +13690,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
   };
   const leader = launch("leader");
   let followerForCleanup: ReturnType<typeof launch> | undefined;
-  let publication: Promise<{ result?: Stats; error?: unknown }> | undefined, settled = false, reconnect: Promise<Stats> | undefined;
+  let publication: Promise<{ result?: Stats; error?: unknown }> | undefined, settled = false, reconnect: Promise<Stats> | undefined, overlappingRefresh: Promise<Stats> | undefined;
   const evidenceDir = process.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR;
   let stage = "native-roots-ready", primaryFailure: unknown, failed = false;
   let initialFollower: Stats | undefined, initialLeader: unknown, publicationObservation: unknown, reconnectObservation: Stats | undefined, finalObservation: unknown;
@@ -13370,7 +13738,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
       if (loss === "damaged") await leader.request("damage");
       else canonical = (await leader.request("replace")).namespaceHash;
       if (refreshBoundary) {
-        reconnect = follower.request("connect"); void reconnect.catch(() => undefined);
+        reconnect = follower.request("connect-refresh"); void reconnect.catch(() => undefined);
         await waitForAsyncCondition(async () => (await follower.request("refresh-status")).refreshSettled === 1);
         const held = await follower.request("probe");
         assert.equal(held.resets, 1); assert.equal(held.refreshEntered, 1); assert.equal(held.refreshFailed, 0);
@@ -13380,6 +13748,10 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
         if (refreshBoundary === "cancel" || refreshBoundary === "config") {
           const canceled = await follower.request(refreshBoundary === "cancel" ? "disconnect" : "config-churn");
           assert.equal(canceled.starts, 1); assert.equal(canceled.refreshReturned, 0);
+        }
+        if (overlappingObservation) {
+          overlappingRefresh = follower.request("observe-refresh"); void overlappingRefresh.catch(() => undefined);
+          await waitForAsyncCondition(async () => { const observed = await follower.request("refresh-status"); return observed.refreshSettled + observed.unrelatedRefreshSettled >= 2; });
         }
         canonical = held.namespaceHash;
       } else {
@@ -13445,6 +13817,11 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
     if (refreshBoundary) {
       await follower.request("release-refresh");
       const resumed = reconnectObservation = await reconnect!;
+      if (overlappingRefresh) {
+        const observed = await overlappingRefresh;
+        assert.ok(observed.unrelatedRefreshSettled >= 1); assert.ok(observed.unrelatedRefreshReturned >= 1);
+        assert.equal(observed.unrelatedRefreshFailed, 0);
+      }
       assert.equal(resumed.refreshReturned, 1); assert.equal(resumed.refreshFailed, 0);
       assert.equal(resumed.starts, refreshBoundary === "held" ? 2 : 1, "Public cancellation spends the original command before its late native refresh completion");
       if (refreshBoundary === "held") { assert.equal(resumed.lastStartOk, true); assert.ok(resumed.target); }
@@ -13481,7 +13858,7 @@ test(`Production separate OS roots retain original lifetimes across namespace lo
           initialFollower, initialLeader, publicationObservation, reconnectObservation, finalObservation,
           leader: leader.diagnostics(), follower: follower?.diagnostics() ?? { notStarted: true }, runtimeLog };
         await mkdir(evidenceDir, { recursive: true });
-        await writeFile(join(evidenceDir, `${artifact}-${profile ?? "default"}-${loss}-${refreshBoundary ?? "none"}-${ownershipFault}-${ipcLoss}.json`),
+        await writeFile(join(evidenceDir, `${artifact}-${profile ?? "default"}-${loss}-${refreshBoundary ?? "none"}-${ownershipFault}-${ipcLoss}${overlappingObservation ? "-overlapping-observation" : ""}.json`),
           JSON.stringify(evidence, null, 2).replaceAll("123:os-original", "<fixture-token>") + "\n", { flag: "wx" });
       } catch (reason) { diagnosticFailures.push({ status: "rejected", reason }); }
     }
@@ -13620,7 +13997,7 @@ test(`Production original registration separates mode publication, IPC and ACK (
     const ConfigModel: typeof import("../lib/config.ts") = await import(configUrl.href);
     const LockModel: typeof Locks = await import(lockUrl.href);
     const stores: Threads.TelegramTopicTargetStore[] = [], configs: Array<ReturnType<typeof ConfigModel.createTelegramConfigStore>> = [];
-    let entered = false, heldCompletions = 0, clockOffset = 0, received = 0, prepared = 0, returned = 0, leaderStarts = 0, registrationCalls = 0, issued = 0;
+    let entered = false, heldCompletions = 0, clockOffset = 0, received = 0, prepared = 0, returned = 0, leaderStarts = 0, leaderReady = false, startupDelayed = false, registrationCalls = 0, issued = 0;
     let release!: () => void, receiverEndpoint: string | undefined;
     const gate = new Promise<void>(resolve => { release = resolve; });
     async function hold() { entered = true; await gate; heldCompletions++; }
@@ -13629,6 +14006,10 @@ test(`Production original registration separates mode publication, IPC and ACK (
       stores.push(store);
       store.persist = async () => {
         if (phase === "publication" && store === stores[0] && store.getBotState().threadMode === "enabled" && !entered) await hold();
+        // Startup may exceed the later producer observer while remaining within its original work budget.
+        if (phase === "connect-protocol" && store === stores[0] && store.getBotState().threadMode === "enabled" && !startupDelayed) {
+          startupDelayed = true; await new Promise(resolve => setTimeout(resolve, 2500));
+        }
         return persist();
       };
       return store;
@@ -13701,6 +14082,7 @@ test(`Production original registration separates mode publication, IPC and ACK (
         leaderStarts++;
         if (phase.startsWith("ipc")) await hold();
         await server.start();
+        leaderReady = true;
       } };
     } } });
     checkpoint("root-import");
@@ -13749,6 +14131,15 @@ test(`Production original registration separates mode publication, IPC and ACK (
       checkpoint("contexts-ready");
       connecting = leader.commands.get("telegram-connect")!.handler(profile ?? "", leaderCtx);
       if (phase === "publication" || phase.startsWith("ipc")) await waitForCondition(() => entered);
+      else {
+        // Later producer clocks must not include unrelated leader bootstrap. Early readiness keeps its own cases.
+        await connecting;
+        assert.equal(leaderReady, true, "The original leader server start must return before later producer observation");
+        assert.equal(registrationCalls, 0);
+        assert.equal(ThreadModel.parseTelegramWorkspaceStateSection(Locks.readTelegramRuntimeState(statePath).profiles[profile ?? "default"]?.workspace,
+          profile ?? "default")?.bot.threadMode, "enabled");
+        checkpoint("leader-ready");
+      }
       following = follower.commands.get("telegram-connect")!.handler(profile ?? "", followerCtx).finally(() => { followerSettled = true; });
       if (phase === "publication") await waitForAsyncCondition(async () => (await events()).some(row => row.details?.phase === "follower-readiness-wait"));
       if (phase.startsWith("ipc")) await waitForAsyncCondition(async () => (await events()).some(row => row.details?.phase === "follower-register-client-retry"));
@@ -13848,7 +14239,7 @@ test(`Production original registration separates mode publication, IPC and ACK (
         const failure = { version: 1, artifact, profile: profile ?? "default", phase, stage: "before-cleanup", pid: process.pid,
           error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error),
           counters: { entered, followerSettled, heldCompletions, registrationCalls, nativeConnects, nativeWrites, wireReceipts,
-            received, prepared, returned, leaderStarts, issued, polls, topics, sends, deletes, takeovers } };
+            received, prepared, returned, leaderStarts, leaderReady, startupDelayed, issued, polls, topics, sends, deletes, takeovers } };
         console.log("registration-phases-failure", JSON.stringify(failure));
         const logPath = Paths.resolveTelegramRuntimeLogPath(agentDir);
         const runtimeLog = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : undefined;

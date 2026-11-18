@@ -5,7 +5,7 @@
  */
 import { type TelegramTarget } from "./target.ts";
 import { type TelegramApiCallOptions } from "./telegram-api.ts";
-import { type TelegramLockContext, type TelegramLockRuntime, type TelegramOwnedStatePublicationOptions, type TelegramOwnedStatePublicationResult, type TelegramRuntimeStateMutation } from "./locks.ts";
+import { type TelegramRuntimeStateTransaction, type TelegramLockContext, type TelegramLockRuntime, type TelegramOwnedStatePublicationOptions, type TelegramOwnedStatePublicationResult, type TelegramRuntimeStateMutation } from "./locks.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import { type TelegramWorkspaceBindingIdentity } from "./workspace-identity.ts";
 import { type TelegramWorkspaceSlotOccupancy } from "./workspace-slots.ts";
@@ -683,7 +683,9 @@ export interface TelegramTopicTargetStoreOptions {
     getNowMs?: () => number;
     canPersist?: () => boolean;
     commitPersist?: (commit: () => void) => boolean;
-    consolidated?: Pick<TelegramConsolidatedWorkspaceStorageOptions, "captureAuthority" | "publishIfOwned">;
+    consolidated?: Pick<TelegramConsolidatedWorkspaceStorageOptions, "captureAuthority" | "publishIfOwned"> & {
+        stateTransaction?: TelegramRuntimeStateTransaction;
+    };
     getExternalReservedSlots?: () => readonly string[];
 }
 export interface TelegramTopicTargetProvisionerDeps {

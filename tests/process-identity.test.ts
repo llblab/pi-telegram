@@ -5,6 +5,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { runNodeEval } from "./fixtures/node-eval.ts";
 
 import {
   getTelegramProcessBirthIdentity,
@@ -35,6 +36,51 @@ test("Darwin process birth identity survives extension generations", () => {
   assert.equal(reloaded, first);
   assert.match(first, /^75433:start:[a-f0-9]{16}$/u);
 });
+
+for (const artifact of ["source", "compiled"] as const) {
+  test(`Darwin native self-proof is reused without caching peer, failed or injected evidence (${artifact})`, async () => {
+    const module = new URL(artifact === "source" ? "../lib/process-identity.ts" : "../dist/lib/process-identity.js", import.meta.url);
+    const result = await runNodeEval(`
+      import assert from "node:assert/strict";
+      import { createRequire, syncBuiltinESMExports } from "node:module";
+      const child = createRequire(import.meta.url)("node:child_process"), self = process.pid, peer = self + 1;
+      const calls = [];
+      let selfReady = false, peerChanged = false;
+      child.execFileSync = (command, args) => {
+        assert.equal(command, "/bin/ps");
+        const pid = Number(args.at(-1));
+        assert.deepEqual(args, ["-o", "lstart=", "-p", String(pid)]);
+        calls.push(pid);
+        if (pid === self && !selfReady) throw new Error("unavailable self proof");
+        return pid === peer && peerChanged ? "different peer birth" : "original native birth";
+      };
+      syncBuiltinESMExports();
+      const Process = await import(${JSON.stringify(module.href)});
+      let alive = true;
+      const options = { platform: "darwin", isProcessAlive: () => alive };
+      assert.equal(Process.getTelegramProcessBirthIdentity(self, "fallback", options), self + ":generation:fallback");
+      selfReady = true;
+      const birth = Process.getTelegramProcessBirthIdentity(self, "original", options);
+      assert.match(birth, /:start:[a-f0-9]{16}$/u);
+      for (let i = 0; i < 16; i++) {
+        assert.equal(Process.getTelegramProcessBirthIdentity(self, i, options), birth);
+        assert.equal(Process.getTelegramProcessLiveness({ processId: self, processBirthId: birth }, options), "alive");
+        assert.equal(Process.getTelegramProcessBirthIdentityLiveness(birth, options), "alive");
+      }
+      const artificial = { ...options, readDarwinProcessStart: () => "injected birth" };
+      assert.notEqual(Process.getTelegramProcessBirthIdentity(self, "artificial", artificial), birth);
+      assert.equal(Process.getTelegramProcessBirthIdentity(self, "after injection", options), birth);
+      const peerBirth = Process.getTelegramProcessBirthIdentity(peer, "peer", options);
+      peerChanged = true;
+      assert.equal(Process.getTelegramProcessLiveness({ processId: peer, processBirthId: peerBirth }, options), "dead");
+      alive = false;
+      assert.equal(Process.getTelegramProcessBirthIdentityLiveness(birth, options), "dead");
+      assert.deepEqual(calls, [self, self, peer, peer]);
+    `);
+    assert.equal(result.signal, null);
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+  });
+}
 
 test(
   "Current Darwin process birth identity survives extension generations",

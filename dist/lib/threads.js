@@ -12,7 +12,7 @@ import { parseTelegramIntegerId as asInteger, getTelegramTargetKey as getTargetR
 import { isTelegramApiCommitUnknownError, TelegramApiCommitUnknownError, } from "./telegram-api.js";
 import { getTelegramTopicName as buildTelegramTopicName, chooseTelegramThreadName, getTelegramManualThreadDisplayNameValidationError, getTelegramThreadNameLeadingSlot, getTelegramTopicIdentityName, getTelegramTopicTitleForThreadName, isTelegramTopicThreadNameValidForSlot, normalizeTelegramTopicTargetThreadName, } from "./thread-naming.js";
 import { isWireRecord as restoreObject, isNonEmptyWireString as restoreText, } from "./wire.js";
-import { renameTelegramPathWithRetry, isTelegramOwnerPrivate, TELEGRAM_STRICT_READ_FLAGS, readTelegramRuntimeState, withTelegramFileTransaction, } from "./locks.js";
+import { renameTelegramPathWithRetry, isTelegramOwnerPrivate, TELEGRAM_STRICT_READ_FLAGS, readTelegramRuntimeState, withTelegramFileTransaction, withTelegramRuntimeStateTransaction, } from "./locks.js";
 import { resolveTelegramProfileTempFilePath } from "./paths.js";
 import { createTelegramRuntimeProjectionStore } from "./status.js";
 import * as ThreadReconciler from "./thread-reconciler.js";
@@ -2147,7 +2147,7 @@ export function createTelegramTopicTargetStore(options) {
         };
         // Retain the original reader and its revision history; only physical observation is serialized.
         return workspaceIO && !workspaceFrame
-            ? withTelegramFileTransaction(join(dirname(path), "runtime", `${basename(path)}.transaction`), sample, { recoverAbandoned: false })
+            ? (consolidated?.stateTransaction ?? withTelegramRuntimeStateTransaction)(path, sample, { recoverAbandoned: false })
             : sample();
     };
     const getRecoveryPath = (path) => consolidated
@@ -2287,7 +2287,7 @@ export function createTelegramTopicTargetStore(options) {
         const revision = mutationRevision;
         // Serialize this original load with envelope publishers, without recovering guards or locking retained/frame reads.
         const rawFile = await (workspaceIO && !workspaceFrame
-            ? withTelegramFileTransaction(join(dirname(path), "runtime", `${basename(path)}.transaction`), () => readStoreSnapshot(path, !!workspaceRestore), { recoverAbandoned: false })
+            ? (consolidated?.stateTransaction ?? withTelegramRuntimeStateTransaction)(path, () => readStoreSnapshot(path, !!workspaceRestore), { recoverAbandoned: false })
             : readStoreSnapshot(path, !!workspaceRestore, true));
         // A read begun before a local mutation cannot replace the newly admitted projection.
         if (mutationRevision !== revision ||

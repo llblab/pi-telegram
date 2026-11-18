@@ -102,10 +102,13 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
     const { instanceId: telegramInstanceId, processId: telegramProcessId, processBirthId: telegramQueueProcessBirthId, manualFollowerOwnerId: telegramManualFollowerOwnerId, getLeaderSocketPath: getTelegramBusSocketPath, getFollowerSocketPath: getTelegramBusFollowerSocketPath, } = busProcessRuntime;
     const getTelegramBotId = Config.createTelegramConfigBotIdGetter(configStore);
     const getActiveProfileKey = Config.createTelegramActiveProfileKeyGetter(configStore);
+    const stateAccess = Locks.createTelegramRuntimeStateAccess(Paths.resolveAgentDir());
+    const stateTransaction = stateAccess.transact;
     const workspaceAdmissionRuntime = WorkspaceAdmission.createTelegramWorkspaceAdmissionRuntimeBinding({
         getProfileName: configStore.getActiveProfileName,
         getBotToken: configStore.getBotToken,
         getStatePath: Paths.resolveTelegramStatePath,
+        stateTransaction,
         owner: {
             processId: telegramProcessId,
             processBirthId: telegramQueueProcessBirthId,
@@ -212,6 +215,8 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
     const lockRuntime = Locks.createTelegramLockRuntime({
         key: Locks.createTelegramLockKeyResolver(configStore),
         statePath: Paths.resolveTelegramStatePath(),
+        stateTransaction,
+        assertStateAuthority: stateAccess.assertAuthority,
         instanceId: telegramInstanceId,
         busSecret: telegramBusAuthSecret,
         staleHeartbeatMs: Locks.TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
@@ -239,6 +244,7 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
         consolidated: {
             captureAuthority: captureTelegramStateAuthority,
             publishIfOwned: lockRuntime.publishStateSectionIfOwned,
+            stateTransaction,
         },
         getExternalReservedSlots: function () {
             return workspaceAdmissionRuntime.resolve()?.listReservedSlots() ?? [];
@@ -1796,6 +1802,8 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
         prepareUpdateBatch: textGroupRuntime.prepareUpdateBatch,
         journal: {
             appendBatch(updates, acceptedThroughUpdateId) {
+                if (!lockRuntime.owns())
+                    throw new TelegramApi.TelegramApiAuthorityError(true);
                 return updateAdmissionLifecycleRuntime.appendBatch(updates, acceptedThroughUpdateId);
             },
             getAcceptedThroughUpdateId() {
@@ -2095,7 +2103,7 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
             return Locks.resetDamagedTelegramRuntimeState(Paths.resolveTelegramStatePath(), function (profile, sections) {
                 Threads.parseTelegramWorkspaceStateSection(sections.workspace, profile);
                 WorkspaceAdmission.assertTelegramConsolidatedAdmissionSection(sections.admission, profile);
-            }, assertCurrent);
+            }, assertCurrent, stateTransaction);
         },
         transportMonitor: telegramThreadCapabilityMonitor,
         hasBotToken: configStore.hasBotToken,

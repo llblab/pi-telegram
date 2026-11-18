@@ -41,8 +41,8 @@ function readWindowsProcessStart(pid) {
         windowsHide: true,
     }).trim();
 }
-/** The current process never changes birth, so its slow Windows proof is read once; other PIDs are never cached. */
-let ownWindowsBirthProof;
+/** A successful self-proof is immutable; do not repeat shell probes inside admission transactions. */
+const ownBirthProofs = new Map();
 function getTelegramProcessBirthProof(pid, options = {}) {
     if (!Number.isSafeInteger(pid) || pid <= 0)
         return { status: "unverifiable" };
@@ -66,6 +66,10 @@ function getTelegramProcessBirthProof(pid, options = {}) {
         }
     }
     else if (platform === "darwin") {
+        const cacheable = pid === process.pid && !options.readDarwinProcessStart;
+        const cached = cacheable && ownBirthProofs.get(platform);
+        if (cached)
+            return cached;
         try {
             const startedAt = (options.readDarwinProcessStart ?? readDarwinProcessStart)(pid);
             if (startedAt) {
@@ -73,7 +77,10 @@ function getTelegramProcessBirthProof(pid, options = {}) {
                     .update(startedAt)
                     .digest("hex")
                     .slice(0, 16);
-                return { status: "proven", identity: `${pid}:start:${fingerprint}` };
+                const proof = { status: "proven", identity: `${pid}:start:${fingerprint}` };
+                if (cacheable)
+                    ownBirthProofs.set(platform, proof);
+                return proof;
             }
         }
         catch {
@@ -82,8 +89,10 @@ function getTelegramProcessBirthProof(pid, options = {}) {
     }
     else if (platform === "win32") {
         const injected = options.readWindowsProcessStart;
-        if (!injected && pid === process.pid && ownWindowsBirthProof)
-            return ownWindowsBirthProof;
+        const cacheable = pid === process.pid && !injected;
+        const cached = cacheable && ownBirthProofs.get(platform);
+        if (cached)
+            return cached;
         let proof = { status: "unverifiable" };
         try {
             const ticks = (injected ?? readWindowsProcessStart)(pid);
@@ -93,8 +102,8 @@ function getTelegramProcessBirthProof(pid, options = {}) {
         catch {
             /* inaccessible process metadata, including another user's process */
         }
-        if (!injected && pid === process.pid && proof.status === "proven")
-            ownWindowsBirthProof = proof;
+        if (cacheable && proof.status === "proven")
+            ownBirthProofs.set(platform, proof);
         return proof;
     }
     return { status: "unverifiable" };
