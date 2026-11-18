@@ -402,7 +402,7 @@ test("Cutover mode requires an exact legacy barrier and a real kernel lease, wit
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-for (const mode of ["healthy", "damaged", "partial-mode", "partial-barrier", "lost-barrier", "lost-mode", "lost-anchor", "replaced-anchor", "lost-directory", "foreign-mode"] as const) {
+for (const mode of ["healthy", "damaged", "partial-mode", "partial-barrier", "lost-barrier", "lost-mode", "lost-anchor", "replaced-anchor", "wider-mode-identity", "lost-directory", "foreign-mode"] as const) {
   test(`Runtime state cutover never falls back after its durable mode is selected (${mode})`, { skip: process.arch !== "x64" }, () => {
     const agent = realpathSync(mkdtempSync(join(tmpdir(), "pt-state-cutover-")));
     const cutover = createTelegramRuntimeStateCutover(agent);
@@ -410,6 +410,7 @@ for (const mode of ["healthy", "damaged", "partial-mode", "partial-barrier", "lo
     const guard = join(root, "runtime", "state.json.transaction"), directory = join(agent, "telegram-kernel-cutover");
     const marker = join(directory, "state.mode"), anchor = join(directory, "state.lock");
     const forbidden = () => assert.fail("Incomplete cutover allowed legacy or kernel execution");
+    let retainedMode: Buffer | undefined, modeReadLimit: number | undefined;
     try {
       const initial = '{"version":2,"profiles":{"default":{"runtime":{"ready":true}}}}\n';
       assert.equal(cutover.run(() => existsSync(guard)), true, "Healthy pre-cutover mode retains ordinary legacy serialization");
@@ -432,6 +433,7 @@ for (const mode of ["healthy", "damaged", "partial-mode", "partial-barrier", "lo
       } else {
         cutover.install(() => true);
         const originalAnchor = statSync(anchor, { bigint: true });
+        const originalMode = readFileSync(marker);
         cutover.install(() => true);
         assert.equal(statSync(anchor, { bigint: true }).ino, originalAnchor.ino);
         if (mode === "healthy" || mode === "damaged") {
@@ -452,8 +454,13 @@ for (const mode of ["healthy", "damaged", "partial-mode", "partial-barrier", "lo
         if (mode === "lost-mode") rmSync(marker);
         if (mode === "lost-anchor" || mode === "replaced-anchor") {
           renameSync(anchor, join(directory, "displaced"));
-          if (mode === "replaced-anchor") writeFileSync(anchor, "", { mode: 0o600 });
-          else {
+          if (mode === "replaced-anchor") {
+            writeFileSync(anchor, "", { flag: "wx", mode: 0o600 });
+            const replacement = statSync(anchor, { bigint: true });
+            assert.notDeepEqual([replacement.dev, replacement.ino], [originalAnchor.dev, originalAnchor.ino]);
+            retainedMode = originalMode;
+            modeReadLimit = originalMode.length - `${originalAnchor.dev}:${originalAnchor.ino}`.length + `${replacement.dev}:${replacement.ino}`.length;
+          } else {
             assert.throws(() => cutover.install(() => true), /anchor is unavailable/u);
             assert.equal(existsSync(anchor), false, "An installed anchor is never recreated by maintenance retry");
           }
@@ -465,13 +472,31 @@ for (const mode of ["healthy", "damaged", "partial-mode", "partial-barrier", "lo
           assert.equal(existsSync(guard), false);
           return;
         }
-        if (mode === "foreign-mode") {
-          const foreign = join(agent, "foreign"); mkdirSync(foreign);
-          createTelegramRuntimeStateCutover(foreign).install(() => true);
-          writeFileSync(marker, readFileSync(join(foreign, "telegram-kernel-cutover", "state.mode")));
+        if (mode === "wider-mode-identity" || mode === "foreign-mode") {
+          if (mode === "foreign-mode") {
+            const foreign = join(agent, "foreign"); mkdirSync(foreign);
+            createTelegramRuntimeStateCutover(foreign).install(() => true);
+            retainedMode = readFileSync(join(foreign, "telegram-kernel-cutover", "state.mode"));
+          } else {
+            // Model a persisted decimal identity wider than the current anchor without relying on inode allocation.
+            const suffix = `:${originalAnchor.dev}:${originalAnchor.ino}\n`;
+            const modeText = originalMode.toString("utf8");
+            assert.ok(modeText.endsWith(suffix));
+            retainedMode = Buffer.from(`${modeText.slice(0, -1)}0\n`);
+            assert.equal(retainedMode.length, originalMode.length + 1);
+          }
+          writeFileSync(marker, retainedMode);
+          modeReadLimit = originalMode.length;
         }
       }
-      assert.throws(() => createTelegramRuntimeStateCutover(agent).run(forbidden), /^Error: Telegram (?:runtime cutover|legacy transaction barrier)/u);
+      const run = () => createTelegramRuntimeStateCutover(agent).run(forbidden);
+      if (retainedMode !== undefined && modeReadLimit !== undefined) {
+        // A shorter current identity can make the old record fail the private reader's byte bound before comparison.
+        if (retainedMode.length > modeReadLimit)
+          assert.throws(run, { name: "TelegramPrivateFileError", failure: "capacity" });
+        else assert.throws(run, { name: "Error", message: "Telegram runtime cutover mode is incomplete or changed." });
+        assert.deepEqual(readFileSync(marker), retainedMode, "A refused successor must not rewrite the mode");
+      } else assert.throws(run, /^Error: Telegram (?:runtime cutover|legacy transaction barrier)/u);
       assert.equal(readFileSync(state, "utf8"), initial);
       if (mode === "lost-barrier" || mode === "partial-mode") assert.equal(existsSync(guard), false);
     } finally { rmSync(agent, { recursive: true, force: true }); }
