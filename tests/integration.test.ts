@@ -8083,7 +8083,9 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
               if (pureChild) assert.equal(stores[1].rows.slice(start).filter(value => !value.action.completionGroup).length, 0, "Pure question output never registers a dummy ordinary control");
               const original = deferredOriginal ?? deadlines.map(value => value.expiresAt);
               assert.ok(original.every(value => value > Date.now() + (carrier.endsWith("earlier") ? 0 : 23 * 60 * 60 * 1000)));
+              phase("post-feedback-sdk-entered");
               const next = await Delivery.openTelegramConfirm({ owner: "@test/carrier", scope: { kind: "instance" }, question: "After remote callback", confirmLabel: "Yes", cancelLabel: "No", signal: new AbortController().signal });
+              phase("post-feedback-sdk-returned");
               assert.ok(next.ok);
               if (deferredFlow && (carrier.endsWith("admission") || carrier.endsWith("cancelled") || carrier.endsWith("earlier"))) assert.deepEqual(deadlines.map(value => value.expiresAt), deferredOriginal.map(value => Math.min(value, admissionCutoff)), "A later SDK input cannot renew the captured conditional ceiling");
               else if (childFlow && !carrier.endsWith("child-second") && !(deferredFlow && carrier.endsWith("editor")) && carrier !== "app-mixed-feedback-child-pure" && carrier !== "app-mixed-feedback-child-queued" && carrier !== "app-mixed-feedback-child-pure-queued" && !carrier.endsWith("retained")) assert.deepEqual(deadlines.map(value => value.expiresAt), original, "An incomplete carrier, changed source/parent/SDK or unrelated native result cannot qualify a child prefix");
@@ -8102,7 +8104,9 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
                   assert.equal(stores[1].store.resolve(retainedCells[0].callback_data, { id: "remote-text-original-after-drain", data: retainedCells[0].callback_data,
                     message: { message_id: originalMessageId, message_thread_id: 44, chat: { id: 77 } } }), undefined, "The original group is superseded, not retained or reborn from raw text");
                   assert.ok(stores[1].store.resolve(children[0].key), "Fresh native Text questions remain answerable under their own proved parent transition");
+                  phase("retained-text-publication-drain-entered");
                   await stores[1].store.waitForPublicationIdle();
+                  phase("retained-text-publication-drain-returned");
                 }
                 if (rich && (carrier.endsWith("retained") || carrier.endsWith("admission"))) {
                   const original = appRows.find(value => value.key === retainedCells[0].callback_data); assert.ok(original);
@@ -8160,7 +8164,8 @@ test(`Production follower SDK first-send refuses foreign native carrier before o
     "follower-shutdown-entered", "follower-shutdown-returned", "leader-shutdown-entered", "leader-shutdown-returned", "cleanup-entered", "cleanup-returned"];
   assert.deepEqual(phases.map(row => row[1]!).filter(name => required.includes(name)), required, "Original follower fixture phases must cover checks and actual cleanup in order");
   const optional = ["bootstrap-refusal-checked", "first-sdk-checked", "agent-started", "first-carrier-returned", "sdk-successor-returned", "worker-exit-observed",
-    "feedback-entered", "feedback-release-issued", "editor-entered", "callback-toast-observed", "conditional-admission-returned", "editor-queue-returned"];
+    "feedback-entered", "feedback-release-issued", "editor-entered", "callback-toast-observed", "conditional-admission-returned", "editor-queue-returned",
+    "post-feedback-sdk-entered", "post-feedback-sdk-returned", "retained-text-publication-drain-entered", "retained-text-publication-drain-returned"];
   assert.ok(phases.every(row => required.includes(row[1]!) || optional.includes(row[1]!)), "Only finite body-free follower fixture phases may be emitted");
   assert.equal(new Set(phases.map(row => row[1])).size, phases.length);
   assert.equal(new Set(phases.map(row => row[3])).size, 1);
@@ -12911,12 +12916,16 @@ test(`Production separate OS startup converges through original admission (${art
           const chooser = choosers.find(value => value.messageId === Number(parameter)); assert.ok(chooser);
           assert.ok(!pendingCancel && drainCancelCleanup);
           const completed = new Promise<void>(complete => { pendingCancel = { updateId: update_id, complete }; });
+          const checkpointCancel = chooser.threadId === 299;
           try {
+            if (checkpointCancel) checkpoint("ambiguous-cancel-released-to-poller");
             deliverPoll({ update_id, callback_query: { id: `cancel-${update_id}`, from, data: chooser.cancel,
               message: { message_id: chooser.messageId, message_thread_id: chooser.threadId, chat, date } } });
             // Poll response release is not semantic completion. Join the real journal callback ACK before joining its cleanup.
             await completed;
+            if (checkpointCancel) checkpoint("ambiguous-cancel-journal-completed");
             await drainCancelCleanup();
+            if (checkpointCancel) checkpoint("ambiguous-cancel-cleanup-drained");
             drainedCancel = update_id;
           } finally { pendingCancel = undefined; }
         }
