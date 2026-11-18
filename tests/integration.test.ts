@@ -12789,6 +12789,25 @@ test(`Production separate OS startup converges through original admission (${art
       localRegistration = state;
       return state;
     } } });
+    let pendingCancel: { updateId: number; complete: () => void } | undefined;
+    let drainCancelCleanup: (() => Promise<void>) | undefined;
+    let completedCancel: number | undefined, drainedCancel: number | undefined;
+    if (role === "successor") {
+      const routeUrl = new URL(artifact === "source" ? "./lib/routing.ts" : "./dist/lib/routing.js", import.meta.url);
+      const RouteModel: typeof import("../lib/routing.ts") = await import(routeUrl.href);
+      mock.module(routeUrl.href, { namedExports: { ...RouteModel, createTelegramInboundRouteRuntime(...args: Parameters<typeof RouteModel.createTelegramInboundRouteRuntime>) {
+        const runtime = RouteModel.createTelegramInboundRouteRuntime(...args), observe = runtime.onUpdateCompleted;
+        assert.equal(drainCancelCleanup, undefined);
+        drainCancelCleanup = runtime.waitForRestoreSettlement;
+        runtime.onUpdateCompleted = (updateId, ctx, key) => {
+          observe(updateId, ctx, key);
+          if (pendingCancel?.updateId !== updateId) return;
+          completedCancel = updateId;
+          pendingCancel.complete();
+        };
+        return runtime;
+      } } });
+    }
     checkpoint("root-import");
     const extension = (await import(artifact === "source" ? "./index.ts" : "./dist/index.js")).default;
     checkpoint("root-import-complete");
@@ -12813,6 +12832,7 @@ test(`Production separate OS startup converges through original admission (${art
         localRegistered: localRegistration?.isRegistered() ?? false, localTarget: localRegistration?.getTarget(), everRegistered,
         registrationPids, notices, publications, polls, activePollers, maxPollers, creations, deletions, takeovers,
         choosers, cancelled, deletedTargets, cleanupTargets, canInject: deliverPoll !== undefined,
+        pendingCancelId: pendingCancel?.updateId, completedCancel, drainedCancel,
         ownerPid: (state?.transport as Locks.TelegramLockEntry | undefined)?.pid, ownerEpoch: (state?.transport as Locks.TelegramLockEntry | undefined)?.leaderEpoch,
         target: binding?.target, bindingKey: binding?.bindingKey, slot: binding?.slot };
     });
@@ -12889,8 +12909,16 @@ test(`Production separate OS startup converges through original admission (${art
         if (action === "arrive") deliverPoll({ update_id, message: { message_id: update_id, message_thread_id: Number(parameter), chat, from, date, text: `Fixture routing ${update_id}` } });
         else {
           const chooser = choosers.find(value => value.messageId === Number(parameter)); assert.ok(chooser);
-          deliverPoll({ update_id, callback_query: { id: `cancel-${update_id}`, from, data: chooser.cancel,
-            message: { message_id: chooser.messageId, message_thread_id: chooser.threadId, chat, date } } });
+          assert.ok(!pendingCancel && drainCancelCleanup);
+          const completed = new Promise<void>(complete => { pendingCancel = { updateId: update_id, complete }; });
+          try {
+            deliverPoll({ update_id, callback_query: { id: `cancel-${update_id}`, from, data: chooser.cancel,
+              message: { message_id: chooser.messageId, message_thread_id: chooser.threadId, chat, date } } });
+            // Poll response release is not semantic completion. Join the real journal callback ACK before joining its cleanup.
+            await completed;
+            await drainCancelCleanup();
+            drainedCancel = update_id;
+          } finally { pendingCancel = undefined; }
         }
         return { updateId: update_id };
       }
@@ -12943,7 +12971,8 @@ test(`Production separate OS startup converges through original admission (${art
     registrationIssues: number; registrationAcks: number; cancelledStarts: number; preparedAcks: number; releasedAcks: number; resets: number; registrationFailures: number; lostSockets: number; nativeTimeouts: number; replyTimeoutMs?: number; replyElapsedMs?: number; receiverEntered: number; receiverReturned: number; receiverReachable?: boolean; receiverAliasExists?: boolean; localRegistered: boolean; localTarget?: { chatId: number; threadId?: number }; everRegistered: boolean;
     registrationPids: number[]; notices: string[]; publications: Array<{ text: string; target: { chatId: number; threadId?: number } }>;
     polls: number; activePollers: number; maxPollers: number; creations: number; deletions: number; takeovers: number; ownerPid?: number; ownerEpoch?: string; target?: { chatId: number; threadId?: number }; bindingKey?: string; slot?: string;
-    choosers: Array<{ threadId: number; messageId: number; cancel: string }>; cancelled: string[]; deletedTargets: number[]; cleanupTargets: number[]; canInject: boolean; updateId: number };
+    choosers: Array<{ threadId: number; messageId: number; cancel: string }>; cancelled: string[]; deletedTargets: number[]; cleanupTargets: number[]; canInject: boolean; updateId: number;
+    pendingCancelId?: number; completedCancel?: number; drainedCancel?: number };
   const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-os-startup-")));
   const bot = { botToken: "123:os-startup", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } };
   await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot } }), { mode: 0o600 });
@@ -13220,17 +13249,15 @@ test(`Production separate OS startup converges through original admission (${art
         const firstId = await inject(`arrive:${target}`), secondId = await inject(`arrive:${target}`);
         await waitForAsyncCondition(async () => (await inspect()).choosers.filter(value => value.threadId === target).length === 2);
         const [one, two] = (await inspect()).choosers.filter(value => value.threadId === target);
-        await inject(`cancel:${one!.messageId}`);
-        await waitForAsyncCondition(async () => (await inspect()).cancelled.length === index * 2 + 1);
+        const firstCancel = await inject(`cancel:${one!.messageId}`), firstSettled = await inspect();
+        assert.equal(firstSettled.completedCancel, firstCancel); assert.equal(firstSettled.drainedCancel, firstCancel);
+        assert.equal(firstSettled.cancelled.length, index * 2 + 1);
         assert.equal(journal.inspectAbandonedPending(firstId)?.updateId, firstId);
         assert.equal(journal.inspectAbandonedPending(secondId), undefined);
-        assert.deepEqual((await inspect()).deletedTargets, formerTargets.slice(0, index), "Another unspent input still needs this exact tab");
-        await inject(`cancel:${two!.messageId}`);
-        await waitForAsyncCondition(async () => {
-          const state = await inspect();
-          return state.deletedTargets.includes(target) && !state.cleanupTargets.includes(target);
-        });
-        const settled = await inspect();
+        assert.deepEqual(firstSettled.deletedTargets, formerTargets.slice(0, index), "Another unspent input still needs this exact tab");
+        const finalCancel = await inject(`cancel:${two!.messageId}`), settled = await inspect();
+        assert.equal(settled.completedCancel, finalCancel); assert.equal(settled.drainedCancel, finalCancel);
+        assert.equal(settled.cleanupTargets.includes(target), false);
         assert.deepEqual(settled.deletedTargets, formerTargets.slice(0, index + 1));
         assert.deepEqual(settled.cancelled, Array<string>(2 * (index + 1)).fill("Routing cancelled"));
         for (const id of [firstId, secondId]) {
@@ -13245,19 +13272,21 @@ test(`Production separate OS startup converges through original admission (${art
       const unknownId = await inject("arrive:299");
       await waitForAsyncCondition(async () => (await inspect()).choosers.some(value => value.threadId === 299));
       const unknown = (await inspect()).choosers.find(value => value.threadId === 299)!;
-      await inject(`cancel:${unknown.messageId}`);
+      const unknownCancel = await inject(`cancel:${unknown.messageId}`);
       const warning = "Routing cancelled; Thread removal is unconfirmed and will not be retried.";
-      await waitForAsyncCondition(async () => (await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")).includes(warning));
-      const debug = await successor.request("debug");
+      const debug = formerRoleObservation = await successor.request("debug");
+      assert.equal(debug.completedCancel, unknownCancel); assert.equal(debug.drainedCancel, unknownCancel);
+      assert.ok((await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")).includes(warning));
       assert.ok(debug.notices.at(-1)?.includes(warning), "The actual status surface reports the exceptional outcome");
       assert.deepEqual(debug.deletedTargets, [...formerTargets, 299]);
       assert.ok(debug.cleanupTargets.includes(299), "Ambiguous removal retains its one-shot frame");
       const freshId = await inject("arrive:299");
       await waitForAsyncCondition(async () => (await inspect()).choosers.filter(value => value.threadId === 299).length === 2);
       const fresh = (await inspect()).choosers.filter(value => value.threadId === 299)[1]!;
-      await inject(`cancel:${fresh.messageId}`);
-      await waitForAsyncCondition(async () => (await inspect()).cancelled.at(-1) === "Routing cancelled; tab removal unconfirmed");
-      assert.deepEqual((await inspect()).deletedTargets, [...formerTargets, 299], "A later Cancel does not reissue the old removal");
+      const freshCancel = await inject(`cancel:${fresh.messageId}`), afterFresh = await inspect();
+      assert.equal(afterFresh.completedCancel, freshCancel); assert.equal(afterFresh.drainedCancel, freshCancel);
+      assert.equal(afterFresh.cancelled.at(-1), "Routing cancelled; tab removal unconfirmed");
+      assert.deepEqual(afterFresh.deletedTargets, [...formerTargets, 299], "A later Cancel does not reissue the old removal");
       assert.equal(journal.inspectAbandonedPending(unknownId)?.updateId, unknownId);
       assert.equal(journal.inspectAbandonedPending(freshId)?.updateId, freshId);
     }
