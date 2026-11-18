@@ -22,6 +22,26 @@ import { createTelegramTypingLoop, createTelegramTypingLoopStarter } from "../li
 import { createTelegramSessionContextStore } from "../lib/lifecycle.ts";
 import { createPassthroughFailureLog } from "./fixtures/failure-log.ts";
 
+test("Direct polling cannot retry a native request after its transport authority is lost", async () => {
+  let owns = true, calls = 0, sleeps = 0;
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify({ ok: false, error_code: 503, description: "fixture unavailable" }), { status: 503 });
+  };
+  const restore = setTelegramApiHttpsFetchForTesting(globalThis.fetch);
+  try {
+    const client = createTelegramApiClient(() => "123:fixture");
+    const direct = createTelegramBridgeApiRuntime({ client: { ...client, call(method, body, options) {
+      return client.call(method, body, { ...options, async sleep() { sleeps++; owns = false; } });
+    } }, tempDir: "/unused", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {} });
+    const api = createTelegramBusAwareApiRuntime({ directRuntime: direct, ownsDirect: () => owns,
+      callFollowerApi: async () => assert.fail("Polling cannot fall back to a follower") });
+    await assert.rejects(api.getUpdates({ offset: 1 }), { name: "TelegramApiAuthorityError", requestIssued: true });
+    assert.equal(sleeps, 1); assert.equal(calls, 1);
+  } finally { restore(); globalThis.fetch = previousFetch; }
+});
+
 for (const fault of ["role", "publisher", "method", "provider", "scope", "bot-provider"] as const)
 test(`Coordinated question capture retains its original direct publisher (${fault})`, () => {
   const direct = createTelegramBridgeApiRuntime({ client: createTelegramApiClient(() => "unused"), tempDir: "/unused", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, recordRuntimeEvent() {} });

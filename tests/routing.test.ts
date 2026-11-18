@@ -7324,10 +7324,14 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
     await writeFile(join(directory, "logs.jsonl"), "first event\n");
     let inspections = 0;
     const apiCalls: Array<{ method: string; threadId?: unknown }> = [];
+    const cleanupOutcomes: unknown[] = [];
     let nextChooser = 200;
     let heldOriginal: { path: string; held: string; bytes: Buffer } | undefined;
     const events: string[] = [];
     const harness = createRouteHarness({ threadStore, instanceId: "leader-a", getSessionGeneration: () => sessionGeneration,
+      recordRuntimeEvent(_category, _error, details) {
+        if (details?.phase === "orphan-cancel-cleanup-outcome") cleanupOutcomes.push(details.outcome);
+      },
       getWorkspaceRestoreStore: () => workspace, inspectRestoreSourceAbandonment: id => journal.inspectAbandonedPending(id),
       ...(readerMode !== "uncomposed" ? { captureOrphanIntentReaderCompatibility() { capturedReaders = true; return readerRegistry.captureOrphanIntentReaderCompatibility!(readerProtocol); },
         hasWorkspaceRestoreAuthority: () => readerMode !== "non-leader",
@@ -7414,9 +7418,19 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
       await worker.waitForDrain();
       await click("reroutecancel:1", 200);
       assert.equal(apiCalls.some(call => call.method === "deleteForumTopic"), false, "A second unspent input still needs the tab");
+      assert.ok(harness.events.includes("answer:Routing cancelled"));
+      assert.deepEqual(cleanupOutcomes, [], "Ordinary sibling protection is not an exceptional final-Cancel outcome");
       await click("reroutecancel:2", 201);
       await routeRuntime.waitForRestoreSettlement();
       const deletions = apiCalls.filter(call => call.method === "deleteForumTopic");
+      if (["uncomposed", "changed", "non-leader"].includes(readerMode)) {
+        assert.equal(harness.events.filter(event => event === "answer:Routing cancelled; tab cleanup unavailable").length, 1);
+        assert.deepEqual(cleanupOutcomes, [], "A refused intent is reported once on the original tap, without a detached attempt");
+        assert.equal(journal.inspectAbandonedPending(102)?.updateId, 102);
+      }
+      if (readerMode === "supported" || readerMode === "v1-only")
+        assert.deepEqual(cleanupOutcomes, deferredReceipt || readerMode === "v1-only" ? ["retained"] : []);
+      if (readerMode === "unknown" && !deferredReceipt) assert.deepEqual(cleanupOutcomes, ["unconfirmed"]);
       const clearCleanupRefused = ["uncomposed", "changed", "unsupported-origin", "non-leader", "v1-only"].includes(readerMode);
       assert.equal(deletions.length, (deferredReceipt && readerMode !== "drain-during-toast") || clearCleanupRefused ? 0 : 1,
         JSON.stringify(apiCalls) + events.join("|"));
@@ -7431,6 +7445,8 @@ test(`Native orphan last Cancel cleanup follows fresh admitted one-shot authorit
           nextUpdateId = 401;
           await click("reroutecancel:3", 202); await routeRuntime.waitForRestoreSettlement();
           assert.equal(journal.inspectAbandonedPending(400)?.updateId, 400, "The fresh routing source can be cancelled without replaying cleanup");
+          assert.equal(harness.events.filter(event => event === "answer:Routing cancelled; tab removal unconfirmed").length, 1);
+          assert.deepEqual(cleanupOutcomes, ["unconfirmed"], "A new cancel cannot renew or relabel the issued cleanup outcome");
           for (const original of originals) assert.deepEqual(fs.readFileSync(original.path), original.bytes);
           assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0);
           assert.equal(apiCalls.filter(call => call.method === "deleteForumTopic").length, 1,

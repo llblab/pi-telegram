@@ -112,6 +112,8 @@ interface TelegramLockRuntimeOptions {
     locksPath?: string;
     /** Consolidated version-2 state envelope; exclusive with `locksPath`. */
     statePath?: string;
+    stateTransaction?: TelegramRuntimeStateTransaction;
+    assertStateAuthority?: (path: string) => void;
     statePublication?: Pick<TelegramRuntimeStatePublicationOptions, "onPublicationBoundary" | "publishRename">;
     /** Read-only ownership file of releases that used another directory; a live fresh owner there blocks acquisition. */
     legacyLocksPath?: string;
@@ -184,8 +186,16 @@ export declare class TelegramFileTransactionGuardError extends Error {
         phase?: "acquire" | "release";
     });
 }
+/**
+ * Close one legacy admission pathname during authorized cold maintenance.
+ * Drain predecessor processes and exclude relaunch first; this marker only closes future entry.
+ * An explicit directory conversion adds one marker to a supported damaged guard without replacing its pathname or bytes.
+ */
+export declare function installTelegramLegacyTransactionBarrier(path: string, isMaintenanceCurrent: () => boolean, options?: {
+    allowDamagedDirectory?: true;
+}): "installed" | "already-installed";
 /** Private per-resource port; callers own immutable anchor placement and backend admission.
- * Kernel exclusion supplements the legacy guard; it grants no reset or old-writer closure. */
+ * Kernel exclusion grants no reset, old-writer closure or authority to select cutover mode. */
 export interface TelegramFileTransactionKernel {
     readonly anchorPath: string;
     readonly signal?: AbortSignal;
@@ -213,6 +223,8 @@ export declare class TelegramFileTransactionKernelError extends Error {
 export interface TelegramFileTransactionOptions {
     /** Dormant until an admitted backend is supplied; no default loader or recovery activation. */
     kernel?: TelegramFileTransactionKernel;
+    /** Explicit cutover selection, established independently of the marker. Missing proof never falls back to legacy. */
+    requireLegacyBarrier?: true;
     recoveryRename?: typeof renameSync;
     publishRename?: typeof renameSync;
     /** Observation leases may contend but must not acquire abandoned-owner recovery authority. */
@@ -221,6 +233,23 @@ export interface TelegramFileTransactionOptions {
     retryDelayMs?: number;
 }
 export declare function withTelegramFileTransaction<T>(transactionPath: string, operation: () => T, options?: TelegramFileTransactionOptions): T;
+type TelegramRuntimeStateTransactionOptions = Pick<TelegramFileTransactionOptions, "recoverAbandoned">;
+export type TelegramRuntimeStateTransaction = <T>(path: string, operation: () => T, options?: TelegramRuntimeStateTransactionOptions) => T;
+export declare function withTelegramRuntimeStateTransaction<T>(path: string, operation: () => T, options?: TelegramRuntimeStateTransactionOptions): T;
+/** Cold-maintenance and transaction port for the one shared runtime envelope, never for arbitrary journal paths. */
+export declare function createTelegramRuntimeStateCutover(agentDir: string): {
+    runFor: TelegramRuntimeStateTransaction;
+    assertAuthority: (path: string) => void;
+    install(isMaintenanceCurrent: () => boolean): void;
+    run<T>(operation: () => T, options?: TelegramRuntimeStateTransactionOptions): T;
+};
+/** Keep one lazily captured cutover owner across the extension's envelope consumers and transport observations. */
+export declare function createTelegramRuntimeStateAccess(agentDir: string): {
+    transact: TelegramRuntimeStateTransaction;
+    assertAuthority: (path: string) => void;
+};
+/** Defensive refusal of a live recorded PID, not a complete census or proof that the operator drained writers. */
+export declare function prepareTelegramRuntimeStateColdCutover(agentDir: string): void;
 export type TelegramRuntimeStateSection = "transport" | "workspace" | "admission" | "runtime";
 type TelegramRuntimeStateProfile = Partial<Record<TelegramRuntimeStateSection, unknown>>;
 interface TelegramRuntimeStateFile {
@@ -242,7 +271,7 @@ export declare function readTelegramRuntimeState(path: string): TelegramRuntimeS
  * caller-validated section is damaged, publish a fresh empty envelope instead of refusing. All profiles lose runtime
  * continuity. Filesystem access errors are not damage and still throw. Returns whether a reset was published.
  */
-export declare function resetDamagedTelegramRuntimeState(path: string, validateProfile?: (profile: string, sections: Readonly<TelegramRuntimeStateProfile>) => void, assertCurrent?: () => void): boolean;
+export declare function resetDamagedTelegramRuntimeState(path: string, validateProfile?: (profile: string, sections: Readonly<TelegramRuntimeStateProfile>) => void, assertCurrent?: () => void, transact?: TelegramRuntimeStateTransaction): boolean;
 /** Pure section reducer: receives the stored section and its profile, returns the next section and result. */
 export type TelegramRuntimeStateSectionReducer<T> = (current: unknown, observed: Readonly<TelegramRuntimeStateProfile>) => TelegramRuntimeStateMutation<T>;
 export interface TelegramRuntimeStateMutation<T> {
@@ -250,6 +279,7 @@ export interface TelegramRuntimeStateMutation<T> {
     result: T;
 }
 interface TelegramRuntimeStatePublicationOptions {
+    stateTransaction?: TelegramRuntimeStateTransaction;
     /** Exact domain authority, recaptured by the caller before invoking this synchronous transaction. */
     isCurrent: () => boolean;
     onPublicationBoundary?: (boundary: "before-write" | "after-write-before-rename" | "after-rename") => void;

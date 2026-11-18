@@ -14,6 +14,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -27,15 +28,18 @@ import { runNodeEval } from "./fixtures/node-eval.ts";
 import { createTelegramJournalSourceSerialization, createTelegramUpdateJournalBindingRuntime } from "../lib/journal.ts";
 import {
   resolveTelegramOwnersPath,
+  resolveTelegramStatePath,
   resolveTelegramSessionsDir,
   resolveTelegramTempDir,
 } from "../lib/paths.ts";
 import { createTelegramSessionFolderSweeper } from "../lib/recovery.ts";
 import { TelegramFollowerRegistrationCancelledError, type TelegramFollowerRegistrationResult, type TelegramFollowerRegistrationOptions } from "../lib/polling.ts";
 import { createTelegramConfigStore } from "../lib/config.ts";
+import { createTelegramWorkspaceAdmissionLedger, createTelegramWorkspaceAdmissionProfileKey } from "../lib/workspace-admission.ts";
 import { createTelegramTopicTargetStore } from "../lib/threads.ts";
 import {
   createTelegramLockedPollingRuntime,
+  createTelegramRuntimeStateCutover,
   createTelegramLockKeyResolver,
   createTelegramLockRuntime,
   readLocks,
@@ -50,6 +54,8 @@ import {
   TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE,
   TELEGRAM_OWNERSHIP_REFRESH_MS,
   withTelegramFileTransaction,
+  installTelegramLegacyTransactionBarrier,
+  loadTelegramFileTransactionKernelBackend,
   TelegramFileTransactionKernelError,
   type TelegramFileTransactionKernel,
   publishTelegramPrivateFile,
@@ -63,7 +69,141 @@ import {
 import { createTelegramSessionContextStore } from "../lib/lifecycle.ts";
 import { readTelegramSyncBlockTotals } from "../lib/loop-lag.ts";
 
+test("Cold legacy admission barrier rejects a path outside its transaction contract before authority", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-legacy-cutover-invalid-"));
+  try {
+    for (const path of ["relative.transaction", join(dir, "settings.json"), join(dir, "guard.transaction") + "\0"])
+      assert.throws(() => installTelegramLegacyTransactionBarrier(path, () => assert.fail("Invalid path reaches authority")), /exact absolute transaction path/u);
+    assert.deepEqual(readdirSync(dir), []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const mode of ["held", "damage", "interrupted", "foreign", "cancel-before", "cancel-after"] as const) {
+  test(`Cold legacy admission barrier preserves occupied evidence (${mode})`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "pt-legacy-cutover-")), guard = join(dir, "legacy.transaction");
+    const install = () => installTelegramLegacyTransactionBarrier(guard, () => true);
+    try {
+      if (mode === "held") {
+        withTelegramFileTransaction(guard, () => {
+          const [marker] = readdirSync(guard), path = join(guard, marker!), before = readFileSync(path);
+          assert.throws(install);
+          assert.throws(() => installTelegramLegacyTransactionBarrier(guard, () => true, { allowDamagedDirectory: true }), /verifiable or changing owner/u);
+          assert.deepEqual(readdirSync(guard), [marker]);
+          assert.deepEqual(readFileSync(path), before);
+        });
+      } else if (mode === "cancel-before") {
+        let checks = 0;
+        assert.throws(() => installTelegramLegacyTransactionBarrier(guard, () => ++checks < 2), /cold maintenance authority/u);
+        assert.equal(existsSync(guard), false);
+      } else if (mode === "cancel-after") {
+        let checks = 0;
+        assert.throws(() => installTelegramLegacyTransactionBarrier(guard, () => ++checks < 3), /cold maintenance authority/u);
+        assert.ok(existsSync(guard), "A spent authority cannot announce even its completed publication");
+      } else if (mode === "damage") {
+        mkdirSync(guard);
+        const owner = join(guard, `owner.${randomUUID()}.json`);
+        writeFileSync(owner, "", { mode: 0o600 });
+        const identity = statSync(guard, { bigint: true });
+        assert.throws(install);
+        assert.equal(statSync(guard, { bigint: true }).ino, identity.ino);
+        assert.equal(readFileSync(owner).length, 0);
+        return;
+      } else {
+        if (mode === "foreign") {
+          const other = join(dir, "other.transaction");
+          assert.equal(installTelegramLegacyTransactionBarrier(other, () => true), "installed");
+          writeFileSync(guard, readFileSync(other), { mode: 0o600 });
+        } else writeFileSync(guard, "pi-telegram:kernel-cutover-v1:", { mode: 0o600 });
+        const before = readFileSync(guard);
+        assert.throws(install, /missing or does not match/u);
+        assert.deepEqual(readFileSync(guard), before);
+        return;
+      }
+      assert.equal(install(), mode === "cancel-after" ? "already-installed" : "installed");
+      const bytes = readFileSync(guard), inode = statSync(guard, { bigint: true }).ino;
+      assert.equal(install(), "already-installed");
+      assert.throws(() => withTelegramFileTransaction(guard, () => assert.fail("Legacy admission reopened"), { attempts: 1 }),
+        { code: "guard-unverifiable", phase: "acquire" });
+      assert.deepEqual(readFileSync(guard), bytes);
+      assert.equal(statSync(guard, { bigint: true }).ino, inode);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const mode of ["empty", "empty-owner", "malformed-owner", "validates-late", "replaced-directory", "cancel", "partial", "unknown-layout", "linked-owner"] as const) {
+  test(`Cold cutover adds its marker without retiring a damaged legacy directory (${mode})`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "pt-legacy-cutover-damaged-")), guard = join(dir, "state.transaction");
+    try {
+      mkdirSync(guard, { mode: 0o700 });
+      const generation = randomUUID(), owner = join(guard, `owner.${generation}.json`), marker = join(guard, "kernel-cutover-v1");
+      const body = mode === "malformed-owner" ? "{ broken" : "";
+      if (mode !== "empty" && mode !== "replaced-directory") writeFileSync(owner, body, { mode: 0o600 });
+      if (mode === "partial") writeFileSync(marker, "pi-telegram:kernel-cutover-v1:", { mode: 0o600 });
+      if (mode === "unknown-layout") writeFileSync(join(guard, "foreign"), "untouched", { mode: 0o600 });
+      if (mode === "linked-owner") linkSync(owner, join(dir, "owner-alias"));
+      const identity = statSync(guard, { bigint: true }), names = readdirSync(guard), bytes = names.map(name => readFileSync(join(guard, name)));
+      let checks = 0;
+      const install = (current = () => true) => installTelegramLegacyTransactionBarrier(guard, current, { allowDamagedDirectory: true });
+      if (mode === "replaced-directory") {
+        const old = join(dir, "displaced");
+        assert.throws(() => install(() => {
+          if (++checks === 2) { renameSync(guard, old); mkdirSync(guard, { mode: 0o700 }); }
+          return true;
+        }), /barrier directory changed/u);
+        assert.deepEqual(readdirSync(guard), []); assert.deepEqual(readdirSync(old), []);
+        assert.equal(statSync(old, { bigint: true }).ino, identity.ino);
+        return;
+      }
+      if (mode === "validates-late") {
+        const valid = JSON.stringify({ pid: process.pid, generation, acquiredAtMs: 1 });
+        assert.throws(() => install(() => {
+          if (++checks === 2) writeFileSync(owner, valid);
+          return true;
+        }), /verifiable or changing owner/u);
+        assert.equal(readFileSync(owner, "utf8"), valid);
+        assert.deepEqual(readdirSync(guard), names);
+      } else if (mode === "cancel" || mode === "partial" || mode === "unknown-layout" || mode === "linked-owner") {
+        assert.throws(() => install(() => mode !== "cancel" || ++checks < 2));
+        assert.deepEqual(readdirSync(guard), names);
+        assert.deepEqual(names.map(name => readFileSync(join(guard, name))), bytes);
+      } else {
+        assert.equal(install(), "installed");
+        const markerBytes = readFileSync(marker), inode = statSync(marker, { bigint: true }).ino;
+        assert.equal(install(), "already-installed");
+        assert.throws(() => withTelegramFileTransaction(guard, () => assert.fail("Legacy admission reopened"), { attempts: 1 }),
+          { code: "guard-unverifiable", reason: "invalid-layout", phase: "acquire" });
+        assert.deepEqual(readdirSync(guard).sort(), [...names, basename(marker)].sort());
+        assert.deepEqual(names.map(name => readFileSync(join(guard, name))), bytes);
+        assert.equal(statSync(marker, { bigint: true }).ino, inode);
+        assert.deepEqual(readFileSync(marker), markerBytes);
+      }
+      const after = statSync(guard, { bigint: true });
+      assert.equal(after.ino, identity.ino); assert.equal(after.dev, identity.dev);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
 for (const layout of ["source", "compiled"] as const) {
+  test(`Cold legacy admission barrier permits one exclusive publication (${layout})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pt-legacy-cutover-race-")), guard = join(dir, "legacy.transaction");
+    const url = new URL(layout === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+    try {
+      const source = `
+        import { installTelegramLegacyTransactionBarrier } from ${JSON.stringify(url)};
+        try { console.log(installTelegramLegacyTransactionBarrier(${JSON.stringify(guard)}, () => true)); }
+        catch (error) {
+          if (!/barrier is missing or does not match|private file changed during inspection/u.test(error.message)) throw error;
+          console.log("unready");
+        }
+      `;
+      const children = await Promise.all([runNodeEval(source), runNodeEval(source)]);
+      for (const child of children) assert.equal(child.code, 0, child.stderr);
+      const outcomes = children.map(child => child.stdout.trim());
+      assert.equal(outcomes.filter(outcome => outcome === "installed").length, 1);
+      assert.ok(outcomes.every(outcome => ["installed", "already-installed", "unready"].includes(outcome)), outcomes.join(", "));
+      assert.equal(installTelegramLegacyTransactionBarrier(guard, () => true), "already-installed");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   for (const fault of ["cold", "healthy", "worker", "missing", "catalog", "manifest", "image", "tuple", "hardlink", "directory", "oversized", "read-race",
     "arch", "node", "napi", "old-napi", "alternate", "musl", "old-glibc", "old-os", "bad-exports", "accessor", "late-change"] as const) {
     test(`Private kernel loader admits exact package bytes without default activation (${layout}/${fault})`, { skip: process.arch !== "x64" }, async () => {
@@ -222,6 +362,170 @@ test("Private source and compiled kernel loaders share one canonical native inst
     `);
     assert.equal(result.code, 0, result.stderr);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Cutover mode requires an exact legacy barrier and a real kernel lease, with no legacy fallback", { skip: process.arch !== "x64" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-legacy-cutover-kernel-"));
+  const guard = join(dir, "state.transaction"), other = join(dir, "other.transaction"), anchorPath = join(dir, "coord.lock");
+  try {
+    writeFileSync(anchorPath, "", { mode: 0o600 });
+    const backend = loadTelegramFileTransactionKernelBackend(), kernel = { ...backend, anchorPath };
+    const options = { kernel, requireLegacyBarrier: true } as const;
+    const forbidden = () => assert.fail("Missing cutover evidence reached the original callback");
+    assert.throws(() => withTelegramFileTransaction(guard, forbidden, { requireLegacyBarrier: true }), { reason: "invalid-port" });
+    assert.throws(() => withTelegramFileTransaction(guard, forbidden, options), /does not match/u);
+    assert.equal(existsSync(guard), false, "Opted-in refusal cannot create a legacy guard");
+    assert.equal(installTelegramLegacyTransactionBarrier(guard, () => true), "installed");
+    const bytes = readFileSync(guard), identity = statSync(guard, { bigint: true });
+    writeFileSync(other, bytes, { mode: 0o600 });
+    assert.throws(() => withTelegramFileTransaction(other, forbidden, options), /does not match/u);
+    assert.equal(withTelegramFileTransaction(guard, () => {
+      assert.equal(kernel.tryAcquire(anchorPath), undefined, "Original callback holds the native resource");
+      assert.throws(() => withTelegramFileTransaction(guard, forbidden), { code: "guard-unverifiable" });
+      return 42;
+    }, options), 42);
+    assert.equal(statSync(guard, { bigint: true }).ino, identity.ino);
+    assert.deepEqual(readFileSync(guard), bytes);
+    const damaged = join(dir, "damaged.transaction");
+    mkdirSync(damaged, { mode: 0o700 });
+    const originalOwner = join(damaged, `owner.${randomUUID()}.json`);
+    writeFileSync(originalOwner, "", { mode: 0o600 });
+    assert.throws(() => withTelegramFileTransaction(damaged, forbidden, options), /does not match/u);
+    assert.equal(installTelegramLegacyTransactionBarrier(damaged, () => true, { allowDamagedDirectory: true }), "installed");
+    assert.equal(withTelegramFileTransaction(damaged, () => {
+      assert.equal(kernel.tryAcquire(anchorPath), undefined);
+      return 43;
+    }, options), 43);
+    assert.equal(readFileSync(originalOwner).length, 0);
+    const lease = kernel.tryAcquire(anchorPath);
+    assert.ok(lease); assert.equal(kernel.release(lease), true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const mode of ["healthy", "damaged", "partial-mode", "partial-barrier", "lost-barrier", "lost-mode", "lost-anchor", "replaced-anchor", "lost-directory", "foreign-mode"] as const) {
+  test(`Runtime state cutover never falls back after its durable mode is selected (${mode})`, { skip: process.arch !== "x64" }, () => {
+    const agent = realpathSync(mkdtempSync(join(tmpdir(), "pt-state-cutover-")));
+    const cutover = createTelegramRuntimeStateCutover(agent);
+    const root = resolveTelegramTempDir(agent), state = resolveTelegramStatePath(agent);
+    const guard = join(root, "runtime", "state.json.transaction"), directory = join(agent, "telegram-kernel-cutover");
+    const marker = join(directory, "state.mode"), anchor = join(directory, "state.lock");
+    const forbidden = () => assert.fail("Incomplete cutover allowed legacy or kernel execution");
+    try {
+      const initial = '{"version":2,"profiles":{"default":{"runtime":{"ready":true}}}}\n';
+      assert.equal(cutover.run(() => existsSync(guard)), true, "Healthy pre-cutover mode retains ordinary legacy serialization");
+      assert.equal(existsSync(directory), false);
+      writeFileSync(state, initial, { mode: 0o600 });
+      if (mode === "damaged" || mode === "partial-barrier") {
+        mkdirSync(guard, { mode: 0o700 });
+        writeFileSync(join(guard, `owner.${randomUUID()}.json`), "", { mode: 0o600 });
+      }
+      if (mode === "partial-barrier") {
+        writeFileSync(join(guard, "kernel-cutover-v1"), "partial", { mode: 0o600 });
+        assert.throws(() => cutover.install(() => true), /does not match/u);
+        assert.equal(existsSync(marker), false);
+      } else if (mode === "partial-mode") {
+        mkdirSync(directory, { mode: 0o700 });
+        writeFileSync(anchor, "", { mode: 0o600 });
+        writeFileSync(marker, "partial", { mode: 0o600 });
+        assert.throws(() => cutover.install(() => true), /mode is incomplete/u);
+        assert.equal(existsSync(guard), false);
+      } else {
+        cutover.install(() => true);
+        const originalAnchor = statSync(anchor, { bigint: true });
+        cutover.install(() => true);
+        assert.equal(statSync(anchor, { bigint: true }).ino, originalAnchor.ino);
+        if (mode === "healthy" || mode === "damaged") {
+          const successor = createTelegramRuntimeStateCutover(agent);
+          assert.equal(successor.run(() => {
+            assert.throws(() => cutover.run(forbidden), { reason: "busy" });
+            assert.throws(() => cutover.install(() => true), { reason: "busy" });
+            assert.throws(() => withTelegramFileTransaction(guard, forbidden, { attempts: 1 }), { code: "guard-unverifiable" });
+            return readFileSync(state, "utf8");
+          }), initial);
+          return;
+        }
+        if (mode === "lost-barrier") {
+          rmSync(guard, { recursive: true });
+          assert.throws(() => cutover.install(() => true), /^Error: Telegram legacy transaction barrier/u);
+          assert.equal(existsSync(guard), false, "A completed mode is not eligible for an implicit barrier reinstall");
+        }
+        if (mode === "lost-mode") rmSync(marker);
+        if (mode === "lost-anchor" || mode === "replaced-anchor") {
+          renameSync(anchor, join(directory, "displaced"));
+          if (mode === "replaced-anchor") writeFileSync(anchor, "", { mode: 0o600 });
+          else {
+            assert.throws(() => cutover.install(() => true), /anchor is unavailable/u);
+            assert.equal(existsSync(anchor), false, "An installed anchor is never recreated by maintenance retry");
+          }
+        }
+        if (mode === "lost-directory") {
+          renameSync(directory, `${directory}-displaced`);
+          rmSync(guard, { recursive: true });
+          assert.throws(() => cutover.run(forbidden), /anchor is unavailable/u);
+          assert.equal(existsSync(guard), false);
+          return;
+        }
+        if (mode === "foreign-mode") {
+          const foreign = join(agent, "foreign"); mkdirSync(foreign);
+          createTelegramRuntimeStateCutover(foreign).install(() => true);
+          writeFileSync(marker, readFileSync(join(foreign, "telegram-kernel-cutover", "state.mode")));
+        }
+      }
+      assert.throws(() => createTelegramRuntimeStateCutover(agent).run(forbidden), /^Error: Telegram (?:runtime cutover|legacy transaction barrier)/u);
+      assert.equal(readFileSync(state, "utf8"), initial);
+      if (mode === "lost-barrier" || mode === "partial-mode") assert.equal(existsSync(guard), false);
+    } finally { rmSync(agent, { recursive: true, force: true }); }
+  });
+}
+
+test("Runtime state cutover refuses two agent roots aliasing the same legacy storage", { skip: process.platform === "win32" }, () => {
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "pt-state-cutover-alias-")));
+  try {
+    const agent = join(parent, "agent"), foreign = join(parent, "foreign");
+    mkdirSync(agent); mkdirSync(join(foreign, "tmp"), { recursive: true });
+    symlinkSync(join(foreign, "tmp"), join(agent, "tmp"), "dir");
+    const cutover = createTelegramRuntimeStateCutover(agent);
+    assert.throws(() => cutover.install(() => true), /scope is unavailable or aliased/u);
+    assert.throws(() => cutover.run(() => assert.fail("Aliased resource admitted")), /scope is unavailable or aliased/u);
+    assert.equal(existsSync(join(agent, "telegram-kernel-cutover")), false);
+    assert.deepEqual(readdirSync(join(foreign, "tmp")), []);
+  } finally { rmSync(parent, { recursive: true, force: true }); }
+});
+
+test("Actual compiled successor resumes an interrupted runtime cutover without replacing its anchor", { skip: process.arch !== "x64" }, async () => {
+  const agent = realpathSync(mkdtempSync(join(tmpdir(), "pt-state-cutover-compiled-")));
+  const directory = join(agent, "telegram-kernel-cutover"), anchor = join(directory, "state.lock");
+  try {
+    const guard = join(resolveTelegramTempDir(agent), "runtime", "state.json.transaction");
+    mkdirSync(directory, { mode: 0o700 }); writeFileSync(anchor, "", { mode: 0o600 });
+    assert.equal(installTelegramLegacyTransactionBarrier(guard, () => true), "installed");
+    const identity = statSync(anchor, { bigint: true });
+    const marker = readFileSync(guard), mode = join(directory, "state.mode");
+    const prepare = () => runNodeEval(`
+      import assert from "node:assert/strict";
+      import { createTelegramRuntimeStateCutover } from ${JSON.stringify(new URL("../dist/lib/locks.js", import.meta.url).href)};
+      const agent = ${JSON.stringify(agent)}, cutover = createTelegramRuntimeStateCutover(agent);
+      assert.throws(() => cutover.run(() => assert.fail("Interrupted transition admitted work")), /mode is incomplete/u);
+      process.argv = [process.execPath, "prepare-cold-cutover.mjs", "--agent-dir", agent, "--confirm-all-writers-stopped"];
+      await import(${JSON.stringify(new URL("../scripts/prepare-cold-cutover.mjs", import.meta.url).href)});
+      if (process.exitCode !== 1) assert.equal(cutover.run(() => "ready"), "ready");
+    `);
+    const backend = loadTelegramFileTransactionKernelBackend(), held = backend.tryAcquire(anchor);
+    assert.ok(held);
+    try {
+      const blocked = await prepare();
+      assert.equal(blocked.signal, null); assert.equal(blocked.code, 1, blocked.stdout + blocked.stderr);
+      assert.match(blocked.stderr, /kernel transaction busy during acquire/u);
+      assert.equal(blocked.stdout, ""); assert.equal(existsSync(mode), false, "A competing preparer cannot publish readiness");
+      assert.deepEqual(readFileSync(guard), marker);
+    } finally { assert.equal(backend.release(held), true); }
+    const result = await prepare();
+    assert.equal(result.signal, null); assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /No connection was started/u);
+    assert.equal(statSync(anchor, { bigint: true }).ino, identity.ino);
+    assert.deepEqual(readFileSync(guard), marker);
+    assert.equal(createTelegramRuntimeStateCutover(agent).run(() => "ready"), "ready");
+  } finally { rmSync(agent, { recursive: true, force: true }); }
 });
 
 for (const mode of ["success", "busy", "acquire-error", "invalid-lease", "async-lease", "pre-aborted", "acquire-aborted", "legacy-aborted", "legacy-damaged",
@@ -865,6 +1169,87 @@ test("Consolidated runtime state serializes competing processes without losing s
     assert.deepEqual(readdirSync(join(temp.dir, "runtime")), []);
   } finally { rmSync(temp.dir, { recursive: true, force: true }); }
 });
+
+for (const mode of ["ready", "lost-barrier"] as const) {
+  test(`All consolidated state transactions use the same cutover port (${mode})`, { skip: process.arch !== "x64" }, async () => {
+    const agent = realpathSync(mkdtempSync(join(tmpdir(), "pt-state-cutover-consumers-")));
+    const statePath = resolveTelegramStatePath(agent), cutover = createTelegramRuntimeStateCutover(agent), stateTransaction = cutover.runFor;
+    try {
+      cutover.install(() => true);
+      const owner = createTelegramLockRuntime({ statePath, stateTransaction, instanceId: "current", mintLeaderEpoch: () => "cutover" });
+      assert.equal(owner.acquire({ cwd: "/fixture" }).ok, true);
+      const workspace = createTelegramTopicTargetStore({ path: statePath, consolidated: {
+        captureAuthority: () => () => true,
+        publishIfOwned: owner.publishStateSectionIfOwned!,
+        stateTransaction,
+      } });
+      await workspace.load();
+      const ledger = createTelegramWorkspaceAdmissionLedger({ path: statePath, stateProfile: "work",
+        profileKey: createTelegramWorkspaceAdmissionProfileKey({ profileName: "work", botToken: "fixture-cutover" }),
+        stateTransaction, getProcessLiveness: () => "alive", owner: { processId: process.pid, processBirthId: `${process.pid}:cutover-fixture` } });
+      const acquire = () => ledger.acquireAdmission({ operationId: "cutover-lease", operationKind: "test", scope: { kind: "profile" } });
+      const reset = () => resetDamagedTelegramRuntimeState(statePath, undefined, () => {}, stateTransaction);
+      let callbacks = 0;
+      const observe = () => workspace.observeWorkspaceSnapshot(() => ++callbacks);
+      const publish = () => owner.publishStateSectionIfOwned!("runtime", () => ({ value: { polling: true }, result: ++callbacks }), { isCurrent: () => true });
+      const before = readFileSync(statePath);
+      if (mode === "lost-barrier") {
+        const guard = join(resolveTelegramTempDir(agent), "runtime", "state.json.transaction");
+        rmSync(guard);
+        const error = /^Error: Telegram legacy transaction barrier/u;
+        for (const attempt of [observe, publish, acquire, reset, () => owner.commitIfOwned(() => callbacks++)])
+          assert.throws(attempt, error);
+        await assert.rejects(workspace.refresh!(), error);
+        assert.equal(callbacks, 0, "No domain callback may borrow a legacy transaction after cutover");
+        assert.deepEqual(readFileSync(statePath), before);
+        assert.equal(existsSync(guard), false);
+        return;
+      }
+      cutover.run(() => {
+        for (const attempt of [observe, publish, acquire, reset, () => owner.commitIfOwned(() => callbacks++)])
+          assert.throws(attempt, { code: "kernel-transaction-refused", reason: "busy" });
+        assert.equal(callbacks, 0);
+      });
+      assert.equal(observe(), 1);
+      assert.deepEqual(publish(), { committed: true, result: 2 });
+      const lease = acquire();
+      assert.ok(lease.kind === "acquired"); assert.equal(ledger.releaseAdmission(lease.lease), true);
+      assert.equal(reset(), false, "A cutover is not permission to reset healthy data");
+      assert.equal(owner.release().kind, "active-here");
+      assert.deepEqual(readTelegramRuntimeState(statePath).profiles.default?.runtime, { polling: true });
+    } finally { rmSync(agent, { recursive: true, force: true }); }
+  });
+}
+
+for (const lost of ["barrier", "mode", "directory"] as const) {
+  test(`Cutover ownership observations revoke transport without reacquiring the lease (${lost})`, { skip: process.arch !== "x64" }, () => {
+    const agent = realpathSync(mkdtempSync(join(tmpdir(), "pt-cutover-owner-")));
+    const statePath = resolveTelegramStatePath(agent), cutover = createTelegramRuntimeStateCutover(agent);
+    const directory = join(agent, "telegram-kernel-cutover");
+    const artifact = lost === "barrier" ? join(resolveTelegramTempDir(agent), "runtime", "state.json.transaction") :
+      lost === "mode" ? join(directory, "state.mode") : directory;
+    const displaced = join(agent, "fixture-displaced");
+    try {
+      cutover.install(() => true);
+      const owner = createTelegramLockRuntime({ statePath, stateTransaction: cutover.runFor,
+        assertStateAuthority: cutover.assertAuthority, instanceId: "fixture-owner", mintLeaderEpoch: () => "cutover-owner" });
+      const acquired = owner.acquire({ cwd: "/fixture" }); assert.ok(acquired.ok);
+      const f = owner.captureFollowerRegistrationScope(acquired.lock);
+      cutover.run(() => { assert.equal(owner.owns(), true); assert.equal(f(), true); });
+      const initial = readFileSync(statePath);
+      renameSync(artifact, displaced);
+      assert.equal(owner.owns(), false);
+      assert.equal(owner.getOwnedLeaderEpoch(), undefined);
+      assert.equal(owner.getState().kind, "inactive");
+      assert.equal(f(), false);
+      assert.deepEqual(readFileSync(statePath), initial, "The raw transport record alone is not proof");
+      renameSync(displaced, artifact);
+      assert.equal(owner.owns(), false, "Restoring evidence does not renew a spent transport lifetime");
+      assert.equal(f(), false, "The captured follower registration never revives");
+      assert.equal(owner.refresh({ cwd: "/fixture" }), false);
+    } finally { rmSync(agent, { recursive: true, force: true }); }
+  });
+}
 
 test("Consolidated transport lifecycle preserves custody, other sections and other profiles", () => {
   const temp = createTempLockPath(), path = join(temp.dir, "state.json");

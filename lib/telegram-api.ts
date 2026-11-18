@@ -930,6 +930,7 @@ export interface TelegramBridgeApiRuntime extends Pick<
   getUpdates: (
     body: Record<string, unknown>,
     signal?: AbortSignal,
+    assertAuthority?: () => void,
   ) => Promise<TelegramUpdate[]>;
   setMyCommands: (
     commands: readonly { command: string; description: string }[],
@@ -2421,8 +2422,8 @@ export function createTelegramBridgeApiRuntime(
         { drop_pending_updates: false },
         { signal },
       ),
-    getUpdates: (body, signal) =>
-      callRecorded<TelegramUpdate[]>("getUpdates", body, { signal }),
+    getUpdates: (body, signal, assertAuthority) =>
+      callRecorded<TelegramUpdate[]>("getUpdates", body, { signal, assertAuthority }),
     setMyCommands: (commands, options) =>
       callRecorded<boolean>("setMyCommands", { commands }, options),
     sendChatAction: (chatId, action, options) =>

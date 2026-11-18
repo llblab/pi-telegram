@@ -185,14 +185,14 @@ test(`Consolidated ${observation} serializes one original read against a native 
         calls++; observing = true;
         try { return Kernel.readTelegramRuntimeState(candidate); } finally { observing = false; }
       },
-      withTelegramFileTransaction(candidate: string, operation: () => unknown, options: { recoverAbandoned?: boolean }) {
-        if (armed && candidate === guard) {
+      withTelegramRuntimeStateTransaction(candidate: string, operation: () => unknown, options: { recoverAbandoned?: boolean }) {
+        if (armed && candidate === path) {
           guardCalls++;
           assert.equal(options.recoverAbandoned, false, "Load observation cannot acquire abandoned-owner recovery authority");
           if (mode === "unguarded") return operation();
-          if (mode === "wrong-guard") candidate += ".wrong";
+          if (mode === "wrong-guard") return Kernel.withTelegramFileTransaction(guard + ".wrong", operation, options);
         }
-        return Kernel.withTelegramFileTransaction(candidate, operation, options);
+        return Kernel.withTelegramRuntimeStateTransaction(candidate, operation, options);
       },
     } });
     const Threads = await import(storeUrl);

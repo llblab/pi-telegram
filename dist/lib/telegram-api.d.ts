@@ -509,7 +509,7 @@ export interface TelegramBridgeApiRuntime extends Pick<TelegramApiClient, "call"
     }) => TelegramAttachmentPublicationTransport | undefined;
     downloadFile: (fileId: string, suggestedName: string, source?: TelegramAttachmentSource) => Promise<string>;
     deleteWebhook: (signal?: AbortSignal) => Promise<boolean>;
-    getUpdates: (body: Record<string, unknown>, signal?: AbortSignal) => Promise<TelegramUpdate[]>;
+    getUpdates: (body: Record<string, unknown>, signal?: AbortSignal, assertAuthority?: () => void) => Promise<TelegramUpdate[]>;
     setMyCommands: (commands: readonly {
         command: string;
         description: string;

@@ -679,9 +679,13 @@ export function createTelegramBusAwareApiRuntime(
       body: Record<string, unknown>,
       signal?: AbortSignal,
     ): Promise<TelegramUpdate[]> {
-      return deps.ownsDirect()
-        ? deps.directRuntime.getUpdates(body, signal)
-        : rejectTelegramDirectOwnership("getUpdates");
+      if (!deps.ownsDirect()) return rejectTelegramDirectOwnership("getUpdates");
+      let lost = false;
+      return deps.directRuntime.getUpdates(body, signal, () => {
+        if (!lost && deps.ownsDirect()) return;
+        lost = true;
+        throw new Error("Telegram polling transport authority is unavailable.");
+      });
     },
     setMyCommands(commands, options): Promise<boolean> {
       if (deps.ownsDirect())

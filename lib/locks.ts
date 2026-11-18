@@ -18,10 +18,13 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  opendirSync,
   readFileSync,
   readSync,
   readdirSync,
+  realpathSync,
   type Stats,
+  type BigIntStats,
   renameSync,
   rmSync,
   unlinkSync,
@@ -34,6 +37,7 @@ import {
   isTelegramSessionPollingJournalPath,
   resolveTelegramOwnersPath,
   resolveTelegramSessionPollingJournalPath,
+  resolveTelegramStatePath,
   resolveTelegramUpdateJournalPathForProfile,
 } from "./paths.ts";
 import {
@@ -204,6 +208,8 @@ interface TelegramLockRuntimeOptions {
   locksPath?: string;
   /** Consolidated version-2 state envelope; exclusive with `locksPath`. */
   statePath?: string;
+  stateTransaction?: TelegramRuntimeStateTransaction;
+  assertStateAuthority?: (path: string) => void;
   statePublication?: Pick<
     TelegramRuntimeStatePublicationOptions,
     "onPublicationBoundary" | "publishRename"
@@ -553,6 +559,104 @@ function readLockTransactionOwner(
   }
 }
 
+function telegramLegacyTransactionBarrierBody(path: string): string {
+  if (typeof path !== "string" || !isAbsolute(path) || path.includes("\0") || resolve(path) !== path || !basename(path).endsWith(".transaction"))
+    throw new Error("Telegram legacy transaction barrier requires an exact absolute transaction path.");
+  // This record deliberately has no legacy owner shape, including during a partial write.
+  return `pi-telegram:kernel-cutover-v1:${createHash("sha256").update(path).digest("hex")}\n`;
+}
+
+const TELEGRAM_LEGACY_CUTOVER_MARKER = "kernel-cutover-v1";
+
+function assertLegacyBarrierDirectoryCurrent(path: string, original: BigIntStats, afterPublication = false): void {
+  const current = lstatSync(path, { bigint: true });
+  if (!current.isDirectory() || !isTelegramOwnerPrivate(current) || current.dev !== original.dev || current.ino !== original.ino ||
+      (!afterPublication && (current.mtimeNs !== original.mtimeNs || current.ctimeNs !== original.ctimeNs)))
+    throw new Error("Telegram legacy transaction barrier directory changed.");
+}
+
+function readLegacyBarrierDirectory(path: string, original: BigIntStats): { marker: boolean; owner?: string } {
+  if (!original.isDirectory() || !isTelegramOwnerPrivate(original))
+    throw new Error("Telegram legacy transaction barrier directory is not private.");
+  const dir = opendirSync(path, { bufferSize: 3 });
+  let marker = false, owner: string | undefined;
+  try {
+    for (let entry = dir.readSync(); entry; entry = dir.readSync()) {
+      if (entry.isFile() && entry.name === TELEGRAM_LEGACY_CUTOVER_MARKER && !marker) marker = true;
+      else if (entry.isFile() && TELEGRAM_TRANSACTION_OWNER_PATTERN.test(entry.name) && !owner) owner = entry.name;
+      else throw new Error("Telegram legacy transaction barrier directory has an unsupported layout.");
+    }
+  } finally { dir.closeSync(); }
+  assertLegacyBarrierDirectoryCurrent(path, original);
+  return { marker, owner };
+}
+
+function assertTelegramLegacyTransactionBarrier(path: string, expected: string): void {
+  const original = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+  if (original?.isDirectory()) {
+    const { marker } = readLegacyBarrierDirectory(path, original);
+    if (marker && readTelegramPrivateFile(join(path, TELEGRAM_LEGACY_CUTOVER_MARKER), expected.length) === expected) {
+      assertLegacyBarrierDirectoryCurrent(path, original);
+      return;
+    }
+  } else if (readTelegramPrivateFile(path, expected.length) === expected) return;
+  throw new Error("Telegram legacy transaction barrier is missing or does not match this path.");
+}
+
+/**
+ * Close one legacy admission pathname during authorized cold maintenance.
+ * Drain predecessor processes and exclude relaunch first; this marker only closes future entry.
+ * An explicit directory conversion adds one marker to a supported damaged guard without replacing its pathname or bytes.
+ */
+export function installTelegramLegacyTransactionBarrier(
+  path: string,
+  isMaintenanceCurrent: () => boolean,
+  options: { allowDamagedDirectory?: true } = {},
+): "installed" | "already-installed" {
+  const expected = telegramLegacyTransactionBarrierBody(path);
+  const assertMaintenance = () => {
+    if (isMaintenanceCurrent() !== true)
+      throw new Error("Telegram legacy transaction barrier requires current cold maintenance authority.");
+  };
+  assertMaintenance();
+  const existing = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+  let destination = path, retainedOwner = false;
+  if (existing?.isDirectory() && options.allowDamagedDirectory === true) {
+    const { marker, owner } = readLegacyBarrierDirectory(path, existing);
+    if (marker) {
+      assertTelegramLegacyTransactionBarrier(path, expected);
+      assertMaintenance();
+      return "already-installed";
+    }
+    retainedOwner = owner !== undefined;
+    destination = join(path, TELEGRAM_LEGACY_CUTOVER_MARKER);
+  } else if (!existing) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  assertMaintenance();
+  if (retainedOwner) {
+    let invalid = false;
+    try { readLockTransactionOwner(path); }
+    catch (error) {
+      if (!(error instanceof TelegramFileTransactionGuardError) || error.reason !== "invalid-owner") throw error;
+      invalid = true;
+    }
+    if (!invalid) throw new Error("Telegram legacy transaction barrier cannot convert a verifiable or changing owner.");
+  }
+  if (destination !== path) assertLegacyBarrierDirectoryCurrent(path, existing!);
+  try {
+    // Exclusive creation refuses overlap. A partial marker blocks legacy entry but cannot admit the successor.
+    writeFileSync(destination, expected, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if ((error as { code?: unknown })?.code !== "EEXIST") throw error;
+    assertTelegramLegacyTransactionBarrier(path, expected);
+    assertMaintenance();
+    return "already-installed";
+  }
+  if (destination !== path) assertLegacyBarrierDirectoryCurrent(path, existing!, true);
+  assertTelegramLegacyTransactionBarrier(path, expected);
+  assertMaintenance();
+  return "installed";
+}
+
 function createLockTransactionContentionError(path: string): Error {
   return Object.assign(
     new Error(`Telegram lock transaction guard already exists: ${path}`),
@@ -653,7 +757,7 @@ type TelegramTransactionGlobal = typeof globalThis & {
 };
 
 /** Private per-resource port; callers own immutable anchor placement and backend admission.
- * Kernel exclusion supplements the legacy guard; it grants no reset or old-writer closure. */
+ * Kernel exclusion grants no reset, old-writer closure or authority to select cutover mode. */
 export interface TelegramFileTransactionKernel {
   readonly anchorPath: string;
   readonly signal?: AbortSignal;
@@ -790,6 +894,8 @@ export class TelegramFileTransactionKernelError extends Error {
 export interface TelegramFileTransactionOptions {
   /** Dormant until an admitted backend is supplied; no default loader or recovery activation. */
   kernel?: TelegramFileTransactionKernel;
+  /** Explicit cutover selection, established independently of the marker. Missing proof never falls back to legacy. */
+  requireLegacyBarrier?: true;
   recoveryRename?: typeof renameSync;
   publishRename?: typeof renameSync;
   /** Observation leases may contend but must not acquire abandoned-owner recovery authority. */
@@ -1075,8 +1181,11 @@ export function withTelegramFileTransaction<T>(
   operation: () => T,
   options: TelegramFileTransactionOptions = {},
 ): T {
-  const kernel = options.kernel;
+  const kernel = options.kernel, requireBarrier = options.requireLegacyBarrier;
+  if (requireBarrier !== undefined && (requireBarrier !== true || !kernel))
+    throw new TelegramFileTransactionKernelError(transactionPath, "invalid-port", "acquire");
   if (!kernel) return withLegacyFileTransaction(transactionPath, operation, options);
+  const barrierBody = requireBarrier ? telegramLegacyTransactionBarrierBody(transactionPath) : undefined;
   const { anchorPath, signal, tryAcquire, release } = kernel;
   // This is lexical validation only, not proof of stable ancestry or writer closure.
   const guard = resolve(transactionPath), anchor = typeof anchorPath === "string" ? resolve(anchorPath) : "";
@@ -1095,6 +1204,11 @@ export function withTelegramFileTransaction<T>(
   let failed = false, operationError: unknown;
   try {
     signal?.throwIfAborted();
+    if (barrierBody !== undefined) {
+      assertTelegramLegacyTransactionBarrier(transactionPath, barrierBody);
+      signal?.throwIfAborted();
+      return operation();
+    }
     return withLegacyFileTransaction(transactionPath, () => {
       signal?.throwIfAborted();
       return operation();
@@ -1127,6 +1241,176 @@ function withLegacyFileTransaction<T>(
     releaseLockTransactionGuard(transactionPath, owner);
     recordTelegramSyncBlock("transaction-held", Date.now() - heldAtMs);
   }
+}
+
+type TelegramRuntimeStateTransactionOptions = Pick<TelegramFileTransactionOptions, "recoverAbandoned">;
+export type TelegramRuntimeStateTransaction = <T>(
+  path: string,
+  operation: () => T,
+  options?: TelegramRuntimeStateTransactionOptions,
+) => T;
+
+export function withTelegramRuntimeStateTransaction<T>(
+  path: string,
+  operation: () => T,
+  options?: TelegramRuntimeStateTransactionOptions,
+): T {
+  requireRuntimeStatePath(path);
+  const runtime = join(dirname(path), "runtime");
+  mkdirSync(runtime, { recursive: true, mode: 0o700 });
+  return withTelegramFileTransaction(join(runtime, `${basename(path)}.transaction`), operation, options);
+}
+
+const activeRuntimeKernelTransactions = new Set<string>();
+
+/** Cold-maintenance and transaction port for the one shared runtime envelope, never for arbitrary journal paths. */
+export function createTelegramRuntimeStateCutover(agentDir: string) {
+  if (!isAbsolute(agentDir) || resolve(agentDir) !== agentDir || agentDir.includes("\0"))
+    throw new Error("Telegram runtime cutover requires an exact absolute agent directory.");
+  const agent = realpathSync(agentDir), tmp = join(agent, "tmp"), root = join(tmp, "pi-telegram");
+  const runtime = join(root, "runtime"), guard = join(runtime, "state.json.transaction");
+  const assertScope = () => {
+    const aliased = (path: string) => {
+      const entry = lstatSync(path, { throwIfNoEntry: false });
+      return entry !== undefined && (!entry.isDirectory() || realpathSync(path) !== path);
+    };
+    if (realpathSync(agentDir) !== agent || [tmp, root, runtime].some(aliased))
+      throw new Error("Telegram runtime cutover storage scope is unavailable or aliased.");
+  };
+  const directory = join(agent, "telegram-kernel-cutover"), anchorPath = join(directory, "state.lock"), modePath = join(directory, "state.mode");
+  let backend: TelegramFileTransactionKernelBackend | undefined, observed = false;
+  const directoryPresent = () => {
+    const current = lstatSync(directory, { bigint: true, throwIfNoEntry: false });
+    if (!current) return false;
+    observed = true;
+    if (!current.isDirectory() || !isTelegramOwnerPrivate(current))
+      throw new Error("Telegram runtime cutover directory is not private.");
+    return true;
+  };
+  const anchorBody = () => {
+    const anchor = lstatSync(anchorPath, { bigint: true, throwIfNoEntry: false });
+    if (!anchor?.isFile() || !isTelegramOwnerPrivate(anchor) || anchor.size !== 0n || anchor.nlink !== 1n)
+      throw new Error("Telegram runtime cutover anchor is unavailable or invalid.");
+    const scope = createHash("sha256").update(guard).digest("hex");
+    return `pi-telegram:runtime-kernel-v1:${scope}:${anchor.dev}:${anchor.ino}\n`;
+  };
+  const getOptions = () => ({
+    kernel: { ...(backend ??= loadTelegramFileTransactionKernelBackend()), anchorPath },
+    requireLegacyBarrier: true as const,
+  });
+  function assertMode(expected: string): void {
+    assertScope();
+    if (!directoryPresent() || readTelegramPrivateFile(modePath, expected.length) !== expected || anchorBody() !== expected)
+      throw new Error("Telegram runtime cutover mode is incomplete or changed.");
+  }
+  function assertAuthority(path: string): void {
+    if (!directoryPresent() && !observed) return;
+    if (path !== join(root, "state.json")) throw new Error("Telegram runtime cutover storage scope changed.");
+    assertMode(anchorBody());
+    assertTelegramLegacyTransactionBarrier(guard, telegramLegacyTransactionBarrierBody(guard));
+  }
+  const runFor: TelegramRuntimeStateTransaction = (path, operation, options) => {
+    if (!directoryPresent() && !observed) {
+      return withTelegramRuntimeStateTransaction(path, () => {
+        if (directoryPresent() || observed) throw new Error("Telegram runtime cutover began during legacy admission.");
+        return operation();
+      }, options);
+    }
+    assertScope();
+    if (path !== join(root, "state.json")) throw new Error("Telegram runtime cutover storage scope changed.");
+    const expected = anchorBody();
+    assertMode(expected);
+    const barrier = telegramLegacyTransactionBarrierBody(guard);
+    assertTelegramLegacyTransactionBarrier(guard, barrier);
+    const native = getOptions();
+    const attempts = activeRuntimeKernelTransactions.has(anchorPath) ? 1 : TELEGRAM_LOCK_TRANSACTION_ATTEMPTS;
+    return withTelegramFileTransaction(guard, () => {
+      assertMode(expected);
+      activeRuntimeKernelTransactions.add(anchorPath);
+      try { return operation(); }
+      finally { activeRuntimeKernelTransactions.delete(anchorPath); }
+    }, { ...native, kernel: { ...native.kernel, tryAcquire(path) {
+      // Only definite contention before entry can wait. Never replay a callback or a release.
+      for (let attempt = 1; ; attempt++) {
+        const lease = native.kernel.tryAcquire(path);
+        if (lease !== undefined || attempt === attempts) return lease;
+        assertMode(expected);
+        assertTelegramLegacyTransactionBarrier(guard, barrier);
+        sleepSync(TELEGRAM_LOCK_TRANSACTION_RETRY_DELAY_MS, "transaction-lock-wait");
+      }
+    } } });
+  };
+  return {
+    runFor,
+    assertAuthority,
+    install(isMaintenanceCurrent: () => boolean): void {
+      const assertMaintenance = () => {
+        if (isMaintenanceCurrent() !== true) throw new Error("Telegram runtime cutover requires current cold maintenance authority.");
+      };
+      assertScope();
+      assertMaintenance();
+      // Admit the existing backend before publishing a durable startup refusal.
+      const options = getOptions();
+      assertMaintenance();
+      if (!directoryPresent()) {
+        if (observed) throw new Error("Telegram runtime cutover directory disappeared.");
+        try { mkdirSync(directory, { mode: 0o700 }); }
+        catch (error) { if ((error as { code?: unknown })?.code !== "EEXIST") throw error; }
+      }
+      if (!directoryPresent()) throw new Error("Telegram runtime cutover directory disappeared.");
+      const retainedMode = lstatSync(modePath, { throwIfNoEntry: false });
+      if (!retainedMode) {
+        try { writeFileSync(anchorPath, "", { flag: "wx", mode: 0o600 }); }
+        catch (error) { if ((error as { code?: unknown })?.code !== "EEXIST") throw error; }
+      }
+      const expected = anchorBody();
+      assertScope();
+      // Retained mode may be re-observed, but a missing barrier after completion needs its own recovery protocol.
+      if (retainedMode) assertMode(expected);
+      else installTelegramLegacyTransactionBarrier(guard, isMaintenanceCurrent, { allowDamagedDirectory: true });
+      withTelegramFileTransaction(guard, () => {
+        assertMaintenance();
+        if (anchorBody() !== expected) throw new Error("Telegram runtime cutover anchor changed.");
+        try { writeFileSync(modePath, expected, { flag: "wx", mode: 0o600 }); }
+        catch (error) { if ((error as { code?: unknown })?.code !== "EEXIST") throw error; }
+        assertMode(expected);
+        assertMaintenance();
+      }, options);
+    },
+    run<T>(operation: () => T, options?: TelegramRuntimeStateTransactionOptions): T {
+      assertScope();
+      return runFor(join(root, "state.json"), operation, options);
+    },
+  };
+}
+
+/** Keep one lazily captured cutover owner across the extension's envelope consumers and transport observations. */
+export function createTelegramRuntimeStateAccess(agentDir: string) {
+  let cutover: ReturnType<typeof createTelegramRuntimeStateCutover> | undefined;
+  const getCutover = () => (cutover ??= createTelegramRuntimeStateCutover(agentDir));
+  const transact: TelegramRuntimeStateTransaction = (path, operation, options) => getCutover().runFor(path, operation, options);
+  return { transact, assertAuthority: (path: string) => getCutover().assertAuthority(path) };
+}
+
+/** Defensive refusal of a live recorded PID, not a complete census or proof that the operator drained writers. */
+export function prepareTelegramRuntimeStateColdCutover(agentDir: string): void {
+  const cutover = createTelegramRuntimeStateCutover(agentDir);
+  const statePath = resolveTelegramStatePath(agentDir);
+  cutover.install(() => {
+    const source = readTelegramRuntimeSource(statePath);
+    if (source === undefined) return true;
+    let value: unknown;
+    try { value = JSON.parse(source); }
+    catch { return true; } // The operator's cold exclusion, not unreadable metadata, is the prerequisite.
+    if (!runtimeStateRecord(value) || !runtimeStateRecord(value.profiles)) return true;
+    for (const sections of Object.values(value.profiles)) {
+      if (!runtimeStateRecord(sections) || !runtimeStateRecord(sections.transport)) continue;
+      const pid = sections.transport.pid;
+      if (isLockTransactionPid(pid) && isProcessAlive(pid))
+        throw new Error("A live process is still recorded as a Telegram transport owner. Cold cutover refused.");
+    }
+    return true;
+  });
 }
 
 export type TelegramRuntimeStateSection =
@@ -1303,13 +1587,13 @@ export function resetDamagedTelegramRuntimeState(
     sections: Readonly<TelegramRuntimeStateProfile>,
   ) => void,
   assertCurrent?: () => void,
+  transact: TelegramRuntimeStateTransaction = withTelegramRuntimeStateTransaction,
 ): boolean {
   requireRuntimeStatePath(path);
   assertCurrent?.();
   const runtimeDir = join(dirname(path), "runtime");
-  mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
-  return withTelegramFileTransaction(
-    join(runtimeDir, `${basename(path)}.transaction`),
+  return transact(
+    path,
     () => {
       assertCurrent?.();
       let damaged = false;
@@ -1372,6 +1656,7 @@ export interface TelegramRuntimeStateMutation<T> {
   result: T;
 }
 interface TelegramRuntimeStatePublicationOptions {
+  stateTransaction?: TelegramRuntimeStateTransaction;
   /** Exact domain authority, recaptured by the caller before invoking this synchronous transaction. */
   isCurrent: () => boolean;
   onPublicationBoundary?: (
@@ -1420,9 +1705,8 @@ export function mutateTelegramRuntimeStateSection<T>(
   active.add(path);
   try {
     const runtimeDir = join(dirname(path), "runtime");
-    mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
-    return withTelegramFileTransaction(
-      join(runtimeDir, `${basename(path)}.transaction`),
+    return (options.stateTransaction ?? withTelegramRuntimeStateTransaction)(
+      path,
       () => {
         assertCurrent();
         const file = readTelegramRuntimeState(path);
@@ -1772,7 +2056,7 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
       "invalid",
       "Telegram transport must select one storage identity.",
     );
-  const statePath = options.statePath;
+  const { statePath, stateTransaction, assertStateAuthority } = options;
   const locksPath = options.locksPath ?? getOwnersPath();
   const pid = options.pid ?? process.pid;
   const isAlive = options.isProcessAlive ?? isProcessAlive;
@@ -1790,8 +2074,13 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
     if (typeof key === "function") return key() || TELEGRAM_LOCK_KEY;
     return key;
   };
+  const verifyStateAuthority = (path: string): boolean => {
+    try { assertStateAuthority?.(path); return true; }
+    catch { deliveryRevoked = true; return false; }
+  };
   const readOwners = (): Record<string, unknown> => {
     if (!statePath) return readLocks(locksPath);
+    if (!verifyStateAuthority(statePath)) return {};
     // Read-only ownership queries fail closed (no owner); acquisition/publication still refuse malformed state.
     // A strict read racing a concurrent atomic replace fails transiently, so retry before failing closed.
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -1802,7 +2091,7 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
             .map(([profile, value]) => [profile, value.transport]),
         );
         assertTelegramStateTransport(transports[resolveEffectiveKey()]);
-        return transports;
+        return verifyStateAuthority(statePath) ? transports : {};
       } catch {
         // Retry; a persistent failure falls through to no owner.
       }
@@ -1828,6 +2117,7 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
       },
       {
         ...options.statePublication,
+        stateTransaction,
         isCurrent: () => resolveEffectiveKey() === profile,
       },
     );
@@ -2156,7 +2446,7 @@ export function createTelegramLockRuntime<TContext extends TelegramLockContext>(
             result: { committed: true, result: outcome.result } as const,
           };
         },
-        { ...publication, isCurrent },
+        { ...publication, stateTransaction, isCurrent },
       );
     },
     refresh: (ctx) => {

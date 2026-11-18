@@ -22,6 +22,7 @@ import {
   readTelegramRuntimeState,
   renameTelegramPathWithRetry,
   TelegramRuntimeStateError,
+  type TelegramRuntimeStateTransaction,
   withTelegramFileTransaction,
 } from "./locks.ts";
 import {
@@ -297,6 +298,7 @@ interface TelegramWorkspaceAdmissionLedgerOptions {
   path: string;
   /** Explicit logical section identity for the consolidated root; absent means the standalone ledger adapter. */
   stateProfile?: string;
+  stateTransaction?: TelegramRuntimeStateTransaction;
   profileKey: string;
   owner: TelegramWorkspaceAdmissionOwner;
   getNowMs?: () => number;
@@ -1083,8 +1085,8 @@ export function createTelegramWorkspaceAdmissionRuntimeBinding(
       owner: TelegramWorkspaceAdmissionOwner,
     ) => TelegramProcessLiveness;
   } & (
-    | { getPath: (profileName?: string) => string; getStatePath?: never }
-    | { getStatePath: () => string; getPath?: never }
+    | { getPath: (profileName?: string) => string; getStatePath?: never; stateTransaction?: never }
+    | { getStatePath: () => string; getPath?: never; stateTransaction?: TelegramRuntimeStateTransaction }
   ),
 ): TelegramWorkspaceAdmissionRuntimeBinding {
   const { getProfileName, getBotToken, getPath, getStatePath } = input;
@@ -1114,7 +1116,7 @@ export function createTelegramWorkspaceAdmissionRuntimeBinding(
         const options: TelegramWorkspaceAdmissionLedgerOptions = {
           path: getStatePath ? getStatePath() : getPath!(configuredProfileName),
           ...(getStatePath
-            ? { stateProfile: configuredProfileName ?? "default" }
+            ? { stateProfile: configuredProfileName ?? "default", stateTransaction: input.stateTransaction }
             : {}),
           profileKey,
           owner: input.owner,
@@ -1129,6 +1131,7 @@ export function createTelegramWorkspaceAdmissionRuntimeBinding(
         if (current && current.botToken === botToken &&
           current.authority.path === authority.path &&
           current.authority.stateProfile === authority.stateProfile &&
+          current.authority.stateTransaction === authority.stateTransaction &&
           current.authority.profileKey === authority.profileKey &&
           areOwnersEqual(current.authority.owner, authority.owner) &&
           areOwnersEqual(current.options.owner, current.authority.owner) &&
@@ -1337,6 +1340,7 @@ export function createTelegramWorkspaceAdmissionLedger(
     suppliedOptions.path === path &&
     suppliedOptions.profileKey === profileKey &&
     suppliedOptions.stateProfile === stateProfile &&
+    suppliedOptions.stateTransaction === options.stateTransaction &&
     areOwnersEqual(suppliedOptions.owner, boundOwner);
   const mapStateError = (error: unknown): never => {
     if (error instanceof TelegramRuntimeStateError)
@@ -1382,6 +1386,7 @@ export function createTelegramWorkspaceAdmissionLedger(
           },
           {
             isCurrent: isStorageCurrent,
+            stateTransaction: options.stateTransaction,
             publishRename: publication.publishRename,
             onPublicationBoundary(boundary) {
               if (boundary !== "after-rename")

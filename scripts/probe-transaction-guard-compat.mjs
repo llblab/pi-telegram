@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { isBuiltin } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, posix } from "node:path";
@@ -15,6 +15,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
+const { installTelegramLegacyTransactionBarrier } = await import("../dist/lib/locks.js");
+const prepare = fileURLToPath(new URL("./prepare-cold-cutover.mjs", import.meta.url));
 const refs = process.argv.slice(2);
 if (!refs.length) refs.push("v0.58.0", "v0.58.1", "v0.58.2", "v0.58.3");
 const sha256 = data => createHash("sha256").update(data).digest("hex");
@@ -79,7 +81,7 @@ try {
     const results = [];
     function assess(name, fixture, expectedCalls) {
       const dir = join(snapshot, `case-${results.length}`); mkdirSync(dir, { mode: 0o700 });
-      const path = join(dir, "guard"); fixture?.(path);
+      const path = join(dir, "guard.transaction"); fixture?.(path);
       const snapshotGuard = () => {
         if (!existsSync(path)) return undefined;
         const stat = lstatSync(path), names = stat.isDirectory() ? readdirSync(path).sort() : [];
@@ -107,6 +109,33 @@ try {
     assess("fresh-native-control", undefined, 1);
     assess("dead-legacy-file-control", path => writeFileSync(path, legacyBody(absentPid), { mode: 0o600 }), 1);
     assess("live-legacy-file-control", path => writeFileSync(path, legacyBody(process.pid), { mode: 0o600 }), 0);
+    assess("cold-cutover-barrier", path => assert.equal(installTelegramLegacyTransactionBarrier(path, () => true), "installed"), 0);
+    if (typeof kernel.mutateTelegramRuntimeStateSection === "function") for (const damaged of [false, true]) {
+      const dir = join(snapshot, damaged ? "cold-cutover-damaged-section" : "cold-cutover-section"), path = join(dir, "state.json");
+      const guard = join(dir, "runtime", "state.json.transaction"), initial = '{"version":2,"profiles":{"default":{"runtime":{"marker":"after cutover"}}}}\n';
+      const retainedOwner = join(guard, `owner.${randomUUID()}.json`);
+      if (damaged) {
+        mkdirSync(guard, { recursive: true, mode: 0o700 });
+        writeFileSync(retainedOwner, "", { mode: 0o600 });
+      }
+      const markerPath = damaged ? join(guard, "kernel-cutover-v1") : guard;
+      assert.equal(installTelegramLegacyTransactionBarrier(guard, () => true, damaged ? { allowDamagedDirectory: true } : {}), "installed");
+      const marker = readFileSync(markerPath), before = lstatSync(guard, { bigint: true });
+      writeFileSync(path, initial, { mode: 0o600 });
+      let calls = 0;
+      assert.throws(() => kernel.mutateTelegramRuntimeStateSection(path, "default", "runtime", () => {
+        calls++;
+        return { value: { marker: "stale legacy write" }, result: true };
+      }, { isCurrent: () => true }), typeof kernel.TelegramFileTransactionGuardError === "function"
+        ? { code: "guard-unverifiable", phase: "acquire" }
+        : /Timed out acquiring Telegram lock transaction/u);
+      assert.equal(calls, 0);
+      assert.equal(readFileSync(path, "utf8"), initial);
+      assert.deepEqual(readFileSync(markerPath), marker);
+      assert.equal(lstatSync(guard, { bigint: true }).ino, before.ino);
+      if (damaged) assert.equal(readFileSync(retainedOwner).length, 0);
+      results.push({ name: damaged ? "cold-cutover-damaged-runtime-section" : "cold-cutover-runtime-section", calls, outcome: "refused" });
+    }
     for (const phase of ["owner", "claim"]) for (const bodyKind of ["v2-complete", "empty", "v1-conflicting"]) {
       const ownerPid = bodyKind === "v1-conflicting" ? process.pid : absentPid;
       const marker = phase === "owner" ? `owner.v2.${ownerPid}.${nonce}.json` : `owner.reclaim.v2.${ownerPid}.${nonce}.${absentPid}.${randomUUID()}.json`;
@@ -140,6 +169,81 @@ try {
       assert.deepEqual(readFileSync(join(path, marker)), foreignBytes, name);
       assert.deepEqual(readFileSync(oldMarker ? join(displaced, oldMarker) : displaced), oldBytes, name);
       results.push({ name, calls, outcome: "replacement-preserved", error: error?.name });
+    }
+    if (typeof kernel.mutateTelegramRuntimeStateSection === "function" && process.arch === "x64") for (const damaged of [false, true]) {
+      const layout = damaged ? "damaged" : "vacant";
+      const dir = join(snapshot, `cold-polling-agent-${layout}`); mkdirSync(dir, { mode: 0o700 });
+      const agent = realpathSync(dir), statePath = join(agent, "tmp", "pi-telegram", "state.json");
+      const guard = join(dirname(statePath), "runtime", "state.json.transaction");
+      const mode = join(agent, "telegram-kernel-cutover", "state.mode");
+      mkdirSync(dirname(guard), { recursive: true, mode: 0o700 });
+      const prepareArgs = [prepare, "--agent-dir", agent, "--confirm-all-writers-stopped"];
+      const child = (args, input) => {
+        const result = spawnSync(process.execPath, args, { input, timeout: 8000, encoding: "utf8" });
+        assert.ifError(result.error); assert.equal(result.signal, null, result.stderr);
+        return result;
+      };
+      const omitted = child(prepareArgs.slice(0, -1));
+      assert.equal(omitted.status, 2, omitted.stderr);
+      assert.equal(existsSync(dirname(mode)), false);
+      function predecessor(phase) {
+        const run = child(["--input-type=module"], `
+          import assert from 'node:assert/strict';
+          import { spawnSync } from 'node:child_process';
+          import { existsSync } from 'node:fs';
+          import * as old from ${JSON.stringify(pathToFileURL(join(snapshot, "dist/lib/locks.js")).href)};
+          const statePath = ${JSON.stringify(statePath)}, phase = ${JSON.stringify(phase)};
+          const lock = old.createTelegramLockRuntime({ statePath, key: 'default', instanceId: 'archived-fixture' });
+          let polls = 0, result, refusal;
+          const runtime = old.createTelegramLockedPollingRuntime({ lock, hasBotToken: () => true,
+            async startPolling() { polls++; }, async stopPolling() {}, updateStatus() {},
+            resetDamagedState(assertCurrent) { return old.resetDamagedTelegramRuntimeState(statePath, undefined, assertCurrent); } });
+          try { result = await runtime.start({ cwd: ${JSON.stringify(agent)} }); }
+          catch (error) { refusal = { code: error.code, message: error.message }; }
+          if (phase === 'before') {
+            assert.equal(result?.ok, true); assert.equal(polls, 1);
+            const denied = spawnSync(process.execPath, ${JSON.stringify(prepareArgs)}, { encoding: 'utf8', timeout: 5000 });
+            assert.ifError(denied.error); assert.equal(denied.status, 1, denied.stdout + denied.stderr);
+            assert.match(denied.stderr, /live process is still recorded/u);
+            assert.equal(existsSync(${JSON.stringify(dirname(mode))}), false);
+            await runtime.stop();
+          } else {
+            assert.equal(result, undefined); assert.equal(polls, 0);
+            assert.ok(refusal?.code === 'guard-unverifiable' || /Timed out acquiring Telegram lock transaction/u.test(refusal?.message));
+          }
+          console.log(JSON.stringify({ pid: process.pid, polls, refusal: refusal?.code ?? refusal?.message }));
+        `);
+        assert.equal(run.status, 0, run.stdout + run.stderr);
+        const observed = JSON.parse(run.stdout);
+        assert.throws(() => process.kill(observed.pid, 0), error => error.code === "ESRCH", "Require natural predecessor process exit");
+        return observed;
+      }
+      const before = predecessor("before");
+      // Older releases may remove an empty envelope on clean disconnect; seed one healthy sibling to check its exact survival.
+      const healthy = '{"version":2,"profiles":{"work":{"runtime":{"marker":"keep healthy state"}}}}\n';
+      writeFileSync(statePath, healthy, { mode: 0o600 });
+      const owner = join(guard, "owner.fixture.json");
+      if (damaged) {
+        mkdirSync(guard, { mode: 0o700 });
+        writeFileSync(owner, "", { mode: 0o600 });
+      }
+      const originalGuard = damaged ? lstatSync(guard, { bigint: true }) : undefined;
+      const prepared = child(prepareArgs), marker = damaged ? join(guard, "kernel-cutover-v1") : guard;
+      assert.equal(prepared.status, 0, prepared.stdout + prepared.stderr);
+      assert.match(prepared.stdout, /No connection was started/u);
+      const installed = readFileSync(mode), barrier = readFileSync(marker);
+      const after = predecessor("after");
+      assert.equal(readFileSync(statePath, "utf8"), healthy);
+      assert.deepEqual(readFileSync(mode), installed); assert.deepEqual(readFileSync(marker), barrier);
+      if (originalGuard) {
+        assert.equal(readFileSync(owner).length, 0); assert.equal(lstatSync(guard, { bigint: true }).ino, originalGuard.ino);
+      }
+      assert.equal(child(prepareArgs).status, 0, "The same admitted mode can be re-observed");
+      renameSync(marker, join(agent, "displaced-barrier"));
+      const lost = child(prepareArgs); assert.equal(lost.status, 1, lost.stdout + lost.stderr);
+      assert.equal(existsSync(marker), false, "A missing installed barrier is not silently reinstalled");
+      assert.deepEqual(readFileSync(mode), installed); assert.equal(readFileSync(statePath, "utf8"), healthy);
+      results.push({ name: `cold-cutover-archived-polling-entry/${layout}`, before, after, outcome: "refused" });
     }
     // Counterexamples are classified, not assumed: older file-only kernels may refuse every directory.
     assess("opaque-owner-counterexample", directory(`owner.${opaque}.json`, JSON.stringify({ pid: absentPid, acquiredAtMs: 1, generation: opaque })));
