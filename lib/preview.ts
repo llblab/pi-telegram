@@ -92,7 +92,7 @@ export interface TelegramPreviewControllerDeps {
   recordRuntimeEvent?: TelegramPreviewEventRecorder;
 }
 
-type TelegramPreviewTargetOptions = { target?: TelegramTarget };
+export type TelegramPreviewTargetOptions = { target?: TelegramTarget };
 
 export interface TelegramPreviewController {
   /** Read-only view of the current segment; it never grants mutation. */
