@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Profiles`: Pi completes saved profile names for `/telegram-setup` and `/telegram-connect`. With no usable default, interactive connect selects a lone saved named profile or offers a choice when multiple profiles are saved. Cancelling the chooser leaves the current connection in place; headless connect still prints the saved names.
+
 ## 0.59.3: Connection Recovery And Routing Cleanup
 
 - `Connect recovery`: After one coordinated offline preparation on a supported x64 host, `/telegram-connect` can recover from a damaged shared-state guard and reports success only once transport starts. Concurrent attempts share one reset and one poller. Healthy state stays intact; incomplete preparation refuses. Recovery can discard runtime continuity across profiles but does not touch credentials, Pi history or Telegram tabs.

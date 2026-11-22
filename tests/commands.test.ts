@@ -6345,6 +6345,9 @@ function createNoDefaultProfileConnectHarness(options: {
   profileNames: string[];
   activeProfileName?: string;
   selectedLabel?: string;
+  select?: () => Promise<string | undefined>;
+  diagnostic?: string;
+  getSessionGeneration?: () => number;
   hasUI?: boolean;
 }) {
   const harness = createCommandRegistrationApiHarness();
@@ -6358,9 +6361,12 @@ function createNoDefaultProfileConnectHarness(options: {
       events.push("setup");
     },
     getStatusLines: () => [],
-    reloadConfig: async () => {
-      events.push("reload");
+    reloadConfig: async () => assert.fail("Selection uses default-profile discovery"),
+    activateDefaultProfileConfig: async () => {
+      events.push("inspect");
+      return { profileNames: options.profileNames, diagnostic: options.diagnostic };
     },
+    getSessionGeneration: options.getSessionGeneration,
     hasBotToken: () => tokenReady,
     startPolling: async () => {
       events.push("start");
@@ -6386,7 +6392,7 @@ function createNoDefaultProfileConnectHarness(options: {
     () => false,
     async (title, items) => {
       selectCalls.push({ title, items });
-      return options.selectedLabel;
+      return options.select ? options.select() : options.selectedLabel;
     },
   );
   (ctx as unknown as { hasUI: boolean }).hasUI = options.hasUI ?? true;
@@ -6404,13 +6410,8 @@ test("Connect without a default profile offers a menu and connects the chosen pr
     { title: "Select Telegram profile", items: ["alpha", "beta (active)"] },
   ]);
   assert.deepEqual(f.activated, ["beta"]);
-  assert.deepEqual(f.events, ["reload", "start", "status"]);
-  assert.ok(
-    f.notifications.some((message) => message.includes('Activated profile "beta".')),
-  );
-  assert.ok(
-    !f.notifications.some((message) => message.includes("No default Telegram profile")),
-  );
+  assert.deepEqual(f.events, ["inspect", "start", "status"]);
+  assert.deepEqual(f.notifications, ['Activated profile "beta".']);
 });
 
 test("Connect profile menu cancellation ends without connecting", async () => {
@@ -6422,7 +6423,20 @@ test("Connect profile menu cancellation ends without connecting", async () => {
   await getRequiredCommand(f.harness.commands, "telegram-connect").handler("", f.ctx);
   assert.equal(f.selectCalls.length, 1);
   assert.deepEqual(f.activated, []);
-  assert.deepEqual(f.events, ["reload", "status"]);
+  assert.deepEqual(f.events, ["inspect", "status"]);
+  assert.deepEqual(f.notifications, []);
+});
+
+test("Connect ignores a profile choice returned after session replacement", async () => {
+  let generation = 1;
+  const f = createNoDefaultProfileConnectHarness({
+    profileNames: ["alpha", "beta"],
+    getSessionGeneration: () => generation,
+    select: async () => { generation++; return "beta"; },
+  });
+  await getRequiredCommand(f.harness.commands, "telegram-connect").handler("", f.ctx);
+  assert.deepEqual(f.activated, []);
+  assert.deepEqual(f.events, ["inspect"]);
   assert.deepEqual(f.notifications, []);
 });
 
@@ -6434,13 +6448,8 @@ test("Connect without a default profile connects the only profile without a menu
   await getRequiredCommand(f.harness.commands, "telegram-connect").handler("", f.ctx);
   assert.deepEqual(f.selectCalls, []);
   assert.deepEqual(f.activated, ["solo"]);
-  assert.deepEqual(f.events, ["reload", "start", "status"]);
-  assert.ok(
-    f.notifications.some((message) => message.includes('Activated profile "solo".')),
-  );
-  assert.ok(
-    !f.notifications.some((message) => message.includes("No default Telegram profile")),
-  );
+  assert.deepEqual(f.events, ["inspect", "start", "status"]);
+  assert.deepEqual(f.notifications, ['Activated profile "solo".']);
 });
 
 test("Connect without a default profile notifies without connecting when headless", async () => {
@@ -6451,14 +6460,8 @@ test("Connect without a default profile notifies without connecting when headles
   await getRequiredCommand(f.harness.commands, "telegram-connect").handler("", f.ctx);
   assert.deepEqual(f.selectCalls, []);
   assert.deepEqual(f.activated, []);
-  assert.deepEqual(f.events, ["reload", "status"]);
-  assert.ok(
-    f.notifications.some((message) =>
-      message.includes(
-        "No default Telegram profile configured. Available profiles: solo.",
-      ),
-    ),
-  );
+  assert.deepEqual(f.events, ["inspect", "status"]);
+  assert.match(f.notifications[0], /No usable default Telegram profile\. Configured profiles: solo\./);
   assert.ok(
     !f.notifications.some((message) => message.includes('Activated profile "solo".')),
   );
@@ -6486,26 +6489,17 @@ test("Profile completions mark the default profile active when the active dep re
   ]);
 });
 
-test("Connect profile menu marks the default profile active when the active dep returns undefined", async () => {
+test("An unavailable configured default never automatically selects an alternate bot", async () => {
+  const diagnostic = "Telegram bot token environment variable DEFAULT_TOKEN is not set.";
   const f = createNoDefaultProfileConnectHarness({
     profileNames: [TELEGRAM_DEFAULT_PROFILE_NAME, "work"],
-    activeProfileName: undefined,
-    selectedLabel: `${TELEGRAM_DEFAULT_PROFILE_NAME} (active)`,
+    diagnostic,
   });
   await getRequiredCommand(f.harness.commands, "telegram-connect").handler("", f.ctx);
-  assert.deepEqual(f.selectCalls, [
-    {
-      title: "Select Telegram profile",
-      items: [`${TELEGRAM_DEFAULT_PROFILE_NAME} (active)`, "work"],
-    },
-  ]);
-  assert.deepEqual(f.activated, [TELEGRAM_DEFAULT_PROFILE_NAME]);
-  assert.deepEqual(f.events, ["reload", "start", "status"]);
-  assert.ok(
-    f.notifications.some((message) =>
-      message.includes(`Activated profile "${TELEGRAM_DEFAULT_PROFILE_NAME}".`),
-    ),
-  );
+  assert.deepEqual(f.selectCalls, [{ title: "Select Telegram profile", items: ["work"] }]);
+  assert.deepEqual(f.activated, []);
+  assert.deepEqual(f.events, ["inspect", "status"]);
+  assert.deepEqual(f.notifications, [diagnostic]);
 });
 
 test("Connect profile menu shows no active mark without the active-profile dep", async () => {
@@ -6518,7 +6512,7 @@ test("Connect profile menu shows no active mark without the active-profile dep",
     { title: "Select Telegram profile", items: ["alpha", "beta"] },
   ]);
   assert.deepEqual(f.activated, ["alpha"]);
-  assert.deepEqual(f.events, ["reload", "start", "status"]);
+  assert.deepEqual(f.events, ["inspect", "start", "status"]);
 });
 
 test("Slash discovery classifies only bare slash and unrecognized bot-command tokens", () => {

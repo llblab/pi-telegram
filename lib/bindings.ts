@@ -1190,6 +1190,12 @@ export function registerTelegramCommandsAndTools({
       if (!isCurrent()) return;
       const selectedConfig = configStore.getStoredConfig();
       const selectedToken = configStore.getBotToken(Config.TELEGRAM_DEFAULT_PROFILE_NAME);
+      if (!selectedToken) {
+        const profileNames = Config.getTelegramProfileNames(selectedConfig);
+        if (profileNames.length > 0) {
+          return { profileNames, diagnostic: configStore.getBotTokenDiagnostic(Config.TELEGRAM_DEFAULT_PROFILE_NAME) };
+        }
+      }
       const isSelectionCurrent = (expectedProfile = previousProfileName) => {
         if (!isCurrent()) return false;
         if (configStore.getStoredConfig() !== selectedConfig ||

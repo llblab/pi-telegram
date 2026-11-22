@@ -107,7 +107,7 @@ export interface TelegramConfigStore {
     getActiveProfileName: () => string | undefined;
     /** Resolve one profile without changing the active identity; omission selects the active profile. */
     getBotToken: (profileName?: string) => string | undefined;
-    getBotTokenDiagnostic: () => string | undefined;
+    getBotTokenDiagnostic: (profileName?: string) => string | undefined;
     hasBotToken: () => boolean;
     getAllowedUserId: () => number | undefined;
     getLegacyPollingCursor: () => number | undefined;

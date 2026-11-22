@@ -200,7 +200,10 @@ export interface TelegramBridgeCommandRegistrationDeps {
     };
     getProfileNames?: () => string[];
     getActiveProfileName?: () => string | undefined;
-    activateDefaultProfileConfig?: (ctx: ExtensionCommandContext, isCurrent: () => boolean) => Promise<void>;
+    activateDefaultProfileConfig?: (ctx: ExtensionCommandContext, isCurrent: () => boolean) => Promise<void | {
+        profileNames: string[];
+        diagnostic?: string;
+    }>;
     activateProfileConfig?: (ctx: ExtensionCommandContext, profileName: string, isCurrent: () => boolean) => Promise<boolean>;
 }
 /** Bound adapters must carry the optional recipient guard through their own effect/publication awaits. */
