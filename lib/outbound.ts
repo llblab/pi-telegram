@@ -835,17 +835,25 @@ export {
   type TelegramOutboundButtonStoredAction,
 } from "./outbound-buttons.ts";
 
+/** @internal Private optional deadline normalization; not root/shared-lifetime activation. */
 export function createTelegramOutboundReplyPlanner(
   store: Pick<TelegramButtonActionStore, "register">,
   getRenderingMode: () => "rich" | "html" = () => "rich",
+  questionHeadTail?: true,
+  questionAppOrigin?: true,
 ): (
   markdown: string,
   options?: { binding?: TelegramOutboundButtonBinding },
 ) => TelegramOutboundReplyPlan<TelegramOutboundButtonMarkup> {
+  if (questionHeadTail !== undefined && questionHeadTail !== true)
+    throw new TypeError("Question head/tail policy must be true or omitted.");
+  if (questionAppOrigin !== undefined && (questionAppOrigin !== true || !questionHeadTail)) throw new TypeError("Question app origin planner requires true and original question policy.");
   return (markdown, options) => {
+    const register = store.register, binding = questionAppOrigin ? options?.binding : undefined;
     const buttonReply = planTelegramButtonReply(markdown, {
-      registerAction: store.register,
+      registerAction: questionAppOrigin ? action => action.promptKind === "selection" ? register(action, binding) : register(action) : register,
       rendering: getRenderingMode(),
+      questionHeadTail,
       ...(options?.binding ? { binding: options.binding } : {}),
     });
 

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The Telegram Delivery API gives trusted extension consumers a safe programmatic way to render operational Telegram UI without importing bridge internals or owning Telegram transport.
+The Telegram Delivery API gives trusted extension consumers a safe programmatic way to render operational Telegram UI and deliver bounded producer-approved documents without importing bridge internals or owning Telegram transport.
 
 It fills the boundary between callback-scoped `TelegramSectionContext.open()` and agent-callable `telegram_message` / `telegram_attach`. It does not replace normal active-turn final replies, Sections, outbound handlers, or raw update handlers.
 
@@ -12,10 +12,16 @@ The public package membrane is:
 import {
   deleteTelegramView,
   editTelegramView,
+  openTelegramTaskView,
+  sendTelegramArtifact,
   sendTelegramChatAction,
   sendTelegramView,
 } from "@llblab/pi-telegram/delivery";
 ```
+
+## Agent Markup Is A Separate Surface
+
+Agents author [selection markup](./public-api.md#agent-selection-markup) in ordinary final replies. Confirm/Choice clicks use the existing `telegram_button` action store, selection feedback and ordinary prompt queue; they do not call these SDK functions or hold a model tool open. Single answers deliver bare question/answer JSON; exact-N Choice toggles locally and delivers one label array only at completion. Choice arrays advance locally through one current question at a time, preserving the composed one-message view, and deliver one ordered question/answer array at completion. No new Confirm/Choice/Task/Artifact agent tools are registered. Companion-extension SDK contracts below remain separate.
 
 ## Ownership Boundary
 
@@ -53,7 +59,7 @@ export interface TelegramDeliveryView {
 
 `plain` is the default. Operational activity should prefer `plain` or explicit `html`. `markdown` exists for extension-authored content that naturally owns Markdown; the bridge converts it through the existing UI/compat Markdown-to-HTML renderer rather than entering the native assistant final-reply pipeline.
 
-`replyMarkup` accepts only structural keyboard data. Callback ownership stays with Sections or a registered raw update handler. The documented external consumer shape uses Sections for interactive Settings toggles and keeps delivered activity rows non-interactive, so a second managed callback registry would duplicate token, answer, edit, navigation, and cleanup ownership without a proven use case. Revisit only when a public-import-only consumer must generate managed callbacks independently of a registered Section context for arbitrary delivered messages.
+`replyMarkup` accepts only structural keyboard data. Arbitrary callback ownership stays with Sections or a registered raw update handler. Explicit binary questions use [`openTelegramConfirm()`](./public-api.md#confirm-api-unreleased) on this same Delivery runtime: pending answers share its generation, target policy and ordering rather than introducing a second managed callback registry. The producer retains operation semantics and execution authority; this narrow capability does not turn arbitrary delivered buttons into managed actions.
 
 ### Target scopes
 
@@ -158,11 +164,34 @@ export function sendTelegramChatAction(
 
 `replyToMessageId` applies only to the first chunk and must belong to the resolved chat. The initial contract exposes only actions already used by bridge-owned activity and delivery paths; it is not a generic Bot API action string.
 
+### Task Projection (Unreleased)
+
+`openTelegramTaskView()` returns one producer-owned progress projection with `update`, `close`, a local lifetime `result` and a separate advisory `cancellation` promise. It reuses this runtime's logical handles, target serialization, native transport and pending-interaction limit. It neither executes work nor interprets cancellation as a global Pi abort. Progress is explicitly producer-reported, optional and coalesced; terminal intent excludes new cancellation/update attempts. Failed/uncertain edits retire the view, while cleanup failure cannot change its local outcome. Reload invalidates controls without restoring a business task. See the exact [Task View public contract](./public-api.md#task-view-api-unreleased) and [internal ownership](./architecture.md#task-view-unreleased). Whole-release and live acceptance remain separate.
+
+### Artifact Output (Unreleased)
+
+[`sendTelegramArtifact()`](./public-api.md#artifact-delivery-contract-unreleased) sends one bounded caller-selected document through this same Delivery owner. It is implemented and exported locally, not in released 0.58.3 or activated in the running session. Direct and authenticated follower source/native and compiled-native fixtures passed locally; supported-platform and live acceptance remain separate. A distinct singular document receipt must not be treated as a text-view handle. File-read/disclosure/business authorization remains producer-owned, and uncertain publication never permits automatic resend.
+
+```ts
+const delivered = await sendTelegramArtifact({
+  owner: "@example/export",
+  scope: { kind: "instance" },
+  file: { path: approvedAbsolutePath, name: "report.json" },
+  caption: "Exported report",
+  timeoutMs: 30_000,
+  signal,
+});
+if (!delivered.ok) return; // Unknown publication is not permission to retry.
+// delivered.receipt identifies the document, not business completion.
+```
+
+The [internal vertical](./architecture.md#artifact-delivery-unreleased-bounded) uses private descriptor-based byte capture, original binding/route/turn/session/transport authority, capability-gated authenticated follower transport, incarnation-aware memoization and bounded actual-work resource lifetimes. Capture is limited to 1 MiB or a lower configured limit, with one outstanding operation per Delivery runtime and one shared native-client slot for leader direct/follower work. A finite deadline and required abort signal do not release resources before actual cleanup. It adds neither a generic media factory nor an outbound consumer lease. Existing views, Sections and generic `telegram_attach` behavior are unchanged.
+
 ## Runtime Binding
 
 The public functions resolve a process-local runtime binding on every call. They never capture a Pi `ExtensionContext` or command context.
 
-The bridge constructs and binds a genuinely fresh delivery runtime during every `session_start`. It unbinds and shuts down the current runtime during `session_shutdown` before session-bound transport state is discarded; binding an unexpected replacement also shuts down the displaced runtime. Reload and session replacement therefore produce these outcomes:
+The bridge constructs and binds a genuinely fresh delivery runtime during every `session_start`. It unbinds and shuts down the current runtime during `session_shutdown` before session-bound transport state is discarded; binding an unexpected replacement also shuts down the displaced runtime. Native transport/registration and leader-target notifications additionally replace a runtime whose original local authority ended, including equal-field follower re-registration. Repeated notifications for the same still-current native owner preserve questions and handles. An initially unavailable owner can become a fresh runtime only from a new native capture; late notifications after shutdown cannot restart one. A legacy local registration lifetime grants neither remote publication proof nor Artifact/private-input readiness. Root additionally coordinates bounded direct SDK/agent questions with the original publisher/native registry scope and [bounded follower plain/native-app first sends](./architecture.md#follower-question-birth-and-plain-first-send-root-bounded) with original local SDK/bot/provider scope plus acknowledged API registration and complete native Message evidence; app frames additionally retain original native app authority and complete rosters; mixed frames require one original native result binding across every question and bound row. Capture precedes publication; an ACK cannot acquire a successor. When that provenance is unavailable, SDK questions remain independent rather than becoming unavailable. Bounded direct and follower original-source first-send app questions now carry original native app capture. Selection remains independently fenced by its original producer/app scope if SDK membership ends or is unavailable; that is not permission to borrow a new SDK owner. [Bounded follower plain known-parent Text/Rich and keyboard-only markup edits](./architecture.md#follower-plain-known-parent-edit-root-bounded) now also retain complete original SDK parent rosters and the actual native edit Message; omitted request Thread derives only from that parent. [Native remote callback feedback](./architecture.md#follower-callback-feedback-root-native-parent-membership-held) separately joins the actual edit Message, API non-refusal and the captured parent location, preserving valid original worker/result execution without opening app-parent membership. The [first read-only app callback child](./architecture.md#follower-read-only-app-callback-child-root-bounded) now has a separate join for complete original feedback/invocation/first-parent evidence, not a general app edit policy. [Pure-question children](./architecture.md#follower-pure-question-callback-child-root-bounded) reuse captured native question origins for that same exact successor; no dummy control or fresh ACK-time owner is needed. [Queued-native-feedback children](./architecture.md#follower-queued-native-feedback-child-root-bounded) retain that exact source while waiting for original feedback I/O; an SDK admission before child native ACK still withholds membership. The [bounded deferred join](./architecture.md#follower-deferred-native-feedback-child-root-bounded) instead captures the cohort at that ACK, waits for the same original editor and retains at most one authenticated later admission ceiling. It exposes no pending head and cannot renew the clock at settlement or adopt a replacement SDK owner. [One producer-backed retained original group](./architecture.md#follower-one-retained-original-group-root-bounded-native-rich) now preserves its original selection, birth/deadline and first publisher through that native Rich path; the explicit main-side fixture does not establish standalone retention intent or a public discovery API. Unsupported general app-parent, follower unproved mixed/retained/edit-first/non-superseding markup and incomplete-carrier histories do not enter the new common cohort. Reload, session and native-owner replacement therefore produce these outcomes:
 
 - A new call resolves the newly bound runtime after startup.
 - An old handle returns `stale-handle` for edit and delete.

@@ -5,6 +5,7 @@
  * Excludes journal/API operations, retirement policy, and binding persistence
  */
 import { type PathLike } from "node:fs";
+import { type TelegramRuntimeStateTransaction } from "./locks.ts";
 import { type TelegramProcessLiveness } from "./process-identity.ts";
 import { type TelegramTarget } from "./target.ts";
 export interface TelegramWorkspaceAdmissionOwner {
@@ -148,6 +149,7 @@ interface TelegramWorkspaceAdmissionLedgerOptions {
     path: string;
     /** Explicit logical section identity for the consolidated root; absent means the standalone ledger adapter. */
     stateProfile?: string;
+    stateTransaction?: TelegramRuntimeStateTransaction;
     profileKey: string;
     owner: TelegramWorkspaceAdmissionOwner;
     getNowMs?: () => number;
@@ -253,9 +255,11 @@ export declare function createTelegramWorkspaceAdmissionRuntimeBinding(input: {
 } & ({
     getPath: (profileName?: string) => string;
     getStatePath?: never;
+    stateTransaction?: never;
 } | {
     getStatePath: () => string;
     getPath?: never;
+    stateTransaction?: TelegramRuntimeStateTransaction;
 })): TelegramWorkspaceAdmissionRuntimeBinding;
 /** Stable admission-scope identity used by leases and admission-gated journal operations. */
 export declare function getTelegramWorkspaceAdmissionScopeKey(scope: TelegramWorkspaceAdmissionScope): string;
@@ -266,12 +270,6 @@ export declare function runWithTelegramWorkspaceAdmissions<T>(input: {
     scopes: readonly TelegramWorkspaceAdmissionScope[];
     operation: () => T;
 }): T;
-export declare function createTelegramWorkspaceJournalWriterAdmission(input: {
-    ledger: Pick<TelegramWorkspaceAdmissionLedger, "acquireAdmission" | "acquireJournalWriterAdmission" | "releaseAdmission">;
-    protocolAuthority?: Omit<Parameters<TelegramWorkspaceAdmissionLedger["acquireJournalWriterAdmission"]>[0], "operationId">;
-    createOperationId?: () => string;
-    onReleaseError?: (error: unknown) => void;
-}): <T>(operation: () => T) => T;
 export declare function runWithTelegramWorkspaceAdmissionsAsync<T>(input: {
     ledger: Pick<TelegramWorkspaceAdmissionLedger, "acquireAdmission" | "releaseAdmission">;
     operationId: string;

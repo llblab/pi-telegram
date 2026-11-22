@@ -1,0 +1,27 @@
+{
+  "source": "https://nodejs.org/dist/",
+  "arch": "x64",
+  "napi": 8,
+  "versions": {
+    "22.19.0": {
+      "headers": {
+        "file": "node-v22.19.0-headers.tar.gz",
+        "sha256": "183bdc17092336ad21e01a425d238e85db4ee077ae3caa0547ff1fbda07d9bd8"
+      },
+      "importLibrary": {
+        "file": "win-x64/node.lib",
+        "sha256": "4af0951712fb05a686a03e0592880e195ba53e5eb70e224d7ea7b8b76f2a3e86"
+      }
+    },
+    "26.8.1": {
+      "headers": {
+        "file": "node-v26.8.1-headers.tar.gz",
+        "sha256": "e4f54decdbf7eadb121c39c050f04f5430a7af1d035bb8ded501171637fe72de"
+      },
+      "importLibrary": {
+        "file": "win-x64/node.lib",
+        "sha256": "5432dceeac196ef89ec001939cc3801cfa131036a05f5fabf5e07b6c5a0895a4"
+      }
+    }
+  }
+}

@@ -25,7 +25,6 @@ import {
   createTelegramWorkspaceAdmissionLedger,
   createTelegramWorkspaceAdmissionProfileKey,
   createTelegramWorkspaceAdmissionRuntimeBinding,
-  createTelegramWorkspaceJournalWriterAdmission,
   runWithTelegramWorkspaceAdmissionsAsync,
   resolveTelegramWorkspaceDestructiveFenceKind,
   normalizeTelegramWorkspaceJournalWriterClosureFence,
@@ -436,52 +435,6 @@ test("Workspace writer protocol mode binds startup and closure authority", () =>
     target }, profileKey), undefined);
 });
 
-test("Workspace closure atomically installs protocol mode and admits only exact v3 writers", () => {
-  const temp = createTempPath();
-  let now = 1_000;
-  try {
-    const ledger = createLedger({ path: temp.path, getNowMs: () => now });
-    const closure = ledger.acquireJournalWriterClosure({ operationId: "closure:install",
-      recoveryKey: "journal:work", requestedAtMs: 900 });
-    assert.equal(closure.kind, "acquired");
-    if (closure.kind !== "acquired") return;
-    const authority = { recoveryKey: "journal:work", startupAuthorityId: "operator-cutover:1",
-      closureOperationId: "closure:install", writerInventorySha256: "a".repeat(64) };
-    const installed = ledger.installJournalWriterProtocolMode(closure.fence, authority);
-    assert.equal(installed.resumed, false);
-    assert.equal(ledger.read().fence, undefined);
-    assert.deepEqual(ledger.read().writerProtocolMode, installed.mode);
-    now = 2_000;
-    assert.deepEqual(ledger.installJournalWriterProtocolMode(closure.fence, authority),
-      { mode: installed.mode, resumed: true });
-    assert.deepEqual(ledger.acquireJournalWriterClosure({ operationId: "closure:other",
-      recoveryKey: "journal:work", requestedAtMs: 1_500 }),
-    { kind: "blocked", reason: "retirement-active" });
-    const generic = createTelegramWorkspaceJournalWriterAdmission({ ledger,
-      createOperationId: () => "writer:generic" });
-    assert.throws(() => generic(() => "unsafe"),
-      error => isAdmissionError(error, "authority-changed"));
-    assert.throws(() => ledger.acquireAdmission({ operationId: "writer:bypass",
-      operationKind: "journal.input.acquire", scope: { kind: "profile" } }),
-    error => isAdmissionError(error, "authority-changed"));
-    const admitted = createTelegramWorkspaceJournalWriterAdmission({ ledger,
-      protocolAuthority: authority, createOperationId: () => "writer:v3" });
-    assert.equal(admitted(() => {
-      const nested = ledger.acquireAdmission({ operationId: "writer:v3:input",
-        operationKind: "journal.input.acquire", scope: { kind: "profile" } });
-      assert.equal(nested.kind, "acquired");
-      if (nested.kind === "acquired") assert.equal(ledger.releaseAdmission(nested.lease), true);
-      return "safe";
-    }), "safe");
-    assert.equal(ledger.read().leases.length, 0);
-    assert.throws(() => ledger.acquireJournalWriterAdmission({ operationId: "writer:wrong",
-      ...authority, writerInventorySha256: "b".repeat(64) }),
-    error => isAdmissionError(error, "authority-changed"));
-  } finally {
-    rmSync(temp.dir, { recursive: true, force: true });
-  }
-});
-
 test("Workspace protocol mode returns to closure only with zero leases and explicit authority", () => {
   const temp = createTempPath();
   const authorizations: string[] = [];
@@ -619,44 +572,6 @@ test("Workspace writer closure acquisition and release require zero leases and e
   }
 });
 
-test("Workspace journal writer adapter retains acquisition identity and never masks settled outcome", () => {
-  const acquireTemp = createTempPath();
-  const releaseTemp = createTempPath();
-  try {
-    let acquireRenames = 0;
-    const acquireLedger = createLedger({ path: acquireTemp.path, publishRename(source, destination) {
-      acquireRenames += 1;
-      renameSync(source, destination);
-      if (acquireRenames === 1) throw new Error("lost acquire acknowledgement");
-    } });
-    let executions = 0;
-    const admitted = createTelegramWorkspaceJournalWriterAdmission({ ledger: acquireLedger,
-      createOperationId: () => "writer:stable" });
-    assert.throws(() => admitted(() => { executions += 1; }),
-      error => isAdmissionError(error, "publication-unknown"));
-    assert.equal(executions, 0);
-    assert.equal(admitted(() => ++executions), 1);
-    assert.equal(executions, 1);
-    assert.equal(acquireLedger.read().leases.length, 0);
-
-    let releaseRenames = 0;
-    const releaseErrors: unknown[] = [];
-    const releaseLedger = createLedger({ path: releaseTemp.path, publishRename(source, destination) {
-      releaseRenames += 1;
-      renameSync(source, destination);
-      if (releaseRenames === 2) throw new Error("lost release acknowledgement");
-    } });
-    const releaseAdmitted = createTelegramWorkspaceJournalWriterAdmission({ ledger: releaseLedger,
-      createOperationId: () => "writer:release", onReleaseError: error => releaseErrors.push(error) });
-    assert.equal(releaseAdmitted(() => "settled"), "settled");
-    assert.equal(releaseErrors.length, 1);
-    assert.equal(releaseLedger.read().leases.length, 0);
-  } finally {
-    rmSync(acquireTemp.dir, { recursive: true, force: true });
-    rmSync(releaseTemp.dir, { recursive: true, force: true });
-  }
-});
-
 test("Workspace destructive fence distinguishes manual cleanup while legacy retirement stays pressure", () => {
   const retirementTemp = createTempPath();
   const cleanupTemp = createTempPath();
@@ -689,6 +604,119 @@ test("Workspace destructive fence distinguishes manual cleanup while legacy reti
     rmSync(retirementTemp.dir, { recursive: true, force: true });
     rmSync(cleanupTemp.dir, { recursive: true, force: true });
   }
+});
+
+for (const consolidated of [false, true]) {
+  test(`Workspace F1 provider retains only unchanged complete authority (${consolidated ? "consolidated" : "standalone"})`, () => {
+    const temp = createTempPath();
+    try {
+      let profile: string | undefined;
+      let token = "synthetic-token";
+      let path = temp.path;
+      const argumentsSeen: (string | undefined)[] = [];
+      const input = {
+        getProfileName: () => profile,
+        getBotToken: () => token,
+        owner: { ...owner },
+        getNowMs: undefined as (() => number) | undefined,
+        getProcessLiveness: undefined as ((owner: TelegramWorkspaceAdmissionOwner) => "alive") | undefined,
+        ...(consolidated ? { getStatePath: () => path } : {
+          getPath: (value?: string) => { argumentsSeen.push(value); return path; },
+        }),
+      };
+      const runtime = createTelegramWorkspaceAdmissionRuntimeBinding(input);
+      let previous = runtime.resolve()!;
+      const unchanged = () => assert.equal(runtime.resolve(), previous);
+      const changed = () => {
+        const next = runtime.resolve()!;
+        assert.notEqual(next, previous);
+        previous = next;
+        unchanged();
+      };
+      unchanged();
+      input.owner = { ...input.owner };
+      unchanged(); // Semantic owner equality, not object equality.
+      profile = "default";
+      unchanged(); // The default alias is the same authority if the actual path is equal.
+      if (!consolidated) assert.deepEqual(argumentsSeen.slice(0, 4), [undefined, undefined, undefined, "default"]);
+      path = join(temp.dir, "other.json"); changed();
+      path = temp.path; changed(); // Single entry, never resurrect the old capability.
+      profile = "work"; changed();
+      if (!consolidated) { profile = " work "; unchanged(); }
+      token = "rotated-token"; changed();
+      input.owner.processBirthId = "101:new-birth"; changed();
+      input.owner.processId = 102; input.owner.processBirthId = "102:new-birth"; changed();
+      input.getNowMs = Date.now; unchanged(); // Explicit default is equivalent.
+      input.getNowMs = () => 100; changed();
+      input.getNowMs = () => 100; changed(); // Equal values do not mean equal callback policy.
+      input.getProcessLiveness = () => "alive"; changed();
+      input.getProcessLiveness = () => "alive"; changed();
+      assert.deepEqual(readdirSync(temp.dir), [], "resolution performs no storage IO");
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+
+  test(`Workspace F1 provider forgets unsuccessful observations (${consolidated ? "consolidated" : "standalone"})`, () => {
+    const temp = createTempPath();
+    try {
+      let token: string | undefined = "synthetic-token";
+      let path = temp.path;
+      let profile = "work";
+      let failure = false;
+      const input = {
+        getProfileName: () => { if (failure) throw new Error("provider failed"); return profile; },
+        getBotToken: () => token,
+        owner: { ...owner },
+        ...(consolidated ? { getStatePath: () => path } : { getPath: () => path }),
+      };
+      const runtime = createTelegramWorkspaceAdmissionRuntimeBinding(input);
+      let previous = runtime.resolve()!;
+      const restored = () => {
+        const next = runtime.resolve()!;
+        assert.notEqual(next, previous);
+        assert.equal(runtime.resolve(), next);
+        previous = next;
+      };
+      token = undefined; assert.equal(runtime.resolve(), undefined);
+      token = "synthetic-token"; restored();
+      failure = true; assert.throws(runtime.resolve, /provider failed/);
+      failure = false; restored();
+      path = ""; assert.throws(runtime.resolve, error => isAdmissionError(error, "invalid-input"));
+      path = temp.path; restored();
+      profile = " "; assert.throws(runtime.resolve, error => isAdmissionError(error, "invalid-input"));
+      profile = "work"; restored();
+      input.owner.processBirthId = "invalid";
+      assert.throws(runtime.resolve, error => isAdmissionError(error, "invalid-input"));
+      input.owner.processBirthId = owner.processBirthId; restored();
+      if (consolidated) {
+        profile = " work "; // Normalized key cannot bypass exact section validation on reuse.
+        assert.throws(runtime.resolve, error => isAdmissionError(error, "invalid-input"));
+        profile = "work"; restored();
+      }
+      assert.deepEqual(readdirSync(temp.dir), []);
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Workspace F1 provider preserves captured getters and the supplied mutable owner fence", () => {
+  const temp = createTempPath();
+  try {
+    const originalOwner = { ...owner };
+    const input = { getStatePath: () => temp.path, getProfileName: () => "work",
+      getBotToken: () => "synthetic-token", owner: originalOwner };
+    const runtime = createTelegramWorkspaceAdmissionRuntimeBinding(input);
+    const first = runtime.resolve()!;
+    input.getStatePath = () => { throw new Error("substituted path getter"); };
+    input.getProfileName = () => "foreign";
+    input.getBotToken = () => "foreign";
+    assert.equal(runtime.resolve(), first);
+    originalOwner.processBirthId = "101:mutated";
+    assert.throws(() => first.read(), error => isAdmissionError(error, "authority-changed"));
+    input.owner = { ...owner };
+    const replacement = runtime.resolve()!;
+    assert.notEqual(replacement, first, "equal replacement cannot reuse a ledger whose live owner fence changed");
+    assert.equal(runtime.resolve(), replacement);
+    assert.deepEqual(replacement.read().leases, []);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
 });
 
 test("Workspace admission runtime binds profile paths to stable bot identity", () => {

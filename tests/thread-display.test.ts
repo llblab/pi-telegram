@@ -354,7 +354,7 @@ test("Concurrent reconciliation is serialized and uses the committed title", asy
   fixture.state.onEdit = async () => { started(); await pending; };
   const first = fixture.reconcile();
   await entered;
-  const second = fixture.reconcile();
+  const second = fixture.reconcileLive();
   release();
   assert.deepEqual(await Promise.all([first, second]), [{ changed: 1 }, { changed: 0 }]);
   assert.deepEqual(fixture.state.calls, ["A"]);

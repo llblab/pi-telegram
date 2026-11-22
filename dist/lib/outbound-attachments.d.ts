@@ -8,6 +8,14 @@ import type { ExtensionAPI } from "./pi.ts";
 import { type TelegramTarget } from "./target.ts";
 export declare const TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES: number;
 export declare function getTelegramOutboundAttachmentByteLimitFromEnv(env: NodeJS.ProcessEnv, names: string[], defaultValue?: number): number;
+export declare class TelegramArtifactSourceError extends Error {
+    readonly reason: "source-unavailable" | "source-invalid" | "source-changed" | "size-exceeded";
+    constructor(reason: TelegramArtifactSourceError["reason"], options?: ErrorOptions);
+}
+export declare function validateTelegramArtifactFile(path: string, name: string): void;
+export declare function getTelegramArtifactByteLimit(maxBytes?: number): number;
+/** One regular descriptor, bounded actual read, and observational continuity; links are caller-authorized. */
+export declare function captureTelegramArtifactSource(path: string, maxBytes?: number): Promise<Buffer>;
 export interface TelegramOutboundAttachmentToolResult {
     content: Array<{
         type: "text";

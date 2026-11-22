@@ -1,15 +1,20 @@
 /**
  * Regression tests for Telegram transport ownership helpers
  * Covers owners.json authority, stale-owner replacement, and owner-gated polling behavior
+ * Zones: telegram ownership, filesystem, transport authority
  */
 
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -23,12 +28,18 @@ import { runNodeEval } from "./fixtures/node-eval.ts";
 import { createTelegramJournalSourceSerialization, createTelegramUpdateJournalBindingRuntime } from "../lib/journal.ts";
 import {
   resolveTelegramOwnersPath,
+  resolveTelegramStatePath,
   resolveTelegramSessionsDir,
   resolveTelegramTempDir,
 } from "../lib/paths.ts";
 import { createTelegramSessionFolderSweeper } from "../lib/recovery.ts";
+import { TelegramFollowerRegistrationCancelledError, type TelegramFollowerRegistrationResult, type TelegramFollowerRegistrationOptions } from "../lib/polling.ts";
+import { createTelegramConfigStore } from "../lib/config.ts";
+import { createTelegramWorkspaceAdmissionLedger, createTelegramWorkspaceAdmissionProfileKey } from "../lib/workspace-admission.ts";
+import { createTelegramTopicTargetStore } from "../lib/threads.ts";
 import {
   createTelegramLockedPollingRuntime,
+  createTelegramRuntimeStateCutover,
   createTelegramLockKeyResolver,
   createTelegramLockRuntime,
   readLocks,
@@ -43,6 +54,10 @@ import {
   TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE,
   TELEGRAM_OWNERSHIP_REFRESH_MS,
   withTelegramFileTransaction,
+  installTelegramLegacyTransactionBarrier,
+  loadTelegramFileTransactionKernelBackend,
+  TelegramFileTransactionKernelError,
+  type TelegramFileTransactionKernel,
   publishTelegramPrivateFile,
   readTelegramPrivateFile,
   TelegramPrivateFileError,
@@ -52,6 +67,610 @@ import {
   createTelegramOwnedStateAuthorityCapture,
 } from "../lib/locks.ts";
 import { createTelegramSessionContextStore } from "../lib/lifecycle.ts";
+import { readTelegramSyncBlockTotals } from "../lib/loop-lag.ts";
+
+test("Cold legacy admission barrier rejects a path outside its transaction contract before authority", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-legacy-cutover-invalid-"));
+  try {
+    for (const path of ["relative.transaction", join(dir, "settings.json"), join(dir, "guard.transaction") + "\0"])
+      assert.throws(() => installTelegramLegacyTransactionBarrier(path, () => assert.fail("Invalid path reaches authority")), /exact absolute transaction path/u);
+    assert.deepEqual(readdirSync(dir), []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const mode of ["held", "damage", "interrupted", "foreign", "cancel-before", "cancel-after"] as const) {
+  test(`Cold legacy admission barrier preserves occupied evidence (${mode})`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "pt-legacy-cutover-")), guard = join(dir, "legacy.transaction");
+    const install = () => installTelegramLegacyTransactionBarrier(guard, () => true);
+    try {
+      if (mode === "held") {
+        withTelegramFileTransaction(guard, () => {
+          const [marker] = readdirSync(guard), path = join(guard, marker!), before = readFileSync(path);
+          assert.throws(install);
+          assert.throws(() => installTelegramLegacyTransactionBarrier(guard, () => true, { allowDamagedDirectory: true }), /verifiable or changing owner/u);
+          assert.deepEqual(readdirSync(guard), [marker]);
+          assert.deepEqual(readFileSync(path), before);
+        });
+      } else if (mode === "cancel-before") {
+        let checks = 0;
+        assert.throws(() => installTelegramLegacyTransactionBarrier(guard, () => ++checks < 2), /cold maintenance authority/u);
+        assert.equal(existsSync(guard), false);
+      } else if (mode === "cancel-after") {
+        let checks = 0;
+        assert.throws(() => installTelegramLegacyTransactionBarrier(guard, () => ++checks < 3), /cold maintenance authority/u);
+        assert.ok(existsSync(guard), "A spent authority cannot announce even its completed publication");
+      } else if (mode === "damage") {
+        mkdirSync(guard);
+        const owner = join(guard, `owner.${randomUUID()}.json`);
+        writeFileSync(owner, "", { mode: 0o600 });
+        const identity = statSync(guard, { bigint: true });
+        assert.throws(install);
+        assert.equal(statSync(guard, { bigint: true }).ino, identity.ino);
+        assert.equal(readFileSync(owner).length, 0);
+        return;
+      } else {
+        if (mode === "foreign") {
+          const other = join(dir, "other.transaction");
+          assert.equal(installTelegramLegacyTransactionBarrier(other, () => true), "installed");
+          writeFileSync(guard, readFileSync(other), { mode: 0o600 });
+        } else writeFileSync(guard, "pi-telegram:kernel-cutover-v1:", { mode: 0o600 });
+        const before = readFileSync(guard);
+        assert.throws(install, /missing or does not match/u);
+        assert.deepEqual(readFileSync(guard), before);
+        return;
+      }
+      assert.equal(install(), mode === "cancel-after" ? "already-installed" : "installed");
+      const bytes = readFileSync(guard), inode = statSync(guard, { bigint: true }).ino;
+      assert.equal(install(), "already-installed");
+      assert.throws(() => withTelegramFileTransaction(guard, () => assert.fail("Legacy admission reopened"), { attempts: 1 }),
+        { code: "guard-unverifiable", phase: "acquire" });
+      assert.deepEqual(readFileSync(guard), bytes);
+      assert.equal(statSync(guard, { bigint: true }).ino, inode);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const mode of ["empty", "empty-owner", "malformed-owner", "validates-late", "replaced-directory", "cancel", "partial", "unknown-layout", "linked-owner"] as const) {
+  test(`Cold cutover adds its marker without retiring a damaged legacy directory (${mode})`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "pt-legacy-cutover-damaged-")), guard = join(dir, "state.transaction");
+    try {
+      mkdirSync(guard, { mode: 0o700 });
+      const generation = randomUUID(), owner = join(guard, `owner.${generation}.json`), marker = join(guard, "kernel-cutover-v1");
+      const body = mode === "malformed-owner" ? "{ broken" : "";
+      if (mode !== "empty" && mode !== "replaced-directory") writeFileSync(owner, body, { mode: 0o600 });
+      if (mode === "partial") writeFileSync(marker, "pi-telegram:kernel-cutover-v1:", { mode: 0o600 });
+      if (mode === "unknown-layout") writeFileSync(join(guard, "foreign"), "untouched", { mode: 0o600 });
+      if (mode === "linked-owner") linkSync(owner, join(dir, "owner-alias"));
+      const identity = statSync(guard, { bigint: true }), names = readdirSync(guard), bytes = names.map(name => readFileSync(join(guard, name)));
+      let checks = 0;
+      const install = (current = () => true) => installTelegramLegacyTransactionBarrier(guard, current, { allowDamagedDirectory: true });
+      if (mode === "replaced-directory") {
+        const old = join(dir, "displaced");
+        assert.throws(() => install(() => {
+          if (++checks === 2) { renameSync(guard, old); mkdirSync(guard, { mode: 0o700 }); }
+          return true;
+        }), /barrier directory changed/u);
+        assert.deepEqual(readdirSync(guard), []); assert.deepEqual(readdirSync(old), []);
+        assert.equal(statSync(old, { bigint: true }).ino, identity.ino);
+        return;
+      }
+      if (mode === "validates-late") {
+        const valid = JSON.stringify({ pid: process.pid, generation, acquiredAtMs: 1 });
+        assert.throws(() => install(() => {
+          if (++checks === 2) writeFileSync(owner, valid);
+          return true;
+        }), /verifiable or changing owner/u);
+        assert.equal(readFileSync(owner, "utf8"), valid);
+        assert.deepEqual(readdirSync(guard), names);
+      } else if (mode === "cancel" || mode === "partial" || mode === "unknown-layout" || mode === "linked-owner") {
+        assert.throws(() => install(() => mode !== "cancel" || ++checks < 2));
+        assert.deepEqual(readdirSync(guard), names);
+        assert.deepEqual(names.map(name => readFileSync(join(guard, name))), bytes);
+      } else {
+        assert.equal(install(), "installed");
+        const markerBytes = readFileSync(marker), inode = statSync(marker, { bigint: true }).ino;
+        assert.equal(install(), "already-installed");
+        assert.throws(() => withTelegramFileTransaction(guard, () => assert.fail("Legacy admission reopened"), { attempts: 1 }),
+          { code: "guard-unverifiable", reason: "invalid-layout", phase: "acquire" });
+        assert.deepEqual(readdirSync(guard).sort(), [...names, basename(marker)].sort());
+        assert.deepEqual(names.map(name => readFileSync(join(guard, name))), bytes);
+        assert.equal(statSync(marker, { bigint: true }).ino, inode);
+        assert.deepEqual(readFileSync(marker), markerBytes);
+      }
+      const after = statSync(guard, { bigint: true });
+      assert.equal(after.ino, identity.ino); assert.equal(after.dev, identity.dev);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const layout of ["source", "compiled"] as const) {
+  test(`Cold legacy admission barrier permits one exclusive publication (${layout})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pt-legacy-cutover-race-")), guard = join(dir, "legacy.transaction");
+    const url = new URL(layout === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+    try {
+      const source = `
+        import { installTelegramLegacyTransactionBarrier } from ${JSON.stringify(url)};
+        try { console.log(installTelegramLegacyTransactionBarrier(${JSON.stringify(guard)}, () => true)); }
+        catch (error) {
+          if (!/barrier is missing or does not match|private file changed during inspection/u.test(error.message)) throw error;
+          console.log("unready");
+        }
+      `;
+      const children = await Promise.all([runNodeEval(source), runNodeEval(source)]);
+      for (const child of children) assert.equal(child.code, 0, child.stderr);
+      const outcomes = children.map(child => child.stdout.trim());
+      assert.equal(outcomes.filter(outcome => outcome === "installed").length, 1);
+      assert.ok(outcomes.every(outcome => ["installed", "already-installed", "unready"].includes(outcome)), outcomes.join(", "));
+      assert.equal(installTelegramLegacyTransactionBarrier(guard, () => true), "already-installed");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  for (const fault of ["cold", "healthy", "worker", "missing", "catalog", "manifest", "image", "tuple", "hardlink", "directory", "oversized", "read-race",
+    "arch", "node", "napi", "old-napi", "alternate", "musl", "old-glibc", "old-os", "bad-exports", "accessor", "late-change"] as const) {
+    test(`Private kernel loader admits exact package bytes without default activation (${layout}/${fault})`, { skip: process.arch !== "x64" }, async () => {
+      const root = mkdtempSync(join(tmpdir(), "pt-kernel-loader-"));
+      const moduleUrl = new URL(layout === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+      try {
+        const result = await runNodeEval(`
+          import assert from "node:assert/strict";
+          import fs from "node:fs";
+          import url from "node:url";
+          import os from "node:os";
+          import { createRequire } from "node:module";
+          import { createHash } from "node:crypto";
+          import { join, sep } from "node:path";
+          import { mock } from "node:test";
+          import { once } from "node:events";
+          import { Worker } from "node:worker_threads";
+          const root = ${JSON.stringify(root)}, moduleUrl = ${JSON.stringify(moduleUrl)}, fault = ${JSON.stringify(fault)};
+          const defaultURL = new URL(${JSON.stringify(new URL("../native/", import.meta.url).href)}), defaultPath = url.fileURLToPath(defaultURL), directory = join(root, "native");
+          const agent = join(root, "must-not-create-agent"); process.env.PI_CODING_AGENT_DIR = agent;
+          fs.cpSync(defaultPath, directory, { recursive: true, filter: () => true });
+          const catalogPath = join(directory, "catalog.json"), catalog = JSON.parse(fs.readFileSync(catalogPath));
+          const target = process.platform + "-x64", base = join(directory, "prebuilds", target), entry = catalog.targets[target];
+          const manifestPath = join(base, "manifest.json"), imagePath = join(base, entry.binarySha256 + ".node");
+          if (fault === "missing") fs.unlinkSync(imagePath);
+          if (fault === "catalog") fs.writeFileSync(catalogPath, JSON.stringify({ ...catalog, version: 2 }));
+          if (fault === "manifest") fs.appendFileSync(manifestPath, " ");
+          if (fault === "image") {
+            const bytes = fs.readFileSync(imagePath); bytes[bytes.length - 1] ^= 1; fs.writeFileSync(imagePath, bytes);
+          }
+          if (fault === "tuple") {
+            const data = JSON.parse(fs.readFileSync(manifestPath)); data.source.sha256 = "f".repeat(64);
+            const bytes = Buffer.from(JSON.stringify(data)); fs.writeFileSync(manifestPath, bytes);
+            entry.manifestSha256 = createHash("sha256").update(bytes).digest("hex"); fs.writeFileSync(catalogPath, JSON.stringify(catalog));
+          }
+          if (fault === "hardlink") fs.linkSync(imagePath, join(root, "alias.node"));
+          if (fault === "directory") { fs.unlinkSync(manifestPath); fs.mkdirSync(manifestPath); }
+          if (fault === "oversized") fs.writeFileSync(catalogPath, "x".repeat(16385));
+          if (fault === "arch") Object.defineProperty(process, "arch", { value: "arm64" });
+          if (fault === "node") Object.defineProperty(process.versions, "node", { value: "22.18.0" });
+          if (fault === "napi" || fault === "old-napi") Object.defineProperty(process.versions, "napi", { value: fault === "napi" ? "unknown" : "7" });
+          if (fault === "alternate") Object.defineProperty(process.versions, "electron", { value: "unqualified" });
+          if (fault === "musl" || fault === "old-glibc") {
+            Object.defineProperty(process, "platform", { value: "linux" });
+            Object.defineProperty(process, "report", { value: { getReport: () => ({ header: fault === "musl" ? {} : { glibcVersionRuntime: "2.27" } }) } });
+          }
+          if (fault === "old-os") Object.defineProperty(process, "platform", { value: "darwin" });
+          let loads = 0, observations = 0, getterCalls = 0, imageFd, raced = false;
+          mock.module("node:fs", { namedExports: { ...fs, openSync(path, ...args) {
+            const fd = fs.openSync(path, ...args); if (path === imagePath) imageFd = fd; return fd;
+          }, readSync(fd, ...args) {
+            if (fault === "read-race" && fd === imageFd && !raced) { raced = true; fs.appendFileSync(imagePath, "x"); }
+            return fs.readSync(fd, ...args);
+          }, lstatSync(path, ...args) {
+            if (typeof path === "string" && (path.startsWith(directory + sep) || path.startsWith(defaultPath))) observations++;
+            return fs.lstatSync(path, ...args);
+          } } });
+          mock.module("node:os", { namedExports: { ...os, release: () => fault === "old-os" ? "19.6.0" : os.release() } });
+          mock.module("node:url", { namedExports: { ...url, fileURLToPath(value, ...args) {
+            if (!["cold", "healthy", "worker"].includes(fault) && value?.href === defaultURL.href) return directory;
+            return url.fileURLToPath(value, ...args);
+          } } });
+          mock.module("node:module", { namedExports: { createRequire(value) {
+            const require = createRequire(value);
+            return path => {
+              if (typeof path === "string" && path.endsWith(".node")) {
+                loads++;
+                if (fault === "bad-exports") return { backendKind: "wrong", napi: 8, tryAcquire() {}, release() {} };
+                if (fault === "accessor") return { backendKind: "pi-telegram-kernel-v1-" + process.platform, napi: 8,
+                  get tryAcquire() { getterCalls++; throw new Error("Accessor must not execute"); }, release() {} };
+                if (!["healthy", "worker", "late-change"].includes(fault)) throw new Error("Unverified input reached native loading");
+                const result = require(path);
+                if (fault === "late-change") fs.appendFileSync(manifestPath, " ");
+                return result;
+              }
+              return require(path);
+            };
+          } } });
+          const Kernel = await import(moduleUrl);
+          assert.equal(typeof Kernel.loadTelegramFileTransactionKernelBackend, "function");
+          assert.equal(loads, 0); assert.equal(observations, 0); assert.equal(fs.existsSync(agent), false);
+          if (fault === "healthy") {
+            const backend = Kernel.loadTelegramFileTransactionKernelBackend();
+            assert.equal(loads, 1); assert.ok(Object.isFrozen(backend));
+            assert.deepEqual(Reflect.ownKeys(backend).sort(), ["backendKind", "napi", "release", "tryAcquire"]);
+            assert.equal(backend.napi, 8); assert.equal(backend.backendKind, "pi-telegram-kernel-v1-" + process.platform);
+            const actualPath = join(defaultPath, "prebuilds", target, entry.binarySha256 + ".node"), native = createRequire(import.meta.url)(actualPath);
+            native.tryAcquire = native.release = () => { throw new Error("Replaced exports have no authority over captured methods"); };
+            const anchor = join(root, "coord.lock"); fs.writeFileSync(anchor, "", { mode: 0o600 });
+            const lease = backend.tryAcquire(anchor); assert.ok(lease); assert.deepEqual(Reflect.ownKeys(lease), []);
+            try {
+              assert.equal(backend.tryAcquire(anchor), undefined);
+              assert.throws(() => backend.release({}), { code: "ERR_INVALID_LEASE" });
+            } finally { assert.equal(backend.release(lease), true); }
+            assert.equal(backend.release(lease), false);
+          } else if (fault === "worker") {
+            const backend = Kernel.loadTelegramFileTransactionKernelBackend(), path = join(root, "coord.lock");
+            fs.writeFileSync(path, "", { mode: 0o600 });
+            const worker = new Worker(\`
+              import { parentPort, workerData } from "node:worker_threads";
+              import(workerData.moduleUrl).then(Kernel => {
+                const backend = Kernel.loadTelegramFileTransactionKernelBackend();
+                globalThis.privateLoaderLease = backend.tryAcquire(workerData.path);
+                if (!globalThis.privateLoaderLease) throw new Error("Worker must own the real lease");
+                parentPort.on("message", () => parentPort.close());
+                parentPort.postMessage("held");
+              }).catch(error => { throw error; });
+            \`, { eval: true, trackUnmanagedFds: false, workerData: { moduleUrl, path } });
+            let exited = false; worker.once("exit", () => { exited = true; });
+            try {
+              const [ready] = await once(worker, "message", { signal: AbortSignal.timeout(5000) }); assert.equal(ready, "held");
+              assert.equal(backend.tryAcquire(path), undefined);
+              const closed = once(worker, "exit", { signal: AbortSignal.timeout(5000) }); worker.postMessage("exit");
+              assert.deepEqual(await closed, [0]);
+              const successor = backend.tryAcquire(path); assert.ok(successor); assert.equal(backend.release(successor), true);
+            } finally { if (!exited) await worker.terminate(); }
+          } else if (fault !== "cold") {
+            const unsupported = ["arch", "node", "napi", "old-napi", "alternate", "musl", "old-glibc", "old-os"].includes(fault);
+            const issued = ["bad-exports", "accessor", "late-change"].includes(fault);
+            assert.throws(() => Kernel.loadTelegramFileTransactionKernelBackend(), {
+              code: "kernel-backend-refused", reason: unsupported ? "unsupported-host" : issued ? "load-failed" : "invalid-distribution",
+            });
+            assert.equal(loads, issued ? 1 : 0); assert.equal(getterCalls, 0);
+            if (unsupported) assert.equal(observations, 0, "Unsupported host refuses before package I/O");
+            if (fault === "late-change") {
+              assert.throws(() => Kernel.loadTelegramFileTransactionKernelBackend(), { reason: "invalid-distribution" });
+              assert.equal(loads, 1, "Observed post-load change grants no cache-clearing or native replay");
+            }
+          }
+          assert.equal(fs.existsSync(agent), false, "Package admission never reads or repairs configured runtime storage");
+        `, { nodeArgs: ["--experimental-test-module-mocks"] });
+        assert.equal(result.code, 0, result.stderr);
+      } finally {
+        // Native DLLs remain mapped until actual child exit, not a logical completion or JS cleanup request.
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+test("Private source and compiled kernel loaders share one canonical native instance", { skip: process.arch !== "x64" }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "pt-kernel-shared-image-"));
+  try {
+    const result = await runNodeEval(`
+      import assert from "node:assert/strict";
+      import { writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      const source = await import(${JSON.stringify(new URL("../lib/locks.ts", import.meta.url).href)});
+      const compiled = await import(${JSON.stringify(new URL("../dist/lib/locks.js?canonical-layout", import.meta.url).href)});
+      const first = source.loadTelegramFileTransactionKernelBackend(), second = compiled.loadTelegramFileTransactionKernelBackend();
+      const path = join(${JSON.stringify(root)}, "coord.lock"); writeFileSync(path, "", { mode: 0o600 });
+      const lease = first.tryAcquire(path); assert.ok(lease);
+      assert.equal(second.tryAcquire(path), undefined);
+      assert.equal(second.release(lease), true, "Both code projections must reach the same package-level module, not copied native instances");
+      assert.equal(first.release(lease), false);
+    `);
+    assert.equal(result.code, 0, result.stderr);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Cutover mode requires an exact legacy barrier and a real kernel lease, with no legacy fallback", { skip: process.arch !== "x64" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-legacy-cutover-kernel-"));
+  const guard = join(dir, "state.transaction"), other = join(dir, "other.transaction"), anchorPath = join(dir, "coord.lock");
+  try {
+    writeFileSync(anchorPath, "", { mode: 0o600 });
+    const backend = loadTelegramFileTransactionKernelBackend(), kernel = { ...backend, anchorPath };
+    const options = { kernel, requireLegacyBarrier: true } as const;
+    const forbidden = () => assert.fail("Missing cutover evidence reached the original callback");
+    assert.throws(() => withTelegramFileTransaction(guard, forbidden, { requireLegacyBarrier: true }), { reason: "invalid-port" });
+    assert.throws(() => withTelegramFileTransaction(guard, forbidden, options), /does not match/u);
+    assert.equal(existsSync(guard), false, "Opted-in refusal cannot create a legacy guard");
+    assert.equal(installTelegramLegacyTransactionBarrier(guard, () => true), "installed");
+    const bytes = readFileSync(guard), identity = statSync(guard, { bigint: true });
+    writeFileSync(other, bytes, { mode: 0o600 });
+    assert.throws(() => withTelegramFileTransaction(other, forbidden, options), /does not match/u);
+    assert.equal(withTelegramFileTransaction(guard, () => {
+      assert.equal(kernel.tryAcquire(anchorPath), undefined, "Original callback holds the native resource");
+      assert.throws(() => withTelegramFileTransaction(guard, forbidden), { code: "guard-unverifiable" });
+      return 42;
+    }, options), 42);
+    assert.equal(statSync(guard, { bigint: true }).ino, identity.ino);
+    assert.deepEqual(readFileSync(guard), bytes);
+    const damaged = join(dir, "damaged.transaction");
+    mkdirSync(damaged, { mode: 0o700 });
+    const originalOwner = join(damaged, `owner.${randomUUID()}.json`);
+    writeFileSync(originalOwner, "", { mode: 0o600 });
+    assert.throws(() => withTelegramFileTransaction(damaged, forbidden, options), /does not match/u);
+    assert.equal(installTelegramLegacyTransactionBarrier(damaged, () => true, { allowDamagedDirectory: true }), "installed");
+    assert.equal(withTelegramFileTransaction(damaged, () => {
+      assert.equal(kernel.tryAcquire(anchorPath), undefined);
+      return 43;
+    }, options), 43);
+    assert.equal(readFileSync(originalOwner).length, 0);
+    const lease = kernel.tryAcquire(anchorPath);
+    assert.ok(lease); assert.equal(kernel.release(lease), true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const mode of ["healthy", "damaged", "partial-mode", "partial-barrier", "lost-barrier", "lost-mode", "lost-anchor", "replaced-anchor", "wider-mode-identity", "lost-directory", "foreign-mode"] as const) {
+  test(`Runtime state cutover never falls back after its durable mode is selected (${mode})`, { skip: process.arch !== "x64" }, () => {
+    const agent = realpathSync(mkdtempSync(join(tmpdir(), "pt-state-cutover-")));
+    const cutover = createTelegramRuntimeStateCutover(agent);
+    const root = resolveTelegramTempDir(agent), state = resolveTelegramStatePath(agent);
+    const guard = join(root, "runtime", "state.json.transaction"), directory = join(agent, "telegram-kernel-cutover");
+    const marker = join(directory, "state.mode"), anchor = join(directory, "state.lock");
+    const forbidden = () => assert.fail("Incomplete cutover allowed legacy or kernel execution");
+    let retainedMode: Buffer | undefined, modeReadLimit: number | undefined;
+    try {
+      const initial = '{"version":2,"profiles":{"default":{"runtime":{"ready":true}}}}\n';
+      assert.equal(cutover.run(() => existsSync(guard)), true, "Healthy pre-cutover mode retains ordinary legacy serialization");
+      assert.equal(existsSync(directory), false);
+      writeFileSync(state, initial, { mode: 0o600 });
+      if (mode === "damaged" || mode === "partial-barrier") {
+        mkdirSync(guard, { mode: 0o700 });
+        writeFileSync(join(guard, `owner.${randomUUID()}.json`), "", { mode: 0o600 });
+      }
+      if (mode === "partial-barrier") {
+        writeFileSync(join(guard, "kernel-cutover-v1"), "partial", { mode: 0o600 });
+        assert.throws(() => cutover.install(() => true), /does not match/u);
+        assert.equal(existsSync(marker), false);
+      } else if (mode === "partial-mode") {
+        mkdirSync(directory, { mode: 0o700 });
+        writeFileSync(anchor, "", { mode: 0o600 });
+        writeFileSync(marker, "partial", { mode: 0o600 });
+        assert.throws(() => cutover.install(() => true), /mode is incomplete/u);
+        assert.equal(existsSync(guard), false);
+      } else {
+        cutover.install(() => true);
+        const originalAnchor = statSync(anchor, { bigint: true });
+        const originalMode = readFileSync(marker);
+        cutover.install(() => true);
+        assert.equal(statSync(anchor, { bigint: true }).ino, originalAnchor.ino);
+        if (mode === "healthy" || mode === "damaged") {
+          const successor = createTelegramRuntimeStateCutover(agent);
+          assert.equal(successor.run(() => {
+            assert.throws(() => cutover.run(forbidden), { reason: "busy" });
+            assert.throws(() => cutover.install(() => true), { reason: "busy" });
+            assert.throws(() => withTelegramFileTransaction(guard, forbidden, { attempts: 1 }), { code: "guard-unverifiable" });
+            return readFileSync(state, "utf8");
+          }), initial);
+          return;
+        }
+        if (mode === "lost-barrier") {
+          rmSync(guard, { recursive: true });
+          assert.throws(() => cutover.install(() => true), /^Error: Telegram legacy transaction barrier/u);
+          assert.equal(existsSync(guard), false, "A completed mode is not eligible for an implicit barrier reinstall");
+        }
+        if (mode === "lost-mode") rmSync(marker);
+        if (mode === "lost-anchor" || mode === "replaced-anchor") {
+          renameSync(anchor, join(directory, "displaced"));
+          if (mode === "replaced-anchor") {
+            writeFileSync(anchor, "", { flag: "wx", mode: 0o600 });
+            const replacement = statSync(anchor, { bigint: true });
+            assert.notDeepEqual([replacement.dev, replacement.ino], [originalAnchor.dev, originalAnchor.ino]);
+            retainedMode = originalMode;
+            modeReadLimit = originalMode.length - `${originalAnchor.dev}:${originalAnchor.ino}`.length + `${replacement.dev}:${replacement.ino}`.length;
+          } else {
+            assert.throws(() => cutover.install(() => true), /anchor is unavailable/u);
+            assert.equal(existsSync(anchor), false, "An installed anchor is never recreated by maintenance retry");
+          }
+        }
+        if (mode === "lost-directory") {
+          renameSync(directory, `${directory}-displaced`);
+          rmSync(guard, { recursive: true });
+          assert.throws(() => cutover.run(forbidden), /anchor is unavailable/u);
+          assert.equal(existsSync(guard), false);
+          return;
+        }
+        if (mode === "wider-mode-identity" || mode === "foreign-mode") {
+          if (mode === "foreign-mode") {
+            const foreign = join(agent, "foreign"); mkdirSync(foreign);
+            createTelegramRuntimeStateCutover(foreign).install(() => true);
+            retainedMode = readFileSync(join(foreign, "telegram-kernel-cutover", "state.mode"));
+          } else {
+            // Model a persisted decimal identity wider than the current anchor without relying on inode allocation.
+            const suffix = `:${originalAnchor.dev}:${originalAnchor.ino}\n`;
+            const modeText = originalMode.toString("utf8");
+            assert.ok(modeText.endsWith(suffix));
+            retainedMode = Buffer.from(`${modeText.slice(0, -1)}0\n`);
+            assert.equal(retainedMode.length, originalMode.length + 1);
+          }
+          writeFileSync(marker, retainedMode);
+          modeReadLimit = originalMode.length;
+        }
+      }
+      const run = () => createTelegramRuntimeStateCutover(agent).run(forbidden);
+      if (retainedMode !== undefined && modeReadLimit !== undefined) {
+        // A shorter current identity can make the old record fail the private reader's byte bound before comparison.
+        if (retainedMode.length > modeReadLimit)
+          assert.throws(run, { name: "TelegramPrivateFileError", failure: "capacity" });
+        else assert.throws(run, { name: "Error", message: "Telegram runtime cutover mode is incomplete or changed." });
+        assert.deepEqual(readFileSync(marker), retainedMode, "A refused successor must not rewrite the mode");
+      } else assert.throws(run, /^Error: Telegram (?:runtime cutover|legacy transaction barrier)/u);
+      assert.equal(readFileSync(state, "utf8"), initial);
+      if (mode === "lost-barrier" || mode === "partial-mode") assert.equal(existsSync(guard), false);
+    } finally { rmSync(agent, { recursive: true, force: true }); }
+  });
+}
+
+test("Runtime state cutover refuses two agent roots aliasing the same legacy storage", { skip: process.platform === "win32" }, () => {
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "pt-state-cutover-alias-")));
+  try {
+    const agent = join(parent, "agent"), foreign = join(parent, "foreign");
+    mkdirSync(agent); mkdirSync(join(foreign, "tmp"), { recursive: true });
+    symlinkSync(join(foreign, "tmp"), join(agent, "tmp"), "dir");
+    const cutover = createTelegramRuntimeStateCutover(agent);
+    assert.throws(() => cutover.install(() => true), /scope is unavailable or aliased/u);
+    assert.throws(() => cutover.run(() => assert.fail("Aliased resource admitted")), /scope is unavailable or aliased/u);
+    assert.equal(existsSync(join(agent, "telegram-kernel-cutover")), false);
+    assert.deepEqual(readdirSync(join(foreign, "tmp")), []);
+  } finally { rmSync(parent, { recursive: true, force: true }); }
+});
+
+test("Actual compiled successor resumes an interrupted runtime cutover without replacing its anchor", { skip: process.arch !== "x64" }, async () => {
+  const agent = realpathSync(mkdtempSync(join(tmpdir(), "pt-state-cutover-compiled-")));
+  const directory = join(agent, "telegram-kernel-cutover"), anchor = join(directory, "state.lock");
+  try {
+    const guard = join(resolveTelegramTempDir(agent), "runtime", "state.json.transaction");
+    mkdirSync(directory, { mode: 0o700 }); writeFileSync(anchor, "", { mode: 0o600 });
+    assert.equal(installTelegramLegacyTransactionBarrier(guard, () => true), "installed");
+    const identity = statSync(anchor, { bigint: true });
+    const marker = readFileSync(guard), mode = join(directory, "state.mode");
+    const prepare = () => runNodeEval(`
+      import assert from "node:assert/strict";
+      import { createTelegramRuntimeStateCutover } from ${JSON.stringify(new URL("../dist/lib/locks.js", import.meta.url).href)};
+      const agent = ${JSON.stringify(agent)}, cutover = createTelegramRuntimeStateCutover(agent);
+      assert.throws(() => cutover.run(() => assert.fail("Interrupted transition admitted work")), /mode is incomplete/u);
+      process.argv = [process.execPath, "prepare-cold-cutover.mjs", "--agent-dir", agent, "--confirm-all-writers-stopped"];
+      await import(${JSON.stringify(new URL("../scripts/prepare-cold-cutover.mjs", import.meta.url).href)});
+      if (process.exitCode !== 1) assert.equal(cutover.run(() => "ready"), "ready");
+    `);
+    const backend = loadTelegramFileTransactionKernelBackend(), held = backend.tryAcquire(anchor);
+    assert.ok(held);
+    try {
+      const blocked = await prepare();
+      assert.equal(blocked.signal, null); assert.equal(blocked.code, 1, blocked.stdout + blocked.stderr);
+      assert.match(blocked.stderr, /kernel transaction busy during acquire/u);
+      assert.equal(blocked.stdout, ""); assert.equal(existsSync(mode), false, "A competing preparer cannot publish readiness");
+      assert.deepEqual(readFileSync(guard), marker);
+    } finally { assert.equal(backend.release(held), true); }
+    const result = await prepare();
+    assert.equal(result.signal, null); assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /No connection was started/u);
+    assert.equal(statSync(anchor, { bigint: true }).ino, identity.ino);
+    assert.deepEqual(readFileSync(guard), marker);
+    assert.equal(createTelegramRuntimeStateCutover(agent).run(() => "ready"), "ready");
+  } finally { rmSync(agent, { recursive: true, force: true }); }
+});
+
+for (const mode of ["success", "busy", "acquire-error", "invalid-lease", "async-lease", "pre-aborted", "acquire-aborted", "legacy-aborted", "legacy-damaged",
+  "operation-error", "release-false", "release-error", "async-release", "both-errors"] as const) {
+  test(`Private kernel transaction port preserves legacy exclusion and one-shot retirement (${mode})`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "pt-kernel-port-")), guard = join(dir, "state.transaction");
+    const controller = new AbortController(), nativeError = new Error("native fixture failure"), operationError = new Error("operation failure");
+    const lease = Object.freeze({});
+    let acquisitions = 0, releases = 0, operations = 0, held = false;
+    const kernel: TelegramFileTransactionKernel = {
+      anchorPath: join(dir, "immutable.lock"), signal: controller.signal,
+      tryAcquire(path) {
+        assert.equal(this, kernel); assert.equal(path, kernel.anchorPath); acquisitions++;
+        assert.equal(existsSync(guard), mode === "legacy-damaged", "Kernel admission precedes legacy guard changes");
+        if (mode === "busy") return undefined;
+        if (mode === "acquire-error") throw nativeError;
+        if (mode === "invalid-lease") return 7 as unknown as object;
+        if (mode === "async-lease") return Promise.resolve(lease);
+        held = true;
+        if (mode === "acquire-aborted") controller.abort(nativeError);
+        return lease;
+      },
+      release(value) {
+        assert.equal(this, kernel); assert.equal(value, lease); releases++;
+        assert.equal(existsSync(guard), mode === "legacy-damaged", "Legacy release/refusal precedes kernel retirement");
+        if (mode === "release-error" || mode === "both-errors") throw nativeError;
+        if (mode === "release-false") return false;
+        if (mode === "async-release") return Promise.resolve(true) as unknown as boolean;
+        held = false; return true;
+      },
+    };
+    try {
+      if (mode === "legacy-damaged") { mkdirSync(guard); writeFileSync(join(guard, "owner.fixture.json"), ""); }
+      if (mode === "pre-aborted") controller.abort(nativeError);
+      let failure: unknown;
+      try {
+        assert.equal(withTelegramFileTransaction(guard, () => {
+          operations++; assert.equal(held, true); assert.equal(existsSync(guard), true);
+          if (mode === "operation-error" || mode === "both-errors") throw operationError;
+          return 17;
+        }, { kernel, attempts: 1, ...(mode === "legacy-aborted" ? {
+          publishRename(...args: Parameters<typeof renameSync>) { renameSync(...args); controller.abort(nativeError); },
+        } : {}) }), 17);
+      } catch (error) { failure = error; }
+      const executes = ["success", "operation-error", "release-false", "release-error", "async-release", "both-errors"].includes(mode);
+      const acquired = !["busy", "acquire-error", "invalid-lease", "async-lease", "pre-aborted"].includes(mode);
+      assert.equal(operations, executes ? 1 : 0);
+      assert.equal(acquisitions, mode === "pre-aborted" ? 0 : 1, "No native wait loop or implicit retry");
+      assert.equal(releases, acquired ? 1 : 0, "No repeated native release, including after failure");
+      if (mode === "success") assert.equal(failure, undefined);
+      else if (mode === "pre-aborted" || mode === "acquire-aborted" || mode === "legacy-aborted") assert.equal(failure, nativeError);
+      else if (mode === "operation-error") assert.equal(failure, operationError);
+      else if (mode === "legacy-damaged") {
+        assert.equal((failure as { code: string }).code, "guard-unverifiable");
+        assert.equal(readFileSync(join(guard, "owner.fixture.json"), "utf8"), "", "Kernel ownership never repairs a damaged legacy guard");
+        assert.deepEqual(readdirSync(guard), ["owner.fixture.json"]);
+      } else {
+        assert.ok(failure instanceof TelegramFileTransactionKernelError);
+        assert.equal(failure.phase, mode.startsWith("release-") || mode === "async-release" || mode === "both-errors" ? "release" : "acquire");
+        if (mode === "acquire-error" || mode === "release-error") assert.equal(failure.cause, nativeError);
+        if (mode === "both-errors") {
+          assert.ok(failure.cause instanceof AggregateError);
+          assert.deepEqual(failure.cause.errors, [operationError, nativeError], "Neither original failure may be hidden by teardown");
+        }
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Private kernel port captures its admitted callables and preserves synchronous-prefix lifetime", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-kernel-sync-")), guard = join(dir, "state.transaction");
+  let held = false, releases = 0;
+  const kernel: TelegramFileTransactionKernel = {
+    anchorPath: join(dir, "immutable.lock"),
+    tryAcquire() {
+      held = true;
+      kernel.release = () => { throw new Error("Replacement callable has no authority over the captured lease"); };
+      return {};
+    },
+    release() { held = false; releases++; return true; },
+  };
+  try {
+    const pending = withTelegramFileTransaction(guard, async () => {
+      assert.equal(held, true); assert.equal(existsSync(guard), true);
+      await Promise.resolve();
+      assert.equal(held, false); assert.equal(existsSync(guard), false);
+      return 31;
+    }, { kernel });
+    assert.equal(held, false); assert.equal(releases, 1);
+    assert.equal(await pending, 31, "Returning a Promise never invents an await-held file transaction");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("Private kernel admission keeps per-resource granularity and refuses guard-contained anchors", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-kernel-resources-")), held = new Map<object, string>();
+  const kernel = (name: string): TelegramFileTransactionKernel => ({
+    anchorPath: join(dir, `${name}.immutable.lock`),
+    tryAcquire(path) {
+      if ([...held.values()].includes(path)) return undefined;
+      const lease = {}; held.set(lease, path); return lease;
+    },
+    release(lease) { return held.delete(lease); },
+  });
+  const first = kernel("first"), second = kernel("second"), guard = join(dir, "first.transaction");
+  try {
+    withTelegramFileTransaction(guard, () => {
+      assert.throws(() => withTelegramFileTransaction(guard, () => assert.fail("Nested same-resource work"), { kernel: first }),
+        { code: "kernel-transaction-refused", reason: "busy" });
+      assert.equal(withTelegramFileTransaction(join(dir, "second.transaction"), () => held.size, { kernel: second }), 2);
+      assert.equal(held.size, 1);
+    }, { kernel: first });
+    assert.equal(held.size, 0);
+    for (const anchorPath of [guard, join(guard, "anchor"), "relative.lock", `${guard}\0suffix`]) {
+      assert.throws(() => withTelegramFileTransaction(guard, () => assert.fail("Invalid-anchor work"), { kernel: {
+        ...first, anchorPath, tryAcquire() { assert.fail("Invalid anchor must refuse before native issuance"); },
+      } }), { code: "kernel-transaction-refused", reason: "invalid-port" });
+    }
+    assert.equal(existsSync(guard), false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 for (const change of ["replace-session", "same-context-restart", "clear", "release", "re-elect"] as const) {
   test(`Shared-state grant binds exact session generation and leader epoch (${change})`, () => {
@@ -81,10 +700,255 @@ for (const change of ["replace-session", "same-context-restart", "clear", "relea
   });
 }
 
+test("Current transport capture owns startup context across fresh same-session callers and sticky loss", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-current-transport-"));
+  const sessions = createTelegramSessionContextStore<{ cwd: string; sessionId: string }>({ getIdentity: ctx => ctx.sessionId });
+  const startup = { cwd: "/fixture", sessionId: "a" };
+  const lock = createTelegramLockRuntime<typeof startup>({ locksPath: join(dir, "owners.json"), instanceId: "current-transport" });
+  const runtime = createTelegramLockedPollingRuntime({
+    lock, hasBotToken: () => true, isContextCurrent: ctx => sessions.isCurrent(ctx), getSessionId: ctx => ctx.sessionId,
+    startPolling: () => undefined, stopPolling: async () => undefined, updateStatus: () => undefined,
+  });
+  try {
+    assert.equal(runtime.captureCurrentTransportAuthority(), undefined);
+    sessions.set(startup);
+    assert.equal((await runtime.start(startup)).ok, true);
+    const caller = { ...startup };
+    sessions.set(caller);
+    assert.equal(runtime.captureTransportAuthority(caller), undefined, "Legacy API still requires the exact startup context");
+    const captured = runtime.captureCurrentTransportAuthority();
+    assert.ok(captured);
+    assert.equal(captured(), true);
+    sessions.set({ ...caller });
+    assert.equal(captured(), true, "Fresh same-session SDK context does not replace transport");
+    await runtime.suspend();
+    assert.equal(captured(), false);
+    assert.equal(runtime.captureCurrentTransportAuthority(), undefined);
+    assert.equal((await runtime.start(caller)).ok, true);
+    assert.equal(captured(), false, "Restart never revives a capture");
+    const fresh = runtime.captureCurrentTransportAuthority();
+    assert.ok(fresh);
+    lock.release();
+    assert.equal(fresh(), false);
+    assert.equal(lock.acquire(caller).ok, true);
+    assert.equal(fresh(), false, "Restored ownership cannot revive observed loss");
+    assert.equal(runtime.captureCurrentTransportAuthority(), undefined, "Observed owner loss requires a real polling restart");
+    await runtime.start(caller);
+    const sessionCapture = runtime.captureCurrentTransportAuthority();
+    assert.ok(sessionCapture);
+    sessions.set({ cwd: startup.cwd, sessionId: "b" });
+    assert.equal(sessionCapture(), false);
+    sessions.set(caller);
+    assert.equal(sessionCapture(), false, "Observed session loss is sticky");
+    assert.equal(runtime.captureCurrentTransportAuthority(), undefined, "Restoring equal session metadata cannot mint a new grant on lost transport");
+  } finally { await runtime.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("Current transport capture refuses a missing session-validity port without weakening legacy capture", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-current-no-session-")), ctx = { cwd: dir };
+  const lock = createTelegramLockRuntime({ locksPath: join(dir, "owners.json"), instanceId: "no-session-port" });
+  const runtime = createTelegramLockedPollingRuntime({ lock, hasBotToken: () => true, startPolling() {}, async stopPolling() {}, updateStatus() {} });
+  try { await runtime.start(ctx); assert.equal(runtime.captureCurrentTransportAuthority(), undefined); assert.equal(runtime.captureTransportAuthority(ctx)?.(), true); }
+  finally { await runtime.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const loss of ["epoch", "throw", "conflict", "same-object-session"] as const)
+test(`Current transport capture observes real ownership loss without restoration (${loss})`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-current-loss-")), ctx = { cwd: dir, sessionId: "loss-session" };
+  const lock = createTelegramLockRuntime({ locksPath: join(dir, "owners.json"), instanceId: "current-loss" });
+  const sessions = createTelegramSessionContextStore<typeof ctx>(); sessions.set(ctx);
+  const runtime = createTelegramLockedPollingRuntime({ lock, hasBotToken: () => true, isContextCurrent: sessions.isCurrent, getSessionId: ctx => ctx.sessionId, startPolling() {}, async stopPolling() {}, updateStatus() {} });
+  try {
+    await runtime.start(ctx); const grant = runtime.captureCurrentTransportAuthority()!; assert.ok(grant);
+    if (loss === "epoch") { lock.release(); lock.acquire(ctx); }
+    if (loss === "throw") {
+      const owns = lock.owns; lock.owns = () => { throw new Error("Unverifiable owner"); };
+      assert.equal(grant(), false); assert.equal(runtime.captureCurrentTransportAuthority(), undefined); lock.owns = owns;
+    }
+    if (loss === "conflict") await runtime.onPersistentConflict(ctx, 3);
+    if (loss === "same-object-session") {
+      ctx.sessionId = "replacement";
+      assert.equal(grant(), false, "A mutable host context cannot hide session replacement");
+      ctx.sessionId = "loss-session";
+      assert.equal(runtime.captureCurrentTransportAuthority(), undefined);
+    }
+    assert.equal(grant(), false);
+    await runtime.start(ctx); assert.ok(runtime.captureCurrentTransportAuthority()); assert.equal(grant(), false);
+  } finally { await runtime.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 function createTempLockPath(): { dir: string; path: string } {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-owners-"));
   return { dir, path: join(dir, "owners.json") };
 }
+
+for (const artifact of ["source", "compiled"] as const)
+test(`Runtime opened-file refusal retains its first finite condition (${artifact})`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-state-read-condition-")), path = join(dir, "state.json");
+  const moduleUrl = new URL(artifact === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+  try {
+    const result = await runNodeEval(`
+      import assert from "node:assert/strict";
+      import * as fs from "node:fs";
+      import { mock } from "node:test";
+      const path = ${JSON.stringify(path)};
+      let fault, lastFd, publishing = false, contentReads = 0;
+      const { default: defaultFs, ...namedFs } = fs;
+      mock.module("node:fs", { defaultExport: defaultFs, namedExports: { ...namedFs,
+        lstatSync(...args) {
+          const actual = fs.lstatSync(...args);
+          if (args[0] === path && fault === "native-rename") {
+            fault = undefined; publishing = true;
+            try { Kernel.mutateTelegramRuntimeStateSection(path, "default", "runtime", () => ({ value: { boundary: "native-rename" }, result: true }), { isCurrent: () => true }); }
+            finally { publishing = false; }
+          }
+          return actual;
+        },
+        fstatSync(...args) {
+          lastFd = args[0];
+          const actual = fs.fstatSync(...args), selected = fault;
+          if (!selected) return actual;
+          fault = undefined;
+          return new Proxy(actual, { get(target, key) {
+            if (selected === "first" && key !== "dev") throw new Error("Later checks ran after the first refusal");
+            if ((selected === "device" || selected === "first") && key === "dev") return target.dev === 0 ? 1 : 0;
+            if (selected === "inode" && key === "ino") return target.ino === 0 ? 1 : 0;
+            if (selected === "links" && key === "nlink") return 0;
+            if (selected === "type" && key === "isFile") return () => false;
+            if (selected === "mode" && key === "mode") return target.mode | 0o040;
+            return Reflect.get(target, key);
+          } });
+        },
+        readFileSync(...args) {
+          if (!publishing && typeof args[0] === "number") contentReads++;
+          return fs.readFileSync(...args);
+        },
+      } });
+      const Kernel = await import(${JSON.stringify(moduleUrl)});
+      Kernel.mutateTelegramRuntimeStateSection(path, "default", "workspace", () => ({ value: { retained: true }, result: true }), { isCurrent: () => true });
+      const cases = [
+        ["device", "device-mismatch"], ["inode", "inode-mismatch"],
+        ["links", "opened-links"], ["type", "opened-type"],
+        ["mode", process.platform === "win32" ? undefined : "opened-mode"],
+        ["first", "device-mismatch"], ["native-rename", "inode-mismatch"],
+      ];
+      for (const [selected, expected] of cases) {
+        fault = selected; contentReads = 0; lastFd = undefined;
+        let original;
+        try { Kernel.readTelegramRuntimeState(path); } catch (error) { original = error; }
+        if (expected === undefined) assert.equal(original, undefined, "Windows retains its existing private-mode policy");
+        else {
+          assert.ok(original instanceof Kernel.TelegramRuntimeStateError);
+          assert.equal(original.name, "TelegramRuntimeStateError");
+          assert.equal(original.code, "invalid");
+          assert.equal(original.message, "Telegram runtime state identity changed before reading.");
+          assert.equal(original.readCondition, expected);
+          assert.equal(original.cause, undefined);
+        }
+        assert.equal(contentReads, expected === undefined ? 1 : 0, "The original reader never parses a rejected descriptor; publisher reads are separate");
+        assert.throws(() => fs.fstatSync(lastFd), { code: "EBADF" }, "The original descriptor closes on success or refusal");
+      }
+      const current = Kernel.readTelegramRuntimeState(path);
+      assert.deepEqual(current.profiles.default.workspace, { retained: true });
+      assert.deepEqual(current.profiles.default.runtime, { boundary: "native-rename" }, "The actual guarded atomic publication remains committed");
+      fs.writeFileSync(path, "{", { mode: 0o600 });
+      assert.throws(() => Kernel.readTelegramRuntimeState(path), error => error instanceof Kernel.TelegramRuntimeStateError && error.readCondition === undefined);
+      console.log(JSON.stringify({ descriptorPartitions: 6, nativeRename: true, malformedStillRefused: true }));
+    `, { nodeArgs: ["--experimental-test-module-mocks"] });
+    assert.equal(result.code, 0, result.stderr + result.stdout);
+    assert.equal(result.signal, null);
+    assert.deepEqual(JSON.parse(result.stdout), { descriptorPartitions: 6, nativeRename: true, malformedStillRefused: true });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+test(`Runtime post-read refusal retains its first finite condition (${artifact})`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-state-post-read-")), path = join(dir, "state.json");
+  const moduleUrl = new URL(artifact === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+  try {
+    const result = await runNodeEval(`
+      import assert from "node:assert/strict";
+      import * as fs from "node:fs";
+      import { mock } from "node:test";
+      const path = ${JSON.stringify(path)};
+      let fault, lastFd, initial, final, publishing = false, contentReads = 0, observations = 0;
+      const { default: defaultFs, ...namedFs } = fs;
+      mock.module("node:fs", { defaultExport: defaultFs, namedExports: { ...namedFs,
+        lstatSync(...args) {
+          const actual = fs.lstatSync(...args);
+          if (args[0] !== path || publishing) return actual;
+          observations++;
+          if (observations === 1) initial = actual;
+          if (observations === 2) final = actual;
+          if (observations !== 2 || !fault) return actual;
+          const selected = fault; fault = undefined;
+          const fields = ["dev", "ino", "size", "mtimeMs", "ctimeMs"];
+          const firstIndex = { device: 0, inode: 1, size: 2, mtime: 3, ctime: 4, first: 0 }[selected];
+          return new Proxy(actual, { get(target, key) {
+            if (fields.indexOf(key) > firstIndex) throw new Error("Later checks ran after the first refusal");
+            if ((selected === "device" || selected === "first") && key === "dev") return target.dev === 0 ? 1 : 0;
+            if (selected === "inode" && key === "ino") return target.ino === 0 ? 1 : 0;
+            if (selected === "size" && key === "size") return target.size + 1;
+            if (selected === "mtime" && key === "mtimeMs") return target.mtimeMs + 1;
+            if (selected === "ctime" && key === "ctimeMs") return target.ctimeMs + 1;
+            return Reflect.get(target, key);
+          } });
+        },
+        readFileSync(...args) {
+          if (!publishing && typeof args[0] === "number") { lastFd = args[0]; contentReads++; }
+          return fs.readFileSync(...args);
+        },
+        closeSync(fd) {
+          fs.closeSync(fd);
+          if (!publishing && fd === lastFd && fault === "native-rename") {
+            fault = undefined; publishing = true;
+            try { Kernel.mutateTelegramRuntimeStateSection(path, "default", "runtime", () => ({ value: { boundary: "post-read-publication" }, result: true }), { isCurrent: () => true }); }
+            finally { publishing = false; }
+          }
+        },
+      } });
+      const Kernel = await import(${JSON.stringify(moduleUrl)});
+      Kernel.mutateTelegramRuntimeStateSection(path, "default", "workspace", () => ({ value: { retained: true }, result: true }), { isCurrent: () => true });
+      const cases = [
+        ["device", "post-read-device-mismatch"], ["inode", "post-read-inode-mismatch"],
+        // Equal device/inode with changed size remains an independent first-refusal partition.
+        ["size", "post-read-size-mismatch"], ["mtime", "post-read-mtime-mismatch"],
+        ["ctime", "post-read-ctime-mismatch"], ["first", "post-read-device-mismatch"],
+        ["native-rename", "observed-first-mismatch"], [undefined, undefined],
+      ];
+      for (const [selected, expected] of cases) {
+        fault = selected; lastFd = initial = final = undefined; contentReads = 0; observations = 0;
+        let original, expectedCondition = expected;
+        try { Kernel.readTelegramRuntimeState(path); } catch (error) { original = error; }
+        if (selected === "native-rename") {
+          const fields = { dev: "device", ino: "inode", size: "size", mtimeMs: "mtime", ctimeMs: "ctime" };
+          const first = Object.keys(fields).find(key => initial[key] !== final[key]);
+          assert.ok(first, "Native publication must change an actually observed field");
+          expectedCondition = "post-read-" + fields[first] + "-mismatch";
+        }
+        if (expected === undefined) assert.equal(original, undefined);
+        else {
+          assert.ok(original instanceof Kernel.TelegramRuntimeStateError);
+          assert.equal(original.name, "TelegramRuntimeStateError");
+          assert.equal(original.code, "invalid");
+          assert.equal(original.message, "Telegram runtime state changed during observation.");
+          assert.equal(original.readCondition, expectedCondition);
+          assert.equal(original.cause, undefined);
+        }
+        assert.equal(contentReads, 1, "The original reader never retries; guarded publisher reads are separate");
+        assert.equal(observations, 2, "Initial and final observations retain their original order and count");
+        assert.throws(() => fs.fstatSync(lastFd), { code: "EBADF" }, "The original descriptor is closed before the final refusal");
+      }
+      const current = Kernel.readTelegramRuntimeState(path);
+      assert.deepEqual(current.profiles.default.workspace, { retained: true });
+      assert.deepEqual(current.profiles.default.runtime, { boundary: "post-read-publication" }, "The guarded publication remains committed despite the original reader refusal");
+      console.log(JSON.stringify({ postReadPartitions: 6, nativePublication: true, healthyRead: true }));
+    `, { nodeArgs: ["--experimental-test-module-mocks"] });
+    assert.equal(result.code, 0, result.stderr + result.stdout);
+    assert.equal(result.signal, null);
+    assert.deepEqual(JSON.parse(result.stdout), { postReadPartitions: 6, nativePublication: true, healthyRead: true });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("Consolidated runtime state publishes only the selected section and profile", () => {
   const temp = createTempLockPath(), path = join(temp.dir, "state.json");
@@ -235,6 +1099,67 @@ test("Healthy runtime state is never reset and elections never reset", async () 
   } finally { rmSync(temp.dir, { recursive: true, force: true }); }
 });
 
+for (const phase of ["entry", "validation", "staged", "published"] as const)
+test(`Explicit state recovery rechecks original authority around publication (${phase})`, () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json"), runtimeDir = join(temp.dir, "runtime");
+  const before = JSON.stringify({ version: 2, profiles: { default: { workspace: "invalid-fixture" } } });
+  let active = true, checks = 0;
+  const assertCurrent = () => {
+    checks++;
+    if (phase === "entry" || phase === "staged" && existsSync(runtimeDir) && readdirSync(runtimeDir).some(name => name.endsWith(".tmp")) ||
+      phase === "published" && readFileSync(path, "utf8") !== before) active = false;
+    if (!active) throw new Error("Original recovery authority ended");
+  };
+  try {
+    writeFileSync(path, before, { mode: 0o600 });
+    assert.throws(() => resetDamagedTelegramRuntimeState(path, () => {
+      if (phase === "validation") active = false;
+      throw new Error("Fixture invalid Workspace");
+    }, assertCurrent), /Original recovery authority ended/u);
+    assert.ok(checks > 0);
+    if (phase === "published") assert.deepEqual(readTelegramRuntimeState(path), { version: 2, profiles: {} }, "Lost post-publication authority cannot roll back the committed reset");
+    else assert.equal(readFileSync(path, "utf8"), before, "Lost authority before rename preserves the original state");
+    if (existsSync(runtimeDir)) assert.deepEqual(readdirSync(runtimeDir), [], "Only fixture-owned temporary preparation is removed");
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const loss of ["caller", "context", "session", "generation", "callout", "reentry"] as const)
+test(`Connection preparation cannot revive an observed original loss (${loss})`, async () => {
+  const temp = createTempLockPath(), ctx = { cwd: "/repo" };
+  let caller = true, context = true, session = "original", resets = 0, stopped: Promise<void> | undefined;
+  let readError = false, reentry = false, originalAssert: (() => void) | undefined;
+  const isCurrent = () => {
+    if (readError) throw new Error("Fixture currentness read failed");
+    if (reentry) { try { originalAssert!(); } catch {} }
+    return caller;
+  };
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ statePath: join(temp.dir, "state.json") }),
+    hasBotToken: () => true, isContextCurrent: () => context, getSessionId: () => session,
+    startPolling: async () => assert.fail("Preparation cannot start a poller"), stopPolling: async () => {}, updateStatus() {},
+    resetDamagedState(assertCurrent) {
+      resets++;
+      originalAssert = assertCurrent;
+      if (loss === "callout") readError = true;
+      if (loss === "reentry") reentry = true;
+      if (loss === "caller") caller = false;
+      if (loss === "context") context = false;
+      if (loss === "session") session = "replacement";
+      if (loss === "generation") stopped = runtime.suspend();
+      assert.throws(assertCurrent, /cancelled or superseded|currentness read failed/u);
+      caller = context = true; session = "original"; readError = reentry = false;
+      assert.throws(assertCurrent, /cancelled or superseded/u, "Equal restored fields cannot revive the spent preparation");
+      return false;
+    },
+  });
+  try {
+    assert.throws(() => runtime.prepareConnection(ctx, isCurrent), /cancelled or superseded/u);
+    assert.equal(resets, 1);
+    assert.equal(existsSync(join(temp.dir, "state.json")), false);
+    await stopped;
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
 test("Consolidated runtime state refuses nested publication and retains a rename with a lost acknowledgement", () => {
   const temp = createTempLockPath(), path = join(temp.dir, "state.json");
   const mutate = () => ({ value: { issued: true }, result: true });
@@ -269,6 +1194,87 @@ test("Consolidated runtime state serializes competing processes without losing s
     assert.deepEqual(readdirSync(join(temp.dir, "runtime")), []);
   } finally { rmSync(temp.dir, { recursive: true, force: true }); }
 });
+
+for (const mode of ["ready", "lost-barrier"] as const) {
+  test(`All consolidated state transactions use the same cutover port (${mode})`, { skip: process.arch !== "x64" }, async () => {
+    const agent = realpathSync(mkdtempSync(join(tmpdir(), "pt-state-cutover-consumers-")));
+    const statePath = resolveTelegramStatePath(agent), cutover = createTelegramRuntimeStateCutover(agent), stateTransaction = cutover.runFor;
+    try {
+      cutover.install(() => true);
+      const owner = createTelegramLockRuntime({ statePath, stateTransaction, instanceId: "current", mintLeaderEpoch: () => "cutover" });
+      assert.equal(owner.acquire({ cwd: "/fixture" }).ok, true);
+      const workspace = createTelegramTopicTargetStore({ path: statePath, consolidated: {
+        captureAuthority: () => () => true,
+        publishIfOwned: owner.publishStateSectionIfOwned!,
+        stateTransaction,
+      } });
+      await workspace.load();
+      const ledger = createTelegramWorkspaceAdmissionLedger({ path: statePath, stateProfile: "work",
+        profileKey: createTelegramWorkspaceAdmissionProfileKey({ profileName: "work", botToken: "fixture-cutover" }),
+        stateTransaction, getProcessLiveness: () => "alive", owner: { processId: process.pid, processBirthId: `${process.pid}:cutover-fixture` } });
+      const acquire = () => ledger.acquireAdmission({ operationId: "cutover-lease", operationKind: "test", scope: { kind: "profile" } });
+      const reset = () => resetDamagedTelegramRuntimeState(statePath, undefined, () => {}, stateTransaction);
+      let callbacks = 0;
+      const observe = () => workspace.observeWorkspaceSnapshot(() => ++callbacks);
+      const publish = () => owner.publishStateSectionIfOwned!("runtime", () => ({ value: { polling: true }, result: ++callbacks }), { isCurrent: () => true });
+      const before = readFileSync(statePath);
+      if (mode === "lost-barrier") {
+        const guard = join(resolveTelegramTempDir(agent), "runtime", "state.json.transaction");
+        rmSync(guard);
+        const error = /^Error: Telegram legacy transaction barrier/u;
+        for (const attempt of [observe, publish, acquire, reset, () => owner.commitIfOwned(() => callbacks++)])
+          assert.throws(attempt, error);
+        await assert.rejects(workspace.refresh!(), error);
+        assert.equal(callbacks, 0, "No domain callback may borrow a legacy transaction after cutover");
+        assert.deepEqual(readFileSync(statePath), before);
+        assert.equal(existsSync(guard), false);
+        return;
+      }
+      cutover.run(() => {
+        for (const attempt of [observe, publish, acquire, reset, () => owner.commitIfOwned(() => callbacks++)])
+          assert.throws(attempt, { code: "kernel-transaction-refused", reason: "busy" });
+        assert.equal(callbacks, 0);
+      });
+      assert.equal(observe(), 1);
+      assert.deepEqual(publish(), { committed: true, result: 2 });
+      const lease = acquire();
+      assert.ok(lease.kind === "acquired"); assert.equal(ledger.releaseAdmission(lease.lease), true);
+      assert.equal(reset(), false, "A cutover is not permission to reset healthy data");
+      assert.equal(owner.release().kind, "active-here");
+      assert.deepEqual(readTelegramRuntimeState(statePath).profiles.default?.runtime, { polling: true });
+    } finally { rmSync(agent, { recursive: true, force: true }); }
+  });
+}
+
+for (const lost of ["barrier", "mode", "directory"] as const) {
+  test(`Cutover ownership observations revoke transport without reacquiring the lease (${lost})`, { skip: process.arch !== "x64" }, () => {
+    const agent = realpathSync(mkdtempSync(join(tmpdir(), "pt-cutover-owner-")));
+    const statePath = resolveTelegramStatePath(agent), cutover = createTelegramRuntimeStateCutover(agent);
+    const directory = join(agent, "telegram-kernel-cutover");
+    const artifact = lost === "barrier" ? join(resolveTelegramTempDir(agent), "runtime", "state.json.transaction") :
+      lost === "mode" ? join(directory, "state.mode") : directory;
+    const displaced = join(agent, "fixture-displaced");
+    try {
+      cutover.install(() => true);
+      const owner = createTelegramLockRuntime({ statePath, stateTransaction: cutover.runFor,
+        assertStateAuthority: cutover.assertAuthority, instanceId: "fixture-owner", mintLeaderEpoch: () => "cutover-owner" });
+      const acquired = owner.acquire({ cwd: "/fixture" }); assert.ok(acquired.ok);
+      const f = owner.captureFollowerRegistrationScope(acquired.lock);
+      cutover.run(() => { assert.equal(owner.owns(), true); assert.equal(f(), true); });
+      const initial = readFileSync(statePath);
+      renameSync(artifact, displaced);
+      assert.equal(owner.owns(), false);
+      assert.equal(owner.getOwnedLeaderEpoch(), undefined);
+      assert.equal(owner.getState().kind, "inactive");
+      assert.equal(f(), false);
+      assert.deepEqual(readFileSync(statePath), initial, "The raw transport record alone is not proof");
+      renameSync(displaced, artifact);
+      assert.equal(owner.owns(), false, "Restoring evidence does not renew a spent transport lifetime");
+      assert.equal(f(), false, "The captured follower registration never revives");
+      assert.equal(owner.refresh({ cwd: "/fixture" }), false);
+    } finally { rmSync(agent, { recursive: true, force: true }); }
+  });
+}
 
 test("Consolidated transport lifecycle preserves custody, other sections and other profiles", () => {
   const temp = createTempLockPath(), path = join(temp.dir, "state.json");
@@ -779,6 +1785,403 @@ test("writeLocks writes private lock files", () => {
   }
 });
 
+for (const artifact of ["source", "compiled"] as const)
+for (const succession of ["removed", "replacement", "logger"] as const)
+test(`Transaction guard recensus distinguishes a released directory from invalid layout (${artifact}/${succession})`, { skip: process.platform === "win32" }, async () => {
+  const moduleUrl = new URL(artifact === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+  const loggerUrl = new URL(artifact === "source" ? "../lib/logging.ts" : "../dist/lib/logging.js", import.meta.url).href;
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import fs from "node:fs";
+    import { spawn } from "node:child_process";
+    import { syncBuiltinESMExports } from "node:module";
+    import { mock } from "node:test";
+    import { tmpdir } from "node:os";
+    import { join } from "node:path";
+    import { setTimeout as delay } from "node:timers/promises";
+    const moduleUrl = ${JSON.stringify(moduleUrl)}, succession = ${JSON.stringify(succession)};
+    const Model = await import(moduleUrl);
+    let appendDone = false; const appendFailures = [];
+    mock.module(moduleUrl, { namedExports: { ...Model, withTelegramFileTransaction(...args) {
+      try { return Model.withTelegramFileTransaction(...args); }
+      catch (error) { appendFailures.push({ name: error.name, code: error.code, reason: error.reason, phase: error.phase }); throw error; }
+      finally { appendDone = true; }
+    } } });
+    const Logger = succession === "logger" ? await import(${JSON.stringify(loggerUrl)}) : undefined;
+    const dir = fs.mkdtempSync(join(tmpdir(), "pt-guard-enumeration-")), logPath = join(dir, "logs.jsonl"), guard = logPath + ".transaction";
+    const ready = join(dir, "ready"), release = join(dir, "release"), retired = join(dir, "retired");
+    const replacementReady = join(dir, "replacement-ready"), replacementRelease = join(dir, "replacement-release");
+    const source = [
+      "import fs from 'node:fs'; import { withTelegramFileTransaction } from " + JSON.stringify(moduleUrl) + ";",
+      "const guard = " + JSON.stringify(guard) + ";",
+      "const wait = path => { const deadline = Date.now() + 5000; while (!fs.existsSync(path)) { if (Date.now() >= deadline) throw new Error('Owner fixture wait expired'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2); } };",
+      // A real opened-but-not-yet-written checkpoint must not establish readiness.
+      "withTelegramFileTransaction(guard, () => { const fd = fs.openSync(" + JSON.stringify(ready) + ", 'wx'); try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); fs.writeFileSync(fd, String(process.pid)); } finally { fs.closeSync(fd); } wait(" + JSON.stringify(release) + "); });",
+      "fs.writeFileSync(" + JSON.stringify(retired) + ", 'released');",
+      ...(succession === "replacement" ? ["withTelegramFileTransaction(guard, () => { fs.writeFileSync(" + JSON.stringify(replacementReady) + ", 'ready'); wait(" + JSON.stringify(replacementRelease) + "); });"] : []),
+    ].join("\n");
+    const owner = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module"], { stdio: ["pipe", "pipe", "pipe"] });
+    let stderr = "", ownerResult;
+    owner.stdout.resume(); owner.stderr.on("data", chunk => { stderr += chunk; });
+    const complete = new Promise((resolve, reject) => { owner.once("error", reject); owner.once("close", (code, signal) => resolve({ code, signal })); });
+    owner.stdin.end(source);
+    const readdir = fs.readdirSync;
+    let armed = true, observedEmpty = false, operations = 0;
+    try {
+      const startupDeadline = Date.now() + 5000;
+      while (Date.now() < startupDeadline) {
+        if (fs.existsSync(ready) && fs.readFileSync(ready, "utf8") === String(owner.pid)) break;
+        await delay(5);
+      }
+      assert.equal(fs.readFileSync(ready, "utf8"), String(owner.pid));
+      console.log("guard-enumeration-checkpoint ready");
+      fs.readdirSync = function(path, ...args) {
+        if (path !== guard || !armed) return Reflect.apply(readdir, fs, [path, ...args]);
+        armed = false;
+        const originalDirectory = fs.opendirSync(guard);
+        try {
+          fs.writeFileSync(release, "release original");
+          const checkpoint = succession === "replacement" ? replacementReady : retired;
+          const deadline = Date.now() + 5000;
+          while (!fs.existsSync(checkpoint)) { if (Date.now() >= deadline) throw new Error("Original native owner did not release"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2); }
+          const entries = []; let entry;
+          while ((entry = originalDirectory.readSync()) !== null) entries.push(entry.name);
+          assert.deepEqual(entries, [], "The actual old directory descriptor enumerates no owner after native release");
+          observedEmpty = true; return entries;
+        } finally { originalDirectory.closeSync(); }
+      };
+      syncBuiltinESMExports();
+      if (Logger) {
+        const log = Logger.createTelegramRuntimeJsonlLog({ path: logPath, canReset: () => false });
+        for (let index = 0; index < 25; index++) log.record({ at: index, category: "actual-native-batch", message: String(index) });
+        const deadline = Date.now() + 2000;
+        while (!appendDone && Date.now() < deadline) await delay(5);
+        assert.equal(appendDone, true); assert.equal(observedEmpty, true);
+        const records = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
+        assert.equal(records.length, 25, JSON.stringify({ appendFailures, records: records.length }));
+        assert.deepEqual(appendFailures, []);
+        assert.deepEqual(records.map(row => row.message), Array.from({ length: 25 }, (_, index) => String(index)));
+      } else {
+        let failure;
+        try { Model.withTelegramFileTransaction(guard, () => { operations++; }, { attempts: 3, retryDelayMs: 1 }); }
+        catch (error) { failure = error; console.log(JSON.stringify({ name: error.name, code: error.code, reason: error.reason, phase: error.phase })); }
+        assert.equal(observedEmpty, true);
+        if (succession === "removed") { assert.equal(failure, undefined, "A consumed directory observation cannot become stable invalid-layout evidence"); assert.equal(operations, 1); }
+        else {
+          assert.equal(operations, 0, "A changed observation never grants entry past a live replacement");
+          assert.match(failure?.message ?? "", /Timed out acquiring Telegram lock transaction/);
+          const names = readdir(guard); assert.equal(names.length, 1);
+          assert.equal(JSON.parse(fs.readFileSync(join(guard, names[0]), "utf8")).pid, owner.pid);
+        }
+      }
+    } finally {
+      fs.readdirSync = readdir; syncBuiltinESMExports();
+      fs.writeFileSync(release, "release"); fs.writeFileSync(replacementRelease, "release");
+      ownerResult = await complete;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    assert.deepEqual(ownerResult, { code: 0, signal: null }, stderr);
+    assert.equal(owner.killed, false);
+  `, { nodeArgs: ["--experimental-test-module-mocks"], timeoutMs: 10000, readiness: { stdoutPrefix: "guard-enumeration-checkpoint ready", startupTimeoutMs: 10000 } });
+  assert.equal(result.signal, null); assert.equal(result.code, 0, result.stdout + result.stderr);
+});
+
+for (const artifact of ["source", "compiled"] as const)
+test(`Non-recovering transaction admission preserves dead and unverifiable guards (${artifact})`, async () => {
+  const temp = createTempLockPath(), guard = `${temp.path}.transaction`;
+  const moduleUrl = new URL(artifact === "source" ? "../lib/locks.ts" : "../dist/lib/locks.js", import.meta.url).href;
+  try {
+    const abandoned = await runNodeEval(`
+      const Kernel = await import(${JSON.stringify(moduleUrl)});
+      Kernel.withTelegramFileTransaction(${JSON.stringify(guard)}, () => process.exit(0));
+    `);
+    assert.equal(abandoned.code, 0, abandoned.stderr); assert.equal(abandoned.signal, null);
+    const locks = artifact === "source" ? await import("../lib/locks.ts") : await import("../dist/lib/locks.js");
+    const names = readdirSync(guard), marker = join(guard, names[0]!);
+    const before = readFileSync(marker, "utf8"), inode = statSync(marker).ino;
+    assert.notEqual(JSON.parse(before).pid, process.pid, "The abandoned guard belongs to the actual exited child");
+    let entered = 0;
+    assert.throws(() => locks.withTelegramFileTransaction(guard, () => { entered++; }, { recoverAbandoned: false, attempts: 1 }), /Timed out acquiring/);
+    assert.equal(entered, 0); assert.deepEqual(readdirSync(guard), names);
+    assert.equal(readFileSync(marker, "utf8"), before); assert.equal(statSync(marker).ino, inode);
+    writeFileSync(marker, "{", { mode: 0o600 });
+    assert.throws(() => locks.withTelegramFileTransaction(guard, () => { entered++; }, { recoverAbandoned: false, attempts: 1 }), error => {
+      assert.equal((error as Error).name, "TelegramFileTransactionGuardError"); return true;
+    });
+    assert.equal(readFileSync(marker, "utf8"), "{"); assert.equal(entered, 0);
+    writeFileSync(marker, before, { mode: 0o600 });
+    locks.withTelegramFileTransaction(guard, () => {
+      entered++;
+      assert.throws(() => locks.withTelegramFileTransaction(guard, () => { entered++; }, { recoverAbandoned: false, attempts: 1 }), /Timed out acquiring/);
+    });
+    assert.equal(entered, 1, "Existing default acquisition still recovers the dead guard; live read contention never enters");
+    assert.equal(existsSync(guard), false);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+for (const format of ["directory", "legacy"] as const)
+for (const fault of ["empty", "truncated", "null", "array", "zero-pid", "negative-pid", "fractional-pid", "unsafe-pid", "out-of-range-pid", "bad-clock", "empty-generation", "invalid-generation", "oversized", "unreadable"] as const)
+test(`Unverifiable transaction owner refuses without contention sleeps (${artifact}/${format}/${fault})`, async t => {
+  if (fault === "unreadable" && (process.platform === "win32" || process.getuid?.() === 0)) { t.skip("Requires POSIX file read denial"); return; }
+  const locks = artifact === "source" ? await import("../lib/locks.ts") : await import("../dist/lib/locks.js");
+  const lag = artifact === "source" ? { readTelegramSyncBlockTotals } : await import("../dist/lib/loop-lag.js");
+  const temp = createTempLockPath(), path = `${temp.path}.transaction`;
+  const owner = { pid: 2_147_483_647, acquiredAtMs: 1, generation: "fixture" };
+  if (fault === "zero-pid") owner.pid = 0;
+  if (fault === "negative-pid") owner.pid = -1;
+  if (fault === "fractional-pid") owner.pid = 1.5;
+  if (fault === "unsafe-pid") owner.pid = Number.MAX_SAFE_INTEGER + 1;
+  if (fault === "out-of-range-pid") owner.pid = 2_147_483_648;
+  if (fault === "bad-clock") owner.acquiredAtMs = -1;
+  if (fault === "empty-generation") owner.generation = "";
+  if (fault === "invalid-generation") owner.generation = "bad/generation";
+  const body = fault === "empty" ? "" : fault === "truncated" ? "{" : fault === "null" ? "null" : fault === "array" ? "[]"
+    : fault === "oversized" ? " ".repeat(8192) + JSON.stringify(owner) : JSON.stringify(owner);
+  if (format === "directory") mkdirSync(path, { mode: 0o700 });
+  const marker = format === "directory" ? join(path, "owner.fixture.json") : path;
+  writeFileSync(marker, body, { mode: 0o600 });
+  if (fault === "unreadable") chmodSync(marker, 0);
+  const before = statSync(marker), waits = lag.readTelegramSyncBlockTotals()["transaction-lock-wait"]?.count ?? 0;
+  let calls = 0;
+  try {
+    assert.throws(() => locks.withTelegramFileTransaction(path, () => { calls++; }, { attempts: 3, retryDelayMs: 1 }), error => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.name, "TelegramFileTransactionGuardError");
+      const fields = Object.getOwnPropertyDescriptors(error);
+      assert.equal(fields.resource?.value, path); assert.equal(fields.code?.value, "guard-unverifiable");
+      assert.equal(fields.phase?.value, "acquire");
+      assert.equal(fields.reason?.value, fault === "unreadable" ? "unavailable-owner" : "invalid-owner");
+      if (fault === "unreadable") assert.equal((error.cause as NodeJS.ErrnoException)?.code, "EACCES");
+      return true;
+    });
+    assert.equal(calls, 0); assert.equal(lag.readTelegramSyncBlockTotals()["transaction-lock-wait"]?.count ?? 0, waits);
+    assert.equal(statSync(marker).ino, before.ino); assert.equal(statSync(marker).size, before.size);
+    if (fault === "unreadable") { assert.equal(statSync(marker).mode, before.mode); chmodSync(marker, 0o600); }
+    assert.equal(readFileSync(marker, "utf8"), body);
+    if (format === "directory") assert.deepEqual(readdirSync(path), ["owner.fixture.json"]);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+for (const fault of ["extra-entry", "invalid-name", "wrong-generation", "owner-directory", "owner-symlink", "owner-hardlink", "zero-reclaim-pid", "padded-reclaim-pid", "empty-reclaim"] as const)
+test(`Unsafe transaction layout cannot become dead-owner authority (${artifact}/${fault})`, async t => {
+  if (fault === "owner-symlink" && process.platform === "win32") { t.skip("Requires POSIX symlink creation"); return; }
+  const locks = artifact === "source" ? await import("../lib/locks.ts") : await import("../dist/lib/locks.js");
+  const lag = artifact === "source" ? { readTelegramSyncBlockTotals } : await import("../dist/lib/loop-lag.js");
+  const temp = createTempLockPath(), path = `${temp.path}.transaction`;
+  mkdirSync(path, { mode: 0o700 });
+  const body = fault === "empty-reclaim" ? "" : JSON.stringify({ pid: 2_147_483_647, acquiredAtMs: 1, generation: fault === "wrong-generation" ? "foreign" : "fixture" });
+  const reclaimPid = fault === "zero-reclaim-pid" ? "0" : fault === "padded-reclaim-pid" ? "02147483647" : "2147483647";
+  const marker = join(path, fault.includes("reclaim") ? `owner.reclaim.${reclaimPid}.00000000-0000-4000-8000-000000000000.json`
+    : fault === "invalid-name" ? "unexpected.json" : "owner.fixture.json");
+  const other = join(temp.dir, "private-original.json");
+  writeFileSync(other, body, { mode: 0o600 });
+  if (fault === "owner-directory") mkdirSync(marker, { mode: 0o700 });
+  else if (fault === "owner-symlink") symlinkSync(other, marker);
+  else if (fault === "owner-hardlink") linkSync(other, marker);
+  else writeFileSync(marker, body, { mode: 0o600 });
+  if (fault === "extra-entry") writeFileSync(join(path, "extra"), "keep", { mode: 0o600 });
+  const names = readdirSync(path).sort(), waits = lag.readTelegramSyncBlockTotals()["transaction-lock-wait"]?.count ?? 0;
+  let calls = 0;
+  try {
+    assert.throws(() => locks.withTelegramFileTransaction(path, () => { calls++; }, { attempts: 3, retryDelayMs: 1 }), error => {
+      assert.ok(error instanceof Error); assert.equal(error.name, "TelegramFileTransactionGuardError");
+      assert.equal(Object.getOwnPropertyDescriptor(error, "reason")?.value, fault === "wrong-generation" || fault.includes("reclaim") ? "invalid-owner" : "invalid-layout");
+      return true;
+    });
+    assert.equal(calls, 0); assert.equal(lag.readTelegramSyncBlockTotals()["transaction-lock-wait"]?.count ?? 0, waits);
+    assert.deepEqual(readdirSync(path).sort(), names); assert.equal(readFileSync(other, "utf8"), body);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+for (const phase of ["owner", "claim"] as const)
+for (const bodyKind of ["live", "dead", "empty", "conflicting"] as const)
+test(`Reserved transaction protocol assessment stays closed before activation (${artifact}/${phase}/${bodyKind})`, async () => {
+  const locks = artifact === "source" ? await import("../lib/locks.ts") : await import("../dist/lib/locks.js");
+  const lag = artifact === "source" ? { readTelegramSyncBlockTotals } : await import("../dist/lib/loop-lag.js");
+  const temp = createTempLockPath(), path = `${temp.path}.transaction`, nonce = "00000000-0000-4000-8000-000000000000";
+  const locatorPid = bodyKind === "dead" || bodyKind === "empty" ? 2_147_483_647 : process.pid;
+  const generation = `v2-p${locatorPid}-${nonce}`;
+  const markerName = phase === "owner" ? `owner.v2.${locatorPid}.${nonce}.json` : `owner.reclaim.v2.${locatorPid}.${nonce}.json`;
+  const body = bodyKind === "empty" ? "" : JSON.stringify({ pid: bodyKind === "conflicting" ? 2_147_483_647 : locatorPid, acquiredAtMs: 1, generation });
+  mkdirSync(path, { mode: 0o700 }); const marker = join(path, markerName);
+  writeFileSync(marker, body, { mode: 0o600 }); const before = statSync(marker);
+  const waits = lag.readTelegramSyncBlockTotals()["transaction-lock-wait"]?.count ?? 0;
+  let calls = 0;
+  try {
+    // These are proposed protocol inputs, not a production v2 writer or metadata-loss recovery grant.
+    assert.throws(() => locks.withTelegramFileTransaction(path, () => { calls++; }, { attempts: 2, retryDelayMs: 1 }), error => {
+      assert.ok(error instanceof Error); assert.equal(error.name, "TelegramFileTransactionGuardError");
+      assert.equal(Object.getOwnPropertyDescriptor(error, "reason")?.value, "invalid-layout"); return true;
+    });
+    assert.equal(calls, 0); assert.equal(lag.readTelegramSyncBlockTotals()["transaction-lock-wait"]?.count ?? 0, waits);
+    assert.deepEqual(readdirSync(path), [markerName]); assert.equal(readFileSync(marker, "utf8"), body);
+    assert.equal(statSync(marker).ino, before.ino);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+function proposedGuardClaimName(original: { pid: number; nonce: string }, recoverer: { pid: number; nonce: string }): string {
+  return `owner.reclaim.v2.${original.pid}.${original.nonce}.${recoverer.pid}.${recoverer.nonce}.json`;
+}
+
+function proposedGuardMarkerIdentity(marker: string) {
+  const owner = /^owner\.v2\.(\d+)\.([0-9a-f-]{36})\.json$/u.exec(marker);
+  if (owner) return { owner: { pid: Number(owner[1]), nonce: owner[2]! }, recoverer: undefined };
+  const claim = /^owner\.reclaim\.v2\.(\d+)\.([0-9a-f-]{36})\.(\d+)\.([0-9a-f-]{36})\.json$/u.exec(marker);
+  if (!claim) return undefined;
+  return { owner: { pid: Number(claim[1]), nonce: claim[2]! }, recoverer: { pid: Number(claim[3]), nonce: claim[4]! } };
+}
+
+for (const artifact of ["source", "compiled"] as const)
+for (const scenario of ["repeated", "contenders"] as const)
+for (const metadata of ["complete", "empty"] as const)
+test(`Proposed guard model retains evidence without granting raced rename authority (${artifact}/${scenario}/${metadata})`, async t => {
+  const locks = artifact === "source" ? await import("../lib/locks.ts") : await import("../dist/lib/locks.js");
+  const temp = createTempLockPath(), path = `${temp.path}.transaction`;
+  try {
+    // This is an executable filesystem model, not an activated v2 transaction implementation.
+    const created = await runNodeEval(`
+      import { mkdtempSync, writeFileSync, renameSync } from "node:fs";
+      import { join } from "node:path";
+      import { randomUUID } from "node:crypto";
+      const path = ${JSON.stringify(path)}, original = { pid: process.pid, nonce: randomUUID(), acquiredAtMs: Date.now() };
+      const staging = mkdtempSync(path + ".staged.");
+      writeFileSync(join(staging, "owner.v2." + original.pid + "." + original.nonce + ".json"), JSON.stringify({ version: 2, owner: original }), { mode: 0o600 });
+      renameSync(staging, path);
+    `);
+    assert.equal(created.code, 0, created.stdout + created.stderr);
+    const initialMarker = readdirSync(path)[0]!;
+    const original = (JSON.parse(readFileSync(join(path, initialMarker), "utf8")) as { owner: { pid: number; nonce: string } }).owner;
+    if (metadata === "empty") writeFileSync(join(path, initialMarker), "");
+    const bytes = readFileSync(join(path, initialMarker), "utf8");
+    const assertClosed = () => {
+      let calls = 0;
+      assert.throws(() => locks.withTelegramFileTransaction(path, () => { calls++; }), /invalid-layout/);
+      assert.equal(calls, 0); const names = readdirSync(path); assert.equal(names.length, 1);
+      assert.equal(readFileSync(join(path, names[0]!), "utf8"), bytes);
+    };
+    const claim = async (expected: string) => {
+      const result = await runNodeEval(`
+        import assert from "node:assert/strict";
+        import { readdirSync, renameSync } from "node:fs";
+        import { join } from "node:path";
+        import { randomUUID } from "node:crypto";
+        const path = ${JSON.stringify(path)}, expected = ${JSON.stringify(expected)};
+        const names = readdirSync(path); assert.equal(names.length, 1);
+        if (names[0] !== expected) console.log("lost");
+        else {
+          const decode = ${proposedGuardMarkerIdentity.toString()}, observed = decode(names[0]); assert.ok(observed);
+          for (const pid of [observed.owner.pid, observed.recoverer?.pid].filter(value => value !== undefined)) {
+            assert.throws(() => process.kill(pid, 0), error => error.code === "ESRCH", "Only actual process absence supports this model step");
+          }
+          const claimName = ${proposedGuardClaimName.toString()};
+          const next = claimName(observed.owner, { pid: process.pid, nonce: randomUUID() });
+          try { renameSync(join(path, expected), join(path, next)); console.log("claimed"); }
+          catch (error) { if (error.code !== "ENOENT") throw error; console.log("lost"); }
+        }
+      `);
+      assert.equal(result.code, 0, result.stdout + result.stderr); return result.stdout.trim();
+    };
+    const readClaim = () => {
+      const marker = readdirSync(path)[0]!;
+      const fields = proposedGuardMarkerIdentity(marker);
+      assert.ok(fields?.recoverer); assert.equal(fields.owner.pid, original.pid); assert.equal(fields.owner.nonce, original.nonce);
+      assert.equal(readFileSync(join(path, marker), "utf8"), bytes);
+      return { marker, recovererPid: fields.recoverer.pid, recovererNonce: fields.recoverer.nonce };
+    };
+    assertClosed();
+    if (scenario === "contenders") {
+      const reports = await Promise.all([claim(initialMarker), claim(initialMarker)]);
+      assert.ok(reports.every(report => report === "claimed" || report === "lost"));
+      readClaim(); assertClosed();
+      // Windows can report success twice: a raced source rename is not a portable CAS or grant.
+      t.diagnostic(`Observed rename reports: ${reports.join(", ")}; recovery authority remains unproved`);
+      assert.equal(existsSync(join(temp.dir, "retired")), false);
+      return;
+    }
+    assert.equal(await claim(initialMarker), "claimed");
+    const first = readClaim(); assertClosed();
+    if (scenario === "repeated") {
+      assert.equal(await claim(first.marker), "claimed");
+      assert.notEqual(readClaim().recovererNonce, first.recovererNonce); assertClosed();
+    }
+    const previous = readClaim();
+    assert.throws(() => process.kill(previous.recovererPid, 0), error => (error as NodeJS.ErrnoException).code === "ESRCH");
+    const parentClaim = proposedGuardClaimName(original, { pid: process.pid, nonce: randomUUID() });
+    renameSync(join(path, previous.marker), join(path, parentClaim)); assertClosed();
+    await assert.rejects(() => claim(parentClaim), /Only actual process absence supports this model step/);
+    assert.deepEqual(readdirSync(path), [parentClaim]); assertClosed();
+    const retired = join(temp.dir, "retired"); renameSync(path, retired);
+    let freshCalls = 0;
+    locks.withTelegramFileTransaction(path, () => {
+      freshCalls++; const fresh = readdirSync(path)[0]!, body = readFileSync(join(path, fresh), "utf8");
+      assert.throws(() => renameSync(join(path, parentClaim), join(path, "late-claim")), error => (error as NodeJS.ErrnoException).code === "ENOENT");
+      assert.deepEqual(readdirSync(path), [fresh]); assert.equal(readFileSync(join(path, fresh), "utf8"), body);
+    });
+    assert.equal(freshCalls, 1); assert.equal(existsSync(path), false);
+    assert.equal(readFileSync(join(retired, parentClaim), "utf8"), bytes);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+test(`Damaged recovery marker cannot bypass owner observation (${artifact})`, async () => {
+  const locks = artifact === "source" ? await import("../lib/locks.ts") : await import("../dist/lib/locks.js");
+  const temp = createTempLockPath(), path = `${temp.path}.transaction`, recovery = `${path}.recovery`;
+  const body = JSON.stringify({ pid: 2_147_483_647, acquiredAtMs: 1, generation: "fixture" });
+  writeFileSync(path, body, { mode: 0o600 }); mkdirSync(recovery, { mode: 0o700 });
+  const marker = join(recovery, "owner.reclaim.2147483647.00000000-0000-4000-8000-000000000000.json");
+  writeFileSync(marker, "", { mode: 0o600 }); let calls = 0;
+  try {
+    assert.throws(() => locks.withTelegramFileTransaction(path, () => { calls++; }, { attempts: 2, retryDelayMs: 0 }), error => {
+      assert.ok(error instanceof Error); assert.equal(error.name, "TelegramFileTransactionGuardError");
+      assert.equal(Object.getOwnPropertyDescriptor(error, "resource")?.value, recovery); return true;
+    });
+    assert.equal(calls, 0); assert.equal(readFileSync(path, "utf8"), body); assert.equal(readFileSync(marker, "utf8"), "");
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+test(`Guard refusal distinguishes release after work from acquisition before work (${artifact})`, async () => {
+  const locks = artifact === "source" ? await import("../lib/locks.ts") : await import("../dist/lib/locks.js");
+  const temp = createTempLockPath(), path = `${temp.path}.transaction`;
+  let calls = 0;
+  try {
+    assert.throws(() => locks.withTelegramFileTransaction(path, () => {
+      calls++; writeFileSync(join(path, readdirSync(path)[0]!), "");
+    }), error => {
+      assert.ok(error instanceof Error); assert.equal(error.name, "TelegramFileTransactionGuardError");
+      assert.equal(Object.getOwnPropertyDescriptor(error, "phase")?.value, "release"); return true;
+    });
+    assert.equal(calls, 1); const marker = readdirSync(path)[0]!;
+    assert.equal(readFileSync(join(path, marker), "utf8"), "");
+    assert.throws(() => locks.withTelegramFileTransaction(path, () => { calls++; }), error => {
+      assert.ok(error instanceof Error); assert.equal(error.name, "TelegramFileTransactionGuardError");
+      assert.equal(Object.getOwnPropertyDescriptor(error, "phase")?.value, "acquire"); return true;
+    });
+    assert.equal(calls, 1); assert.deepEqual(readdirSync(path), [marker]);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+test(`Valid live transaction ownership retains ordinary bounded contention (${artifact})`, async () => {
+  const locks = artifact === "source" ? await import("../lib/locks.ts") : await import("../dist/lib/locks.js");
+  const lag = artifact === "source" ? { readTelegramSyncBlockTotals } : await import("../dist/lib/loop-lag.js");
+  const temp = createTempLockPath(), path = `${temp.path}.transaction`;
+  let forbidden = 0;
+  try {
+    locks.withTelegramFileTransaction(path, () => {
+      const marker = readdirSync(path)[0]!, body = readFileSync(join(path, marker), "utf8");
+      const waits = lag.readTelegramSyncBlockTotals()["transaction-lock-wait"]?.count ?? 0;
+      assert.throws(() => locks.withTelegramFileTransaction(path, () => { forbidden++; }, { attempts: 3, retryDelayMs: 1 }), /Timed out acquiring Telegram lock transaction/);
+      assert.equal(lag.readTelegramSyncBlockTotals()["transaction-lock-wait"]!.count - waits, 2);
+      assert.deepEqual(readdirSync(path), [marker]); assert.equal(readFileSync(join(path, marker), "utf8"), body);
+    });
+    assert.equal(forbidden, 0); assert.equal(existsSync(path), false);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
 test("File transaction publishes a private directory guard with owner metadata", () => {
   const temp = createTempLockPath();
   const transactionPath = `${temp.path}.transaction`;
@@ -1223,6 +2626,7 @@ test("Lock transaction recovers a guard left by a dead process", () => {
         acquiredAtMs: Date.now(),
         generation: "dead-guard",
       }),
+      { mode: 0o600 },
     );
     const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
     assert.equal(lock.acquire({ cwd: "/repo" }).ok, true);
@@ -1235,7 +2639,7 @@ test("Lock transaction recovers a guard left by a dead process", () => {
 test("Lock transaction fails closed on an unverified guard", () => {
   const temp = createTempLockPath();
   try {
-    writeFileSync(`${temp.path}.transaction`, "");
+    writeFileSync(`${temp.path}.transaction`, "", { mode: 0o600 });
     assert.throws(
       () =>
         withTelegramFileTransaction(
@@ -1243,7 +2647,7 @@ test("Lock transaction fails closed on an unverified guard", () => {
           () => undefined,
           { attempts: 2, retryDelayMs: 0 },
         ),
-      /Timed out acquiring Telegram lock transaction/,
+      /Cannot verify Telegram lock transaction guard \(invalid-owner\)/,
     );
     assert.equal(readFileSync(`${temp.path}.transaction`, "utf8"), "");
   } finally {
@@ -1262,7 +2666,7 @@ test("Lock transaction fails closed on an unverified directory guard", () => {
           attempts: 2,
           retryDelayMs: 0,
         }),
-      /Timed out acquiring Telegram lock transaction/,
+      /Cannot verify Telegram lock transaction guard \(invalid-layout\)/,
     );
     assert.equal(statSync(transactionPath).isDirectory(), true);
     assert.deepEqual(readdirSync(transactionPath), []);
@@ -1908,6 +3312,35 @@ test("Locked polling runtime prevents inherited child sessions from polling the 
   }
 });
 
+for (const fault of ["none", "heartbeat", "profile", "epoch", "endpoint", "auth", "runtime", "missing", "caught-loss", "caller-object"] as const)
+test(`Follower owner scope binds its original profile and immutable routing identity (${fault})`, () => {
+  const temp = createTempLockPath();
+  let profile = "default";
+  const expected = { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "epoch", runtimeGeneration: 1,
+    busSocketPath: "original.sock", busSecret: "fixture-secret", heartbeatMs: 1 };
+  const write = (owner: typeof expected) => writeFileSync(temp.path, JSON.stringify({ default: owner, work: { ...expected } }));
+  const lock = createTelegramLockRuntime({ locksPath: temp.path, key: () => profile, pid: 10, isProcessAlive: pid => pid === 99 });
+  try {
+    write(expected);
+    const current = lock.captureFollowerRegistrationScope(expected);
+    assert.equal(current(), true);
+    if (fault === "profile") profile = "work";
+    if (fault === "epoch") write({ ...expected, leaderEpoch: "replacement" });
+    if (fault === "endpoint") write({ ...expected, busSocketPath: "replacement.sock" });
+    if (fault === "auth") write({ ...expected, busSecret: "replacement-secret" });
+    if (fault === "runtime") write({ ...expected, runtimeGeneration: 2 });
+    if (fault === "heartbeat") write({ ...expected, heartbeatMs: 2 });
+    if (fault === "missing") writeFileSync(temp.path, "{}");
+    if (fault === "caught-loss") { profile = "work"; assert.equal(current(), false); profile = "default"; }
+    if (fault === "caller-object") expected.leaderEpoch = "caller-mutated";
+    const before = readFileSync(temp.path, "utf8");
+    const positive = fault === "none" || fault === "heartbeat" || fault === "caller-object";
+    assert.equal(current(), positive);
+    assert.equal(readFileSync(temp.path, "utf8"), before, "Scope observation cannot acquire, repair or publish state");
+    if (!positive) { profile = "default"; write(expected); assert.equal(current(), false, "Equal owner restoration cannot renew the old scope"); }
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
 test("Locked polling runtime registers as follower when another live owner blocks start", async () => {
   const temp = createTempLockPath();
   const recovery: boolean[] = [];
@@ -1963,6 +3396,276 @@ test("Locked polling runtime registers as follower when another live owner block
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
+});
+
+for (const mode of ["pending", "classic", "registered"] as const)
+test(`Locked polling classifies original follower readiness without truthy grants (${mode})`, async () => {
+  const temp = createTempLockPath(), before = JSON.stringify({ [TELEGRAM_LOCK_KEY]: { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "original" } });
+  let starts = 0, statuses = 0, proofs = 0;
+  const phases: unknown[] = [];
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ locksPath: temp.path, pid: 10, isProcessAlive: pid => pid === 99 }),
+    hasBotToken: () => true, registerFollowerWithOwner: async () => mode === "pending" ? "pending" : mode === "registered" ? true : undefined,
+    proveOwnerUnresponsive: async () => { proofs++; return true; },
+    startPolling: async () => { starts++; }, stopPolling: async () => {}, updateStatus: () => { statuses++; },
+    recordRuntimeEvent(_category, _error, details) { phases.push(details?.phase); },
+  });
+  try {
+    writeFileSync(temp.path, before);
+    const result = await runtime.start({ cwd: "/recipient" });
+    assert.equal(result.ok, mode === "registered");
+    assert.equal(result.canTakeover, mode === "classic");
+    assert.equal(statuses, mode === "registered" ? 1 : 0);
+    assert.equal(starts, 0, "A follower readiness observation never starts a local poller");
+    assert.equal(proofs, 0, "Pending capability is not a failed registration or unresponsiveness proof");
+    assert.deepEqual(phases, mode === "pending" ? ["follower-readiness-pending"] : []);
+    assert.equal(readFileSync(temp.path, "utf8"), before);
+    if (mode === "pending") {
+      assert.equal(await runtime.registerFollowerWithOwner!({ cwd: "/recipient" }, { pid: 99 }), "pending");
+      assert.equal(statuses, 0, "The exposed adapter must not project pending as successful membership");
+    }
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Pending follower observation cannot cross a reused context's session identity", async () => {
+  const temp = createTempLockPath(), ctx = { cwd: "/recipient" };
+  let session = "original", statuses = 0, release!: (value: "pending") => void;
+  const pending = new Promise<"pending">(resolve => { release = resolve; });
+  let entered!: () => void;
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ locksPath: temp.path, pid: 10, isProcessAlive: pid => pid === 99 }),
+    hasBotToken: () => true, getSessionId: () => session, isContextCurrent: () => true,
+    registerFollowerWithOwner: async () => { entered(); return pending; },
+    startPolling: async () => assert.fail("A stale observation cannot poll"), stopPolling: async () => {}, updateStatus: () => { statuses++; },
+    proveOwnerUnresponsive: async () => assert.fail("A stale observation cannot request takeover proof"),
+  });
+  try {
+    writeFileSync(temp.path, JSON.stringify({ [TELEGRAM_LOCK_KEY]: { pid: 99, cwd: "/leader" } }));
+    const start = runtime.start(ctx);
+    await waiting;
+    session = "replacement";
+    release("pending");
+    const result = await start;
+    assert.equal(result.ok, false); assert.equal(result.canTakeover, false);
+    assert.match(result.message!, /cancelled or superseded/u);
+    assert.equal(statuses, 0);
+  } finally { release("pending"); rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const artifact of ["source", "compiled"] as const)
+for (const fault of ["none", "config", "profile", "path", "owner", "endpoint", "intent", "caught-owner-restore"] as const)
+test(`Follower startup binds original selected scope before registration awaits (${artifact}/${fault})`, async () => {
+  const ConfigModel = artifact === "source" ? { createTelegramConfigStore } : await import("../dist/lib/config.js");
+  const ThreadModel = artifact === "source" ? { createTelegramTopicTargetStore } : await import("../dist/lib/threads.js");
+  const LockModel = artifact === "source" ? { createTelegramLockRuntime, createTelegramLockedPollingRuntime } : await import("../dist/lib/locks.js");
+  const temp = createTempLockPath();
+  const config = ConfigModel.createTelegramConfigStore({ initialConfig: { botToken: "123:scope", profiles: { work: { botToken: "123:scope" } } } });
+  let path = join(temp.dir, "original.json"), caller = true, effects = 0, statuses = 0, proofs = 0, entered!: () => void, release!: () => void;
+  let assertOriginal: (() => void) | undefined;
+  const store = ThreadModel.createTelegramTopicTargetStore({ path: () => path, telegramProfile: config.getActiveProfileName });
+  const owner = { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "original", busSocketPath: "original.sock" };
+  const write = (value: typeof owner) => writeFileSync(temp.path, JSON.stringify({ default: value, work: { ...owner } }));
+  const waiting = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  const runtime = LockModel.createTelegramLockedPollingRuntime({
+    lock: LockModel.createTelegramLockRuntime({ locksPath: temp.path, key: () => config.getActiveProfileName() ?? "default", pid: 10, isProcessAlive: pid => pid === 99 }),
+    captureConfigScope: config.captureConnectionScope, captureStorageScope: store.captureReadScope, hasBotToken: config.hasBotToken,
+    async registerFollowerWithOwner(_ctx, selected, options) {
+      assertOriginal = options?.assertAuthority; entered(); await gate;
+      assert.deepEqual(JSON.parse(JSON.stringify(selected)), owner); assert.equal(Object.isFrozen(selected), true);
+      assert.ok(assertOriginal); assertOriginal(); effects++; return true;
+    },
+    startPolling: async () => assert.fail("A foreign scope cannot poll"), stopPolling: async () => {}, updateStatus() { statuses++; },
+    proveOwnerUnresponsive: async () => { proofs++; return true; },
+  });
+  let pending: ReturnType<typeof runtime.start> | undefined;
+  try {
+    write(owner);
+    pending = runtime.start({ cwd: "/recipient" }, { assertAuthority() { if (!caller) throw new Error("Original command ended"); } });
+    await waiting;
+    if (fault === "config") config.set(config.get());
+    if (fault === "profile") config.activateProfile("work");
+    if (fault === "path") path = join(temp.dir, "replacement.json");
+    if (fault === "owner") write({ ...owner, leaderEpoch: "replacement" });
+    if (fault === "endpoint") write({ ...owner, busSocketPath: "replacement.sock" });
+    if (fault === "intent") caller = false;
+    if (fault === "caught-owner-restore") { write({ ...owner, leaderEpoch: "replacement" }); assert.throws(assertOriginal!); write(owner); }
+    const before = readFileSync(temp.path, "utf8");
+    release();
+    const result = await pending;
+    assert.equal(result.ok, fault === "none"); assert.equal(result.canTakeover, false);
+    assert.equal(effects, fault === "none" ? 1 : 0); assert.equal(statuses, fault === "none" ? 1 : 0); assert.equal(proofs, 0);
+    assert.equal(readFileSync(temp.path, "utf8"), before, "Selection checks cannot repair or rebind the canonical owner");
+  } finally { release(); await pending; rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const fault of ["deadline", "deadline-logging", "backwards", "nan", "throw", "reentry", "profile", "session", "locator", "registration-port", "birth-invalid", "constant-clock"] as const)
+test(`Original readiness budget cannot renew its clock or selected scope (${fault})`, async () => {
+  const temp = createTempLockPath(), statePath = join(temp.dir, "state.json");
+  const config = createTelegramConfigStore({ initialConfig: { botToken: "123:scope", profiles: { work: { botToken: "123:scope" } } } });
+  const store = createTelegramTopicTargetStore({ path: statePath, telegramProfile: config.getActiveProfileName });
+  const owner = { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "epoch", busSecret: "fixture", runtimeGeneration: 1 };
+  let now = 100, session = "original", locator = "original.sock", throwing = false, reenter = false, remaining: (() => number) | undefined, statuses = 0, proofs = 0;
+  if (fault === "birth-invalid") now = Number.MAX_VALUE;
+  const deps = {
+    lock: createTelegramLockRuntime({ statePath, pid: 10, isProcessAlive: (pid: number) => pid === 99 }),
+    captureConfigScope: config.captureConnectionScope, captureStorageScope: store.captureReadScope, hasBotToken: config.hasBotToken,
+    getSessionId: () => session, getLeaderEndpoint: () => locator, waitForReadiness: async () => {},
+    readinessClock() { if (throwing) throw new Error("clock failed"); if (reenter) { reenter = false; try { remaining!(); } catch { /* A provider catches its reentry. */ } } return now; },
+    async registerFollowerWithOwner(_ctx: { cwd: string }, _owner: TelegramLockEntry, options?: TelegramFollowerRegistrationOptions): Promise<TelegramFollowerRegistrationResult> {
+      remaining = options?.readiness?.remainingMs; assert.ok(remaining);
+      if (fault === "birth-invalid") { assert.equal(remaining(), 0); return "readiness-expired"; }
+      assert.equal(remaining(), 8000);
+      if (fault === "constant-clock") {
+        let observations = 0;
+        while (await options!.readiness!.wait()) observations++;
+        assert.equal(observations, 54, "A frozen clock cannot grow the original bus-cadence observation count");
+        assert.equal(remaining(), 0);
+        return "readiness-expired";
+      }
+      if (fault === "deadline" || fault === "deadline-logging") { now = 8099; assert.equal(remaining(), 1); now = 8100; }
+      if (fault === "backwards") now = 99;
+      if (fault === "nan") now = NaN;
+      if (fault === "throw") throwing = true;
+      if (fault === "reentry") reenter = true;
+      if (fault === "profile") config.activateProfile("work");
+      if (fault === "session") session = "replacement";
+      if (fault === "locator") locator = "replacement.sock";
+      if (fault === "registration-port") deps.registerFollowerWithOwner = async () => true;
+      if (["reentry", "profile", "session", "locator", "registration-port"].includes(fault)) assert.throws(remaining);
+      else { assert.equal(remaining(), 0); now = 100; throwing = false; assert.equal(remaining(), 0, "Restored clock fields cannot renew the deadline"); }
+      return "readiness-expired" as const;
+    },
+    startPolling: async () => assert.fail("Readiness cannot poll"), stopPolling: async () => {}, updateStatus() { statuses++; },
+    proveOwnerUnresponsive: async () => { proofs++; return true; },
+    recordRuntimeEvent() { if (fault === "deadline-logging") throw new Error("Fixture logging failure"); },
+  };
+  try {
+    mutateTelegramRuntimeStateSection(statePath, "default", "transport", () => ({ value: owner, result: undefined }), { isCurrent: () => true });
+    const before = readFileSync(statePath, "utf8");
+    const result = await createTelegramLockedPollingRuntime(deps).start({ cwd: "/recipient" }, { assertAuthority() {} });
+    assert.equal(result.ok, false); assert.equal(result.canTakeover, false); assert.equal(statuses, 0); assert.equal(proofs, 0);
+    assert.equal(readFileSync(statePath, "utf8"), before);
+    assert.match(result.message!, ["deadline", "deadline-logging", "backwards", "nan", "throw", "birth-invalid", "constant-clock"].includes(fault) ? /Timed out waiting/ : /cancelled or superseded/);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Original readiness deadline is born before an existing transport drain", async () => {
+  const temp = createTempLockPath(), statePath = join(temp.dir, "state.json");
+  const config = createTelegramConfigStore({ initialConfig: { botToken: "123:scope" } });
+  const store = createTelegramTopicTargetStore({ path: statePath, telegramProfile: config.getActiveProfileName });
+  let now = 100, hold = false, draining = false, release!: () => void, calls = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ statePath, instanceId: "local", pid: 10, isProcessAlive: () => true }),
+    hasBotToken: config.hasBotToken, captureConfigScope: config.captureConnectionScope, captureStorageScope: store.captureReadScope,
+    getSessionId: () => "session", readinessClock: () => now, ownershipCheckMs: 1, ownershipRefreshMs: 1,
+    startPolling: async () => {}, stopPolling: async () => { if (hold) { draining = true; await gate; } }, updateStatus() {},
+    registerFollowerWithOwner: async (_ctx, _owner, options) => { calls++; assert.ok(options?.readiness); assert.equal(options.readiness.remainingMs(), 0); return "readiness-expired" as const; },
+  });
+  let pending: ReturnType<typeof runtime.start> | undefined;
+  try {
+    assert.equal((await runtime.start({ cwd: "/local" })).ok, true);
+    hold = true;
+    mutateTelegramRuntimeStateSection(statePath, "default", "transport", () => ({ value: {
+      pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "epoch", busSecret: "fixture", busSocketPath: "original.sock", runtimeGeneration: 1,
+    }, result: undefined }), { isCurrent: () => true });
+    await waitForCondition(() => draining);
+    pending = runtime.start({ cwd: "/recipient" }, { assertAuthority() {} });
+    now = 8100; release();
+    const result = await pending;
+    assert.equal(result.ok, false); assert.equal(result.canTakeover, false); assert.equal(calls, 1);
+    assert.match(result.message!, /Timed out waiting/);
+  } finally { release(); await pending; await runtime.stop(); rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const mismatch of ["none", "profile", "path"] as const)
+test(`Consolidated follower admission cross-binds config and Workspace to native transport coordinates (${mismatch})`, async () => {
+  const temp = createTempLockPath(), statePath = join(temp.dir, "state.json");
+  const config = createTelegramConfigStore({ initialConfig: { botToken: "123:scope", profiles: { work: { botToken: "123:scope" } } } });
+  const store = createTelegramTopicTargetStore({ path: mismatch === "path" ? join(temp.dir, "other.json") : statePath,
+    telegramProfile: config.getActiveProfileName });
+  const owner = { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "epoch" };
+  let registrations = 0;
+  const lock = createTelegramLockRuntime({ statePath, key: () => mismatch === "profile" ? "work" : "default", pid: 10, isProcessAlive: pid => pid === 99 });
+  const runtime = createTelegramLockedPollingRuntime({ lock, hasBotToken: config.hasBotToken,
+    captureConfigScope: config.captureConnectionScope, captureStorageScope: store.captureReadScope,
+    registerFollowerWithOwner: async () => { registrations++; return true; },
+    startPolling: async () => assert.fail("A foreign binding cannot poll"), stopPolling: async () => {}, updateStatus() {},
+  });
+  try {
+    for (const profile of ["default", "work"]) mutateTelegramRuntimeStateSection(statePath, profile, "transport", () => ({ value: owner, result: undefined }), { isCurrent: () => true });
+    const before = readFileSync(statePath, "utf8");
+    const result = await runtime.start({ cwd: "/recipient" });
+    assert.equal(result.ok, mismatch === "none"); assert.equal(result.canTakeover, false);
+    assert.equal(registrations, mismatch === "none" ? 1 : 0, "Individually current but mismatched scopes cannot certify one original selection");
+    assert.equal(readFileSync(statePath, "utf8"), before);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const replace of [false, true])
+test(`Follower owner selection precedes an existing ownership-drain await (${replace})`, async () => {
+  const temp = createTempLockPath();
+  let release!: () => void, registrations = 0, draining = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let hold = false;
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ locksPath: temp.path, pid: 10, isProcessAlive: () => true }),
+    hasBotToken: () => true, ownershipCheckMs: 1, ownershipRefreshMs: 1,
+    startPolling: async () => {}, stopPolling: async () => { if (hold) { draining = true; await gate; } }, updateStatus() {},
+    registerFollowerWithOwner: async (_ctx, _owner, options) => { options?.assertAuthority?.(); registrations++; return true; },
+  });
+  let starting: ReturnType<typeof runtime.start> | undefined;
+  try {
+    assert.equal((await runtime.start({ cwd: "/original" })).ok, true);
+    const owner = { pid: 99, cwd: "/leader", instanceId: "leader", leaderEpoch: "original" };
+    writeFileSync(temp.path, JSON.stringify({ default: owner }));
+    hold = true; await waitForCondition(() => draining);
+    starting = runtime.start({ cwd: "/recipient" });
+    if (replace) writeFileSync(temp.path, JSON.stringify({ default: { ...owner, leaderEpoch: "replacement" } }));
+    release();
+    const result = await starting;
+    assert.equal(result.ok, !replace); assert.equal(result.canTakeover, false);
+    assert.equal(registrations, replace ? 0 : 1, "A drain cannot authorize adopting the leader that replaced the selected original");
+  } finally { release(); await starting; await runtime.stop(); rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const fault of ["session", "context", "stop", "caught-loss", "producer"] as const)
+test(`Locked polling passes original cancellation through registration without takeover proof (${fault})`, async () => {
+  const temp = createTempLockPath(), ctx = { cwd: "/recipient" };
+  let session = "original", active = true, statuses = 0, proofs = 0, entered!: () => void, release!: () => void;
+  let assertOriginal: (() => void) | undefined;
+  const waiting = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  const runtime = createTelegramLockedPollingRuntime({
+    lock: createTelegramLockRuntime({ locksPath: temp.path, pid: 10, isProcessAlive: pid => pid === 99 }),
+    hasBotToken: () => true, getSessionId: () => session, isContextCurrent: () => active,
+    registerFollowerWithOwner: async (_ctx, _owner, options) => {
+      assertOriginal = options?.assertAuthority;
+      entered(); await gate;
+      assert.ok(assertOriginal);
+      if (fault === "producer") throw new TelegramFollowerRegistrationCancelledError();
+      assertOriginal(); return true;
+    },
+    startPolling: async () => assert.fail("A cancelled registration cannot poll"), stopPolling: async () => {}, updateStatus: () => { statuses++; },
+    proveOwnerUnresponsive: async () => { proofs++; return true; },
+  });
+  let pending: ReturnType<typeof runtime.start> | undefined;
+  try {
+    const original = JSON.stringify({ [TELEGRAM_LOCK_KEY]: { pid: 99, cwd: "/leader" } });
+    writeFileSync(temp.path, original);
+    pending = runtime.start(ctx);
+    await waiting;
+    if (fault === "session") session = "replacement";
+    if (fault === "context") active = false;
+    if (fault === "stop") await runtime.stop();
+    if (fault === "caught-loss") { active = false; assert.throws(assertOriginal!); active = true; }
+    release();
+    const result = await pending;
+    assert.equal(result.ok, false); assert.equal(result.canTakeover, false);
+    assert.match(result.message!, /cancelled or superseded/u);
+    assert.equal(statuses, 0); assert.equal(proofs, 0, "Cancellation is not evidence of an unavailable leader");
+    assert.equal(readFileSync(temp.path, "utf8"), original);
+  } finally { release(); await pending; rmSync(temp.dir, { recursive: true, force: true }); }
 });
 
 test("Locked polling runtime falls back to takeover when follower registration is not applicable", async () => {
@@ -3344,6 +5047,8 @@ test("Locked polling runtime tolerates a transient unverified ownership check", 
     getOwnedLeaderEpoch: () => undefined,
     getJournalPath: () => undefined,
     owns: () => !unverifiedNextCheck,
+    captureFollowerRegistrationScope: () => () => false,
+    getStorageScope: () => undefined,
     commitIfOwned: (commit: () => void) => {
       commit();
       return true;
@@ -3413,6 +5118,8 @@ for (const ownsReadable of [true, false]) test(`Locked polling runtime records r
     getOwnedLeaderEpoch: () => undefined,
     getJournalPath: () => undefined,
     owns: () => ownsReadable || refreshCalls < 2,
+    captureFollowerRegistrationScope: () => () => false,
+    getStorageScope: () => undefined,
     commitIfOwned: (commit: () => void) => {
       commit();
       return true;
@@ -3460,6 +5167,26 @@ for (const ownsReadable of [true, false]) test(`Locked polling runtime records r
   assert.equal(runtimeEvents[0]?.category, "lock");
   assert.equal(runtimeEvents[0]?.phase, "ownership-check-failed");
   assert.match(runtimeEvents[0]?.message ?? "", /EPERM/);
+});
+
+test("Automatic startup cannot carry a reused context across awaited session eligibility", async () => {
+  const temp = createTempLockPath(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const ctx = { cwd: "/repo", sessionId: "A" };
+  let starts = 0;
+  writeFileSync(temp.path, JSON.stringify({ [TELEGRAM_LOCK_KEY]: { pid: 99, cwd: "/repo" } }));
+  const before = readFileSync(temp.path, "utf8");
+  const lock = createTelegramLockRuntime<typeof ctx>({ locksPath: temp.path, pid: 10, isProcessAlive: () => false });
+  const runtime = createTelegramLockedPollingRuntime({ lock, hasBotToken: () => true, isContextCurrent: () => true,
+    getSessionId: context => context.sessionId,
+    async canAutoStartSession() { entered.resolve(); await release.promise; return true; },
+    startPolling() { starts++; }, async stopPolling() {}, updateStatus() {},
+  });
+  try {
+    await runtime.onSessionStart({}, ctx); await entered.promise;
+    ctx.sessionId = "B"; release.resolve();
+    await new Promise(resolve => setImmediate(resolve)); await runtime.suspend();
+    assert.equal(starts, 0); assert.equal(readFileSync(temp.path, "utf8"), before);
+  } finally { release.resolve(); await runtime.stop(); rmSync(temp.dir, { recursive: true, force: true }); }
 });
 
 test("Locked polling runtime resumes stale same-cwd ownership after process restart", async () => {
@@ -3555,4 +5282,21 @@ test("Private file helpers publish owner-only contents and refuse unsafe or over
     rmSync(path); symlinkSync(join(dir, "elsewhere"), path);
     failure(() => readTelegramPrivateFile(path, 64), "unsafe");
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("File transactions report their held time and contended lock waits as synchronous blocking", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-lock-block-"));
+  try {
+    const path = join(dir, "transaction.lock");
+    const before = readTelegramSyncBlockTotals();
+    withTelegramFileTransaction(path, () => "done");
+    const after = readTelegramSyncBlockTotals();
+    assert.equal(
+      (after["transaction-held"]?.count ?? 0) - (before["transaction-held"]?.count ?? 0),
+      1,
+      "Every transaction reports how long it held the event loop",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

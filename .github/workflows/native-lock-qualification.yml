@@ -1,0 +1,279 @@
+name: Native lock qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/probe-native-file-lock.mjs"
+      - "scripts/probe-owned-native-lease.mjs"
+      - "scripts/probe-owned-native-close-failure.mjs"
+      - "scripts/probe-native-napi-build.mjs"
+      - "scripts/probe-native-package-update.mjs"
+      - "scripts/build-dist.mjs"
+      - "lib/locks.ts"
+      - "dist/lib/locks.js"
+      - "scripts/package-native-lock.mjs"
+      - "scripts/build-linux-native-lock.mjs"
+      - "native/**"
+      - "tests/fixtures/native-file-lock/**"
+      - ".github/workflows/native-lock-qualification.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-lock-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: native lock (${{ matrix.os }}, Node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-26-intel]
+        node: [22.19.0, 26.8.1]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      QUALIFICATION_EVIDENCE: native-lock-evidence
+    steps:
+      - name: Check out qualification source without retained credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up exact Node.js runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - name: Record source, runtime and frozen dependency inputs
+        run: |
+          mkdir -p "$QUALIFICATION_EVIDENCE"
+          git rev-parse HEAD > "$QUALIFICATION_EVIDENCE/source-commit.txt"
+          node --version > "$QUALIFICATION_EVIDENCE/node-version.txt"
+          npm --version > "$QUALIFICATION_EVIDENCE/npm-version.txt"
+          cp tests/fixtures/native-file-lock/package.json "$QUALIFICATION_EVIDENCE/package.json"
+          cp tests/fixtures/native-file-lock/package-lock.json "$QUALIFICATION_EVIDENCE/package-lock.json"
+      - name: Install only the frozen candidate without lifecycle hooks
+        timeout-minutes: 5
+        run: npm ci --prefix tests/fixtures/native-file-lock --ignore-scripts --bin-links=false --no-fund
+      - name: Audit the isolated dependency closure
+        timeout-minutes: 2
+        run: npm audit --prefix tests/fixtures/native-file-lock --omit=dev --json > "$QUALIFICATION_EVIDENCE/audit.json"
+      - name: Verify registry signatures and supplied attestations
+        timeout-minutes: 2
+        run: npm audit signatures --prefix tests/fixtures/native-file-lock --json > "$QUALIFICATION_EVIDENCE/signature-audit.json"
+      - name: Qualify actual native behavior in disposable storage
+        timeout-minutes: 2
+        run: |
+          set +e
+          node scripts/probe-native-file-lock.mjs --addon tests/fixtures/native-file-lock/node_modules/fs-native-extensions > "$QUALIFICATION_EVIDENCE/report.json" 2> "$QUALIFICATION_EVIDENCE/probe.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/exit-code.txt"
+          while IFS= read -r line; do printf '%s\n' "$line"; done < "$QUALIFICATION_EVIDENCE/report.json"
+          while IFS= read -r line; do printf '%s\n' "$line" >&2; done < "$QUALIFICATION_EVIDENCE/probe.stderr"
+          exit "$status"
+      - name: Qualify Linux and Darwin environment-owned lease fixture
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        timeout-minutes: 3
+        run: |
+          build="$RUNNER_TEMP/owned-lease-prototype"
+          mkdir -p "$build"
+          include="$(node -p 'require("node:path").join(require("node:path").dirname(process.execPath), "..", "include", "node")')"
+          test -f "$include/node_api.h"
+          cc --version > "$QUALIFICATION_EVIDENCE/owned-lease-compiler.txt"
+          flags=(-std=c11 -fPIC -Wall -Wextra -Werror -DNAPI_VERSION=8 -I "$include")
+          if [ "$RUNNER_OS" = macOS ]; then flags+=(-bundle -undefined dynamic_lookup); else flags+=(-shared); fi
+          cc "${flags[@]}" tests/fixtures/native-file-lock/owned-lease.c -o "$build/owned-lease.node"
+          cc "${flags[@]}" -DOWNED_LEASE_SUPPRESS_TEARDOWN=1 tests/fixtures/native-file-lock/owned-lease.c -o "$build/without-teardown.node"
+          if [ "$RUNNER_OS" = macOS ]; then
+            cc "${flags[@]}" -mmacosx-version-min=11.0 -DOWNED_LEASE_DISTRIBUTION=1 native/locks.c -o "$build/distribution.node"
+            cc "${flags[@]}" -mmacosx-version-min=26.0 -DOWNED_LEASE_DISTRIBUTION=1 native/locks.c -o "$build/deployment-incompatible.node"
+          fi
+          node --input-type=module -e 'import{createHash}from"node:crypto";import{readFileSync}from"node:fs";for(const path of process.argv.slice(1))console.log(createHash("sha256").update(readFileSync(path)).digest("hex")+"  "+path)' tests/fixtures/native-file-lock/owned-lease.c native/locks.c scripts/probe-owned-native-lease.mjs "$build/owned-lease.node" > "$QUALIFICATION_EVIDENCE/owned-lease-inputs.txt"
+          set +e
+          node scripts/probe-owned-native-lease.mjs --addon "$build/owned-lease.node" > "$QUALIFICATION_EVIDENCE/owned-lease-report.json" 2> "$QUALIFICATION_EVIDENCE/owned-lease.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/owned-lease-exit-code.txt"
+          while IFS= read -r line; do printf '%s\n' "$line" >&2; done < "$QUALIFICATION_EVIDENCE/owned-lease.stderr"
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+          set +e
+          node scripts/probe-owned-native-lease.mjs --addon "$build/without-teardown.node" > "$QUALIFICATION_EVIDENCE/owned-lease-control.stdout" 2> "$QUALIFICATION_EVIDENCE/owned-lease-control.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/owned-lease-control-exit-code.txt"
+          test "$status" -eq 1
+          grep -Fq 'Actual Worker exit, not a stop request or JS finally, precedes reacquisition' "$QUALIFICATION_EVIDENCE/owned-lease-control.stderr"
+      - name: Compile and load public Windows N-API smoke fixture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $version = (node -p process.versions.node).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $arch = (node -p process.arch).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $manifest = Get-Content tests/fixtures/native-file-lock/windows-node-sdk.json -Raw | ConvertFrom-Json -AsHashtable
+          $release = $manifest.versions[$version]
+          if (!$release -or $arch -ne $manifest.arch -or $manifest.napi -ne 8) { throw 'Unsupported SDK qualification tuple' }
+          $build = Join-Path $env:RUNNER_TEMP 'windows-napi-build'
+          New-Item -ItemType Directory -Force $build | Out-Null
+          $evidence = $env:QUALIFICATION_EVIDENCE
+          $source = (Resolve-Path tests/fixtures/native-file-lock/napi-build.c).Path
+          @{ node = $version; arch = $arch; sdk = $release; sourceSha256 = (Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant(); probeSha256 = (Get-FileHash scripts/probe-native-napi-build.mjs -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json -Depth 6 | Set-Content "$evidence/windows-napi-inputs.json"
+          foreach ($name in @('headers', 'importLibrary')) {
+            $asset = $release[$name]
+            $file = Join-Path $build $(if ($name -eq 'importLibrary') { 'node.lib' } else { 'headers.tar.gz' })
+            Invoke-WebRequest -Uri "$($manifest.source)v$version/$($asset.file)" -OutFile $file -TimeoutSec 45 -MaximumRedirection 0
+            if ((Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant() -ne $asset.sha256) { throw "SDK digest mismatch: $name" }
+          }
+          tar.exe -xzf "$build/headers.tar.gz" -C $build > "$evidence/windows-napi-extract.stdout" 2> "$evidence/windows-napi-extract.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/windows-napi-extract-exit-code.txt"
+          if ($status -ne 0) { exit $status }
+          $include = Join-Path $build "node-v$version/include/node"
+          if (!(Test-Path "$include/node_api.h")) { throw 'Missing public Node headers' }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installation = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          if ($LASTEXITCODE -ne 0 -or !$installation) { throw 'No public MSVC development environment found' }
+          $developer = Join-Path $installation.Trim() 'Common7/Tools/VsDevCmd.bat'
+          $binary = Join-Path $build 'napi-build.node'
+          $command = Join-Path $build 'compile.cmd'
+          @('@echo off', "call `"$developer`" -no_logo -arch=x64 -host_arch=x64", 'if errorlevel 1 exit /b %errorlevel%', "cl.exe /nologo /Bv /LD /MD /std:c11 /W4 /WX /DNAPI_VERSION=8 /I`"$include`" `"$source`" /Fo`"$build/napi-build.obj`" /link /OUT:`"$binary`" /IMPLIB:`"$build/napi-build.lib`" /INCREMENTAL:NO `"$build/node.lib`"", 'exit /b %errorlevel%') | Set-Content $command -Encoding ascii
+          & $env:ComSpec /d /s /c "`"$command`"" > "$evidence/windows-napi-compile.stdout" 2> "$evidence/windows-napi-compile.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/windows-napi-compile-exit-code.txt"
+          if ($status -ne 0) { exit $status }
+          (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() | Set-Content "$evidence/windows-napi-binary-sha256.txt"
+          node scripts/probe-native-napi-build.mjs --addon $binary > "$evidence/windows-napi-report.json" 2> "$evidence/windows-napi-load.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/windows-napi-load-exit-code.txt"
+          exit $status
+      - name: Qualify Windows environment-owned HANDLE fixture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $version = (node -p process.versions.node).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $build = Join-Path $env:RUNNER_TEMP 'windows-napi-build'
+          $include = Join-Path $build "node-v$version/include/node"
+          $evidence = $env:QUALIFICATION_EVIDENCE
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installation = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          if ($LASTEXITCODE -ne 0 -or !$installation) { throw 'No public MSVC development environment found' }
+          $developer = Join-Path $installation.Trim() 'Common7/Tools/VsDevCmd.bat'
+          $source = (Resolve-Path tests/fixtures/native-file-lock/owned-lease.c).Path
+          @{ node = $version; sourceSha256 = (Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant(); nativeSourceSha256 = (Get-FileHash native/locks.c -Algorithm SHA256).Hash.ToLowerInvariant(); probeSha256 = (Get-FileHash scripts/probe-owned-native-lease.mjs -Algorithm SHA256).Hash.ToLowerInvariant(); closeFailureProbeSha256 = (Get-FileHash scripts/probe-owned-native-close-failure.mjs -Algorithm SHA256).Hash.ToLowerInvariant(); sdkEvidence = (Get-Content "$evidence/windows-napi-inputs.json" -Raw | ConvertFrom-Json) } | ConvertTo-Json -Depth 8 | Set-Content "$evidence/windows-owned-inputs.json"
+          foreach ($name in @('owned-lease', 'without-teardown', 'protected-close', 'forgotten-close-error', 'distribution')) {
+            $define = switch ($name) {
+              'without-teardown' { '/DOWNED_LEASE_SUPPRESS_TEARDOWN=1' }
+              'protected-close' { '/DOWNED_LEASE_CLOSE_FAILURE_WITNESS=1' }
+              'forgotten-close-error' { '/DOWNED_LEASE_CLOSE_FAILURE_WITNESS=1 /DOWNED_LEASE_FORGET_CLOSE_ERROR=1' }
+              'distribution' { '/DOWNED_LEASE_DISTRIBUTION=1' }
+              default { '' }
+            }
+            $compileSource = if ($name -eq 'distribution') { (Resolve-Path native/locks.c).Path } else { $source }
+            $command = Join-Path $build "$name.cmd"
+            @('@echo off', "call `"$developer`" -no_logo -arch=x64 -host_arch=x64", 'if errorlevel 1 exit /b %errorlevel%', "cl.exe /nologo /Bv /LD /MD /std:c11 /W4 /WX /DNAPI_VERSION=8 $define /I`"$include`" `"$compileSource`" /Fo`"$build/$name.obj`" /link /OUT:`"$build/$name.node`" /IMPLIB:`"$build/$name.lib`" /INCREMENTAL:NO `"$build/node.lib`" advapi32.lib", 'exit /b %errorlevel%') | Set-Content $command -Encoding ascii
+            & $env:ComSpec /d /s /c "`"$command`"" > "$evidence/windows-$name-compile.stdout" 2> "$evidence/windows-$name-compile.stderr"
+            $status = $LASTEXITCODE
+            $status | Set-Content "$evidence/windows-$name-compile-exit-code.txt"
+            if ($status -ne 0) { exit $status }
+            (Get-FileHash "$build/$name.node" -Algorithm SHA256).Hash.ToLowerInvariant() | Set-Content "$evidence/windows-$name-binary-sha256.txt"
+          }
+          node scripts/probe-owned-native-lease.mjs --addon "$build/owned-lease.node" > "$evidence/owned-lease-report.json" 2> "$evidence/owned-lease.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/owned-lease-exit-code.txt"
+          if ($status -ne 0) { exit $status }
+          node scripts/probe-owned-native-lease.mjs --addon "$build/without-teardown.node" > "$evidence/owned-lease-control.stdout" 2> "$evidence/owned-lease-control.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/owned-lease-control-exit-code.txt"
+          # The runner otherwise propagates the expected native exit 1 after this assertion.
+          if ($status -ne 1 -or !(Select-String -Path "$evidence/owned-lease-control.stderr" -SimpleMatch 'Actual Worker exit, not a stop request or JS finally, precedes reacquisition' -Quiet)) { throw 'Windows teardown falsifier did not reach the expected failure' }
+          node scripts/probe-owned-native-close-failure.mjs --addon "$build/protected-close.node" > "$evidence/owned-close-failure-report.json" 2> "$evidence/owned-close-failure.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/owned-close-failure-exit-code.txt"
+          if ($status -ne 0) { exit $status }
+          node scripts/probe-owned-native-close-failure.mjs --addon "$build/forgotten-close-error.node" > "$evidence/owned-close-failure-control.stdout" 2> "$evidence/owned-close-failure-control.stderr"
+          $status = $LASTEXITCODE
+          $status | Set-Content "$evidence/owned-close-failure-control-exit-code.txt"
+          if ($status -ne 1 -or !(Select-String -Path "$evidence/owned-close-failure-control.stderr" -SimpleMatch 'Repeated release preserves unconfirmed native retirement' -Quiet)) { throw 'Windows failed-close falsifier did not reach the expected failure' }
+          exit 0
+      - name: Build Linux distribution against pinned GLIBC baseline
+        if: runner.os == 'Linux'
+        timeout-minutes: 7
+        run: |
+          set +e
+          node scripts/build-linux-native-lock.mjs --out "$QUALIFICATION_EVIDENCE/linux-baseline" > "$QUALIFICATION_EVIDENCE/linux-baseline-report.json" 2> "$QUALIFICATION_EVIDENCE/linux-baseline.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/linux-baseline-exit-code.txt"
+          exit "$status"
+      - name: Assemble private backend package without installer or runtime compilation
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then build="$RUNNER_TEMP/windows-napi-build"; elif [ "$RUNNER_OS" = Linux ]; then build="$QUALIFICATION_EVIDENCE/linux-baseline"; else build="$RUNNER_TEMP/owned-lease-prototype"; fi
+          if [ "$RUNNER_OS" = macOS ]; then
+            cp "$build/deployment-incompatible.node" "$QUALIFICATION_EVIDENCE/darwin-deployment-incompatible.node"
+            set +e
+            node scripts/package-native-lock.mjs --binary "$build/deployment-incompatible.node" --out "$QUALIFICATION_EVIDENCE/darwin-refused-backend" > "$QUALIFICATION_EVIDENCE/darwin-deployment-refusal.stdout" 2> "$QUALIFICATION_EVIDENCE/darwin-deployment-refusal.stderr"
+            refusal=$?
+            set -e
+            printf '%s\n' "$refusal" > "$QUALIFICATION_EVIDENCE/darwin-deployment-refusal-exit-code.txt"
+            test "$refusal" -eq 1
+            grep -F 'exceeds the Node 22 macOS 11 baseline (26.0.0)' "$QUALIFICATION_EVIDENCE/darwin-deployment-refusal.stderr"
+            test ! -e "$QUALIFICATION_EVIDENCE/darwin-refused-backend"
+          fi
+          set +e
+          node scripts/package-native-lock.mjs --binary "$build/distribution.node" --out "$QUALIFICATION_EVIDENCE/kernel-backend" > "$QUALIFICATION_EVIDENCE/kernel-package-report.json" 2> "$QUALIFICATION_EVIDENCE/kernel-package.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/kernel-package-exit-code.txt"
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+          set +e
+          node scripts/probe-owned-native-lease.mjs --backend "$QUALIFICATION_EVIDENCE/kernel-backend/locks.node" > "$QUALIFICATION_EVIDENCE/kernel-package-owner-report.json" 2> "$QUALIFICATION_EVIDENCE/kernel-package-owner.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/kernel-package-owner-exit-code.txt"
+          exit "$status"
+      - name: Observe mapped native package publication and actual holder exit
+        timeout-minutes: 3
+        run: |
+          set +e
+          node scripts/probe-native-package-update.mjs --out "$QUALIFICATION_EVIDENCE/mapped-native-update" > "$QUALIFICATION_EVIDENCE/mapped-native-update.stdout" 2> "$QUALIFICATION_EVIDENCE/mapped-native-update.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/mapped-native-update-exit-code.txt"
+          exit "$status"
+      - name: Set up alternate exact Node.js runtime for the same image
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: ${{ matrix.node == '22.19.0' && '26.8.1' || '22.19.0' }}
+          package-manager-cache: false
+      - name: Verify identical packaged image on alternate runtime without rebuilding
+        run: |
+          set +e
+          node scripts/probe-owned-native-lease.mjs --backend "$QUALIFICATION_EVIDENCE/kernel-backend/locks.node" > "$QUALIFICATION_EVIDENCE/kernel-package-alternate-owner-report.json" 2> "$QUALIFICATION_EVIDENCE/kernel-package-alternate-owner.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$QUALIFICATION_EVIDENCE/kernel-package-alternate-owner-exit-code.txt"
+          exit "$status"
+      - name: Preserve qualification and failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-lock-${{ matrix.os }}-node-${{ matrix.node }}-${{ github.run_attempt }}
+          path: native-lock-evidence
+          if-no-files-found: error
+          retention-days: 14

@@ -6,7 +6,7 @@
 import { assertTelegramInlineKeyboardCallbackData } from "./keyboard.js";
 import { renderTelegramMessage, } from "./rendering.js";
 import { getTelegramTargetThreadParams, } from "./target.js";
-import { assertTelegramApiCallAuthority, isTelegramApiCommitUnknownError, TelegramApiAuthorityError, } from "./telegram-api.js";
+import { assertTelegramApiCallAuthority, captureTelegramUiAuthorityOptions, getTelegramUiAuthorityAssertion, isTelegramApiCommitUnknownError, TelegramApiAuthorityError, } from "./telegram-api.js";
 export { renderTelegramMessage, };
 export function renderTelegramMarkdownToHtmlDraft(markdown) {
     return renderTelegramMessage(markdown, { mode: "markdown" })
@@ -171,7 +171,8 @@ export async function sendTelegramRenderedChunks(chatId, chunks, deps, options) 
  * before issuance and after every response/ownership publication.
  */
 async function sendTelegramChunkSequence(chatId, chunks, replyToMessageId, options, recordOwnership, send) {
-    const target = options?.target && { ...options.target }, assertAuthority = options?.assertAuthority, replyMarkup = options?.replyMarkup;
+    const authorityOptions = captureTelegramUiAuthorityOptions(options);
+    const target = options?.target && { ...options.target }, assertAuthority = getTelegramUiAuthorityAssertion(authorityOptions), replyMarkup = options?.replyMarkup;
     assertTelegramInlineKeyboardCallbackData(replyMarkup);
     let lastMessageId;
     for (const [index, chunk] of chunks.entries()) {
@@ -181,7 +182,7 @@ async function sendTelegramChunkSequence(chatId, chunks, replyToMessageId, optio
                 reply_markup: index === chunks.length - 1 ? replyMarkup : undefined,
                 ...(replyParameters ? { reply_parameters: replyParameters } : {}),
                 ...(target ? getTelegramTargetThreadParams(target) : {}),
-            }, assertAuthority ? { assertAuthority } : undefined);
+            }, authorityOptions);
             assertTelegramApiCallAuthority(assertAuthority, true);
             return sent;
         });
@@ -194,7 +195,8 @@ async function sendTelegramChunkSequence(chatId, chunks, replyToMessageId, optio
 }
 export async function editTelegramRenderedMessage(chatId, messageId, chunks, deps, options) {
     options = { ...options, target: options?.target && { ...options.target } };
-    const assertAuthority = options.assertAuthority;
+    const authorityOptions = captureTelegramUiAuthorityOptions(options);
+    const assertAuthority = getTelegramUiAuthorityAssertion(authorityOptions);
     assertTelegramApiCallAuthority(assertAuthority, false);
     assertTelegramInlineKeyboardCallbackData(options?.replyMarkup);
     if (chunks.length === 0)
@@ -209,7 +211,7 @@ export async function editTelegramRenderedMessage(chatId, messageId, chunks, dep
         parse_mode: firstChunk.parseMode,
         reply_markup: remainingChunks.length === 0 ? options?.replyMarkup : undefined,
         ...(options?.target ? getTelegramTargetThreadParams(options.target) : {}),
-    }, assertAuthority ? { assertAuthority } : undefined);
+    }, authorityOptions);
     assertTelegramApiCallAuthority(assertAuthority, true);
     if (assertAuthority)
         deps.recordOwnership?.({ chatId, messageId, target: options.target });
@@ -218,10 +220,27 @@ export async function editTelegramRenderedMessage(chatId, messageId, chunks, dep
         return sendTelegramRenderedChunks(chatId, remainingChunks, deps, {
             replyMarkup: options?.replyMarkup,
             target: options?.target,
-            assertAuthority,
+            ...authorityOptions,
         });
     }
     return messageId;
+}
+/** Edit one fixed assistant message without chunk spill, rendering downgrade or transport fallback. */
+export async function editTelegramSingleMarkdownMessage(chatId, messageId, markdown, rendering, replyMarkup, deps, options) {
+    const captured = captureTelegramUiAuthorityOptions(options);
+    const assertAuthority = getTelegramUiAuthorityAssertion(captured);
+    assertTelegramApiCallAuthority(assertAuthority, false);
+    assertTelegramInlineKeyboardCallbackData(replyMarkup);
+    const chunks = rendering === "rich" ? splitTelegramNativeMarkdown(markdown) :
+        renderTelegramMessage(markdown, { mode: "markdown" });
+    if (chunks.length !== 1)
+        throw new TypeError("Telegram Markdown edit must fit one message.");
+    const chunk = chunks[0];
+    await deps.editMessage({
+        chat_id: chatId, message_id: messageId, reply_markup: replyMarkup,
+        ...(typeof chunk === "string" ? { rich_message: { markdown: chunk } } : { text: chunk.text, parse_mode: chunk.parseMode }),
+    }, captured);
+    assertTelegramApiCallAuthority(assertAuthority, true);
 }
 export async function sendTelegramPlainReply(text, deps, options) {
     options = { ...options, target: options?.target && { ...options.target } };
@@ -550,7 +569,7 @@ export function createTelegramRenderedMessageRuntime(deps) {
                 replyMarkup,
                 target: options?.target,
                 replyToMessageId: options?.replyToMessageId,
-                assertAuthority: options.assertAuthority,
+                ...captureTelegramUiAuthorityOptions(options),
             });
         },
         sendSectionRichMessage: (chatId, message, options) => sendTelegramNativeRichMessage(chatId, message, {

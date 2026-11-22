@@ -1,7 +1,7 @@
 /**
  * Pure state-machine runner
  * Zones: shared utils
- * Owns committing a pure transition's next state, running the effects it returns and waking state waiters
+ * Owns committing a pure transition's next state, running the effects it returns and waking state waiters, plus the inert best-effort drain-observer capture shared by queue-like domains
  * Knows nothing about the machines it drives: their state, events, effects, timers and transports stay with each domain
  */
 /** One transition result: the next state plus effects as data. A machine may add fields, such as a call result. */
@@ -21,3 +21,5 @@ export declare function createTelegramMachineRunner<State, Event, Effect, Step e
     transition: (state: State, event: Event) => Step;
     run: (effect: Effect) => void;
 }): TelegramMachineRunner<State, Event, Step>;
+/** Optional drain hints are not transport/queue outcomes or request authority; observer failure is inert. */
+export declare function captureTelegramDrainObserver(capture?: () => (() => void) | undefined): () => void;

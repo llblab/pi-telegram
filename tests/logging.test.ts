@@ -1,6 +1,7 @@
 /**
  * Regression tests for Telegram runtime JSONL diagnostics log
  * Covers session-local reset, scope changes, append-only event evidence, and collapsed failure runs
+ * Zones: telegram diagnostics, test infrastructure
  */
 
 import assert from "node:assert/strict";
@@ -531,14 +532,24 @@ test("Runtime JSONL appends serialize across processes without lost lines", asyn
   const path = join(dir, "logs.jsonl");
   const startPath = join(dir, "start");
   const moduleUrl = new URL("../lib/logging.ts", import.meta.url).href;
+  const transactionUrl = new URL("../lib/locks.ts", import.meta.url).href;
   const children = ["a", "b"].map((worker) => {
-    const readyPath = join(dir, `ready-${worker}`);
+    const readyPath = join(dir, `ready-${worker}`), errorPath = join(dir, `errors-${worker}.jsonl`);
     const source = `
-      import { existsSync, writeFileSync } from "node:fs";
-      import { createTelegramRuntimeJsonlLog } from ${JSON.stringify(moduleUrl)};
+      import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+      import { mock } from "node:test";
+      const Transactions = await import(${JSON.stringify(transactionUrl)});
+      mock.module(${JSON.stringify(transactionUrl)}, { namedExports: { ...Transactions, withTelegramFileTransaction(...args) {
+        try { return Transactions.withTelegramFileTransaction(...args); }
+        catch (error) {
+          try { appendFileSync(process.env.ERROR_PATH, JSON.stringify({ name: error?.name, code: error?.code, reason: error?.reason, phase: error?.phase, message: String(error) }) + "\\n", { mode: 0o600 }); } catch { /* Preserve the original failure. */ }
+          throw error;
+        }
+      } } });
+      const { createTelegramRuntimeJsonlLog } = await import(${JSON.stringify(moduleUrl)});
       const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
       const log = createTelegramRuntimeJsonlLog({ path: process.env.LOG_PATH, canReset: () => false });
-      writeFileSync(process.env.READY_PATH, "ready");
+      writeFileSync(process.env.READY_PATH, String(process.pid));
       while (!existsSync(process.env.START_PATH)) sleep(2);
       for (let index = 0; index < 25; index += 1) {
         log.record({ at: index, category: process.env.WORKER, message: String(index) });
@@ -549,11 +560,16 @@ test("Runtime JSONL appends serialize across processes without lost lines", asyn
       env: {
         LOG_PATH: path,
         READY_PATH: readyPath,
+        ERROR_PATH: errorPath,
         START_PATH: startPath,
         WORKER: worker,
       },
-    }).then(({ code, stderr }) => {
-      if (code !== 0) throw new Error(`log child exited ${code}: ${stderr}`);
+      nodeArgs: ["--experimental-test-module-mocks"],
+    }).then(async ({ code, signal, stderr }) => {
+      const failures = existsSync(errorPath) ? await readJsonl(errorPath) : [];
+      assert.equal(code, 0, JSON.stringify({ worker, signal, stderr, failures }));
+      assert.equal(signal, null);
+      return { worker, pid: Number(await readFile(readyPath, "utf8")), failures };
     });
     return { readyPath, done };
   });
@@ -567,12 +583,13 @@ test("Runtime JSONL appends serialize across processes without lost lines", asyn
     }
     assert.equal(children.every((child) => existsSync(child.readyPath)), true);
     await writeFile(startPath, "start");
-    await Promise.all(children.map((child) => child.done));
+    const evidence = await Promise.all(children.map((child) => child.done));
     const lines = (await readJsonl(path)) as {
       category?: string;
       message?: string;
     }[];
-    assert.equal(lines.length, 50);
+    assert.equal(lines.length, 50, JSON.stringify({ workers: evidence, counts: Object.fromEntries(["a", "b"].map(worker => [worker, lines.filter(line => line.category === worker).length])) }));
+    assert.deepEqual(evidence.flatMap(child => child.failures), [], JSON.stringify(evidence));
     for (const worker of ["a", "b"]) {
       assert.deepEqual(
         lines

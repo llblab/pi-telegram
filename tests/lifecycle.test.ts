@@ -20,6 +20,7 @@ import {
   createTelegramConnectionLifecycle,
   type TelegramConnectionHandoffStore,
   createTelegramSessionContextStore,
+  createTelegramArtifactSessionCapture,
   createTelegramSessionDrainObserver,
   createTelegramSessionGenerationFence,
   createTelegramMessageActivityTypingHooks,
@@ -31,6 +32,26 @@ import {
   createTelegramTypingLoopStarter,
 } from "../lib/runtime.ts";
 import { createPassthroughFailureLog } from "./fixtures/failure-log.ts";
+
+for (const change of ["none", "fresh-context", "clear", "same-identity-generation", "session-id"] as const)
+test(`Artifact session capture binds exact generation and session ID with sticky loss (${change})`, () => {
+  const manager = { id: "session" }, ctx = { manager };
+  const context = createTelegramSessionContextStore<typeof ctx>({ getIdentity: value => value.manager });
+  const capture = createTelegramArtifactSessionCapture({ context, getSessionId: value => value?.manager.id });
+  assert.equal(capture(), undefined);
+  context.set(ctx);
+  const current = capture()!;
+  assert.equal(current(), true);
+  if (change === "fresh-context") assert.equal(context.isCurrent({ manager }), true);
+  if (change === "clear") context.clear();
+  if (change === "same-identity-generation") context.set({ manager });
+  if (change === "session-id") manager.id = "other";
+  assert.equal(current(), change === "none" || change === "fresh-context");
+  manager.id = "session";
+  assert.equal(current(), change === "none" || change === "fresh-context", "Restored identity cannot renew observed loss");
+  manager.id = "";
+  assert.equal(capture(), undefined);
+});
 
 for (const change of ["none", "clear", "reused-context", "authority", "queued-clear", "sink-fails"] as const)
 test(`Session drain observer cannot borrow replacement authority (${change})`, async () => {

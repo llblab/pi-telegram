@@ -189,6 +189,8 @@ export interface TelegramThreadCapabilityRuntimeDeps<TContext> extends TelegramT
     topicTargetStore: TelegramThreadCapabilityStore;
     ownsLock: (ctx: TContext) => boolean;
     isFollowerRegistered?: () => boolean;
+    /** Fresh capability relayed by the leader; a registered follower consults it before probing Telegram itself. */
+    getRelayedThreadCapability?: () => boolean | undefined;
     getPollingStartedWithTelegramBus: () => boolean;
     setPollingStartedWithTelegramBus: (started: boolean) => void;
     setTopicModeUnavailable: (unavailable: boolean) => void;
@@ -227,14 +229,35 @@ export interface TelegramThreadTargetObservationBinding<TContext> {
     set(handler: TelegramThreadTargetObservationHandler<TContext>): void;
 }
 export declare function createTelegramThreadTargetObservationBinding<TContext>(): TelegramThreadTargetObservationBinding<TContext>;
+/** Local registration observation: pending capability is neither classic fallback nor acknowledged membership. */
+export type TelegramFollowerRegistrationResult = boolean | undefined | "pending" | "readiness-expired";
+/** One original observation/connection budget; never applies to an issued request's ACK. */
+export interface TelegramFollowerReadiness {
+    remainingMs: () => number;
+    wait: () => Promise<boolean>;
+}
+/** Process-local original-attempt evidence; never sent in registration packets. */
+export interface TelegramFollowerRegistrationOptions {
+    recoverConnection?: boolean;
+    assertAuthority?: () => void;
+    readiness?: TelegramFollowerReadiness;
+}
+/** Cancellation is not failed membership, endpoint unresponsiveness or takeover evidence. */
+export declare class TelegramFollowerRegistrationCancelledError extends Error {
+    constructor();
+}
+/** A native pre-issuance deadline is not membership failure or takeover proof. */
+export declare class TelegramFollowerReadinessExpiredError extends Error {
+    constructor();
+}
 export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
     startPolling: (ctx: TContext, options?: {
         forceFreshLeaderThread?: boolean;
+        restoreWorkspaceOnly?: true;
     }) => Promise<void>;
     stopPolling: () => Promise<void>;
-    registerFollowerWithOwner: (ctx: TContext, owner: TOwner, options?: {
-        recoverConnection?: boolean;
-    }) => Promise<boolean | undefined>;
+    canAutoStartSession: (ctx: TContext) => Promise<boolean>;
+    registerFollowerWithOwner: (ctx: TContext, owner: TOwner, options?: TelegramFollowerRegistrationOptions) => Promise<TelegramFollowerRegistrationResult>;
     restoreFollowerWithOwner: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
     stopFollowerRegistration: () => void;
 }
@@ -248,6 +271,8 @@ export interface TelegramThreadAwarePollingControls<TContext, TOwner> {
     stopLeaderHealth: () => void;
     registerFollowerWithLeader: (ctx: TContext, owner: TOwner, options?: {
         recoverConnection?: boolean;
+        assertAuthority?: () => void;
+        connectionReadiness?: TelegramFollowerReadiness;
     }) => Promise<boolean | undefined>;
     restoreFollowerWithLeader?: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
     hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
@@ -268,6 +293,7 @@ export interface TelegramThreadCapabilityOrchestrationDeps<TContext, TOwner> ext
     topicTargetStore: TelegramThreadCapabilityStore;
     ownsLock: (ctx: TContext) => boolean;
     isFollowerRegistered?: () => boolean;
+    getRelayedThreadCapability?: () => boolean | undefined;
     suspendLiveThreadTarget?: () => void;
     updateStatus: (ctx: TContext) => void;
     recordEvent: (category: string, message: unknown, details?: Record<string, unknown>) => void;
@@ -316,11 +342,20 @@ export interface TelegramPollingBatchAdmissionDeps<TUpdate extends TelegramUpdat
     onPhaseChange?: (phase: TelegramPollingWorkPhase, currentUpdateId?: number) => void;
 }
 export declare function admitTelegramPollingUpdateBatch<TUpdate extends TelegramUpdate>(deps: TelegramPollingBatchAdmissionDeps<TUpdate>): Promise<TelegramPollingBatchAdmissionResult>;
+/** @internal One native incoming response only, not historical freshness, cursor ACK or execution authority. */
+export interface TelegramPollingFirstObservation<TUpdate extends TelegramUpdate> {
+    readonly requestedAfterUpdateId: number;
+    readonly updates: readonly Readonly<TUpdate>[];
+    /** A supplied update must be this exact scoped record, never a decoded/copied DTO. */
+    readonly assertCurrent: (update?: Readonly<TUpdate>) => void;
+}
 /** Bot API, journal and progress ports shared by one poll loop and its restartable runner. */
 export interface TelegramPollLoopTransportPorts<TUpdate extends TelegramUpdate> extends TelegramRuntimeEventRecorderPort {
     deleteWebhook: (signal: AbortSignal) => Promise<unknown>;
     getUpdates: (body: Record<string, unknown>, signal: AbortSignal) => Promise<TUpdate[]>;
     getUpdatesRequestBudgetMs?: (body: Record<string, unknown>) => number;
+    /** @internal Opt-in, synchronous and fail-closed; runs before response/cursor/phase/append callbacks. No scope may escape. */
+    onFirstUpdateBatch?: (scope: Readonly<TelegramPollingFirstObservation<TUpdate>>) => void;
     persistConfig: (config: TelegramPollingConfig) => Promise<void>;
     appendUpdateBatch: (updates: readonly TUpdate[], acceptedThroughUpdateId?: number) => MaybePromise<unknown>;
     getAcceptedThroughUpdateId?: () => number | undefined;

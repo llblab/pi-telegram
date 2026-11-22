@@ -4,6 +4,22 @@
  * Owns small session-local runtime primitives that are shared by orchestration but are not specific to queueing, rendering, polling, or Telegram transport
  */
 import * as Machine from "./machine.js";
+/** A faulty diagnostics port must not break its owning loop, probe, interval callback or completed outcome. */
+function guardTelegramRepeatedFailureLog(port) {
+    const guarded = (call) => (...args) => {
+        try {
+            call(...args);
+        }
+        catch {
+            // Diagnostics are best-effort.
+        }
+    };
+    return {
+        record: guarded((error, details) => port.record(error, details)),
+        settled: guarded(() => port.settled()),
+        reset: guarded(() => port.reset()),
+    };
+}
 const TELEGRAM_TYPING_ACTION_INTERVAL_MS = 3_000;
 const TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS = 250;
 export function createTelegramBridgeRuntimeState() {
@@ -163,33 +179,7 @@ function updateTelegramRuntimeStatusSafely(updateStatus, ctx, options) {
 export function createTelegramTypingLoopStarter(deps) {
     let currentOwner;
     // An unreachable transport repeats one identical presence failure every tick; the port collapses the run.
-    // Running it through one guard keeps a faulty diagnostics port from escaping the in-flight action owner.
-    const typingFailureLog = {
-        record(error, details) {
-            try {
-                deps.failureLog.record(error, details);
-            }
-            catch {
-                // Typing diagnostics cannot escape the in-flight action owner.
-            }
-        },
-        settled() {
-            try {
-                deps.failureLog.settled();
-            }
-            catch {
-                // A successful presence outranks its own diagnostic.
-            }
-        },
-        reset() {
-            try {
-                deps.failureLog.reset();
-            }
-            catch {
-                // Typing diagnostics cannot fail a loop stop.
-            }
-        },
-    };
+    const typingFailureLog = guardTelegramRepeatedFailureLog(deps.failureLog);
     return (ctx, chatId, options) => {
         const sessionGeneration = deps.getSessionGeneration?.();
         const transportAuthority = deps.getTransportAuthority?.();

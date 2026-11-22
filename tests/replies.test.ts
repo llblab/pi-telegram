@@ -6,6 +6,26 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+for (const rendering of ["rich", "html"] as const)
+for (const outcome of ["edited", "before-issue", "late-ack", "oversize"] as const)
+test(`Single-message assistant edits preserve rendering, target, boundedness and authority (${rendering}/${outcome})`, async () => {
+  let current = outcome !== "before-issue", effects = 0;
+  const markup = { inline_keyboard: [[{ text: "A", callback_data: "tgbtn:a" }]] };
+  const options = { assertLocalAuthority() { if (!current) throw new Error("Owner ended"); } };
+  const markdown = outcome === "oversize" ? "x".repeat(33000) : "**Next?**";
+  const request = editTelegramSingleMarkdownMessage(7, 11, markdown, rendering, markup, {
+    async editMessage(body, captured) {
+      effects++;
+      assert.equal(captured?.assertLocalAuthority, options.assertLocalAuthority);
+      assert.deepEqual(body, { chat_id: 7, message_id: 11, reply_markup: markup,
+        ...(rendering === "rich" ? { rich_message: { markdown: "**Next?**" } } : { text: "<b>Next?</b>", parse_mode: "HTML" }) });
+      if (outcome === "late-ack") current = false;
+    },
+  }, options);
+  if (outcome === "edited") await request; else await assert.rejects(request);
+  assert.equal(effects, outcome === "edited" || outcome === "late-ack" ? 1 : 0);
+});
+
 // Transport-level dedup is module-global; reset between tests.
 test.beforeEach(() => {
   resetTransportReplyDedup();
@@ -21,6 +41,7 @@ import {
   createTelegramRenderedMessageDeliveryRuntime,
   createTelegramRenderedMessageRuntime,
   editTelegramRenderedMessage,
+  editTelegramSingleMarkdownMessage,
   extractLatestAssistantMessageText,
   extractRunAssistantMessage,
   getAgentMessageText,
@@ -47,6 +68,35 @@ import { createTelegramActivityPublicationRuntime } from "../lib/activity.ts";
 import { createTelegramThreadTarget } from "../lib/target.ts";
 import { createDefaultTelegramBridgeApiRuntime, TelegramApiAuthorityError, TelegramApiCommitUnknownError, TelegramApiFollowerNotAllowedError } from "../lib/telegram-api.ts";
 import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
+
+for (const surface of ["send", "edit"] as const) for (const boundary of ["current", "before", "after"] as const) {
+test(`Rendered local UI fence is explicit, snapshotted and retained across overflow (${surface}, ${boundary})`, async () => {
+  let current = boundary !== "before", calls = 0, owned = 0;
+  const options = { target: { chatId: 7, threadId: 70 }, assertLocalAuthority() { if (!current) throw new Error("UI owner ended"); } };
+  const captured = options.assertLocalAuthority;
+  const runtime = createTelegramRenderedMessageDeliveryRuntime<unknown>({
+    renderTelegramMessage: () => [{ text: "first" }, { text: "second" }, { text: "third" }],
+    async sendMessage(body, supplied) {
+      calls++; assert.equal(body.message_thread_id, 70); assert.equal(supplied?.assertAuthority, undefined);
+      assert.equal(supplied?.assertLocalAuthority, captured); supplied?.assertLocalAuthority?.();
+      if (boundary === "after") { options.assertLocalAuthority = () => {}; current = false; }
+      return { message_id: calls };
+    },
+    async editMessage(body, supplied) {
+      calls++; assert.equal(body.message_thread_id, 70); assert.equal(supplied?.assertAuthority, undefined);
+      assert.equal(supplied?.assertLocalAuthority, captured); supplied?.assertLocalAuthority?.();
+      if (boundary === "after") { options.assertLocalAuthority = () => {}; current = false; }
+    },
+    sendRichMessage: async () => assert.fail("Local UI does not silently authorize rich transport"),
+    recordOwnership() { owned++; },
+  });
+  const work = surface === "send" ? runtime.sendInteractiveMessage(7, "question", "html", {}, options) :
+    runtime.editInteractiveMessage(7, 501, "result", "html", {}, options);
+  if (boundary === "current") { await work; assert.equal(calls, 3); assert.equal(owned, 3); }
+  else { await assert.rejects(work, { name: "TelegramApiAuthorityError", requestIssued: boundary === "after" });
+    assert.equal(calls, boundary === "before" ? 0 : 1); assert.equal(owned, 0); }
+});
+}
 
 type RenderedFenceSurface = "plain" | "interactive" | "edit" | "html" | "native" | "rich";
 type RenderedFenceOptions = { target: { chatId: number; threadId: number }; replyToMessageId: number; assertAuthority: () => void };

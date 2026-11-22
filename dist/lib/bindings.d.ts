@@ -80,6 +80,7 @@ export declare function createTelegramQueueBindingRuntime<TContext>(deps: {
     hasPendingMessages: (ctx: TContext) => boolean;
     isContextCurrent?: (ctx: TContext) => boolean;
     isContextAborted?: (ctx: TContext) => boolean;
+    isShutdownRequested?: () => boolean;
     updateStatus: (ctx: TContext, error?: string) => void;
     sendTextReply: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendTextReply"];
     sendUserMessage: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendUserMessage"];
@@ -102,6 +103,13 @@ export declare function createTelegramGenerativeAppBoundButtonActionInvoker<TQue
     };
 }>(deps: {
     agentDir: string;
+    /** @internal Native callback-worker ownership only; no disposition or successor permission. */
+    callbackWorkerDrain?: true;
+    /** @internal App-only predecessor; bound mode preserves legacy unbound prompts without fabricating lineage. */
+    callbackSuccessor?: true | "bound";
+    /** @internal Qualified mode joins issued native origins without requiring provenance for legacy execution. */
+    callbackDispatch?: true | "qualified";
+    onOwnerObserved?: GenerativeApps.GenerativeAppRuntimeOptions["onOwnerObserved"];
     assertExecutionCurrent: (query: TQuery) => void;
     getExecutionFence: (query: TQuery) => GenerativeApps.GenerativeAppExecutionFence | undefined;
     getActiveProfileName?: () => string | undefined;
@@ -109,8 +117,11 @@ export declare function createTelegramGenerativeAppBoundButtonActionInvoker<TQue
     planOutput: ReturnType<typeof OutboundHandlers.createTelegramOutboundReplyPlanner>;
     sendMarkdownReply: (chatId: number, replyToMessageId: number, markdown: string, options?: {
         replyMarkup?: OutboundHandlers.TelegramOutboundButtonMarkup;
+        target?: TelegramTarget;
     }) => Promise<unknown>;
     editInteractiveMessage?: (chatId: number, messageId: number, markdown: string, mode: "markdown", replyMarkup: OutboundHandlers.TelegramOutboundButtonMarkup) => Promise<void>;
+    /** App output uses its configured Markdown carrier; harness-owned interactive menus stay HTML. */
+    editMarkdownMessage?: (chatId: number, messageId: number, markdown: string, replyMarkup: OutboundHandlers.TelegramOutboundButtonMarkup, options?: Parameters<typeof Replies.editTelegramSingleMarkdownMessage>[6]) => Promise<void>;
     recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }): (action: OutboundHandlers.TelegramOutboundButtonAction, query: TQuery) => Promise<false | "new" | "edit">;
 export interface TelegramAgentMessageToolRoutingRuntime {
@@ -211,6 +222,8 @@ interface TelegramCommandsAndToolsBindingDeps {
     stopPolling?: () => Promise<void | string>;
     getDisconnectThreadName?: () => string | undefined;
     onTransportChanged?: () => Promise<void> | void;
+    /** Read the selected profile's canonical projection only after this connect published an approved envelope reset. */
+    refreshProfileStateAfterReset?: () => Promise<void>;
     getStatusLines: (options?: Status.TelegramBridgeStatusLineOptions) => string[];
     buttonActionStore: OutboundHandlers.TelegramButtonActionStore;
     sendMarkdownReply: (chatId: number, replyToMessageId: number | undefined, markdown: string, options?: {
@@ -242,7 +255,7 @@ interface TelegramCommandsAndToolsBindingDeps {
     connectionIntent: NonNullable<Commands.TelegramBridgeCommandRegistrationDeps["connectionIntent"]>;
     recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }
-export declare function registerTelegramCommandsAndTools({ pi, handleInternalAction, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, getDisconnectThreadName, onTransportChanged, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, }: TelegramCommandsAndToolsBindingDeps): void;
+export declare function registerTelegramCommandsAndTools({ pi, handleInternalAction, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, getDisconnectThreadName, onTransportChanged, refreshProfileStateAfterReset, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, }: TelegramCommandsAndToolsBindingDeps): void;
 interface TelegramLifecycleBindingDeps {
     pi: Pi.ExtensionAPI;
     publicationRuntime: TelegramBridgePublicationRuntime;

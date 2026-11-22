@@ -381,9 +381,9 @@ export function createTelegramThreadDisplaySettingsRuntime(deps: {
 /** Caller owns triggering and reporting; no timer or background retry is created. */
 export function createTelegramThreadDisplayReconciler(
   deps: TelegramThreadDisplayReconcilerDeps,
-): { reconcile(bindingKey?: string): Promise<{ changed: number }> } {
+): { reconcile(bindingKey?: string): Promise<{ changed: number }>; reconcileLive(): Promise<{ changed: number }> } {
   let tail: Promise<unknown> = Promise.resolve();
-  const apply = async (bindingKey?: string): Promise<{ changed: number }> => {
+  const apply = async (bindingKey?: string, liveOnly = false): Promise<{ changed: number }> => {
     const epoch = deps.getLeaderEpoch();
     const profile = deps.getProfileKey();
     const mode = deps.getMode();
@@ -410,6 +410,7 @@ export function createTelegramThreadDisplayReconciler(
     let changed = 0;
     for (const binding of bindings) {
       if (bindingKey !== undefined && binding.bindingKey !== bindingKey) continue;
+      if (liveOnly && !liveBindingKeys.has(binding.bindingKey)) continue;
       const isBindingCurrent = deps.captureBindingAuthority(binding);
       if (!isBindingCurrent) continue;
       const title = titles.get(binding.bindingKey);
@@ -457,11 +458,14 @@ export function createTelegramThreadDisplayReconciler(
     assertAuthority();
     return { changed };
   };
+  const enqueue = (bindingKey?: string, liveOnly = false) => {
+    const run = tail.then(() => apply(bindingKey, liveOnly));
+    tail = run.catch(() => undefined);
+    return run;
+  };
   return {
-    reconcile(bindingKey) {
-      const run = tail.then(() => apply(bindingKey));
-      tail = run.catch(() => undefined);
-      return run;
-    },
+    reconcile: (bindingKey) => enqueue(bindingKey),
+    // Automatic roster/mode projection must not enter retained slotless repair.
+    reconcileLive: () => enqueue(undefined, true),
   };
 }

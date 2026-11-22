@@ -56,6 +56,10 @@ export interface TelegramBusTransportErrorInfo {
 export declare function classifyTelegramBusTransportError(error: unknown): TelegramBusTransportErrorInfo;
 export declare function isRetryableTelegramBusTransportError(error: unknown): boolean;
 export declare function createTelegramBusTransportTimeoutError(message: string): NodeJS.ErrnoException;
+/** Local pre-issuance budget exhaustion; not an ACK refusal or a remote no-effect certificate. */
+export declare class TelegramBusConnectionReadinessExpiredError extends Error {
+    constructor();
+}
 export declare function delayTelegramBusTransportRetry(ms: number): Promise<void>;
 export interface TelegramBusTransportProbeResult extends TelegramBusTransportEndpointDiagnostics {
     reachable: boolean;

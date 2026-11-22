@@ -1,6 +1,6 @@
 {
   "name": "@llblab/pi-telegram",
-  "version": "0.58.3",
+  "version": "0.59.3",
   "private": false,
   "publishConfig": {
     "access": "public"
@@ -44,6 +44,7 @@
     "index.ts",
     "api/",
     "lib/",
+    "native/",
     "dist/",
     "README.md",
     "AGENTS.md",
@@ -57,7 +58,7 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
+      "default": "./dist/pi-telegram/index.js"
     },
     "./inbound": {
       "types": "./dist/api/inbound.d.ts",

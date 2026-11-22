@@ -5,13 +5,16 @@
  */
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, normalize, relative } from "node:path";
 import test from "node:test";
 import ts from "typescript";
+import { runNodeEval } from "./fixtures/node-eval.ts";
+import { createIntegrationShardSelector } from "./fixtures/shared.ts";
 
 const PROJECT_ROOT = process.cwd();
 const releaseWorkflowSource = readFileSync(
@@ -67,32 +70,897 @@ test("Unreleased changelog respects the project release-entry budget", () => {
   );
 });
 
-test("macOS CI shards cover every test file exactly once without widening deadlines", () => {
-  const runner = join(PROJECT_ROOT, "scripts", "run-macos-tests.mjs");
+test("CI dependency installation has its own bounded timing phase without retry or failure suppression", () => {
+  for (const file of ["validate.yml", "recovery-diagnostics.yml", "release.yml"]) {
+    const source = readFileSync(join(PROJECT_ROOT, ".github", "workflows", file), "utf8");
+    const install = source.match(/      - name: Install (?:exact )?dependencies\n((?:        [^\n]*\n)+)/u)?.[1];
+    assert.ok(install, file);
+    assert.match(install, /^        timeout-minutes: 5$/mu);
+    assert.match(install, /^        run: npm ci --timing$/mu);
+    assert.doesNotMatch(install, /continue-on-error|retry|\|\|/u);
+  }
+});
+
+test("Native lock qualification freezes an isolated candidate without runtime adoption or privileged CI", () => {
+  const directory = join(PROJECT_ROOT, "tests", "fixtures", "native-file-lock");
+  const fixture = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
+  const frozen = JSON.parse(readFileSync(join(directory, "package-lock.json"), "utf8"));
+  const main = JSON.parse(readFileSync(join(PROJECT_ROOT, "package.json"), "utf8"));
+  const mainLock = JSON.parse(readFileSync(join(PROJECT_ROOT, "package-lock.json"), "utf8"));
+  assert.equal(fixture.private, true);
+  assert.deepEqual(fixture.dependencies, { "fs-native-extensions": "1.5.3" });
+  assert.deepEqual(frozen.packages[""].dependencies, fixture.dependencies);
+  assert.equal(frozen.packages["node_modules/fs-native-extensions"].version, "1.5.3");
+  assert.equal(frozen.packages["node_modules/fs-native-extensions"].integrity,
+    "sha512-pl39uoPqAdANcule683Wghiw3UlQc+tDagBtKT8ltKaK/Jxu9cDL5sMjca+4eTgrHnn3I7qRO5jPG/658GOsdg==");
+  assert.equal(Object.keys(fixture.scripts ?? {}).length, 0);
+  for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+    assert.equal(main[field]?.["fs-native-extensions"], undefined, "Candidate qualification cannot adopt a runtime or root test dependency");
+  }
+  assert.equal(mainLock.packages["node_modules/fs-native-extensions"], undefined);
+  const workflow = readFileSync(join(PROJECT_ROOT, ".github", "workflows", "native-lock-qualification.yml"), "utf8");
+  assert.match(workflow, /^  workflow_dispatch:$/mu);
+  const paths = workflow.match(/^    paths:\n((?:      - [^\n]+\n)+)/mu)?.[1];
+  assert.ok(paths);
+  assert.deepEqual(paths.trim().split("\n").map(line => line.trim().replace(/^- "|"$/gu, "")), [
+    "scripts/probe-native-file-lock.mjs", "scripts/probe-owned-native-lease.mjs", "scripts/probe-owned-native-close-failure.mjs", "scripts/probe-native-napi-build.mjs",
+    "scripts/probe-native-package-update.mjs", "scripts/build-dist.mjs", "lib/locks.ts", "dist/lib/locks.js",
+    "scripts/package-native-lock.mjs", "scripts/build-linux-native-lock.mjs", "native/**", "tests/fixtures/native-file-lock/**", ".github/workflows/native-lock-qualification.yml",
+  ]);
+  assert.match(workflow, /^  contents: read$/mu);
+  const jobEnvironment = workflow.match(/^    env:\n((?:      [^\n]+\n)+)/mu)?.[1];
+  assert.ok(jobEnvironment);
+  assert.doesNotMatch(jobEnvironment, /\$\{\{\s*runner\./u, "Runner context is unavailable in job-level env");
+  assert.equal(workflow.match(/^      QUALIFICATION_EVIDENCE: (.+)$/mu)?.[1],
+    workflow.match(/^          path: (.+)$/mu)?.[1], "Capture and upload the same context-free evidence directory");
+  assert.match(workflow, /^          persist-credentials: false$/mu);
+  assert.match(workflow, /npm ci --prefix tests\/fixtures\/native-file-lock --ignore-scripts --bin-links=false/u);
+  assert.match(workflow, /npm audit signatures --prefix tests\/fixtures\/native-file-lock --json/u);
+  for (const probe of ["node scripts/probe-native-file-lock.mjs", "node scripts/probe-owned-native-lease.mjs", "node scripts/probe-owned-native-close-failure.mjs", "node scripts/probe-native-napi-build.mjs", "node scripts/package-native-lock.mjs", "node scripts/probe-native-package-update.mjs"]) {
+    assert.ok(workflow.indexOf("npm audit signatures") < workflow.indexOf(probe),
+      "Verify registry signatures and supplied attestations before loading either native candidate");
+  }
+  const ownership = workflow.match(/      - name: Qualify Linux and Darwin environment-owned lease fixture\n((?:        [^\n]*\n)+)/u)?.[1];
+  assert.ok(ownership);
+  assert.match(ownership, /^        if: runner\.os == 'Linux' \|\| runner\.os == 'macOS'$/mu);
+  assert.match(ownership, /flags\+=\(-bundle -undefined dynamic_lookup\)/u);
+  assert.doesNotMatch(ownership, /sha256sum/u, "Fingerprint through Node rather than a Linux-only tool");
+  assert.match(ownership, /-DOWNED_LEASE_SUPPRESS_TEARDOWN=1/u);
+  assert.match(ownership, /test "\$status" -eq 1/u);
+  assert.match(ownership, /Actual Worker exit, not a stop request or JS finally, precedes reacquisition/u);
+  assert.match(workflow, /^          exit "\$status"$/mu);
+  assert.doesNotMatch(workflow, /pull_request_target|workflow_run|^  push:|secrets\.|:\s*write\b|continue-on-error/u);
+});
+
+test("Private kernel package builds use one source and preserve image identity across runtimes", () => {
+  const fixture = readFileSync(join(PROJECT_ROOT, "tests/fixtures/native-file-lock/owned-lease.c"), "utf8");
+  const source = readFileSync(join(PROJECT_ROOT, "native/locks.c"), "utf8");
+  const packager = readFileSync(join(PROJECT_ROOT, "scripts/package-native-lock.mjs"), "utf8");
+  const workflow = readFileSync(join(PROJECT_ROOT, ".github/workflows/native-lock-qualification.yml"), "utf8");
+  assert.match(fixture, /^#include "\.\.\/\.\.\/\.\.\/native\/locks\.c"$/mu);
+  assert.doesNotMatch(fixture, /NAPI_MODULE_INIT|static .*\(/u, "The fixture cannot fork the native implementation");
+  assert.match(source, /defined\(OWNED_LEASE_DISTRIBUTION\).*defined\(OWNED_LEASE_SUPPRESS_TEARDOWN\).*defined\(OWNED_LEASE_FORGET_CLOSE_ERROR\).*defined\(OWNED_LEASE_CLOSE_FAILURE_WITNESS\)/u);
+  assert.match(source, /#error "Distribution builds cannot contain qualification fault switches"/u);
+  assert.match(packager, /Reflect\.ownKeys\(native\)\.sort\(\)/u);
+  assert.match(packager, /mkdirSync\(output, \{ mode: 0o700 \}\)/u);
+  assert.match(packager, /source: \{ file: "locks\.c", sha256: digest\(sourceBytes\)/u);
+  assert.doesNotMatch(packager, /https?:|fetch\(|rmSync|recursive: true/u, "Assembly cannot download, compile, overwrite or clean existing output");
+  assert.match(packager, /execFileSync\("readelf", \[flag, "--", binary\]/u);
+  assert.doesNotMatch(packager, /execFileSync\("(?:cc|gcc|cl|docker|sh|bash)"/u, "ELF inspection is not compilation or a shell escape");
+  assert.match(workflow, /-mmacosx-version-min=11\.0 -DOWNED_LEASE_DISTRIBUTION=1 native\/locks\.c/u);
+  assert.match(workflow, /'distribution' \{ '\/DOWNED_LEASE_DISTRIBUTION=1' \}/u);
+  assert.match(workflow, /node-version: \$\{\{ matrix\.node == '22\.19\.0' && '26\.8\.1' \|\| '22\.19\.0' \}\}/u);
+  const alternate = workflow.match(/      - name: Verify identical packaged image on alternate runtime without rebuilding\n((?:        [^\n]*\n)+)/u)?.[1];
+  assert.ok(alternate);
+  assert.match(alternate, /--backend "\$QUALIFICATION_EVIDENCE\/kernel-backend\/locks\.node"/u);
+  assert.doesNotMatch(alternate, /cc |cl\.exe|package-native-lock/u, "The alternate runtime must load the very same packaged bytes");
+});
+
+test("Native distribution admission binds canonical package inventory outside replaceable JS output", async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import fs from "node:fs";
+    import { createHash } from "node:crypto";
+    import { tmpdir } from "node:os";
+    import { join } from "node:path";
+    import { validateNativeLockDistribution } from "./scripts/package-native-lock.mjs";
+    const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+    validateNativeLockDistribution("native");
+    assert.doesNotMatch(validateNativeLockDistribution.toString(), /createRequire|execFile|spawn|fetch\(/u, "Inventory admission must never execute foreign images or tools");
+    const root = fs.mkdtempSync(join(tmpdir(), "pt-native-inventory-")), dir = join(root, "native");
+    const catalog = JSON.parse(fs.readFileSync("native/catalog.json")), target = catalog.targets["linux-x64"];
+    const imagePath = join(dir, "prebuilds/linux-x64/" + target.binarySha256 + ".node"), manifestPath = join(dir, "prebuilds/linux-x64/manifest.json");
+    try {
+      for (const fault of ["source", "image", "manifest", "relabelled", "architecture", "extra-image", "hardlink", "directory", "oversized", "version"]) {
+        fs.rmSync(dir, { recursive: true, force: true }); fs.cpSync("native", dir, { recursive: true, filter: () => true });
+        if (fault === "source" || fault === "image") {
+          const path = fault === "source" ? join(dir, "locks.c") : imagePath, bytes = fs.readFileSync(path);
+          bytes[bytes.length - 1] ^= 1; fs.writeFileSync(path, bytes);
+        }
+        if (fault === "manifest") fs.appendFileSync(manifestPath, " ");
+        if (fault === "relabelled") {
+          const changed = JSON.parse(fs.readFileSync(manifestPath)); changed.napi = 9;
+          const bytes = Buffer.from(JSON.stringify(changed)); fs.writeFileSync(manifestPath, bytes);
+          const next = structuredClone(catalog); next.targets["linux-x64"].manifestSha256 = digest(bytes);
+          fs.writeFileSync(join(dir, "catalog.json"), JSON.stringify(next));
+        }
+        if (fault === "architecture") fs.mkdirSync(join(dir, "prebuilds/linux-arm64"));
+        if (fault === "extra-image") fs.writeFileSync(join(dir, "prebuilds/linux-x64/fault.node"), "unclassified");
+        if (fault === "hardlink") fs.linkSync(imagePath, join(root, "alias.node"));
+        if (fault === "directory") { fs.unlinkSync(manifestPath); fs.mkdirSync(manifestPath); }
+        if (fault === "oversized") fs.writeFileSync(join(dir, "catalog.json"), "x".repeat(16385));
+        if (fault === "version") fs.writeFileSync(join(dir, "catalog.json"), JSON.stringify({ ...catalog, version: 2 }));
+        assert.throws(() => validateNativeLockDistribution(dir), undefined, fault);
+        if (fault === "hardlink") fs.unlinkSync(join(root, "alias.node"));
+      }
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  `);
+  assert.equal(result.code, 0, result.stderr);
+  const pkg = JSON.parse(readFileSync(join(PROJECT_ROOT, "package.json"), "utf8"));
+  assert.ok(pkg.files.includes("native/") && pkg.files.includes("dist/"));
+  const build = readFileSync(join(PROJECT_ROOT, "scripts/build-dist.mjs"), "utf8");
+  assert.match(build, /validateNativeLockDistribution\("native"\)/u);
+  assert.doesNotMatch(build, /join\(candidate, "native"/u, "Native package code cannot move through the JS publication backup");
+  assert.match(readFileSync(join(PROJECT_ROOT, ".gitattributes"), "utf8"), /^\*\.node binary$/mu);
+});
+
+test("Linux native build pins its minimum-userland toolchain without widening container authority", () => {
+  const lock = JSON.parse(readFileSync(join(PROJECT_ROOT, "native/linux-toolchain.json"), "utf8"));
+  const builder = readFileSync(join(PROJECT_ROOT, "scripts/build-linux-native-lock.mjs"), "utf8");
+  const workflow = readFileSync(join(PROJECT_ROOT, ".github/workflows/native-lock-qualification.yml"), "utf8");
+  assert.equal(lock.version, 1); assert.equal(lock.platform, "linux/amd64"); assert.equal(lock.glibcBaseline, "2.28");
+  assert.match(lock.image, /^quay\.io\/pypa\/manylinux_2_28_x86_64@sha256:[a-f0-9]{64}$/u);
+  assert.match(lock.configDigest, /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(lock.compiler, "/opt/rh/gcc-toolset-14/root/usr/bin/gcc");
+  for (const restriction of ["--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user"]) assert.ok(builder.includes(restriction));
+  assert.doesNotMatch(builder, /--privileged|--network=host|docker\.sock|\bsudo\b/u);
+  assert.match(builder, /validateLinuxNativeBuilderIdentity\(images\[0\], manifest, lock\)/u);
+  assert.match(builder, /host\.glibc, lock\.glibcBaseline/u);
+  assert.match(builder, /inspectLinuxNativeImage\(binary\)/u);
+  const macDistribution = workflow.match(/^          if \[ "\$RUNNER_OS" = macOS \]; then\n(?:            [^\n]*\n)+          fi$/mu)?.[0];
+  assert.ok(macDistribution, "Distribution compilation must retain its explicit macOS-only branch");
+  assert.match(macDistribution, /-mmacosx-version-min=11\.0 -DOWNED_LEASE_DISTRIBUTION=1/u);
+  assert.match(macDistribution, /-mmacosx-version-min=26\.0 -DOWNED_LEASE_DISTRIBUTION=1/u);
+  assert.doesNotMatch(workflow.replace(macDistribution, ""), /^\s*cc .*OWNED_LEASE_DISTRIBUTION/mu,
+    "Linux distribution may not silently return to the newer runner-host compiler");
+  const step = workflow.match(/      - name: Build Linux distribution against pinned GLIBC baseline\n((?:        [^\n]*\n)+)/u)?.[1];
+  assert.ok(step); assert.match(step, /if: runner\.os == 'Linux'/u); assert.match(step, /timeout-minutes: 7/u);
+});
+
+test("Linux builder binds manifest and config across classic and containerd identity views", async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { readFileSync } from "node:fs";
+    import { validateLinuxNativeBuilderIdentity } from "./scripts/build-linux-native-lock.mjs";
+    const lock = JSON.parse(readFileSync("native/linux-toolchain.json", "utf8"));
+    const digest = lock.image.split("@")[1], foreign = "sha256:" + "0".repeat(64);
+    const manifest = { schemaVersion: 2, mediaType: "application/vnd.docker.distribution.manifest.v2+json", config: { digest: lock.configDigest } };
+    const image = { Id: digest, Architecture: "amd64", Os: "linux", RepoDigests: [lock.image], Descriptor: { digest } };
+    assert.equal(validateLinuxNativeBuilderIdentity(image, manifest, lock).daemonImageId, digest);
+    const classic = { ...image, Id: lock.configDigest }; delete classic.Descriptor;
+    assert.equal(validateLinuxNativeBuilderIdentity(classic, manifest, lock).daemonImageId, lock.configDigest);
+    for (const changed of [
+      { ...image, Id: foreign }, { ...image, RepoDigests: [lock.image.split("@")[0] + "@" + foreign] },
+      { ...image, Descriptor: { digest: foreign } }, { ...image, Architecture: "arm64" },
+    ]) assert.throws(() => validateLinuxNativeBuilderIdentity(changed, manifest, lock));
+    assert.throws(() => validateLinuxNativeBuilderIdentity(image, { ...manifest, config: { digest: foreign } }, lock));
+    assert.throws(() => validateLinuxNativeBuilderIdentity(image, { ...manifest, mediaType: "application/vnd.oci.image.index.v1+json" }, lock));
+  `);
+  assert.equal(result.code, 0, result.stderr);
+});
+
+test("Linux image admission rejects newer GLIBC before loading or package publication", async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { validateLinuxNativeVersionNeeds } from "./scripts/package-native-lock.mjs";
+    const dynamic = "Shared library: [libc.so.6]";
+    assert.deepEqual(validateLinuxNativeVersionNeeds(dynamic, "Name: GLIBC_2.2.5\nName: GLIBC_2.28\nName: GLIBC_2.4"),
+      { family: "glibc", baseline: "2.28", highestRequired: "2.28", libraries: ["libc.so.6"] });
+    for (const versions of ["Name: GLIBC_2.33", "Name: GLIBC_2.28.1", "Name: GLIBC_3.0"])
+      assert.throws(() => validateLinuxNativeVersionNeeds(dynamic, versions), /exceeds the Node 22 GLIBC 2.28 baseline/u);
+    assert.throws(() => validateLinuxNativeVersionNeeds(dynamic, "Name: GLIBC_PRIVATE"), /Unknown native GLIBC requirement/u);
+    assert.throws(() => validateLinuxNativeVersionNeeds(dynamic, ""), /inspectable GLIBC/u);
+    assert.throws(() => validateLinuxNativeVersionNeeds(dynamic + "\nShared library: [libssl.so.3]", "Name: GLIBC_2.28"), /depend only on libc/u);
+  `);
+  assert.equal(result.code, 0, result.stderr);
+});
+
+test("Darwin image admission bounds native load commands and preserves the Node macOS baseline", async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { validateDarwinNativeImage } from "./scripts/package-native-lock.mjs";
+    const version = (major, minor = 0, patch = 0) => major * 65536 + minor * 256 + patch;
+    const modern = (minimum = version(11), platform = 1) => {
+      const command = Buffer.alloc(24);
+      [0x32, 24, platform, minimum, version(26, 5), 0].forEach((value, index) => command.writeUInt32LE(value, index * 4));
+      return command;
+    };
+    const legacy = Buffer.alloc(16);
+    [0x24, 16, version(10, 15, 7), version(26, 5)].forEach((value, index) => legacy.writeUInt32LE(value, index * 4));
+    const image = (...commands) => {
+      const bytes = Buffer.alloc(32 + commands.reduce((size, command) => size + command.length, 0));
+      [0xfeedfacf, 0x01000007, 3, 8, commands.length, bytes.length - 32, 0, 0].forEach((value, index) => bytes.writeUInt32LE(value, index * 4));
+      let offset = 32; for (const command of commands) { command.copy(bytes, offset); offset += command.length; }
+      return bytes;
+    };
+    assert.deepEqual(validateDarwinNativeImage(image(modern())), { platform: "macos", baseline: "11.0", minimumOS: "11.0.0", sdk: "26.5.0" });
+    assert.equal(validateDarwinNativeImage(image(legacy)).minimumOS, "10.15.7");
+    const lib64 = image(modern()); lib64.writeUInt32LE(0x80000003, 8);
+    assert.equal(validateDarwinNativeImage(lib64).minimumOS, "11.0.0");
+    for (const minimum of [version(26), version(11, 1), version(11, 0, 1)])
+      assert.throws(() => validateDarwinNativeImage(image(modern(minimum))), /exceeds the Node 22 macOS 11 baseline/u);
+    assert.throws(() => validateDarwinNativeImage(image(modern(version(11), 2))), /target macOS/u);
+    assert.throws(() => validateDarwinNativeImage(image(legacy, modern())), /Conflicting/u);
+    for (const [offset, value] of [[0, 0xcafebabe], [4, 0x0100000c], [8, 8], [8, 0x01000003], [12, 2], [16, 129], [20, 65537], [36, 4], [52, 1], [44, 0], [48, 0]]) {
+      const bytes = image(modern()); bytes.writeUInt32LE(value, offset);
+      assert.throws(() => validateDarwinNativeImage(bytes));
+    }
+    assert.throws(() => validateDarwinNativeImage(image(modern()).subarray(0, 40)), /truncated/u);
+    const unknown = Buffer.alloc(8); unknown.writeUInt32LE(0x99); unknown.writeUInt32LE(8, 4);
+    assert.throws(() => validateDarwinNativeImage(image(unknown)), /Missing macOS deployment/u);
+    const extra = Buffer.concat([image(modern()), Buffer.alloc(8)]); extra.writeUInt32LE(32, 20);
+    assert.throws(() => validateDarwinNativeImage(extra), /Unclassified/u);
+  `);
+  assert.equal(result.code, 0, result.stderr);
+});
+
+test("Windows N-API SDK qualification pins only public x64 build inputs", () => {
+  const sdk = JSON.parse(readFileSync(join(PROJECT_ROOT, "tests", "fixtures", "native-file-lock", "windows-node-sdk.json"), "utf8"));
+  assert.equal(sdk.source, "https://nodejs.org/dist/");
+  assert.equal(sdk.arch, "x64");
+  assert.equal(sdk.napi, 8);
+  assert.deepEqual(Object.keys(sdk.versions), ["22.19.0", "26.8.1"]);
+  for (const version of Object.keys(sdk.versions)) {
+    const release = sdk.versions[version];
+    assert.equal(release.headers.file, `node-v${version}-headers.tar.gz`);
+    assert.equal(release.importLibrary.file, "win-x64/node.lib");
+    for (const input of [release.headers, release.importLibrary]) assert.match(input.sha256, /^[a-f0-9]{64}$/u);
+  }
+  const workflow = readFileSync(join(PROJECT_ROOT, ".github", "workflows", "native-lock-qualification.yml"), "utf8");
+  const windows = workflow.match(/      - name: Compile and load public Windows N-API smoke fixture\n((?:        [^\n]*\n)+)/u)?.[1];
+  assert.ok(windows);
+  assert.match(windows, /^        if: runner\.os == 'Windows'$/mu);
+  assert.match(windows, /^        shell: pwsh$/mu);
+  assert.match(windows, /Get-FileHash \$file -Algorithm SHA256.*-ne \$asset\.sha256/u);
+  assert.ok(windows.indexOf("SDK digest mismatch") >= 0 && windows.indexOf("SDK digest mismatch") < windows.indexOf("cl.exe"), "Check pinned SDK bytes before compilation");
+  assert.match(windows, /\/std:c11.*\/DNAPI_VERSION=8/u);
+  assert.match(windows, /windows-napi-compile-exit-code\.txt/u);
+  assert.match(windows, /windows-napi-load-exit-code\.txt/u);
+  const handles = workflow.match(/      - name: Qualify Windows environment-owned HANDLE fixture\n((?:        [^\n]*\n)+)/u)?.[1];
+  assert.ok(handles);
+  assert.match(handles, /^        if: runner\.os == 'Windows'$/mu);
+  assert.match(handles, /^        shell: pwsh$/mu);
+  assert.match(handles, /advapi32\.lib/u);
+  assert.match(handles, /\/DOWNED_LEASE_SUPPRESS_TEARDOWN=1/u);
+  assert.match(handles, /\$status -ne 1.*expected failure/u);
+  assert.match(handles, /\/DOWNED_LEASE_CLOSE_FAILURE_WITNESS=1/u);
+  assert.match(handles, /\/DOWNED_LEASE_FORGET_CLOSE_ERROR=1/u);
+  assert.match(handles, /owned-close-failure-exit-code\.txt/u);
+  assert.match(handles, /\$status -ne 1.*Repeated release preserves unconfirmed native retirement.*expected failure' \}\n          exit 0\n$/u,
+    "Only verified negative-control failure may end with success instead of the runner's LASTEXITCODE suffix");
+  assert.ok(workflow.indexOf("Compile and load public Windows N-API smoke fixture") < workflow.indexOf("Qualify Windows environment-owned HANDLE fixture"));
+});
+
+test("CI native progress stays finite, body-free and separate from native completion", async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { createHash } from "node:crypto";
+    import { resolve } from "node:path";
+    import nativeReporter, { createNativeTestProgressProjection } from "./scripts/ci-test-progress.mjs";
+    const file = resolve("fixture", "tests", "integration.test.ts");
+    const name = "123:private-title\n::error::must-not-escape";
+    const data = (title, extra = {}) => ({ file, name: title, nesting: 0, line: 92, column: 13, ...extra });
+    const dequeue = title => ({ type: "test:dequeue", data: data(title, { type: "test" }) });
+    const complete = (title, passed, extra = {}) => ({ type: "test:complete", data: data(title, { details: { passed, type: "test", get error() { throw new Error("Do not inspect native error bodies"); } }, ...extra }) });
+    const summary = (count, extra = {}) => ({ type: "test:summary", data: { file, success: !extra.failed, counts: { tests: count, passed: count, failed: 0, cancelled: 0, skipped: 0, todo: 0, ...extra } } });
+    const project = createNativeTestProgressProjection(file), output = [];
+    const observe = event => { const row = project(event); if (row) output.push(row); return row; };
+    assert.equal(observe({ type: "test:stdout", get data() { throw new Error("Do not inspect stdout bodies"); } }), undefined);
+    assert.equal(observe({ type: "test:dequeue", data: { file: "/foreign", get name() { throw new Error("Foreign event cannot enter projection"); } } }), undefined);
+    assert.equal(observe({ type: "test:dequeue", data: data("nested", { nesting: 1, type: "test" }) }), undefined);
+    assert.equal(observe({ type: "test:dequeue", data: data(file, { line: 1, column: 1, type: "test" }) }), undefined, "The native file wrapper is not a top-level body");
+    for (let index = 1; index <= 1024; index++) {
+      observe(dequeue(name));
+      observe(complete(name, index !== 500, index === 7 ? { skip: "123:skip-reason" } : {}));
+    }
+    observe(summary(1024, { passed: 1022, failed: 1, skipped: 1 }));
+    assert.equal(output.length, 8, "Six milestones, one first failure and one original summary are the entire output budget");
+    assert.deepEqual(output.filter(row => row.phase === "dequeued").map(row => row.dequeued), [1, 64, 128, 192, 256, 320]);
+    const failure = output.find(row => row.phase === "native-test-failed");
+    assert.equal(failure.dequeued, 500); assert.equal(failure.nativeCompleted, 500);
+    assert.equal(failure.id, createHash("sha256").update(name).digest("hex"));
+    assert.equal(output.at(-1).phase, "native-summary"); assert.equal(output.at(-1).counts.skipped, 1);
+    const encoded = output.map(row => JSON.stringify(row)).join("\n");
+    assert.ok(Buffer.byteLength(encoded) <= 4096);
+    assert.equal(encoded.includes("123:"), false, "Progress must never contain raw private labels"); assert.equal(encoded.includes("::error"), false);
+    assert.equal(encoded.includes(file), false); assert.equal(encoded.includes("body"), false);
+    assert.equal(observe(dequeue(name)), undefined, "A native summary cannot be renewed by later events");
+    const lost = createNativeTestProgressProjection(file);
+    assert.equal(lost(complete(name, true))?.phase, "unavailable");
+    assert.equal(lost(dequeue(name)), undefined, "Missing original dequeue cannot be reconstructed from completion");
+    const duplicate = createNativeTestProgressProjection(file);
+    duplicate(dequeue(name)); duplicate(complete(name, true));
+    assert.equal(duplicate(complete(name, true)).phase, "unavailable");
+    const partial = createNativeTestProgressProjection(file);
+    partial(dequeue(name));
+    assert.equal(partial(summary(1)).phase, "unavailable", "A summary cannot settle a held or missing completion");
+    const changed = createNativeTestProgressProjection(file);
+    changed(dequeue(name));
+    assert.equal(changed(complete("replacement", true)).phase, "unavailable");
+    const oversized = createNativeTestProgressProjection(file);
+    assert.equal(oversized(dequeue("x".repeat(513))).phase, "unavailable");
+    const ordered = createNativeTestProgressProjection(file);
+    assert.equal(ordered({ type: "test:start", data: data(name) }), undefined, "Reporting order is not dequeue authority");
+    const chunks = [];
+    const incomplete = async function* () { yield { type: "test:dequeue", data: { ...dequeue(name).data, file: resolve("tests/integration.test.ts") } }; };
+    for await (const chunk of nativeReporter(incomplete())) chunks.push(chunk);
+    assert.equal(chunks.length, 1); assert.equal(chunks[0].includes("native-summary"), false, "Stream EOF is not a native test summary");
+    for (const flag of ["true", "false", "TRUE", ""]) {
+      process.env.GITHUB_ACTIONS = flag;
+      const events = async function* () {
+        for (let index = 1; index <= 1024; index++) {
+          yield { ...dequeue(name), data: { ...dequeue(name).data, file: resolve("tests/integration.test.ts") } };
+          yield { ...complete(name, index !== 500), data: { ...complete(name, index !== 500).data, file: resolve("tests/integration.test.ts") } };
+        }
+        yield { ...summary(1024, { passed: 1023, failed: 1 }), data: { ...summary(1024, { passed: 1023, failed: 1 }).data, file: resolve("tests/integration.test.ts") } };
+      };
+      const framed = [];
+      for await (const chunk of nativeReporter(events())) framed.push(chunk);
+      assert.equal(framed.length, 8);
+      assert.ok(Buffer.byteLength(framed.join("")) <= 4096, "Workflow framing must retain the entire finite byte budget");
+      const prefix = flag === "true" ? "::notice title=CI native progress::" : "ci-native-progress:";
+      for (const line of framed) {
+        assert.ok(line.startsWith(prefix), "Only exact GitHub CI selects the constant notice command");
+        assert.equal(line.split("\n").length, 2, "One record cannot inject a second command line");
+        const payload = line.slice(prefix.length).trim();
+        assert.equal(payload.includes("123:"), false); assert.equal(payload.includes("::error"), false);
+        assert.equal(payload.includes(file), false); assert.equal(payload.includes("%"), false);
+        assert.equal(JSON.parse(payload).v, 1);
+      }
+    }
+    console.log("finite-native-progress-pass");
+  `, { timeoutMs: 5000 });
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /finite-native-progress-pass/u);
+});
+
+test("CI progress reporter observes public native events without changing TAP or cancellation", { timeout: 20000 }, async () => {
+  const result = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { spawn } from "node:child_process";
+    import { createHash } from "node:crypto";
+    import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+    import { join, resolve } from "node:path";
+    import { tmpdir } from "node:os";
+    import { setTimeout as delay } from "node:timers/promises";
+    import { pathToFileURL } from "node:url";
+    const reporterSource = resolve("scripts/ci-test-progress.mjs");
+    const phaseModule = pathToFileURL(resolve("tests/fixtures/native-test-phase.ts")).href;
+    const { createNativeTestPhaseObserver } = await import(phaseModule);
+    const name = "held-123:private-title\n::error::not-a-command";
+    const frames = [], abort = new AbortController();
+    const observer = createNativeTestPhaseObserver({ name, signal: abort.signal, diagnostic: value => frames.push(JSON.parse(value)) });
+    observer.enter("invoke"); abort.abort({ get message() { throw Error("Never inspect abort bodies"); } });
+    observer.enter("cleanup"); observer.complete(); abort.abort();
+    assert.equal(frames.length, 1); assert.equal(frames[0].stage, "invoke"); assert.equal(frames[0].ordinal, 1);
+    assert.equal(frames[0].id, createHash("sha256").update(name).digest("hex"));
+    assert.ok(Buffer.byteLength(JSON.stringify(frames[0])) <= 384); assert.equal(JSON.stringify(frames).includes("123:"), false);
+    const complete = new AbortController(), completedFrames = [];
+    createNativeTestPhaseObserver({ name, signal: complete.signal, diagnostic: value => completedFrames.push(value) }).complete();
+    complete.abort(); assert.deepEqual(completedFrames, [], "Completed tests emit no abort phase");
+    const unavailable = new AbortController();
+    createNativeTestPhaseObserver({ name, signal: unavailable.signal, diagnostic() { throw Error("Unavailable diagnostic sink"); } });
+    unavailable.abort();
+    for (const github of [false, true]) for (const mode of ["healthy", "failure", "timeout", "SIGTERM", "SIGKILL"]) {
+      const root = mkdtempSync(join(tmpdir(), "pt-progress-native # % λ-"));
+      mkdirSync(join(root, "tests"));
+      const reporterPath = join(root, "progress # % λ.mjs");
+      writeFileSync(reporterPath, readFileSync(reporterSource));
+      const reporter = pathToFileURL(reporterPath).href;
+      const entered = join(root, "entered"), release = join(root, "release");
+      writeFileSync(join(root, "tests", "integration.test.ts"), [
+        'import assert from "node:assert/strict"; import test from "node:test";',
+        'import { existsSync, writeFileSync } from "node:fs"; import { setTimeout as delay } from "node:timers/promises";',
+        'import { createNativeTestPhaseObserver } from ' + JSON.stringify(phaseModule) + ';',
+        'test(' + JSON.stringify(name) + ', { timeout: ' + (mode === "timeout" ? 150 : 4000) + ' }, async t => {',
+        't.mock.timers.enable({ apis: ["Date"], now: 1000 });',
+        'const phase = createNativeTestPhaseObserver(t); phase.enter("invoke"); t.mock.timers.tick(3600000);',
+        'writeFileSync(' + JSON.stringify(entered) + ', "body-entered"); const end = performance.now() + 3000;',
+        'while (!existsSync(' + JSON.stringify(release) + ')) { if (performance.now() >= end) throw new Error("Probe release missing"); await delay(10); }',
+        ...(mode === "failure" ? ['assert.fail("123:assertion-body");'] : []),
+        'phase.enter("cleanup"); phase.complete();',
+        '});',
+        'test("skip-123:hidden", { skip: "123:reason" }, () => assert.fail("Skipped body cannot run"));',
+        'test("last-native-pass", () => {});',
+      ].join("\n"));
+      const env = { ...process.env, GITHUB_ACTIONS: github ? "true" : "false" }; delete env.NODE_TEST_CONTEXT;
+      const child = spawn(process.execPath, ["--experimental-strip-types", "--test", "--test-concurrency=1",
+        "--test-reporter=tap", "--test-reporter-destination=stdout", "--test-reporter=" + reporter,
+        "--test-reporter-destination=" + (github ? "stdout" : "stderr"), "tests/integration.test.ts"], { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "", closed = false;
+      child.stdout.on("data", data => { stdout += String(data); }); child.stderr.on("data", data => { stderr += String(data); });
+      const completion = new Promise((resolve, reject) => {
+        child.once("error", reject); child.once("close", (code, signal) => { closed = true; resolve({ code, signal }); });
+      });
+      const prefix = github ? "::notice title=CI native progress::" : "ci-native-progress:";
+      const records = () => (github ? stdout : stderr).split("\n").filter(line => line.startsWith(prefix)).map(line => JSON.parse(line.slice(prefix.length)));
+      const phases = () => stdout.split("\n").filter(line => line.startsWith('# {"v":1,"phase":"native-test-phase"')).map(line => JSON.parse(line.slice(2)));
+      const until = async predicate => { const end = performance.now() + 2000; while (!predicate() && !closed && performance.now() < end) await delay(10); return predicate(); };
+      let native, primary;
+      try {
+        assert.equal(await until(() => existsSync(entered) && records().length > 0), true, mode + ": " + stderr);
+        if (mode === "timeout") {
+          assert.equal(await until(() => records().some(row => row.phase === "native-test-failed") && phases().length === 1), true, stderr);
+          assert.equal(phases()[0].stage, "invoke"); assert.equal(phases()[0].ordinal, 1);
+          assert.ok(phases()[0].elapsedMs < 3600000, "Virtual Date advancement cannot inflate native elapsed time");
+        }
+        assert.deepEqual(records()[0], { v: 1, phase: "dequeued", dequeued: 1, nativeCompleted: 0, id: createHash("sha256").update(name).digest("hex") });
+        assert.equal(closed, false); assert.equal(existsSync(release), false, "Native reporting cannot certify original-body drain");
+        if (mode === "SIGTERM" || mode === "SIGKILL") { assert.equal(child.kill(mode), true); await delay(75); }
+      } catch (error) { primary = error; throw error; }
+      finally {
+        writeFileSync(release, "release");
+        let timer;
+        try {
+          native = await Promise.race([completion, new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error("Native progress reporter did not drain after original body release")), 2000);
+          })]);
+        } catch (error) {
+          if (!closed) child.kill("SIGKILL");
+          await completion;
+          if (!primary) throw error;
+          console.error("Secondary native progress cleanup failure:", error);
+        } finally {
+          clearTimeout(timer);
+          writeFileSync(join(root, "stdout.log"), stdout); writeFileSync(join(root, "stderr.log"), stderr);
+        }
+      }
+      const projected = records();
+      assert.ok(phases().length <= 1);
+      for (const phase of phases()) {
+        assert.equal(phase.id, createHash("sha256").update(name).digest("hex"));
+        assert.ok(Buffer.byteLength(JSON.stringify(phase)) <= 384); assert.equal(JSON.stringify(phase).includes("123:"), false);
+      }
+      if (mode === "healthy") assert.deepEqual(phases(), []);
+      if (mode === "timeout") { assert.equal(phases().length, 1); assert.equal(phases()[0].stage, "invoke"); assert.match(stdout, /test timed out after 150ms/u); }
+      assert.equal(JSON.stringify(projected).includes("123:"), false); assert.equal(JSON.stringify(projected).includes(root), false);
+      assert.equal(stdout.includes("ci-native-progress:"), false);
+      assert.equal(stdout.includes("::notice title=CI native progress::"), github);
+      assert.equal(projected.some(row => row.phase === "unavailable"), false, stderr);
+      if (mode === "SIGTERM" || mode === "SIGKILL") {
+        const forced = mode === "SIGKILL" || process.platform === "win32";
+        assert.deepEqual(native, forced ? { code: null, signal: mode } : { code: 1, signal: null });
+        assert.equal(projected.some(row => row.phase === "native-summary" || row.phase === "native-test-failed"), false);
+        assert.doesNotMatch(stdout, /# tests 3\b/u);
+      } else {
+        assert.deepEqual(native, { code: mode === "healthy" ? 0 : 1, signal: null });
+        assert.match(stdout, /# tests 3\b/u); assert.match(stdout, /# skipped 1\b/u);
+        assert.equal(projected.at(-1).phase, "native-summary", stderr);
+        assert.equal(projected.at(-1).counts.tests, 3); assert.equal(projected.at(-1).counts.skipped, 1);
+        assert.equal(projected.filter(row => row.phase === "native-test-failed").length, mode === "healthy" ? 0 : 1);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+    console.log("native-progress-boundaries-pass");
+  `, { timeoutMs: 15000 });
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /native-progress-boundaries-pass/u);
+});
+
+test("Recovery diagnostic runner never turns later success or missing coverage into a passing cohort", { timeout: 15000 }, async () => {
+  const result = await runNodeEval(`
+    import assert from "node:assert/strict";
+    import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+    import { join } from "node:path";
+    import { tmpdir } from "node:os";
+    import { runRecoveryDiagnostics } from "./scripts/run-recovery-diagnostics.mjs";
+    const dir = mkdtempSync(join(tmpdir(), "pt-ci-recovery-"));
+    try {
+      for (const fault of ["none", "first-round", "skipped", "zero-tests", "spawn-error", "thrown"]) {
+        const outputDir = join(dir, fault); let calls = 0;
+        const execute = (command, args, options) => {
+          calls++;
+          assert.equal(command, process.execPath);
+          assert.ok(args.includes("--test-concurrency=1"));
+          assert.ok(args.some(arg => arg.startsWith("--test-name-pattern=^Production separate OS roots")));
+          assert.equal(options.env.PI_TELEGRAM_INTEGRATION_SHARD, undefined);
+          assert.equal(options.env.PI_TELEGRAM_INTEGRATION_LIST, undefined);
+          assert.ok(options.env.PI_TELEGRAM_RECOVERY_DIAGNOSTICS_DIR.startsWith(outputDir));
+          assert.equal(options.shell, undefined);
+          if (calls === 1 && fault === "thrown") throw new Error("native launch refused 123:os-original");
+          const failed = calls === 1 && fault !== "none";
+          const tests = failed && fault === "zero-tests" ? 0 : 5;
+          const passes = failed ? (fault === "skipped" ? 4 : 0) : 5;
+          const failures = failed && fault === "first-round" ? 1 : 0;
+          return { status: failures ? 1 : 0, signal: null,
+            ...(failed && fault === "spawn-error" ? { error: new Error("native launch refused 123:os-original") } : {}),
+            stdout: "# tests " + tests + "\\n# pass " + passes + "\\n# fail " + failures + "\\n", stderr: "123:os-original" };
+        };
+        const exit = runRecoveryDiagnostics({ rounds: 3, outputDir, execute,
+          env: { PATH: process.env.PATH, PI_TELEGRAM_INTEGRATION_SHARD: "3/4", PI_TELEGRAM_INTEGRATION_LIST: "1" } });
+        assert.equal(exit, fault === "none" ? 0 : 1);
+        assert.equal(calls, 3, "A failed observation is retained, not retried or used to truncate later observations");
+        const summaryPath = join(outputDir, "summary.json"), original = readFileSync(summaryPath, "utf8"), summary = JSON.parse(original);
+        assert.equal(summary.complete, true); assert.equal(summary.attempts.length, 3);
+        assert.deepEqual(summary.attempts.map(row => row.passed), [fault === "none", true, true]);
+        assert.ok(!original.includes("123:os-original"));
+        assert.equal(readFileSync(join(outputDir, "round-001", "stderr.log"), "utf8").includes("123:os-original"), false);
+        assert.throws(() => runRecoveryDiagnostics({ rounds: 1, outputDir, execute }), /EEXIST/);
+        assert.equal(calls, 3); assert.equal(readFileSync(summaryPath, "utf8"), original, "A second invocation cannot overwrite retained evidence");
+      }
+      for (const rounds of [0, 21, 1.5, NaN]) assert.throws(() => runRecoveryDiagnostics({ rounds, outputDir: join(dir, "invalid") }));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  `, { timeoutMs: 10000 });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+});
+
+test("CI integration failures retain native details before a later test drains", async () => {
+  const observation = await runNodeEval(String.raw`
+    import assert from "node:assert/strict";
+    import { spawn } from "node:child_process";
+    import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+    import { tmpdir } from "node:os";
+    import { join } from "node:path";
+    import { setTimeout as delay } from "node:timers/promises";
+    const root = mkdtempSync(join(tmpdir(), "pt-ci-stream # % λ-"));
+    const entered = join(root, "entered"), release = join(root, "release");
+    mkdirSync(join(root, "scripts")); mkdirSync(join(root, "tests", "fixtures"), { recursive: true });
+    for (const script of ["run-ci-tests.mjs", "ci-test-progress.mjs"])
+      writeFileSync(join(root, "scripts", script), readFileSync("scripts/" + script));
+    writeFileSync(join(root, "tests", "fixtures", "canonical-tmpdir.ts"), "export {};\n");
+    writeFileSync(join(root, "tests", "process-shutdown.test.ts"), "export {};\n");
+    writeFileSync(join(root, "tests", "integration.test.ts"), [
+      "import assert from 'node:assert/strict'; import test from 'node:test';",
+      "import { existsSync, writeFileSync } from 'node:fs'; import { setTimeout as delay } from 'node:timers/promises';",
+      "test('early-native-failure', () => assert.fail('early-native-details'));",
+      "test('later-held-test', async () => {",
+      "writeFileSync(" + JSON.stringify(entered) + ", 'ready'); const deadline = Date.now() + 8000;",
+      "while (!existsSync(" + JSON.stringify(release) + ")) { if (Date.now() >= deadline) throw new Error('Held fixture did not drain'); await delay(10); }",
+      "});",
+    ].join("\n"));
+    const env = { ...process.env, GITHUB_ACTIONS: "true" }; delete env.NODE_TEST_CONTEXT;
+    const child = spawn(process.execPath, [join(root, "scripts", "run-ci-tests.mjs"), "integration", "0"], { cwd: root, stdio: ["ignore", "pipe", "pipe"], env });
+    let stdout = "", stderr = "", closed = false;
+    child.stdout.on("data", chunk => { stdout += chunk; }); child.stderr.on("data", chunk => { stderr += chunk; });
+    const completion = new Promise((resolve, reject) => {
+      child.once("error", reject); child.once("close", (code, signal) => { closed = true; resolve({ code, signal }); });
+    });
+    const until = async (predicate, ms) => {
+      const deadline = Date.now() + ms;
+      while (!predicate() && !closed && Date.now() < deadline) await delay(10);
+      return predicate();
+    };
+    let earlyDetails = false, earlyProgress = false, result;
+    try {
+      assert.equal(await until(() => existsSync(entered), 5000), true, "Native test startup must reach its held checkpoint: " + stderr);
+      await until(() => {
+        earlyDetails = stdout.includes("not ok 1 - early-native-failure") && stdout.includes("early-native-details");
+        earlyProgress = stdout.includes('"phase":"native-test-failed"');
+        return earlyDetails && earlyProgress;
+      }, 2000);
+      assert.equal(closed, false, "The native runner must still await the later test");
+    } finally {
+      writeFileSync(release, "drain"); result = await completion;
+      rmSync(root, { recursive: true, force: true });
+    }
+    assert.deepEqual(result, { code: 1, signal: null }, "Expected failure must settle naturally, not by cancellation");
+    assert.equal(child.killed, false);
+    assert.equal(earlyDetails, true, "Original native failure details must be available before release/EOF: " + stdout);
+    assert.equal(earlyProgress, true, "Original finite notice must be available before release/EOF: " + stdout);
+    assert.match(stdout, /# tests 2/); assert.match(stdout, /# fail 1/);
+    const notices = stdout.split("\n").filter(line => line.startsWith("::notice title=CI native progress::"));
+    assert.equal(notices.length, 3, "The existing CI runner must publish dequeue, first failure and original summary");
+    assert.equal(notices.join("").includes("early-native"), false, "Notice data cannot borrow original TAP error bodies");
+    assert.equal(JSON.parse(notices.at(-1).slice("::notice title=CI native progress::".length)).success, false);
+  `, { timeoutMs: 15_000 });
+  assert.equal(observation.signal, null);
+  assert.equal(observation.code, 0, observation.stdout + observation.stderr);
+});
+
+test("CI shards cover every domain file exactly once without widening deadlines", () => {
+  const runner = join(PROJECT_ROOT, "scripts", "run-ci-tests.mjs");
   const inventory = readdirSync(join(PROJECT_ROOT, "tests"))
     .filter((name) => name.endsWith(".test.ts")).map((name) => `tests/${name}`).sort();
   const list = (shard: string, phase: string): string[] => JSON.parse(execFileSync(
-    process.execPath, [runner, shard, phase, "--list"], { encoding: "utf8" },
+    process.execPath, [runner, phase, shard, "--list"], { encoding: "utf8" },
   ));
   const realProcess = "tests/process-shutdown.test.ts";
   assert.deepEqual(list("0", "process"), [realProcess]);
   assert.deepEqual(list("1", "process"), []);
-  const first = list("0", "remaining"), second = list("1", "remaining");
+  const first = list("0", "domains"), second = list("1", "domains");
   assert.ok(first.length > 0 && second.length > 0);
   assert.ok(Math.abs(first.length - second.length) <= 1);
   const all = [...list("0", "process"), ...first, ...second];
   assert.equal(new Set(all).size, all.length, "Shards cannot overlap");
-  assert.deepEqual(all.sort(), inventory, "No test file can disappear from macOS CI");
-  assert.deepEqual(list("0", "remaining"), first, "Selection is deterministic");
-  assert.deepEqual(Array.from(validateWorkflowSource.matchAll(/- os: macos-26-intel\s+shard: (\d+)/g),
+  assert.deepEqual(all.sort(), inventory.filter(name => name !== "tests/integration.test.ts"), "No domain file can disappear from macOS CI");
+  assert.deepEqual(list("all", "domains").sort(), inventory.filter(name => name !== "tests/integration.test.ts"));
+  assert.deepEqual(list("0", "domains"), first, "Selection is deterministic");
+  assert.deepEqual(Array.from(validateWorkflowSource.matchAll(/- os: macos-26-intel\s+suite: domains\s+shard: (\d+)/g),
     (match) => Number(match[1])), [0, 1]);
+  for (const os of ["ubuntu-latest", "windows-latest", "macos-26-intel"]) {
+    const count = os === "windows-latest" ? 4 : 8;
+    const matrix = new RegExp(`- os: ${os}\\s+suite: integration\\s+integrationShard: (\\d+)\\s+integrationCount: (\\d+)\\s+shardName: ", integration (\\d+)/(\\d+)"`, "g");
+    assert.deepEqual(Array.from(validateWorkflowSource.matchAll(matrix), match => match.slice(1).map(Number)),
+      Array.from({ length: count }, (_, index) => [index, count, index + 1, count]),
+      `${os} integration matrix must cover each exact native bucket once with its matching label`);
+    for (let index = 0; index < count; index++) assert.deepEqual(list(`${index}/${count}`, "integration"), ["tests/integration.test.ts"]);
+  }
   assert.match(validateWorkflowSource, /timeout-minutes: 30/);
-  assert.match(validateWorkflowSource, /matrix\.os == 'macos-26-intel' && matrix\.shard == 0/);
-  assert.match(validateWorkflowSource, /run: node scripts\/run-macos-tests\.mjs 0 process/);
-  assert.match(validateWorkflowSource, /run: node scripts\/run-macos-tests\.mjs \$\{\{ matrix\.shard \}\} remaining/);
-  assert.match(readFileSync(runner, "utf8"), /"--test-concurrency=1"/);
-  for (const args of [["2", "remaining"], ["0", "unknown"], ["0", "process", "extra"]])
+  assert.match(validateWorkflowSource, /matrix\.os == 'macos-26-intel' && matrix\.suite == 'domains' && matrix\.shard == 0/);
+  assert.match(validateWorkflowSource, /run: node scripts\/run-ci-tests\.mjs process 0/);
+  assert.match(validateWorkflowSource, /run: node scripts\/run-ci-tests\.mjs domains \$\{\{ matrix\.shard \}\}/);
+  assert.match(validateWorkflowSource, /run: node scripts\/run-ci-tests\.mjs integration \$\{\{ matrix\.integrationShard \}\}\/\$\{\{ matrix\.integrationCount \}\}/);
+  assert.match(readFileSync(runner, "utf8"), /\? 4 : 1/);
+  for (const args of [["domains", "2"], ["unknown", "0"], ["process", "0", "extra"], ["integration", "4"],
+    ["integration", "8/8"], ["integration", "4/4"], ["integration", "0/6"], ["integration", "00/8"]])
     assert.throws(() => execFileSync(process.execPath, [runner, ...args], { stdio: "pipe" }));
+});
+
+test("CI runner forwards the exact shard to its native child without inherited filters", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-ci-spec # % λ-"));
+  try {
+    await mkdir(join(root, "scripts")); await mkdir(join(root, "tests", "fixtures"), { recursive: true });
+    for (const script of ["run-ci-tests.mjs", "ci-test-progress.mjs"])
+      await writeFile(join(root, "scripts", script), readFileSync(join(PROJECT_ROOT, "scripts", script)));
+    await writeFile(join(root, "tests", "fixtures", "canonical-tmpdir.ts"), "export {};\n");
+    await writeFile(join(root, "tests", "process-shutdown.test.ts"), "export {};\n");
+    for (const [argument, expected] of [["0", "0/4"], ["0/4", "0/4"], ["7/8", "7/8"]] as const) {
+      await writeFile(join(root, "tests", "integration.test.ts"), [
+        'import assert from "node:assert/strict"; import test from "node:test";',
+        'test("native-shard-body", () => {',
+        `assert.equal(process.env.PI_TELEGRAM_INTEGRATION_SHARD, ${JSON.stringify(expected)});`,
+        'assert.equal(process.env.PI_TELEGRAM_INTEGRATION_LIST, undefined);',
+        'console.log("native-shard-accepted");',
+        '});',
+      ].join("\n"));
+      const env: NodeJS.ProcessEnv = { ...process.env, GITHUB_ACTIONS: argument === "0/4" ? "true" : "false", PI_TELEGRAM_INTEGRATION_SHARD: "foreign", PI_TELEGRAM_INTEGRATION_LIST: "1" };
+      delete env.NODE_TEST_CONTEXT;
+      const result = spawnSync(process.execPath, [join(root, "scripts", "run-ci-tests.mjs"), "integration", argument],
+        { cwd: root, env, encoding: "utf8", timeout: 10000 });
+      assert.ifError(result.error); assert.equal(result.signal, null);
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.match(result.stdout, /native-shard-accepted/u); assert.match(result.stdout, /# pass 1\b/u);
+      assert.equal(result.stdout.includes("::notice title=CI native progress::"), env.GITHUB_ACTIONS === "true");
+      assert.equal(result.stdout.includes("ci-native-progress:"), false);
+    }
+    await writeFile(join(root, "tests", "integration.test.ts"), "export {};\n");
+    const empty = spawnSync(process.execPath, [join(root, "scripts", "run-ci-tests.mjs"), "integration", "0/4"],
+      { cwd: root, env: { ...process.env, GITHUB_ACTIONS: "true", NODE_TEST_CONTEXT: undefined }, encoding: "utf8", timeout: 10000 });
+    assert.ifError(empty.error); assert.equal(empty.signal, null); assert.equal(empty.status, 0, empty.stdout + empty.stderr);
+    assert.equal(empty.stdout.includes("::notice title=CI native progress::"), false, "File-only TAP success is not a semantic test progress witness");
+    await rm(join(root, "scripts", "ci-test-progress.mjs"));
+    for (const [phase, argument] of [["process", "0"], ["domains", "all"]] as const) {
+      const nonIntegration = spawnSync(process.execPath, [join(root, "scripts", "run-ci-tests.mjs"), phase, argument],
+        { cwd: root, env: { ...process.env, GITHUB_ACTIONS: "true", NODE_TEST_CONTEXT: undefined }, encoding: "utf8", timeout: 10000 });
+      assert.ifError(nonIntegration.error); assert.equal(nonIntegration.signal, null);
+      assert.equal(nonIntegration.status, 0, nonIntegration.stdout + nonIntegration.stderr);
+      assert.equal(nonIntegration.stdout.includes("::notice title=CI native progress::"), false, "Other CI phases must not even load the progress reporter");
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("Integration CI name shards are exhaustive, disjoint and use actual registrations", t => {
+  const list = (specification?: string): string[] => {
+    const env: NodeJS.ProcessEnv = { ...process.env, PI_TELEGRAM_INTEGRATION_LIST: "1" };
+    delete env.PI_TELEGRAM_INTEGRATION_SHARD;
+    if (specification !== undefined) env.PI_TELEGRAM_INTEGRATION_SHARD = specification;
+    const output = execFileSync(process.execPath, ["--experimental-strip-types", "tests/integration.test.ts"], {
+      cwd: PROJECT_ROOT, env, encoding: "utf8", maxBuffer: 4 * 1024 * 1024,
+    });
+    const lines = output.split(/\r?\n/u).filter(line => line.startsWith("integration-inventory:"));
+    assert.equal(lines.length, 1); return JSON.parse(lines[0]!.slice("integration-inventory:".length)) as string[];
+  };
+  const all = list(); assert.ok(all.length > 0);
+  assert.deepEqual(all.filter(name => name.startsWith("Production question root") && name.includes("/app-coheads/")),
+    ["source", "compiled"].flatMap(source => [false, true].flatMap(threaded => [false, true].map(rich =>
+      `Production question root uses original SDK binding at birth, not ACK (${source}/${threaded}/app-coheads/rich=${rich})`))),
+    "The independent app co-head control must retain every source, target-mode and rendering configuration");
+  const partitions = new Map<number, string[][]>();
+  for (const count of [4, 8]) {
+    const shards = Array.from({ length: count }, (_, index) => {
+      const spec = `${index}/${count}`, selected = list(spec), selector = createIntegrationShardSelector(spec);
+      assert.ok(selected.length > 0); assert.deepEqual(selected, all.filter(selector)); return selected;
+    });
+    assert.deepEqual(shards.flat().sort(), [...all].sort(), "Every registration must execute exactly once, including duplicate names");
+    for (const name of new Set(all)) assert.equal(shards.filter(shard => shard.includes(name)).length, 1, name);
+    partitions.set(count, shards);
+    t.diagnostic(`Integration registrations: ${all.length}; ${count}-way shard sizes: ${shards.map(shard => shard.length).join(", ")}`);
+  }
+  for (let index = 0; index < 4; index++) {
+    const original = all.filter(name => createHash("sha256").update(name).digest().readUInt32BE(0) % 4 === index);
+    assert.deepEqual(partitions.get(4)![index], original, "The original four-way mapping remains unchanged for Windows and legacy selectors");
+    assert.deepEqual([...partitions.get(8)![index]!, ...partitions.get(8)![index + 4]!].sort(), [...original].sort(),
+      "Each Linux/macOS eight-way pair refines one original bucket without omissions or duplicates");
+  }
+  for (const value of ["", "4/4", "8/8", "-1/4", "01/4", "00/8", "0/0", "0/5", "0/6", "0/16", "0/4x", " 0/4"]) {
+    assert.throws(() => createIntegrationShardSelector(value), /Integration shard/);
+  }
+  assert.ok(all.every(createIntegrationShardSelector()));
+  const source = readFileSync(join(PROJECT_ROOT, "tests/integration.test.ts"), "utf8");
+  assert.equal([...source.matchAll(/\bnativeTest\(/gu)].length, 1, "Every registration must pass the selector");
+  assert.match(source, /if \(!selectIntegrationTest\(name\)\) return/);
+});
+
+async function createNativeBuildFixture() {
+  const root = await mkdtemp(join(tmpdir(), "pt-build-#%-λ-"));
+  for (const path of ["scripts", ".git", "node_modules/typescript/bin", "skills", "lib"])
+    await mkdir(join(root, path), { recursive: true });
+  await writeFile(join(root, "scripts/build-dist.mjs"), readFileSync(join(PROJECT_ROOT, "scripts/build-dist.mjs")));
+  await writeFile(join(root, "scripts/package-native-lock.mjs"), readFileSync(join(PROJECT_ROOT, "scripts/package-native-lock.mjs")));
+  await cp(join(PROJECT_ROOT, "native"), join(root, "native"), { recursive: true, filter: () => true });
+  await writeFile(join(root, "package.json"), '{"type":"module"}');
+  await writeFile(join(root, ".git/HEAD"), "ab".repeat(20) + "\n");
+  await writeFile(join(root, "skills/probe.md"), "fixture asset\n");
+  await mkdir(join(root, "skills/nested λ#"));
+  await writeFile(join(root, "skills/nested λ#/percent %.md"), "nested Unicode asset\n");
+  await writeFile(join(root, "lib/generative-app-worker.mjs"), "export {};\n");
+  await writeFile(join(root, "node_modules/typescript/package.json"), '{"type":"commonjs"}');
+  await writeFile(join(root, "node_modules/typescript/bin/tsc"), `
+    const { mkdirSync, writeFileSync, existsSync } = require("node:fs");
+    const { join } = require("node:path");
+    const { setTimeout: delay } = require("node:timers/promises");
+    (async () => {
+      if (process.env.BUILD_FIXTURE_ENTERED) writeFileSync(process.env.BUILD_FIXTURE_ENTERED, "entered");
+      while (process.env.BUILD_FIXTURE_RELEASE && !existsSync(process.env.BUILD_FIXTURE_RELEASE)) await delay(10);
+      writeFileSync(join(process.cwd(), "compiler-argv.json"), JSON.stringify(process.execArgv));
+      const out = process.argv[process.argv.indexOf("--outDir") + 1];
+      mkdirSync(join(out, "lib"), { recursive: true });
+      writeFileSync(join(out, "index.js"), "export default function() {}\\r\\n");
+      console.log("original compiler stdout"); console.error("original compiler stderr");
+      if (process.env.BUILD_FIXTURE_FAILURE === "signal") { process.kill(process.pid, "SIGTERM"); return; }
+      process.exitCode = Number(process.env.BUILD_FIXTURE_FAILURE ?? 0);
+    })();
+  `);
+  return root;
+}
+
+function readNativeBuildRecords(stdout: string): Record<string, unknown>[] {
+  return stdout.split(/\r?\n/u).filter(line => line.startsWith("::notice title=CI native build::"))
+    .map(line => JSON.parse(line.slice("::notice title=CI native build::".length)) as Record<string, unknown>);
+}
+
+test("Mapped native package rebuild observes actual holder lifetime and retains publication outcomes", { timeout: 110000, skip: process.arch !== "x64" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pt-mapped-build-evidence-")), output = join(root, "evidence");
+  try {
+    const result = spawnSync(process.execPath, [join(PROJECT_ROOT, "scripts/probe-native-package-update.mjs"), "--out", output], {
+      cwd: PROJECT_ROOT, encoding: "utf8", timeout: 100000,
+    });
+    assert.equal(result.error, undefined); assert.equal(result.signal, null); assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(readFileSync(join(output, "report.json"), "utf8"));
+    assert.equal(report.node, process.version); assert.equal(report.compiler, "byte-copy-stand-in");
+    assert.equal(report.checks.length, 6); assert.equal(report.cleanup.timedOut, false);
+    assert.deepEqual(report.holderExit, { code: 0, signal: null });
+    assert.ok(report.builds.every((build: { code: number; signal: string | null }) => build.code === 0 && build.signal === null));
+    for (const phase of ["held", "released"]) {
+      const observation = report.observations.find((value: { phase?: string }) => value.phase === phase);
+      assert.equal(observation.imageSha256, report.imageSha256); assert.equal(observation.mappedImages.length, 1);
+    }
+    const workflow = readFileSync(join(PROJECT_ROOT, ".github/workflows/native-lock-qualification.yml"), "utf8");
+    for (const trigger of ["scripts/probe-native-package-update.mjs", "scripts/build-dist.mjs", "lib/locks.ts", "dist/lib/locks.js"])
+      assert.ok(workflow.includes(`      - "${trigger}"`));
+    assert.match(workflow, /node scripts\/probe-native-package-update\.mjs --out/u);
+    assert.match(workflow, /mapped-native-update-exit-code\.txt/u);
+    const probe = readFileSync(join(PROJECT_ROOT, "scripts/probe-native-package-update.mjs"), "utf8");
+    assert.doesNotMatch(probe, /execFile|npm |https?:|fetch\(|cc |cl\.exe|docker|process\.env\.PI_CODING_AGENT_DIR/u, "Publication observation cannot install/compile native code or resolve configured storage");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("CI build checkpoints retain native compiler outcomes and rollback-safe publication", { timeout: 20000 }, async () => {
+  const root = await createNativeBuildFixture();
+  const copyProbe = "data:text/javascript," + encodeURIComponent(`
+    import { mock } from "node:test";
+    import fs from "node:fs";
+    mock.module("node:fs", { namedExports: { ...fs, cpSync(source, destination, options) {
+      if (options?.recursive && (typeof options.filter !== "function" || options.filter(source, destination) !== true))
+        throw new Error("Build directory copy must use the portable explicit-filter traversal");
+      return fs.cpSync(source, destination, options);
+    } } });
+  `);
+  const run = (github = "true", args: string[] = [], failure = "0") => spawnSync(process.execPath, ["--experimental-test-module-mocks", "--import", copyProbe, "scripts/build-dist.mjs", ...args], {
+    cwd: root, encoding: "utf8", timeout: 5000,
+    env: { ...process.env, GITHUB_ACTIONS: github, BUILD_FIXTURE_FAILURE: failure, PRIVATE_BUILD_FIXTURE: "never disclose this value" },
+  });
+  try {
+    const built = run(); assert.equal(built.status, 0, built.stdout + built.stderr); assert.equal(built.signal, null);
+    const records = readNativeBuildRecords(built.stdout);
+    assert.deepEqual(records.map(r => r.phase), ["build-entered", "compiler-invoking", "compiler-node-entered", "compiler-node-exiting", "compiler-returned", "assets-prepared", "publication-invoking", "publication-complete"]);
+    assert.equal(records[1]!.detachedHead, "ab".repeat(20));
+    assert.equal(records[0]!.pid, built.pid); assert.equal(records[2]!.ppid, built.pid);
+    assert.equal(records[2]!.pid, records[4]!.childPid); assert.equal(records[3]!.code, 0); assert.equal(records[4]!.code, 0);
+    assert.ok(built.stdout.includes("original compiler stdout")); assert.ok(built.stderr.includes("original compiler stderr"));
+    assert.ok(Buffer.byteLength(built.stdout.split(/\r?\n/u).filter(line => line.startsWith("::notice title=CI native build::")).join("\n")) <= 4096);
+    const fields = new Set(["v", "build", "phase", "pid", "ppid", "uptimeMs", "check", "detachedHead", "childPid", "code", "signal", "spawnError"]);
+    assert.match(String(records[0]!.build), /^[a-f0-9]{16}$/u);
+    assert.ok(records.every(r => r.build === records[0]!.build));
+    assert.ok(records.every(r => Object.keys(r).every(key => fields.has(key))));
+    assert.ok(records.every(r => Object.values(r).every(value => typeof value !== "string" || !value.includes(root) && !value.includes("never disclose"))));
+    for (const pid of new Set(records.map(r => r.pid))) {
+      const clock = records.filter(r => r.pid === pid).map(r => Number(r.uptimeMs));
+      assert.ok(clock.every((at, i) => Number.isSafeInteger(at) && at >= 0 && (!i || at >= clock[i - 1]!)));
+    }
+    const checked = run("true", ["--check"]); assert.equal(checked.status, 0, checked.stdout + checked.stderr);
+    assert.equal(readNativeBuildRecords(checked.stdout).at(-1)!.phase, "publication-complete");
+    assert.notEqual(readNativeBuildRecords(checked.stdout)[0]!.build, records[0]!.build, "Another build cannot borrow the original invocation identity");
+    assert.equal(readFileSync(join(root, "dist/skills/nested λ#/percent %.md"), "utf8"), "nested Unicode asset\n");
+    const originalDist = readFileSync(join(root, "dist/index.js"));
+    const catalogPath = join(root, "native/catalog.json"), catalogBytes = readFileSync(catalogPath), catalog = JSON.parse(catalogBytes.toString());
+    const nativeFiles = ["catalog.json", ...Object.keys(catalog.targets).flatMap(target => [
+      `prebuilds/${target}/manifest.json`, `prebuilds/${target}/${catalog.targets[target].binarySha256}.node`,
+    ])];
+    const originalNative = nativeFiles.map(path => readFileSync(join(root, "native", path)));
+    await writeFile(catalogPath, JSON.stringify({ ...catalog, version: 2 }));
+    originalNative[0] = readFileSync(catalogPath);
+    const invalid = run(); assert.equal(invalid.status, 1); assert.match(invalid.stderr, /Unsupported native distribution catalog/u);
+    assert.deepEqual(readNativeBuildRecords(invalid.stdout).map(r => r.phase), ["build-entered"], "Invalid package bytes cannot start a compiler or publication");
+    assert.deepEqual(readFileSync(join(root, "dist/index.js")), originalDist);
+    nativeFiles.forEach((path, index) => assert.deepEqual(readFileSync(join(root, "native", path)), originalNative[index]));
+    await writeFile(catalogPath, catalogBytes);
+    const failed = run("true", [], "7"); assert.equal(failed.status, 1); assert.equal(failed.signal, null);
+    const failure = readNativeBuildRecords(failed.stdout);
+    assert.equal(failure.find(r => r.phase === "compiler-node-exiting")!.code, 7);
+    assert.equal(failure.find(r => r.phase === "compiler-returned")!.code, 7);
+    assert.ok(!failure.some(r => r.phase === "publication-complete")); assert.match(failed.stderr, /exited with status 7/);
+    assert.deepEqual(readFileSync(join(root, "dist/index.js")), originalDist);
+    const nativeSignal = spawnSync(process.execPath, ["node_modules/typescript/bin/tsc", "--outDir", join(root, "signal-reference")], {
+      cwd: root, encoding: "utf8", timeout: 5000, env: { ...process.env, BUILD_FIXTURE_FAILURE: "signal" },
+    });
+    assert.equal(nativeSignal.error, undefined);
+    assert.ok(nativeSignal.signal !== null || nativeSignal.status !== 0, "Original signal control must not be a healthy compiler exit");
+    const signalled = run("true", [], "signal"), signalRecord = readNativeBuildRecords(signalled.stdout).find(r => r.phase === "compiler-returned")!;
+    assert.equal(signalled.status, 1); assert.equal(signalRecord.code, nativeSignal.status); assert.equal(signalRecord.signal, nativeSignal.signal);
+    assert.ok(!readNativeBuildRecords(signalled.stdout).some(r => r.phase === "publication-complete"));
+    assert.deepEqual(readFileSync(join(root, "dist/index.js")), originalDist);
+    await writeFile(join(root, "dist/index.js"), "stale dist");
+    const stale = run("true", ["--check"]); assert.equal(stale.status, 1); assert.match(stale.stderr, /dist\/index.js is stale/);
+    assert.ok(!readNativeBuildRecords(stale.stdout).some(r => r.phase === "publication-complete"));
+    assert.equal(readFileSync(join(root, "dist/index.js"), "utf8"), "stale dist");
+    for (const github of ["false", "TRUE", ""]) {
+      const ordinary = run(github); assert.equal(ordinary.status, 0, ordinary.stdout + ordinary.stderr);
+      assert.deepEqual(readNativeBuildRecords(ordinary.stdout), []);
+      assert.deepEqual(JSON.parse(readFileSync(join(root, "compiler-argv.json"), "utf8")), [], "Non-CI compiler arguments remain unchanged");
+    }
+    assert.ok(!readdirSync(root).some(name => name.startsWith(".dist-build-") || name.startsWith(".dist-backup-")));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("CI build compiler entry cannot certify held body completion or publication", { timeout: 20000 }, async () => {
+  const root = await createNativeBuildFixture(), entered = join(root, "entered"), release = join(root, "release");
+  const child = spawn(process.execPath, ["scripts/build-dist.mjs"], { cwd: root,
+    env: { ...process.env, GITHUB_ACTIONS: "true", BUILD_FIXTURE_ENTERED: entered, BUILD_FIXTURE_RELEASE: release }, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "", stderr = "", closed = false;
+  child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+  child.stdout.on("data", chunk => { stdout += chunk; }); child.stderr.on("data", chunk => { stderr += chunk; });
+  const completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject); child.once("close", (code, signal) => { closed = true; resolve({ code, signal }); });
+  });
+  try {
+    const deadline = performance.now() + 2000;
+    while ((!existsSync(entered) || !readNativeBuildRecords(stdout).some(r => r.phase === "compiler-node-entered")) && !closed && performance.now() < deadline)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(existsSync(entered), "Original compiler body must enter within its startup observation");
+    assert.ok(readNativeBuildRecords(stdout).some(r => r.phase === "compiler-node-entered"), "Original compiler Node entry must be visible while its body is held");
+    assert.equal(closed, false); assert.equal(existsSync(join(root, "dist")), false);
+    assert.ok(!readNativeBuildRecords(stdout).some(r => ["compiler-node-exiting", "compiler-returned", "publication-complete"].includes(String(r.phase))));
+    await writeFile(release, "release");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const result = await Promise.race([completion, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Native build did not drain after original compiler release")), 2000);
+    })]).finally(() => clearTimeout(timer));
+    assert.equal(result.code, 0, stdout + stderr); assert.equal(result.signal, null);
+    assert.equal(readNativeBuildRecords(stdout).at(-1)!.phase, "publication-complete");
+  } finally {
+    await writeFile(release, "release");
+    if (!closed) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([completion.catch(() => {}), new Promise(resolve => { timer = setTimeout(resolve, 1000); })])
+        .finally(() => clearTimeout(timer));
+    }
+    if (!closed) child.kill("SIGKILL");
+    await completion.catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Release CI validates exact tags and publishes through npm Trusted Publisher", () => {
@@ -134,6 +1002,16 @@ test("Release CI validates exact tags and publishes through npm Trusted Publishe
     /gh release view[\s\S]*gh release edit[\s\S]*gh release create/,
   );
   assert.doesNotMatch(releaseWorkflowSource, /NPM_TOKEN|NODE_AUTH_TOKEN/);
+});
+
+test("Release CI keeps prerelease tags out of GitHub and npm latest", () => {
+  assert.match(releaseWorkflowSource, /npm publish --access public --provenance --tag \$\{\{ contains\(github\.ref_name, '-'\) && 'next' \|\| 'latest' \}\}/);
+  const commands = [...releaseWorkflowSource.matchAll(/gh release (?:edit|create) "\$TAG_NAME"[\s\S]*?(?=\n\s*(?:else|fi)\b)/gu)];
+  assert.equal(commands.length, 2, "Both existing and new releases must retain the same tag classification");
+  for (const [command] of commands) {
+    assert.match(command, /--prerelease=\$\{\{ contains\(github\.ref_name, '-'\) \}\}/);
+    assert.match(command, /--latest=\$\{\{ !contains\(github\.ref_name, '-'\) \}\}/);
+  }
 });
 
 function getProjectSourceFiles(): string[] {
@@ -250,6 +1128,65 @@ test("Source-only invariant scans ignore strings and comments", () => {
   );
 });
 
+for (const length of [16, 256 * 1024])
+test(`Node eval fixture transports source without command-line growth (${length})`, async () => {
+  const result = await runNodeEval(`/*${"x".repeat(length)}*/
+    import assert from "node:assert/strict";
+    import { isWireRecord } from "./lib/wire.ts";
+    assert.equal(process.argv[1], undefined);
+    assert.equal(typeof globalThis.gc, "function");
+    assert.equal(process.env.PI_TELEGRAM_FIXTURE_VALUE, "isolated");
+    assert.equal(isWireRecord({}), true);
+    console.log("module-source-ok");
+  `, { nodeArgs: ["--expose-gc"], env: { PI_TELEGRAM_FIXTURE_VALUE: "isolated" } });
+  assert.equal(result.code, 0, result.stderr); assert.equal(result.signal, null);
+  assert.equal(result.stdout.trim(), "module-source-ok");
+});
+
+test("Node eval fixture waits for complete Unicode output from both streams", async () => {
+  const result = await runNodeEval('process.stdout.write("🙂".repeat(32768)); process.stderr.write("done".repeat(32768));');
+  assert.equal(result.code, 0); assert.equal(result.signal, null);
+  assert.equal(result.stdout, "🙂".repeat(32768)); assert.equal(result.stderr, "done".repeat(32768));
+});
+
+test("Node eval fixture retains early Node option refusal with large pending input", async () => {
+  const result = await runNodeEval("/*" + "x".repeat(256 * 1024) + "*/", { nodeArgs: ["--pi-telegram-invalid-fixture-option"] });
+  assert.notEqual(result.code, 0); assert.equal(result.signal, null);
+  assert.match(result.stderr, /bad option|unknown option/iu);
+});
+
+test("Node eval readiness bounds startup separately from execution and actual drain", async () => {
+  const result = await runNodeEval('await new Promise(resolve => setTimeout(resolve, 700)); console.log("fixture-ready"); console.log("after-ready");', {
+    timeoutMs: 500, readiness: { stdoutPrefix: "fixture-ready", startupTimeoutMs: 3000 },
+  });
+  assert.equal(result.code, 0, result.stderr); assert.match(result.stdout, /after-ready/u);
+  const started = performance.now();
+  await assert.rejects(runNodeEval('console.log("fixture-ready"); setInterval(() => console.log("fixture-ready"), 100);', {
+    timeoutMs: 500, readiness: { stdoutPrefix: "fixture-ready", startupTimeoutMs: 3000 },
+  }), /did not exit \(execution\/drain\)/u);
+  assert.ok(performance.now() - started < 3000, "Extra startup allowance cannot conceal post-ready retained handles or marker renewal");
+  const integration = readFileSync(join(PROJECT_ROOT, "tests", "integration.test.ts"), "utf8");
+  const start = integration.indexOf('test(`Production follower SDK first-send refuses foreign native carrier before ownership');
+  const end = integration.indexOf('test(`Production follower question root keeps physical ACK', start);
+  assert.ok(start >= 0 && end > start);
+  const follower = integration.slice(start, end);
+  assert.match(follower, /timeoutMs: 20000,\s*readiness: \{ stdoutPrefix: "follower-carrier-phase:import-complete:", startupTimeoutMs: 20000 \}/u,
+    "Follower cold startup must be bounded separately from the original twenty-second work/drain guard");
+  assert.match(follower, /\}, 45000\);/u, "The outer guard must retain only five seconds beyond the fixed forty-second child total");
+  const imports = follower.indexOf('phase("import-complete");');
+  assert.ok(imports > follower.indexOf('await import(base + "extension" + suffix)'));
+  assert.ok(imports < follower.indexOf('extension(leader.pi)'), "Cold startup cannot hide a Root connection or semantic execution");
+});
+
+test("Node eval readiness refuses missing checkpoints within its startup bound", async () => {
+  await assert.rejects(runNodeEval('setInterval(() => {}, 1000);', {
+    timeoutMs: 1000, readiness: { stdoutPrefix: "fixture-ready", startupTimeoutMs: 300 },
+  }), /did not exit \(startup\)/u);
+  await assert.rejects(runNodeEval('console.log("not-ready");', {
+    timeoutMs: 500, readiness: { stdoutPrefix: "fixture-ready", startupTimeoutMs: 3000 },
+  }), /closed before readiness/u);
+});
+
 test("Domain test filenames mirror their owning lib domain", () => {
   const libDomains = new Set(
     readdirSync(join(PROJECT_ROOT, "lib"))
@@ -303,7 +1240,7 @@ test("Package exports expose only stable public domains", () => {
   ) as { exports?: Record<string, { types: string; default: string }> };
 
   assert.deepEqual(packageJson.exports, {
-    ".": { types: "./dist/index.d.ts", default: "./dist/index.js" },
+    ".": { types: "./dist/index.d.ts", default: "./dist/pi-telegram/index.js" },
     "./inbound": { types: "./dist/api/inbound.d.ts", default: "./dist/api/inbound.js" },
     "./outbound": { types: "./dist/api/outbound.d.ts", default: "./dist/api/outbound.js" },
     "./delivery": { types: "./dist/api/delivery.d.ts", default: "./dist/api/delivery.js" },
@@ -359,9 +1296,10 @@ test("Project source avoids empty interface-extension shells", () => {
   assert.deepEqual(emptyInterfaceExtensions, []);
 });
 
-test("Pi SDK imports stay centralized in the pi adapter", () => {
+test("Pi SDK imports stay centralized in the pi adapter and entrypoint-only host leaf", () => {
+  const hostLeaf = normalize(join("lib", "pi-host.ts"));
   const directSdkImportFiles = getProjectSourceFiles().filter((file) => {
-    if (file === normalize(join("lib", "pi.ts"))) return false;
+    if (file === normalize(join("lib", "pi.ts")) || file === hostLeaf) return false;
     const source = readFileSync(join(PROJECT_ROOT, file), "utf8");
     const piSdkPackages = [
       "@mariozechner/pi-coding-agent",
@@ -372,6 +1310,13 @@ test("Pi SDK imports stay centralized in the pi adapter", () => {
     return piSdkPackages.some((packageName) => source.includes(packageName));
   });
   assert.deepEqual(directSdkImportFiles, []);
+  assert.deepEqual(getImportSpecifiers(hostLeaf), ["@earendil-works/pi-coding-agent"]);
+  const hostConsumers = getProjectSourceFiles().filter(file =>
+    getImportSpecifiers(file).some(specifier => specifier.endsWith("/pi-host.ts")));
+  assert.deepEqual(hostConsumers, []);
+  assert.deepEqual(getImportSpecifiers("dist/pi-telegram/index.js"), [
+    "../index.js", "../lib/pi-host.js", "../lib/pi.js",
+  ]);
 });
 
 test("Entrypoint stays free of direct Node runtime imports", () => {

@@ -123,6 +123,23 @@ export interface TelegramMediaGroupControllerOptions {
     clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 }
 export type TelegramAttachmentKind = "photo" | "document" | "video" | "audio" | "voice" | "animation" | "sticker";
+/** @internal Metadata only: no receiver, source-custody, actual-byte or download grant. */
+export interface TelegramAttachmentRequestCandidate {
+    readonly messageId: number;
+    readonly kind: TelegramAttachmentKind;
+    readonly fileId: string;
+    readonly fileName?: string;
+    readonly mimeType?: string;
+    readonly reportedBytes?: number;
+}
+/** @internal Shared bounded producer metadata; never a receiver, actual-byte or file-use grant. */
+export declare function normalizeTelegramAttachmentRequestConstraints(constraints: {
+    readonly accept: readonly string[];
+    readonly maxBytes: number;
+}): {
+    readonly accept: readonly string[];
+    readonly maxBytes: number;
+};
 /** Where an inbound attachment came from; the download layer turns it into a scoped file name. */
 export interface TelegramAttachmentSource {
     kind: string;

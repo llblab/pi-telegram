@@ -2,7 +2,8 @@
  * Telegram transport destination value helpers
  * Zones: Bot API transport, routing, replies/previews, ownership, multi-instance bus
  * Owns the minimal `{ chatId, threadId? }` address shape shared by classic private chats
- * and Telegram UI threads mapped through Bot API `message_thread_id`.
+ * and Telegram UI threads mapped through Bot API `message_thread_id`, plus the shared assigned-target and
+ * Threaded Mode projections over the bus roles.
  */
 
 export interface TelegramTarget {
@@ -65,4 +66,34 @@ export function parseTelegramIntegerId(value: unknown): number | undefined {
   if (typeof value !== "string" || value.trim() === "") return undefined;
   const parsed = Number(value);
   return Number.isInteger(parsed) ? parsed : undefined;
+}
+
+/** Registered follower and own leader Thread sources; each reports its acknowledged target, if any. */
+interface TelegramAssignedTargetSources {
+  follower: { getTarget: () => TelegramTarget | undefined };
+  leader: { getTarget: () => TelegramTarget | undefined };
+}
+
+/** The registered follower's target wins over the leader's own Thread. */
+export function createTelegramAssignedTargetGetter(
+  sources: TelegramAssignedTargetSources,
+): () => TelegramTarget | undefined {
+  return function getAssignedTarget() {
+    return sources.follower.getTarget() ?? sources.leader.getTarget();
+  };
+}
+
+/** Threaded Mode holds when persisted state enables it or either bus role owns a Thread target. */
+export function createTelegramThreadedModeReader(
+  sources: TelegramAssignedTargetSources & {
+    botState: { getBotState: () => { threadMode?: string } };
+  },
+): () => boolean {
+  return function isThreadedMode() {
+    return (
+      sources.botState.getBotState().threadMode === "enabled" ||
+      sources.follower.getTarget()?.threadId !== undefined ||
+      sources.leader.getTarget()?.threadId !== undefined
+    );
+  };
 }

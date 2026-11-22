@@ -5,7 +5,7 @@
  */
 import { renderTelegramMessage, type TelegramRenderedChunk, type TelegramRenderMode } from "./rendering.ts";
 import { type TelegramTarget } from "./target.ts";
-import type { TelegramApiCallOptions, TelegramInputRichMessage, TelegramReplyParameters, TelegramSendRichMessageBody, TelegramSentMessage } from "./telegram-api.ts";
+import type { TelegramApiCallOptions, TelegramApiUiAuthorityOptions, TelegramInputRichMessage, TelegramReplyParameters, TelegramSendRichMessageBody, TelegramSentMessage } from "./telegram-api.ts";
 export { renderTelegramMessage, type TelegramRenderedChunk, type TelegramRenderMode, };
 export declare function renderTelegramMarkdownToHtmlDraft(markdown: string): string;
 export declare const TELEGRAM_RICH_MESSAGE_MAX_CHARS = 32768;
@@ -55,7 +55,7 @@ export interface TelegramReplyDeliveryDeps<TReplyMarkup> {
         reply_parameters?: TelegramReplyParameters;
         reply_to_message_id?: number;
         message_thread_id?: number;
-    }, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<TelegramSentMessage>;
+    }, options?: TelegramApiUiAuthorityOptions) => Promise<TelegramSentMessage>;
     editMessage: (body: {
         chat_id: number;
         message_id: number;
@@ -64,27 +64,31 @@ export interface TelegramReplyDeliveryDeps<TReplyMarkup> {
         parse_mode?: "HTML";
         reply_markup?: TReplyMarkup;
         message_thread_id?: number;
-    }, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<unknown>;
+    }, options?: TelegramApiUiAuthorityOptions) => Promise<unknown>;
 }
 export interface TelegramReplyTargetOptions extends Pick<TelegramApiCallOptions, "assertAuthority"> {
     target?: TelegramTarget;
     replyToMessageId?: number;
 }
+/** UI-only local lifetime fences never become remote execution authority. */
+export type TelegramUiReplyTargetOptions = Omit<TelegramReplyTargetOptions, "assertAuthority"> & TelegramApiUiAuthorityOptions;
 export interface TelegramReplyTransport<TReplyMarkup> {
-    sendRenderedChunks: (chatId: number, chunks: TelegramRenderedChunk[], options?: TelegramReplyTargetOptions & {
+    sendRenderedChunks: (chatId: number, chunks: TelegramRenderedChunk[], options?: TelegramUiReplyTargetOptions & {
         replyMarkup?: TReplyMarkup;
     }) => Promise<number | undefined>;
-    editRenderedMessage: (chatId: number, messageId: number, chunks: TelegramRenderedChunk[], options?: TelegramReplyTargetOptions & {
+    editRenderedMessage: (chatId: number, messageId: number, chunks: TelegramRenderedChunk[], options?: TelegramUiReplyTargetOptions & {
         replyMarkup?: TReplyMarkup;
     }) => Promise<number | undefined>;
 }
 export declare function buildTelegramReplyTransport<TReplyMarkup>(deps: TelegramReplyDeliveryDeps<TReplyMarkup>): TelegramReplyTransport<TReplyMarkup>;
-export declare function sendTelegramRenderedChunks<TReplyMarkup>(chatId: number, chunks: TelegramRenderedChunk[], deps: TelegramReplyDeliveryDeps<TReplyMarkup>, options?: TelegramReplyTargetOptions & {
+export declare function sendTelegramRenderedChunks<TReplyMarkup>(chatId: number, chunks: TelegramRenderedChunk[], deps: TelegramReplyDeliveryDeps<TReplyMarkup>, options?: TelegramUiReplyTargetOptions & {
     replyMarkup?: TReplyMarkup;
 }): Promise<number | undefined>;
-export declare function editTelegramRenderedMessage<TReplyMarkup>(chatId: number, messageId: number, chunks: TelegramRenderedChunk[], deps: TelegramReplyDeliveryDeps<TReplyMarkup>, options?: TelegramReplyTargetOptions & {
+export declare function editTelegramRenderedMessage<TReplyMarkup>(chatId: number, messageId: number, chunks: TelegramRenderedChunk[], deps: TelegramReplyDeliveryDeps<TReplyMarkup>, options?: TelegramUiReplyTargetOptions & {
     replyMarkup?: TReplyMarkup;
 }): Promise<number | undefined>;
+/** Edit one fixed assistant message without chunk spill, rendering downgrade or transport fallback. */
+export declare function editTelegramSingleMarkdownMessage<TReplyMarkup>(chatId: number, messageId: number, markdown: string, rendering: "rich" | "html", replyMarkup: TReplyMarkup, deps: Pick<TelegramReplyDeliveryDeps<TReplyMarkup>, "editMessage">, options?: TelegramApiUiAuthorityOptions): Promise<void>;
 export interface TelegramTextReplyOptions extends TelegramReplyTargetOptions {
     parseMode?: "HTML";
 }
@@ -127,8 +131,8 @@ export interface TelegramRenderedMessageRuntime<TReplyMarkup> {
     sendMarkdownReply: (chatId: number, replyToMessageId: number | undefined, markdown: string, options?: TelegramReplyTargetOptions & {
         replyMarkup?: TReplyMarkup;
     }) => Promise<number | undefined>;
-    editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: TelegramRenderMode, replyMarkup: TReplyMarkup, options?: TelegramReplyTargetOptions) => Promise<void>;
-    sendInteractiveMessage: (chatId: number, text: string, mode: TelegramRenderMode, replyMarkup: TReplyMarkup, options?: TelegramReplyTargetOptions) => Promise<number | undefined>;
+    editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: TelegramRenderMode, replyMarkup: TReplyMarkup, options?: TelegramUiReplyTargetOptions) => Promise<void>;
+    sendInteractiveMessage: (chatId: number, text: string, mode: TelegramRenderMode, replyMarkup: TReplyMarkup, options?: TelegramUiReplyTargetOptions) => Promise<number | undefined>;
     sendSectionRichMessage: (chatId: number, message: TelegramInputRichMessage, options?: TelegramReplyTargetOptions) => Promise<number>;
 }
 export interface TelegramRenderedMessageDeliveryRuntime<TReplyMarkup> extends TelegramRenderedMessageRuntime<TReplyMarkup> {

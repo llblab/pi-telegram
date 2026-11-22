@@ -124,13 +124,6 @@ export interface TelegramBusLeaderRuntimeAssemblyDeps<TContext> {
     workspaceRotation?: TelegramWorkspaceSlotRotationPorts;
 }
 export type TelegramBusFollowerSessionReplacementOperation = (follower: TelegramBusFollowerView, intent: Threads.TelegramSessionReplacementIntent, isCurrent: () => boolean) => Promise<boolean>;
-/**
- * Leader-owned durable session-replacement authority for registered followers.
- * Followers cannot persist `state.json`; the leader validates the request
- * against its live registry entry and authoritative Workspace binding before
- * one CAS publication or claim. Follower memory is never accepted as binding
- * evidence.
- */
 export declare function createTelegramBusFollowerSessionReplacementAuthority(deps: {
     store: Pick<Threads.TelegramTopicTargetStore, "load" | "getWorkspaceBindingByTarget" | "getSessionReplacementIntent" | "commitSessionReplacementIntent" | "removeSessionReplacementIntent">;
     getTelegramProfile?: () => string | undefined;
@@ -225,6 +218,11 @@ export declare function createTelegramBusSelectedMenuDeliveryHandler(deps: {
     };
 }): (input: TelegramBusSelectedMenuDelivery, isCallerCurrent: () => boolean) => Promise<TelegramBusEnvelope>;
 export interface TelegramBusLeaderEnvelopeHandlerDeps {
+    /** Ordinary locally guarded API wire authority only; not remote question membership. */
+    captureApiTransport?: () => (() => boolean) | undefined;
+    captureArtifactTransport?: () => (() => boolean) | undefined;
+    artifactApi?: Pick<TelegramBridgeApiRuntime, "callArtifactBytes" | "reserveArtifact">;
+    artifactMaxBytes?: number;
     followerRegistry: TelegramBusFollowerRegistry;
     authSecret?: string;
     protocolIdentity: TelegramBusProtocolIdentity;
@@ -238,6 +236,10 @@ export interface TelegramBusLeaderEnvelopeHandlerDeps {
         args: unknown[];
     }) => boolean;
     recordFollowerMessageOwnership?: TelegramBusFollowerMessageOwnershipRecorder;
+    captureInputPublication?: (follower: TelegramBusFollowerView, target: TelegramTarget) => (messageId: number) => void;
+    getTextInputReceiverBotId?: (follower: Readonly<TelegramBusFollowerView>, target: Readonly<TelegramTarget>) => number | undefined;
+    /** Private broker opt-in only; no production readiness or peer capability is advertised. */
+    getAttachmentReceiverBotId?: (follower: Readonly<TelegramBusFollowerView>, target: Readonly<TelegramTarget>) => number | undefined;
     resolveAgentTarget?: (follower: TelegramBusFollowerView, selector: Extract<TelegramBusEnvelope, {
         kind: "follower.resolveAgentTarget";
     }>["selector"]) => Promise<TelegramTarget | undefined> | TelegramTarget | undefined;
@@ -272,6 +274,8 @@ export interface TelegramBusLeaderEnvelopeHandlerDeps {
     publishFollowerSessionReplacement?: TelegramBusFollowerSessionReplacementOperation;
     settleFollowerSessionReplacement?: TelegramBusFollowerSessionReplacementOperation;
     getFollowerDisplayTitle?: (follower: TelegramBusFollowerView) => string | undefined;
+    /** The leader's own Thread capability, relayed on heartbeats so followers need not probe Telegram themselves. */
+    getThreadCapability?: () => boolean | undefined;
     onFollowerRegistered?: () => void;
     /** Observation only: reacquire admission and inspect work, never infer completion.
      * Listener settlement ends its currentness fence; return asynchronous work to retain that fence. */
@@ -280,7 +284,8 @@ export interface TelegramBusLeaderEnvelopeHandlerDeps {
     recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
     applyThreadDisplayMode?: (mode: TelegramThreadDisplayMode, isCurrent: () => boolean) => Promise<void>;
     getThreadDisplayMode?: () => TelegramThreadDisplayMode;
-    requiresPreDispatchRebindReader?: () => boolean;
+    /** Fresh state-derived codec requirements, rechecked before provisioning and registration publication. */
+    getRequiredWorkspaceReaderCapabilities?: () => readonly string[];
     getCurrentLeaderEpoch?: () => number | string | undefined;
     getTelegramProfile?: () => string | undefined;
     getAllowedUserId?: () => number | undefined;
@@ -288,6 +293,9 @@ export interface TelegramBusLeaderEnvelopeHandlerDeps {
     runWorkspaceAdmission?: TelegramBusWorkspaceAdmissionRunner;
     runWithWorkspaceCapacity?: TelegramWorkspaceCapacityRunner;
 }
+export declare function createTelegramBusArtifactAuthorityCapture(deps: TelegramBusLeaderEnvelopeHandlerDeps): (envelope: Extract<TelegramBusEnvelope, {
+    kind: "follower.callApi";
+}>) => (() => boolean) | undefined;
 export declare function createTelegramBusLeaderEnvelopeHandler(deps: TelegramBusLeaderEnvelopeHandlerDeps): (envelope: TelegramBusEnvelope) => Promise<TelegramBusEnvelope> | TelegramBusEnvelope;
 export declare function createTelegramBusLeaderRuntime<TContext>(deps: TelegramBusLeaderRuntimeDeps<TContext>): TelegramBusLeaderRuntime<TContext>;
 export {};

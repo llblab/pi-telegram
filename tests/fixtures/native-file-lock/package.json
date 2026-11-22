@@ -1,0 +1,12 @@
+{
+  "name": "pi-telegram-native-lock-qualification",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Isolated dependency closure for opt-in native lock qualification, not runtime adoption",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "fs-native-extensions": "1.5.3"
+  }
+}

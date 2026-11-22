@@ -53,6 +53,8 @@ export interface TelegramSessionFolderSweeperDeps {
   getProfileName: () => string | undefined;
   /** Sessions holding a Workspace slot binding, live registrations and this process's own session. */
   getKeptSessionIds: () => Iterable<string | undefined>;
+  /** Private opt-in whole-sweep hold; unknown history cannot be classified by a missing marker. */
+  preserveJournalFamilies?: true;
   getNowMs?: () => number;
   intervalMs?: number;
 }
@@ -64,11 +66,15 @@ export interface TelegramSessionFolderSweeperDeps {
 export function createTelegramSessionFolderSweeper(
   deps: TelegramSessionFolderSweeperDeps,
 ): { sweep: () => string[] } {
+  const preserveJournalFamilies = deps.preserveJournalFamilies;
+  if (preserveJournalFamilies !== undefined && preserveJournalFamilies !== true)
+    throw new Error("Telegram session journal preservation must be true or omitted.");
   const getNowMs = deps.getNowMs ?? Date.now;
   const intervalMs = deps.intervalMs ?? TELEGRAM_SESSION_SWEEP_INTERVAL_MS;
   let lastSweepAtMs: number | undefined;
   return {
     sweep() {
+      if (preserveJournalFamilies) return [];
       const now = getNowMs();
       if (lastSweepAtMs !== undefined && now - lastSweepAtMs < intervalMs)
         return [];

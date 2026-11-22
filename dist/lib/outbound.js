@@ -405,11 +405,18 @@ export function createTelegramVoiceReplySender(deps) {
     });
 }
 export { createTelegramButtonActionStore, createTelegramButtonPromptTurn, createTelegramButtonReplyPlanner, handleTelegramButtonCallbackQuery, markTelegramButtonSelected, planTelegramButtonReply, } from "./outbound-buttons.js";
-export function createTelegramOutboundReplyPlanner(store, getRenderingMode = () => "rich") {
+/** @internal Private optional deadline normalization; not root/shared-lifetime activation. */
+export function createTelegramOutboundReplyPlanner(store, getRenderingMode = () => "rich", questionHeadTail, questionAppOrigin) {
+    if (questionHeadTail !== undefined && questionHeadTail !== true)
+        throw new TypeError("Question head/tail policy must be true or omitted.");
+    if (questionAppOrigin !== undefined && (questionAppOrigin !== true || !questionHeadTail))
+        throw new TypeError("Question app origin planner requires true and original question policy.");
     return (markdown, options) => {
+        const register = store.register, binding = questionAppOrigin ? options?.binding : undefined;
         const buttonReply = planTelegramButtonReply(markdown, {
-            registerAction: store.register,
+            registerAction: questionAppOrigin ? action => action.promptKind === "selection" ? register(action, binding) : register(action) : register,
             rendering: getRenderingMode(),
+            questionHeadTail,
             ...(options?.binding ? { binding: options.binding } : {}),
         });
         // Extract voice from the original text before button-fence rendering consumes it.

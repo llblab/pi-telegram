@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -95,6 +95,7 @@ import {
 import { createTelegramJournalSourceSerialization,
   createTelegramUpdateJournalBindingKey,
   createTelegramUpdateJournalRuntimeBindingResolver,
+  createTelegramUpdateJournalReferenceRegistry,
   createTelegramUpdateJournalEntryDigest,
   createTelegramUpdateJournalBotIdentity,
   createTelegramUpdateJournalStore,
@@ -102,6 +103,7 @@ import { createTelegramJournalSourceSerialization,
   type TelegramUpdateJournalQueueOwner,
   type TelegramUpdateJournalStore,
 } from "../lib/journal.ts";
+import { acceptedForeignUpdateSettlement } from "./fixtures/shared.ts";
 
 for (const fault of ["normal", "refused", "authority", "context", "binding", "owner", "changed", "missing", "reported",
   "cold", "stop", "before-publication", "after-publication", "lost-before", "lost-after", "bad-ack", "no-exact", "observer-replaced"] as const) {
@@ -176,17 +178,6 @@ for (const fault of ["normal", "refused", "authority", "context", "binding", "ow
 
 const TEST_CONTEXT = "ctx";
 const REGISTRY_KEY = "__piTelegramUpdateHandlerRegistry__";
-
-function acceptedForeignUpdateSettlement(sourceUpdateId = 1) {
-  return {
-    status: "accepted" as const,
-    delivery: {
-      deliveryId: `test-delivery-${sourceUpdateId}`,
-      sourceUpdateId,
-      recipientBindingKey: "test-recipient",
-    },
-  };
-}
 
 function clearGlobalRegistry(): void {
   delete (globalThis as Record<string, unknown>)[REGISTRY_KEY];
@@ -963,6 +954,72 @@ test("Update execution plan can be built directly from updates", () => {
   assert.equal(plan.kind, "callback");
   assert.equal(plan.kind === "callback" ? plan.shouldDeny : false, true);
 });
+
+for (const paired of [false, true]) for (const edited of [false, true]) for (const outcome of ["matched", "ordinary", "denied", "source-lost", "failed", "invalid-response"] as const) {
+test(`Private Delivery interception precedes all ordinary input lanes (paired=${paired}, edit=${edited}, ${outcome})`, async () => {
+  const events: string[] = [];
+  let current = true;
+  const deps = {
+    getAllowedUserId: () => 42, getCurrentInstanceId: () => "local",
+    persistAllowedUserId: async () => true, updateStatus() {},
+    removePendingMediaGroupMessages() {}, removeQueuedTelegramTurnsByMessageIds: () => 0,
+    applyQueuedTelegramTurnReactionByMessageId: () => true, pairTelegramUserIfNeeded: async () => false,
+    answerCallbackQuery: async () => {}, answerGuestQuery: async () => {}, handleAuthorizedTelegramCallbackQuery: async () => {},
+    sendTextReply: async () => { events.push("denied"); return 1; },
+    getMessageOwnership() { events.push("ownership"); return undefined; },
+    getTargetOwnership() { events.push("target"); return undefined; },
+    handleUnboundTelegramTopicMessage: async () => { events.push("unbound"); },
+    handleAuthorizedTelegramMessage: async () => { events.push("message"); },
+    handleAuthorizedTelegramEditedMessage: async () => { events.push("edit"); },
+    async handleAuthorizedTelegramDeliveryReply(_message: unknown, _ctx: string, isEdited: boolean) {
+      events.push(`private:${isEdited}`);
+      if (outcome === "failed") throw new Error("Private disposition unavailable");
+      if (outcome === "source-lost") { current = false; return paired; }
+      if (outcome === "invalid-response") return undefined as unknown as boolean;
+      return outcome === "matched";
+    },
+  };
+  const runtime = paired ? createTelegramPairedUpdateRuntime(deps) : createTelegramUpdateRuntime(deps);
+  const message = { message_id: 201, chat: { id: 42, type: "private" }, message_thread_id: 7,
+    from: { id: outcome === "denied" ? 43 : 42, is_bot: false }, text: "/quit",
+    reply_to_message: { message_id: 101 } };
+  const operation = runtime.handleUpdate(edited ? { edited_message: message } : { message }, "ctx", {
+    generation: 1, updateId: 301, signal: new AbortController().signal,
+    isCurrent: () => current, assertCurrent() { if (!current) throw new Error("Source ended"); },
+  });
+  if (outcome === "source-lost") await assert.rejects(operation, /Source ended/);
+  else if (outcome === "failed") await assert.rejects(operation, /Private disposition unavailable/);
+  else if (outcome === "invalid-response") await assert.rejects(operation, /Private Delivery reply disposition is unavailable/);
+  else await operation;
+  if (outcome === "denied") assert.deepEqual(events, ["denied"]);
+  else if (outcome === "ordinary") assert.deepEqual(events, [`private:${edited}`, "ownership", "target", edited ? "edit" : "unbound"]);
+  else assert.deepEqual(events, [`private:${edited}`]);
+});
+}
+
+for (const edited of [false, true]) {
+test(`Successful first-contact pairing precedes private interception (edit=${edited})`, async () => {
+  const events: string[] = [];
+  let allowed: number | undefined;
+  const runtime = createTelegramPairedUpdateRuntime({
+    getAllowedUserId: () => allowed,
+    async persistAllowedUserId(id) { events.push("persist"); allowed = id; return true; },
+    updateStatus() { events.push("status"); }, removePendingMediaGroupMessages() {},
+    removeQueuedTelegramTurnsByMessageIds: () => 0, applyQueuedTelegramTurnReactionByMessageId: () => true,
+    answerCallbackQuery: async () => {}, answerGuestQuery: async () => {}, handleAuthorizedTelegramCallbackQuery: async () => {},
+    async sendTextReply() { events.push("notice"); return 1; },
+    async handleAuthorizedTelegramDeliveryReply(_message, _ctx: string, isEdited) {
+      assert.equal(allowed, 42); assert.equal(isEdited, edited); events.push("private"); return true;
+    },
+    getMessageOwnership() { assert.fail("A private answer cannot reach ordinary ownership after pairing"); },
+    handleAuthorizedTelegramMessage: async () => assert.fail("No model dispatch"),
+    handleAuthorizedTelegramEditedMessage: async () => assert.fail("No queued prompt edit"),
+  });
+  const message = { message_id: 201, chat: { id: 42, type: "private" }, from: { id: 42, is_bot: false }, text: "private" };
+  await runtime.handleUpdate(edited ? { edited_message: message } : { message }, "ctx");
+  assert.deepEqual(events, edited ? ["persist", "status", "private"] : ["persist", "status", "notice", "private"]);
+});
+}
 
 test("Update runtime controller binds update and reaction ports", async () => {
   const events: string[] = [];
@@ -1832,7 +1889,7 @@ test("Update runtime routes edited messages without creating normal message turn
   assert.deepEqual(events, ["edited-message"]);
 });
 
-test("Internal agent messages bypass outbound message ownership forwarding", async () => {
+test("Internal agent messages bypass outbound message ownership and private human reply interception", async () => {
   const events: string[] = [];
   await executeTelegramUpdate(
     {
@@ -1852,6 +1909,7 @@ test("Internal agent messages bypass outbound message ownership forwarding", asy
       getCurrentInstanceId: () => "leader",
       getMessageOwnership: () => ({ instanceId: "follower" }),
       getTargetOwnership: () => undefined,
+      handleAuthorizedTelegramDeliveryReply: async () => { assert.fail("Agent messages are not human SDK answers"); },
       recordMessageOwnership: () => events.push("record"),
       foreignOwnedUpdateForwarder: {
         forwardMessage: async () => {
@@ -1895,6 +1953,7 @@ test("Internal agent messages preserve target ownership forwarding", async () =>
       ctx: TEST_CONTEXT,
       getCurrentInstanceId: () => "leader",
       getMessageOwnership: () => ({ instanceId: "leader" }),
+      handleAuthorizedTelegramDeliveryReply: async () => { assert.fail("Private interception cannot steal agent routing"); },
       getTargetOwnership: () => ({
         instanceId: "follower",
         ownerGeneration: "generation-2",
@@ -1971,6 +2030,87 @@ test("Update runtime keeps callback authority after its error answer", async () 
   assert.deepEqual(events, [
     "answer:cb-foreign:This Telegram message belongs to another Pi instance",
   ]);
+});
+
+for (const outcome of ["accepted", "retryable"] as const)
+test(`Update runtime releases a slow forwarded tap once, without a second toast (${outcome})`, async () => {
+  const events: string[] = [];
+  const run = executeTelegramUpdatePlan(
+    {
+      kind: "callback",
+      query: { id: "cb-slow", from: { id: 7, is_bot: false }, message: { chat: { id: 10, type: "private" }, message_id: 99 } },
+      shouldPair: false,
+      shouldDeny: false,
+    },
+    {
+      ctx: TEST_CONTEXT,
+      foreignCallbackReleaseMs: 5,
+      getCurrentInstanceId: () => "instance-a",
+      getMessageOwnership: () => ({ instanceId: "instance-b" }),
+      foreignOwnedUpdateForwarder: {
+        forwardCallback: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          events.push("forward-settled");
+          return outcome === "accepted"
+            ? acceptedForeignUpdateSettlement()
+            : { status: "retryable" as const, failureClass: "transport-failed" as const, message: "Telegram follower forwarding ownership changed." };
+        },
+      },
+      removePendingMediaGroupMessages: () => {},
+      removeQueuedTelegramTurnsByMessageIds: () => 0,
+      handleAuthorizedTelegramReactionUpdate: async () => {},
+      pairTelegramUserIfNeeded: async () => false,
+      answerCallbackQuery: async (id, text) => { events.push(`answer:${id}:${text}`); },
+      answerGuestQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => { events.push("callback"); },
+      sendTextReply: async () => undefined,
+      handleAuthorizedTelegramMessage: async () => {},
+      handleAuthorizedTelegramEditedMessage: async () => {},
+    },
+  );
+  if (outcome === "accepted") await run;
+  else await assert.rejects(run, /forwarding did not settle/u);
+  assert.deepEqual(events, ["answer:cb-slow:undefined", "forward-settled"],
+    "The neutral answer precedes the slow settlement and is the only answer for this query");
+});
+
+test("Update runtime tells a retryable foreign callback settlement from a foreign-ownership verdict", async () => {
+  const events: string[] = [];
+  await assert.rejects(
+    executeTelegramUpdatePlan(
+      {
+        kind: "callback",
+        query: { id: "cb-busy", from: { id: 7, is_bot: false }, message: { chat: { id: 10, type: "private" }, message_id: 99 } },
+        shouldPair: false,
+        shouldDeny: false,
+      },
+      {
+        ctx: TEST_CONTEXT,
+        getCurrentInstanceId: () => "instance-a",
+        getMessageOwnership: () => ({ instanceId: "instance-b" }),
+        foreignOwnedUpdateForwarder: {
+          forwardCallback: () => ({
+            status: "retryable" as const,
+            failureClass: "transport-failed" as const,
+            message: "Telegram follower forwarding ownership changed.",
+          }),
+        },
+        removePendingMediaGroupMessages: () => {},
+        removeQueuedTelegramTurnsByMessageIds: () => 0,
+        handleAuthorizedTelegramReactionUpdate: async () => {},
+        pairTelegramUserIfNeeded: async () => false,
+        answerCallbackQuery: async (id, text) => { events.push(`answer:${id}:${text}`); },
+        answerGuestQuery: async () => {},
+        handleAuthorizedTelegramCallbackQuery: async () => { events.push("callback"); },
+        sendTextReply: async () => undefined,
+        handleAuthorizedTelegramMessage: async () => {},
+        handleAuthorizedTelegramEditedMessage: async () => {},
+      },
+    ),
+    /forwarding did not settle: transport-failed/u,
+  );
+  assert.deepEqual(events, ["answer:cb-busy:Pi instance is busy, retrying"],
+    "A transient forwarding failure keeps the journaled retry and never claims the message belongs to another instance");
 });
 
 test("Update runtime forwards callbacks owned by another instance", async () => {
@@ -5600,6 +5740,44 @@ test("Admission runtime assembly owns queue identity and leader/follower workers
   await runtimeBinding.onSessionShutdown();
 });
 
+for (const role of ["leader", "follower"] as const)
+test(`Admission runtime assembly fences source I/O on reference admission (${role})`, async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  const references = createTelegramUpdateJournalReferenceRegistry();
+  const binding = { runtimeKey: `runtime-${role}`, recoveryKey: `binding-${role}`, journal: {
+    ...storage.journal, appendBatch: () => ({ nonExcludedUpdateIds: [] }),
+  } };
+  let denied = true, executions = 0;
+  const runtimeBinding = createTelegramUpdateAdmissionRuntimeBinding<string>({ isFollowerRegistered: () => role === "follower" });
+  const assembly = createTelegramUpdateAdmissionRuntimeAssembly<TelegramJournaledUpdate & TelegramUpdateFlow, string>({
+    runtimeBinding,
+    acquireSourceReference(actualRole, source) {
+      assert.equal(actualRole, role); assert.equal(source.recoveryKey, binding.recoveryKey);
+      assert.equal(source.journal, binding.journal);
+      if (denied) throw new Error("Original source reference refused");
+      return references.acquire({ referenceClass: actualRole === "leader" ? "leader-lifecycle" : "follower-lifecycle", recoveryKey: source.recoveryKey });
+    },
+    owner: { instanceId: "reference-owner", processId: 42, processBirthId: "42:start:1", getSessionGeneration: () => 1,
+      isContextCurrent: () => true, dispatchNext() {}, requestQueueHandoffReconciliation() {} },
+    worker: { async defaultHandle() { executions++; } },
+    leader: { resolveBinding: () => binding, hasAuthority: () => true },
+    follower: { resolveBinding: () => binding, isRegistered: () => role === "follower", getGeneration: () => "generation-1", prepareUpdateForExecution: update => update },
+  });
+  const lifecycle = assembly[role];
+  try {
+    await assert.rejects(lifecycle.onSessionStart(TEST_CONTEXT), /Original source reference refused/);
+    assert.equal(storage.getReadCount(), 0, "Reference admission must precede worker source I/O and construction");
+    assert.equal(executions, 0); assert.deepEqual(references.list(), []);
+    denied = false;
+    await lifecycle.onSessionStart(TEST_CONTEXT);
+    await waitForUpdateWorkerCondition(() => storage.getUpdateIds().length === 0, "Admitted source did not execute");
+    assert.equal(executions, 1);
+    assert.deepEqual(references.list(), [{ referenceClass: role === "leader" ? "leader-lifecycle" : "follower-lifecycle", recoveryKey: binding.recoveryKey }]);
+    await lifecycle.onSessionShutdown();
+    assert.deepEqual(references.list(), [], "Native lifecycle stop must release its own actual source lease");
+  } finally { await runtimeBinding.onSessionShutdown(); }
+});
+
 test("Admission live preparation uses a retained source reference without pausing ordinary work or adopting leader originals", async () => {
   await withLiveInputWorker(1, async f => {
     let references = 0;
@@ -7719,7 +7897,7 @@ for (const scenario of ["exact", "foreign-binding", "read-only", "completed-afte
 
 for (const scenario of ["normal", "transport-lost", "ordinary", "grouped", "batch", "batch-reordered", "scope-subset", "empty-scope", "duplicate-scope", "foreign-binding",
   "missing-disposer", "missing-reader", "missing-scope", "bad-hash", "identity-before", "binding-before", "source-changed", "before-write", "restart-held",
-  "lost-ack", "no-result", "no-removed-result", "foreign-result", "reader-empty", "reader-throws", "reader-foreign",
+  "lost-ack", "lost-ack-restart", "no-result", "no-removed-result", "foreign-result", "reader-empty", "reader-throws", "reader-foreign",
   "post-commit-context", "post-read-binding", "post-read-identity", "detached", "capability-snapshot", "downgrade", "conflicting-retry"] as const) {
   test(`Scoped queued worker disposition acknowledges only retained full-source proof (${scenario})`,
     async () => {
@@ -7734,8 +7912,9 @@ for (const scenario of ["normal", "transport-lost", "ordinary", "grouped", "batc
     const receipts = scenario === "batch" || scenario === "batch-reordered" ? ids.map(id => ({ queueKind: "prompt" as const, receiptId: `queued-${id}`, sourceUpdateIds: [id], journalBindingKey: binding.recoveryKey }))
       : [{ queueKind: "prompt" as const, receiptId: "queued", sourceUpdateIds: [...ids], journalBindingKey: binding.recoveryKey }];
     const carriers: unknown[] = [], events: string[] = [];
-    let currentBinding = binding.recoveryKey, contextCurrent = true, transportCurrent = true, fault = true, disposals = 0, reads = 0;
+    let currentBinding = binding.recoveryKey, contextCurrent = true, transportCurrent = true, fault = true, disposals = 0, reads = 0, snapshots = 0, publications = 0;
     const port: TelegramUpdateWorkerJournalPort = { ...journal,
+      read() { snapshots++; return journal.read(); },
       completeQueued(receipts) { events.push("ordinary-disposal"); return journal.completeQueued(receipts); },
       completeQueuedExact: scenario === "missing-disposer" ? undefined : function (this: TelegramUpdateWorkerJournalPort, receipts, markers) {
         assert.equal(this, port, "captured disposal retains its original receiver"); disposals++; events.push("scoped-disposal");
@@ -7743,7 +7922,7 @@ for (const scenario of ["normal", "transport-lost", "ordinary", "grouped", "batc
         const result = journal.completeQueuedExact(receipts, markers);
         if (scenario === "post-commit-context") contextCurrent = false;
         if (scenario === "detached") markers[0]!.completionSha256 = "f".repeat(64);
-        if (scenario === "lost-ack" || scenario === "batch-reordered" || scenario === "downgrade" || scenario === "conflicting-retry") throw new Error("Fixture scoped queued ACK lost");
+        if (scenario === "lost-ack" || scenario === "lost-ack-restart" || scenario === "batch-reordered" || scenario === "downgrade" || scenario === "conflicting-retry") throw new Error("Fixture scoped queued ACK lost");
         if (scenario === "no-result") return { removedUpdateIds: result.removedUpdateIds };
         if (scenario === "no-removed-result") return { ...result, removedUpdateIds: [] };
         if (scenario === "foreign-result") return { ...result, sourceCompletions: result.sourceCompletions!.map(marker => ({ ...marker, completionSha256: "f".repeat(64) })) };
@@ -7764,12 +7943,14 @@ for (const scenario of ["normal", "transport-lost", "ordinary", "grouped", "batc
     const worker = createTelegramUpdateAdmissionWorkerRuntime<TelegramJournaledUpdate & TelegramUpdateFlow, string>({
       journal: port, getJournalBindingKey: () => currentBinding, getQueueOwnerIdentity: () => identity,
       hasAuthority: () => transportCurrent, isContextCurrent: () => contextCurrent,
+      onQueueReceiptCommitted() { publications++; },
       async defaultHandle(update) { carriers.push(update.message); reportTelegramUpdateDeferred(update.message); },
     });
     try {
       worker.start(TEST_CONTEXT); await worker.waitForDrain(); reportTelegramQueueAdmission(carriers, receipts);
       await Promise.resolve(); await worker.waitForDrain();
       assert.equal(carriers.length, ids.length); assert.ok(receipts.every(receipt => worker.isQueueReceiptCommitted(receipt)));
+      assert.equal(publications, receipts.length, "each actual queued group publishes exactly once");
       const proof = journal.read().entries.map(entry => ({ ...createTelegramUpdateJournalEntryDigest(entry),
         journalBindingKey: binding.recoveryKey, completionSha256: (entry.updateId === 1 ? "a" : "b").repeat(64) }));
       const expected = structuredClone(proof);
@@ -7813,13 +7994,18 @@ for (const scenario of ["normal", "transport-lost", "ordinary", "grouped", "batc
         const { journalBindingKey: _binding, ...scope } = marker;
         assert.deepEqual(journal.inspectSourceCompletion(scope), scope, "lost replies retain exact scoped evidence");
       }
-      if (scenario === "restart-held") {
+      if (scenario === "restart-held" || scenario === "lost-ack-restart") {
+        worker.signal(); await worker.waitForDrain();
+        assert.equal(worker.getState().queuedClaimCount, ids.length);
+        assert.equal(worker.isQueueReceiptCommitted(receipts[0]!), false);
         await worker.stop(); worker.start(TEST_CONTEXT); await worker.waitForDrain();
         assert.equal(worker.completeQueueReceipts(input), false, "a new worker owner cannot borrow the old issued batch");
         assert.equal(worker.completeQueueReceipts({ receipts, ctx: TEST_CONTEXT, reason: "prompt-handoff" }), false);
-        assert.equal(disposals, 1); assert.equal(carriers.length, ids.length); assert.equal(journal.read().entries.length, ids.length);
+        assert.equal(worker.getQueueReceiptSettlementOwner!(receipts[0]!, TEST_CONTEXT, "prompt-handoff"), undefined);
+        assert.equal(worker.getQueueReceiptOwner(receipts[0]!), undefined);
+        assert.equal(disposals, 1); assert.equal(carriers.length, ids.length); assert.equal(journal.read().entries.length, scenario === "restart-held" ? ids.length : 0);
       } else if (!positive && !neverIssued) {
-        fault = false; contextCurrent = true; currentBinding = binding.recoveryKey; identity.sessionGeneration = 1;
+        contextCurrent = true; currentBinding = binding.recoveryKey; identity.sessionGeneration = 1;
         if (scenario === "downgrade") {
           assert.equal(worker.completeQueueReceipts({ receipts, ctx: TEST_CONTEXT, reason: "prompt-handoff" }), false);
           assert.equal(events.includes("ordinary-disposal"), false);
@@ -7827,11 +8013,55 @@ for (const scenario of ["normal", "transport-lost", "ordinary", "grouped", "batc
         if (scenario === "conflicting-retry") {
           assert.equal(worker.completeQueueReceipts({ ...input, sourceCompletions: proof.map(marker => ({ ...marker, completionSha256: "f".repeat(64) })) }), false);
         }
+        const beforeSnapshots = snapshots, beforePublications = publications;
+        for (let refresh = 0; refresh < 2; refresh++) {
+          worker.signal(); await worker.waitForDrain();
+          assert.ok(snapshots > beforeSnapshots + refresh, "public drain reads and refreshes the native journal before retry");
+          assert.equal(journal.read().entries.length, uncommitted ? ids.length : 0);
+          assert.equal(worker.getState().queuedClaimCount, ids.length, "unknown ACK keeps frozen claims even when queued rows disappeared");
+          assert.ok(receipts.every(receipt => !worker.isQueueReceiptCommitted(receipt) && !worker.getQueueReceiptOwner(receipt)),
+            "issued attempts never regain execution readiness through refresh");
+          assert.equal(publications, beforePublications, "refresh never republishes an issued receipt");
+          assert.equal(worker.getQueueReceiptSettlementOwner!(receipts[0]!, TEST_CONTEXT, "discard"), undefined);
+          assert.ok(worker.getQueueReceiptSettlementOwner!(receipts[0]!, TEST_CONTEXT, "prompt-handoff"),
+            "only matching frozen settlement retains its owner");
+        }
+        if (["reader-empty", "reader-throws", "reader-foreign"].includes(scenario)) {
+          assert.equal(worker.completeQueueReceipts(input), false, "missing/unreadable/conflicting proof stays frozen after refresh");
+          assert.equal(worker.getState().queuedClaimCount, ids.length);
+          assert.equal(disposals, 1);
+        }
+        fault = false;
+        const beforeInvalidReads = reads;
+        if (scenario === "lost-ack") {
+          for (const replacement of ["binding", "session", "process"] as const) {
+            const original = { ...identity };
+            if (replacement === "binding") currentBinding = "foreign";
+            if (replacement === "session") identity.sessionGeneration++;
+            if (replacement === "process") identity.processBirthId = "replacement-birth";
+            assert.equal(worker.getQueueReceiptSettlementOwner!(receipts[0]!, TEST_CONTEXT, "prompt-handoff"), undefined);
+            assert.equal(worker.completeQueueReceipts(input), false, "replacement authority cannot borrow frozen settlement");
+            worker.signal(); await worker.waitForDrain();
+            assert.equal(worker.completeQueueReceipts(input), false, "refresh cannot authorize replacement authority");
+            assert.equal(worker.isQueueReceiptCommitted(receipts[0]!), false);
+            Object.assign(identity, original); currentBinding = binding.recoveryKey;
+          }
+        }
+        assert.equal(worker.completeQueueReceipts({ receipts, ctx: TEST_CONTEXT, reason: "prompt-handoff" }), false,
+          "refresh cannot downgrade an explicitly scoped attempt to ordinary disposal");
+        assert.equal(events.includes("ordinary-disposal"), false);
+        assert.equal(worker.completeQueueReceipts({ ...input, reason: "discard" }), false);
+        assert.equal(worker.completeQueueReceipts({ ...input, sourceCompletions: proof.map(marker => ({ ...marker, completionSha256: "f".repeat(64) })) }), false);
+        if (receipts.length > 1) assert.equal(worker.completeQueueReceipts({ ...input, receipts: receipts.slice(0, 1), sourceCompletions: proof.slice(0, 1) }), false);
+        assert.equal(reads, beforeInvalidReads, "wrong reason/scope/subset cannot inspect or mutate the issued attempt");
+        assert.equal(disposals, 1);
         const beforeReads = reads;
         const reconciled = worker.completeQueueReceipts(scenario === "batch-reordered" ? { ...input, receipts: [...receipts].reverse() } : input);
         assert.equal(reconciled, !uncommitted, "a retry reads only exact retained proof; missing proof stays held");
         assert.equal(disposals, 1, "an issued or uncertain disposal never replays");
         assert.ok(reads > beforeReads); assert.equal(worker.getState().queuedClaimCount, reconciled ? 0 : ids.length);
+        assert.equal(carriers.length, ids.length, "refresh and reconciliation never re-enter the handler");
+        assert.equal(publications, receipts.length, "reconciliation emits no new queue receipt");
       }
     } finally { await worker.stop(); await rm(dir, { recursive: true, force: true }); }
   });
@@ -7912,6 +8142,14 @@ for (const scenario of ["ready", "group", "control", "batch", "mixed", "mixed-lo
           assert.equal(settlement.isItemReady(item), false, "partial ACKs never restore execution readiness");
           if (scenario === "mixed-context" || scenario === "mixed-binding" || scenario === "mixed-identity") assert.equal(complete(), false);
           fault = false; contextCurrent = true; liveBinding = binding.recoveryKey; identity.sessionGeneration = 1;
+          if (lost) {
+            const beforePublications = publications;
+            worker.signal(); await worker.waitForDrain();
+            worker.signal(); await worker.waitForDrain();
+            assert.equal(publications, beforePublications, "frozen prepared scopes survive refresh without republishing");
+            assert.equal(worker.getState().queuedClaimCount, ids.length);
+            assert.equal(settlement.isItemReady(item), false);
+          }
           assert.equal(complete(), true, "retained exact ACKs resume source disposition, never semantic handoff");
         }
         assert.equal(exact, 1, "partition retry never repeats an issued scoped disposal");
@@ -8557,6 +8795,133 @@ test("Update worker reconstructs durable queue claims after session replacement"
   await replacement.waitForDrain();
   assert.deepEqual(storage.getUpdateIds(), []);
   await replacement.stop();
+});
+
+for (const completion of ["success", "failure"] as const)
+test(`Source-qualified workers retain actual execution across cancellation (${completion})`, async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  const identity = { tokenSha256: "a".repeat(64) };
+  const coordinates = { path: `/source-exclusion-${completion}/inbox.json`, profileName: "test", botIdentity: identity };
+  const binding = createTelegramUpdateJournalBindingKey(coordinates);
+  let resolveFirst!: (value: TelegramUpdateAdmissionOutcome) => void, rejectFirst!: (error: Error) => void;
+  const firstExecution = new Promise<TelegramUpdateAdmissionOutcome>((resolve, reject) => { resolveFirst = resolve; rejectFirst = reject; });
+  let donorCalls = 0, waiterCalls = 0, recipientCalls = 0, independentCalls = 0;
+  const donor = createTelegramUpdateWorkerRuntime({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    executeUpdate() { donorCalls++; return firstExecution; } });
+  const waiter = createTelegramUpdateWorkerRuntime({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    executeUpdate() { waiterCalls++; return { kind: "complete" }; } });
+  // Only the structural legacy-worker port crosses module copies, never branded private-input capabilities.
+  const recipientFactory = completion === "success"
+    ? (await import("../dist/lib/updates.js")).createTelegramUpdateWorkerRuntime as unknown as typeof createTelegramUpdateWorkerRuntime
+    : createTelegramUpdateWorkerRuntime;
+  const recipient = recipientFactory({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    executeUpdate() { recipientCalls++; return { kind: "complete" }; } });
+  const workers = [donor, waiter, recipient];
+  try {
+    donor.start(TEST_CONTEXT);
+    await waitForUpdateWorkerCondition(() => donorCalls === 1, "original execution did not enter");
+    await donor.stop();
+    assert.equal(donor.getState().unsettledExecutionCount, 1);
+    waiter.start(TEST_CONTEXT);
+    await waitForUpdateWorkerCondition(() => waiter.getState().blockedReason === "prior-generation-executing", "new worker did not retain original execution exclusion");
+    let stopped = false;
+    const stopping = waiter.stop().then(() => { stopped = true; });
+    await waitForUpdateWorkerCondition(() => stopped, "cancellation waited for another worker's unsettled handler");
+    await stopping;
+    assert.equal(waiterCalls, 0);
+    recipient.start(TEST_CONTEXT);
+    await waitForUpdateWorkerCondition(() => recipient.getState().blockedReason === "prior-generation-executing", "stopping a waiter released someone else's execution");
+    for (const alternate of [
+      { ...coordinates, profileName: "other" },
+      { ...coordinates, path: coordinates.path + ".other" },
+      { ...coordinates, botIdentity: { tokenSha256: "b".repeat(64) } },
+    ]) {
+      const independent = createTestUpdateWorkerJournal([1]);
+      const worker = createTelegramUpdateWorkerRuntime({ journal: { ...independent.journal, read: () => ({ ...independent.journal.read(), profile: alternate.profileName, botIdentity: alternate.botIdentity }) },
+        getJournalBindingKey: () => createTelegramUpdateJournalBindingKey(alternate), hasAuthority: () => true,
+        executeUpdate() { independentCalls++; return { kind: "complete" }; } });
+      workers.push(worker); worker.start(TEST_CONTEXT);
+      let drained = false;
+      const draining = worker.waitForDrain().then(() => { drained = true; });
+      await waitForUpdateWorkerCondition(() => drained, "An unrelated full source binding was blocked");
+      await draining;
+      assert.deepEqual(independent.getUpdateIds(), [], "A different full binding with the same numeric ID must remain independent");
+    }
+    assert.equal(independentCalls, 3);
+    assert.equal(recipientCalls, 0);
+    assert.deepEqual(storage.getUpdateIds(), [1]);
+    if (completion === "success") resolveFirst({ kind: "complete" }); else rejectFirst(new Error("Original handler failed after stop"));
+    await recipient.waitForDrain();
+    assert.equal(donorCalls, 1); assert.equal(waiterCalls, 0); assert.equal(recipientCalls, 1);
+    assert.deepEqual(storage.getRemovals(), [[1]], "Only current recipient authority settles the original entry");
+    const pool = (globalThis as unknown as Record<symbol, Map<string, unknown>>)[Symbol.for("pi-telegram.update-source-executions.v1")];
+    assert.equal(pool?.has(binding), false, "Actual settlement releases the private process-local exclusion record");
+  } finally {
+    resolveFirst({ kind: "complete" });
+    await Promise.allSettled(workers.map(worker => worker.stop()));
+  }
+});
+
+for (const completion of ["success", "failure"] as const)
+test(`Source-qualified execution cleanup retains the original mutable DTO identity (${completion})`, async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  const binding = createTelegramUpdateJournalBindingKey({ path: `/source-exclusion-mutated-${completion}/inbox.json`, profileName: "test", botIdentity: { tokenSha256: "a".repeat(64) } });
+  let release!: () => void, entered = false, recipientCalls = 0;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const donor = createTelegramUpdateWorkerRuntime({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    async executeUpdate(update) { entered = true; update.update_id = 999; await held; if (completion === "failure") throw new Error("Late mutated handler failed"); return { kind: "complete" as const }; } });
+  const recipient = createTelegramUpdateWorkerRuntime({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    executeUpdate(update) { assert.equal(update.update_id, 1); recipientCalls++; return { kind: "complete" }; } });
+  const pool = () => (globalThis as unknown as Record<symbol, Map<string, Map<number, unknown>>>)[Symbol.for("pi-telegram.update-source-executions.v1")];
+  try {
+    donor.start(TEST_CONTEXT);
+    await waitForUpdateWorkerCondition(() => entered, "Mutable handler did not enter");
+    await donor.stop();
+    assert.deepEqual([...pool().get(binding)!.keys()], [1], "Only the original source identity owns this in-flight claim");
+    release();
+    await waitForUpdateWorkerCondition(() => donor.getState().unsettledExecutionCount === 0, "Actual mutated execution did not settle");
+    assert.equal(pool().has(binding), false, "Actual settlement must not leave a ghost claim under the original ID");
+    assert.deepEqual(storage.getUpdateIds(), [1]); assert.deepEqual(storage.getRemovals(), []);
+    recipient.start(TEST_CONTEXT); await recipient.waitForDrain();
+    assert.equal(recipientCalls, 1); assert.deepEqual(storage.getRemovals(), [[1]]);
+  } finally { release(); await Promise.allSettled([donor.stop(), recipient.stop()]); }
+});
+
+test("Source-qualified workers atomically recheck a claim after asynchronous preparation", async () => {
+  const storage = createTestUpdateWorkerJournal([1]);
+  const binding = createTelegramUpdateJournalBindingKey({ path: "/source-exclusion-race/inbox.json", profileName: "test", botIdentity: { tokenSha256: "a".repeat(64) } });
+  let releasePreparation!: () => void, releaseExecution!: (value: TelegramUpdateAdmissionOutcome) => void;
+  const preparation = new Promise<void>(resolve => { releasePreparation = resolve; });
+  const execution = new Promise<TelegramUpdateAdmissionOutcome>(resolve => { releaseExecution = resolve; });
+  let prepared = 0, calls = 0, active = 0, maximumActive = 0, yields = 0, firstContext: string | undefined;
+  const makeWorker = () => createTelegramUpdateWorkerRuntime<string>({ journal: storage.journal, getJournalBindingKey: () => binding, hasAuthority: () => true,
+    // This fixture's bounded observer also runs on immediates; do not race a production zero-delay timer against its tick budget.
+    yieldToEventLoop: () => new Promise<void>(resolve => { yields++; setImmediate(resolve); }),
+    async shouldReviewHistoricalInput() { prepared++; await preparation; return false; },
+    executeUpdate(_update, ctx) {
+      calls++; active++; maximumActive = Math.max(maximumActive, active);
+      if (calls === 1) { firstContext = ctx; return execution.finally(() => { active--; }); }
+      active--; return { kind: "complete" };
+    } });
+  const one = makeWorker(), two = makeWorker();
+  try {
+    one.start("one"); two.start("two");
+    await waitForUpdateWorkerCondition(() => prepared === 2, "Both entry snapshots were not captured before preparation");
+    releasePreparation();
+    await waitForUpdateWorkerCondition(() => calls > 0, "No actual handler entered");
+    const original = firstContext === "one" ? one : two, successor = original === one ? two : one;
+    await original.stop();
+    assert.equal(calls, 1);
+    await waitForUpdateWorkerCondition(() => successor.getState().blockedReason === "prior-generation-executing", "Late competing snapshot bypassed the actual claim");
+    releaseExecution({ kind: "complete" });
+    await successor.waitForDrain();
+    assert.equal(calls, 2); assert.equal(maximumActive, 1);
+    assert.ok(yields > 0, "The stale snapshot was invalidated, not executed after the competing claim");
+    assert.deepEqual(storage.getRemovals(), [[1]]);
+  } finally {
+    releasePreparation(); releaseExecution({ kind: "complete" });
+    await Promise.allSettled([one.stop(), two.stop()]);
+  }
 });
 
 test("Update worker delays replacement replay until an abort-ignoring generation settles", async () => {

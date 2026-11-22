@@ -22,6 +22,7 @@ import {
   readTelegramRuntimeState,
   renameTelegramPathWithRetry,
   TelegramRuntimeStateError,
+  type TelegramRuntimeStateTransaction,
   withTelegramFileTransaction,
 } from "./locks.ts";
 import {
@@ -297,6 +298,7 @@ interface TelegramWorkspaceAdmissionLedgerOptions {
   path: string;
   /** Explicit logical section identity for the consolidated root; absent means the standalone ledger adapter. */
   stateProfile?: string;
+  stateTransaction?: TelegramRuntimeStateTransaction;
   profileKey: string;
   owner: TelegramWorkspaceAdmissionOwner;
   getNowMs?: () => number;
@@ -1083,8 +1085,8 @@ export function createTelegramWorkspaceAdmissionRuntimeBinding(
       owner: TelegramWorkspaceAdmissionOwner,
     ) => TelegramProcessLiveness;
   } & (
-    | { getPath: (profileName?: string) => string; getStatePath?: never }
-    | { getStatePath: () => string; getPath?: never }
+    | { getPath: (profileName?: string) => string; getStatePath?: never; stateTransaction?: never }
+    | { getStatePath: () => string; getPath?: never; stateTransaction?: TelegramRuntimeStateTransaction }
   ),
 ): TelegramWorkspaceAdmissionRuntimeBinding {
   const { getProfileName, getBotToken, getPath, getStatePath } = input;
@@ -1092,25 +1094,58 @@ export function createTelegramWorkspaceAdmissionRuntimeBinding(
     invalidInput(
       "Telegram admission binding must select one storage identity.",
     );
+  let current: {
+    ledger: TelegramWorkspaceAdmissionLedger;
+    options: TelegramWorkspaceAdmissionLedgerOptions;
+    authority: TelegramWorkspaceAdmissionLedgerOptions;
+    botToken: string;
+  } | undefined;
   return {
     resolve() {
-      const botToken = getBotToken();
-      if (!botToken) return undefined;
-      const configuredProfileName = getProfileName();
-      const profileKey = createTelegramWorkspaceAdmissionProfileKey({
-        profileName: configuredProfileName ?? "default",
-        botToken,
-      });
-      return createTelegramWorkspaceAdmissionLedger({
-        path: getStatePath ? getStatePath() : getPath!(configuredProfileName),
-        ...(getStatePath
-          ? { stateProfile: configuredProfileName ?? "default" }
-          : {}),
-        profileKey,
-        owner: input.owner,
-        getNowMs: input.getNowMs,
-        getProcessLiveness: input.getProcessLiveness,
-      });
+      try {
+        const botToken = getBotToken();
+        if (!botToken) {
+          current = undefined;
+          return undefined;
+        }
+        const configuredProfileName = getProfileName();
+        const profileKey = createTelegramWorkspaceAdmissionProfileKey({
+          profileName: configuredProfileName ?? "default",
+          botToken,
+        });
+        const options: TelegramWorkspaceAdmissionLedgerOptions = {
+          path: getStatePath ? getStatePath() : getPath!(configuredProfileName),
+          ...(getStatePath
+            ? { stateProfile: configuredProfileName ?? "default", stateTransaction: input.stateTransaction }
+            : {}),
+          profileKey,
+          owner: input.owner,
+          getNowMs: input.getNowMs,
+          getProcessLiveness: input.getProcessLiveness,
+        };
+        // Validate even on reuse; snapshot metadata separately from the ledger's live owner fence.
+        validateOptions(options);
+        const authority = { ...options, owner: { ...options.owner },
+          getNowMs: options.getNowMs ?? Date.now,
+          getProcessLiveness: options.getProcessLiveness ?? getTelegramProcessLiveness };
+        if (current && current.botToken === botToken &&
+          current.authority.path === authority.path &&
+          current.authority.stateProfile === authority.stateProfile &&
+          current.authority.stateTransaction === authority.stateTransaction &&
+          current.authority.profileKey === authority.profileKey &&
+          areOwnersEqual(current.authority.owner, authority.owner) &&
+          areOwnersEqual(current.options.owner, current.authority.owner) &&
+          current.authority.getNowMs === authority.getNowMs &&
+          current.authority.getProcessLiveness === authority.getProcessLiveness)
+          return current.ledger;
+        current = undefined;
+        const ledger = createTelegramWorkspaceAdmissionLedger(options);
+        current = { ledger, options, authority, botToken };
+        return ledger;
+      } catch (error) {
+        current = undefined;
+        throw error;
+      }
     },
   };
 }
@@ -1231,71 +1266,6 @@ export function runWithTelegramWorkspaceAdmissions<T>(input: {
   return outcome.value;
 }
 
-export function createTelegramWorkspaceJournalWriterAdmission(input: {
-  ledger: Pick<
-    TelegramWorkspaceAdmissionLedger,
-    "acquireAdmission" | "acquireJournalWriterAdmission" | "releaseAdmission"
-  >;
-  protocolAuthority?: Omit<
-    Parameters<
-      TelegramWorkspaceAdmissionLedger["acquireJournalWriterAdmission"]
-    >[0],
-    "operationId"
-  >;
-  createOperationId?: () => string;
-  onReleaseError?: (error: unknown) => void;
-}): <T>(operation: () => T) => T {
-  let pendingOperationId: string | undefined;
-  let active = false;
-  return <T>(operation: () => T): T => {
-    if (active)
-      invalidState(
-        "Telegram Workspace journal writer admission is already active.",
-      );
-    const operationId =
-      pendingOperationId ??
-      input.createOperationId?.() ??
-      `journal-writer:${randomUUID()}`;
-    validateOperationId(operationId);
-    pendingOperationId = operationId;
-    const result = input.protocolAuthority
-      ? input.ledger.acquireJournalWriterAdmission({
-          operationId,
-          ...input.protocolAuthority,
-        })
-      : input.ledger.acquireAdmission({
-          operationId,
-          operationKind: "journal-write",
-          scope: { kind: "profile" },
-        });
-    if (result.kind === "blocked") {
-      throw new TelegramWorkspaceAdmissionError(
-        "admission-blocked",
-        "Telegram Workspace journal writer is blocked by destructive closure.",
-      );
-    }
-    pendingOperationId = undefined;
-    active = true;
-    try {
-      return operation();
-    } finally {
-      active = false;
-      try {
-        if (!input.ledger.releaseAdmission(result.lease))
-          authorityChanged(
-            "Telegram Workspace journal writer lease disappeared before release.",
-          );
-      } catch (error) {
-        try {
-          input.onReleaseError?.(error);
-        } catch {
-          /* Diagnostics cannot change the journal outcome. */
-        }
-      }
-    }
-  };
-}
-
 export async function runWithTelegramWorkspaceAdmissionsAsync<T>(input: {
   ledger: Pick<
     TelegramWorkspaceAdmissionLedger,
@@ -1370,6 +1340,7 @@ export function createTelegramWorkspaceAdmissionLedger(
     suppliedOptions.path === path &&
     suppliedOptions.profileKey === profileKey &&
     suppliedOptions.stateProfile === stateProfile &&
+    suppliedOptions.stateTransaction === options.stateTransaction &&
     areOwnersEqual(suppliedOptions.owner, boundOwner);
   const mapStateError = (error: unknown): never => {
     if (error instanceof TelegramRuntimeStateError)
@@ -1415,6 +1386,7 @@ export function createTelegramWorkspaceAdmissionLedger(
           },
           {
             isCurrent: isStorageCurrent,
+            stateTransaction: options.stateTransaction,
             publishRename: publication.publishRename,
             onPublicationBoundary(boundary) {
               if (boundary !== "after-rename")
