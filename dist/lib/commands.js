@@ -469,6 +469,27 @@ function parseTelegramProfileArg(args) {
         return undefined;
     return word === TELEGRAM_DEFAULT_PROFILE_NAME ? undefined : word;
 }
+export function getTelegramProfileCompletions(deps, argumentPrefix) {
+    // The profile argument is a single word: never complete after it is finished.
+    if (/\s/.test(argumentPrefix))
+        return null;
+    const names = deps.getProfileNames?.() ?? [];
+    if (names.length === 0)
+        return null;
+    const prefix = argumentPrefix.toLowerCase();
+    const activeProfileName = deps.getActiveProfileName
+        ? (deps.getActiveProfileName() ?? TELEGRAM_DEFAULT_PROFILE_NAME)
+        : undefined;
+    const items = names
+        .filter((name) => name.toLowerCase().startsWith(prefix))
+        .map((name) => name === activeProfileName
+        ? { value: name, label: name, description: "active profile" }
+        : { value: name, label: name });
+    return items.length > 0 ? items : null;
+}
+function notifyUnavailableDefaultProfile(ctx, profileNames) {
+    ctx.ui.notify(`No usable default Telegram profile. Configured profiles: ${profileNames.join(", ")}. Use /telegram-connect <profileName> or /telegram-setup to configure the default profile.`, "info");
+}
 function formatTelegramTakeoverTitle(ctx) {
     return ctx.ui.theme.fg("accent", "pi-telegram");
 }
@@ -482,8 +503,10 @@ function formatTelegramTakeoverPrompt(ctx, owner) {
 }
 export function registerTelegramBridgeCommands(pi, deps) {
     const handleInternalAction = deps.handleInternalAction;
+    let connectAttempt = 0;
     pi.registerCommand("telegram-setup", {
         description: "<profile> — Configure Telegram bot token",
+        getArgumentCompletions: (argumentPrefix) => getTelegramProfileCompletions(deps, argumentPrefix),
         handler: async (args, ctx) => {
             await deps.promptForConfig(ctx, parseTelegramProfileArg(args));
         },
@@ -497,6 +520,7 @@ export function registerTelegramBridgeCommands(pi, deps) {
     });
     pi.registerCommand(TELEGRAM_CONNECT_COMMAND_NAME, {
         description: "<profile> — Start Telegram bridge",
+        getArgumentCompletions: (argumentPrefix) => getTelegramProfileCompletions(deps, argumentPrefix),
         handler: async (args, ctx) => {
             const words = args.trim().split(/\s+/);
             // Service dispatch never inherits profile activation or explicit-connect recovery authority.
@@ -519,8 +543,10 @@ export function registerTelegramBridgeCommands(pi, deps) {
                 return;
             }
             let intentId;
+            let attempt = connectAttempt;
             // Pi context getters throw after replacement; check plain intent/generation first.
-            const isCurrent = () => (!intentId || deps.connectionIntent?.isActive(intentId) !== false) &&
+            const isCurrent = () => attempt === connectAttempt &&
+                (!intentId || deps.connectionIntent?.isActive(intentId) !== false) &&
                 (sessionGeneration === undefined ||
                     deps.getSessionGeneration?.() === sessionGeneration) &&
                 deps.isContextCurrent?.(ctx) !== false &&
@@ -535,9 +561,50 @@ export function registerTelegramBridgeCommands(pi, deps) {
                 deps.updateStatus(ctx);
                 return;
             }
-            const profileName = parseTelegramProfileArg(args);
+            attempt = ++connectAttempt;
+            let profileName = parseTelegramProfileArg(args);
             intentId = deps.connectionIntent?.begin(ctx.cwd, profileName);
             try {
+                if (!profileName) {
+                    const selection = deps.activateDefaultProfileConfig
+                        ? await deps.activateDefaultProfileConfig(ctx, isCurrent)
+                        : await deps.reloadConfig();
+                    if (!isCurrent())
+                        return;
+                    if (selection) {
+                        if (selection.diagnostic)
+                            ctx.ui.notify(selection.diagnostic, "error");
+                        const alternatives = selection.profileNames.filter(name => name !== TELEGRAM_DEFAULT_PROFILE_NAME);
+                        if (alternatives.length === 0 || !deps.activateProfileConfig ||
+                            !ctx.hasUI || typeof ctx.ui.select !== "function") {
+                            notifyUnavailableDefaultProfile(ctx, selection.profileNames);
+                            deps.updateStatus(ctx);
+                            return;
+                        }
+                        // An unresolved choice must not carry a pending default connection into /resume.
+                        if (intentId)
+                            deps.connectionIntent?.finish(intentId);
+                        intentId = undefined;
+                        if (selection.profileNames.length === 1) {
+                            profileName = alternatives[0];
+                        }
+                        else {
+                            const active = deps.getActiveProfileName?.();
+                            const options = alternatives.map(name => ({
+                                name, label: name === active ? `${name} (active)` : name,
+                            }));
+                            const selected = await ctx.ui.select("Select Telegram profile", options.map(option => option.label));
+                            if (!isCurrent())
+                                return;
+                            profileName = options.find(option => option.label === selected)?.name;
+                        }
+                        if (!profileName) {
+                            deps.updateStatus(ctx);
+                            return;
+                        }
+                        intentId = deps.connectionIntent?.begin(ctx.cwd, profileName);
+                    }
+                }
                 if (profileName && deps.activateProfileConfig) {
                     const ok = await deps.activateProfileConfig(ctx, profileName, isCurrent);
                     if (!isCurrent())
@@ -549,19 +616,13 @@ export function registerTelegramBridgeCommands(pi, deps) {
                     }
                     ctx.ui.notify(`Activated profile "${profileName}".`, "info");
                 }
-                else {
-                    await (deps.activateDefaultProfileConfig?.(ctx, isCurrent) ??
-                        deps.reloadConfig());
-                    if (!isCurrent())
-                        return;
-                }
                 if (!deps.hasBotToken()) {
                     const botTokenDiagnostic = deps.getBotTokenDiagnostic?.();
                     if (botTokenDiagnostic)
                         ctx.ui.notify(botTokenDiagnostic, "error");
                     const profileNames = deps.getProfileNames?.() ?? [];
                     if (!profileName && profileNames.length > 0) {
-                        ctx.ui.notify(`No default Telegram profile configured. Available profiles: ${profileNames.join(", ")}. Use /telegram-connect <profileName> or /telegram-setup to create a default profile.`, "info");
+                        notifyUnavailableDefaultProfile(ctx, profileNames);
                         deps.updateStatus(ctx);
                         return;
                     }
@@ -654,6 +715,7 @@ export function registerTelegramBridgeCommands(pi, deps) {
                 deps.isContextCurrent?.(ctx) !== false;
             if (!isCurrent())
                 return;
+            ++connectAttempt;
             deps.connectionIntent?.cancel();
             try {
                 const threadName = deps.getDisconnectThreadName?.();

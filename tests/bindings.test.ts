@@ -1695,6 +1695,48 @@ test(`Connect preparation pins selected profile before old cleanup (${named ? "n
   else assert.deepEqual(events, ["prepare"], "A refused preparation cannot start old cleanup or change identity");
 });
 
+test("Cancelling the fallback picker does not stop or replace the connected named bot", async (t) => {
+  const harness = createBindingApiHarness();
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-profile-picker-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const store = Config.createTelegramConfigStore({
+    env: {}, agentDir: dir, configPath: join(dir, "telegram.json"), initialConfig: { profiles: {
+      default: { botToken: "$MISSING_DEFAULT" }, old: { botToken: "123:old" }, work: { botToken: "123:work" },
+    } },
+  });
+  await store.persist();
+  assert.equal(store.activateProfile("old"), true);
+  const notices: string[] = [];
+  registerTelegramCommandsAndTools({
+    pi: harness.api, configStore: store, setup: { start: () => true, finish() {} }, activeTurnRuntime: { get: () => undefined },
+    lockedPollingRuntime: {
+      prepareConnection: () => assert.fail("No profile was selected"),
+      start: async () => assert.fail("No profile was selected"),
+      stop: async () => assert.fail("The current transport must survive cancellation"),
+    },
+    onTransportChanged: async () => assert.fail("Cancellation does not publish a transport change"),
+    getStatusLines: () => [], buttonActionStore: { register: () => "fixture" },
+    sendMarkdownReply: async () => 1, callMultipart: async () => ({ ok: true }),
+    getDefaultChatId: () => 42, canSendDirect: () => true, updateStatus() {}, recordRuntimeEvent() {},
+  } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
+  const connect = harness.commands.get("telegram-connect") as { handler: (args: string, ctx: ExtensionContext) => Promise<void> };
+  await connect.handler("", {
+    cwd: "/repo", hasUI: true,
+    ui: {
+      notify(message: string) { notices.push(message); },
+      async select(_title: string, labels: string[]) {
+        assert.deepEqual(labels, ["old (active)", "work"]);
+        assert.equal(store.getActiveProfileName(), "old");
+        return undefined;
+      },
+    },
+  } as unknown as ExtensionContext);
+  assert.equal(store.getActiveProfileName(), "old");
+  assert.equal(store.getBotToken(), "123:old");
+  assert.equal(notices.length, 1);
+  assert.match(notices[0], /MISSING_DEFAULT/);
+});
+
 test("Named profile setup cancellation preserves the active runtime", async () => {
   const harness = createBindingApiHarness();
   const events: string[] = [];

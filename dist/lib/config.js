@@ -452,7 +452,7 @@ export function createTelegramConfigStore(options = {}) {
         },
         getActiveProfileName: () => activeProfileName,
         getBotToken: (profileName = activeProfileName) => resolveTelegramBotToken(applyTelegramProfile(config, profileName).botToken, env),
-        getBotTokenDiagnostic: () => getTelegramBotTokenDiagnostic(getEffectiveConfig().botToken, env),
+        getBotTokenDiagnostic: (profileName = activeProfileName) => getTelegramBotTokenDiagnostic(applyTelegramProfile(config, profileName).botToken, env),
         hasBotToken: () => !!resolveTelegramBotToken(getEffectiveConfig().botToken, env),
         getAllowedUserId: () => getEffectiveConfig().allowedUserId,
         getLegacyPollingCursor: () => getEffectiveConfig()
