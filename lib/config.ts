@@ -276,7 +276,7 @@ export interface TelegramConfigStore {
   getActiveProfileName: () => string | undefined;
   /** Resolve one profile without changing the active identity; omission selects the active profile. */
   getBotToken: (profileName?: string) => string | undefined;
-  getBotTokenDiagnostic: () => string | undefined;
+  getBotTokenDiagnostic: (profileName?: string) => string | undefined;
   hasBotToken: () => boolean;
   getAllowedUserId: () => number | undefined;
   getLegacyPollingCursor: () => number | undefined;
@@ -761,8 +761,8 @@ export function createTelegramConfigStore(
     getActiveProfileName: () => activeProfileName,
     getBotToken: (profileName = activeProfileName) =>
       resolveTelegramBotToken(applyTelegramProfile(config, profileName).botToken, env),
-    getBotTokenDiagnostic: () =>
-      getTelegramBotTokenDiagnostic(getEffectiveConfig().botToken, env),
+    getBotTokenDiagnostic: (profileName = activeProfileName) =>
+      getTelegramBotTokenDiagnostic(applyTelegramProfile(config, profileName).botToken, env),
     hasBotToken: () =>
       !!resolveTelegramBotToken(getEffectiveConfig().botToken, env),
     getAllowedUserId: () => getEffectiveConfig().allowedUserId,
