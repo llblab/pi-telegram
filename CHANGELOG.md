@@ -4,7 +4,9 @@
 
 ## Unreleased
 
-- `Profiles`: Pi completes saved profile names for `/telegram-setup` and `/telegram-connect`. With no usable default, interactive connect selects a lone saved named profile or offers a choice when multiple profiles are saved. Cancelling the chooser leaves the current connection in place; headless connect still prints the saved names.
+## 0.59.4: Profile Selection Hotfix
+
+- `Profiles`: Pi completes saved profile names for `/telegram-setup` and `/telegram-connect`. With no usable default, interactive connect selects a lone saved named profile or offers a choice when multiple profiles are saved. Cancelling the chooser leaves the current connection in place; headless connect still prints the saved names. Closes #373.
 
 ## 0.59.3: Connection Recovery And Routing Cleanup
 
