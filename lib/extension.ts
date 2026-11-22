@@ -1138,6 +1138,7 @@ export default function (
         recordRuntimeEvent,
       },
       recordRuntimeEvent,
+      isStreamMode: configControls.isActivityStreamMode,
     },
     activityVerbosity: {
       getActivityMode: configControls.getActivityVerbosity,
@@ -1148,8 +1149,14 @@ export default function (
       sendMessage,
       sendRichMessage,
       editMessageText: editTelegramMessageText,
+      deleteMessage: deleteTelegramMessage,
     },
   });
+  const previewStreamClearRuntime =
+    Bindings.createTelegramPreviewStreamClearRuntime({
+      clearPreview: previewRuntime.clear,
+      clearStreamMessage: activityVerbosityRuntime.clearStreamMessage,
+    });
   const {
     mutation: queueMutationRuntime,
     dispatchNext: dispatchNextQueuedTelegramTurn,
@@ -2697,7 +2704,7 @@ export default function (
         clearModelMenuState: modelMenuRuntime.clear,
         getActiveTurnChatId: activeTurnRuntime.getChatId,
         getActiveTurnTarget: activeTurnRuntime.getTarget,
-        clearPreview: previewRuntime.clear,
+        clearPreview: previewStreamClearRuntime.clear,
         clearActiveTurn: activeTurnRuntime.clear,
         clearAbort: abort.clearHandler,
         recordRuntimeEvent,
