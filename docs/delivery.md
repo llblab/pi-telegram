@@ -87,6 +87,44 @@ No scope selects another named profile. Profile activation remains session-local
 
 Threaded Mode applies to active-turn output and edits through retained Classic handles too. The Bot API client rejects new positive private-chat sends, copies, forwards, drafts and chat actions without a positive safe-integer top-level `message_thread_id`, before transport/file access and again at asynchronous/retry authority boundaries. Reply anchors and caller guards cannot substitute a Thread target. Classic DM, explicit channel destinations, business namespaces, callback answers and deletion remain distinct. The extension does not auto-clean historical All output.
 
+### Replies to a group message
+
+A trusted companion can pass Markdown and the exact original update to `sendTelegramView` while its [raw update handler](./updates.md) is running. The bridge sends through the same connected bot and preserves the source group, forum topic, and reply anchor:
+
+```ts
+const sent = await sendTelegramView(
+  { text: "**Build complete**" },
+  { scope: { kind: "group-reply", update } },
+);
+```
+
+Opt in by adding exact destinations to the top-level `groupReplies` list in `telegram.json`. For example, this permits one forum topic for the default profile:
+
+```json
+{
+  "groupReplies": [{ "profile": "default", "chatId": -1001234567890, "threadId": 42 }]
+}
+```
+
+Use a chat-only entry for a non-forum group; it does not authorize any forum topic. Without an exact opt-in and a new ordinary group message from the paired operator, no group send is issued. The direct polling owner must still own the original profile, bot transport, session, and update; an update copy, a numeric address, historical or retrying input, a forwarded worker, or an already-ended handler grants nothing. Await the call inside the handler. The first send attempt spends the update's group reply and suppresses default routing, even if its outcome is unknown. A refusal before that attempt does not consume the update. The companion still decides which messages match its workflow.
+
+The first part must reply to the original message; it cannot fall back to a standalone post if that anchor is unavailable. Every part uses the same exact target. The bridge never retries an issued part or sends the remainder after an unknown result. Success returns an observation-only `TelegramGroupDeliveryReceipt` with the exact target and confirmed message IDs; if a later part fails, `partial` contains the already confirmed IDs. Those IDs are not editable Delivery handles or retry authority. This scope does not grant proactive sends, Guest Mode delivery, buttons, files, edits, deletes, or chat actions.
+
+### New messages to a group
+
+To send a Markdown notification without an inbound update, use the separate `group-message` scope:
+
+```ts
+const sent = await sendTelegramView(
+  { text: "**Build complete**" },
+  { scope: { kind: "group-message", target: { chatId: -1001234567890, threadId: 42 } } },
+);
+```
+
+The operator must opt in with an exact entry in top-level `groupMessages` in `telegram.json`. It takes the same `{ profile, chatId, threadId? }` entry shape as `groupReplies`, but neither list grants the other permission. Omit `threadId` for a regular group or a non-forum supergroup. Before issuing any message, the direct polling owner checks the authorized chat's current type via Bot API `getChat`; channels, missing metadata, a forum without a topic, or a topic on a non-forum target refuse. The exact forum topic is sent as `message_thread_id`; there is no retry in General or another chat. Telegram still decides whether the bot can write.
+
+One call sends to one target. For fan-out, the companion can call it once per explicitly configured destination and keep each result separately; no enumeration of chats, implicit broadcast, or replay of uncertain sends is provided. This path uses the same confirmed-chunk receipts, no automatic retry, and no edit/delete authority as group replies. Neither scope exposes bot credentials or applies to Guest Mode.
+
 ### Handles
 
 ```ts

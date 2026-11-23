@@ -25,6 +25,7 @@ import {
   TELEGRAM_DEFAULT_PROFILE_NAME,
 } from "./paths.ts";
 import { isPiStaleContextError } from "./pi.ts";
+import { areTelegramTargetsEqual, parseTelegramGroupTarget } from "./target.ts";
 import { isWireRecord as isPlainConfigRecord } from "./wire.ts";
 
 export { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.ts";
@@ -199,6 +200,10 @@ export interface TelegramConfig {
   inboundHandlers?: TelegramInboundHandlerConfig[];
   attachmentHandlers?: TelegramInboundHandlerConfig[];
   outboundHandlers?: TelegramOutboundHandlerConfig[];
+  /** Opt-in exact group destinations, separate from pairing and private Thread settings. */
+  groupReplies?: TelegramGroupDestination[];
+  /** Independent opt-in for new messages not tied to inbound updates. */
+  groupMessages?: TelegramGroupDestination[];
   assistant?: {
     draftPreviews?: boolean;
     rendering?: TelegramAssistantRenderingMode;
@@ -226,6 +231,12 @@ export interface TelegramConfig {
   };
   /** Canonical bot/session profiles, including profiles.default. */
   profiles?: Record<string, TelegramBotProfile>;
+}
+
+interface TelegramGroupDestination {
+  profile: string;
+  chatId: number;
+  threadId?: number;
 }
 
 /**
@@ -257,6 +268,21 @@ export function isValidTelegramProfileName(name: string): boolean {
     TELEGRAM_PROFILE_NAME_PATTERN.test(name) &&
     !TELEGRAM_RESERVED_PROFILE_NAMES.has(name)
   );
+}
+
+/** Only an exact profile/chat/topic allowlist entry can opt in; a chat-only entry is not a topic wildcard. */
+export function isTelegramGroupDeliveryAllowed(
+  config: TelegramConfig,
+  policy: "group-message" | "group-reply",
+  profile: string,
+  target: { chatId: number; threadId?: number },
+): boolean {
+  const entries = policy === "group-message" ? config.groupMessages : config.groupReplies;
+  return Array.isArray(entries) && entries.some(entry => {
+    if (!isPlainConfigRecord(entry) || entry.profile !== profile) return false;
+    const allowed = parseTelegramGroupTarget(entry);
+    return allowed !== undefined && areTelegramTargetsEqual(allowed, target);
+  });
 }
 
 /** List defined profile names. */

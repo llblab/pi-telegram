@@ -6,7 +6,7 @@
 import { type TelegramTextSourceUseInput } from "./journal.ts";
 import { type TelegramInlineKeyboardButtonStyle, type TelegramInlineKeyboardMarkup } from "./keyboard.ts";
 import { type TelegramTarget } from "./target.ts";
-import { type TelegramBridgeApiRuntime, type TelegramAttachmentConsumerLease } from "./telegram-api.ts";
+import { type TelegramBridgeApiRuntime, type TelegramApiCallOptions, type TelegramAttachmentConsumerLease, type TelegramSendMessageBody } from "./telegram-api.ts";
 export type TelegramDeliveryParseMode = "plain" | "html" | "markdown";
 export interface TelegramDeliveryView {
     text: string;
@@ -78,6 +78,31 @@ export type TelegramDeliveryResult<T> = {
 export interface SendTelegramViewOptions {
     scope: TelegramDeliveryScope;
     replyToMessageId?: number;
+}
+export interface TelegramGroupDeliveryView {
+    text: string;
+    parseMode?: "markdown";
+    replyMarkup?: never;
+}
+export interface SendTelegramGroupReplyOptions {
+    scope: {
+        kind: "group-reply";
+        update: unknown;
+    };
+    replyToMessageId?: never;
+}
+export interface SendTelegramGroupMessageOptions {
+    scope: {
+        kind: "group-message";
+        target: TelegramDeliveryTarget;
+    };
+    replyToMessageId?: never;
+}
+type TelegramGroupScope = (SendTelegramGroupReplyOptions | SendTelegramGroupMessageOptions)["scope"];
+/** Confirmed chunks only; this receipt grants no edit, delete, or replay authority. */
+export interface TelegramGroupDeliveryReceipt {
+    readonly target: Readonly<TelegramDeliveryTarget>;
+    readonly messageIds: readonly number[];
 }
 export type TelegramDeliveryChatAction = "typing" | "upload_document" | "upload_photo" | "record_voice";
 export type TelegramTaskViewStatus = "running" | "completed" | "failed" | "cancelled";
@@ -527,6 +552,7 @@ export interface TelegramDeliveryRuntime {
     hasPendingTarget?: (target: TelegramDeliveryTarget) => boolean;
     shutdown: () => void;
     sendView: (view: TelegramDeliveryView, options: SendTelegramViewOptions) => Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
+    sendGroupView?: (view: TelegramGroupDeliveryView, scope: TelegramGroupScope) => Promise<TelegramDeliveryResult<TelegramGroupDeliveryReceipt>>;
     editView: (handle: TelegramDeliveryHandle, view: TelegramDeliveryView) => Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
     deleteView: (handle: TelegramDeliveryHandle) => Promise<TelegramDeliveryResult<void>>;
     sendChatAction: (action: TelegramDeliveryChatAction, scope: TelegramDeliveryScope) => Promise<TelegramDeliveryResult<void>>;
@@ -562,6 +588,24 @@ export interface TelegramQuestionLifetimeOwner {
         assertAuthority?: () => void;
     }>) => (() => void);
 }
+interface TelegramGroupReplySource {
+    target: Readonly<TelegramDeliveryTarget>;
+    messageId: number;
+    senderId: number;
+    journalBindingKey: string;
+    isCurrent(): boolean;
+    claim(): boolean;
+}
+type TelegramGroupPublication = {
+    target: Readonly<TelegramDeliveryTarget>;
+    assertCurrent(): void;
+    send(body: TelegramSendMessageBody, assertAuthority: () => void): Promise<unknown>;
+} & (({
+    kind: "group-reply";
+} & Pick<TelegramGroupReplySource, "messageId" | "claim">) | {
+    kind: "group-message";
+    verifyChat(assertAuthority: () => void): Promise<boolean>;
+});
 /** @internal */
 export interface TelegramDeliveryTargetResolverDeps {
     getActiveTurnTarget: () => TelegramDeliveryTarget | undefined;
@@ -603,6 +647,7 @@ export interface TelegramDeliveryRuntimeDeps extends TelegramDeliveryTargetResol
     /** Transport adapters must provide this query; isolated pure-kernel fixtures need no bot transport. */
     getTextInputReceiverBotId?: (target: Readonly<TelegramDeliveryTarget>) => number | undefined;
     captureDrain?: () => (() => void) | undefined;
+    captureGroupPublication?: (scope: TelegramGroupScope) => TelegramGroupPublication | undefined;
     renderView: (view: TelegramDeliveryView) => readonly TelegramDeliveryRenderedChunk[];
     sendChunk: (target: TelegramDeliveryTarget, chunk: TelegramDeliveryRenderedChunk, options: TelegramDeliveryTransportOptions) => Promise<number>;
     editChunk: (target: TelegramDeliveryTarget, messageId: number, chunk: TelegramDeliveryRenderedChunk, options: TelegramDeliveryTransportOptions) => Promise<void>;
@@ -628,6 +673,14 @@ export interface TelegramBridgeDeliveryRuntimeDeps {
     getActiveTurnIdentity?: () => object | undefined;
     captureArtifactSession?: () => (() => boolean) | undefined;
     isTransportActive?: () => boolean;
+    groupDelivery?: {
+        getReplySource(update: unknown): TelegramGroupReplySource | undefined;
+        getDirectJournalBindingKey(): string | undefined;
+        isAllowed(kind: TelegramGroupScope["kind"], profile: string, target: Readonly<TelegramDeliveryTarget>): boolean;
+        captureProfileScope(profile: string): () => boolean;
+        captureDirectAuthority(): (() => void) | undefined;
+        call(method: "getChat" | "sendMessage", body: Record<string, unknown>, options: TelegramApiCallOptions): Promise<unknown>;
+    };
     api: Pick<TelegramBridgeApiRuntime, "sendMessage" | "editMessageText" | "deleteMessage" | "sendChatAction" | "captureArtifactTransport" | "captureAttachmentPublication">;
     recordOwnership: (input: {
         chatId: number;
@@ -707,6 +760,7 @@ export declare function clearTelegramDeliveryRuntime(): void;
 export declare function captureTelegramQuestionLifetimeOwner(): Readonly<TelegramQuestionLifetimeOwner> | undefined;
 /** @internal */
 export declare function isTelegramDeliveryHandleCurrent(handle: TelegramDeliveryHandle): boolean;
+export declare function sendTelegramView(view: TelegramGroupDeliveryView, options: SendTelegramGroupReplyOptions | SendTelegramGroupMessageOptions): Promise<TelegramDeliveryResult<TelegramGroupDeliveryReceipt>>;
 export declare function sendTelegramView(view: TelegramDeliveryView, options: SendTelegramViewOptions): Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
 export declare function openTelegramTaskView(raw: TelegramTaskViewRequest): Promise<TelegramTaskViewOpenResult>;
 /** @internal Reserved Attachment controls fail softly without a compatible receiver; never model input. */

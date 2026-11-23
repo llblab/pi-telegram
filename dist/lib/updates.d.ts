@@ -600,7 +600,7 @@ export interface TelegramUpdateWorkerRuntimeDeps<TContext> {
     journal: TelegramUpdateWorkerJournalPort;
     executeUpdate: (update: TelegramJournaledUpdate, ctx: TContext, signal: AbortSignal, target?: TelegramTarget & {
         threadId: number;
-    }) => Promise<TelegramUpdateAdmissionOutcome> | TelegramUpdateAdmissionOutcome;
+    }, freshGroupReply?: true) => Promise<TelegramUpdateAdmissionOutcome> | TelegramUpdateAdmissionOutcome;
     /** Native source-only binding, installed by the admission-worker assembly rather than ordinary dispatch. */
     admitPreparedLiveInput?: (update: TelegramJournaledUpdate, ctx: TContext, signal: AbortSignal) => Promise<{
         outcome: TelegramUpdateAdmissionOutcome;
@@ -852,6 +852,18 @@ export interface TelegramUpdateHandlerRegistry {
      */
     dispatch: (update: unknown, execution?: TelegramUpdateExecutionFence) => Promise<TelegramUpdateHandlerVerdict>;
 }
+interface TelegramGroupReplyAddress {
+    readonly target: Readonly<TelegramTarget>;
+    readonly senderId: number;
+    readonly messageId: number;
+}
+interface TelegramGroupReplySource extends TelegramGroupReplyAddress {
+    readonly journalBindingKey: string;
+    isCurrent(): boolean;
+    claim(): boolean;
+}
+/** @internal Read the original direct-dispatch source; caller-supplied clones and late lookups do not qualify. */
+export declare function getTelegramGroupReplySource(update: unknown): TelegramGroupReplySource | undefined;
 /**
  * Called by pi-telegram's own runtime to obtain the registry it dispatches
  * through. Extension consumers should not call this; use

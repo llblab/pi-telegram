@@ -39,7 +39,7 @@ Each handler returns one of:
 - `"consume"` — `pi-telegram` skips its default routing for this update.
 - `"pass"` or `void` / `undefined` — `pi-telegram` routes the update normally. Other handlers registered after this one still run for the same update.
 
-The first handler that returns `"consume"` wins; later handlers are not called for that update.
+The first handler that returns `"consume"` wins; later handlers are not called for that update. An [opt-in group reply](./delivery.md#replies-to-a-group-message) that claims its original update suppresses default routing even if the companion returns `"pass"`.
 
 ## Registering a handler
 

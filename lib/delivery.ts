@@ -23,6 +23,8 @@ import {
 import {
   areTelegramTargetsEqual as areDeliveryTargetsEqual,
   getTelegramTargetThreadParams,
+  matchesTelegramGroupChat,
+  parseTelegramGroupTarget,
   type TelegramTarget,
 } from "./target.ts";
 import { captureTelegramDrainObserver } from "./machine.ts";
@@ -35,8 +37,10 @@ import {
   TelegramApiAuthorityError,
   isTelegramMessageUnavailableError,
   type TelegramBridgeApiRuntime,
+  type TelegramApiCallOptions,
   type TelegramApiUiAuthorityOptions,
   type TelegramAttachmentConsumerLease,
+  type TelegramSendMessageBody,
 } from "./telegram-api.ts";
 
 const TELEGRAM_DELIVERY_RUNTIME_KEY = "__piTelegramDeliveryRuntime__";
@@ -139,6 +143,30 @@ export type TelegramDeliveryResult<T> =
 export interface SendTelegramViewOptions {
   scope: TelegramDeliveryScope;
   replyToMessageId?: number;
+}
+
+export interface TelegramGroupDeliveryView {
+  text: string;
+  parseMode?: "markdown";
+  replyMarkup?: never;
+}
+
+export interface SendTelegramGroupReplyOptions {
+  scope: { kind: "group-reply"; update: unknown };
+  replyToMessageId?: never;
+}
+
+export interface SendTelegramGroupMessageOptions {
+  scope: { kind: "group-message"; target: TelegramDeliveryTarget };
+  replyToMessageId?: never;
+}
+
+type TelegramGroupScope = (SendTelegramGroupReplyOptions | SendTelegramGroupMessageOptions)["scope"];
+
+/** Confirmed chunks only; this receipt grants no edit, delete, or replay authority. */
+export interface TelegramGroupDeliveryReceipt {
+  readonly target: Readonly<TelegramDeliveryTarget>;
+  readonly messageIds: readonly number[];
 }
 
 export type TelegramDeliveryChatAction =
@@ -761,6 +789,10 @@ export interface TelegramDeliveryRuntime {
     view: TelegramDeliveryView,
     options: SendTelegramViewOptions,
   ) => Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
+  sendGroupView?: (
+    view: TelegramGroupDeliveryView,
+    scope: TelegramGroupScope,
+  ) => Promise<TelegramDeliveryResult<TelegramGroupDeliveryReceipt>>;
   editView: (
     handle: TelegramDeliveryHandle,
     view: TelegramDeliveryView,
@@ -832,6 +864,24 @@ export interface TelegramQuestionLifetimeOwner {
   }>) => (() => void);
 }
 
+interface TelegramGroupReplySource {
+  target: Readonly<TelegramDeliveryTarget>;
+  messageId: number;
+  senderId: number;
+  journalBindingKey: string;
+  isCurrent(): boolean;
+  claim(): boolean;
+}
+
+type TelegramGroupPublication = {
+  target: Readonly<TelegramDeliveryTarget>;
+  assertCurrent(): void;
+  send(body: TelegramSendMessageBody, assertAuthority: () => void): Promise<unknown>;
+} & (
+  | ({ kind: "group-reply" } & Pick<TelegramGroupReplySource, "messageId" | "claim">)
+  | { kind: "group-message"; verifyChat(assertAuthority: () => void): Promise<boolean> }
+);
+
 /** @internal */
 export interface TelegramDeliveryTargetResolverDeps {
   getActiveTurnTarget: () => TelegramDeliveryTarget | undefined;
@@ -870,6 +920,7 @@ export interface TelegramDeliveryRuntimeDeps extends TelegramDeliveryTargetResol
   /** Transport adapters must provide this query; isolated pure-kernel fixtures need no bot transport. */
   getTextInputReceiverBotId?: (target: Readonly<TelegramDeliveryTarget>) => number | undefined;
   captureDrain?: () => (() => void) | undefined;
+  captureGroupPublication?: (scope: TelegramGroupScope) => TelegramGroupPublication | undefined;
   renderView: (
     view: TelegramDeliveryView,
   ) => readonly TelegramDeliveryRenderedChunk[];
@@ -917,6 +968,14 @@ export interface TelegramBridgeDeliveryRuntimeDeps {
   getActiveTurnIdentity?: () => object | undefined;
   captureArtifactSession?: () => (() => boolean) | undefined;
   isTransportActive?: () => boolean;
+  groupDelivery?: {
+    getReplySource(update: unknown): TelegramGroupReplySource | undefined;
+    getDirectJournalBindingKey(): string | undefined;
+    isAllowed(kind: TelegramGroupScope["kind"], profile: string, target: Readonly<TelegramDeliveryTarget>): boolean;
+    captureProfileScope(profile: string): () => boolean;
+    captureDirectAuthority(): (() => void) | undefined;
+    call(method: "getChat" | "sendMessage", body: Record<string, unknown>, options: TelegramApiCallOptions): Promise<unknown>;
+  };
   api: Pick<
     TelegramBridgeApiRuntime,
     "sendMessage" | "editMessageText" | "deleteMessage" | "sendChatAction" | "captureArtifactTransport" | "captureAttachmentPublication"
@@ -1547,6 +1606,71 @@ export function createTelegramDeliveryRuntime(
       partial,
       classified.retryAfterMs,
     );
+  };
+  const sendGroupView = async (
+    view: TelegramGroupDeliveryView,
+    scope: TelegramGroupScope,
+  ): Promise<TelegramDeliveryResult<TelegramGroupDeliveryReceipt>> => {
+    if (!active) return inactive();
+    const publication = deps.captureGroupPublication?.(scope);
+    if (!publication) return failure("target-unauthorized", scope.kind === "group-reply"
+      ? "An original authorized Telegram group message is required."
+      : "Telegram group message delivery is not authorized for this target.");
+    const rendered = render({ text: view.text, parseMode: "markdown" });
+    if (!rendered.ok) return failure(rendered.reason, rendered.message);
+    const { target } = publication;
+    return runForTarget(target, async () => {
+      const ids: number[] = [];
+      const receipt = (): TelegramGroupDeliveryReceipt => Object.freeze({
+        target, messageIds: Object.freeze([...ids]),
+      });
+      const unavailable = () => failure("target-unavailable", "Telegram group delivery authority is no longer current.",
+        ids.length ? receipt() : undefined);
+      const assertAuthority = () => {
+        if (!active) throw new TelegramApiAuthorityError(false);
+        publication.assertCurrent();
+      };
+      if (publication.kind === "group-message") {
+        try {
+          assertAuthority();
+          if (!await publication.verifyChat(assertAuthority))
+            return failure("target-unavailable", "Telegram group and topic metadata do not match the exact target.");
+        } catch (error) {
+          if (error instanceof TelegramApiAuthorityError) return unavailable();
+          return transportFailure("send", error, target);
+        }
+      }
+      for (const [index, chunk] of rendered.value.entries()) {
+        try { assertAuthority(); }
+        catch { return unavailable(); }
+        const reply = index === 0 && publication.kind === "group-reply" ? publication : undefined;
+        if (reply && !reply.claim())
+          return failure("target-unavailable", "This Telegram group message already has a reply attempt.");
+        const body: TelegramSendMessageBody = {
+          chat_id: target.chatId,
+          ...getTelegramTargetThreadParams(target),
+          text: chunk.text,
+          ...(chunk.parseMode === "html" ? { parse_mode: "HTML" as const } : {}),
+          ...(reply ? { reply_parameters: { message_id: reply.messageId, allow_sending_without_reply: false } } : {}),
+        };
+        try {
+          const sent = await publication.send(body, assertAuthority);
+          if (!isWireRecord(sent) || !isWireRecord(sent.chat) || sent.chat.id !== target.chatId ||
+              sent.message_thread_id !== target.threadId || typeof sent.message_id !== "number" ||
+              !Number.isSafeInteger(sent.message_id) || sent.message_id <= 0 || ids.includes(sent.message_id))
+            throw new TelegramApiCommitUnknownError("sendMessage", new Error("Telegram group delivery receipt did not match its target."));
+          ids.push(sent.message_id);
+        } catch (error) {
+          if (error instanceof TelegramApiAuthorityError && !error.requestIssued) return unavailable();
+          const original = isTelegramApiRequestRejected(error, "sendMessage") || isTelegramApiCommitUnknownError(error)
+            ? error : new TelegramApiCommitUnknownError("sendMessage", error);
+          return transportFailure("send", original, target, ids.length ? receipt() : undefined);
+        }
+        try { assertAuthority(); }
+        catch { return unavailable(); }
+      }
+      return { ok: true, value: receipt() };
+    });
   };
   const createHandle = (
     target: TelegramDeliveryTarget,
@@ -2657,6 +2781,7 @@ export function createTelegramDeliveryRuntime(
       if (!finishQuestion(entry, decision.status, option?.id)) return { handled: true, accepted: false };
       return { handled: true, accepted: true, handle: entry.handle, decision, assertCurrent: acceptedAuthority(entry) };
     },
+    ...(deps.captureGroupPublication ? { sendGroupView } : {}),
     async sendView(view, options) {
       if (!active) return inactive();
       const resolved = resolveTelegramDeliveryTarget(options.scope, deps);
@@ -2816,6 +2941,7 @@ export function createTelegramBridgeDeliveryRuntime(
 ): TelegramDeliveryRuntime {
   const questionPolicy = captureTelegramBridgeQuestionPolicy(deps);
   const getPolicyView = deps.getTargetPolicyView;
+  const groupDelivery = deps.groupDelivery;
   const getInputReceiverBotId = deps.getTextInputReceiverBotId;
   const assertTransportActive = (): void => {
     if (deps.isTransportActive?.() === false) {
@@ -2893,6 +3019,55 @@ export function createTelegramBridgeDeliveryRuntime(
     ...questionPolicy,
     generation: deps.generation,
     captureDrain: deps.captureDrain,
+    captureGroupPublication: groupDelivery && (scope => {
+      const kind = scope.kind;
+      const source = kind === "group-reply" ? groupDelivery.getReplySource(scope.update) : undefined;
+      const address = kind === "group-reply" ? source?.target : parseTelegramGroupTarget(scope.target);
+      const profile = deps.getProfileName?.();
+      if (!address || !profile) return undefined;
+      const target = Object.freeze(address);
+      const permitted = () => {
+        const policy = getPolicyView();
+        return policy.ownsDirect && policy.canDeliver && policy.allowedChatId !== undefined &&
+          deps.isTransportActive?.() !== false && deps.getProfileName?.() === profile &&
+          (!source || policy.allowedChatId === source.senderId && source.isCurrent() &&
+            groupDelivery.getDirectJournalBindingKey() === source.journalBindingKey) &&
+          groupDelivery.isAllowed(kind, profile, target);
+      };
+      if (!permitted()) return undefined;
+      const profileCurrent = groupDelivery.captureProfileScope(profile);
+      const transport = groupDelivery.captureDirectAuthority();
+      if (!transport) return undefined;
+      let lost = false;
+      const assertCurrent = () => {
+        try {
+          if (lost || !permitted()) throw new TelegramApiAuthorityError(false);
+          transport();
+          if (!profileCurrent() || !permitted()) throw new TelegramApiAuthorityError(false);
+        } catch {
+          lost = true;
+          throw new TelegramApiAuthorityError(false);
+        }
+      };
+      try { assertCurrent(); }
+      catch { return undefined; }
+      const call = (method: "getChat" | "sendMessage", body: Record<string, unknown>, assertAuthority: () => void) =>
+        groupDelivery.call(method, body, {
+          assertAuthority, maxAttempts: 1, retryRateLimit: false,
+          retrySafety: method === "getChat" ? "safe" : "non-idempotent",
+        });
+      return {
+        target, assertCurrent,
+        ...(source ? { kind: "group-reply", messageId: source.messageId, claim: () => source.claim() } : {
+          kind: "group-message",
+          // Unlike a reply, this destination has no native inbound chat evidence.
+          verifyChat: async (assertAuthority: () => void) => matchesTelegramGroupChat(
+            await call("getChat", { chat_id: target.chatId }, assertAuthority), target,
+          ),
+        }),
+        send: (body, assertAuthority) => call("sendMessage", { ...body }, assertAuthority),
+      };
+    }),
     captureArtifactTransport(target, scope) {
       const transport = deps.api.captureArtifactTransport?.(target), session = deps.captureArtifactSession?.();
       const turn = scope.kind === "active-turn" ? deps.getActiveTurnIdentity?.() : undefined;
@@ -3141,13 +3316,29 @@ export function isTelegramDeliveryHandleCurrent(
   return runtime !== undefined && runtime.generation === handle.generation;
 }
 
-export async function sendTelegramView(
+export function sendTelegramView(
+  view: TelegramGroupDeliveryView,
+  options: SendTelegramGroupReplyOptions | SendTelegramGroupMessageOptions,
+): Promise<TelegramDeliveryResult<TelegramGroupDeliveryReceipt>>;
+export function sendTelegramView(
   view: TelegramDeliveryView,
   options: SendTelegramViewOptions,
-): Promise<TelegramDeliveryResult<TelegramDeliveryHandle>> {
-  const invalid = validateView<TelegramDeliveryHandle>(view);
+): Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
+export async function sendTelegramView(
+  view: TelegramDeliveryView,
+  options: SendTelegramViewOptions | SendTelegramGroupReplyOptions | SendTelegramGroupMessageOptions,
+): Promise<TelegramDeliveryResult<TelegramDeliveryHandle | TelegramGroupDeliveryReceipt>> {
+  const invalid = validateView<TelegramDeliveryHandle | TelegramGroupDeliveryReceipt>(view);
   if (invalid) return invalid;
-  return runDeliveryOperation((runtime) => runtime.sendView(view, options));
+  const { scope } = options;
+  if (scope.kind === "group-reply" || scope.kind === "group-message") {
+    const { text, parseMode, replyMarkup } = view;
+    if ((parseMode !== undefined && parseMode !== "markdown") || replyMarkup !== undefined || options.replyToMessageId !== undefined)
+      return failure("invalid-view", "Telegram group delivery accepts only Markdown and does not accept a caller-supplied reply anchor.");
+    return runDeliveryOperation(runtime => runtime.sendGroupView?.({ text }, scope) ??
+      Promise.resolve(failure("runtime-unavailable", "Telegram group delivery is unavailable.")));
+  }
+  return runDeliveryOperation(runtime => runtime.sendView(view, options as SendTelegramViewOptions));
 }
 
 export function openTelegramTaskView(raw: TelegramTaskViewRequest): Promise<TelegramTaskViewOpenResult> {

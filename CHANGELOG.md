@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.60.0: Companion Delivery To Telegram Groups
+
+- `Delivery`: Companion extensions can send Markdown through the connected bot to exact, opt-in groups and forum topics. Reply and proactive-send permissions are separate; replies require the original live operator update, while new messages do not. Both report confirmed parts without granting edit, delete, or replay authority, and never fall back to another chat or topic.
+
 ## 0.59.4: Profile Selection Hotfix
 
 - `Profiles`: Pi completes saved profile names for `/telegram-setup` and `/telegram-connect`. With no usable default, interactive connect selects a lone saved named profile or offers a choice when multiple profiles are saved. Cancelling the chooser leaves the current connection in place; headless connect still prints the saved names. Closes #373.

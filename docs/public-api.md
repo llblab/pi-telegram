@@ -346,6 +346,8 @@ if (!sent.ok) {
 
 The delivery runtime resolves its live binding on every call and returns structured failures for unavailable runtimes, missing or unauthorized targets, stale handles, invalid views, and transport failures. A logical handle may represent several chunked Telegram messages; edit and delete reconcile the whole logical view. If send or edit growth fails after materializing messages, the failure carries a valid partial handle for deterministic retry or cleanup. Followers route through the existing leader transport, and reload/session replacement invalidates old handles rather than retaining Pi contexts.
 
+The `group-reply` scope for `sendTelegramView` sends Markdown in reply to one original authorized group update. The separately opted-in `group-message` scope sends new Markdown to an exact group or topic without an update. Both return confirmed message IDs rather than editable handles. See [Telegram Delivery API](./delivery.md#replies-to-a-group-message) for configuration and boundaries.
+
 Full behavior: [Telegram Delivery API](./delivery.md).
 
 ## Confirm API (Unreleased)

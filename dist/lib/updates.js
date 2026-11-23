@@ -10,7 +10,7 @@ import { createTelegramUserPairingRuntime, getTelegramAuthorizationState, } from
 import { TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION, TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION, TELEGRAM_UPDATE_JOURNAL_FAILURE_CLASS_MAX_LENGTH, TELEGRAM_UPDATE_JOURNAL_FAILURE_SUMMARY_MAX_LENGTH, TELEGRAM_UPDATE_JOURNAL_QUEUE_OWNER_ID_MAX_LENGTH, TELEGRAM_UPDATE_JOURNAL_VERSION, areTelegramUpdateJournalQueueOwnersEqual, createTelegramUpdateJournalEntryDigest, doesTelegramJournalUpdateNameThread, isTelegramJournalLoneCallbackUpdate, getTelegramUpdateJournalBindingPath, isTelegramUpdateJournalLegacyFamilyVersion, isTelegramUpdateJournalQueueOwnerProcess, parseTelegramUpdateJournalQueueOwner, } from "./journal.js";
 import { isPiStaleContextError } from "./pi.js";
 import { areTelegramQueueAdmissionReceiptsEqual, createTelegramQueueHandoff, removeTelegramQueueItemByReceipt, } from "./queue.js";
-import { createTelegramPrivateTarget, createTelegramThreadTarget, } from "./target.js";
+import { createTelegramPrivateTarget, createTelegramThreadTarget, matchesTelegramGroupChat, parseTelegramGroupTarget, } from "./target.js";
 import { isWireRecord as isTelegramUpdateAdmissionRecord, isNonEmptyWireString as isTelegramUpdateAdmissionString, } from "./wire.js";
 export const TELEGRAM_PRIORITY_REACTIONS = [
     { id: 10, name: "like", emoji: "👍" },
@@ -1946,7 +1946,7 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
             signal.removeEventListener("abort", cancel);
         }
     };
-    const executeWithinOwner = async (expectedOwner, update, preparedExecute, target) => {
+    const executeWithinOwner = async (expectedOwner, update, preparedExecute, target, freshGroupReply) => {
         const updateId = update.update_id;
         if (expectedOwner.controller.signal.aborted) {
             return TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED;
@@ -1985,7 +1985,7 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
                 ? preparedExecute(update, expectedOwner.ctx, expectedOwner.controller.signal)
                 : deps.executeCustodiedUpdate
                     ? deps.executeCustodiedUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal)
-                    : deps.executeUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal, target);
+                    : deps.executeUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal, target, freshGroupReply);
         });
         const settlement = execution.then((outcome) => custodied
             ? {
@@ -2697,7 +2697,8 @@ function createTelegramUpdateWorkerCore(deps, ordinaryV4) {
                             throw new Error("Prepared status admission is unconfirmed.");
                         return admitted.outcome;
                     }
-                    : undefined, prepared?.target);
+                    : undefined, prepared?.target, !prepared && entry.state === "pending" && !entry.failure &&
+                    !expectedOwner.startupUpdateIds.has(entry.updateId) ? true : undefined);
                 if (execution === TELEGRAM_UPDATE_WORKER_EXECUTION_RECHECK) {
                     snapshotInvalidated = true;
                     break;
@@ -4334,6 +4335,34 @@ export function carryTelegramUpdateExecutionFence(source, target) {
         : target;
 }
 const UPDATE_HANDLER_REGISTRY_KEY = "__piTelegramUpdateHandlerRegistry__";
+// An update ID or the public execution fence alone does not prove original destination or ongoing handler ownership.
+const groupReplySources = new WeakMap();
+/** @internal Read the original direct-dispatch source; caller-supplied clones and late lookups do not qualify. */
+export function getTelegramGroupReplySource(update) {
+    if (!update || typeof update !== "object")
+        return undefined;
+    return groupReplySources.get(update);
+}
+function captureTelegramGroupReplyAddress(update) {
+    const message = update.message;
+    if (!isTelegramUpdateAdmissionRecord(message) ||
+        !isTelegramUpdateAdmissionRecord(message.chat) ||
+        !isTelegramUpdateAdmissionRecord(message.from) ||
+        message.from.is_bot !== false || "sender_chat" in message ||
+        "business_connection_id" in message || "guest_query_id" in message ||
+        "ephemeral_message_id" in message || "direct_messages_topic" in message ||
+        "forum_topic_created" in message || "forum_topic_closed" in message || "forum_topic_reopened" in message)
+        return undefined;
+    const { id: senderId } = message.from;
+    const { message_id: messageId, message_thread_id: threadId, is_topic_message: isTopic } = message;
+    const target = parseTelegramGroupTarget({ chatId: message.chat.id, threadId });
+    if (!target || !matchesTelegramGroupChat(message.chat, target) ||
+        (threadId === undefined ? isTopic !== undefined && isTopic !== false : isTopic !== true) ||
+        typeof senderId !== "number" || !Number.isSafeInteger(senderId) || senderId <= 0 ||
+        typeof messageId !== "number" || !Number.isSafeInteger(messageId) || messageId <= 0)
+        return undefined;
+    return { updateId: update.update_id, target: Object.freeze(target), senderId, messageId };
+}
 function isValidV1UpdateHandlerRegistry(candidate) {
     if (!candidate || typeof candidate !== "object")
         return false;
@@ -4485,16 +4514,16 @@ export function createTelegramCustodiedExecutionSession(input) {
  * admission. Production polling switches to this only with the journal worker.
  */
 export function createTelegramUpdateAdmissionHandle(deps) {
-    if (deps.onLateOutcome && !deps.onLateOutcomeError) {
-        throw new Error("Telegram late admission outcomes require a diagnostic error sink.");
-    }
     return createTelegramUpdateSourceAdmissionHandle(deps);
 }
 /** Same native source/fence/late-ACK owner, with an internal binding-only callback instead of registry/ordinary dispatch. */
 function createTelegramUpdateSourceAdmissionHandle(deps, capture) {
+    if (deps.onLateOutcome && !deps.onLateOutcomeError) {
+        throw new Error("Telegram late admission outcomes require a diagnostic error sink.");
+    }
     const registry = deps.registry ?? getOrCreateUpdateHandlerRegistry();
     let nextExecutionGeneration = 0;
-    return async (update, ctx, signal) => {
+    return async (update, ctx, signal, groupReply) => {
         const generation = ++nextExecutionGeneration;
         const journalBindingKey = deps.getJournalBindingKey?.();
         let suspended = false;
@@ -4526,9 +4555,33 @@ function createTelegramUpdateSourceAdmissionHandle(deps, capture) {
         };
         execution.assertCurrent();
         if (!capture) {
-            const verdict = await registry.dispatch(update, execution);
+            const reply = groupReply?.updateId === update.update_id && journalBindingKey !== undefined ? groupReply : undefined;
+            let claimed = false, dispatching = true;
+            if (reply && journalBindingKey) {
+                const { target, senderId, messageId } = reply;
+                const isCurrent = () => dispatching && execution.isCurrent() && deps.getJournalBindingKey?.() === journalBindingKey;
+                groupReplySources.set(update, Object.freeze({
+                    target, senderId, messageId, journalBindingKey, isCurrent,
+                    claim() {
+                        if (claimed || !isCurrent())
+                            return false;
+                        claimed = true;
+                        return true;
+                    },
+                }));
+            }
+            let verdict;
+            try {
+                verdict = await registry.dispatch(update, execution);
+            }
+            finally {
+                dispatching = false;
+                if (reply)
+                    groupReplySources.delete(update);
+            }
             execution.assertCurrent();
-            if (verdict === "consume")
+            // Once the companion attempts publication, default routing must not answer the same source again.
+            if (claimed || verdict === "consume")
                 return { kind: "complete" };
         }
         let immediate = true;
@@ -5688,7 +5741,7 @@ export function createTelegramUpdateAdmissionWorkerRuntime(deps) {
             });
         },
     };
-    const executeUpdate = createTelegramUpdateAdmissionHandle(admissionDeps);
+    const executeUpdate = createTelegramUpdateSourceAdmissionHandle(admissionDeps);
     const admitPreparedLiveInput = async (update, ctx, signal) => {
         let carrier;
         const admit = createTelegramUpdateSourceAdmissionHandle(admissionDeps, (value) => {
@@ -5735,8 +5788,10 @@ export function createTelegramUpdateAdmissionWorkerRuntime(deps) {
                     update, ctx, signal),
             }
             : {}),
-        async executeUpdate(update, ctx, signal, target) {
+        async executeUpdate(update, ctx, signal, target, freshGroupReply) {
             const typedUpdate = update;
+            // Preparation may project or mutate the handler's update. It cannot choose a reply address.
+            const groupReply = freshGroupReply && !target ? captureTelegramGroupReplyAddress(typedUpdate) : undefined;
             const prepared = deps.prepareUpdateForExecution?.(typedUpdate) ?? typedUpdate;
             // Journal/source evidence remains the original; only the warm released handler projection changes destination.
             const projectTo = (destination) => ({ ...prepared,
@@ -5747,7 +5802,7 @@ export function createTelegramUpdateAdmissionWorkerRuntime(deps) {
             });
             const routed = target ? projectTo(target) : prepared;
             try {
-                return await executeUpdate(routed, ctx, signal);
+                return await executeUpdate(routed, ctx, signal, groupReply);
             }
             catch (error) {
                 if (await deps.settleTerminalExecutionFailure?.(error)) {

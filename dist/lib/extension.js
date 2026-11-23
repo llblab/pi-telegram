@@ -828,6 +828,18 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
         isTransportStampActive: telegramTransportStampRuntime.isActive,
         getActiveTurnTarget: deliveryTargetPolicyRuntime.getActiveTurnTarget,
         getActiveTurnIdentity: activeTurnRuntime.get,
+        groupDelivery: {
+            getReplySource: Updates.getTelegramGroupReplySource,
+            getDirectJournalBindingKey() {
+                return updateAdmissionRuntimeBinding.getLeader()?.getJournalBindingKey();
+            },
+            isAllowed(kind, profile, target) {
+                return Config.isTelegramGroupDeliveryAllowed(configStore.getStoredConfig(), kind, profile, target);
+            },
+            captureProfileScope: configStore.captureConnectionScope,
+            captureDirectAuthority: captureRuntimeAuthority,
+            call: directTelegramApiRuntime.call,
+        },
         captureArtifactSession: Lifecycle.createTelegramArtifactSessionCapture({
             context: telegramSessionContextStore,
             getSessionId: Pi.getExtensionContextSessionId,
@@ -838,7 +850,9 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
         recordFailure(operation, error, target) {
             recordRuntimeEvent("delivery", error, {
                 operation,
-                scope: target?.threadId === undefined ? "aggregate" : "thread",
+                scope: target && target.chatId < 0
+                    ? target.threadId === undefined ? "group" : "group-topic"
+                    : target?.threadId === undefined ? "aggregate" : "thread",
             });
         },
     });
