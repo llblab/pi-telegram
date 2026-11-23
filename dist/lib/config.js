@@ -8,6 +8,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, u
 import { withTelegramFileTransaction } from "./locks.js";
 import { resolveAgentDir, resolveTelegramConfigPath, TELEGRAM_DEFAULT_PROFILE_NAME, } from "./paths.js";
 import { isPiStaleContextError } from "./pi.js";
+import { areTelegramTargetsEqual, parseTelegramGroupTarget } from "./target.js";
 import { isWireRecord as isPlainConfigRecord } from "./wire.js";
 export { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.js";
 const CONFIG_REPLACE_RETRY_ATTEMPTS = 5;
@@ -117,6 +118,16 @@ const TELEGRAM_RESERVED_PROFILE_NAMES = new Set([
 export function isValidTelegramProfileName(name) {
     return (TELEGRAM_PROFILE_NAME_PATTERN.test(name) &&
         !TELEGRAM_RESERVED_PROFILE_NAMES.has(name));
+}
+/** Only an exact profile/chat/topic allowlist entry can opt in; a chat-only entry is not a topic wildcard. */
+export function isTelegramGroupDeliveryAllowed(config, policy, profile, target) {
+    const entries = policy === "group-message" ? config.groupMessages : config.groupReplies;
+    return Array.isArray(entries) && entries.some(entry => {
+        if (!isPlainConfigRecord(entry) || entry.profile !== profile)
+            return false;
+        const allowed = parseTelegramGroupTarget(entry);
+        return allowed !== undefined && areTelegramTargetsEqual(allowed, target);
+    });
 }
 /** List defined profile names. */
 export function getTelegramProfileNames(config) {

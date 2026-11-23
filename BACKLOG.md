@@ -32,6 +32,10 @@ Outcome: attribute the reported session replacement during unfinished native com
 
 - [ ] Obtain redacted original session/runtime evidence and exact bridge/host versions. Distinguish observer expiry, native compaction completion/cancellation, ordinary prompt dispatch and explicit session-replacement controls. Reproduce any remaining failure through the actual SDK and bridge with original queued receipts; a configurable or longer observer timeout is not an admitted fix without a causal witness. Close by an evidenced correction or attribution to an older host, explicit control or other owner; do not infer the historical cause from passing current-runtime checks.
 
+## Companion group delivery
+
+- [ ] Obtain operator-authorized live acceptance of the [opt-in group delivery paths](./docs/delivery.md#replies-to-a-group-message) on a disposable group and forum. Verify reply and proactive scopes separately: exact opt-in, one target per call, all parts retain their topic, and neither a missing reply anchor nor a failed group send redirects to another destination. Verify that removal of the bot or its write permission gives a truthful refusal. Local fake-Bot-API checks do not establish live behavior.
+
 ## Nonblocking post-release investigations
 
 Outcome: attribute retained historical failures and finish remaining live acceptance without treating later successful checks as their cause. These remain follow-ups after the operator-approved 0.59.0 publication, not new gates for the narrow attachment-addressing hotfix. Warm custody-preserving recovery and private Input/Attachment delivery retain their separate planned scope.

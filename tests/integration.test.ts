@@ -30,6 +30,8 @@ import nativeTest, { after, mock, type TestContext, type TestOptions } from "nod
 import { fileURLToPath } from "node:url";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
+import { sendTelegramView } from "../api/delivery.ts";
+import { isTelegramGroupDeliveryAllowed } from "../lib/config.ts";
 import { runNodeEval } from "./fixtures/node-eval.ts";
 import { createNativeTestPhaseObserver } from "./fixtures/native-test-phase.ts";
 import { createIntegrationShardSelector } from "./fixtures/shared.ts";
@@ -100,6 +102,132 @@ function test(
 ): void {
   void testRoot(name, { concurrency: false, timeout: timeoutMs }, fn);
 }
+
+for (const scenario of ["topic", "group", "missing-topic", "wrong-sender", "wrong-profile", "chat-only-allowlist", "follower", "old-source", "revoke-after-first", "unknown-second", "mismatched-ack"] as const)
+test(`Companion group reply uses the original journaled source without fallback (${scenario})`, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-group-reply-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const journal = Journal.createTelegramUpdateJournalStore({
+    path: join(dir, "updates.json"),
+    botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "fixture" }),
+  });
+  const group = scenario === "group";
+  const source = { update_id: 501, message: {
+    chat: { type: group ? "group" : "supergroup", id: -10042, ...(!group ? { is_forum: true } : {}) },
+    from: { id: scenario === "wrong-sender" ? 8 : 7, is_bot: false },
+    message_id: 81,
+    ...(!group && scenario !== "missing-topic" ? { message_thread_id: 12, is_topic_message: true } : {}),
+  } };
+  const target = { chatId: -10042, ...(!group ? { threadId: 12 } : {}) };
+  const config = { groupReplies: [{
+    profile: scenario === "wrong-profile" ? "other" : "work", chatId: target.chatId,
+    ...(!group && scenario !== "chat-only-allowlist" ? { threadId: 12 } : {}),
+  }] };
+  const requests: Array<Record<string, unknown>> = [];
+  let transport = true, defaultCalls = 0, original: unknown;
+  const runtime = Delivery.createTelegramBridgeDeliveryRuntime({
+    generation: "group-reply", getProfileName: () => "work",
+    getTargetPolicyView: () => ({ canDeliver: true, ownsDirect: scenario !== "follower", allowedChatId: 7, threaded: true }),
+    getActiveTurnTarget: () => undefined,
+    groupDelivery: {
+      getReplySource: Updates.getTelegramGroupReplySource,
+      getDirectJournalBindingKey: () => "direct-binding",
+      isAllowed: (kind, profile, candidate) => isTelegramGroupDeliveryAllowed(config, kind, profile, candidate),
+      captureProfileScope: () => () => true,
+      captureDirectAuthority: () => () => { if (!transport) throw new Error("Original transport ended"); },
+      async call(method, body, options) {
+        assert.equal(method, "sendMessage");
+        assert.equal(options.maxAttempts, 1);
+        assert.equal(options.retryRateLimit, false);
+        assert.equal(options.retrySafety, "non-idempotent");
+        assert.ok(options.assertAuthority);
+        options.assertAuthority();
+        requests.push(body);
+        if (requests.length === 1 && scenario === "revoke-after-first") transport = false;
+        if (requests.length === 2 && scenario === "unknown-second") throw new Error("Lost transport acknowledgement");
+        return {
+          chat: { id: body.chat_id },
+          message_thread_id: scenario === "mismatched-ack" ? 99 : body.message_thread_id,
+          message_id: 100 + requests.length,
+        };
+      },
+    },
+    api: {
+      async sendMessage() { return assert.fail("Group reply cannot use the ordinary send path"); },
+      async editMessageText() { return assert.fail("No editable group handle"); },
+      async deleteMessage() { assert.fail("No deletable group handle"); },
+      async sendChatAction() { return assert.fail("No group chat action"); },
+    },
+    recordOwnership() { assert.fail("A group receipt must not publish private-workspace ownership"); },
+  });
+  const unbind = Delivery.bindTelegramDeliveryRuntime(runtime);
+  const publish = (update: unknown, text = "**Build complete**") =>
+    sendTelegramView({ text }, { scope: { kind: "group-reply", update } });
+  const runs: Array<Awaited<ReturnType<typeof publish>>> = [];
+  const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime({
+    journal, getJournalBindingKey: () => "direct-binding", hasAuthority: () => true,
+    prepareUpdateForExecution(update) {
+      if (scenario === "topic") {
+        const message = (update as typeof source).message;
+        message.message_id = 82;
+        message.chat.id = -10046;
+        message.message_thread_id = 16;
+      }
+      return update;
+    },
+    defaultHandle: async () => { defaultCalls++; },
+    registry: { version: 1, add: () => () => {}, async dispatch(update) {
+      original = update;
+      const copied = await publish(structuredClone(update));
+      assert.ok(!copied.ok && copied.reason === "target-unauthorized");
+      const message = (update as typeof source).message;
+      if (scenario === "topic") assert.equal(message.message_id, 82, "Companion sees the prepared update projection");
+      message.chat.id = -10043;
+      if (message.message_thread_id !== undefined) message.message_thread_id = 13;
+      const multi = scenario === "unknown-second" || scenario === "revoke-after-first";
+      runs.push(await publish(update, multi ? "x".repeat(9000) : undefined));
+      if (runs[0]?.ok || multi || scenario === "mismatched-ack") runs.push(await publish(update));
+      return "pass";
+    } },
+  });
+  try {
+    if (scenario === "old-source") journal.appendBatch([source]);
+    worker.start("ctx"); await worker.waitForDrain();
+    if (scenario !== "old-source") {
+      journal.appendBatch([source]); worker.signal(); await worker.waitForDrain();
+    }
+    assert.equal(journal.read().entries.length, 0);
+    const result = runs[0]!;
+    const offScope = await publish(original);
+    assert.ok(!offScope.ok && offScope.reason === "target-unauthorized");
+    const noSend = ["missing-topic", "wrong-sender", "wrong-profile", "chat-only-allowlist", "follower", "old-source"].includes(scenario);
+    if (noSend) {
+      assert.equal(defaultCalls, 1);
+      assert.deepEqual(requests, []);
+      assert.ok(!result.ok && result.reason === "target-unauthorized");
+      return;
+    }
+    assert.equal(defaultCalls, 0, "A claimed reply prevents a second default reply, even after an unknown outcome");
+    const secondAttempt = runs[1]!;
+    assert.ok(!secondAttempt.ok);
+    assert.equal(requests.length, scenario === "unknown-second" ? 2 : 1);
+    assert.ok(requests.every(body => body.chat_id === target.chatId && body.message_thread_id === target.threadId));
+    assert.deepEqual(requests[0]!.reply_parameters, { message_id: 81, allow_sending_without_reply: false });
+    if (scenario === "topic" || scenario === "group") {
+      assert.equal(requests[0]!.parse_mode, "HTML");
+      assert.equal(requests[0]!.text, "<b>Build complete</b>");
+      assert.deepEqual(result, { ok: true, value: { target, messageIds: [101] } });
+    } else {
+      assert.ok(!result.ok);
+      assert.equal(result.reason, scenario === "revoke-after-first" ? "target-unavailable" : "commit-unknown");
+      assert.deepEqual(result.partial, scenario === "mismatched-ack" ? undefined : { target, messageIds: [101] });
+      if (scenario === "unknown-second") assert.equal(requests[1]!.reply_parameters, undefined);
+    }
+  } finally {
+    await worker.stop();
+    unbind(); runtime.shutdown();
+  }
+});
 
 function strictFileTest(name: string, fn: RuntimeTestHandler): void {
   void testRoot(name, { concurrency: false, skip: process.platform === "win32", timeout: 5_000 }, fn);
@@ -14527,6 +14655,100 @@ test(`Production connect preparation cannot reset through invalid authority (${a
     await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   }
 }, 15000);
+
+test("Extension runtime sends companion group messages and exact-topic replies through its bot", async t => {
+  const extension = await getRuntimeTelegramExtension();
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-group-reply-runtime-")));
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const fixture = await createRuntimeTelegramConfigFixture(agentDir);
+  const { handlers, commands, pi } = createRuntimePiHarness({
+    sendUserMessage: () => assert.fail("Companion reply must not admit an ordinary prompt"),
+  });
+  const ctx = createRuntimeExtensionContext();
+  const requests: Array<Record<string, unknown>> = [];
+  const update = { update_id: 1, message: {
+    message_id: 42, chat: { id: -10042, type: "supergroup", is_forum: true },
+    from: { id: 77, is_bot: false }, message_thread_id: 12, is_topic_message: true, text: "Build?",
+  } };
+  let pending = true;
+  const methods: string[] = [];
+  const restoreFetch = setTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    methods.push(method);
+    if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: false });
+    if (method === "deleteWebhook" || method === "setMyCommands") return createRuntimeTelegramApiResponse(true);
+    if (method === "getChat") {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      assert.equal(body.chat_id, -10043);
+      return createRuntimeTelegramApiResponse({ id: -10043, type: "supergroup" });
+    }
+    if (method === "getUpdates") {
+      if (!pending) throw new DOMException("stop", "AbortError");
+      pending = false;
+      return createRuntimeTelegramApiResponse([update]);
+    }
+    if (method === "sendMessage") {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      if (body.chat_id === -10043) {
+        return new Response(JSON.stringify({
+          ok: false, error_code: 403, description: "Forbidden: bot is not a member of the supergroup",
+        }), { status: 403 });
+      }
+      return createRuntimeTelegramApiResponse({
+        message_id: 63, chat: { id: body.chat_id, type: "supergroup" }, message_thread_id: body.message_thread_id,
+      });
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  const delivered = Promise.withResolvers<Awaited<ReturnType<typeof reply>>>();
+  const reply = (original: unknown) => sendTelegramView({ text: "**Build complete**" }, {
+    scope: { kind: "group-reply", update: original },
+  });
+  const off = Updates.registerTelegramUpdateHandler(async (original): Promise<Updates.TelegramUpdateHandlerVerdict> => {
+    if ((original as { update_id?: number })?.update_id !== update.update_id) return "pass";
+    delivered.resolve(await reply(original));
+    return "pass";
+  });
+  void delivered.promise.catch(() => {});
+  const onAbort = () => delivered.reject(t.signal.reason);
+  t.signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    await fixture.write({
+      profiles: { default: { botToken: "123:group-reply", allowedUserId: 77 } },
+      lastUpdateId: 0,
+      groupReplies: [{ profile: "default", chatId: -10042, threadId: 12 }],
+      groupMessages: [{ profile: "default", chatId: -10043 }],
+    });
+    extension(pi);
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    assert.deepEqual(await delivered.promise, { ok: true, value: { target: { chatId: -10042, threadId: 12 }, messageIds: [63] } });
+    assert.deepEqual(requests, [{ chat_id: -10042, message_thread_id: 12,
+      text: "<b>Build complete</b>", parse_mode: "HTML",
+      reply_parameters: { message_id: 42, allow_sending_without_reply: false },
+    }]);
+    const refused = await sendTelegramView({ text: "**Scheduled notice**" }, {
+      scope: { kind: "group-message", target: { chatId: -10043 } },
+    });
+    assert.ok(!refused.ok && refused.reason === "transport-failed");
+    assert.equal(refused.partial, undefined);
+    assert.deepEqual(requests.slice(1), [{ chat_id: -10043, text: "<b>Scheduled notice</b>", parse_mode: "HTML" }]);
+  } catch (error) {
+    const logs = await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8").catch(() => "<unavailable>");
+    console.error("Group reply fixture:", methods, logs.slice(-2500));
+    throw error;
+  } finally {
+    off(); t.signal.removeEventListener("abort", onAbort);
+    try { await handlers.get("session_shutdown")?.({}, ctx); }
+    finally {
+      restoreFetch(); await fixture.restore();
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  }
+}, 15_000);
 
 test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn into pi", async t => {
   const extension = await getRuntimeTelegramExtension(), previousAgentDir = process.env.PI_CODING_AGENT_DIR;

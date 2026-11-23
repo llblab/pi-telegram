@@ -88,6 +88,8 @@ import {
 import {
   createTelegramPrivateTarget,
   createTelegramThreadTarget,
+  matchesTelegramGroupChat,
+  parseTelegramGroupTarget,
   type TelegramTarget,
 } from "./target.ts";
 import {
@@ -2440,6 +2442,7 @@ export interface TelegramUpdateWorkerRuntimeDeps<TContext> {
     ctx: TContext,
     signal: AbortSignal,
     target?: TelegramTarget & { threadId: number },
+    freshGroupReply?: true,
   ) => Promise<TelegramUpdateAdmissionOutcome> | TelegramUpdateAdmissionOutcome;
   /** Native source-only binding, installed by the admission-worker assembly rather than ordinary dispatch. */
   admitPreparedLiveInput?: (
@@ -3956,6 +3959,7 @@ function createTelegramUpdateWorkerCore<TContext>(
     update: TelegramJournaledUpdate,
     preparedExecute?: TelegramUpdateWorkerRuntimeDeps<TContext>["executeUpdate"],
     target?: TelegramTarget & { threadId: number },
+    freshGroupReply?: true,
   ): Promise<
     | TelegramUpdateWorkerExecutionSettlement
     | typeof TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED
@@ -4003,6 +4007,7 @@ function createTelegramUpdateWorkerCore<TContext>(
                 expectedOwner.ctx,
                 expectedOwner.controller.signal,
                 target,
+                freshGroupReply,
               );
       },
     );
@@ -5000,6 +5005,8 @@ function createTelegramUpdateWorkerCore<TContext>(
               }
             : undefined,
           prepared?.target,
+          !prepared && entry.state === "pending" && !entry.failure &&
+            !expectedOwner.startupUpdateIds.has(entry.updateId) ? true : undefined,
         );
         if (execution === TELEGRAM_UPDATE_WORKER_EXECUTION_RECHECK) {
           snapshotInvalidated = true;
@@ -7186,6 +7193,47 @@ export interface TelegramUpdateHandlerRegistry {
 
 const UPDATE_HANDLER_REGISTRY_KEY = "__piTelegramUpdateHandlerRegistry__";
 
+interface TelegramGroupReplyAddress {
+  readonly target: Readonly<TelegramTarget>;
+  readonly senderId: number;
+  readonly messageId: number;
+}
+
+interface TelegramGroupReplySource extends TelegramGroupReplyAddress {
+  readonly journalBindingKey: string;
+  isCurrent(): boolean;
+  claim(): boolean;
+}
+
+// An update ID or the public execution fence alone does not prove original destination or ongoing handler ownership.
+const groupReplySources = new WeakMap<object, TelegramGroupReplySource>();
+
+/** @internal Read the original direct-dispatch source; caller-supplied clones and late lookups do not qualify. */
+export function getTelegramGroupReplySource(update: unknown): TelegramGroupReplySource | undefined {
+  if (!update || typeof update !== "object") return undefined;
+  return groupReplySources.get(update);
+}
+
+function captureTelegramGroupReplyAddress(update: TelegramUpdateFlow & { update_id: number }): (TelegramGroupReplyAddress & { readonly updateId: number }) | undefined {
+  const message = update.message;
+  if (!isTelegramUpdateAdmissionRecord(message) ||
+      !isTelegramUpdateAdmissionRecord(message.chat) ||
+      !isTelegramUpdateAdmissionRecord(message.from) ||
+      message.from.is_bot !== false || "sender_chat" in message ||
+      "business_connection_id" in message || "guest_query_id" in message ||
+      "ephemeral_message_id" in message || "direct_messages_topic" in message ||
+      "forum_topic_created" in message || "forum_topic_closed" in message || "forum_topic_reopened" in message)
+    return undefined;
+  const { id: senderId } = message.from;
+  const { message_id: messageId, message_thread_id: threadId, is_topic_message: isTopic } = message;
+  const target = parseTelegramGroupTarget({ chatId: message.chat.id, threadId });
+  if (!target || !matchesTelegramGroupChat(message.chat, target) ||
+      (threadId === undefined ? isTopic !== undefined && isTopic !== false : isTopic !== true) ||
+      typeof senderId !== "number" || !Number.isSafeInteger(senderId) || senderId <= 0 ||
+      typeof messageId !== "number" || !Number.isSafeInteger(messageId) || messageId <= 0) return undefined;
+  return { updateId: update.update_id, target: Object.freeze(target), senderId, messageId };
+}
+
 function isValidV1UpdateHandlerRegistry(
   candidate: unknown,
 ): candidate is TelegramUpdateHandlerRegistry {
@@ -7496,11 +7544,6 @@ export function createTelegramUpdateAdmissionHandle<
   ctx: TContext,
   signal: AbortSignal,
 ) => Promise<TelegramUpdateAdmissionOutcome> {
-  if (deps.onLateOutcome && !deps.onLateOutcomeError) {
-    throw new Error(
-      "Telegram late admission outcomes require a diagnostic error sink.",
-    );
-  }
   return createTelegramUpdateSourceAdmissionHandle(deps);
 }
 
@@ -7515,10 +7558,16 @@ function createTelegramUpdateSourceAdmissionHandle<
   update: TUpdate,
   ctx: TContext,
   signal: AbortSignal,
+  groupReply?: ReturnType<typeof captureTelegramGroupReplyAddress>,
 ) => Promise<TelegramUpdateAdmissionOutcome> {
+  if (deps.onLateOutcome && !deps.onLateOutcomeError) {
+    throw new Error(
+      "Telegram late admission outcomes require a diagnostic error sink.",
+    );
+  }
   const registry = deps.registry ?? getOrCreateUpdateHandlerRegistry();
   let nextExecutionGeneration = 0;
-  return async (update, ctx, signal) => {
+  return async (update, ctx, signal, groupReply) => {
     const generation = ++nextExecutionGeneration;
     const journalBindingKey = deps.getJournalBindingKey?.();
     let suspended = false;
@@ -7551,9 +7600,30 @@ function createTelegramUpdateSourceAdmissionHandle<
     };
     execution.assertCurrent();
     if (!capture) {
-      const verdict = await registry.dispatch(update, execution);
+      const reply = groupReply?.updateId === update.update_id && journalBindingKey !== undefined ? groupReply : undefined;
+      let claimed = false, dispatching = true;
+      if (reply && journalBindingKey) {
+        const { target, senderId, messageId } = reply;
+        const isCurrent = () => dispatching && execution.isCurrent() && deps.getJournalBindingKey?.() === journalBindingKey;
+        groupReplySources.set(update, Object.freeze({
+          target, senderId, messageId, journalBindingKey, isCurrent,
+          claim() {
+            if (claimed || !isCurrent()) return false;
+            claimed = true;
+            return true;
+          },
+        }));
+      }
+      let verdict: TelegramUpdateHandlerVerdict;
+      try {
+        verdict = await registry.dispatch(update, execution);
+      } finally {
+        dispatching = false;
+        if (reply) groupReplySources.delete(update);
+      }
       execution.assertCurrent();
-      if (verdict === "consume") return { kind: "complete" };
+      // Once the companion attempts publication, default routing must not answer the same source again.
+      if (claimed || verdict === "consume") return { kind: "complete" };
     }
     let immediate = true;
     let settlementReported = false;
@@ -9416,9 +9486,7 @@ export function createTelegramUpdateAdmissionWorkerRuntime<
       });
     },
   };
-  const executeUpdate = createTelegramUpdateAdmissionHandle<TUpdate, TContext>(
-    admissionDeps,
-  );
+  const executeUpdate = createTelegramUpdateSourceAdmissionHandle(admissionDeps);
   const admitPreparedLiveInput = async (
     update: TelegramJournaledUpdate,
     ctx: TContext,
@@ -9490,8 +9558,10 @@ export function createTelegramUpdateAdmissionWorkerRuntime<
             ),
         }
       : {}),
-    async executeUpdate(update, ctx, signal, target) {
+    async executeUpdate(update, ctx, signal, target, freshGroupReply) {
       const typedUpdate = update as TUpdate;
+      // Preparation may project or mutate the handler's update. It cannot choose a reply address.
+      const groupReply = freshGroupReply && !target ? captureTelegramGroupReplyAddress(typedUpdate) : undefined;
       const prepared = deps.prepareUpdateForExecution?.(typedUpdate) ?? typedUpdate;
       // Journal/source evidence remains the original; only the warm released handler projection changes destination.
       const projectTo = (destination: TelegramTarget & { threadId: number }): TUpdate => ({ ...prepared,
@@ -9506,6 +9576,7 @@ export function createTelegramUpdateAdmissionWorkerRuntime<
           routed,
           ctx,
           signal,
+          groupReply,
         );
       } catch (error) {
         if (await deps.settleTerminalExecutionFailure?.(error)) {

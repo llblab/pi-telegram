@@ -52,6 +52,10 @@ export interface TelegramConfig {
     inboundHandlers?: TelegramInboundHandlerConfig[];
     attachmentHandlers?: TelegramInboundHandlerConfig[];
     outboundHandlers?: TelegramOutboundHandlerConfig[];
+    /** Opt-in exact group destinations, separate from pairing and private Thread settings. */
+    groupReplies?: TelegramGroupDestination[];
+    /** Independent opt-in for new messages not tied to inbound updates. */
+    groupMessages?: TelegramGroupDestination[];
     assistant?: {
         draftPreviews?: boolean;
         rendering?: TelegramAssistantRenderingMode;
@@ -80,6 +84,11 @@ export interface TelegramConfig {
     /** Canonical bot/session profiles, including profiles.default. */
     profiles?: Record<string, TelegramBotProfile>;
 }
+interface TelegramGroupDestination {
+    profile: string;
+    chatId: number;
+    threadId?: number;
+}
 /**
  * Per-profile bot identity and paired owner only.
  * Stored under `profiles.<name>` in telegram.json.
@@ -93,6 +102,11 @@ export interface TelegramBotProfile {
     allowedUserId?: number;
 }
 export declare function isValidTelegramProfileName(name: string): boolean;
+/** Only an exact profile/chat/topic allowlist entry can opt in; a chat-only entry is not a topic wildcard. */
+export declare function isTelegramGroupDeliveryAllowed(config: TelegramConfig, policy: "group-message" | "group-reply", profile: string, target: {
+    chatId: number;
+    threadId?: number;
+}): boolean;
 /** List defined profile names. */
 export declare function getTelegramProfileNames(config: TelegramConfig): string[];
 export interface TelegramConfigStore {

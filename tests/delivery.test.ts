@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTelegramTaskView, sendTelegramArtifact, openTelegramChoice, openTelegramConfirm, type TelegramTaskViewRequest, type TelegramChoiceRequest, type TelegramConfirmRequest } from "../api/delivery.ts";
 import type { TelegramInlineKeyboardMarkup } from "../lib/keyboard.ts";
+import { isTelegramGroupDeliveryAllowed } from "../lib/config.ts";
 import {
   bindTelegramDeliveryRuntime,
   acceptTelegramTaskViewCallback,
@@ -57,6 +58,92 @@ import { createTelegramBusFollowerApiCaller, createTelegramBusFollowerRegistrati
 import { createTelegramApiClient, createTelegramBridgeApiRuntime, setTelegramApiHttpsFetchForTesting } from "../lib/telegram-api.ts";
 
 const target = { chatId: 42, threadId: 7 };
+
+for (const scenario of ["group", "supergroup", "forum", "forum-without-topic", "non-forum-with-topic",
+  "channel", "different-chat", "reply-only", "no-allowlist", "follower", "revoke-after-lookup", "unknown-second"] as const)
+test(`Proactive group delivery requires one exact configured group target (${scenario})`, async () => {
+  const forum = scenario === "forum" || scenario === "forum-without-topic" || scenario === "unknown-second";
+  const supplied = { chatId: -10055,
+    ...(["forum", "non-forum-with-topic", "unknown-second"].includes(scenario) ? { threadId: 13 } : {}) };
+  const exact = { ...supplied };
+  const config = {
+    groupReplies: [{ profile: "default", ...exact }],
+    groupMessages: scenario === "reply-only" ? undefined
+      : [{ profile: scenario === "no-allowlist" ? "other" : "default", ...exact }],
+  };
+  const requests: Array<{ method: string; body: Record<string, unknown> }> = [];
+  let allowed = true;
+  const runtime = createTelegramBridgeDeliveryRuntime({
+    generation: "proactive-group", getProfileName: () => "default", getActiveTurnTarget: () => undefined,
+    getTargetPolicyView: () => ({ canDeliver: true, ownsDirect: scenario !== "follower", allowedChatId: 42, threaded: true }),
+    groupDelivery: {
+      getReplySource() { return assert.fail("Proactive send must not inspect the inbound update"); },
+      getDirectJournalBindingKey() { return assert.fail("Proactive send needs no journal source"); },
+      isAllowed: (kind, profile, candidate) => allowed && isTelegramGroupDeliveryAllowed(config, kind, profile, candidate),
+      captureProfileScope: () => () => true,
+      captureDirectAuthority: () => () => {},
+      async call(method, body, options) {
+        assert.ok(options.assertAuthority);
+        options.assertAuthority();
+        assert.equal(options.maxAttempts, 1);
+        assert.equal(options.retryRateLimit, false);
+        assert.equal(options.retrySafety, method === "getChat" ? "safe" : "non-idempotent");
+        requests.push({ method, body });
+        if (method === "getChat") {
+          assert.deepEqual(body, { chat_id: exact.chatId });
+          supplied.chatId = -10056;
+          if (scenario === "revoke-after-lookup") allowed = false;
+          return { id: exact.chatId - (scenario === "different-chat" ? 1 : 0),
+            type: scenario === "channel" ? "channel" : scenario === "group" ? "group" : "supergroup",
+            ...(forum ? { is_forum: true } : {}) };
+        }
+        if (scenario === "unknown-second" && requests.length === 3) throw new Error("ACK lost");
+        return { chat: { id: exact.chatId }, message_thread_id: exact.threadId, message_id: 123 };
+      },
+    },
+    api: {
+      async sendMessage() { return assert.fail("No legacy group send"); },
+      async editMessageText() { return assert.fail("No group edit"); },
+      async deleteMessage() { return assert.fail("No group delete"); },
+      async sendChatAction() { return assert.fail("No group chat action"); },
+    },
+    recordOwnership() { assert.fail("No private ownership for a group message"); },
+  });
+  const unbind = bindTelegramDeliveryRuntime(runtime);
+  try {
+    const result = await sendTelegramView(
+      { text: scenario === "unknown-second" ? "x".repeat(9000) : "**Ready.**" },
+      { scope: { kind: "group-message", target: supplied } },
+    );
+    if (["reply-only", "no-allowlist", "follower"].includes(scenario)) {
+      assert.ok(!result.ok && result.reason === "target-unauthorized");
+      assert.deepEqual(requests, []);
+      return;
+    }
+    if (["forum-without-topic", "non-forum-with-topic", "channel", "different-chat", "revoke-after-lookup"].includes(scenario)) {
+      assert.ok(!result.ok && result.reason === "target-unavailable");
+      assert.deepEqual(requests.map(({ method }) => method), ["getChat"]);
+      return;
+    }
+    const sends = requests.slice(1);
+    assert.ok(sends.every(({ body }) => body.chat_id === exact.chatId &&
+      body.message_thread_id === exact.threadId && !("reply_parameters" in body)));
+    if (scenario === "unknown-second") {
+      assert.ok(!result.ok && result.reason === "commit-unknown");
+      assert.deepEqual(result.partial, { target: exact, messageIds: [123] });
+      assert.equal(sends.length, 2, "Neither the uncertain part nor the remaining part is sent again");
+    } else {
+      assert.deepEqual(sends, [{ method: "sendMessage", body: {
+        chat_id: exact.chatId, ...(exact.threadId !== undefined ? { message_thread_id: exact.threadId } : {}),
+        parse_mode: "HTML", text: "<b>Ready.</b>",
+      } }]);
+      assert.deepEqual(result, { ok: true, value: { target: exact, messageIds: [123] } });
+    }
+  } finally {
+    unbind();
+    runtime.shutdown();
+  }
+});
 
 for (const outcome of ["sent", "failed", "stopped", "observer-failed", "async-observer-failed"] as const)
 test(`Delivery drain follows the last queued operation and keeps shutdown inert (${outcome})`, async () => {
