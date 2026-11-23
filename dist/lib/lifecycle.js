@@ -1,7 +1,7 @@
 /**
  * Telegram session lifecycle coordination and hook registration
  * Zones: pi agent lifecycle, telegram session
- * Owns context generations, bounded connect intent across resume, and session sequencing.
+ * Owns context generations, bounded connect intent across same-process session replacement, and session sequencing.
  * Transport authority, durable bindings, and queue custody remain with their owners.
  */
 import { randomUUID } from "node:crypto";
@@ -27,13 +27,45 @@ function processHandoffStore() {
     const globals = globalThis;
     return (globals[HANDOFF_KEY] ??= {});
 }
+/** Same-process successors that may claim the predecessor's selected connection. */
+const TELEGRAM_SESSION_REPLACEMENT_REASONS = new Set([
+    "resume",
+    "new",
+    "fork",
+    "reload",
+]);
+/** Default profiles keep their existing auto-start path; only named profiles need this carry. */
+const TELEGRAM_NAMED_SESSION_REPLACEMENT_REASONS = new Set([
+    "new",
+    "fork",
+    "reload",
+]);
+function carriesTelegramConnectionHandoff(reason) {
+    return TELEGRAM_SESSION_REPLACEMENT_REASONS.has(reason);
+}
+function carriesTelegramNamedConnectionHandoff(reason) {
+    return TELEGRAM_NAMED_SESSION_REPLACEMENT_REASONS.has(reason);
+}
+function getTelegramSessionFile(ctx) {
+    try {
+        return ctx.sessionManager?.getSessionFile();
+    }
+    catch {
+        // A stale or incomplete context cannot mint replacement authority.
+        return undefined;
+    }
+}
 export function createTelegramConnectionLifecycle(deps) {
     return {
         onSessionShutdown(event, ctx) {
+            // Reload has no destination event field; its successor keeps the same session file.
+            const targetSessionFile = event.reason === "reload"
+                ? (event.targetSessionFile ?? getTelegramSessionFile(ctx))
+                : event.targetSessionFile;
             deps.intent.suspend({
                 reason: event.reason,
                 cwd: ctx.cwd,
-                targetSessionFile: event.targetSessionFile,
+                targetSessionFile,
                 connected: deps.isConnected(),
                 profileName: deps.getProfileName(),
             });
@@ -42,8 +74,8 @@ export function createTelegramConnectionLifecycle(deps) {
             const intent = deps.intent.resume({
                 reason: event.reason,
                 cwd: ctx.cwd,
-                sessionFile: event.reason === "resume"
-                    ? ctx.sessionManager.getSessionFile()
+                sessionFile: carriesTelegramConnectionHandoff(event.reason)
+                    ? getTelegramSessionFile(ctx)
                     : undefined,
             });
             if (!intent)
@@ -110,8 +142,10 @@ export function createTelegramConnectionIntentRuntime(options = {}) {
                     ? { id: randomUUID(), cwd: input.cwd, profileName: input.profileName }
                     : undefined);
             active = undefined;
+            const carriesNamedProfile = carriesTelegramNamedConnectionHandoff(input.reason) &&
+                intent?.profileName !== undefined;
             store.pending =
-                input.reason === "resume" &&
+                (input.reason === "resume" || carriesNamedProfile) &&
                     input.targetSessionFile &&
                     intent?.cwd === input.cwd
                     ? {
@@ -128,7 +162,7 @@ export function createTelegramConnectionIntentRuntime(options = {}) {
             if (!handoff ||
                 handoff.pid !== pid ||
                 now() >= handoff.expiresAtMs ||
-                input.reason !== "resume" ||
+                !carriesTelegramConnectionHandoff(input.reason) ||
                 input.cwd !== handoff.cwd ||
                 input.sessionFile !== handoff.targetSessionFile)
                 return undefined;
