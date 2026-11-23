@@ -4,7 +4,9 @@
 
 ## Unreleased
 
-- `Profiles`: A same-process `/new`, `/fork`, or `/reload` now carries the active named profile into the successor session, so the bridge reconnects to the same bot instead of falling back to `default` or requiring `/telegram-connect <profile>` again. Default profiles keep their existing auto-start path; fresh processes and different sessions still require an explicit connect. Closes #388.
+## 0.60.1: Named Profile Continuity Hotfix
+
+- `Profiles`: A same-process `/new`, `/fork`, or `/reload` with an exact successor session file reconnects the active named profile. The successor selects that profile before restoring transport and its Thread, and confirms a Telegram `/new` only after reconnecting. It does not fall back to another bot if the carried profile is unavailable. Default startup and explicit profile selection in a fresh process are unchanged. Closes #388.
 
 ## 0.60.0: Companion Delivery To Telegram Groups
 

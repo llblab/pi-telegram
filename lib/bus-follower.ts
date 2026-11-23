@@ -140,6 +140,7 @@ const TELEGRAM_FOLLOWER_SESSION_HANDOFF_KEY =
 
 export interface TelegramFollowerSessionHandoff {
   pid: number;
+  profileName?: string;
   instanceId: string;
   createdAtMs: number;
   target: TelegramTarget;
@@ -156,6 +157,7 @@ export function getTelegramFollowerSessionHandoff():
   const handoff = value as Partial<TelegramFollowerSessionHandoff>;
   if (
     typeof handoff.pid !== "number" ||
+    (handoff.profileName !== undefined && typeof handoff.profileName !== "string") ||
     typeof handoff.instanceId !== "string" ||
     typeof handoff.createdAtMs !== "number" ||
     !handoff.target ||
@@ -257,6 +259,7 @@ export interface TelegramBusFollowerSessionRefreshHookDeps<TContext> {
     "registerWithLeader" | "setContext"
   >;
   getLeaderState: () => TelegramLockState;
+  getActiveProfileName?: () => string | undefined;
   isSessionActive?: (ctx: TContext) => boolean;
   updateStatus: (ctx: TContext) => void;
   recordRuntimeEvent: (
@@ -430,6 +433,7 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<
   registrationState?: TelegramBusFollowerRegistrationState;
   isContextActive?: (ctx: TContext) => boolean;
   getProfileKey?: (ctx: TContext) => string | undefined;
+  getActiveProfileName?: () => string | undefined;
   getThreadName?: (ctx: TContext) => string | undefined;
   getNowMs?: () => number;
   getPid?: () => number;
@@ -2308,8 +2312,10 @@ export function createTelegramBusFollowerSessionReplacementSuspender(
     }
     const target = deps.registrationState.getTarget();
     if (deps.registrationState.isRegistered() && target) {
+      const profileName = deps.getActiveProfileName?.();
       setTelegramFollowerSessionHandoff({
         pid: getPid(),
+        ...(profileName === undefined ? {} : { profileName }),
         instanceId: deps.instanceId,
         createdAtMs: getNowMs(),
         target,
@@ -2375,7 +2381,7 @@ export function createTelegramBusFollowerSessionRefreshHook<TContext>(
       const handoff = getTelegramFollowerSessionHandoff();
       const lockState = deps.getLeaderState();
       const handoffIsFresh = isTelegramFollowerSessionHandoffFresh(handoff);
-      if (handoffIsFresh && lockState.kind === "active-elsewhere") {
+      if (handoffIsFresh && handoff.profileName === deps.getActiveProfileName?.() && lockState.kind === "active-elsewhere") {
         try {
           const restored = await deps.registrationRuntime.registerWithLeader(
             ctx,
@@ -3401,7 +3407,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
       const pendingHandoff = getTelegramFollowerSessionHandoff();
       const pendingHandoffOptions = isTelegramFollowerSessionHandoffFresh(
         pendingHandoff,
-      )
+      ) && pendingHandoff.profileName === deps.getActiveProfileName?.()
         ? {
             target: pendingHandoff.target,
             previousInstanceId: pendingHandoff.instanceId,

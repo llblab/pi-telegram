@@ -1784,6 +1784,7 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
             createRequestId: telegramBusFollowerClients.createRequestId,
             setActiveAuthSecret: telegramBusFollowerControlState.setActiveAuthSecret,
             getProfileKey: getTelegramManualFollowerProfileKey,
+            getActiveProfileName: configStore.getActiveProfileName,
             getThreadName() {
                 return telegramThreadCapabilityState.getRequestedThreadName();
             },
@@ -2178,14 +2179,11 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
             return (lockRuntime.owns() ||
                 telegramBusFollowerRegistrationState.isRegistered());
         },
-        async activateProfile(profileName, isCurrent) {
-            await configStore.load();
-            if (!isCurrent())
-                return false;
-            return (configStore.activateProfile(profileName) && configStore.hasBotToken());
+        activateProfile(profileName) {
+            return configStore.activateProfile(profileName) && configStore.hasBotToken();
         },
-        start(ctx) {
-            return lockedPollingRuntime.start(ctx);
+        start(ctx, assertAuthority) {
+            return lockedPollingRuntime.start(ctx, { assertAuthority });
         },
         recordError(error) {
             recordRuntimeEvent("connection", error, { phase: "resume-connect" });
@@ -2242,6 +2240,7 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
             delivery: deliveryLifecycleRuntime,
             polling: lockedPollingRuntime,
             connection: connectionLifecycle,
+            settleSessionReplacement: sessionActionAssembly.settlement.onSessionStart,
             inboundWorker: {
                 onSessionShutdown: updateAdmissionRuntimeBinding.onSessionShutdown,
             },
@@ -2649,9 +2648,6 @@ export default function (pi, createSettingsManager = Pi.createSettingsManager) {
         disconnectOnQuit: cleanupTelegramThreadForSessionRestart,
         shutdownGenerativeAppLiveSurfaces: generativeAppLiveSurfaceBinding.shutdown,
         resolveAutomaticThreadCleanupEnabled: configControls.resolveAutomaticThreadCleanupEnabled,
-        onSessionStarted(_event, ctx) {
-            sessionActionAssembly.settlement.onSessionStart(ctx);
-        },
         buttonActionStore,
         callMultipart,
         sendChatAction,

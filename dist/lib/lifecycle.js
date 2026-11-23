@@ -84,32 +84,47 @@ export function createTelegramConnectionLifecycle(deps) {
             const isCurrent = () => deps.intent.isActive(intent.id) &&
                 generation === deps.getGeneration() &&
                 deps.isCurrent(ctx);
+            const reportFailure = (error) => {
+                deps.recordError(error);
+                if (isCurrent())
+                    ctx.ui.notify(formatTelegramConnectionFailure(error), "warning");
+            };
             return () => {
-                // Startup remains extension-owned background work; no captured command ctx crosses resume.
-                void (async () => {
-                    if (!isCurrent())
-                        return;
-                    if (!(await deps.activateProfile(intent.profileName, isCurrent))) {
-                        if (isCurrent())
-                            ctx.ui.notify("Telegram profile unavailable. Run /telegram-setup.", "warning");
-                        return;
+                try {
+                    if (isCurrent() && deps.activateProfile(intent.profileName) && isCurrent()) {
+                        const profile = deps.getProfileName();
+                        const isSelected = () => isCurrent() && deps.getProfileName() === profile;
+                        return async (onConnected) => {
+                            try {
+                                if (!isSelected())
+                                    return;
+                                const result = await deps.start(ctx, () => {
+                                    if (!isSelected())
+                                        throw new Error("Telegram carried reconnect was superseded.");
+                                });
+                                if (!isSelected())
+                                    return;
+                                if (!result.ok)
+                                    reportFailure(new Error(result.message ?? "Telegram carried reconnect failed."));
+                                else
+                                    onConnected();
+                            }
+                            catch (error) {
+                                reportFailure(error);
+                            }
+                            finally {
+                                deps.intent.finish(intent.id);
+                            }
+                        };
                     }
-                    if (!isCurrent())
-                        return;
-                    const result = await deps.start(ctx);
-                    if (!isCurrent())
-                        return;
-                    if (!result.ok) {
-                        deps.recordError(new Error(result.message ?? "Telegram resume connection failed."));
-                        ctx.ui.notify(formatTelegramConnectionFailure(result.message), "warning");
-                    }
-                })()
-                    .catch((error) => {
-                    deps.recordError(error);
                     if (isCurrent())
-                        ctx.ui.notify(formatTelegramConnectionFailure(error), "warning");
-                })
-                    .finally(() => deps.intent.finish(intent.id));
+                        ctx.ui.notify("Telegram profile unavailable. Run /telegram-setup.", "warning");
+                }
+                catch (error) {
+                    reportFailure(error);
+                }
+                deps.intent.finish(intent.id);
+                return undefined;
             };
         },
     };
@@ -308,6 +323,7 @@ export function createTelegramBridgeSessionLifecycleDeps(ports) {
             delivery: ports.services.delivery,
             polling: ports.services.polling,
             connection: ports.services.connection,
+            settleSessionReplacement: ports.services.settleSessionReplacement,
             inboundWorker: ports.services.inboundWorker,
             capabilityMonitor: ports.services.capabilityMonitor,
             queueWatchdog: ports.services.queueWatchdog,
@@ -320,32 +336,50 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
     const suspendForReplacement = BusFollower.createTelegramBusFollowerSessionReplacementSuspender({
         registrationState: deps.follower.registrationState,
         instanceId: deps.follower.instanceId,
+        getActiveProfileName: deps.follower.getActiveProfileName,
         suspendPolling: deps.follower.suspendPolling,
         recordRuntimeEvent: deps.follower.recordRuntimeEvent,
     });
     // A reused context can be current for a successor; inner awaits need this invocation's generation too.
-    const queueLifecycle = (ctx, generation, preserveTarget = true) => Queue.createTelegramSessionLifecycleRuntime({
+    const queueLifecycle = (ctx, generation, options) => Queue.createTelegramSessionLifecycleRuntime({
         ...deps.queue,
+        loadConfig: options?.loadConfig ?? deps.queue.loadConfig,
         isSessionActive: () => deps.contextStore.isCurrent(ctx, generation),
-        stopPolling: () => suspendForReplacement(preserveTarget),
+        stopPolling: () => suspendForReplacement(options?.preserveTarget),
         clearPendingMediaGroups: deps.services.suspendGroupedInput,
     });
     const servicesLifecycle = {
         async onSessionStart(event, ctx) {
             const generation = deps.contextStore.getGeneration();
             const isCurrent = () => deps.contextStore.isCurrent(ctx, generation);
-            const resumeConnection = deps.services.connection?.prepare(event, ctx);
-            await queueLifecycle(ctx, generation).onSessionStart(event, ctx);
+            const selectCarriedProfile = deps.services.connection?.prepare(event, ctx);
+            let reconnect;
+            await queueLifecycle(ctx, generation, selectCarriedProfile ? {
+                async loadConfig() {
+                    await deps.queue.loadConfig();
+                    if (isCurrent())
+                        reconnect = selectCarriedProfile();
+                },
+            } : undefined).onSessionStart(event, ctx);
             if (!isCurrent())
                 return;
             deps.services.resumeGroupedInput(ctx);
             await deps.services.delivery.onSessionStart();
             if (!isCurrent())
                 return;
-            if (resumeConnection)
-                resumeConnection();
-            else
-                await deps.services.polling.onSessionStart(event, ctx);
+            if (selectCarriedProfile) {
+                // The locked reconnect owns registration. A parallel refresh can steal its handoff.
+                deps.services.queueWatchdog.start(ctx);
+                if (reconnect)
+                    void reconnect(() => {
+                        if (!isCurrent())
+                            return;
+                        deps.services.capabilityMonitor.start(ctx);
+                        deps.services.settleSessionReplacement?.(ctx);
+                    });
+                return;
+            }
+            await deps.services.polling.onSessionStart(event, ctx);
             if (!isCurrent())
                 return;
             deps.services.capabilityMonitor.start(ctx);
@@ -354,10 +388,13 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
                 registrationState: deps.follower.registrationState,
                 registrationRuntime: deps.follower.registrationRuntime,
                 getLeaderState: deps.follower.getLeaderState,
+                getActiveProfileName: deps.follower.getActiveProfileName,
                 isSessionActive: isCurrent,
                 updateStatus: deps.follower.updateStatus,
                 recordRuntimeEvent: deps.follower.recordRuntimeEvent,
             })(event, ctx);
+            if (isCurrent())
+                deps.services.settleSessionReplacement?.(ctx);
         },
         async onSessionShutdown(event, ctx) {
             const generation = deps.contextStore.getGeneration();
@@ -384,7 +421,7 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
                 return;
             deps.services.queueWatchdog.stop();
             deps.services.capabilityMonitor.stop();
-            await queueLifecycle(ctx, generation, preserveTarget).onSessionShutdown(event, ctx);
+            await queueLifecycle(ctx, generation, { preserveTarget }).onSessionShutdown(event, ctx);
             if (!isCurrent())
                 return;
             await deps.services.inboundWorker.onSessionShutdown();

@@ -21,6 +21,7 @@ import { type TelegramWorkspaceAdmissionLedger } from "./workspace-admission.ts"
 export declare const TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_MS = 8000;
 export interface TelegramFollowerSessionHandoff {
     pid: number;
+    profileName?: string;
     instanceId: string;
     createdAtMs: number;
     target: TelegramTarget;
@@ -84,6 +85,7 @@ export interface TelegramBusFollowerSessionRefreshHookDeps<TContext> {
     registrationState: Pick<TelegramBusFollowerRegistrationState, "isRegistered">;
     registrationRuntime: Pick<TelegramBusFollowerRegistrationRuntime<TContext>, "registerWithLeader" | "setContext">;
     getLeaderState: () => TelegramLockState;
+    getActiveProfileName?: () => string | undefined;
     isSessionActive?: (ctx: TContext) => boolean;
     updateStatus: (ctx: TContext) => void;
     recordRuntimeEvent: (category: string, error: unknown, details?: Record<string, unknown>) => void;
@@ -220,6 +222,7 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<TContext extends {
     registrationState?: TelegramBusFollowerRegistrationState;
     isContextActive?: (ctx: TContext) => boolean;
     getProfileKey?: (ctx: TContext) => string | undefined;
+    getActiveProfileName?: () => string | undefined;
     getThreadName?: (ctx: TContext) => string | undefined;
     getNowMs?: () => number;
     getPid?: () => number;

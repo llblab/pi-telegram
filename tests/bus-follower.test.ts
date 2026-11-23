@@ -5238,7 +5238,8 @@ test("Bus follower initial registration consumes a pending session handoff after
   }
 });
 
-test("Bus follower restore after session replacement reuses the preserved Thread", async () => {
+for (const [carriedProfile, activeProfile] of [[undefined, undefined], ["work", "work"], ["work", undefined]] as const)
+test(`Bus follower restore uses only its profile's preserved Thread (${carriedProfile}/${activeProfile})`, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-handoff-restore-"));
   const socketPath = join(dir, "bus.sock");
   const registrations: Array<{
@@ -5262,9 +5263,11 @@ test("Bus follower restore after session replacement reuses the preserved Thread
     instanceId: "new-inst",
     createRequestId: () => "new-inst:restore:1",
     registrationState: createTelegramBusFollowerRegistrationState(),
+    getActiveProfileName: () => activeProfile,
   });
   setTelegramFollowerSessionHandoff({
     pid: process.pid,
+    profileName: carriedProfile,
     instanceId: "old-inst",
     createdAtMs: Date.now(),
     target: { chatId: 1, threadId: 2 },
@@ -5282,12 +5285,9 @@ test("Bus follower restore after session replacement reuses the preserved Thread
       ),
       true,
     );
-    assert.deepEqual(registrations, [
-      {
-        target: { chatId: 1, threadId: 2 },
-        previousInstanceId: "old-inst",
-      },
-    ]);
+    assert.deepEqual(registrations, [activeProfile === carriedProfile
+      ? { target: { chatId: 1, threadId: 2 }, previousInstanceId: "old-inst" }
+      : { target: undefined, previousInstanceId: undefined }]);
   } finally {
     follower.stop();
     setTelegramFollowerSessionHandoff(undefined);
@@ -5467,6 +5467,32 @@ test("Bus follower session refresh re-registers with the handed-off target", asy
       details: { phase: "follower-session-refresh" },
     },
   ]);
+});
+
+test("A default follower cannot restore a named profile's preserved Thread", async () => {
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  const refresh = createTelegramBusFollowerSessionRefreshHook({
+    registrationState,
+    registrationRuntime: {
+      async registerWithLeader() { return assert.fail("Foreign Thread cannot be sent to the default leader"); },
+      setContext() { assert.fail("No default follower was registered"); },
+    },
+    getActiveProfileName: () => undefined,
+    getLeaderState: () => ({ kind: "active-elsewhere", lock: { pid: 20 } }),
+    updateStatus() {},
+    recordRuntimeEvent() {},
+  });
+  setTelegramFollowerSessionHandoff({
+    pid: process.pid, profileName: "work", instanceId: "old-work",
+    createdAtMs: Date.now(), target: { chatId: 1, threadId: 2 },
+  });
+  try {
+    await refresh({}, { cwd: "/repo" });
+    assert.equal(registrationState.isRegistered(), false);
+    assert.equal(getTelegramFollowerSessionHandoff(), undefined);
+  } finally {
+    setTelegramFollowerSessionHandoff(undefined);
+  }
 });
 
 test("follower client runtime exposes authenticated queue handoff transport", async () => {
