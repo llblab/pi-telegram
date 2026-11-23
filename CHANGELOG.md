@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Profiles`: A same-process `/new`, `/fork`, or `/reload` now carries the active named profile into the successor session, so the bridge reconnects to the same bot instead of falling back to `default` or requiring `/telegram-connect <profile>` again. Default profiles keep their existing auto-start path; fresh processes and different sessions still require an explicit connect. Closes #388.
+
 ## 0.60.0: Companion Delivery To Telegram Groups
 
 - `Delivery`: Companion extensions can send Markdown through the connected bot to exact, opt-in groups and forum topics. Reply and proactive-send permissions are separate; replies require the original live operator update, while new messages do not. Both report confirmed parts without granting edit, delete, or replay authority, and never fall back to another chat or topic.

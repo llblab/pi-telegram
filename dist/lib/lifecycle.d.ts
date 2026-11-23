@@ -1,7 +1,7 @@
 /**
  * Telegram session lifecycle coordination and hook registration
  * Zones: pi agent lifecycle, telegram session
- * Owns context generations, bounded connect intent across resume, and session sequencing.
+ * Owns context generations, bounded connect intent across same-process session replacement, and session sequencing.
  * Transport authority, durable bindings, and queue custody remain with their owners.
  */
 import * as BusFollower from "./bus-follower.ts";
