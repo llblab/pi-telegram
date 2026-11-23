@@ -41,6 +41,7 @@ export function getTelegramFollowerSessionHandoff() {
         return undefined;
     const handoff = value;
     if (typeof handoff.pid !== "number" ||
+        (handoff.profileName !== undefined && typeof handoff.profileName !== "string") ||
         typeof handoff.instanceId !== "string" ||
         typeof handoff.createdAtMs !== "number" ||
         !handoff.target ||
@@ -1327,8 +1328,10 @@ export function createTelegramBusFollowerSessionReplacementSuspender(deps) {
         }
         const target = deps.registrationState.getTarget();
         if (deps.registrationState.isRegistered() && target) {
+            const profileName = deps.getActiveProfileName?.();
             setTelegramFollowerSessionHandoff({
                 pid: getPid(),
+                ...(profileName === undefined ? {} : { profileName }),
                 instanceId: deps.instanceId,
                 createdAtMs: getNowMs(),
                 target,
@@ -1385,7 +1388,7 @@ export function createTelegramBusFollowerSessionRefreshHook(deps) {
             const handoff = getTelegramFollowerSessionHandoff();
             const lockState = deps.getLeaderState();
             const handoffIsFresh = isTelegramFollowerSessionHandoffFresh(handoff);
-            if (handoffIsFresh && lockState.kind === "active-elsewhere") {
+            if (handoffIsFresh && handoff.profileName === deps.getActiveProfileName?.() && lockState.kind === "active-elsewhere") {
                 try {
                     const restored = await deps.registrationRuntime.registerWithLeader(ctx, lockState.lock, {
                         target: handoff.target,
@@ -2252,7 +2255,7 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
             // A fresh handoff belongs to this same process, so a replaced session reuses its Thread: the tab keeps
             // one identity and only its owner rotates. Explicit options still override the preserved target.
             const pendingHandoff = getTelegramFollowerSessionHandoff();
-            const pendingHandoffOptions = isTelegramFollowerSessionHandoffFresh(pendingHandoff)
+            const pendingHandoffOptions = isTelegramFollowerSessionHandoffFresh(pendingHandoff) && pendingHandoff.profileName === deps.getActiveProfileName?.()
                 ? {
                     target: pendingHandoff.target,
                     previousInstanceId: pendingHandoff.instanceId,

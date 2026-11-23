@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.60.1: Named Profile Continuity Hotfix
+
+- `Profiles`: A same-process `/new`, `/fork`, or `/reload` with an exact successor session file reconnects the active named profile. The successor selects that profile before restoring transport and its Thread, and confirms a Telegram `/new` only after reconnecting. It does not fall back to another bot if the carried profile is unavailable. Default startup and explicit profile selection in a fresh process are unchanged. Closes #388.
+
 ## 0.60.0: Companion Delivery To Telegram Groups
 
 - `Delivery`: Companion extensions can send Markdown through the connected bot to exact, opt-in groups and forum topics. Reply and proactive-send permissions are separate; replies require the original live operator update, while new messages do not. Both report confirmed parts without granting edit, delete, or replay authority, and never fall back to another chat or topic.

@@ -1294,10 +1294,6 @@ interface TelegramLifecycleBindingDeps {
   deferredQueueDispatchRuntime: Queue.TelegramDeferredQueueDispatchRuntime<Pi.ExtensionContext>;
   modelContextAvailabilityRuntime: Prompts.TelegramModelContextAvailabilityRuntime;
   disconnectOnQuit?: () => Promise<unknown>;
-  onSessionStarted?: (
-    event: Pi.SessionStartEvent,
-    ctx: Pi.ExtensionContext,
-  ) => void;
   shutdownGenerativeAppLiveSurfaces?: () => void;
   resolveAutomaticThreadCleanupEnabled?: () => boolean | Promise<boolean>;
   buttonActionStore: OutboundHandlers.TelegramButtonActionStore;
@@ -1394,7 +1390,6 @@ export function registerTelegramLifecycleRuntimeHooks({
   deferredQueueDispatchRuntime,
   modelContextAvailabilityRuntime,
   disconnectOnQuit,
-  onSessionStarted,
   shutdownGenerativeAppLiveSurfaces,
   resolveAutomaticThreadCleanupEnabled,
   buttonActionStore,
@@ -1767,7 +1762,6 @@ export function registerTelegramLifecycleRuntimeHooks({
       activityVerbosityRuntime?.reset();
       modelContextAvailabilityRuntime.reconcile();
       await sessionLifecycleRuntime.onSessionStart(event, ctx);
-      onSessionStarted?.(event, ctx);
     },
     async onSessionShutdown(event, ctx) {
       const generation = getSessionGeneration?.();

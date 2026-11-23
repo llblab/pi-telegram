@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as Queue from "../lib/queue.ts";
+import * as BusFollower from "../lib/bus-follower.ts";
 import { createTelegramQueueBindingRuntime } from "../lib/bindings.ts";
 
 import {
@@ -146,8 +147,62 @@ test("Connection handoff carries plain selected-profile intent once, never old c
   assert.equal(third.resume(resume), undefined);
 });
 
+test("Named session replacement carries the selected profile across new, fork and reload", () => {
+  for (const reason of ["new", "fork", "reload"] as const) {
+    for (const connected of [false, true]) {
+      const target = `/sessions/${reason}-${connected}.jsonl`;
+      const store: TelegramConnectionHandoffStore = {};
+      const source = createTelegramConnectionIntentRuntime({ store, pid: 42, now: () => 1000 });
+      if (!connected) source.begin("/repo", "work");
+      source.suspend({ reason, cwd: "/repo", targetSessionFile: target, connected, profileName: "work" });
+      const successor = createTelegramConnectionIntentRuntime({ store, pid: 42, now: () => 2000 });
+      assert.equal(
+        successor.resume({ reason, cwd: "/repo", sessionFile: target })?.profileName,
+        "work",
+        `${reason}:${connected}`,
+      );
+      assert.equal(store.pending, undefined);
+    }
+  }
+});
+
+test("Named session replacement requires an exact destination, process, directory and deadline", () => {
+  for (const scenario of ["file", "cwd", "pid", "expired"] as const) {
+    const store: TelegramConnectionHandoffStore = {};
+    const target = "/sessions/replacement.jsonl";
+    const source = createTelegramConnectionIntentRuntime({ store, pid: 42, now: () => 1000 });
+    source.begin("/repo", "work");
+    source.suspend({
+      reason: "new",
+      cwd: "/repo",
+      targetSessionFile: target,
+      connected: false,
+      profileName: "work",
+    });
+    const successor = createTelegramConnectionIntentRuntime({
+      store,
+      pid: scenario === "pid" ? 43 : 42,
+      now: () => (scenario === "expired" ? 31_000 : 2000),
+    });
+    assert.equal(
+      successor.resume({
+        reason: "new",
+        cwd: scenario === "cwd" ? "/other" : "/repo",
+        sessionFile: scenario === "file" ? "/other.jsonl" : target,
+      }),
+      undefined,
+      scenario,
+    );
+  }
+  const store: TelegramConnectionHandoffStore = {};
+  const source = createTelegramConnectionIntentRuntime({ store, pid: 42, now: () => 1000 });
+  source.begin("/repo", "work");
+  source.suspend({ reason: "new", cwd: "/repo", connected: true, profileName: "work" });
+  assert.equal(store.pending, undefined, "Missing destination is not a handoff");
+});
+
 test("Connection handoff refuses unrelated startup, process, directory, file, expiry and explicit cancellation", () => {
-  for (const scenario of ["startup", "reload", "new", "fork", "pid", "cwd", "file", "expired", "cancel"] as const) {
+  for (const scenario of ["startup", "pid", "cwd", "file", "expired", "cancel"] as const) {
     const store: TelegramConnectionHandoffStore = {};
     const source = createTelegramConnectionIntentRuntime({ store, pid: 42, now: () => 1000 });
     source.begin("/repo", "work");
@@ -156,16 +211,16 @@ test("Connection handoff refuses unrelated startup, process, directory, file, ex
     const successor = createTelegramConnectionIntentRuntime({ store,
       pid: scenario === "pid" ? 43 : 42, now: () => scenario === "expired" ? 31_000 : 2000 });
     assert.equal(successor.resume({ ...resume,
-      reason: ["startup", "reload", "new", "fork"].includes(scenario) ? scenario : "resume",
+      reason: scenario === "startup" ? "startup" : "resume",
       cwd: scenario === "cwd" ? "/other" : "/repo",
       sessionFile: scenario === "file" ? "/other.jsonl" : resume.sessionFile }), undefined, scenario);
   }
-  for (const reason of ["quit", "reload", "new", "fork"]) {
+  for (const reason of ["startup", "quit", "reload", "new", "fork"]) {
     const store: TelegramConnectionHandoffStore = {};
     const source = createTelegramConnectionIntentRuntime({ store });
     source.begin("/repo");
     source.suspend({ ...shutdown, reason });
-    assert.equal(store.pending, undefined);
+    assert.equal(store.pending, undefined, reason);
   }
 });
 
@@ -176,6 +231,85 @@ test("Connected transport carries intent on resume; disconnected startup never g
     source.suspend({ ...shutdown, connected, profileName: "work" });
     const successor = createTelegramConnectionIntentRuntime({ store });
     assert.equal(successor.resume(resume)?.profileName, connected ? "work" : undefined);
+  }
+});
+
+test("Same-process named session replacement activates the selected profile before reconnecting", async () => {
+  for (const reason of ["new", "fork", "reload"] as const) {
+    const store: TelegramConnectionHandoffStore = {};
+    const target = `/sessions/${reason}.jsonl`;
+    const sourceIntent = createTelegramConnectionIntentRuntime({
+      store,
+      pid: 42,
+      now: () => 1000,
+    });
+    sourceIntent.begin("/repo", "work");
+    const sourceContext = {
+      cwd: "/repo",
+      sessionManager: { getSessionFile: () => target },
+    } as ExtensionContext;
+    const sourceLifecycle = createTelegramConnectionLifecycle({
+      intent: sourceIntent,
+      getGeneration: () => 1,
+      isCurrent: () => true,
+      isConnected: () => true,
+      getProfileName: () => "work",
+      activateProfile: () => true,
+      start: async () => ({ ok: true }),
+      recordError() {},
+    });
+    sourceLifecycle.onSessionShutdown(
+      {
+        type: "session_shutdown",
+        reason,
+        ...(reason === "reload" ? {} : { targetSessionFile: target }),
+      } as SessionShutdownEvent,
+      sourceContext,
+    );
+    assert.equal(
+      store.pending?.targetSessionFile,
+      target,
+      `${reason}: reload falls back to the current session file`,
+    );
+    const successorIntent = createTelegramConnectionIntentRuntime({
+      store,
+      pid: 42,
+      now: () => 2000,
+    });
+    const activated: Array<string | undefined> = [];
+    let starts = 0;
+    const successorLifecycle = createTelegramConnectionLifecycle({
+      intent: successorIntent,
+      getGeneration: () => 1,
+      isCurrent: () => true,
+      isConnected: () => false,
+      getProfileName: () => undefined,
+      activateProfile: (profile) => {
+        activated.push(profile);
+        return true;
+      },
+      start: async () => {
+        starts += 1;
+        return { ok: true };
+      },
+      recordError() {},
+    });
+    const successorContext = {
+      cwd: "/repo",
+      sessionManager: { getSessionFile: () => target },
+      ui: { notify() {} },
+    } as unknown as ExtensionContext;
+    const selectProfile = successorLifecycle.prepare(
+      { type: "session_start", reason } as SessionStartEvent,
+      successorContext,
+    );
+    assert.ok(selectProfile, reason);
+    const reconnect = selectProfile();
+    assert.ok(reconnect, reason);
+    assert.deepEqual(activated, ["work"], reason);
+    assert.equal(starts, 0, "Profile selection cannot start transport");
+    await reconnect(() => {});
+    assert.equal(starts, 1, reason);
   }
 });
 
@@ -190,15 +324,21 @@ test("Disconnect and newer connect supersede a delayed resumed startup", async (
     const pending = new Promise<void>((resolve) => { release = resolve; });
     const lifecycle = createTelegramConnectionLifecycle({ intent, getGeneration: () => 1,
       isCurrent: () => true, isConnected: () => false, getProfileName: () => undefined,
-      activateProfile: async (profile) => { assert.equal(profile, "selected"); await pending; return true; },
-      start: async () => { starts += 1; return { ok: true }; }, recordError() {},
+      activateProfile: (profile) => { assert.equal(profile, "selected"); return true; },
+      start: async (_ctx, assertAuthority) => {
+        await pending;
+        assertAuthority();
+        starts += 1;
+        return { ok: true };
+      }, recordError() {},
     });
     const ctx = { cwd: "/repo", sessionManager: { getSessionFile: () => resume.sessionFile } } as ExtensionContext;
-    lifecycle.prepare({ reason: "resume" } as SessionStartEvent, ctx)!();
+    const reconnect = lifecycle.prepare({ reason: "resume" } as SessionStartEvent, ctx)!()!;
+    const completion = reconnect(() => assert.fail("Superseded transport cannot publish connected"));
     const newer = supersede ? intent.begin("/repo", "other") : undefined;
     if (!supersede) intent.cancel();
     release();
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await completion;
     assert.equal(starts, 0);
     if (newer) assert.equal(intent.isActive(newer), true, "Older finally must not clear newer intent");
   }
@@ -214,7 +354,7 @@ test("Resume connection failures retain detailed diagnostics without leaking the
     const detail = "Owner epoch changed during destination claim";
     const lifecycle = createTelegramConnectionLifecycle({ intent, getGeneration: () => 1,
       isCurrent: () => true, isConnected: () => false, getProfileName: () => undefined,
-      activateProfile: async () => true,
+      activateProfile: () => true,
       async start() {
         if (rejection) throw new Error(detail);
         return { ok: false, message: detail };
@@ -222,8 +362,9 @@ test("Resume connection failures retain detailed diagnostics without leaking the
     });
     const ctx = { cwd: "/repo", sessionManager: { getSessionFile: () => resume.sessionFile },
       ui: { notify: (text: string) => notices.push(text) } } as unknown as ExtensionContext;
-    lifecycle.prepare({ reason: "resume" } as SessionStartEvent, ctx)!();
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await lifecycle.prepare({ reason: "resume" } as SessionStartEvent, ctx)!()!(
+      () => assert.fail("Failed transport cannot publish connected"),
+    );
     assert.equal(errors.length, 1);
     assert.match(String(errors[0]), new RegExp(detail));
     assert.equal(notices.length, 1);
@@ -241,20 +382,17 @@ test("Resumed startup drops late work before reading invalid Pi getters", async 
   intent.suspend(shutdown);
   let generation = 1;
   let starts = 0;
-  let release!: () => void;
-  const pending = new Promise<void>((resolve) => { release = resolve; });
   const ctx = { cwd: "/repo", sessionManager: { getSessionFile: () => resume.sessionFile } } as ExtensionContext;
   const lifecycle = createTelegramConnectionLifecycle({ intent, getGeneration: () => generation,
     isCurrent: () => { assert.equal(generation, 1); return true; },
     isConnected: () => false, getProfileName: () => undefined,
-    activateProfile: async () => { await pending; return true; },
+    activateProfile: () => true,
     start: async () => { starts += 1; return { ok: true }; }, recordError() {},
   });
-  lifecycle.prepare({ reason: "resume" } as SessionStartEvent, ctx)!();
+  const reconnect = lifecycle.prepare({ reason: "resume" } as SessionStartEvent, ctx)!()!;
   lifecycle.onSessionShutdown({ reason: "resume", targetSessionFile: "/sessions/third.jsonl" } as SessionShutdownEvent, ctx);
   generation += 1;
-  release();
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await reconnect(() => assert.fail("Obsolete session cannot publish connected"));
   assert.equal(starts, 0);
   assert.equal(store.pending?.targetSessionFile, "/sessions/third.jsonl");
 });
@@ -310,38 +448,125 @@ test("Session generation fence ignores delayed shutdown from a replaced context"
   assert.deepEqual(shutdowns, [newContext]);
 });
 
-test("Resume connection claims before queue startup and replaces ordinary auto-restore", async () => {
-  for (const resumeIntent of [false, true]) {
-    const contexts = createTelegramSessionContextStore<ExtensionContext>();
-    const events: string[] = [];
-    const runtime = createTelegramBridgeSessionLifecycleAssembly({
-      contextStore: contexts,
-      queue: {
-        getCurrentModel: () => undefined, loadConfig: async () => { events.push("config"); },
-        setQueuedItems() {}, setCurrentModel() {}, setPendingModelSwitch() {}, syncCounters() {}, syncFlags() {},
-        bindDeferredDispatchContext() {}, prepareTempDir: async () => {}, updateStatus() {},
-      },
-      follower: {
-        registrationState: { getTarget: () => undefined, isRegistered: () => false },
-        registrationRuntime: {}, instanceId: "leader", getLeaderState: () => ({ kind: "unlocked" }),
-        suspendPolling: async () => {}, updateStatus() {}, recordRuntimeEvent() {},
-      },
-      services: {
-        connection: {
-          prepare() {
-            events.push("claim-intent");
-            return resumeIntent ? () => { events.push("resume-connect"); } : undefined;
-          }, onSessionShutdown() {},
+test("Session replacement connection claims before queue startup and replaces ordinary auto-restore", async () => {
+  for (const reason of ["resume", "new", "fork", "reload"] as const) {
+    for (const resumeIntent of [false, true]) {
+      const contexts = createTelegramSessionContextStore<ExtensionContext>();
+      const events: string[] = [];
+      const runtime = createTelegramBridgeSessionLifecycleAssembly({
+        contextStore: contexts,
+        queue: {
+          getCurrentModel: () => undefined, loadConfig: async () => { events.push("config"); },
+          setQueuedItems() {}, setCurrentModel() {}, setPendingModelSwitch() {}, syncCounters() {}, syncFlags() {},
+          bindDeferredDispatchContext() {}, prepareTempDir: async () => {}, updateStatus() {},
         },
-        resumeGroupedInput() {}, suspendGroupedInput() {},
-        delivery: { onSessionStart: async () => { events.push("delivery"); }, onSessionShutdown: async () => {} },
-        polling: { onSessionStart: async () => { events.push("auto-restore"); } },
-        inboundWorker: { onSessionShutdown: async () => {} },
-        capabilityMonitor: { start() {}, stop() {} }, queueWatchdog: { start() {}, stop() {} },
+        follower: {
+          registrationState: { getTarget: () => undefined, isRegistered: () => false },
+          registrationRuntime: {}, instanceId: "leader", getLeaderState: () => ({ kind: "unlocked" }),
+          suspendPolling: async () => {}, updateStatus() {}, recordRuntimeEvent() {},
+        },
+        services: {
+          connection: {
+            prepare() {
+              events.push("claim-intent");
+              return resumeIntent ? () => {
+                events.push("activate-profile");
+                return async (onConnected: () => void) => { events.push("resume-connect"); onConnected(); };
+              } : undefined;
+            }, onSessionShutdown() {},
+          },
+          resumeGroupedInput() {}, suspendGroupedInput() {},
+          delivery: { onSessionStart: async () => { events.push("delivery"); }, onSessionShutdown: async () => {} },
+          polling: { onSessionStart: async () => { events.push("auto-restore"); } },
+          inboundWorker: { onSessionShutdown: async () => {} },
+          capabilityMonitor: { start() {}, stop() {} }, queueWatchdog: { start() {}, stop() {} },
+        },
+      } as unknown as Parameters<typeof createTelegramBridgeSessionLifecycleAssembly>[0]);
+      await runtime.onSessionStart({ type: "session_start", reason }, createLifecycleContext());
+      assert.deepEqual(
+        events,
+        ["claim-intent", "config", ...(resumeIntent ? ["activate-profile"] : []), "delivery", resumeIntent ? "resume-connect" : "auto-restore"],
+        `${reason}:${resumeIntent}`,
+      );
+    }
+  }
+});
+
+for (const reason of ["new", "fork", "reload"] as const)
+for (const fault of ["none", "default-leader", "missing-profile", "failed-reconnect", "replaced"] as const)
+test(`Carried follower startup has one profile and one transport owner (${reason}/${fault})`, async () => {
+  const store: TelegramConnectionHandoffStore = {};
+  const source = createTelegramConnectionIntentRuntime({ store });
+  const sessionFile = "/sessions/work.jsonl";
+  source.suspend({ reason, cwd: "/repo", targetSessionFile: sessionFile, connected: true, profileName: "work" });
+  const target = { chatId: 123, threadId: 77 };
+  BusFollower.setTelegramFollowerSessionHandoff({ pid: process.pid, instanceId: "old-work", target, createdAtMs: Date.now() });
+  const contexts = createTelegramSessionContextStore<ExtensionContext>();
+  const ctx = { cwd: "/repo", sessionManager: { getSessionFile: () => sessionFile }, ui: { notify() {} } } as unknown as ExtensionContext;
+  const config = Promise.withResolvers<void>();
+  const transport = Promise.withResolvers<{ ok: boolean }>();
+  const effects: string[] = [];
+  let profile: string | undefined, registered = false;
+  const connection = createTelegramConnectionLifecycle({
+    intent: createTelegramConnectionIntentRuntime({ store }), getGeneration: contexts.getGeneration, isCurrent: contexts.isCurrent,
+    getProfileName: () => profile, isConnected: () => registered,
+    activateProfile(name) {
+      assert.equal(name, "work"); effects.push("select");
+      if (fault === "missing-profile") return false;
+      profile = name;
+      return true;
+    },
+    async start(_ctx, assertAuthority) {
+      assertAuthority();
+      assert.equal(profile, "work");
+      assert.deepEqual(BusFollower.getTelegramFollowerSessionHandoff()?.target, target);
+      effects.push("reconnect");
+      const result = await transport.promise;
+      assertAuthority();
+      registered = result.ok;
+      return result;
+    },
+    recordError() {},
+  });
+  const runtime = createTelegramBridgeSessionLifecycleAssembly({
+    contextStore: contexts,
+    queue: {
+      getCurrentModel: () => undefined, loadConfig: () => config.promise,
+      setQueuedItems() {}, setCurrentModel() {}, setPendingModelSwitch() {}, syncCounters() {}, syncFlags() {},
+      bindDeferredDispatchContext() {}, prepareTempDir: async () => {}, updateStatus() {},
+    },
+    follower: {
+      registrationState: { getTarget: () => undefined, getSlot: () => undefined, getThreadName: () => undefined, isRegistered: () => registered },
+      registrationRuntime: { async registerWithLeader() { effects.push("parallel-register"); return false; }, setContext() {} },
+      instanceId: "successor", getLeaderState: () => {
+        effects.push("parallel-owner-read");
+        return fault === "default-leader" && !profile ? { kind: "active-elsewhere" } : { kind: "unlocked" };
       },
-    } as unknown as Parameters<typeof createTelegramBridgeSessionLifecycleAssembly>[0]);
-    await runtime.onSessionStart({ type: "session_start", reason: "resume" }, createLifecycleContext());
-    assert.deepEqual(events, ["claim-intent", "config", "delivery", resumeIntent ? "resume-connect" : "auto-restore"]);
+      suspendPolling: async () => {}, updateStatus() {}, recordRuntimeEvent() {},
+    },
+    services: {
+      connection, resumeGroupedInput() {}, suspendGroupedInput() {},
+      delivery: { async onSessionStart() { effects.push("delivery"); }, onSessionShutdown: async () => {} },
+      polling: { async onSessionStart() { effects.push("auto-restore"); } }, inboundWorker: { onSessionShutdown: async () => {} },
+      capabilityMonitor: { start() { effects.push("monitor"); }, stop() {} }, queueWatchdog: { start() {}, stop() {} },
+      settleSessionReplacement() { assert.equal(profile, "work"); assert.equal(registered, true); effects.push("settle"); },
+    },
+  } as unknown as Parameters<typeof createTelegramBridgeSessionLifecycleAssembly>[0]);
+  try {
+    const startup = runtime.onSessionStart({ type: "session_start", reason }, ctx);
+    assert.equal(store.pending, undefined, "Claim the intent before config I/O");
+    assert.deepEqual(effects, []);
+    config.resolve();
+    await startup; // The Pi hook must return even while Telegram transport is still held.
+    const startupEffects = fault === "missing-profile" ? ["select", "delivery"] : ["select", "delivery", "reconnect"];
+    assert.deepEqual(effects, startupEffects);
+    if (fault === "replaced") contexts.set(ctx);
+    transport.resolve({ ok: fault !== "failed-reconnect" });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(effects, fault === "none" || fault === "default-leader" ? [...startupEffects, "monitor", "settle"] : startupEffects);
+  } finally {
+    transport.resolve({ ok: false });
+    BusFollower.setTelegramFollowerSessionHandoff(undefined);
   }
 });
 

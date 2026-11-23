@@ -4969,7 +4969,7 @@ for (const role of ["leader", "follower"] as const) {
         const lifecycle = Lifecycle.createTelegramConnectionLifecycle({ intent,
           getGeneration: () => 1, isCurrent: () => true,
           getProfileName: () => undefined, isConnected: () => false,
-          activateProfile: async () => true,
+          activateProfile: () => true,
           async start(current) {
             starts += 1;
             assert.equal(current, ctx);
@@ -5003,9 +5003,9 @@ for (const role of ["leader", "follower"] as const) {
             finally { finished(); }
           }, recordError(error) { failures.push(error); },
         });
-        const launch = lifecycle.prepare({ type: "session_start", reason: "resume" }, ctx);
-        assert.ok(launch);
-        launch();
+        const reconnect = lifecycle.prepare({ type: "session_start", reason: "resume" }, ctx)?.();
+        assert.ok(reconnect);
+        await reconnect(() => {});
         await completed;
         if (followerProvisioned) await backgroundSettled.promise;
         await new Promise<void>((resolve) => setImmediate(resolve));

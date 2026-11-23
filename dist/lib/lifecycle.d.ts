@@ -1,7 +1,7 @@
 /**
  * Telegram session lifecycle coordination and hook registration
  * Zones: pi agent lifecycle, telegram session
- * Owns context generations, bounded connect intent across resume, and session sequencing.
+ * Owns context generations, bounded connect intent across same-process session replacement, and session sequencing.
  * Transport authority, durable bindings, and queue custody remain with their owners.
  */
 import * as BusFollower from "./bus-follower.ts";
@@ -66,8 +66,10 @@ interface TelegramConnectionHandoff extends TelegramConnectionIntent {
 export interface TelegramConnectionHandoffStore {
     pending?: TelegramConnectionHandoff;
 }
+type TelegramCarriedReconnect = (onConnected: () => void) => Promise<void>;
 export interface TelegramConnectionLifecycle {
-    prepare(event: SessionStartEvent, ctx: ExtensionContext): (() => void) | undefined;
+    /** Claim now; select from loaded local config before profile-dependent startup. */
+    prepare(event: SessionStartEvent, ctx: ExtensionContext): (() => TelegramCarriedReconnect | undefined) | undefined;
     onSessionShutdown(event: SessionShutdownEvent, ctx: ExtensionContext): void;
 }
 export declare function createTelegramConnectionLifecycle(deps: {
@@ -76,8 +78,8 @@ export declare function createTelegramConnectionLifecycle(deps: {
     isCurrent(ctx: ExtensionContext): boolean;
     getProfileName(): string | undefined;
     isConnected(): boolean;
-    activateProfile(profileName: string | undefined, isCurrent: () => boolean): Promise<boolean>;
-    start(ctx: ExtensionContext): Promise<{
+    activateProfile(profileName: string | undefined): boolean;
+    start(ctx: ExtensionContext, assertAuthority: () => void): Promise<{
         ok: boolean;
         message?: string;
     }>;
@@ -130,6 +132,7 @@ export declare function createTelegramSessionDrainObserver<TContext, TAuthority>
 export declare function createTelegramSessionGenerationFence(store: TelegramSessionContextStore<ExtensionContext>, hooks: TelegramSessionLifecycleHooks): TelegramSessionLifecycleHooks;
 export interface TelegramBridgeSessionServiceRuntime {
     connection?: TelegramConnectionLifecycle;
+    settleSessionReplacement?: (ctx: ExtensionContext) => void;
     resumeGroupedInput(ctx: ExtensionContext): void;
     suspendGroupedInput(): void;
     delivery: {
@@ -177,6 +180,7 @@ export interface TelegramBridgeSessionLifecyclePorts<TQueueItem, TModel = unknow
         delivery: TelegramBridgeSessionServiceRuntime["delivery"];
         polling: TelegramBridgeSessionServiceRuntime["polling"];
         connection?: TelegramBridgeSessionServiceRuntime["connection"];
+        settleSessionReplacement?: TelegramBridgeSessionServiceRuntime["settleSessionReplacement"];
         inboundWorker: TelegramBridgeSessionServiceRuntime["inboundWorker"];
         capabilityMonitor: TelegramBridgeSessionServiceRuntime["capabilityMonitor"];
         queueWatchdog: TelegramBridgeSessionServiceRuntime["queueWatchdog"];
