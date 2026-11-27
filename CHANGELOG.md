@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Thread naming`: `/telegram-connect [profile] --name <Thread name>` connects and then applies a manual display name to this instance's Threaded Mode tab through the same leader/follower rename path as Telegram `/name`. The name is validated before connecting, applied once the Thread exists, kept until `/name` reset, and refused with a notice in classic mode, after session replacement or when no Thread appears within 30 seconds.
+
 ## 0.60.1: Named Profile Continuity Hotfix
 
 - `Profiles`: A same-process `/new`, `/fork`, or `/reload` with an exact successor session file reconnects the active named profile. The successor selects that profile before restoring transport and its Thread, and confirms a Telegram `/new` only after reconnecting. It does not fall back to another bot if the carried profile is unavailable. Default startup and explicit profile selection in a fresh process are unchanged. Closes #388.

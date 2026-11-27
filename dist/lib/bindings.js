@@ -553,7 +553,7 @@ export function createTelegramLiveTargetWorkObserver(deps) {
         };
     };
 }
-export function registerTelegramCommandsAndTools({ pi, handleInternalAction, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, getDisconnectThreadName, onTransportChanged, refreshProfileStateAfterReset, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, }) {
+export function registerTelegramCommandsAndTools({ pi, handleInternalAction, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, getDisconnectThreadName, onTransportChanged, refreshProfileStateAfterReset, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, connectThreadName, }) {
     GenerativeApps.registerTelegramBindTool(pi, {
         agentDir,
         onOwnerObserved: buttonActionStore.observeAppOwner,
@@ -696,6 +696,7 @@ export function registerTelegramCommandsAndTools({ pi, handleInternalAction, age
         isContextCurrent,
         getSessionGeneration,
         connectionIntent,
+        ...(connectThreadName ? { connectThreadName } : {}),
         getProfileNames: () => Config.getTelegramProfileNames(configStore.getStoredConfig()),
         getActiveProfileName: configStore.getActiveProfileName,
         activateDefaultProfileConfig: async (ctx, isCurrent) => {

@@ -205,7 +205,53 @@ export interface TelegramBridgeCommandRegistrationDeps {
         diagnostic?: string;
     }>;
     activateProfileConfig?: (ctx: ExtensionCommandContext, profileName: string, isCurrent: () => boolean) => Promise<boolean>;
+    /** Optional `--name` support: applies a manual Thread display name once this instance owns a Thread. */
+    connectThreadName?: Pick<TelegramConnectThreadNameRuntime<ExtensionCommandContext>, "validate" | "request" | "cancel">;
 }
+export declare const TELEGRAM_CONNECT_NAME_FLAG = "--name";
+export declare const TELEGRAM_CONNECT_NAME_USAGE = "Usage: /telegram-connect [profile] --name <Thread name>";
+export interface TelegramConnectArguments {
+    /** Arguments preceding `--name`; the optional profile word lives here. */
+    profileArgs: string;
+    /** Present only when `--name` was supplied; may be empty when its value is missing. */
+    threadName?: string;
+}
+/**
+ * `--name` consumes the remainder of the line so multi-word names need no quoting;
+ * one matching pair of surrounding quotes is stripped. The profile word must precede it.
+ */
+export declare function parseTelegramConnectArguments(args: string): TelegramConnectArguments;
+export declare const TELEGRAM_CONNECT_THREAD_NAME_TIMEOUT_MS = 30000;
+export interface TelegramConnectThreadNameRuntimeDeps<TContext> {
+    /** Current local Workspace Thread target: registered follower target, otherwise leader target. */
+    getLocalTarget: () => {
+        chatId: number;
+        threadId?: number;
+    } | undefined;
+    /** True when the bot is known to run without private-chat Threaded Mode. */
+    isThreadModeDisabled?: () => boolean;
+    rename: TelegramThreadDisplayNameRenamePort;
+    validate: (threadName: string) => string | undefined;
+    /** Captures the command's session authority; the returned check must fail after replacement. */
+    captureSession: (ctx: TContext) => () => boolean;
+    notify: (ctx: TContext, message: string, level: "info" | "warning" | "error") => void;
+    recordRuntimeEvent?: (category: string, error: unknown) => void;
+    timeoutMs?: number;
+}
+export interface TelegramConnectThreadNameRuntime<TContext> {
+    validate(threadName: string): string | undefined;
+    /** Replaces any earlier pending name; applied once a local Thread target exists. */
+    request(ctx: TContext, threadName: string): void;
+    cancel(): void;
+    /** Wire to leader-target and follower-registration change signals. */
+    onTargetChanged(): void;
+}
+/**
+ * Pending `/telegram-connect --name` intent. It reuses the ordinary manual-rename port
+ * (the same path as Telegram `/name`), so leader/follower authority, admission and
+ * persistence stay with their existing owners. It is session-fenced and bounded.
+ */
+export declare function createTelegramConnectThreadNameRuntime<TContext>(deps: TelegramConnectThreadNameRuntimeDeps<TContext>): TelegramConnectThreadNameRuntime<TContext>;
 /** Bound adapters must carry the optional recipient guard through their own effect/publication awaits. */
 export type TelegramThreadDisplayNameRenamePort = (target: {
     chatId: number;

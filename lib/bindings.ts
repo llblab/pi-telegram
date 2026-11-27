@@ -976,6 +976,7 @@ interface TelegramCommandsAndToolsBindingDeps {
   connectionIntent: NonNullable<
     Commands.TelegramBridgeCommandRegistrationDeps["connectionIntent"]
   >;
+  connectThreadName?: Commands.TelegramBridgeCommandRegistrationDeps["connectThreadName"];
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }
 
@@ -1011,6 +1012,7 @@ export function registerTelegramCommandsAndTools({
   isContextCurrent,
   getSessionGeneration,
   connectionIntent,
+  connectThreadName,
 }: TelegramCommandsAndToolsBindingDeps): void {
   GenerativeApps.registerTelegramBindTool(pi, {
     agentDir,
@@ -1181,6 +1183,7 @@ export function registerTelegramCommandsAndTools({
     isContextCurrent,
     getSessionGeneration,
     connectionIntent,
+    ...(connectThreadName ? { connectThreadName } : {}),
     getProfileNames: () =>
       Config.getTelegramProfileNames(configStore.getStoredConfig()),
     getActiveProfileName: configStore.getActiveProfileName,
