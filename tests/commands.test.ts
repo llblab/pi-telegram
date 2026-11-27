@@ -1043,7 +1043,7 @@ test("Command helpers register pi setup and status commands", async () => {
     [
       "<profile> — Configure Telegram bot token",
       "Show Telegram bridge status",
-      "<profile> — Start Telegram bridge",
+      "<profile> [--name <Thread name>] — Start Telegram bridge",
       "Stop Telegram and delete current thread in Threaded Mode",
     ],
   );
@@ -1057,7 +1057,7 @@ test("Command helpers register pi setup and status commands", async () => {
   assert.equal(harness.commands.has("telegram-name"), false);
 });
 
-test("Connect rejects Thread naming from Pi commands", async () => {
+test("Connect rejects legacy as= Thread naming and points to --name", async () => {
   const harness = createCommandRegistrationApiHarness();
   const notifications: string[] = [];
   let starts = 0;
@@ -1086,9 +1086,228 @@ test("Connect rejects Thread naming from Pi commands", async () => {
   assert.equal(starts, 0);
   assert.equal(statusUpdates, 2);
   assert.deepEqual(notifications, [
-    "Thread names are configured from Telegram, not from Pi commands.",
-    "Thread names are configured from Telegram, not from Pi commands.",
+    "Use --name <Thread name> to name the Telegram Thread.",
+    "Use --name <Thread name> to name the Telegram Thread.",
   ]);
+});
+
+test("Connect --name arguments keep the profile prefix and consume the rest of the line", () => {
+  const parse = Commands.parseTelegramConnectArguments;
+  assert.deepEqual(parse(""), { profileArgs: "" });
+  assert.deepEqual(parse("work"), { profileArgs: "work" });
+  assert.deepEqual(parse("--name abc"), { profileArgs: "", threadName: "abc" });
+  assert.deepEqual(parse("--name=abc"), { profileArgs: "", threadName: "abc" });
+  assert.deepEqual(parse("work --name My Project"), {
+    profileArgs: "work",
+    threadName: "My Project",
+  });
+  assert.deepEqual(parse('work --name "My Project"'), {
+    profileArgs: "work",
+    threadName: "My Project",
+  });
+  assert.deepEqual(parse("--NAME abc"), { profileArgs: "", threadName: "abc" });
+  assert.deepEqual(parse("work --name"), { profileArgs: "work", threadName: "" });
+  assert.deepEqual(parse("--named abc"), { profileArgs: "--named abc" });
+});
+
+test("Connect --name validates before connecting and requests the name only after success", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const notifications: string[] = [];
+  const events: string[] = [];
+  let result: { ok: boolean; message?: string } | undefined;
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async () => {
+      events.push("start");
+      return result;
+    },
+    stopPolling: async () => {},
+    updateStatus: () => {},
+    activateProfileConfig: async (_ctx, profileName) => {
+      events.push(`profile:${profileName}`);
+      return true;
+    },
+    connectThreadName: {
+      validate: (name) => (name === "Z" ? "reserved" : undefined),
+      request: (_ctx, name) => events.push(`request:${name}`),
+      cancel: () => events.push("cancel"),
+    },
+  });
+  const connect = getRequiredCommand(harness.commands, "telegram-connect");
+  const ctx = createBridgeCommandContext((message) => {
+    notifications.push(message);
+  });
+
+  await connect.handler("--name Z", ctx);
+  await connect.handler("--name", ctx);
+  assert.deepEqual(events, []);
+  assert.deepEqual(notifications, [
+    "reserved",
+    Commands.TELEGRAM_CONNECT_NAME_USAGE,
+  ]);
+
+  await connect.handler("work --name My Project", ctx);
+  assert.deepEqual(events, [
+    "cancel",
+    "profile:work",
+    "start",
+    "request:My Project",
+  ]);
+
+  events.length = 0;
+  result = { ok: false, message: "refused" };
+  await connect.handler("--name abc", ctx);
+  assert.deepEqual(events, ["cancel", "start"]);
+
+  events.length = 0;
+  result = undefined;
+  await connect.handler("", ctx);
+  assert.deepEqual(events, ["cancel", "start"]);
+});
+
+test("Connect --name reports unavailable support without connecting", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const notifications: string[] = [];
+  let starts = 0;
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async () => {
+      starts += 1;
+    },
+    stopPolling: async () => {},
+    updateStatus: () => {},
+  });
+  const connect = getRequiredCommand(harness.commands, "telegram-connect");
+  await connect.handler(
+    "--name abc",
+    createBridgeCommandContext((message) => notifications.push(message)),
+  );
+  assert.equal(starts, 0);
+  assert.equal(notifications.length, 1);
+  assert.match(notifications[0] ?? "", /unavailable/);
+});
+
+function createConnectThreadNameHarness(
+  options: {
+    threadModeDisabled?: boolean;
+    rename?: Commands.TelegramThreadDisplayNameRenamePort;
+    timeoutMs?: number;
+  } = {},
+) {
+  let target: { chatId: number; threadId?: number } | undefined;
+  let current = true;
+  const renames: Array<{ target: unknown; name: string }> = [];
+  const notifications: Array<{ message: string; level: string }> = [];
+  const runtime = Commands.createTelegramConnectThreadNameRuntime<string>({
+    getLocalTarget: () => target,
+    isThreadModeDisabled: () => options.threadModeDisabled === true,
+    rename:
+      options.rename ??
+      (async (renameTarget, name) => {
+        renames.push({ target: renameTarget, name });
+        return { ok: true, threadName: name };
+      }),
+    validate: () => undefined,
+    captureSession: () => () => current,
+    notify: (_ctx, message, level) => notifications.push({ message, level }),
+    timeoutMs: options.timeoutMs ?? 60_000,
+  });
+  return {
+    runtime,
+    renames,
+    notifications,
+    setTarget(next: typeof target) {
+      target = next;
+      runtime.onTargetChanged();
+    },
+    loseSession() {
+      current = false;
+    },
+  };
+}
+
+const settleMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
+
+test("Connect Thread name applies once when the local Thread target appears", async () => {
+  const harness = createConnectThreadNameHarness();
+  harness.runtime.request("ctx", "My Project");
+  await settleMicrotasks();
+  assert.deepEqual(harness.renames, []);
+
+  harness.setTarget({ chatId: 7 });
+  await settleMicrotasks();
+  assert.deepEqual(harness.renames, []);
+
+  harness.setTarget({ chatId: 7, threadId: 42 });
+  harness.setTarget({ chatId: 7, threadId: 42 });
+  await settleMicrotasks();
+  assert.deepEqual(harness.renames, [
+    { target: { chatId: 7, threadId: 42 }, name: "My Project" },
+  ]);
+  assert.deepEqual(harness.notifications, [
+    { message: 'Telegram Thread named "My Project".', level: "info" },
+  ]);
+
+  harness.setTarget({ chatId: 7, threadId: 43 });
+  await settleMicrotasks();
+  assert.equal(harness.renames.length, 1);
+});
+
+test("Connect Thread name applies immediately to an existing target and reports rename failures", async () => {
+  const harness = createConnectThreadNameHarness({
+    rename: async () => ({ ok: false, message: "Leader is busy." }),
+  });
+  harness.setTarget({ chatId: 7, threadId: 42 });
+  harness.runtime.request("ctx", "abc");
+  await settleMicrotasks();
+  assert.deepEqual(harness.notifications, [
+    {
+      message: "Telegram Thread name was not applied: Leader is busy.",
+      level: "warning",
+    },
+  ]);
+});
+
+test("Connect Thread name is dropped after session replacement or cancel", async () => {
+  const replaced = createConnectThreadNameHarness();
+  replaced.runtime.request("ctx", "abc");
+  replaced.loseSession();
+  replaced.setTarget({ chatId: 7, threadId: 42 });
+  await settleMicrotasks();
+  assert.deepEqual(replaced.renames, []);
+  assert.deepEqual(replaced.notifications, []);
+
+  const cancelled = createConnectThreadNameHarness();
+  cancelled.runtime.request("ctx", "abc");
+  cancelled.runtime.cancel();
+  cancelled.setTarget({ chatId: 7, threadId: 42 });
+  await settleMicrotasks();
+  assert.deepEqual(cancelled.renames, []);
+});
+
+test("Connect Thread name refuses classic mode and times out without a Thread", async () => {
+  const classic = createConnectThreadNameHarness({ threadModeDisabled: true });
+  classic.runtime.request("ctx", "abc");
+  await settleMicrotasks();
+  assert.deepEqual(classic.renames, []);
+  assert.match(classic.notifications[0]?.message ?? "", /Threaded Mode is off/);
+
+  const waiting = createConnectThreadNameHarness({ timeoutMs: 5 });
+  waiting.runtime.request("ctx", "abc");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  waiting.setTarget({ chatId: 7, threadId: 42 });
+  await settleMicrotasks();
+  assert.deepEqual(waiting.renames, []);
+  assert.match(
+    waiting.notifications[0]?.message ?? "",
+    /no Workspace Thread became available/,
+  );
 });
 
 test("Bare and explicit default setup/connect commands select the same profile", async () => {

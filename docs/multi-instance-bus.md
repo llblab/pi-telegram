@@ -42,7 +42,7 @@ one private bot chat -> one thread per live Pi instance
 The operator experience:
 
 1. Start one Pi instance; it becomes the Telegram bus leader and polls Telegram.
-2. Start another Pi instance with `pi-telegram` and run `/telegram-connect`; the follower registers instead of fighting for `getUpdates`. Use `/telegram-connect as=Navigator`, or `/telegram-connect work as=Navigator` for a named profile, to name a fresh Workspace Thread. On later process reopen, a profile-scoped exact-`cwd` Workspace with a remembered Thread reconnects as a follower automatically while the leader remains live.
+2. Start another Pi instance with `pi-telegram` and run `/telegram-connect`; the follower registers instead of fighting for `getUpdates`. Use `/telegram-connect --name Navigator`, or `/telegram-connect work --name Navigator` for a named profile, to apply a manual display name to this instance's Thread once it exists (the same override as Telegram `/name Navigator`). On later process reopen, a profile-scoped exact-`cwd` Workspace with a remembered Thread reconnects as a follower automatically while the leader remains live.
 3. The leader provisions or reuses a Telegram thread target for that instance. Use `/name Navigator` in that Telegram Thread later to change its display name through leader-authorized persistence.
 4. Messages, callbacks, reactions, files, voice, previews, and menus in that target route to the owning live Pi instance.
 5. If the leader exits, remaining followers elect/promote a new leader, which resumes polling and keeps the registered target routes alive where possible.

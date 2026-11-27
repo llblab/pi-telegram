@@ -741,6 +741,193 @@ export interface TelegramBridgeCommandRegistrationDeps {
     profileName: string,
     isCurrent: () => boolean,
   ) => Promise<boolean>;
+  /** Optional `--name` support: applies a manual Thread display name once this instance owns a Thread. */
+  connectThreadName?: Pick<
+    TelegramConnectThreadNameRuntime<ExtensionCommandContext>,
+    "validate" | "request" | "cancel"
+  >;
+}
+
+export const TELEGRAM_CONNECT_NAME_FLAG = "--name";
+export const TELEGRAM_CONNECT_NAME_USAGE =
+  "Usage: /telegram-connect [profile] --name <Thread name>";
+
+export interface TelegramConnectArguments {
+  /** Arguments preceding `--name`; the optional profile word lives here. */
+  profileArgs: string;
+  /** Present only when `--name` was supplied; may be empty when its value is missing. */
+  threadName?: string;
+}
+
+/**
+ * `--name` consumes the remainder of the line so multi-word names need no quoting;
+ * one matching pair of surrounding quotes is stripped. The profile word must precede it.
+ */
+export function parseTelegramConnectArguments(
+  args: string,
+): TelegramConnectArguments {
+  const match = /(?:^|\s)--name(?=\s|=|$)/i.exec(args);
+  if (!match) return { profileArgs: args };
+  let rest = args.slice(match.index + match[0].length);
+  if (rest.startsWith("=")) rest = rest.slice(1);
+  let threadName = rest.trim();
+  const quoted = /^(["'])([\s\S]*)\1$/.exec(threadName);
+  if (quoted) threadName = (quoted[2] ?? "").trim();
+  return { profileArgs: args.slice(0, match.index), threadName };
+}
+
+export const TELEGRAM_CONNECT_THREAD_NAME_TIMEOUT_MS = 30_000;
+
+export interface TelegramConnectThreadNameRuntimeDeps<TContext> {
+  /** Current local Workspace Thread target: registered follower target, otherwise leader target. */
+  getLocalTarget: () => { chatId: number; threadId?: number } | undefined;
+  /** True when the bot is known to run without private-chat Threaded Mode. */
+  isThreadModeDisabled?: () => boolean;
+  rename: TelegramThreadDisplayNameRenamePort;
+  validate: (threadName: string) => string | undefined;
+  /** Captures the command's session authority; the returned check must fail after replacement. */
+  captureSession: (ctx: TContext) => () => boolean;
+  notify: (
+    ctx: TContext,
+    message: string,
+    level: "info" | "warning" | "error",
+  ) => void;
+  recordRuntimeEvent?: (category: string, error: unknown) => void;
+  timeoutMs?: number;
+}
+
+export interface TelegramConnectThreadNameRuntime<TContext> {
+  validate(threadName: string): string | undefined;
+  /** Replaces any earlier pending name; applied once a local Thread target exists. */
+  request(ctx: TContext, threadName: string): void;
+  cancel(): void;
+  /** Wire to leader-target and follower-registration change signals. */
+  onTargetChanged(): void;
+}
+
+/**
+ * Pending `/telegram-connect --name` intent. It reuses the ordinary manual-rename port
+ * (the same path as Telegram `/name`), so leader/follower authority, admission and
+ * persistence stay with their existing owners. It is session-fenced and bounded.
+ */
+export function createTelegramConnectThreadNameRuntime<TContext>(
+  deps: TelegramConnectThreadNameRuntimeDeps<TContext>,
+): TelegramConnectThreadNameRuntime<TContext> {
+  interface Pending {
+    id: number;
+    ctx: TContext;
+    threadName: string;
+    isCurrent: () => boolean;
+    timer: ReturnType<typeof setTimeout>;
+  }
+  let pending: Pending | undefined;
+  let nextId = 0;
+  const clear = (): void => {
+    if (pending) clearTimeout(pending.timer);
+    pending = undefined;
+  };
+  const isCurrent = (entry: Pending): boolean => {
+    try {
+      return entry.isCurrent();
+    } catch {
+      return false;
+    }
+  };
+  const report = (
+    entry: Pending,
+    message: string,
+    level: "info" | "warning" | "error",
+  ): void => {
+    if (!isCurrent(entry)) return;
+    try {
+      deps.notify(entry.ctx, message, level);
+    } catch {
+      // A replaced Pi context may throw from UI getters; the rename outcome stays in diagnostics.
+    }
+  };
+  const tryApply = (): void => {
+    const entry = pending;
+    if (!entry) return;
+    if (!isCurrent(entry)) {
+      clear();
+      return;
+    }
+    const target = deps.getLocalTarget();
+    if (typeof target?.threadId !== "number") return;
+    clear();
+    const capturedTarget = { chatId: target.chatId, threadId: target.threadId };
+    void deps.rename(capturedTarget, entry.threadName).then(
+      (result) => {
+        if (result.ok) {
+          report(
+            entry,
+            `Telegram Thread named "${result.threadName ?? entry.threadName}".`,
+            "info",
+          );
+          return;
+        }
+        report(
+          entry,
+          `Telegram Thread name was not applied: ${result.message ?? "rename failed."}`,
+          "warning",
+        );
+      },
+      (error: unknown) => {
+        deps.recordRuntimeEvent?.("connect-thread-name", error);
+        const message = error instanceof Error ? error.message : String(error);
+        report(
+          entry,
+          `Telegram Thread name was not applied: ${message}`,
+          "warning",
+        );
+      },
+    );
+  };
+  const schedule = (): void => {
+    // Target signals fire inside leader/follower state mutation; never re-enter it synchronously.
+    if (pending) void Promise.resolve().then(tryApply);
+  };
+  return {
+    validate: deps.validate,
+    request(ctx, threadName) {
+      clear();
+      const id = ++nextId;
+      const timer = setTimeout(() => {
+        const entry = pending;
+        if (!entry || entry.id !== id) return;
+        clear();
+        report(
+          entry,
+          "Telegram Thread name was not applied: no Workspace Thread became available. Use /name in the Telegram Thread instead.",
+          "warning",
+        );
+      }, deps.timeoutMs ?? TELEGRAM_CONNECT_THREAD_NAME_TIMEOUT_MS);
+      (timer as { unref?: () => void }).unref?.();
+      const entry: Pending = {
+        id,
+        ctx,
+        threadName,
+        isCurrent: deps.captureSession(ctx),
+        timer,
+      };
+      pending = entry;
+      if (
+        deps.isThreadModeDisabled?.() &&
+        typeof deps.getLocalTarget()?.threadId !== "number"
+      ) {
+        clear();
+        report(
+          entry,
+          "Telegram Thread name was not applied: Threaded Mode is off, so this connection has no Thread to name.",
+          "warning",
+        );
+        return;
+      }
+      schedule();
+    },
+    cancel: clear,
+    onTargetChanged: schedule,
+  };
 }
 
 /** Bound adapters must carry the optional recipient guard through their own effect/publication awaits. */
@@ -927,7 +1114,7 @@ export function registerTelegramBridgeCommands(
     },
   });
   pi.registerCommand(TELEGRAM_CONNECT_COMMAND_NAME, {
-    description: "<profile> — Start Telegram bridge",
+    description: "<profile> [--name <Thread name>] — Start Telegram bridge",
     getArgumentCompletions: (argumentPrefix) =>
       getTelegramProfileCompletions(deps, argumentPrefix),
     handler: async (args, ctx) => {
@@ -960,21 +1147,42 @@ export function registerTelegramBridgeCommands(
         deps.isContextCurrent?.(ctx) !== false &&
         getExtensionContextSessionId(ctx) === sessionId;
       if (!isCurrent()) return;
+      const connectArgs = parseTelegramConnectArguments(args);
       if (
-        args
+        connectArgs.profileArgs
           .trim()
           .split(/\s+/)
           .some((word) => /^as=/i.test(word))
       ) {
         ctx.ui.notify(
-          "Thread names are configured from Telegram, not from Pi commands.",
+          `Use ${TELEGRAM_CONNECT_NAME_FLAG} <Thread name> to name the Telegram Thread.`,
           "warning",
         );
         deps.updateStatus(ctx);
         return;
       }
+      const connectThreadName = connectArgs.threadName;
+      if (connectThreadName !== undefined) {
+        if (!deps.connectThreadName) {
+          ctx.ui.notify(
+            "Thread naming from /telegram-connect is unavailable. Use /name in the Telegram Thread.",
+            "warning",
+          );
+          deps.updateStatus(ctx);
+          return;
+        }
+        const validationError = connectThreadName
+          ? deps.connectThreadName.validate(connectThreadName)
+          : TELEGRAM_CONNECT_NAME_USAGE;
+        if (validationError) {
+          ctx.ui.notify(validationError, "error");
+          deps.updateStatus(ctx);
+          return;
+        }
+      }
       attempt = ++connectAttempt;
-      let profileName = parseTelegramProfileArg(args);
+      deps.connectThreadName?.cancel();
+      let profileName = parseTelegramProfileArg(connectArgs.profileArgs);
       intentId = deps.connectionIntent?.begin(ctx.cwd, profileName);
       try {
         if (!profileName) {
@@ -1090,7 +1298,11 @@ export function registerTelegramBridgeCommands(
         } else if (result?.message) {
           ctx.ui.notify(result.message, "info");
         }
-        if (!result || result.ok) deps.queueAgentConnectionContext?.(true);
+        if (!result || result.ok) {
+          deps.queueAgentConnectionContext?.(true);
+          if (connectThreadName)
+            deps.connectThreadName?.request(ctx, connectThreadName);
+        }
         deps.updateStatus(ctx);
       } catch (error) {
         if (!isCurrent()) return;
@@ -1113,6 +1325,7 @@ export function registerTelegramBridgeCommands(
       if (!isCurrent()) return;
       ++connectAttempt;
       deps.connectionIntent?.cancel();
+      deps.connectThreadName?.cancel();
       try {
         const threadName = deps.getDisconnectThreadName?.();
         if (threadName) {

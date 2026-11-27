@@ -169,12 +169,14 @@ export default function (
       onAvailabilityChanged: modelContextAvailabilityBinding.reconcile,
       onRegistrationChanged() {
         deliveryLifecycleRuntime.requestTransportRefresh();
+        connectThreadNameRuntime.onTargetChanged();
       },
     });
   const telegramBusLeaderState =
     Threads.createTelegramLeaderThreadStateRuntime({
       onTargetChanged() {
         deliveryLifecycleRuntime.requestTransportRefresh();
+        connectThreadNameRuntime.onTargetChanged();
       },
     });
   const telegramThreadCapabilityState =
@@ -1429,6 +1431,29 @@ export default function (
     Commands.createTelegramThreadDisplayNameRenameBinding();
   const telegramThreadDisplayNameResetBinding =
     Commands.createTelegramThreadDisplayNameResetBinding();
+  const connectThreadNameRuntime =
+    Commands.createTelegramConnectThreadNameRuntime<Pi.ExtensionContext>({
+      getLocalTarget() {
+        return telegramBusFollowerRegistrationState.isRegistered()
+          ? telegramBusFollowerRegistrationState.getTarget()
+          : telegramBusLeaderState.getTarget();
+      },
+      isThreadModeDisabled() {
+        return threadStore.getBotState().threadMode === "disabled";
+      },
+      rename: telegramThreadDisplayNameRenameBinding.rename,
+      validate: ThreadNaming.getTelegramManualThreadDisplayNameValidationError,
+      captureSession(ctx) {
+        const generation = telegramSessionContextStore.getGeneration();
+        return function () {
+          return telegramSessionContextStore.isCurrent(ctx, generation);
+        };
+      },
+      notify(ctx, message, level) {
+        ctx.ui.notify(message, level);
+      },
+      recordRuntimeEvent,
+    });
   const observeLiveTargetWork = Bindings.createTelegramLiveTargetWorkObserver({
     queue: telegramQueueStore,
     activeTurn: activeTurnRuntime,
@@ -2978,6 +3003,7 @@ export default function (
     isContextCurrent: telegramSessionContextStore.isCurrent,
     getSessionGeneration: telegramSessionContextStore.getGeneration,
     connectionIntent,
+    connectThreadName: connectThreadNameRuntime,
     buttonActionStore,
     sendMarkdownReply,
     async sendChannelMarkdownMessage(channel, markdown, options) {
